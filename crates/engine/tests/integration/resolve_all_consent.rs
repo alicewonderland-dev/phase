@@ -1,6 +1,6 @@
 //! Phase-1 protocol coverage for explicit Resolve All consent.
 
-use engine::ai_support::{candidates::candidate_actions, legal_actions_for_viewer};
+use engine::ai_support::{candidate_actions, legal_actions_for_viewer};
 use engine::game::engine::apply;
 use engine::game::interaction::{
     bind_interaction_authority, derive_viewer_interaction, resolve_interaction_response,

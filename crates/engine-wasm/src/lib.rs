@@ -13,10 +13,8 @@ use engine::ai_support::{
 };
 use engine::database::legality::{any_ai_difficulty_is_cedh, validate_cedh_bracket};
 use engine::database::{CardDatabase, CardSearchQuery};
-use engine::game::engine::{
-    apply, apply_for_simulation, resolve_all_fast_forward, resolve_all_ready_prefix,
-    ResolveAllCallbackDecision, ResolveAllFastForwardResult as BatchResolveResult,
-};
+use engine::game::engine::{apply, apply_for_simulation};
+use engine::game::engine_resolve_batch::resolve_all_ready_prefix;
 use engine::game::interaction::{bind_interaction_authority, submit_interaction};
 use engine::game::preview::{compute_preview_diff, preview_auto_payment_sources};
 use engine::game::{
@@ -2175,8 +2173,8 @@ pub fn restore_game_state(json_str: &str) -> Result<(), JsValue> {
 
 /// The natively-callable body of [`restore_game_state`].
 ///
-/// Split for the same reason — and in the same shape — as `resolve_all_inner`
-/// and `scored_candidates_inner`: the `#[wasm_bindgen]` shell may only run on
+/// Split for the same reason — and in the same shape — as `scored_candidates_inner`:
+/// the `#[wasm_bindgen]` shell may only run on
 /// wasm32. Off-target, `JsValue::from_str` panics inside a function that cannot
 /// unwind, so a shell that merely RETURNS an error aborts the whole process with
 /// SIGABRT instead of failing the test. A native test that calls the shell is
@@ -2801,7 +2799,7 @@ pub fn get_ai_tactical_action_proposal_with_diagnostics(
 /// Split out of [`get_ai_scored_candidates`] so native tests can drive the real
 /// scoring path: the `#[wasm_bindgen]` shell returns through `to_js`, which calls
 /// the real `JSON.parse` binding and panics outside a wasm32 runtime (same reason
-/// `resolve_all_inner` exists).
+/// `scored_candidates_inner` exists).
 fn scored_candidates_inner(
     state: &mut GameState,
     difficulty: AiDifficulty,
@@ -3035,54 +3033,15 @@ pub fn submit_ai_action_proposal(token: &str, actor: u8, action: JsValue) -> JsV
 /// - AI declines to pass priority
 /// - Game ends
 /// - Safety cap reached (prevents infinite loops from cascading triggers)
+#[expect(
+    dead_code,
+    reason = "the legacy Resolve All wire payload remains validated for compatibility, but unanimous engine consent now owns seat decisions"
+)]
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AiSeatConfig {
     player_id: u8,
     difficulty: String,
-}
-
-fn resolve_all_inner(
-    state: &mut GameState,
-    requester: PlayerId,
-    ai_seats: &[AiSeatConfig],
-    max_resolutions: u32,
-    rng: &mut impl Rng,
-) -> BatchResolveResult {
-    // The first AI decision in the fast-forward loop can run before any
-    // `apply()` (which would flush internally); flush up front so it sees
-    // precise derived state + presence index. No-op when layers are clean.
-    engine::game::layers::flush_layers(state);
-    let session = ai_session_for(state);
-    resolve_all_fast_forward(state, requester, max_resolutions, |state, actor| {
-        if let Some(seat) = ai_seats
-            .iter()
-            .find(|seat| PlayerId(seat.player_id) == actor)
-        {
-            let ai_difficulty = AiDifficulty::from_label(&seat.difficulty);
-            let config =
-                create_config_for_players(ai_difficulty, Platform::Wasm, state.players.len() as u8);
-            // Seeding asks whether a later seat will pass before the live
-            // `WaitingFor` advances to that seat. Give the AI the exact
-            // future priority prompt on a clone; its contract otherwise has
-            // an empty candidate domain and it cannot select PassPriority.
-            let mut decision_state = state.clone();
-            decision_state.waiting_for = WaitingFor::Priority { player: actor };
-            decision_state.priority_player = actor;
-            match choose_action_with_session(&decision_state, actor, &config, rng, &session) {
-                // `seed_remaining_priority_cycle_passes` asks about future
-                // priority seats before `WaitingFor` advances to them. A
-                // priority pass is the sole raw action the batch accepts, so
-                // it remains valid without fabricating a future contract.
-                Some(GameAction::PassPriority) => {
-                    ResolveAllCallbackDecision::Action(GameAction::PassPriority)
-                }
-                Some(_) | None => ResolveAllCallbackDecision::Stop,
-            }
-        } else {
-            ResolveAllCallbackDecision::Stop
-        }
-    })
 }
 
 #[wasm_bindgen]
@@ -3264,94 +3223,6 @@ mod bracket_estimate_tests {
             ..Default::default()
         };
         assert!(estimate_bracket_inner(&deck).is_none());
-    }
-}
-
-#[cfg(test)]
-mod resolve_all_tests {
-    use super::*;
-    use engine::types::ability::{Effect, ResolvedAbility};
-    use engine::types::game_state::{StackEntry, StackEntryKind, WaitingFor};
-    use engine::types::identifiers::ObjectId;
-
-    fn no_op_entry(id: u64, controller: PlayerId) -> StackEntry {
-        let object_id = ObjectId(id);
-        StackEntry {
-            id: object_id,
-            source_id: object_id,
-            controller,
-            kind: StackEntryKind::ActivatedAbility {
-                source_id: object_id,
-                ability: Box::new(ResolvedAbility::new(
-                    Effect::NoOp,
-                    vec![],
-                    object_id,
-                    controller,
-                )),
-            },
-        }
-    }
-
-    fn priority_state(semantic_seat: PlayerId, stack: Vec<StackEntry>) -> GameState {
-        let mut state = GameState::new_two_player(7);
-        state.waiting_for = WaitingFor::Priority {
-            player: semantic_seat,
-        };
-        state.priority_player = semantic_seat;
-        state.stack = stack.into_iter().collect();
-        state
-    }
-
-    #[test]
-    fn resolve_all_tls_production_path_substitute_routes_controlled_priority() {
-        let mut state = priority_state(PlayerId(1), vec![no_op_entry(1, PlayerId(1))]);
-        state.active_player = PlayerId(1);
-        state.turn_decision_controller = Some(PlayerId(0));
-        state.priority_player = PlayerId(0);
-        state.priority_passes.insert(PlayerId(0));
-        GAME_STATE.with(|cell| cell.set(Some(state)));
-
-        let ai_seats: Vec<AiSeatConfig> = serde_json::from_str("[]").unwrap();
-        let result = with_state_mut(|state| {
-            let mut rng = ChaCha20Rng::seed_from_u64(13);
-            resolve_all_inner(state, PlayerId(0), &ai_seats, 0, &mut rng)
-        })
-        .unwrap();
-
-        assert_eq!(result.items_resolved, 1);
-        with_state(|state| assert!(state.stack.is_empty())).unwrap();
-        clear_game_state();
-    }
-
-    #[test]
-    fn resolve_all_tls_production_path_seeds_ai_priority_passes() {
-        let mut state = GameState::new(FormatConfig::free_for_all(), 3, 7);
-        state.waiting_for = WaitingFor::Priority {
-            player: PlayerId(0),
-        };
-        state.priority_player = PlayerId(0);
-        state.stack.push_back(no_op_entry(1, PlayerId(2)));
-        GAME_STATE.with(|cell| cell.set(Some(state)));
-
-        let ai_seats = vec![
-            AiSeatConfig {
-                player_id: 1,
-                difficulty: "Medium".to_string(),
-            },
-            AiSeatConfig {
-                player_id: 2,
-                difficulty: "Medium".to_string(),
-            },
-        ];
-        let result = with_state_mut(|state| {
-            let mut rng = ChaCha20Rng::seed_from_u64(13);
-            resolve_all_inner(state, PlayerId(0), &ai_seats, 0, &mut rng)
-        })
-        .unwrap();
-
-        assert_eq!(result.items_resolved, 1);
-        with_state(|state| assert!(state.stack.is_empty())).unwrap();
-        clear_game_state();
     }
 }
 

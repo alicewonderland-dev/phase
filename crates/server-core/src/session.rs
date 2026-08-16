@@ -6,7 +6,8 @@ use engine::ai_support::{auto_pass_recommended, legal_actions_full as engine_leg
 use engine::database::legality::{validate_cedh_bracket, CedhBracketError};
 use engine::database::CardDatabase;
 use engine::game::deck_loading::{DeckPayload, PlayerDeckPayload};
-use engine::game::engine::{apply, resolve_all_ready_prefix, start_game};
+use engine::game::engine::{apply, start_game};
+use engine::game::engine_resolve_batch::resolve_all_ready_prefix;
 use engine::game::interaction::{bind_interaction_authority, submit_interaction};
 use engine::game::layers::flush_layers;
 use engine::game::match_flow::apply_trusted_match_forfeit;

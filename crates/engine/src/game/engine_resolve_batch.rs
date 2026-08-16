@@ -832,14 +832,15 @@ mod tests {
             GameAction::BeginResolveAll { max_resolutions: 0 },
         )
         .expect("priority holder begins the consent run");
-        let WaitingFor::ResolveAllConsent { epoch, .. } = &state.waiting_for else {
-            panic!("second representative should be queued");
+        let epoch = match &state.waiting_for {
+            WaitingFor::ResolveAllConsent { epoch, .. } => *epoch,
+            _ => panic!("second representative should be queued"),
         };
         super::super::engine::apply(
             &mut state,
             PlayerId(1),
             GameAction::RespondResolveAllConsent {
-                epoch: *epoch,
+                epoch,
                 decision: ResolveAllConsentDecision::Grant,
             },
         )

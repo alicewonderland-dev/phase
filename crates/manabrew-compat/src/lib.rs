@@ -2577,6 +2577,13 @@ pub fn convert_available_action(
         | GameAction::CancelCast
         | GameAction::BackToManaPayment
         | GameAction::Concede { .. } => AvailableActionConversion::Skip,
+        // The upstream protocol has no consent-shortcut action family. Do not
+        // advertise an action it cannot round-trip; surface the fidelity gap.
+        GameAction::BeginResolveAll { .. }
+        | GameAction::RespondResolveAllConsent { .. }
+        | GameAction::RevokeResolveAllConsent { .. } => {
+            AvailableActionConversion::Unsupported("local.resolve-all-unsupported")
+        }
         GameAction::DeclareAttackers { .. } => AvailableActionConversion::Skip,
         GameAction::DeclareBlockers { .. } => AvailableActionConversion::Skip,
         GameAction::ChooseUntap { .. } => {
