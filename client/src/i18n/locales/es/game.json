@@ -49,6 +49,13 @@
     "collapse": "Contraer progreso de resolución",
     "expand": "Expandir progreso de resolución"
   },
+  "resolveAllConsent": {
+    "eyebrow": "Resolver todo",
+    "title": "¿Aprobar la resolución rápida?",
+    "subtitle": "Todos los jugadores deben aprobar antes de que el motor resuelva un prefijo seguro de la pila.",
+    "grant": "Aprobar",
+    "decline": "Conservar prioridad"
+  },
   "debugCreate": {
     "copies": "Copias",
     "tokenPower": "Power",

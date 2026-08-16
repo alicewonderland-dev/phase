@@ -49,6 +49,13 @@
     "collapse": "Auflösungsfortschritt einklappen",
     "expand": "Auflösungsfortschritt ausklappen"
   },
+  "resolveAllConsent": {
+    "eyebrow": "Alles auflösen",
+    "title": "Schnelles Auflösen genehmigen?",
+    "subtitle": "Alle Spieler müssen zustimmen, bevor die Engine einen sicheren Stapelpräfix auflöst.",
+    "grant": "Genehmigen",
+    "decline": "Priorität behalten"
+  },
   "debugCreate": {
     "copies": "Kopien",
     "tokenPower": "Power",

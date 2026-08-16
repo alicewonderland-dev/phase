@@ -49,6 +49,13 @@
     "collapse": "Recolher progresso de resolução",
     "expand": "Expandir progresso de resolução"
   },
+  "resolveAllConsent": {
+    "eyebrow": "Resolver tudo",
+    "title": "Aprovar a resolução rápida?",
+    "subtitle": "Todos os jogadores precisam aprovar antes que o mecanismo resolva um prefixo seguro da pilha.",
+    "grant": "Aprovar",
+    "decline": "Manter prioridade"
+  },
   "debugCreate": {
     "copies": "Cópias",
     "tokenPower": "Power",

@@ -49,6 +49,13 @@
     "collapse": "Zwiń postęp rozwiązywania",
     "expand": "Rozwiń postęp rozwiązywania"
   },
+  "resolveAllConsent": {
+    "eyebrow": "Rozpatrz wszystko",
+    "title": "Zatwierdzić szybkie rozpatrywanie?",
+    "subtitle": "Wszyscy gracze muszą zatwierdzić, zanim silnik rozpatrzy bezpieczny prefiks stosu.",
+    "grant": "Zatwierdź",
+    "decline": "Zachowaj priorytet"
+  },
   "debugCreate": {
     "copies": "Kopie",
     "tokenPower": "Power",

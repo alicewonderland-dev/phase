@@ -1232,6 +1232,22 @@ pub fn fallback_action(
         // Terminal — no action possible.
         WaitingFor::GameOver { .. } => None,
 
+        // Resolve All is opt-in. If no policy selected one of the engine-issued
+        // consent actions, decline the shortcut rather than leave its
+        // representative's decision unanswered.
+        WaitingFor::ResolveAllConsent { .. } => issued(|action| {
+            matches!(
+                action,
+                GameAction::RespondResolveAllConsent {
+                    decision: engine::types::actions::ResolveAllConsentDecision::Decline,
+                    ..
+                }
+            )
+        }),
+        // Ready has no acting player; the authorized frontend consumer starts
+        // the bounded prefix drain.
+        WaitingFor::ResolveAllReady { .. } => None,
+
         // Priority is the only state where PassPriority is valid.
         WaitingFor::Priority { .. } => Some(GameAction::PassPriority),
 
