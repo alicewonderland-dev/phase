@@ -4,10 +4,14 @@
 //! families use [`ResolutionStack`] as their runtime authority; unmigrated
 //! families remain in their legacy `GameState` slots until their Phase-3 turn.
 
+mod frame_vec;
+
 use std::collections::HashSet;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
+
+use frame_vec::{FrameSlot, FrameVec};
 
 use crate::types::ability::{AbilityDefinition, DiscardedCardResult, ResolvedAbility, TargetRef};
 use crate::types::events::GameEvent;
@@ -435,12 +439,16 @@ pub enum ResolutionStackError {
 
 /// An ordered, LIFO stack of suspended resolution work.
 ///
-/// Its backing storage is intentionally private: all future mutations must
-/// pass through the checked structural APIs rather than searching for or
-/// removing a non-top parent.
+/// Its backing storage is intentionally private, and the privacy is enforced by
+/// the type system rather than by convention: [`FrameVec`] hands out positions
+/// only as opaque [`FrameSlot`]s minted from the top, from an adjacent frame, or
+/// from a [`PostReplacementFrameId`]. A frame located any other way — by
+/// scanning, by arithmetic on the length — yields a `usize` that no accessor
+/// accepts, so a positional search cannot be spent even when it can be written.
+/// See [`frame_vec`] for why that replaced a grep-based guard.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResolutionStack {
-    frames: Vec<ResolutionFrame>,
+    frames: FrameVec,
     /// The monotonic draw-frame allocator survives an abandoned MultiDraw
     /// frame, so a stale captured ID cannot alias a later instruction.
     #[serde(default)]
@@ -708,19 +716,16 @@ impl ResolutionStack {
         &mut self,
         discard_id: DiscardFrameId,
     ) -> Option<&mut AbilityContinuationFrame> {
-        let continuation_index = self.frames.len().checked_sub(1)?;
-        let discard_index = continuation_index.checked_sub(1)?;
-        match (
-            self.frames.get(discard_index),
-            self.frames.get(continuation_index),
-        ) {
+        let continuation = self.frames.top()?;
+        let discard = self.frames.below(continuation)?;
+        match (self.frames.get(discard), self.frames.get(continuation)) {
             (
                 Some(ResolutionFrame::Discard(discard)),
                 Some(ResolutionFrame::AbilityContinuation(_)),
             ) if discard.id == discard_id => {}
             _ => return None,
         }
-        match self.frames.get_mut(continuation_index) {
+        match self.frames.get_mut(continuation) {
             Some(ResolutionFrame::AbilityContinuation(continuation)) => Some(continuation),
             Some(_) | None => {
                 unreachable!("checked direct continuation must retain its frame kind")
@@ -736,19 +741,16 @@ impl ResolutionStack {
         &mut self,
         discard_id: DiscardFrameId,
     ) -> Option<&mut DiscardFrame> {
-        let continuation_index = self.frames.len().checked_sub(1)?;
-        let discard_index = continuation_index.checked_sub(1)?;
-        match (
-            self.frames.get(discard_index),
-            self.frames.get(continuation_index),
-        ) {
+        let continuation = self.frames.top()?;
+        let discard = self.frames.below(continuation)?;
+        match (self.frames.get(discard), self.frames.get(continuation)) {
             (
                 Some(ResolutionFrame::Discard(discard)),
                 Some(ResolutionFrame::AbilityContinuation(_)),
             ) if discard.id == discard_id => {}
             _ => return None,
         }
-        match self.frames.get_mut(discard_index) {
+        match self.frames.get_mut(discard) {
             Some(ResolutionFrame::Discard(discard)) => Some(discard),
             Some(_) | None => unreachable!("checked direct discard must retain its frame kind"),
         }
@@ -762,21 +764,19 @@ impl ResolutionStack {
         &mut self,
         discard_id: DiscardFrameId,
     ) -> Option<&mut DiscardFrame> {
-        let active_index = self.frames.len().checked_sub(1)?;
-        let discard_index = match self.frames.get(active_index) {
-            Some(ResolutionFrame::Discard(discard)) if discard.id == discard_id => active_index,
+        let active = self.frames.top()?;
+        let discard = match self.frames.get(active) {
+            Some(ResolutionFrame::Discard(discard)) if discard.id == discard_id => active,
             Some(ResolutionFrame::AbilityContinuation(_)) => {
-                let discard_index = active_index.checked_sub(1)?;
-                match self.frames.get(discard_index) {
-                    Some(ResolutionFrame::Discard(discard)) if discard.id == discard_id => {
-                        discard_index
-                    }
+                let below = self.frames.below(active)?;
+                match self.frames.get(below) {
+                    Some(ResolutionFrame::Discard(discard)) if discard.id == discard_id => below,
                     Some(_) | None => return None,
                 }
             }
             Some(_) | None => return None,
         };
-        match self.frames.get_mut(discard_index) {
+        match self.frames.get_mut(discard) {
             Some(ResolutionFrame::Discard(discard)) => Some(discard),
             Some(_) | None => unreachable!("checked discard frame must retain its frame kind"),
         }
@@ -785,12 +785,9 @@ impl ResolutionStack {
     /// Identifies the exact discard parent of the active continuation without
     /// exposing any non-adjacent frame.
     pub fn active_ability_continuation_discard_parent_id(&self) -> Option<DiscardFrameId> {
-        let continuation_index = self.frames.len().checked_sub(1)?;
-        let discard_index = continuation_index.checked_sub(1)?;
-        match (
-            self.frames.get(discard_index),
-            self.frames.get(continuation_index),
-        ) {
+        let continuation = self.frames.top()?;
+        let discard = self.frames.below(continuation)?;
+        match (self.frames.get(discard), self.frames.get(continuation)) {
             (
                 Some(ResolutionFrame::Discard(discard)),
                 Some(ResolutionFrame::AbilityContinuation(_)),
@@ -803,12 +800,9 @@ impl ResolutionStack {
         &self,
         discard_id: DiscardFrameId,
     ) -> Option<crate::types::ability::DiscardedCardResult> {
-        let continuation_index = self.frames.len().checked_sub(1)?;
-        let discard_index = continuation_index.checked_sub(1)?;
-        match (
-            self.frames.get(discard_index),
-            self.frames.get(continuation_index),
-        ) {
+        let continuation = self.frames.top()?;
+        let discard = self.frames.below(continuation)?;
+        match (self.frames.get(discard), self.frames.get(continuation)) {
             (
                 Some(ResolutionFrame::Discard(frame)),
                 Some(ResolutionFrame::AbilityContinuation(_)),
@@ -850,17 +844,19 @@ impl ResolutionStack {
                 self.take_active_ability_continuation()
             }
             Some(ResolutionFrame::BatchDelivery(_)) => {
-                let Some(parent_index) = self.frames.len().checked_sub(2) else {
+                let Some(child) = self.frames.top() else {
+                    return Ok(None);
+                };
+                let Some(parent) = self.frames.below(child) else {
                     return Ok(None);
                 };
                 if !matches!(
-                    self.frames.get(parent_index),
+                    self.frames.get(parent),
                     Some(ResolutionFrame::AbilityContinuation(_))
                 ) {
                     return Ok(None);
                 }
-                let child_index = self.frames.len() - 1;
-                self.frames.swap(parent_index, child_index);
+                self.frames.swap(parent, child);
                 let ResolutionFrame::AbilityContinuation(frame) =
                     self.pop_expected(FrameKind::AbilityContinuation)?
                 else {
@@ -1037,34 +1033,38 @@ impl ResolutionStack {
         pending: PendingChangeZoneIteration,
         child_stack_start: usize,
     ) -> Result<(), ResolutionStackError> {
-        if child_stack_start >= self.frames.len() {
+        let Some(boundary) = self.frames.slot_at_captured_depth(child_stack_start) else {
             return Err(ResolutionStackError::InvalidChildBoundary {
                 child_stack_start,
                 stack_len: self.frames.len(),
             });
-        }
+        };
 
-        if let Some(ResolutionFrame::ChangeZone(frame)) = self.frames.get(child_stack_start) {
+        if let Some(ResolutionFrame::ChangeZone(frame)) = self.frames.get(boundary) {
             if frame.pending.is_none() && frame.devour_eligible_snapshot.is_some() {
                 let devour_eligible_snapshot = frame.devour_eligible_snapshot.clone();
-                self.frames[child_stack_start] =
+                self.frames.replace(
+                    boundary,
                     ResolutionFrame::ChangeZone(Box::new(ChangeZoneFrame {
                         pending: Some(pending),
                         devour_eligible_snapshot,
-                    }));
+                    })),
+                );
                 return Ok(());
             }
         }
 
-        if let Some(parent_index) = child_stack_start.checked_sub(1) {
-            if let Some(ResolutionFrame::ChangeZone(frame)) = self.frames.get(parent_index) {
+        if let Some(parent) = self.frames.below(boundary) {
+            if let Some(ResolutionFrame::ChangeZone(frame)) = self.frames.get(parent) {
                 if frame.pending.is_none() && frame.devour_eligible_snapshot.is_some() {
                     let devour_eligible_snapshot = frame.devour_eligible_snapshot.clone();
-                    self.frames[parent_index] =
+                    self.frames.replace(
+                        parent,
                         ResolutionFrame::ChangeZone(Box::new(ChangeZoneFrame {
                             pending: Some(pending),
                             devour_eligible_snapshot,
-                        }));
+                        })),
+                    );
                     return Ok(());
                 }
             }
@@ -1090,28 +1090,32 @@ impl ResolutionStack {
         child_stack_start: usize,
     ) -> Result<(), ResolutionStackError> {
         let logical_group_id = pending.logical_zone_change_group.logical_group_id;
-        if let Some(ResolutionFrame::ChangeZone(frame)) = self.frames.get(child_stack_start) {
-            if frame.pending.as_ref().is_some_and(|current| {
-                current.logical_zone_change_group.logical_group_id == logical_group_id
-            }) {
-                let devour_eligible_snapshot = frame.devour_eligible_snapshot.clone();
-                self.frames[child_stack_start] =
-                    ResolutionFrame::ChangeZone(Box::new(ChangeZoneFrame {
-                        pending: Some(pending),
-                        devour_eligible_snapshot,
-                    }));
-                return Ok(());
+        let boundary = self.frames.slot_at_captured_depth(child_stack_start);
+        if let Some(boundary) = boundary {
+            if let Some(ResolutionFrame::ChangeZone(frame)) = self.frames.get(boundary) {
+                if frame.pending.as_ref().is_some_and(|current| {
+                    current.logical_zone_change_group.logical_group_id == logical_group_id
+                }) {
+                    let devour_eligible_snapshot = frame.devour_eligible_snapshot.clone();
+                    self.frames.replace(
+                        boundary,
+                        ResolutionFrame::ChangeZone(Box::new(ChangeZoneFrame {
+                            pending: Some(pending),
+                            devour_eligible_snapshot,
+                        })),
+                    );
+                    return Ok(());
+                }
             }
         }
 
-        let parent_index =
-            child_stack_start
-                .checked_sub(1)
-                .ok_or(ResolutionStackError::InvalidChildBoundary {
-                    child_stack_start,
-                    stack_len: self.frames.len(),
-                })?;
-        let Some(parent) = self.frames.get(parent_index) else {
+        let parent_slot = boundary.and_then(|slot| self.frames.below(slot)).ok_or(
+            ResolutionStackError::InvalidChildBoundary {
+                child_stack_start,
+                stack_len: self.frames.len(),
+            },
+        )?;
+        let Some(parent) = self.frames.get(parent_slot) else {
             return Err(ResolutionStackError::InvalidChildBoundary {
                 child_stack_start,
                 stack_len: self.frames.len(),
@@ -1132,10 +1136,13 @@ impl ResolutionStack {
             });
         }
         let devour_eligible_snapshot = frame.devour_eligible_snapshot.clone();
-        self.frames[parent_index] = ResolutionFrame::ChangeZone(Box::new(ChangeZoneFrame {
-            pending: Some(pending),
-            devour_eligible_snapshot,
-        }));
+        self.frames.replace(
+            parent_slot,
+            ResolutionFrame::ChangeZone(Box::new(ChangeZoneFrame {
+                pending: Some(pending),
+                devour_eligible_snapshot,
+            })),
+        );
         Ok(())
     }
 
@@ -1165,14 +1172,14 @@ impl ResolutionStack {
     pub fn active_batch_delivery_or_post_replacement_child_mut(
         &mut self,
     ) -> Option<&mut PendingBatchDeliveries> {
-        let parent_index = self.frames.len().checked_sub(2);
+        let parent = self.frames.top().and_then(|top| self.frames.below(top));
         match self.frames.last() {
             Some(ResolutionFrame::BatchDelivery(_)) => match self.frames.last_mut() {
                 Some(ResolutionFrame::BatchDelivery(frame)) => Some(frame),
                 Some(_) | None => unreachable!("checked active batch frame must match"),
             },
-            Some(ResolutionFrame::PostReplacement(_)) => match parent_index {
-                Some(index) => match self.frames.get_mut(index) {
+            Some(ResolutionFrame::PostReplacement(_)) => match parent {
+                Some(parent) => match self.frames.get_mut(parent) {
                     Some(ResolutionFrame::BatchDelivery(frame)) => Some(frame),
                     Some(_) | None => None,
                 },
@@ -2339,8 +2346,8 @@ impl ResolutionStack {
     /// immediate parent of the active child raised while its continuation
     /// dispatches; there is intentionally no general frame search.
     pub fn active_post_replacement_or_paired_parent(&self) -> Option<&PostReplacementDrainStack> {
-        let index = self.active_post_replacement_parent_index()?;
-        match self.frames.get(index) {
+        let parent = self.active_post_replacement_parent_slot()?;
+        match self.frames.get(parent) {
             Some(ResolutionFrame::PostReplacement(drains)) => Some(drains),
             Some(_) | None => unreachable!("checked post-replacement parent must match"),
         }
@@ -2350,8 +2357,8 @@ impl ResolutionStack {
     pub fn active_post_replacement_or_paired_parent_mut(
         &mut self,
     ) -> Option<&mut PostReplacementDrainStack> {
-        let index = self.active_post_replacement_parent_index()?;
-        match self.frames.get_mut(index) {
+        let parent = self.active_post_replacement_parent_slot()?;
+        match self.frames.get_mut(parent) {
             Some(ResolutionFrame::PostReplacement(drains)) => Some(drains),
             Some(_) | None => unreachable!("checked post-replacement parent must match"),
         }
@@ -2362,9 +2369,9 @@ impl ResolutionStack {
     /// dispatch; it never reaches through a child or searches for a buried
     /// parent.
     pub fn take_active_post_replacement_child(&mut self) -> Option<ResolutionFrame> {
-        let parent_index = self.active_post_replacement_parent_index()?;
-        let child_index = self.frames.len().checked_sub(1)?;
-        if parent_index.checked_add(1) != Some(child_index) {
+        let parent = self.active_post_replacement_parent_slot()?;
+        let child = self.frames.top()?;
+        if self.frames.above(parent) != Some(child) {
             return None;
         }
         self.frames.pop()
@@ -2374,21 +2381,21 @@ impl ResolutionStack {
     /// The two legal shapes are `[... PostReplacement]` and
     /// `[... PostReplacement, child]`; any deeper relationship is deliberately
     /// invisible here so callers cannot turn this into a generic frame search.
-    fn active_post_replacement_parent_index(&self) -> Option<usize> {
-        let parent_index = self.frames.len().checked_sub(1)?;
+    fn active_post_replacement_parent_slot(&self) -> Option<FrameSlot> {
+        let top = self.frames.top()?;
         if matches!(
-            self.frames.get(parent_index),
+            self.frames.get(top),
             Some(ResolutionFrame::PostReplacement(_))
         ) {
-            return Some(parent_index);
+            return Some(top);
         }
 
-        let parent_index = parent_index.checked_sub(1)?;
+        let below = self.frames.below(top)?;
         matches!(
-            self.frames.get(parent_index),
+            self.frames.get(below),
             Some(ResolutionFrame::PostReplacement(_))
         )
-        .then_some(parent_index)
+        .then_some(below)
     }
 
     /// CR 614.12a + CR 616.1g: take the active frame's resident continuation and
@@ -2397,7 +2404,7 @@ impl ResolutionStack {
     /// Ordering here is load-bearing:
     ///
     ///  * the frame index is resolved through the EXISTING private
-    ///    [`Self::active_post_replacement_parent_index`], which keeps its
+    ///    [`Self::active_post_replacement_parent_slot`], which keeps its
     ///    documented "no general frame search" contract and remains the
     ///    mint-time authority — identity addressing is added for the CLEANUP,
     ///    which is the only side that can be reached after the frame has moved;
@@ -2418,10 +2425,10 @@ impl ResolutionStack {
         crate::types::ability::PostReplacementContinuation,
         IdentifiedPostReplacementDispatch,
     )> {
-        let index = self.active_post_replacement_parent_index()?;
+        let parent = self.active_post_replacement_parent_slot()?;
         let candidate =
             PostReplacementFrameId(self.last_post_replacement_frame_id.saturating_add(1));
-        let Some(ResolutionFrame::PostReplacement(drains)) = self.frames.get_mut(index) else {
+        let Some(ResolutionFrame::PostReplacement(drains)) = self.frames.get_mut(parent) else {
             unreachable!("checked post-replacement parent must match")
         };
         let (continuation, dispatch) = drains.begin_dispatch()?;
@@ -2442,59 +2449,41 @@ impl ResolutionStack {
         ))
     }
 
-    /// The SINGLE identity-addressed search over `frames`, and the only place in
-    /// this module licensed to search the frame vector at all.
+    /// The drain stack of the frame `id` names, if that frame is still resident.
     ///
-    /// `scripts/check-resolution-frame-boundaries.sh` anchors its exemption to
-    /// this function BY NAME. The rule the guard enforces is "one search, here",
-    /// not "any search that looks identity-shaped": a second search anywhere in
-    /// this file — including a verbatim copy of the expression below, and
-    /// including one added INSIDE this body — still fails the guard, which
-    /// counts the searches in this span and requires exactly one. The guard
-    /// also requires that search to select on `frame_id() == Some(id)`, so the
-    /// exemption cannot be inherited by a positional probe that merely takes
-    /// this function's name. Move this function and the guard fails loudly
-    /// rather than silently widening.
+    /// The identity search itself lives in [`FrameVec::by_id`], which is the
+    /// only place in the crate that can turn a match into an addressable
+    /// position. This used to be a hand-written `frames.iter().position(..)`
+    /// exempted by name from a grep guard; the exemption is gone because the
+    /// search is now the only one the type system permits.
     ///
-    /// The distinction the guard draws is between POSITIONAL or
-    /// adjacency-inferred access, which guesses a structural relationship the
-    /// stack does not guarantee, and identity-addressed access, which asserts
-    /// one. The latter is an established access mode in this codebase, not a
-    /// carve-out invented here: [`DrawSequenceStack`]'s `frame_mut` / `active_if`
-    /// / `pop` address their frames the same way, resting on the same
-    /// monotonic-allocator property — an id is never reissued, so a stale id
-    /// matches nothing rather than aliasing a later frame. Unstamped frames
-    /// carry `None` and can never match.
+    /// The distinction being drawn is between POSITIONAL or adjacency-inferred
+    /// access, which guesses a structural relationship the stack does not
+    /// guarantee, and identity-addressed access, which asserts one. The latter
+    /// is an established access mode in this codebase, not a carve-out invented
+    /// here: [`DrawSequenceStack`]'s `frame_mut` / `active_if` / `pop` address
+    /// their frames the same way, resting on the same monotonic-allocator
+    /// property — an id is never reissued, so a stale id matches nothing rather
+    /// than aliasing a later frame. Unstamped frames carry `None` and can never
+    /// match.
     ///
     /// Both halves of that soundness argument are pinned by existing rows rather
     /// than asserted here: `h6a_legacy_id_less_post_replacement_frames_restore_unstamped`
     /// for the unstamped case, and
     /// `v2_reader_recovers_discard_allocator_and_rejects_duplicate_frame_ids`
-    /// for the no-reissue case. If either is deleted, this exemption loses its
-    /// basis.
+    /// for the no-reissue case. If either is deleted, identity addressing loses
+    /// its basis.
     ///
     /// [`DrawSequenceStack`]: crate::types::game_state::DrawSequenceStack
-    fn post_replacement_frame_index(&self, id: PostReplacementFrameId) -> Option<usize> {
-        self.frames.iter().position(|frame| {
-            matches!(frame, ResolutionFrame::PostReplacement(drains) if drains.frame_id() == Some(id))
-        })
-    }
-
-    /// The drain stack of the frame `id` names, if that frame is still resident.
-    ///
-    /// The index does NOT escape this accessor pair. Handing a position to
-    /// callers would reintroduce exactly the positional coupling this change
-    /// exists to remove, which is why the three operations below take the
-    /// payload rather than an index.
     fn post_replacement_frame(
         &self,
         id: PostReplacementFrameId,
     ) -> Option<&PostReplacementDrainStack> {
-        let index = self.post_replacement_frame_index(id)?;
-        match self.frames.get(index) {
+        let slot = self.frames.by_id(id)?;
+        match self.frames.get(slot) {
             Some(ResolutionFrame::PostReplacement(drains)) => Some(drains),
             Some(_) | None => {
-                unreachable!("the index came from a matched post-replacement frame")
+                unreachable!("the slot came from a matched post-replacement frame")
             }
         }
     }
@@ -2504,11 +2493,11 @@ impl ResolutionStack {
         &mut self,
         id: PostReplacementFrameId,
     ) -> Option<&mut PostReplacementDrainStack> {
-        let index = self.post_replacement_frame_index(id)?;
-        match self.frames.get_mut(index) {
+        let slot = self.frames.by_id(id)?;
+        match self.frames.get_mut(slot) {
             Some(ResolutionFrame::PostReplacement(drains)) => Some(drains),
             Some(_) | None => {
-                unreachable!("the index came from a matched post-replacement frame")
+                unreachable!("the slot came from a matched post-replacement frame")
             }
         }
     }
@@ -2665,7 +2654,8 @@ impl ResolutionStack {
     /// This is intentionally narrower than a frame search: it serves only the
     /// paused-drain/draw adjacency.
     pub fn active_predecessor(&self) -> Option<&ResolutionFrame> {
-        self.frames.get(self.frames.len().checked_sub(2)?)
+        let top = self.frames.top()?;
+        self.frames.get(self.frames.below(top)?)
     }
 
     /// True only for the live general-drain/draw pair at the active stack
@@ -2693,11 +2683,12 @@ impl ResolutionStack {
     pub fn outer_ability_continuation_of_active_post_replacement_draw_pair(
         &self,
     ) -> Option<&AbilityContinuationFrame> {
-        let post_replacement_index = self.frames.len().checked_sub(2)?;
-        let continuation_index = post_replacement_index.checked_sub(1)?;
+        let draw_child = self.frames.top()?;
+        let post_replacement = self.frames.below(draw_child)?;
+        let continuation = self.frames.below(post_replacement)?;
         match (
-            self.frames.get(continuation_index),
-            self.frames.get(post_replacement_index),
+            self.frames.get(continuation),
+            self.frames.get(post_replacement),
             self.last(),
         ) {
             (
@@ -2721,9 +2712,13 @@ impl ResolutionStack {
     pub fn outer_ability_continuation_of_active_post_replacement_draw_pair_mut(
         &mut self,
     ) -> Option<&mut AbilityContinuationFrame> {
-        let continuation_index = self.frames.len().checked_sub(3)?;
+        // The pair is {draw child, post-replacement parent}; the outer
+        // continuation sits immediately beneath both.
+        let draw_child = self.frames.top()?;
+        let post_replacement = self.frames.below(draw_child)?;
+        let continuation = self.frames.below(post_replacement)?;
         self.outer_ability_continuation_of_active_post_replacement_draw_pair()?;
-        match self.frames.get_mut(continuation_index) {
+        match self.frames.get_mut(continuation) {
             Some(ResolutionFrame::AbilityContinuation(continuation)) => Some(continuation),
             Some(_) | None => {
                 unreachable!("checked paired continuation must retain its frame kind")
@@ -2751,13 +2746,16 @@ impl ResolutionStack {
                 }),
             };
         }
-        let post_replacement_index = self
+        let draw_child = self
             .frames
-            .len()
-            .checked_sub(2)
+            .top()
+            .expect("the checked adjacent pair has a child");
+        let post_replacement = self
+            .frames
+            .below(draw_child)
             .expect("the checked adjacent pair has a parent");
-        self.frames.insert(
-            post_replacement_index,
+        self.frames.insert_below(
+            post_replacement,
             ResolutionFrame::AbilityContinuation(frame),
         );
         Ok(())
@@ -2770,17 +2768,13 @@ impl ResolutionStack {
     pub fn promote_ability_continuation_after_post_replacement_draw(
         &mut self,
     ) -> Result<bool, ResolutionStackError> {
-        let post_replacement_index = self
-            .frames
-            .len()
-            .checked_sub(1)
-            .ok_or(ResolutionStackError::Empty)?;
-        let Some(continuation_index) = post_replacement_index.checked_sub(1) else {
+        let post_replacement = self.frames.top().ok_or(ResolutionStackError::Empty)?;
+        let Some(continuation) = self.frames.below(post_replacement) else {
             return Ok(false);
         };
         match (
-            self.frames.get(continuation_index),
-            self.frames.get(post_replacement_index),
+            self.frames.get(continuation),
+            self.frames.get(post_replacement),
         ) {
             (
                 Some(ResolutionFrame::AbilityContinuation(_)),
@@ -2790,7 +2784,7 @@ impl ResolutionStack {
                 Some(DrainStatus::Paused)
             ) =>
             {
-                self.frames.swap(continuation_index, post_replacement_index);
+                self.frames.swap(continuation, post_replacement);
                 Ok(true)
             }
             (Some(_), Some(ResolutionFrame::PostReplacement(_))) => Ok(false),
@@ -2798,7 +2792,7 @@ impl ResolutionStack {
                 expected: FrameKind::PostReplacement,
                 actual: actual.kind(),
             }),
-            (_, None) => unreachable!("checked active post-replacement index exists"),
+            (_, None) => unreachable!("checked active post-replacement slot exists"),
         }
     }
 
@@ -2822,12 +2816,11 @@ impl ResolutionStack {
         &mut self,
         frame: ResolutionFrame,
     ) -> Result<(), ResolutionStackError> {
-        let active_index = self
+        let active = self
             .frames
-            .len()
-            .checked_sub(1)
+            .top()
             .ok_or(ResolutionStackError::NoActiveChild)?;
-        self.frames.insert(active_index, frame);
+        self.frames.insert_below(active, frame);
         Ok(())
     }
 
@@ -2847,13 +2840,15 @@ impl ResolutionStack {
         if stack_len == 0 {
             return Err(ResolutionStackError::NoActiveChild);
         }
-        if child_stack_start >= stack_len {
+        if !self
+            .frames
+            .insert_at_child_boundary(child_stack_start, frame)
+        {
             return Err(ResolutionStackError::InvalidChildBoundary {
                 child_stack_start,
                 stack_len,
             });
         }
-        self.frames.insert(child_stack_start, frame);
         Ok(())
     }
 
@@ -2916,21 +2911,19 @@ impl ResolutionStack {
     pub fn complete_adjacent_post_replacement_draw(
         &mut self,
     ) -> Result<ResolutionFrame, ResolutionStackError> {
-        let child_index = self
+        let child = self.frames.top().ok_or(ResolutionStackError::Empty)?;
+        let parent = self
             .frames
-            .len()
-            .checked_sub(1)
-            .ok_or(ResolutionStackError::Empty)?;
-        let parent_index =
-            child_index
-                .checked_sub(1)
-                .ok_or(ResolutionStackError::InvalidAdjacentPair(
-                    "a multi-draw child has no immediate post-replacement predecessor",
-                ))?;
-        validate_shipped_post_replacement_draw_pair(
-            &self.frames[parent_index],
-            &self.frames[child_index],
-        )?;
+            .below(child)
+            .ok_or(ResolutionStackError::InvalidAdjacentPair(
+                "a multi-draw child has no immediate post-replacement predecessor",
+            ))?;
+        let (Some(parent_frame), Some(child_frame)) =
+            (self.frames.get(parent), self.frames.get(child))
+        else {
+            unreachable!("both slots were just located in this stack")
+        };
+        validate_shipped_post_replacement_draw_pair(parent_frame, child_frame)?;
         Ok(self
             .frames
             .pop()
@@ -3029,12 +3022,11 @@ impl ResolutionStack {
                         )
                 )
             {
-                let child =
-                    self.frames
-                        .get(index + 1)
-                        .ok_or(ResolutionStackError::InvalidAdjacentPair(
-                            "a paused post-replacement drain has no immediate multi-draw child",
-                        ))?;
+                let child = self.frames.frame_at_offset(index + 1).ok_or(
+                    ResolutionStackError::InvalidAdjacentPair(
+                        "a paused post-replacement drain has no immediate multi-draw child",
+                    ),
+                )?;
                 validate_shipped_post_replacement_draw_pair(frame, child)?;
                 // CR 614.11a + CR 121.6b: when a replacement replaces a draw
                 // inside a draw sequence, ALL actions the replacement requires
@@ -3073,7 +3065,7 @@ impl ResolutionStack {
                 // ABOVE the draw instead of outside the pair, where
                 // `insert_ability_continuation_outside_active_post_replacement_draw`
                 // puts it (CR 608.2c: instructions run in the order written).
-                let paired_child_is_reachable = match self.frames.get(index + 2) {
+                let paired_child_is_reachable = match self.frames.frame_at_offset(index + 2) {
                     None => true,
                     Some(above) => {
                         matches!(above.gate(), FrameGate::DirectChoice(_))
@@ -4519,7 +4511,11 @@ mod tests {
             .expect("the direct discard parent is mutable")
             .source_id = Some(ObjectId(1));
         assert_eq!(
-            match &direct.frames[0] {
+            match direct
+                .iter()
+                .next()
+                .expect("the discard parent is resident")
+            {
                 ResolutionFrame::Discard(frame) => frame.source_id,
                 other => panic!("expected discard parent, got {other:?}"),
             },
@@ -6360,9 +6356,8 @@ mod tests {
         // Positive reach-guard: the POSITIONAL accessor still resolves here, so
         // the row is not passing merely because positional addressing was
         // already broken before the insert.
-        assert_eq!(
-            stack.active_post_replacement_parent_index(),
-            Some(0),
+        assert!(
+            stack.active_post_replacement_parent_slot().is_some(),
             "reach-guard: distance from the top is 1 before the insert"
         );
 
@@ -6379,9 +6374,8 @@ mod tests {
             Some(PostReplacementFrameId(1)),
             "the PostReplacement frame's ABSOLUTE index is still 0"
         );
-        assert_eq!(
-            stack.active_post_replacement_parent_index(),
-            None,
+        assert!(
+            stack.active_post_replacement_parent_slot().is_none(),
             "reach-guard: the frame has left the two-deep positional window"
         );
 
@@ -6434,9 +6428,8 @@ mod tests {
 
         stack.push_inner(continuation_frame(1));
         stack.push_inner(continuation_frame(2));
-        assert_eq!(
-            stack.active_post_replacement_parent_index(),
-            None,
+        assert!(
+            stack.active_post_replacement_parent_slot().is_none(),
             "reach-guard: F1 is buried, which is the precondition under which \
              install_post_replacement_drain mints a sibling in production"
         );
