@@ -327,7 +327,7 @@ describe("AI proposal controller", () => {
     storeState.gameState = state;
     storeState.waitingFor = consent;
     storeState.adapter = {
-      getAiActionProposal: vi.fn(async () => ({
+      getAiActionProposal: vi.fn<() => Promise<AiActionProposal>>(async () => ({
         token: "engine-bound-consent",
         semanticOwner: 1,
         actor: 0,
@@ -362,7 +362,7 @@ describe("AI proposal controller", () => {
     storeState.gameState = state;
     storeState.waitingFor = consent;
     storeState.adapter = {
-      getAiActionProposal: vi.fn(async () => ({
+      getAiActionProposal: vi.fn<() => Promise<AiActionProposal>>(async () => ({
         token: "engine-bound-consent",
         semanticOwner: 1,
         actor: 0,
@@ -398,7 +398,7 @@ describe("AI proposal controller", () => {
     storeState.gameState = state;
     storeState.waitingFor = consent;
     storeState.adapter = {
-      getAiActionProposal: vi.fn(async () => ({
+      getAiActionProposal: vi.fn<() => Promise<AiActionProposal>>(async () => ({
         token: "engine-bound-consent",
         semanticOwner: 1,
         actor: 0,
