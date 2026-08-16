@@ -18,6 +18,13 @@ function stateWithStack(len: number): GameState {
   });
 }
 
+function readyStateWithStack(len: number): GameState {
+  return buildGameState({
+    waiting_for: { type: "ResolveAllReady", data: { epoch: 1 } },
+    stack: Array.from({ length: len }, (_, index) => buildStackEntry({ id: index + 1 })),
+  });
+}
+
 function chunk(itemsResolved: number, total: number): BatchResolveResult {
   return { events: [], waitingFor: priorityWf, logEntries: [], itemsResolved, total };
 }
@@ -167,6 +174,27 @@ describe("dispatchResolveAll progress", () => {
       { type: "SetAutoPass", data: { mode: { type: "UntilStackEmpty" } } },
       0,
     );
+  });
+
+  it("consumes Ready consent before considering the empty-AI fallback", async () => {
+    const resolveAll = vi.fn<EngineResolveAll>().mockResolvedValue(chunk(1, 2));
+    const submitAction = vi.fn();
+    const getState = vi.fn().mockResolvedValue(stateWithStack(1));
+    useGameStore.setState({
+      gameState: readyStateWithStack(2),
+      adapter: {
+        resolveAll,
+        submitAction,
+        getState,
+        getLegalActions: vi.fn().mockResolvedValue({ actions: [], autoPassRecommended: false }),
+        getSnapshot: snapshotVia(getState),
+      } as never,
+    });
+
+    await dispatchResolveAll(0, []);
+
+    expect(resolveAll).toHaveBeenCalledWith(0, [], 5);
+    expect(submitAction).not.toHaveBeenCalled();
   });
 
   it("uses an empty AI-seat list when the adapter delegates native AI ownership to its server", async () => {

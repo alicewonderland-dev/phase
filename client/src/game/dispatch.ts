@@ -980,7 +980,12 @@ export async function dispatchResolveAll(
     return;
   }
   const waitingFor = useGameStore.getState().gameState?.waiting_for;
-  if (
+  if (waitingFor?.type === "ResolveAllReady") {
+    if (!batchAdapter.resolveAll) {
+      debugLog("dispatchResolveAll: consent is Ready but the adapter cannot consume it");
+      return;
+    }
+  } else if (
     !batchAdapter.resolveAll
     || (aiSeats.length === 0 && batchAdapter.resolveAllUsesServerAi !== true)
   ) {
