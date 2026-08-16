@@ -83,6 +83,7 @@ export function createAIController(config: AIControllerConfig): AIController {
     waitingForFingerprint: string;
     playerId: number;
     isPriority: boolean;
+    resolveAllConsentEpoch: number | null;
   }
 
   let currentAttempt: AIAttempt | null = null;
@@ -154,6 +155,11 @@ export function createAIController(config: AIControllerConfig): AIController {
     ) {
       return null;
     }
+    if (waitingFor.type === "ResolveAllConsent") {
+      return waitingFor.data.representative === PLAYER_ID
+        ? null
+        : waitingFor.data.representative;
+    }
     if (
       !("data" in waitingFor) ||
       !waitingFor.data ||
@@ -174,6 +180,8 @@ export function createAIController(config: AIControllerConfig): AIController {
       waitingForFingerprint: waitingForFingerprint(waitingFor),
       playerId,
       isPriority: waitingFor.type === "Priority",
+      resolveAllConsentEpoch:
+        waitingFor.type === "ResolveAllConsent" ? waitingFor.data.epoch : null,
     };
     currentAttempt = attempt;
     pending = true;
@@ -390,14 +398,22 @@ export function createAIController(config: AIControllerConfig): AIController {
         // the authority boundary.
         if (!isAttemptCurrent(attempt)) return;
         const submission = await dispatchAiActionProposal(proposal);
-        if (!isAttemptCurrent(attempt)) return;
+        const store = useGameStore.getState();
+        const waitingForAfterSubmission = store.gameState?.waiting_for ?? null;
         if (
+          active &&
+          submission.status === "applied" &&
+          attempt.resolveAllConsentEpoch !== null &&
           proposal.action.type === "RespondResolveAllConsent" &&
           proposal.action.data.decision.type === "Grant" &&
-          useGameStore.getState().gameState?.waiting_for?.type === "ResolveAllReady"
+          proposal.action.data.epoch === attempt.resolveAllConsentEpoch &&
+          store.gameSessionGeneration === attempt.gameSessionGeneration &&
+          waitingForAfterSubmission?.type === "ResolveAllReady" &&
+          waitingForAfterSubmission.data.epoch === attempt.resolveAllConsentEpoch
         ) {
-          void dispatchResolveAll(playerId, config.seats);
+          void dispatchResolveAll(proposal.actor, config.seats);
         }
+        if (!isAttemptCurrent(attempt)) return;
         // The proposal boundary returns a tagged stale result without mutating
         // the store. That is a normal race, not a failed AI decision: leave
         // the counters untouched and let the final scheduler re-query the
