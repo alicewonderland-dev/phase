@@ -1,10 +1,17 @@
 //! Phase-1 protocol coverage for explicit Resolve All consent.
 
-use engine::ai_support::candidates::candidate_actions;
+use engine::ai_support::{candidates::candidate_actions, legal_actions_for_viewer};
 use engine::game::engine::apply;
+use engine::game::interaction::{
+    bind_interaction_authority, derive_viewer_interaction, resolve_interaction_response,
+};
 use engine::game::visibility::filter_state_for_viewer;
 use engine::types::actions::{GameAction, ResolveAllConsentDecision};
 use engine::types::game_state::{GameState, WaitingFor};
+use engine::types::interaction::{
+    InteractionOpportunityResponse, InteractionResponse, InteractionSessionId,
+    InteractionSubmission,
+};
 use engine::types::player::PlayerId;
 
 const P0: PlayerId = PlayerId(0);
@@ -166,4 +173,76 @@ fn granted_representative_can_revoke_off_queue_and_private_run_is_not_visible() 
     .expect("a granted representative may revoke from Ready");
     assert!(matches!(&state.waiting_for, WaitingFor::Priority { player } if *player == P0));
     assert!(state.resolve_all_consent_run.is_none());
+}
+
+#[test]
+fn transport_surfaces_only_each_grantors_own_revoke_and_uses_exact_consent_choices() {
+    let mut state = GameState::new_two_player(46);
+    let epoch = begin(&mut state);
+
+    let p0_actions = legal_actions_for_viewer(&state, P0).0;
+    assert_eq!(
+        p0_actions,
+        vec![GameAction::RevokeResolveAllConsent {
+            epoch,
+            representative: P0,
+        }],
+        "an off-prompt grantor receives only its own frozen revoke"
+    );
+    let p1_actions = legal_actions_for_viewer(&state, P1).0;
+    assert!(p1_actions
+        .iter()
+        .all(|action| { !matches!(action, GameAction::RevokeResolveAllConsent { .. }) }));
+    assert!(p1_actions.iter().any(|action| {
+        matches!(
+            action,
+            GameAction::RespondResolveAllConsent {
+                epoch: action_epoch,
+                decision: ResolveAllConsentDecision::Grant,
+            } if *action_epoch == epoch
+        )
+    }));
+
+    bind_interaction_authority(&mut state, InteractionSessionId("resolve-all".to_string()))
+        .expect("consent slots bind for each authorized owner");
+    let p0_view = derive_viewer_interaction(&state, &filter_state_for_viewer(&state, P0), P0);
+    let p1_view = derive_viewer_interaction(&state, &filter_state_for_viewer(&state, P1), P1);
+    assert!(p0_view.can_submit);
+    assert!(p1_view.can_submit);
+    assert_eq!(p0_view.opportunities.len(), 1);
+    assert_eq!(p1_view.opportunities.len(), 1);
+
+    let InteractionOpportunityResponse::ExactChoices { choices } =
+        &p0_view.opportunities[0].response
+    else {
+        panic!("off-prompt revoke must use an exact choice, not the CR 732 reply schema");
+    };
+    let choice_id = choices
+        .first()
+        .expect("grantor has one revoke choice")
+        .id
+        .clone();
+    let action = resolve_interaction_response(
+        &state,
+        P0,
+        &InteractionSubmission {
+            interaction_id: p0_view.opportunities[0].interaction_id.clone(),
+            response: InteractionResponse::Choose { choice_id },
+        },
+    )
+    .expect("transport may materialize the off-prompt revoke");
+    assert_eq!(
+        action,
+        GameAction::RevokeResolveAllConsent {
+            epoch,
+            representative: P0,
+        }
+    );
+
+    let InteractionOpportunityResponse::ExactChoices { choices } =
+        &p1_view.opportunities[0].response
+    else {
+        panic!("queued consent must use bounded exact grant/decline choices");
+    };
+    assert_eq!(choices.len(), 2);
 }
