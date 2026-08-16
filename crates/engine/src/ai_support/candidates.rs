@@ -917,7 +917,9 @@ pub fn candidate_actions_broad_with_probe(
     probe: Option<&casting::PriorityCastProbe>,
 ) -> Vec<CandidateAction> {
     let actions = match &state.waiting_for {
-        WaitingFor::MeldPairChoice { .. }
+        WaitingFor::ResolveAllConsent { .. }
+        | WaitingFor::ResolveAllReady { .. }
+        | WaitingFor::MeldPairChoice { .. }
         | WaitingFor::MeldAttackTargetChoice { .. }
         | WaitingFor::EntryAttackTargetChoice { .. } => candidate_actions_exact(state),
         WaitingFor::Priority { player } => priority_actions_with_probe(state, *player, probe),

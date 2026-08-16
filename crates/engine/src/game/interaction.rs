@@ -3085,6 +3085,7 @@ fn selection_projection(
     }
 
     Ok(match waiting_for {
+        WaitingFor::ResolveAllConsent { .. } | WaitingFor::ResolveAllReady { .. } => None,
         WaitingFor::OpeningHandBottomCards { pending, .. } => pending
             .iter()
             .find(|entry| entry.player == semantic_owner)

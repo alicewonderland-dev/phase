@@ -13177,6 +13177,7 @@ impl WaitingFor {
                     None
                 }
             }
+            WaitingFor::ResolveAllReady { .. } => None,
             WaitingFor::Priority { player }
             | WaitingFor::ResolveAllConsent {
                 representative: player,

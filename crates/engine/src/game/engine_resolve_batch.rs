@@ -189,16 +189,17 @@ fn materialize_one_consented_resolution(
     let WaitingFor::Priority { player } = &state.waiting_for else {
         return None;
     };
+    let player = *player;
     if !consent_authorization_matches(state, run) {
         return None;
     }
-    let actor = turn_control::authorized_submitter_for_player(state, *player);
+    let actor = turn_control::authorized_submitter_for_player(state, player);
     let mut recorded = Vec::new();
-    seed_remaining_consented_priority_passes(state, *player, &mut recorded)?;
+    seed_remaining_consented_priority_passes(state, player, &mut recorded)?;
     let boundary = apply_action_boundary_with_stack_limit(
         state,
         actor,
-        *player,
+        player,
         GameAction::PassPriority,
         PublicFinalizeMode::DeferredDisplay,
         Some(1),
