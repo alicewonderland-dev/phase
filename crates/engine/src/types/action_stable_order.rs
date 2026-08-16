@@ -809,6 +809,43 @@ fn cmp_payload(a: &GameAction, b: &GameAction) -> Ordering {
                 .then_with(|| cmp_val(a1, b1))
                 .then_with(|| cmp_val(a2, b2))
         }
+        GameAction::BeginResolveAll {
+            max_resolutions: a0,
+        } => {
+            let GameAction::BeginResolveAll {
+                max_resolutions: b0,
+            } = b
+            else {
+                unreachable!("cmp_payload: same-variant invariant");
+            };
+            cmp_val(a0, b0)
+        }
+        GameAction::RespondResolveAllConsent {
+            epoch: a0,
+            decision: a1,
+        } => {
+            let GameAction::RespondResolveAllConsent {
+                epoch: b0,
+                decision: b1,
+            } = b
+            else {
+                unreachable!("cmp_payload: same-variant invariant");
+            };
+            cmp_val(a0, b0).then_with(|| cmp_val(a1, b1))
+        }
+        GameAction::RevokeResolveAllConsent {
+            epoch: a0,
+            representative: a1,
+        } => {
+            let GameAction::RevokeResolveAllConsent {
+                epoch: b0,
+                representative: b1,
+            } = b
+            else {
+                unreachable!("cmp_payload: same-variant invariant");
+            };
+            cmp_val(a0, b0).then_with(|| cmp_val(a1, b1))
+        }
         GameAction::DiscoverChoice { choice: a0 } => {
             let GameAction::DiscoverChoice { choice: b0 } = b else {
                 unreachable!("cmp_payload: same-variant invariant");

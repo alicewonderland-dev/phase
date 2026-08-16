@@ -1,0 +1,169 @@
+//! Phase-1 protocol coverage for explicit Resolve All consent.
+
+use engine::ai_support::candidates::candidate_actions;
+use engine::game::engine::apply;
+use engine::game::visibility::filter_state_for_viewer;
+use engine::types::actions::{GameAction, ResolveAllConsentDecision};
+use engine::types::game_state::{GameState, WaitingFor};
+use engine::types::player::PlayerId;
+
+const P0: PlayerId = PlayerId(0);
+const P1: PlayerId = PlayerId(1);
+
+fn begin(state: &mut GameState) -> u64 {
+    apply(
+        state,
+        P0,
+        GameAction::BeginResolveAll { max_resolutions: 7 },
+    )
+    .expect("priority holder may begin Resolve All consent");
+    match &state.waiting_for {
+        WaitingFor::ResolveAllConsent {
+            epoch,
+            representative,
+        } => {
+            assert_eq!(
+                *representative, P1,
+                "initiator grants before the queue opens"
+            );
+            *epoch
+        }
+        ref other => panic!("expected queued consent, got {other:?}"),
+    }
+}
+
+#[test]
+fn consent_queue_reaches_inert_ready_only_after_every_representative_grants() {
+    let mut state = GameState::new_two_player(42);
+    let epoch = begin(&mut state);
+
+    apply(
+        &mut state,
+        P1,
+        GameAction::RespondResolveAllConsent {
+            epoch,
+            decision: ResolveAllConsentDecision::Grant,
+        },
+    )
+    .expect("queued representative may grant");
+    assert!(matches!(
+        &state.waiting_for,
+        WaitingFor::ResolveAllReady { epoch: ready_epoch } if *ready_epoch == epoch
+    ));
+    assert!(apply(&mut state, P1, GameAction::PassPriority).is_err());
+    assert!(matches!(
+        &state.waiting_for,
+        WaitingFor::ResolveAllReady { epoch: ready_epoch } if *ready_epoch == epoch
+    ));
+}
+
+#[test]
+fn stale_epoch_and_decline_restore_the_exact_priority_snapshot() {
+    let mut state = GameState::new_two_player(43);
+    state.priority_pass_count = 3;
+    state.priority_passes.insert(P0);
+    let epoch = begin(&mut state);
+
+    assert!(apply(
+        &mut state,
+        P1,
+        GameAction::RespondResolveAllConsent {
+            epoch: epoch + 1,
+            decision: ResolveAllConsentDecision::Grant,
+        },
+    )
+    .is_err());
+    apply(
+        &mut state,
+        P1,
+        GameAction::RespondResolveAllConsent {
+            epoch,
+            decision: ResolveAllConsentDecision::Decline,
+        },
+    )
+    .expect("queued representative may decline");
+
+    assert!(matches!(&state.waiting_for, WaitingFor::Priority { player } if *player == P0));
+    assert_eq!(state.priority_player, P0);
+    assert_eq!(state.priority_pass_count, 3);
+    assert!(state.priority_passes.contains(&P0));
+    assert!(state.resolve_all_consent_run.is_none());
+    assert!(apply(
+        &mut state,
+        P1,
+        GameAction::RespondResolveAllConsent {
+            epoch,
+            decision: ResolveAllConsentDecision::Grant,
+        },
+    )
+    .is_err());
+}
+
+#[test]
+fn queued_response_and_candidate_keep_the_frozen_submitter_after_control_changes() {
+    let mut state = GameState::new_two_player(44);
+    let epoch = begin(&mut state);
+    state.active_player = P1;
+    state.turn_decision_controller = Some(P0);
+
+    let candidates = candidate_actions(&state);
+    assert!(candidates.iter().any(|candidate| {
+        matches!(
+            candidate.action,
+            GameAction::RespondResolveAllConsent {
+                epoch: candidate_epoch,
+                decision: ResolveAllConsentDecision::Grant,
+            } if candidate_epoch == epoch
+        ) && candidate.metadata.actor == Some(P1)
+    }));
+    apply(
+        &mut state,
+        P1,
+        GameAction::RespondResolveAllConsent {
+            epoch,
+            decision: ResolveAllConsentDecision::Grant,
+        },
+    )
+    .expect("frozen submitter, not the new live controller, answers the prompt");
+}
+
+#[test]
+fn granted_representative_can_revoke_off_queue_and_private_run_is_not_visible() {
+    let mut state = GameState::new_two_player(45);
+    let epoch = begin(&mut state);
+    apply(
+        &mut state,
+        P1,
+        GameAction::RespondResolveAllConsent {
+            epoch,
+            decision: ResolveAllConsentDecision::Grant,
+        },
+    )
+    .expect("reach ready state");
+
+    let view = filter_state_for_viewer(&state, P1);
+    assert!(matches!(&view.waiting_for, WaitingFor::ResolveAllReady { epoch: e } if *e == epoch));
+    assert!(view.resolve_all_consent_run.is_none());
+
+    let candidates = candidate_actions(&state);
+    assert!(candidates.iter().any(|candidate| {
+        matches!(
+            candidate.action,
+            GameAction::RevokeResolveAllConsent {
+                epoch: candidate_epoch,
+                representative: P0,
+            } if candidate_epoch == epoch
+        ) && candidate.metadata.actor == Some(P0)
+    }));
+    apply(
+        &mut state,
+        P0,
+        GameAction::RevokeResolveAllConsent {
+            epoch,
+            representative: P0,
+        },
+    )
+    .expect("a granted representative may revoke from Ready");
+    assert!(matches!(&state.waiting_for, WaitingFor::Priority { player } if *player == P0));
+    assert!(state.resolve_all_consent_run.is_none());
+}

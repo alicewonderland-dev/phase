@@ -85,6 +85,10 @@ fn initial_delayed_trigger_instance_id() -> u64 {
     1
 }
 
+fn initial_resolve_all_consent_epoch() -> u64 {
+    1
+}
+
 fn default_interaction_serial() -> String {
     "1".to_string()
 }
@@ -1902,6 +1906,58 @@ pub enum YieldTarget {
 pub struct PriorityYield {
     pub player: PlayerId,
     pub target: YieldTarget,
+}
+
+/// Exact priority state restored if a Resolve All consent run is declined,
+/// revoked, or invalidated before it becomes actionable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolveAllPrioritySnapshot {
+    pub waiting_player: PlayerId,
+    pub priority_player: PlayerId,
+    pub priority_pass_count: u8,
+    pub priority_passes: BTreeSet<PlayerId>,
+}
+
+/// One canonical priority representative and the submitter authorized for that
+/// representative when a Resolve All consent run began.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolveAllConsentParticipant {
+    pub representative: PlayerId,
+    pub authorized_submitter: PlayerId,
+    pub granted: bool,
+}
+
+/// Server-authoritative state behind the public Resolve All consent prompts.
+/// The frozen submitters prevent turn-control changes from rebinding a queued
+/// response or a later revocation to a different person.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolveAllConsentRun {
+    pub epoch: u64,
+    pub max_resolutions: u32,
+    pub priority_snapshot: ResolveAllPrioritySnapshot,
+    pub participants: Vec<ResolveAllConsentParticipant>,
+}
+
+impl ResolveAllConsentRun {
+    pub fn authorized_submitter_for(&self, representative: PlayerId) -> Option<PlayerId> {
+        self.participants
+            .iter()
+            .find(|participant| participant.representative == representative)
+            .map(|participant| participant.authorized_submitter)
+    }
+
+    pub fn is_granted(&self, representative: PlayerId) -> bool {
+        self.participants
+            .iter()
+            .any(|participant| participant.representative == representative && participant.granted)
+    }
+
+    pub fn next_pending_representative(&self) -> Option<PlayerId> {
+        self.participants
+            .iter()
+            .find(|participant| !participant.granted)
+            .map(|participant| participant.representative)
+    }
 }
 
 /// CR 609.7a: A source of damage chosen while creating a prevention or
@@ -10624,6 +10680,17 @@ pub enum WaitingFor {
     Priority {
         player: PlayerId,
     },
+    /// Public Resolve All consent prompt. The protocol details and frozen
+    /// submitter ledger remain in `GameState::resolve_all_consent_run`.
+    ResolveAllConsent {
+        epoch: u64,
+        representative: PlayerId,
+    },
+    /// Every canonical representative granted the same Resolve All epoch.
+    /// Phase 1 deliberately keeps this state inert; a later phase consumes it.
+    ResolveAllReady {
+        epoch: u64,
+    },
     /// CR 608.2d + CR 701.42: choose the exact pair of current battlefield
     /// referents the meld instruction will exile. Candidate identity is frozen
     /// in the tuples; the physical meld-card check intentionally happens later.
@@ -12954,6 +13021,8 @@ impl WaitingFor {
     pub fn variant_name(&self) -> &'static str {
         match self {
             WaitingFor::Priority { .. } => "Priority",
+            WaitingFor::ResolveAllConsent { .. } => "ResolveAllConsent",
+            WaitingFor::ResolveAllReady { .. } => "ResolveAllReady",
             WaitingFor::MeldPairChoice { .. } => "MeldPairChoice",
             WaitingFor::MeldAttackTargetChoice { .. } => "MeldAttackTargetChoice",
             WaitingFor::EntryAttackTargetChoice { .. } => "EntryAttackTargetChoice",
@@ -13109,6 +13178,10 @@ impl WaitingFor {
                 }
             }
             WaitingFor::Priority { player }
+            | WaitingFor::ResolveAllConsent {
+                representative: player,
+                ..
+            }
             | WaitingFor::MeldPairChoice { player, .. }
             | WaitingFor::MeldAttackTargetChoice { player, .. }
             | WaitingFor::EntryAttackTargetChoice { player, .. }
@@ -15103,6 +15176,13 @@ declare_game_state! {
 
     // Game flow
     pub waiting_for: WaitingFor,
+    /// Persisted allocation source for Resolve All consent epochs. Starts at
+    /// one for legacy saves and is minted only by `BeginResolveAll`.
+    #[serde(default = "initial_resolve_all_consent_epoch")]
+    pub next_resolve_all_consent_epoch: u64,
+    /// Private protocol ledger behind the public consent/ready waiting states.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolve_all_consent_run: Option<ResolveAllConsentRun>,
     /// Trusted interaction capability scope. Viewer-filtered copies always
     /// redact this field; only the engine uses it to mint opaque decision IDs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -21033,6 +21113,8 @@ impl GameState {
             waiting_for: WaitingFor::Priority {
                 player: starting_player,
             },
+            next_resolve_all_consent_epoch: initial_resolve_all_consent_epoch(),
+            resolve_all_consent_run: None,
             interaction_session_id: None,
             interaction_generation: 0,
             next_interaction_serial: default_interaction_serial(),
@@ -22864,6 +22946,8 @@ fn _gamestate_partition_is_total(s: &GameState) {
         rng: _,
         combat: _,
         waiting_for: _,
+        next_resolve_all_consent_epoch: _,
+        resolve_all_consent_run: _,
         interaction_session_id: _,
         interaction_generation: _,
         next_interaction_serial: _,
@@ -23210,6 +23294,8 @@ impl PartialEq for GameState {
             && self.rng_seed == other.rng_seed
             && self.combat == other.combat
             && self.waiting_for == other.waiting_for
+            && self.next_resolve_all_consent_epoch == other.next_resolve_all_consent_epoch
+            && self.resolve_all_consent_run == other.resolve_all_consent_run
             && self.lands_played_this_turn == other.lands_played_this_turn
             && self.max_lands_per_turn == other.max_lands_per_turn
             && self.priority_pass_count == other.priority_pass_count
@@ -29103,6 +29189,11 @@ mod tests {
         variants.push(Box::new(WaitingFor::Priority {
             player: PlayerId(0),
         }));
+        variants.push(Box::new(WaitingFor::ResolveAllConsent {
+            epoch: 1,
+            representative: PlayerId(0),
+        }));
+        variants.push(Box::new(WaitingFor::ResolveAllReady { epoch: 1 }));
         variants.push(Box::new(WaitingFor::MulliganDecision {
             pending: vec![MulliganDecisionEntry {
                 player: PlayerId(0),

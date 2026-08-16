@@ -11,6 +11,7 @@ use crate::game::mana_sources;
 use crate::types::ability::{ChoiceType, CounterCostSelection, TargetRef};
 use crate::types::actions::{
     CastChoice, GameAction, LearnOption, MulliganChoice, OutsideGameSelection,
+    ResolveAllConsentDecision,
 };
 use crate::types::card::LayoutKind;
 use crate::types::card_type::CoreType;
@@ -381,6 +382,36 @@ fn permute_into(
 /// constructing `GameAction::Concede { player_id }` directly.
 pub fn candidate_actions_exact(state: &GameState) -> Vec<CandidateAction> {
     match &state.waiting_for {
+        WaitingFor::ResolveAllConsent {
+            epoch,
+            representative,
+        } => {
+            let mut actions = vec![
+                candidate(
+                    GameAction::RespondResolveAllConsent {
+                        epoch: *epoch,
+                        decision: ResolveAllConsentDecision::Grant,
+                    },
+                    TacticalClass::Selection,
+                    Some(*representative),
+                ),
+                candidate(
+                    GameAction::RespondResolveAllConsent {
+                        epoch: *epoch,
+                        decision: ResolveAllConsentDecision::Decline,
+                    },
+                    TacticalClass::Selection,
+                    Some(*representative),
+                ),
+            ];
+            append_resolve_all_revocations(state, *epoch, &mut actions);
+            actions
+        }
+        WaitingFor::ResolveAllReady { epoch } => {
+            let mut actions = Vec::new();
+            append_resolve_all_revocations(state, *epoch, &mut actions);
+            actions
+        }
         WaitingFor::MeldPairChoice { player, choices } => choices
             .iter()
             .map(|choice| {
@@ -846,6 +877,35 @@ pub fn candidate_actions_exact(state: &GameState) -> Vec<CandidateAction> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+fn append_resolve_all_revocations(
+    state: &GameState,
+    epoch: u64,
+    actions: &mut Vec<CandidateAction>,
+) {
+    let Some(run) = state
+        .resolve_all_consent_run
+        .as_ref()
+        .filter(|run| run.epoch == epoch)
+    else {
+        return;
+    };
+    actions.extend(
+        run.participants
+            .iter()
+            .filter(|participant| participant.granted)
+            .map(|participant| {
+                candidate(
+                    GameAction::RevokeResolveAllConsent {
+                        epoch,
+                        representative: participant.representative,
+                    },
+                    TacticalClass::Selection,
+                    Some(participant.representative),
+                )
+            }),
+    );
 }
 
 pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
@@ -3538,9 +3598,30 @@ fn semantic_candidate_actions_with_probe(
 
 fn authorize_candidate_actors(state: &GameState, actions: &mut [CandidateAction]) {
     for action in actions {
-        action.metadata.actor = action.metadata.actor.map(|player| {
-            crate::game::turn_control::authorized_submitter_for_player(state, player)
-        });
+        action.metadata.actor = match &action.action {
+            GameAction::RespondResolveAllConsent { epoch, .. } => match &state.waiting_for {
+                WaitingFor::ResolveAllConsent {
+                    epoch: active_epoch,
+                    representative,
+                } if *epoch == *active_epoch => state
+                    .resolve_all_consent_run
+                    .as_ref()
+                    .filter(|run| run.epoch == *active_epoch)
+                    .and_then(|run| run.authorized_submitter_for(*representative)),
+                _ => None,
+            },
+            GameAction::RevokeResolveAllConsent {
+                epoch,
+                representative,
+            } => crate::game::turn_control::resolve_all_granted_submitter(
+                state,
+                *epoch,
+                *representative,
+            ),
+            _ => action.metadata.actor.map(|player| {
+                crate::game::turn_control::authorized_submitter_for_player(state, player)
+            }),
+        };
     }
 }
 

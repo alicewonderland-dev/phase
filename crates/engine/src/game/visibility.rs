@@ -238,6 +238,10 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
     filtered.interaction_generation = 0;
     filtered.next_interaction_serial = "1".to_string();
     filtered.active_interaction_slots.clear();
+    // Resolve All consent's frozen authority and priority restoration snapshot
+    // are server-private. The public WaitingFor state is sufficient to render
+    // the current consent or ready status.
+    filtered.resolve_all_consent_run = None;
     // Product knowledge is projection authority, never transport payload. Its
     // effect is applied below before hidden cards are redacted; viewers receive
     // identities they learned, not the audience facts or library epochs behind

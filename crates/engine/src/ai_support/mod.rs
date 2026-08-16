@@ -1316,7 +1316,10 @@ fn classify_flat_priority_action(action: &GameAction) -> FlatPriorityActionClass
         | GameAction::DeclareShortcut { .. }
         | GameAction::RespondToShortcut { .. }
         | GameAction::DeclineShortcut
-        | GameAction::PrecastCopyShortcut { .. } => FlatPriorityActionClass::Other,
+        | GameAction::PrecastCopyShortcut { .. }
+        | GameAction::BeginResolveAll { .. }
+        | GameAction::RespondResolveAllConsent { .. }
+        | GameAction::RevokeResolveAllConsent { .. } => FlatPriorityActionClass::Other,
     }
 }
 

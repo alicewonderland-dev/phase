@@ -827,6 +827,11 @@ fn do_eliminate(
         super::turn_control::recompute_active_player_control(state);
     }
 
+    // A consent run freezes canonical representatives and submitters. Player
+    // elimination changes that topology, so discard the run rather than
+    // allowing a stale prompt or Ready state to authorize anyone.
+    super::turn_control::invalidate_resolve_all_consent(state);
+
     // CR 800.4a + CR 800.4b: a departing searcher/zone owner invalidates its
     // live session, while a departing latched controller ends only that
     // controller's decision/knowledge role and falls back to the searcher.

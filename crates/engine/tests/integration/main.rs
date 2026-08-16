@@ -937,6 +937,7 @@ mod render_silent_cant_cast;
 mod replacement_mill_double_application;
 mod repro_pilot_crew;
 mod retarget_prompt_softlock;
+mod resolve_all_consent;
 mod revealed_card_type_disjunction_518;
 mod rhys_evermore_remove_counters;
 mod riot_control_regression;

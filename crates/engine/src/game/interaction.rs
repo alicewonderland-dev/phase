@@ -244,7 +244,9 @@ fn human_response_model(waiting_for: &WaitingFor, semantic_owner: PlayerId) -> H
         }
         WaitingFor::OutsideGameChoice { .. } => HumanResponseModel::OutsideSelection,
         WaitingFor::NamedChoice { .. } => HumanResponseModel::TextChoice,
-        WaitingFor::RespondToShortcut { .. } => HumanResponseModel::ShortcutReply,
+        WaitingFor::RespondToShortcut { .. } | WaitingFor::ResolveAllConsent { .. } => {
+            HumanResponseModel::ShortcutReply
+        }
         WaitingFor::PrecastCopyShortcutOffer { .. }
         | WaitingFor::RespondToPrecastCopyShortcut { .. }
         | WaitingFor::CommanderZoneChoice { .. }
@@ -254,7 +256,8 @@ fn human_response_model(waiting_for: &WaitingFor, semantic_owner: PlayerId) -> H
             HumanResponseModel::DirectChoices
         }
         WaitingFor::LoopShortcut { .. } => HumanResponseModel::LoopShortcut,
-        WaitingFor::Priority { .. }
+        WaitingFor::ResolveAllReady { .. }
+        | WaitingFor::Priority { .. }
         | WaitingFor::MeldPairChoice { .. }
         | WaitingFor::MeldAttackTargetChoice { .. }
         | WaitingFor::EntryAttackTargetChoice { .. }
@@ -329,6 +332,7 @@ fn human_response_model(waiting_for: &WaitingFor, semantic_owner: PlayerId) -> H
 fn classify_waiting_for(waiting_for: &WaitingFor) -> WaitingClassification {
     let (code, simultaneous, slot_kind) = match waiting_for {
         WaitingFor::GameOver { .. } => (InteractionWaitingForCode::Terminal, None, None),
+        WaitingFor::ResolveAllReady { .. } => (InteractionWaitingForCode::Shortcut, None, None),
         WaitingFor::MulliganDecision { .. } => (
             InteractionWaitingForCode::Mulligan,
             Some(SimultaneousDecisionKind::Mulligan),
@@ -431,7 +435,9 @@ fn classify_waiting_for(waiting_for: &WaitingFor) -> WaitingClassification {
             None,
             Some(InteractionSlotKind::Single),
         ),
-        WaitingFor::LoopShortcut { .. } | WaitingFor::RespondToShortcut { .. } => (
+        WaitingFor::LoopShortcut { .. }
+        | WaitingFor::RespondToShortcut { .. }
+        | WaitingFor::ResolveAllConsent { .. } => (
             InteractionWaitingForCode::Shortcut,
             None,
             Some(InteractionSlotKind::Single),
@@ -5102,6 +5108,27 @@ fn project_action_payload(
             };
             surfaces.push(InteractionPresentationSurface::ShortcutResponse { response });
         }
+        GameAction::BeginResolveAll { .. } => {
+            surfaces.push(InteractionPresentationSurface::ShortcutResponse {
+                response: InteractionShortcutResponseCode::Propose,
+            });
+        }
+        GameAction::RespondResolveAllConsent { decision, .. } => {
+            let response = match decision {
+                crate::types::actions::ResolveAllConsentDecision::Grant => {
+                    InteractionShortcutResponseCode::Accept
+                }
+                crate::types::actions::ResolveAllConsentDecision::Decline => {
+                    InteractionShortcutResponseCode::Decline
+                }
+            };
+            surfaces.push(InteractionPresentationSurface::ShortcutResponse { response });
+        }
+        GameAction::RevokeResolveAllConsent { .. } => {
+            surfaces.push(InteractionPresentationSurface::ShortcutResponse {
+                response: InteractionShortcutResponseCode::Decline,
+            });
+        }
         // CR 116.2c: two live pay-to-end permissions are two distinct
         // candidates, so the group key must reach the surface list or they
         // project identically. The permanent whose resolution installed the
@@ -5341,6 +5368,9 @@ fn action_code(action: &GameAction) -> InteractionActionCode {
         GameAction::RespondToShortcut { .. } => InteractionActionCode::RespondToShortcut,
         GameAction::DeclineShortcut => InteractionActionCode::DeclineShortcut,
         GameAction::PrecastCopyShortcut { .. } => InteractionActionCode::PrecastCopyShortcut,
+        GameAction::BeginResolveAll { .. } => InteractionActionCode::DeclareShortcut,
+        GameAction::RespondResolveAllConsent { .. } => InteractionActionCode::RespondToShortcut,
+        GameAction::RevokeResolveAllConsent { .. } => InteractionActionCode::DeclineShortcut,
         GameAction::Debug(_) => InteractionActionCode::Debug,
     }
 }
