@@ -55,6 +55,13 @@
     "collapse": "Collapse resolving progress",
     "expand": "Expand resolving progress"
   },
+  "resolveAllConsent": {
+    "eyebrow": "Resolve All",
+    "title": "Approve fast resolution?",
+    "subtitle": "All players must approve before the engine resolves a safe stack prefix.",
+    "grant": "Approve",
+    "decline": "Keep priority"
+  },
   "debugCreate": {
     "copies": "Copies",
     "tokenPower": "Power",

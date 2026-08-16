@@ -1692,6 +1692,8 @@ export type MulliganDecisionPhase =
 
 export type WaitingFor =
   | { type: "Priority"; data: { player: PlayerId } }
+  | { type: "ResolveAllConsent"; data: { epoch: number; representative: PlayerId } }
+  | { type: "ResolveAllReady"; data: { epoch: number } }
   | { type: "MeldPairChoice"; data: { player: PlayerId; choices: MeldSelection[] } }
   | { type: "MeldAttackTargetChoice"; data: { player: PlayerId; context: MeldSelection; valid_targets: AttackTarget[] } }
   | { type: "EntryAttackTargetChoice"; data: { player: PlayerId; object_id: ObjectId; valid_targets: AttackTarget[] } }
@@ -2247,6 +2249,12 @@ export type PrecastCopyShortcutResponse =
 
 export type GameAction =
   | { type: "PassPriority" }
+  | { type: "BeginResolveAll"; data: { max_resolutions: number } }
+  | {
+      type: "RespondResolveAllConsent";
+      data: { epoch: number; decision: { type: "Grant" } | { type: "Decline" } };
+    }
+  | { type: "RevokeResolveAllConsent"; data: { epoch: number; representative: PlayerId } }
   | { type: "ChooseMeldPair"; data: { source_id: ObjectId; partner_id: ObjectId } }
   | { type: "ChooseEntryAttackTarget"; data: { target: AttackTarget } }
   | { type: "RollPlanarDie" }

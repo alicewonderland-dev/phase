@@ -14,8 +14,8 @@ use engine::ai_support::{
 use engine::database::legality::{any_ai_difficulty_is_cedh, validate_cedh_bracket};
 use engine::database::{CardDatabase, CardSearchQuery};
 use engine::game::engine::{
-    apply, apply_for_simulation, resolve_all_fast_forward, ResolveAllCallbackDecision,
-    ResolveAllFastForwardResult as BatchResolveResult,
+    apply, apply_for_simulation, resolve_all_fast_forward, resolve_all_ready_prefix,
+    ResolveAllCallbackDecision, ResolveAllFastForwardResult as BatchResolveResult,
 };
 use engine::game::interaction::{bind_interaction_authority, submit_interaction};
 use engine::game::preview::{compute_preview_diff, preview_auto_payment_sources};
@@ -3097,8 +3097,16 @@ pub fn resolve_all(
     let requester = PlayerId(requester);
 
     with_state_mut(|state| {
-        let mut rng = rand::rng();
-        let mut result = resolve_all_inner(state, requester, &ai_seats, max_resolutions, &mut rng);
+        // Phase 2 consumes only the already-issued, unanimous consent run.
+        // AI consent is answered through ordinary engine candidates before this
+        // call; Resolve All must never ask an AI about a speculative future
+        // priority window. Keep the legacy payload parse as a wire-compatible
+        // boundary while the consent action owns the authoritative cap.
+        let _ = (ai_seats, max_resolutions);
+        if !matches!(&state.waiting_for, WaitingFor::ResolveAllReady { .. }) {
+            return Err(JsValue::from_str("Resolve All consent is not ready"));
+        }
+        let mut result = resolve_all_ready_prefix(state, requester);
         // A Resolve All burst applies real actions directly via
         // `apply_action_boundary_with_stack_limit` (bypassing `submit_action`,
         // which is the only other place REPLAY_LOG is appended to) — without

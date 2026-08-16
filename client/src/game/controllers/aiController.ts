@@ -5,7 +5,7 @@ import { AdapterError, AdapterErrorCode } from "../../adapter/types";
 import { pressureMultiplier } from "../../utils/stackPressure";
 import { effectiveStackPressure } from "../../utils/stackThroughput";
 import { debugLog } from "../debugLog";
-import { dispatchAiActionProposal } from "../dispatch";
+import { dispatchAiActionProposal, dispatchResolveAll } from "../dispatch";
 import { attemptStateRehydrate, isEnginePanic, notifyEngineLost, routePanic } from "../engineRecovery";
 import type { OpponentController } from "./types";
 
@@ -391,6 +391,13 @@ export function createAIController(config: AIControllerConfig): AIController {
         if (!isAttemptCurrent(attempt)) return;
         const submission = await dispatchAiActionProposal(proposal);
         if (!isAttemptCurrent(attempt)) return;
+        if (
+          proposal.action.type === "RespondResolveAllConsent" &&
+          proposal.action.data.decision.type === "Grant" &&
+          useGameStore.getState().gameState?.waiting_for?.type === "ResolveAllReady"
+        ) {
+          void dispatchResolveAll(playerId, config.seats);
+        }
         // The proposal boundary returns a tagged stale result without mutating
         // the store. That is a normal race, not a failed AI decision: leave
         // the counters untouched and let the final scheduler re-query the

@@ -2917,7 +2917,7 @@ fn resolve_proven_inert_trigger_batch(
     run_len: u32,
     pipeline_invariant: Option<InertTriggerBatchPipelineInvariant>,
 ) -> Option<u32> {
-    if !inert_trigger_batch_state_is_settled(state) {
+    if !priority_checkpoint_is_settled(state) {
         return None;
     }
 
@@ -2966,7 +2966,7 @@ fn resolve_proven_inert_trigger_batch(
             || counters_after_resolution
                 .is_some_and(|before| battlefield_counter_snapshot(&proof) != before)
             || initial_len.saturating_sub(proof.stack.len()) != expected_consumed
-            || !inert_trigger_batch_state_is_settled(&proof)
+            || !priority_checkpoint_is_settled(&proof)
         {
             return None;
         }
@@ -3025,7 +3025,11 @@ fn consumed_trigger_event_occurrences(
         .collect()
 }
 
-fn inert_trigger_batch_state_is_settled(state: &GameState) -> bool {
+/// True when resolution has reached a full priority checkpoint with no latent
+/// trigger, replacement, or continuation work.  Batch consumers that prove a
+/// sequence on a clone share this boundary rather than inferring safety from
+/// stack depth alone.
+pub(crate) fn priority_checkpoint_is_settled(state: &GameState) -> bool {
     state.pending_replacement.is_none()
         && state.pending_trigger.is_none()
         && state.pending_trigger_event_batch.is_empty()
@@ -7490,8 +7494,8 @@ mod tests {
         // Driver internals under test (the stack module).
         use super::super::{
             batch_run_len, effects, fixed_controller_gain_life_run_len,
-            fixed_opponent_lose_life_run_len, inert_trigger_batch_state_is_settled,
-            observers_are_batch_safe, resolve_next, resolve_next_with_limit, resolve_top,
+            fixed_opponent_lose_life_run_len, observers_are_batch_safe,
+            priority_checkpoint_is_settled, resolve_next, resolve_next_with_limit, resolve_top,
             self_counter_run_len,
         };
         // Test fixtures from the parent `tests` module.
@@ -8160,7 +8164,7 @@ mod tests {
             });
 
             assert!(
-                !inert_trigger_batch_state_is_settled(&state),
+                !priority_checkpoint_is_settled(&state),
                 "an active resolution frame makes a skipped priority checkpoint observable"
             );
         }

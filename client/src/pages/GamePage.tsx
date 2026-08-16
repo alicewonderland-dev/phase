@@ -100,6 +100,7 @@ import {
   RespondToPrecastCopyShortcutModal,
 } from "../components/modal/PrecastCopyShortcutModal.tsx";
 import { ReplacementModal } from "../components/modal/ReplacementModal.tsx";
+import { ResolveAllConsentModal } from "../components/modal/ResolveAllConsentModal.tsx";
 import { TriggerOrderModal } from "../components/modal/TriggerOrderModal.tsx";
 import { PeekTab } from "../components/modal/DialogShell.tsx";
 import { PeekRestoreTab } from "../components/modal/DialogHost.tsx";
@@ -1868,6 +1869,7 @@ function GamePageContent({
           canActForWaitingState && <AssistPaymentUI />}
         {waitingFor?.type === "ReplacementChoice" &&
           canActForWaitingState && <ReplacementModal />}
+        <ResolveAllConsentModal playerId={playerId} />
         {waitingFor?.type === "OrderTriggers" &&
           canActForWaitingState && <TriggerOrderModal />}
         <BattleProtectorModal />
