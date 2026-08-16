@@ -14,13 +14,23 @@
 //! version of the same rule.
 //!
 //! [`FrameSlot`] is an opaque position with a private field, so it can be minted
-//! only by [`FrameVec::top`], [`FrameVec::below`], [`FrameVec::above`], and
-//! [`FrameVec::by_id`]. Reading or mutating a frame requires one. A `usize`
-//! obtained any other way — `iter().position(..)`, arithmetic on `len()`, a
-//! literal — still compiles, but there is no way to spend it: every accessor
-//! takes a `FrameSlot`, and no constructor accepts a `usize`. The wrong thing is
-//! not forbidden, it is unusable, which is the difference between a lint and a
-//! type.
+//! by exactly five methods: [`FrameVec::top`], [`FrameVec::below`],
+//! [`FrameVec::above`] and [`FrameVec::by_id`], which are the three sanctioned
+//! access modes above, plus [`FrameVec::slot_at_captured_depth`].
+//!
+//! Reading or mutating a frame requires a slot. A `usize` obtained by scanning
+//! — `iter().position(..)`, arithmetic on `len()`, a literal — still compiles,
+//! and the only thing that will accept it is `slot_at_captured_depth`, whose
+//! argument is contractually a stack length recorded before a child producer
+//! ran. So the guarantee is precisely this: positional addressing cannot be
+//! reached by accident or by ordinary-looking code, and the single way to reach
+//! it deliberately names itself at the call site. That is weaker than "no way
+//! to spend it" and stronger than a lint, and the difference matters enough to
+//! state exactly — see that method for why the door cannot close while the
+//! depth arrives as a bare `usize`.
+//!
+//! [`FrameVec::frame_at_offset`] takes a `usize` too, but returns a frame and
+//! never a slot, so it cannot widen addressing.
 //!
 //! Two operations are absent rather than restricted. `remove`, `swap_remove`,
 //! `retain`, `drain`, `truncate` and `clear` have no wrapper here because the
@@ -40,8 +50,9 @@ use super::ResolutionFrame;
 /// A position in a [`FrameVec`].
 ///
 /// The field is private to this module, so a `FrameSlot` can only come from one
-/// of the four minting methods. That is the whole mechanism: it makes "which
-/// frames may I address?" a question the compiler answers.
+/// of the five minting methods listed in the module docs. That is the whole
+/// mechanism: it makes "which frames may I address?" a question the compiler
+/// answers.
 ///
 /// A slot is a position, not a handle. Pushing, popping or inserting can move
 /// the frame a slot refers to, so a slot held across a mutation may name a
