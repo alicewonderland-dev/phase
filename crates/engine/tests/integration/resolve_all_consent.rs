@@ -246,3 +246,49 @@ fn transport_surfaces_only_each_grantors_own_revoke_and_uses_exact_consent_choic
     };
     assert_eq!(choices.len(), 2);
 }
+
+#[test]
+fn ready_state_transport_materializes_each_grantors_frozen_revoke() {
+    let mut state = GameState::new_two_player(47);
+    let epoch = begin(&mut state);
+    apply(
+        &mut state,
+        P1,
+        GameAction::RespondResolveAllConsent {
+            epoch,
+            decision: ResolveAllConsentDecision::Grant,
+        },
+    )
+    .expect("the final grant reaches Ready");
+
+    bind_interaction_authority(
+        &mut state,
+        InteractionSessionId("resolve-all-ready".to_string()),
+    )
+    .expect("Ready binds one slot per frozen grantor");
+    let p0_view = derive_viewer_interaction(&state, &filter_state_for_viewer(&state, P0), P0);
+    let InteractionOpportunityResponse::ExactChoices { choices } =
+        &p0_view.opportunities[0].response
+    else {
+        panic!("Ready revoke must remain an exact choice");
+    };
+    assert_eq!(choices.len(), 1);
+    let action = resolve_interaction_response(
+        &state,
+        P0,
+        &InteractionSubmission {
+            interaction_id: p0_view.opportunities[0].interaction_id.clone(),
+            response: InteractionResponse::Choose {
+                choice_id: choices[0].id.clone(),
+            },
+        },
+    )
+    .expect("Ready has no acting player, but its frozen grantor may still revoke");
+    assert_eq!(
+        action,
+        GameAction::RevokeResolveAllConsent {
+            epoch,
+            representative: P0,
+        }
+    );
+}

@@ -249,6 +249,20 @@ pub(crate) fn structurally_valid_tap_for_convoke_payment(
 }
 
 fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
+    // Ready intentionally has no current acting player, but an active consent
+    // grantor may still revoke. The candidate pipeline retains the frozen actor
+    // and its SimulationFilter checks that authority before admitting it.
+    if let GameAction::RevokeResolveAllConsent {
+        epoch,
+        representative,
+    } = action
+    {
+        if crate::game::turn_control::resolve_all_granted_submitter(state, *epoch, *representative)
+            .is_some()
+        {
+            return false;
+        }
+    }
     // CR 103.5 / TL:R 906.6a: For simultaneous-decision states
     // `acting_player()` is None when multiple players are pending. The
     // Priority-branch check below only fires for the Priority variant, so we
