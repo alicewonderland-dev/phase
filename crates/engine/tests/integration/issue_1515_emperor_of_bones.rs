@@ -5,11 +5,12 @@ use engine::game::ability_utils::build_resolved_from_def;
 use engine::game::effects::resolve_ability_chain;
 use engine::game::scenario::{GameScenario, P0};
 use engine::parser::oracle_effect::parse_effect_chain;
+use engine::types::ability::Duration;
 use engine::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, ChoiceType, ChosenAttribute,
     ContinuousModification, ControllerRef, DelayedTriggerCondition, Effect, FilterProp,
-    QuantityExpr, QuantityRef, ReplacementDefinition, ResolvedAbility, TargetChoiceTiming,
-    TargetFilter, TypedFilter,
+    QuantityExpr, QuantityRef, ReplacementDefinition, ResolvedAbility, StaticDefinition,
+    SubAbilityLink, TargetChoiceTiming, TargetFilter, TypeFilter, TypedFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
@@ -328,6 +329,180 @@ fn emperor_of_bones_adapt_without_linked_exile_has_no_riders_to_apply() {
         Zone::Battlefield,
         "Emperor must remain on the battlefield when no linked creature was exiled"
     );
+}
+
+/// Build a spell-shaped forward-result chain and drive it through the public
+/// cast/apply pipeline. Its optional graveyard move selects nothing, exercising
+/// the same empty-forward-result branch as an illegal target at resolution.
+fn empty_forward_result_generic_spell(
+    static_abilities: Vec<StaticDefinition>,
+    target: Option<TargetFilter>,
+) -> AbilityDefinition {
+    let mut independent_draw = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        },
+    );
+    independent_draw.sub_link = SubAbilityLink::SequentialSibling;
+    let dependent_continuation = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 1 },
+            player: TargetFilter::Controller,
+        },
+    )
+    .sub_ability(independent_draw);
+    let generic = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::GenericEffect {
+            static_abilities,
+            duration: Some(Duration::UntilEndOfTurn),
+            target,
+            end_cost: None,
+        },
+    )
+    .sub_ability(dependent_continuation);
+    let mut root = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::ChangeZone {
+            origin: Some(Zone::Graveyard),
+            destination: Zone::Battlefield,
+            target: TargetFilter::Typed(TypedFilter {
+                type_filters: vec![TypeFilter::Creature],
+                controller: None,
+                properties: vec![FilterProp::InZone {
+                    zone: Zone::Graveyard,
+                }],
+            }),
+            owner_library: false,
+            enter_transformed: false,
+            enters_under: Some(ControllerRef::You),
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+            enters_attacking: false,
+            up_to: true,
+            enter_with_counters: vec![],
+            conditional_enter_with_counters: vec![],
+            face_down_profile: None,
+            enters_modified_if: None,
+        },
+    )
+    .sub_ability(generic);
+    root.forward_result = true;
+    root.target_choice_timing = TargetChoiceTiming::Resolution;
+    root
+}
+
+fn resolve_empty_forward_result_generic_spell(
+    static_abilities: Vec<StaticDefinition>,
+    target: Option<TargetFilter>,
+) -> engine::types::game_state::GameState {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(P0, &["independent sibling draw"]);
+    let spell = scenario
+        .add_spell_to_hand(P0, "Empty Forward Generic", false)
+        .with_ability_definition(empty_forward_result_generic_spell(static_abilities, target))
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    runner
+        .act(GameAction::CastSpell {
+            object_id: spell,
+            card_id: runner.state().objects[&spell].card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("synthetic spell announcement must be accepted");
+    runner.advance_until_stack_empty();
+    runner.state().clone()
+}
+
+/// The exact Princess Yue regression shape: a no-op forwarded move followed by
+/// an all-effective-SelfRef GenericEffect must skip that grant while preserving
+/// an independent sequential sibling in the normal cast/apply pipeline.
+#[test]
+fn empty_forward_result_skips_all_self_ref_generic_effect_but_runs_independent_sibling() {
+    let state = resolve_empty_forward_result_generic_spell(
+        vec![StaticDefinition::continuous()
+            .affected(TargetFilter::SelfRef)
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Haste,
+            }])],
+        None,
+    );
+    assert_eq!(state.players[P0.0 as usize].hand.len(), 1);
+    assert_eq!(state.players[P0.0 as usize].life, 20);
+    assert!(
+        state.transient_continuous_effects.is_empty(),
+        "the missing forwarded object must suppress the all-SelfRef grant"
+    );
+}
+
+/// `affected: TriggeringSource` overrides an outer SelfRef descriptor. The
+/// GenericEffect must remain executable after an empty forwarded move, so its
+/// dependent continuation runs before the independent sibling.
+#[test]
+fn empty_forward_result_preserves_triggering_source_generic_effect() {
+    let state = resolve_empty_forward_result_generic_spell(
+        vec![StaticDefinition::continuous()
+            .affected(TargetFilter::TriggeringSource)
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Haste,
+            }])],
+        Some(TargetFilter::SelfRef),
+    );
+    assert_eq!(state.players[P0.0 as usize].hand.len(), 1);
+    assert_eq!(state.players[P0.0 as usize].life, 21);
+}
+
+/// `affected: CostPaidObject` likewise overrides outer SelfRef. It must not be
+/// pruned merely because the outer descriptor is SelfRef.
+#[test]
+fn empty_forward_result_preserves_cost_paid_object_generic_effect() {
+    let state = resolve_empty_forward_result_generic_spell(
+        vec![StaticDefinition::continuous()
+            .affected(TargetFilter::CostPaidObject)
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Haste,
+            }])],
+        Some(TargetFilter::SelfRef),
+    );
+    assert_eq!(state.players[P0.0 as usize].hand.len(), 1);
+    assert_eq!(state.players[P0.0 as usize].life, 21);
+}
+
+/// Only an all-effective-SelfRef GenericEffect depends on the missing result.
+/// Mixed, broadcast, empty, and no-application-filter forms keep both their
+/// continuation and independent sibling in the production cast/apply path.
+#[test]
+fn empty_forward_result_preserves_non_self_ref_generic_effect_forms() {
+    let cases = vec![
+        (
+            "mixed",
+            vec![
+                StaticDefinition::continuous().affected(TargetFilter::SelfRef),
+                StaticDefinition::continuous().affected(TargetFilter::Controller),
+            ],
+            None,
+        ),
+        (
+            "broadcast",
+            vec![StaticDefinition::continuous().affected(TargetFilter::Controller)],
+            None,
+        ),
+        ("empty", vec![], Some(TargetFilter::SelfRef)),
+        ("none", vec![StaticDefinition::continuous()], None),
+    ];
+
+    for (label, static_abilities, target) in cases {
+        let state = resolve_empty_forward_result_generic_spell(static_abilities, target);
+        assert_eq!(
+            state.players[P0.0 as usize].life, 21,
+            "{label} GenericEffect must remain executable after an empty forward result"
+        );
+    }
 }
 
 #[test]

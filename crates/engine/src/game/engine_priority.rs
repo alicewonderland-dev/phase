@@ -298,6 +298,16 @@ fn run_post_action_pipeline_from_with_policy(
         let events_before = events.len();
         sba::check_state_based_actions(state, events);
         if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+            // CR 603.3b: an SBA batch can open a non-priority choice (for
+            // example, a command-zone replacement) before the ordinary
+            // priority-path collector runs. Preserve every trigger from the
+            // completed SBA batch until that choice is answered; otherwise its
+            // ZoneChanged events are never scanned.
+            if events.len() > events_before {
+                let sba_events: Vec<_> = events[events_before..].to_vec();
+                triggers::collect_triggers_into_deferred(state, &sba_events);
+                triggers::collect_delayed_triggers_into_deferred(state, &sba_events);
+            }
             break;
         }
         if events.len() > events_before {

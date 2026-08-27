@@ -13024,15 +13024,16 @@ fn resolve_chain_body(
             }
         } else if ability.forward_result
             && forwarded_objects.is_empty()
-            && ability_chain_refs_parent_target(sub)
+            && ability_chain_depends_on_missing_forward_result(sub)
         {
             // CR 608.2c: A forward-result continuation is anchored to the object
-            // moved by the preceding instruction. If no object moved, that
-            // instruction has no referent for dependent riders such as "it gains
-            // haste" or "sacrifice it"; do not let ParentTarget fall back to the
-            // original ability source. Walk past dependent sequential siblings
-            // and resume at the first independent sibling instead of terminating
-            // the entire printed instruction chain.
+            // moved by the preceding instruction. If no object moved, an
+            // instruction that needs that moved object — either a ParentTarget
+            // rider or an all-SelfRef GenericEffect — has no referent. Do not
+            // let it fall back to the original ability source. Walk past
+            // dependent sequential siblings and resume at the first independent
+            // sibling instead of terminating the entire printed instruction
+            // chain.
             if let Some(mut remaining) = without_missing_forward_result_dependencies(sub) {
                 apply_parent_chain_context(
                     &mut remaining,
@@ -13373,21 +13374,20 @@ fn resolve_chain_body(
     Ok(())
 }
 
-/// CR 608.2c + CR 603.7c: Detect a ParentTarget dependency anywhere in a
-/// continuation, including a delayed-trigger payload whose AbilityDefinition
-/// is nested inside the current effect. This keeps a missing forward-result
-/// object from rebinding an inner rider to the original source while allowing
-/// independent sequential siblings to continue.
-fn ability_chain_refs_parent_target(ability: &ResolvedAbility) -> bool {
-    effect_chain_refs_parent_target(&ability.effect)
+/// CR 608.2c + CR 603.7c: Detect a dependency on a missing forward-result
+/// object anywhere in a continuation. `CreateDelayedTrigger` payloads retain
+/// their ParentTarget walk, but a SelfRef GenericEffect nested inside one still
+/// names the creating source rather than the forwarded object.
+fn ability_chain_depends_on_missing_forward_result(ability: &ResolvedAbility) -> bool {
+    effect_chain_depends_on_missing_forward_result(&ability.effect)
         || ability
             .sub_ability
             .as_deref()
-            .is_some_and(ability_chain_refs_parent_target)
+            .is_some_and(ability_chain_depends_on_missing_forward_result)
         || ability
             .else_ability
             .as_deref()
-            .is_some_and(ability_chain_refs_parent_target)
+            .is_some_and(ability_chain_depends_on_missing_forward_result)
 }
 
 fn ability_definition_chain_refs_parent_target(definition: &AbilityDefinition) -> bool {
@@ -13402,6 +13402,8 @@ fn ability_definition_chain_refs_parent_target(definition: &AbilityDefinition) -
             .is_some_and(ability_definition_chain_refs_parent_target)
 }
 
+/// Delayed-trigger payloads preserve their original source, so their recursive
+/// dependency scan remains limited to ParentTarget anaphora.
 fn effect_chain_refs_parent_target(effect: &Effect) -> bool {
     effect_refs_parent_target(effect)
         || matches!(
@@ -13409,6 +13411,42 @@ fn effect_chain_refs_parent_target(effect: &Effect) -> bool {
             Effect::CreateDelayedTrigger { effect: definition, .. }
                 if ability_definition_chain_refs_parent_target(definition)
         )
+}
+
+fn effect_chain_depends_on_missing_forward_result(effect: &Effect) -> bool {
+    effect_refs_parent_target(effect)
+        || generic_effect_depends_on_missing_forward_result(effect)
+        || matches!(
+            effect,
+            Effect::CreateDelayedTrigger { effect: definition, .. }
+                if ability_definition_chain_refs_parent_target(definition)
+        )
+}
+
+/// A GenericEffect depends on the forwarded object only when every static it
+/// installs is bound to SelfRef. An inner `affected` inherited reference wins
+/// over the outer target descriptor, so use the shared application-filter
+/// classifier instead of examining `target` directly.
+fn generic_effect_depends_on_missing_forward_result(effect: &Effect) -> bool {
+    let Effect::GenericEffect {
+        static_abilities,
+        target,
+        ..
+    } = effect
+    else {
+        return false;
+    };
+
+    !static_abilities.is_empty()
+        && static_abilities.iter().all(|static_def| {
+            matches!(
+                effect::generic_effect_application_filter(
+                    target.as_ref(),
+                    static_def.affected.as_ref(),
+                ),
+                Some(TargetFilter::SelfRef)
+            )
+        })
 }
 
 /// CR 608.2c: Remove only continuation nodes whose effects require the absent
@@ -13419,7 +13457,7 @@ fn effect_chain_refs_parent_target(effect: &Effect) -> bool {
 fn without_missing_forward_result_dependencies(
     ability: &ResolvedAbility,
 ) -> Option<ResolvedAbility> {
-    if effect_chain_refs_parent_target(&ability.effect) {
+    if effect_chain_depends_on_missing_forward_result(&ability.effect) {
         return first_independent_forward_result_sibling(ability.sub_ability.as_deref());
     }
 
