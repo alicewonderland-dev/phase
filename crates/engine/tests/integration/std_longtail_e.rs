@@ -2136,7 +2136,70 @@ fn dies_draw_trigger() -> TriggerDefinition {
         ))
 }
 
-/// An SBA batch that opens the commander replacement prompt must collect both
+/// CR 104.2a + CR 603.3b + CR 704.5a + CR 800.4a: a player-loss SBA that ends
+/// the game can emit zone changes while the losing player's objects leave the
+/// game. Once elimination has terminalized the game and cleared trigger
+/// scaffolding, the outer priority pipeline must not collect those events into a
+/// new deferred batch.
+#[test]
+fn sba_game_over_does_not_repopulate_terminal_trigger_scaffolding() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let observer = scenario
+        .add_creature(P0, "Surviving exile observer", 2, 2)
+        .with_trigger_definition(
+            TriggerDefinition::new(TriggerMode::ChangesZone)
+                .origin(Zone::Battlefield)
+                .destination(Zone::Exile)
+                .valid_card(TargetFilter::Typed(
+                    engine::types::ability::TypedFilter::creature(),
+                ))
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                )),
+        )
+        .id();
+    let departing = scenario.add_creature(P1, "Departing creature", 2, 2).id();
+    let mut runner = scenario.build();
+    runner.state_mut().players[P1.0 as usize].life = 0;
+
+    let result = runner
+        .act(GameAction::PassPriority)
+        .expect("the priority pass that discovers the player-loss SBA must be accepted");
+
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::GameOver { winner: Some(P0) }
+    ));
+    assert_eq!(runner.state().objects[&observer].zone, Zone::Battlefield);
+    assert!(
+        result.events.iter().any(|event| {
+            matches!(
+                event,
+                GameEvent::ZoneChanged {
+                    object_id,
+                    from: Some(Zone::Battlefield),
+                    to: Zone::Exile,
+                    ..
+                } if *object_id == departing
+            )
+        }),
+        "reach guard: player elimination must emit the observed battlefield-to-exile event"
+    );
+    assert!(
+        runner.state().deferred_triggers.is_empty(),
+        "terminal GameOver cleanup must not be repopulated from SBA events"
+    );
+    assert!(runner.state().pending_trigger_order.is_none());
+    assert!(runner.state().pending_trigger.is_none());
+    assert!(runner.state().stack.is_empty());
+}
+
+/// An SBA batch that opens the commander-zone return choice must collect both
 /// ordinary and delayed dies triggers before yielding the prompt. The two
 /// trigger controllers make the APNAP stack order observable through draws.
 #[test]
