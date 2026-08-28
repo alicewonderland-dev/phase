@@ -153,6 +153,19 @@ pub fn eliminate_players_simultaneously(
         }
     }
 
+    // CR 800.4a: elimination can remove frozen stack entries and a session's
+    // canonical representative. Restore the pre-overlay preferences before
+    // `do_eliminate` removes the departing player's own state, so teardown
+    // cannot later resurrect an eliminated seat's auto-pass preference.
+    if !leaving_set.is_empty() {
+        // CR 117.4 + CR 800.4a: an unmaterialized Resolve All run captures an
+        // exact auto-pass baseline. Restore it while every departing seat's
+        // preference is still present; the established elimination cleanup then
+        // removes only the entries that belong to players leaving the game.
+        super::turn_control::invalidate_resolve_all_consent_for_topology_change(state);
+        super::engine::take_and_restore_stack_resolution_session(state);
+    }
+
     let interrupted_ordinary_search = state
         .pending_scoped_library_search
         .is_none()
@@ -215,6 +228,78 @@ pub fn eliminate_players_simultaneously(
     // the full `leaving_set` — the retain+sweep scope is what makes a co-leaver's
     // steal of a survivor's object revert instead of being over-exiled.
     end_control_effects_for_leaving_players(state, &leaving_set, events);
+
+    // CR 800.4a + CR 101.4: A player that leaves during an APNAP unless poll
+    // neither answers nor remains an eligible future chooser. Preserve the
+    // aggregate for the surviving seats, advancing past a departed current
+    // prompt instead of leaving a serialized choice owned by a non-player.
+    if let Some(mut pending) = state.pending_player_scope_unless_payment.take() {
+        let original_controller = pending
+            .pending_effect
+            .original_controller
+            .unwrap_or(pending.pending_effect.controller);
+        if leaving_set.contains(&original_controller) {
+            // CR 800.4a: The resolving instruction leaves with its original
+            // controller. A previously-recorded decline cannot create tokens
+            // for a player no longer in the game, and its per-payer prompt
+            // must not outlive the abandoned aggregate.
+            let aggregate_prompt_is_live = match &state.waiting_for {
+                WaitingFor::UnlessPayment { pending_effect, .. }
+                | WaitingFor::WardSacrificeChoice { pending_effect, .. } => {
+                    pending_effect.source_id == pending.pending_effect.source_id
+                }
+                WaitingFor::ReplacementChoice { .. } => state
+                    .pending_replacement
+                    .as_ref()
+                    .and_then(|replacement| replacement.sacrifice_provenance.as_ref())
+                    .is_some_and(|provenance| provenance.player_id == pending.current_player),
+                _ => false,
+            };
+            if aggregate_prompt_is_live {
+                // The only parked replacement at this point belongs to the
+                // aggregate's current payer. Once its controller leaves, the
+                // aggregate cannot resume through that payer's choice.
+                state.pending_replacement = None;
+                state.replacement_may_cost_paused = false;
+                super::replacement::abandon_post_replacement_continuation(state);
+                state.waiting_for = WaitingFor::Priority {
+                    player: players::next_player(state, original_controller),
+                };
+            }
+        } else {
+            pending
+                .remaining_players
+                .retain(|player| !leaving_set.contains(player));
+            if leaving_set.contains(&pending.current_player) {
+                if let Some((next, rest)) = pending.remaining_players.split_first() {
+                    pending.current_player = *next;
+                    pending.remaining_players = rest.to_vec();
+                    state.waiting_for = WaitingFor::UnlessPayment {
+                        player: pending.current_player,
+                        cost: pending.cost.clone(),
+                        pending_effect: pending.pending_effect.clone(),
+                        trigger_event: None,
+                        effect_description: None,
+                        remaining: Vec::new(),
+                    };
+                    state.pending_player_scope_unless_payment = Some(pending);
+                } else {
+                    // The departed prompt contributes no new decline, but earlier
+                    // surviving decliners still owe the source controller one
+                    // aggregate token batch. Reinstall then settle through the
+                    // regular terminal-payment authority so `waiting_for` cannot
+                    // retain this eliminated player's stale prompt.
+                    state.pending_player_scope_unless_payment = Some(pending);
+                    crate::game::engine_payment_choices::settle_eliminated_player_scope_token_unless_payment(
+                        state, events,
+                    )
+                    .expect("eliminated final payer must settle a token-unless aggregate");
+                }
+            } else {
+                state.pending_player_scope_unless_payment = Some(pending);
+            }
+        }
+    }
 
     // CR 704.3 + CR 104.4a: a SINGLE game-over check after all simultaneous
     // eliminations — so a finish where every remaining player lost at once
@@ -826,11 +911,6 @@ fn do_eliminate(
         state.active_combat_phase_control = None;
         super::turn_control::recompute_active_player_control(state);
     }
-
-    // A consent run freezes canonical representatives and submitters. Player
-    // elimination changes that topology, so discard the run rather than
-    // allowing a stale prompt or Ready state to authorize anyone.
-    super::turn_control::invalidate_resolve_all_consent(state);
 
     // CR 800.4a + CR 800.4b: a departing searcher/zone owner invalidates its
     // live session, while a departing latched controller ends only that

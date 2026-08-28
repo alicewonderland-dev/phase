@@ -3732,7 +3732,11 @@ fn resolve_ref(
         }
         // CR 107.1 + CR 700.1: min/max across players of the count of
         // battlefield objects matching `filter` each player controls.
-        QuantityRef::ControlledByEachPlayer { filter, aggregate } => {
+        QuantityRef::ControlledByEachPlayer {
+            filter,
+            aggregate,
+            relation,
+        } => {
             // CR 608.2e (§8): prefer the clause-local snapshot if this clause
             // captured one — that freezes the extremum against the board as it
             // stood when the clause began, so an earlier APNAP player's
@@ -3749,31 +3753,37 @@ fn resolve_ref(
                 state,
                 crate::types::zones::Zone::Battlefield,
             );
-            aggregate_over_players(state.players.iter(), *aggregate, |p| {
-                // CR 109.5: evaluate `filter` as if `p` were "you" — count
-                // battlefield objects `p` controls matching the filter. The
-                // explicit `obj.controller == p.id` gate enforces the "they
-                // control" semantics even when `filter` itself carries no
-                // controller clause (Balance's Arm A parses a bare "lands"
-                // type phrase); the rebound `FilterContext` additionally makes
-                // any `controller: You` clause inside `filter` read `p`.
-                let pctx = match ability {
-                    Some(a) => FilterContext::from_ability_with_controller(a, p.id),
-                    None => FilterContext::from_source_with_controller(source_id, p.id),
-                };
-                usize_to_i32_saturating(
-                    zone_ids
-                        .iter()
-                        .filter(|&&id| {
-                            state
-                                .objects
-                                .get(&id)
-                                .is_some_and(|obj| obj.controller == p.id)
-                                && matches_target_filter(state, id, filter, &pctx)
-                        })
-                        .count(),
-                )
-            })
+            aggregate_over_players(
+                state.players.iter().filter(|p| {
+                    crate::game::players::matches_relation(state, p.id, controller, *relation)
+                }),
+                *aggregate,
+                |p| {
+                    // CR 109.5: evaluate `filter` as if `p` were "you" — count
+                    // battlefield objects `p` controls matching the filter. The
+                    // explicit `obj.controller == p.id` gate enforces the "they
+                    // control" semantics even when `filter` itself carries no
+                    // controller clause (Balance's Arm A parses a bare "lands"
+                    // type phrase); the rebound `FilterContext` additionally makes
+                    // any `controller: You` clause inside `filter` read `p`.
+                    let pctx = match ability {
+                        Some(a) => FilterContext::from_ability_with_controller(a, p.id),
+                        None => FilterContext::from_source_with_controller(source_id, p.id),
+                    };
+                    usize_to_i32_saturating(
+                        zone_ids
+                            .iter()
+                            .filter(|&&id| {
+                                state
+                                    .objects
+                                    .get(&id)
+                                    .is_some_and(|obj| obj.controller == p.id)
+                                    && matches_target_filter(state, id, filter, &pctx)
+                            })
+                            .count(),
+                    )
+                },
+            )
         }
         QuantityRef::CountersOnObjects {
             counter_type,
@@ -7665,8 +7675,8 @@ mod tests {
     use crate::game::zones::create_object;
     use crate::types::ability::{
         AggregateFunction, ChoiceValue, ControllerRef, DamageKindFilter, DevotionColors, Effect,
-        FilterProp, KickerVariant, ObjectProperty, SharedQuality, TargetFilter, TargetRef,
-        ThisWayCause, TypeFilter, TypedFilter,
+        FilterProp, KickerVariant, ObjectProperty, PlayerRelation, SharedQuality, TargetFilter,
+        TargetRef, ThisWayCause, TypeFilter, TypedFilter,
     };
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::counter::{CounterMatch, CounterType};
@@ -17502,6 +17512,7 @@ mod tests {
             qty: QuantityRef::ControlledByEachPlayer {
                 filter: lands_filter(),
                 aggregate: AggregateFunction::Min,
+                relation: PlayerRelation::All,
             },
         };
         assert_eq!(resolve_quantity(&state, &qty, PlayerId(0), ObjectId(0)), 1);
@@ -17517,6 +17528,24 @@ mod tests {
             qty: QuantityRef::ControlledByEachPlayer {
                 filter: lands_filter(),
                 aggregate: AggregateFunction::Max,
+                relation: PlayerRelation::All,
+            },
+        };
+        assert_eq!(resolve_quantity(&state, &qty, PlayerId(0), ObjectId(0)), 3);
+    }
+
+    #[test]
+    fn controlled_by_each_player_opponent_max_excludes_controller() {
+        // CR 102.2: P0 is not their own opponent. P0=5, P1=3 must therefore
+        // resolve to 3, not the all-player maximum of 5.
+        let mut state = GameState::new_two_player(42);
+        add_lands(&mut state, PlayerId(0), 5);
+        add_lands(&mut state, PlayerId(1), 3);
+        let qty = QuantityExpr::Ref {
+            qty: QuantityRef::ControlledByEachPlayer {
+                filter: lands_filter(),
+                aggregate: AggregateFunction::Max,
+                relation: PlayerRelation::Opponent,
             },
         };
         assert_eq!(resolve_quantity(&state, &qty, PlayerId(0), ObjectId(0)), 3);
@@ -17548,6 +17577,7 @@ mod tests {
             qty: QuantityRef::ControlledByEachPlayer {
                 filter: lands_filter(),
                 aggregate: AggregateFunction::Min,
+                relation: PlayerRelation::All,
             },
         };
         assert_eq!(resolve_quantity(&state, &qty, PlayerId(0), ObjectId(0)), 0);
@@ -17564,6 +17594,7 @@ mod tests {
             qty: QuantityRef::ControlledByEachPlayer {
                 filter: lands_filter(),
                 aggregate: AggregateFunction::Min,
+                relation: PlayerRelation::All,
             },
         };
         assert_eq!(resolve_quantity(&state, &qty, PlayerId(0), ObjectId(0)), 2);
@@ -17580,6 +17611,7 @@ mod tests {
         let qref = QuantityRef::ControlledByEachPlayer {
             filter: lands_filter(),
             aggregate: AggregateFunction::Min,
+            relation: PlayerRelation::All,
         };
         // Live board would yield 1; freeze a different value into the snapshot.
         let mut snap = crate::types::game_state::ClauseMinimumSnapshot::default();

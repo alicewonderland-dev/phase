@@ -321,6 +321,8 @@ fn synthesize_prepared_copy_object(
         .casting_permissions
         .push(CastingPermission::ExileWithAltCost {
             cost: back.mana_cost.clone(),
+            // CR 118.9a: the back face's own printed cost — normal payment.
+            cost_provenance: crate::types::ability::ExileGrantCostProvenance::NormalCost,
             cast_transformed: false,
             constraint: None,
             granted_to: Some(controller),
@@ -1068,6 +1070,7 @@ mod tests {
             source
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::zero(),
                     cast_transformed: false,
                     constraint: None,
@@ -1234,6 +1237,7 @@ mod tests {
             let mut card_types = crate::types::card_type::CardType::default();
             card_types.core_types.push(CoreType::Sorcery);
             crate::game::game_object::BackFaceData {
+                is_swap_snapshot: false,
                 name: "Test Prepare Face".to_string(),
                 power: None,
                 toughness: None,

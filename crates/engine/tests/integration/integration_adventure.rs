@@ -45,6 +45,7 @@ fn add_mana(runner: &mut GameRunner, player: PlayerId, color: ManaType, count: u
 /// Build the Adventure back_face data for Stomp.
 fn stomp_back_face() -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
         name: "Stomp".to_string(),
         power: None,
         toughness: None,

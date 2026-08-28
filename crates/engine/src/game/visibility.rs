@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::types::action_rejection::ActionRejection;
 use crate::types::events::{GameEvent, LibrarySearchCardFaceView, LibrarySearchCardView};
 use crate::types::game_state::{CastOfferKind, GameState, PayCostKind, WaitingFor};
 use crate::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef};
@@ -40,6 +41,31 @@ pub(crate) fn interaction_object_identity_is_visible(state: &GameState, id: Obje
         .objects
         .get(&id)
         .is_some_and(|object| object.name != HIDDEN_CARD_NAME)
+}
+
+/// Projects ephemeral rejection metadata through the same viewer filter as the
+/// state snapshot. The state is filtered before identity checks so hidden card
+/// names can never be reintroduced through a rejected action's object ids.
+pub fn filter_action_rejection_for_viewer(
+    state: &GameState,
+    viewer: PlayerId,
+    rejection: &ActionRejection,
+) -> ActionRejection {
+    if rejection.related_object_ids.is_empty() {
+        return rejection.clone();
+    }
+    let filtered = filter_state_for_viewer(state, viewer);
+    ActionRejection {
+        code: rejection.code,
+        disposition: rejection.disposition,
+        message: rejection.message.clone(),
+        related_object_ids: rejection
+            .related_object_ids
+            .iter()
+            .copied()
+            .filter(|object_id| interaction_object_identity_is_visible(&filtered, *object_id))
+            .collect(),
+    }
 }
 
 /// Capture the authoritative display characteristics learned at the search
@@ -242,6 +268,11 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
     // are server-private. The public WaitingFor state is sufficient to render
     // the current consent or ready status.
     filtered.resolve_all_consent_run = None;
+    // Shared stack-resolution sessions carry an authorized entry cohort, exact
+    // source/LKI provenance, target incarnation pins, and a private temporary
+    // auto-pass baseline. The visible stack and WaitingFor state are sufficient
+    // for display; none of this execution authority belongs in a viewer copy.
+    filtered.stack_resolution_session = None;
     // Product knowledge is projection authority, never transport payload. Its
     // effect is applied below before hidden cards are redacted; viewers receive
     // identities they learned, not the audience facts or library epochs behind
@@ -2496,6 +2527,52 @@ mod tests {
             !state.resolution_stack.is_empty(),
             "filtering must not mutate the authoritative continuation"
         );
+    }
+
+    #[test]
+    fn redacts_private_stack_resolution_session_from_every_viewer() {
+        use crate::types::ability::KeywordAction;
+        use crate::types::game_state::{
+            StackEntry, StackEntryKind, StackResolutionAutoPassOverlay, StackResolutionBudget,
+            StackResolutionEntryFence, StackResolutionPolicy, StackResolutionSession,
+        };
+
+        let mut state = GameState::new_two_player(42);
+        let entry = StackEntry {
+            id: ObjectId(71),
+            source_id: ObjectId(72),
+            controller: PlayerId(0),
+            kind: StackEntryKind::KeywordAction {
+                action: KeywordAction::Equip {
+                    equipment_id: ObjectId(72),
+                    target_creature_id: ObjectId(73),
+                },
+            },
+        };
+        state.stack_resolution_session = Some(StackResolutionSession {
+            entries: vec![StackResolutionEntryFence::capture(&entry)],
+            cursor: 0,
+            representatives: std::collections::BTreeSet::from([PlayerId(0)]),
+            verified_pass_representatives: std::collections::BTreeSet::new(),
+            budget: StackResolutionBudget::from_legacy_max_resolutions(3),
+            policy: StackResolutionPolicy::Committed,
+            auto_pass_overlay: StackResolutionAutoPassOverlay {
+                baseline: std::collections::BTreeMap::new(),
+            },
+        });
+
+        assert!(
+            state.stack_resolution_session.is_some(),
+            "fixture has authority"
+        );
+        for viewer in [PlayerId(0), PlayerId(1), PlayerId(u8::MAX)] {
+            assert!(
+                filter_state_for_viewer(&state, viewer)
+                    .stack_resolution_session
+                    .is_none(),
+                "viewer {viewer:?} must not receive frozen execution authority"
+            );
+        }
     }
 
     #[test]

@@ -1300,6 +1300,19 @@ pub(crate) fn resolve_to_priority(probe: &mut LoopProbe, prefer_target: Option<T
                     break;
                 }
             }
+            WaitingFor::ResolutionOptionalPaymentChoice { costs, .. } => {
+                let Some(option) = costs.first() else { break };
+                if probe
+                    .act(GameAction::ChooseResolutionOptionalPaymentBranch {
+                        choice: crate::types::ResolutionOptionalPaymentChoice::Pay {
+                            index: option.index,
+                        },
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
             // CR 608.2d: a resolution-time "choose one of A or B" (e.g. a "tap or
             // untap" ability, parsed to `Effect::ChooseOneOf`). Pick the branch
             // whose effect is `SetTapState { Untap }`; fall back to the last branch

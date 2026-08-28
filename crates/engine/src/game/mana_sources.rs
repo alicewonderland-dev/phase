@@ -38,6 +38,7 @@ use super::mana_abilities;
 use super::mana_payment;
 use super::restrictions;
 use super::triggers::trigger_source_context_for_latch;
+use super::turn_control;
 
 pub use crate::types::mana::ManaSourcePenalty;
 
@@ -854,10 +855,13 @@ pub(crate) fn preflight_tap_land_action(
             ));
         }
     };
-    if waiting_player != player {
+    // CR 723.5 + CR 723.5a: a turn controller makes the waiting player's
+    // choices, but activates that player's mana sources and spends only that
+    // player's resources.
+    if turn_control::authorized_submitter_for_player(state, waiting_player) != player {
         return Err(EngineError::WrongPlayer);
     }
-    let matches = activatable_mana_actions_for_player(state, player)
+    let matches = activatable_mana_actions_for_player(state, waiting_player)
         .into_iter()
         .filter(|candidate| candidate == action)
         .count();

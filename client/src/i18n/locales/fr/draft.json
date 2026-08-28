@@ -2,19 +2,25 @@
   "intro": {
     "quickTitle": "Quick Draft",
     "podTitle": "Pod Draft",
+    "commanderTitle": "Commander Draft",
     "subtitle": "Voici comment ça fonctionne",
     "startDrafting": "Commencer le draft",
     "quick": {
       "step1": "Vous ouvrirez 3 boosters de 14 cartes chacun",
       "step2": "Choisissez une carte par booster, puis passez le reste aux drafteurs IA",
       "step3": "Les boosters changent de sens à chaque manche — gauche, droite, gauche",
-      "step4": "Après tous les choix, construisez un deck de 40 cartes et jouez un match"
+      "step4": "Après tous les choix, construisez un deck de 40 cartes et jouez un match",
+      "step1Mixed": "Vous ouvrirez {{packCount}} boosters de tailles différentes — {{packSizes}} cartes, dans cet ordre"
     },
     "pod": {
       "step1": "Vous draftez avec {{count}} joueurs dans un pod",
       "step2": "Ouvrez 3 boosters de 14 cartes — choisissez-en une, passez le reste",
       "step3": "Les boosters changent de sens à chaque manche — gauche, droite, gauche",
       "step4": "Après le draft, construisez un deck de 40 cartes et jouez des matchs de tournoi"
+    },
+    "commander": {
+      "step2": "Choisissez deux cartes dans chaque booster, puis passez le reste",
+      "step4": "Après le draft, construisez un deck Commander de 60 cartes et jouez une partie multijoueur"
     }
   },
   "steps": {
@@ -71,18 +77,48 @@
       "Hard": "Difficile",
       "VeryHard": "Très difficile"
     },
-    "chooseSet": "Choisir une extension",
     "noPools": "Aucun pool de draft disponible. Lancez d'abord le pipeline de données de draft.",
     "setIconAlt": "Icône d'extension {{name}}",
-    "loadFailed": "Échec du chargement des éditions"
+    "loadFailed": "Échec du chargement des éditions",
+    "packOrder": "Ordre des boosters",
+    "clearPacks": "Vider",
+    "emptyPacks_one": "Choisissez une extension pour chaque booster. Un draft ouvre {{count}} booster par défaut — répétez une extension ou mélangez-en plusieurs.",
+    "emptyPacks_other": "Choisissez une extension pour chaque booster. Un draft ouvre {{count}} boosters par défaut — répétez une extension ou mélangez-en plusieurs pour drafter un bloc.",
+    "emptyPacksFixed_one": "Le scellé ouvre exactement {{count}} booster. Choisissez une extension pour celui-ci.",
+    "emptyPacksFixed_other": "Le scellé ouvre exactement {{count}} boosters. Choisissez une extension pour chacun — répétez-en une ou mélangez-en plusieurs.",
+    "packCountFixed": "{{selected}} boosters sur {{required}} choisis",
+    "packCountFlexible": "{{selected}} boosters choisis — jusqu'à {{max}}",
+    "addPackFromSet": "Ajouter un booster",
+    "packsFull": "La liste de boosters est pleine",
+    "addPackOf": "Ajouter un booster de {{name}}",
+    "movePackEarlier": "Avancer le booster {{number}}",
+    "movePackLater": "Reculer le booster {{number}}",
+    "removePack": "Retirer le booster {{number}}",
+    "chooseSet": "Choisir une extension",
+    "draftSet": "Drafter {{name}}",
+    "fillRemaining_one": "Remplir le dernier booster avec {{name}}",
+    "fillRemaining_other": "Remplir les {{count}} boosters restants avec {{name}}",
+    "startDraft": "Lancer le draft",
+    "startSealed": "Lancer le scellé"
   },
   "pack": {
     "confirmPick": "Confirmer le choix",
+    "selected": "Sélection",
     "draftEffects": "Effets de draft :",
     "waitingNext": "En attente du booster suivant...",
-    "cardsInPack": "{{count}} cartes dans le booster",
+    "cardsInPack_one": "{{count}} carte dans le booster",
+    "cardsInPack_few": "{{count}} cartes dans le booster",
+    "cardsInPack_many": "{{count}} cartes dans le booster",
+    "cardsInPack_other": "{{count}} cartes dans le booster",
+    "currentPick": "Booster {{pack}} Choix {{pick}}",
     "picking": "Sélection…",
-    "autoPick": "Sélection auto"
+    "autoPick": "Sélection auto",
+    "scale": "Taille du booster",
+    "scaleDecrease": "Réduire la taille du booster",
+    "scaleReset": "Réinitialiser la taille du booster",
+    "scaleIncrease": "Augmenter la taille du booster",
+    "pickToDeck": "Choisir {{card}} pour le deck",
+    "pickToSideboard": "Choisir {{card}} pour la réserve"
   },
   "sealedOpening": {
     "title": "Ouvrez votre pool scellé",
@@ -94,15 +130,22 @@
     "nextPack": "Booster suivant",
     "viewPool": "Voir votre pool",
     "poolTitle": "Votre pool scellé",
-    "poolSubtitle": "Les {{count}} cartes, regroupées par type.",
+    "poolSubtitle_one": "La {{count}} carte, regroupée par type.",
+    "poolSubtitle_few": "Les {{count}} cartes, regroupées par type.",
+    "poolSubtitle_many": "Les {{count}} cartes, regroupées par type.",
+    "poolSubtitle_other": "Les {{count}} cartes, regroupées par type.",
     "buildDeck": "Construire le deck"
   },
   "pool": {
-    "cardsDrafted": "{{count}} cartes draftées",
+    "cardsDrafted_one": "{{count}} carte draftée",
+    "cardsDrafted_few": "{{count}} cartes draftées",
+    "cardsDrafted_many": "{{count}} cartes draftées",
+    "cardsDrafted_other": "{{count}} cartes draftées",
     "empty": "Aucune carte draftée pour l'instant",
     "sortColor": "Couleur",
     "sortType": "Type",
     "sortCmc": "CMC",
+    "grantedFiller": "+ jusqu'à {{maximum}} × {{name}} (commandant uniquement)",
     "groups": {
       "white": "Blanc",
       "blue": "Bleu",
@@ -133,6 +176,79 @@
       "manaValue6Plus": "6+ CMC"
     }
   },
+  "workspace": {
+    "locked": "Choix en cours.",
+    "shell": { "label": "Espace de construction", "show": "Afficher l’espace de construction", "hide": "Masquer l’espace de construction", "title": "Construisez votre deck" },
+    "view": { "label": "Vue de l'espace", "board": "Plateau", "compact": "Compacte" },
+    "preview": { "label": "Aperçu de carte", "none": "Aucun", "follow": "Suivre", "side": "Côté", "shift": "Maj" },
+    "count": {
+      "deck_one": "Deck ({{count}} carte)",
+      "deck_few": "Deck ({{count}} cartes)",
+      "deck_many": "Deck ({{count}} cartes)",
+      "deck_other": "Deck ({{count}} cartes)",
+      "sideboard_one": "Réserve ({{count}} carte)",
+      "sideboard_few": "Réserve ({{count}} cartes)",
+      "sideboard_many": "Réserve ({{count}} cartes)",
+      "sideboard_other": "Réserve ({{count}} cartes)"
+    },
+    "empty": { "sideboard": "Aucune carte dans la réserve" },
+    "sideboard": {
+      "expand_one": "Afficher la réserve ({{count}} carte)",
+      "expand_few": "Afficher la réserve ({{count}} cartes)",
+      "expand_many": "Afficher la réserve ({{count}} cartes)",
+      "expand_other": "Afficher la réserve ({{count}} cartes)",
+      "collapse": "Masquer la réserve"
+    },
+    "pool": {
+      "label": "Pool de cartes",
+      "filterLabel": "Filtre de zone du pool",
+      "sortLabel": "Tri du pool",
+      "empty": "Aucune carte dans cette vue",
+      "filter": {
+        "combined_one": "Toutes ({{count}})",
+        "combined_few": "Toutes ({{count}})",
+        "combined_many": "Toutes ({{count}})",
+        "combined_other": "Toutes ({{count}})",
+        "deck_one": "Deck ({{count}})",
+        "deck_few": "Deck ({{count}})",
+        "deck_many": "Deck ({{count}})",
+        "deck_other": "Deck ({{count}})",
+        "sideboard_one": "Réserve ({{count}})",
+        "sideboard_few": "Réserve ({{count}})",
+        "sideboard_many": "Réserve ({{count}})",
+        "sideboard_other": "Réserve ({{count}})"
+      }
+    },
+    "compact": { "sideboardRegion": "Réserve compacte" },
+    "toolbar": { "label": "Disposition du plateau" },
+    "layout": { "label": "Disposition", "columns": "Colonnes", "maxPerRow": "Maximum de colonnes par ligne", "decreaseMaxPerRow": "Diminuer le maximum de colonnes par ligne", "increaseMaxPerRow": "Augmenter le maximum de colonnes par ligne" },
+    "sort": { "label": "Trier le plateau", "cmc": "Valeur de mana", "color": "Couleur", "rarity": "Rareté", "type": "Type" },
+    "rows": { "label": "Rangées du plateau", "one": "Une rangée", "two": "Deux rangées" },
+    "rowHeaders": { "creatures": "Créatures", "nonCreatures": "Non-créatures" },
+    "columns": { "label": "Colonnes du plateau", "add": "Ajouter une colonne", "removeFinal": "Supprimer la dernière colonne", "removeHeader": "Supprimer la colonne {{column}}" },
+    "headers": {
+      "compact": "En-têtes",
+      "show": "Afficher les en-têtes",
+      "addedBasics": "Terrains de base ajoutés",
+      "unclassified": "Non classé",
+      "emptyOrdinal": "Colonne vide {{column}}",
+      "accessible_one": "Colonne {{column}} : {{labels}}, {{count}} carte",
+      "accessible_few": "Colonne {{column}} : {{labels}}, {{count}} cartes",
+      "accessible_many": "Colonne {{column}} : {{labels}}, {{count}} cartes",
+      "accessible_other": "Colonne {{column}} : {{labels}}, {{count}} cartes"
+    },
+    "card": {
+      "inspect": "Examiner {{card}}",
+      "moveToZone": "Déplacer {{card}} vers {{zone}}"
+    },
+    "zone": { "deck": "Deck", "sideboard": "Réserve" },
+    "drop": { "zone": "Déposer dans cette zone", "column": "Déposer dans cette colonne", "row": "Déposer dans cette rangée" },
+    "drag": { "started": "Déplacement de {{card}}.", "target": "Déposer dans {{zone}}, colonne {{column}}.", "success": "{{card}} choisie.", "moved": "{{card}} déplacée.", "cancelled": "Choix annulé.", "rejected": "Impossible de choisir {{card}}. Elle a été restaurée.", "dispatchError": "Impossible d’envoyer {{card}}. Réessayez." },
+    "announcement": {
+      "moved": "{{card}} déplacé vers {{zone}}, colonne {{column}}, position {{position}}.",
+      "columnRemoved": "Colonne {{column}} supprimée et plateau reconstruit."
+    }
+  },
   "standings": {
     "title": "Classement — Manche {{round}}",
     "rank": "N°",
@@ -152,7 +268,17 @@
     "emptyDeckHint": "Cliquez sur des cartes du pool pour les ajouter à votre deck.",
     "addableCards": "Cartes ajoutables",
     "searchAddableCards": "Rechercher des cartes ajoutables...",
+    "addLands": "Ajouter des terrains",
+    "snowCovered": "Neigeux",
     "autoLands": "Terrains auto",
+    "averageManaCost": "Coût moyen de mana",
+    "manaColor": "Couleur de mana",
+    "countInCost": "Nombre dans le coût",
+    "type": "Type",
+    "count": "Nombre",
+    "percent": "%",
+    "basicLand": "Terrain de base",
+    "total": "Total",
     "suggestDeck": "Suggérer un deck",
     "submitDeck": "Soumettre le deck",
     "validationTitle": "Le deck nécessite votre attention",
@@ -161,11 +287,18 @@
     "addCard": "Ajouter {{name}}",
     "cardCount": "/ {{min}} cartes",
     "spellCount_one": "{{count}} sort",
+    "spellCount_few": "{{count}} sorts",
+    "spellCount_many": "{{count}} sorts",
     "spellCount_other": "{{count}} sorts",
     "landCount_one": "{{count}} terrain",
+    "landCount_few": "{{count}} terrains",
+    "landCount_many": "{{count}} terrains",
     "landCount_other": "{{count}} terrains",
     "readyToSubmit": "prêt à soumettre",
-    "moreNeeded": "{{count}} de plus requise(s)"
+    "moreNeeded": "{{count}} de plus requise(s)",
+    "commanderRequired": "Désignez un commandant depuis votre réserve pour valider.",
+    "commanderUnavailable": "La désignation du commandant est indisponible pour le moment — la base de données des cartes n'a pas pu être chargée.",
+    "grantedFiller": "Votre réserve comprend également jusqu'à {{maximum}} × {{name}}, utilisable uniquement comme commandant."
   },
   "landing": {
     "title": "Draft",
@@ -187,6 +320,10 @@
     "podDraft": {
       "title": "Pod Draft",
       "description": "Hébergez ou rejoignez un pod jusqu'à 8 joueurs, draftez ensemble en direct, puis jouez un tournoi suisse ou à élimination."
+    },
+    "commanderDraft": {
+      "title": "Commander Draft",
+      "description": "Draftez deux cartes à la fois dans un pod, construisez un deck Commander de 60 cartes, puis jouez une partie multijoueur."
     },
     "podInProgress": "Pod Draft en cours",
     "guestPodInProgress": "Pod rejoint prêt à se reconnecter",
@@ -328,6 +465,8 @@
     "kindTraditionalDesc": "Matchs de tournoi en meilleur des trois après la construction, avec réserve entre les parties.",
     "kindSealed": "Scellé",
     "kindSealedDesc": "Ouvrez six boosters directement dans la réserve de chaque joueur, puis construisez un deck de tournoi en meilleur des un.",
+    "kindCommanderDraft": "Commander",
+    "kindCommanderDraftDesc": "Chaque joueur drafte deux cartes à la fois et construit un deck Commander de 60 cartes, puis le pod joue une partie multijoueur.",
     "tournamentFormat": "Format du tournoi",
     "tournamentSwiss": "Suisse",
     "tournamentSwissDesc": "Tout le monde continue de jouer sur trois manches, même après une défaite.",
@@ -341,7 +480,8 @@
     "podSize": "Taille du pod",
     "podSizeDesc": "{{count}} sièges au total. Les sièges vides peuvent être remplis par des bots depuis le salon avant le début du draft.",
     "playerCount": "{{count}} joueurs",
-    "setSelectorHint": "Choisissez l'extension de draft en dernier. Sélectionner une extension charge son pool de cartes et crée la salle du pod.",
+    "setSelectorHint": "Organisez les éditions draftées par votre pod — une par booster, dans l'ordre d'ouverture. Nommez une seule édition pour remplir tous les boosters. La création du pod charge les réserves.",
+    "createPod": "Créer un pod",
     "loadingPool": "Chargement des données du pool d'extension...",
     "roomCode": "Code de la salle",
     "roomCodePlaceholder": "Saisissez le code de la salle...",
@@ -390,6 +530,7 @@
   },
   "podComplete": {
     "title": "Draft terminé",
+    "launchCommanderGame": "Lancer la partie Commander",
     "returnToMenu": "Retour au menu"
   },
   "podError": {

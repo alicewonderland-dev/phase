@@ -46,8 +46,25 @@ export function clear_replay_playback(): void;
  * Background) via the engine's single-authority `can_pair_commanders`. The
  * frontend must not re-derive partner-pairing rules — it filters its candidate
  * list through this. Returns an empty array if the database isn't loaded.
+ *
+ * `draft_set_codes` is every set whose draft boosters this deck's draft
+ * CONTAINED, as an array — or `null`/`undefined`, which is read as the empty
+ * array, i.e. constructed play. CR 903.13f(3)
+ * conditions its partner grant on what the DRAFT contained, which is a session
+ * property no pair of card names can express — so the caller supplies the set
+ * codes and the ENGINE maps them to a grant. The client never learns which
+ * sets grant what.
+ *
+ * A LIST rather than one code, because CR 903.13f(3) asks about containment: a
+ * mixed draft that opened Commander Masters and other boosters contained
+ * Commander Masters, and the grant is in force. The engine takes the union.
+ *
+ * It is a REQUIRED third parameter, and `JsValue` rather than
+ * `Vec<String>`, on purpose: that matches this file's existing convention
+ * for engine-typed arguments and makes a stale caller a compile error rather
+ * than a silent `undefined`.
  */
-export function commanderPartnerCandidates(first_commander: string, candidates: any): any;
+export function commanderPartnerCandidates(first_commander: string, candidates: any, draft_set_codes: any): any;
 
 /**
  * Returns legal Commander-family companion candidates from the main deck.
@@ -405,8 +422,6 @@ export function replay_length_js(): number;
  */
 export function replay_seek_js(target: number): any;
 
-export function resolve_all(requester: number, ai_seats_json: string, max_resolutions: number): any;
-
 /**
  * Restore the game state from a JSON string.
  * Uses serde_json which handles string-keyed maps (from localStorage round-trip)
@@ -417,6 +432,17 @@ export function resolve_all(requester: number, ai_seats_json: string, max_resolu
  * game on the wire. Undo is a single-player affordance only.
  */
 export function restore_game_state(json_str: string): void;
+
+/**
+ * Explicitly resume a persisted stack-automation session after
+ * `restore_game_state` has installed the snapshot.
+ *
+ * Generic restore is intentionally decode-only, so it never manufactures a
+ * priority pass. This returns the engine-authored bounded presentation for the
+ * resumed session (or an explicit no-op/repair); read the post-transition game
+ * state through `get_game_state` or a filtered state export.
+ */
+export function resume_restored_game_state(): any;
 
 /**
  * Resume a multiplayer host session from a persisted `GameState`.
@@ -449,9 +475,11 @@ export function restore_game_state(json_str: string): void;
  *    session.
  *
  * Refuses when the engine is already in use — this is a fresh-instance
- * entry point. Callers must clear any existing state first.
+ * entry point. Callers must clear any existing state first. Returns the same
+ * bounded engine-authored restored-automation presentation as
+ * `resume_restored_game_state` before the host exposes its first snapshot.
  */
-export function resume_multiplayer_host_state(json_str: string): void;
+export function resume_multiplayer_host_state(json_str: string): any;
 
 /**
  * Search the loaded card database. The engine is the single authority for the
@@ -539,7 +567,7 @@ export interface InitOutput {
     readonly build_ai_card_subset: () => [number, number, number, number];
     readonly classify_deck_js: (a: any) => [number, number, number];
     readonly clear_game_state: () => void;
-    readonly commanderPartnerCandidates: (a: number, b: number, c: any) => [number, number, number];
+    readonly commanderPartnerCandidates: (a: number, b: number, c: any, d: any) => [number, number, number];
     readonly companionCandidates: (a: any) => [number, number, number];
     readonly deckCopyLimit: (a: number, b: number) => any;
     readonly estimate_bracket_for_deck: (a: any) => [number, number, number];
@@ -575,9 +603,9 @@ export interface InitOutput {
     readonly preview_mana_payment_js: (a: number, b: any) => any;
     readonly project_seat_view: (a: number, b: number) => [number, number, number];
     readonly replay_seek_js: (a: number) => [number, number, number];
-    readonly resolve_all: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly restore_game_state: (a: number, b: number) => [number, number];
-    readonly resume_multiplayer_host_state: (a: number, b: number) => [number, number];
+    readonly resume_restored_game_state: () => [number, number, number];
+    readonly resume_multiplayer_host_state: (a: number, b: number) => [number, number, number];
     readonly search_cards_js: (a: any) => [number, number, number];
     readonly set_multiplayer_mode: (a: number) => void;
     readonly sideboardPolicyForFormat: (a: any) => [number, number, number];

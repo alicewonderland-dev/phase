@@ -2,19 +2,25 @@
   "intro": {
     "quickTitle": "Szybki draft",
     "podTitle": "Draft w grupie",
+    "commanderTitle": "Commander Draft",
     "subtitle": "Oto jak to działa",
     "startDrafting": "Rozpocznij draft",
     "quick": {
       "step1": "Otworzysz 3 boostery po 14 kart każdy",
       "step2": "Wybierz jedną kartę z każdego boostera, a resztę przekaż dalej do botów",
       "step3": "Boostery zmieniają kierunek w każdej rundzie — w lewo, w prawo, w lewo",
-      "step4": "Po wszystkich wyborach zbuduj talię z 40 kart i rozegraj mecz"
+      "step4": "Po wszystkich wyborach zbuduj talię z 40 kart i rozegraj mecz",
+      "step1Mixed": "Otworzysz {{packCount}} boosterów o różnych rozmiarach — {{packSizes}} kart, w tej kolejności"
     },
     "pod": {
       "step1": "Draftujesz z {{count}} graczami w grupie",
       "step2": "Otwórz 3 boostery po 14 kart — wybierz jedną, resztę przekaż dalej",
       "step3": "Boostery zmieniają kierunek w każdej rundzie — w lewo, w prawo, w lewo",
       "step4": "Po drafcie zbuduj talię z 40 kart i rozegraj mecze turniejowe"
+    },
+    "commander": {
+      "step2": "Wybierz dwie karty z każdego boostera, a resztę przekaż dalej",
+      "step4": "Po drafcie zbuduj talię Commander z 60 kart i rozegraj jedną grę wieloosobową"
     }
   },
   "steps": {
@@ -71,18 +77,48 @@
       "Hard": "Trudny",
       "VeryHard": "Bardzo trudny"
     },
-    "chooseSet": "Wybierz dodatek",
     "noPools": "Brak dostępnych pul do draftu. Najpierw uruchom pipeline danych draftu.",
     "setIconAlt": "Ikona dodatku {{name}}",
-    "loadFailed": "Nie udało się wczytać dodatków"
+    "loadFailed": "Nie udało się wczytać dodatków",
+    "packOrder": "Kolejność boosterów",
+    "clearPacks": "Wyczyść",
+    "emptyPacks_one": "Wybierz dodatek dla każdego boostera. Draft domyślnie otwiera {{count}} booster — powtórz dodatek lub połącz kilka.",
+    "emptyPacks_other": "Wybierz dodatek dla każdego boostera. Draft domyślnie otwiera {{count}} boostery — powtórz dodatek lub połącz kilka, aby draftować blok.",
+    "emptyPacksFixed_one": "Sealed otwiera dokładnie {{count}} booster. Wybierz dla niego dodatek.",
+    "emptyPacksFixed_other": "Sealed otwiera dokładnie {{count}} boosterów. Wybierz dodatek dla każdego — powtórz jeden lub połącz kilka.",
+    "packCountFixed": "Wybrano {{selected}} z {{required}} boosterów",
+    "packCountFlexible": "Wybrano {{selected}} boosterów — maksymalnie {{max}}",
+    "addPackFromSet": "Dodaj booster",
+    "packsFull": "Lista boosterów jest pełna",
+    "addPackOf": "Dodaj booster z dodatku {{name}}",
+    "movePackEarlier": "Przesuń booster {{number}} wcześniej",
+    "movePackLater": "Przesuń booster {{number}} później",
+    "removePack": "Usuń booster {{number}}",
+    "chooseSet": "Wybierz dodatek",
+    "draftSet": "Draftuj {{name}}",
+    "fillRemaining_one": "Wypełnij ostatni booster dodatkiem {{name}}",
+    "fillRemaining_other": "Wypełnij pozostałe {{count}} boostery dodatkiem {{name}}",
+    "startDraft": "Rozpocznij draft",
+    "startSealed": "Rozpocznij sealed"
   },
   "pack": {
     "confirmPick": "Potwierdź wybór",
+    "selected": "Wybrano",
     "draftEffects": "Efekty draftu:",
     "waitingNext": "Oczekiwanie na następny booster...",
-    "cardsInPack": "{{count}} kart w boosterze",
+    "cardsInPack_one": "{{count}} karta w boosterze",
+    "cardsInPack_few": "{{count}} karty w boosterze",
+    "cardsInPack_many": "{{count}} kart w boosterze",
+    "cardsInPack_other": "{{count}} karty w boosterze",
+    "currentPick": "Booster {{pack}} Wybór {{pick}}",
     "picking": "Wybieranie…",
-    "autoPick": "Wybór automatyczny"
+    "autoPick": "Wybór automatyczny",
+    "scale": "Rozmiar boostera",
+    "scaleDecrease": "Zmniejsz rozmiar boostera",
+    "scaleReset": "Resetuj rozmiar boostera",
+    "scaleIncrease": "Zwiększ rozmiar boostera",
+    "pickToDeck": "Wybierz {{card}} do talii",
+    "pickToSideboard": "Wybierz {{card}} do sideboardu"
   },
   "sealedOpening": {
     "title": "Otwórz swoją pulę Sealed",
@@ -94,15 +130,22 @@
     "nextPack": "Następny booster",
     "viewPool": "Zobacz swoją pulę",
     "poolTitle": "Twoja pula Sealed",
-    "poolSubtitle": "Wszystkie {{count}} karty, pogrupowane według typu.",
+    "poolSubtitle_one": "{{count}} karta, pogrupowana według typu.",
+    "poolSubtitle_few": "Wszystkie {{count}} karty, pogrupowane według typu.",
+    "poolSubtitle_many": "Wszystkie {{count}} kart, pogrupowanych według typu.",
+    "poolSubtitle_other": "Wszystkie {{count}} karty, pogrupowane według typu.",
     "buildDeck": "Zbuduj talię"
   },
   "pool": {
-    "cardsDrafted": "{{count}} wybranych kart",
+    "cardsDrafted_one": "{{count}} wybrana karta",
+    "cardsDrafted_few": "{{count}} wybrane karty",
+    "cardsDrafted_many": "{{count}} wybranych kart",
+    "cardsDrafted_other": "{{count}} wybranej karty",
     "empty": "Nie wybrano jeszcze żadnych kart",
     "sortColor": "Kolor",
     "sortType": "Typ",
     "sortCmc": "CMC",
+    "grantedFiller": "+ do {{maximum}} × {{name}} (tylko jako dowódca)",
     "groups": {
       "white": "Biały",
       "blue": "Niebieski",
@@ -133,6 +176,79 @@
       "manaValue6Plus": "6+ CMC"
     }
   },
+  "workspace": {
+    "locked": "Wybór w toku.",
+    "shell": { "label": "Obszar budowy talii", "show": "Pokaż obszar budowy talii", "hide": "Ukryj obszar budowy talii", "title": "Zbuduj talię" },
+    "view": { "label": "Widok obszaru", "board": "Plansza", "compact": "Kompaktowy" },
+    "preview": { "label": "Podgląd karty", "none": "Brak", "follow": "Podążaj", "side": "Bok", "shift": "Shift" },
+    "count": {
+      "deck_one": "Talia ({{count}} karta)",
+      "deck_few": "Talia ({{count}} karty)",
+      "deck_many": "Talia ({{count}} kart)",
+      "deck_other": "Talia ({{count}} karty)",
+      "sideboard_one": "Sideboard ({{count}} karta)",
+      "sideboard_few": "Sideboard ({{count}} karty)",
+      "sideboard_many": "Sideboard ({{count}} kart)",
+      "sideboard_other": "Sideboard ({{count}} karty)"
+    },
+    "empty": { "sideboard": "Brak kart w sideboardzie" },
+    "sideboard": {
+      "expand_one": "Pokaż sideboard ({{count}} karta)",
+      "expand_few": "Pokaż sideboard ({{count}} karty)",
+      "expand_many": "Pokaż sideboard ({{count}} kart)",
+      "expand_other": "Pokaż sideboard ({{count}} karty)",
+      "collapse": "Ukryj sideboard"
+    },
+    "pool": {
+      "label": "Pula kart",
+      "filterLabel": "Filtr strefy puli",
+      "sortLabel": "Sortowanie puli",
+      "empty": "Brak kart w tym widoku",
+      "filter": {
+        "combined_one": "Wszystkie ({{count}})",
+        "combined_few": "Wszystkie ({{count}})",
+        "combined_many": "Wszystkie ({{count}})",
+        "combined_other": "Wszystkie ({{count}})",
+        "deck_one": "Talia ({{count}})",
+        "deck_few": "Talia ({{count}})",
+        "deck_many": "Talia ({{count}})",
+        "deck_other": "Talia ({{count}})",
+        "sideboard_one": "Sideboard ({{count}})",
+        "sideboard_few": "Sideboard ({{count}})",
+        "sideboard_many": "Sideboard ({{count}})",
+        "sideboard_other": "Sideboard ({{count}})"
+      }
+    },
+    "compact": { "sideboardRegion": "Kompaktowy sideboard" },
+    "toolbar": { "label": "Układ planszy" },
+    "layout": { "label": "Układ", "columns": "Kolumny", "maxPerRow": "Maksymalna liczba kolumn w wierszu", "decreaseMaxPerRow": "Zmniejsz maksymalną liczbę kolumn w wierszu", "increaseMaxPerRow": "Zwiększ maksymalną liczbę kolumn w wierszu" },
+    "sort": { "label": "Sortuj planszę", "cmc": "Wartość many", "color": "Kolor", "rarity": "Rzadkość", "type": "Typ" },
+    "rows": { "label": "Rzędy planszy", "one": "Jeden rząd", "two": "Dwa rzędy" },
+    "rowHeaders": { "creatures": "Stwory", "nonCreatures": "Nie-stwory" },
+    "columns": { "label": "Kolumny planszy", "add": "Dodaj kolumnę", "removeFinal": "Usuń ostatnią kolumnę", "removeHeader": "Usuń kolumnę {{column}}" },
+    "headers": {
+      "compact": "Nagłówki",
+      "show": "Pokaż nagłówki",
+      "addedBasics": "Dodane lądy podstawowe",
+      "unclassified": "Niesklasyfikowane",
+      "emptyOrdinal": "Pusta kolumna {{column}}",
+      "accessible_one": "Kolumna {{column}}: {{labels}}, {{count}} karta",
+      "accessible_few": "Kolumna {{column}}: {{labels}}, {{count}} karty",
+      "accessible_many": "Kolumna {{column}}: {{labels}}, {{count}} kart",
+      "accessible_other": "Kolumna {{column}}: {{labels}}, {{count}} karty"
+    },
+    "card": {
+      "inspect": "Obejrzyj {{card}}",
+      "moveToZone": "Przenieś {{card}} do {{zone}}"
+    },
+    "zone": { "deck": "Talia", "sideboard": "Sideboard" },
+    "drop": { "zone": "Upuść w tej strefie", "column": "Upuść w tej kolumnie", "row": "Upuść w tym rzędzie" },
+    "drag": { "started": "Przeciąganie {{card}}.", "target": "Upuść w {{zone}}, kolumna {{column}}.", "success": "Wybrano {{card}}.", "moved": "Przeniesiono {{card}}.", "cancelled": "Anulowano wybór.", "rejected": "Nie udało się wybrać {{card}}. Karta została przywrócona.", "dispatchError": "Nie udało się wysłać {{card}}. Spróbuj ponownie." },
+    "announcement": {
+      "moved": "Przeniesiono {{card}} do {{zone}}, kolumna {{column}}, pozycja {{position}}.",
+      "columnRemoved": "Usunięto kolumnę {{column}} i przebudowano planszę."
+    }
+  },
   "standings": {
     "title": "Klasyfikacja — Runda {{round}}",
     "rank": "#",
@@ -152,7 +268,17 @@
     "emptyDeckHint": "Klikaj karty z puli, aby dodać je do talii.",
     "addableCards": "Karty do dodania",
     "searchAddableCards": "Szukaj kart do dodania...",
+    "addLands": "Dodaj ziemie",
+    "snowCovered": "Pokryte śniegiem",
     "autoLands": "Automatyczne ziemie",
+    "averageManaCost": "Średni koszt many",
+    "manaColor": "Kolor many",
+    "countInCost": "Liczba w koszcie",
+    "type": "Typ",
+    "count": "Liczba",
+    "percent": "%",
+    "basicLand": "Ziemia podstawowa",
+    "total": "Razem",
     "suggestDeck": "Zaproponuj talię",
     "submitDeck": "Zatwierdź talię",
     "validationTitle": "Talia wymaga uwagi",
@@ -161,11 +287,18 @@
     "addCard": "Dodaj {{name}}",
     "cardCount": "/ {{min}} kart",
     "spellCount_one": "{{count}} czar",
-    "spellCount_other": "{{count}} czarów",
+    "spellCount_few": "{{count}} czary",
+    "spellCount_many": "{{count}} czarów",
+    "spellCount_other": "{{count}} czaru",
     "landCount_one": "{{count}} ziemia",
-    "landCount_other": "{{count}} ziem",
+    "landCount_few": "{{count}} ziemie",
+    "landCount_many": "{{count}} ziem",
+    "landCount_other": "{{count}} ziemi",
     "readyToSubmit": "gotowe do zatwierdzenia",
-    "moreNeeded": "potrzeba jeszcze {{count}}"
+    "moreNeeded": "potrzeba jeszcze {{count}}",
+    "commanderRequired": "Wyznacz dowódcę ze swojej puli, aby przesłać talię.",
+    "commanderUnavailable": "Wyznaczanie dowódcy jest w tej chwili niedostępne — nie udało się wczytać bazy kart.",
+    "grantedFiller": "Twoja pula zawiera także do {{maximum}} × {{name}}, do użycia wyłącznie jako dowódca."
   },
   "landing": {
     "title": "Draft",
@@ -187,6 +320,10 @@
     "podDraft": {
       "title": "Draft w grupie",
       "description": "Załóż lub dołącz do grupy liczącej do 8 graczy, draftujcie razem na żywo, a potem rozegrajcie turniej szwajcarski lub na wylot."
+    },
+    "commanderDraft": {
+      "title": "Commander Draft",
+      "description": "Draftuj po dwie karty naraz w grupie, zbuduj talię Commander z 60 kart, a potem rozegraj jedną grę wieloosobową."
     },
     "podInProgress": "Trwa draft w grupie",
     "guestPodInProgress": "Dołączony pod gotowy do ponownego połączenia",
@@ -328,6 +465,8 @@
     "kindTraditionalDesc": "Mecze turniejowe do dwóch wygranych po budowaniu talii, z wymianą kart bocznych między grami.",
     "kindSealed": "Sealed",
     "kindSealedDesc": "Otwórz sześć boosterów bezpośrednio do puli każdego gracza, a następnie zbuduj talię turniejową do jednej wygranej.",
+    "kindCommanderDraft": "Commander",
+    "kindCommanderDraftDesc": "Każdy gracz draftuje po dwie karty naraz i buduje talię Commander z 60 kart, a potem grupa rozgrywa jedną grę wieloosobową.",
     "tournamentFormat": "Format turnieju",
     "tournamentSwiss": "Szwajcarski",
     "tournamentSwissDesc": "Wszyscy grają przez trzy rundy, nawet po porażce.",
@@ -341,7 +480,8 @@
     "podSize": "Rozmiar grupy",
     "podSizeDesc": "Łącznie {{count}} miejsc. Puste miejsca można wypełnić botami z poczekalni przed rozpoczęciem draftu.",
     "playerCount": "{{count}} graczy",
-    "setSelectorHint": "Wybierz dodatek do draftu na końcu. Wybór dodatku wczytuje jego pulę kart i tworzy pokój grupy.",
+    "setSelectorHint": "Ułóż dodatki, które draftuje twój pod — po jednym na booster, w kolejności otwierania. Podaj jeden dodatek, aby wypełnić nim każdy booster. Utworzenie podu wczytuje pule.",
+    "createPod": "Utwórz pod",
     "loadingPool": "Wczytywanie danych puli dodatku...",
     "roomCode": "Kod pokoju",
     "roomCodePlaceholder": "Wpisz kod pokoju...",
@@ -390,6 +530,7 @@
   },
   "podComplete": {
     "title": "Draft zakończony",
+    "launchCommanderGame": "Rozpocznij grę Commander",
     "returnToMenu": "Powrót do menu"
   },
   "podError": {

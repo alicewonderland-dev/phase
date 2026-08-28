@@ -32,6 +32,7 @@ import type {
   CardPreviewMode,
   CardSizePreference,
   CommandZoneDisplay,
+  DraftCardPreviewMode,
   LogDefaultState,
   MultiplayerBoardLayout,
   SpellPaymentMode,
@@ -47,7 +48,9 @@ import { MenuSelect } from "../ui/MenuSelect";
 import { downloadBackup, importBackupFromFile, type ImportMode } from "../../services/backup.ts";
 import { isDesktopTauri } from "../../services/platform.ts";
 import { useCloudSyncStore } from "../../stores/cloudSyncStore.ts";
+import { useSetCatalog } from "../../hooks/useSetSymbols.ts";
 import { DiscordIcon, GoogleIcon } from "../ui/ProviderIcons";
+import { VisualPackManager } from "./visual-packs/VisualPackManager.tsx";
 
 export type SettingsHighlight = "board-background";
 
@@ -73,6 +76,8 @@ const CARD_SIZES: CardSizePreference[] = ["small", "medium", "large"];
 const COMMAND_ZONE_DISPLAYS: CommandZoneDisplay[] = ["auto", "inline", "compact"];
 const ZONE_COLLAPSE_MODES: ZoneCollapseMode[] = ["auto", "on", "off"];
 const CARD_PREVIEW_MODES: CardPreviewMode[] = ["follow", "side", "shift"];
+const DRAFT_CARD_PREVIEW_MODES: DraftCardPreviewMode[] = ["none", ...CARD_PREVIEW_MODES];
+const DRAFT_DOUBLE_CLICK_CONFIRM_PICK_OPTIONS: Array<"disabled" | "enabled"> = ["disabled", "enabled"];
 const SPELL_PAYMENT_MODES: SpellPaymentMode[] = ["auto", "autoExceptSacrificialMana", "manual"];
 const LOG_DEFAULTS: LogDefaultState[] = ["open", "closed"];
 const VFX_QUALITIES: VfxQuality[] = ["full", "reduced", "minimal"];
@@ -202,6 +207,10 @@ export function PreferencesModal({
   const setBattlefieldPeekOnHover = usePreferencesStore((s) => s.setBattlefieldPeekOnHover);
   const cardPreviewMode = usePreferencesStore((s) => s.cardPreviewMode) ?? "follow";
   const setCardPreviewMode = usePreferencesStore((s) => s.setCardPreviewMode);
+  const draftCardPreviewMode = usePreferencesStore((s) => s.draftCardPreviewMode) ?? "none";
+  const setDraftCardPreviewMode = usePreferencesStore((s) => s.setDraftCardPreviewMode);
+  const draftDoubleClickConfirmPick = usePreferencesStore((s) => s.draftDoubleClickConfirmPick) ?? true;
+  const setDraftDoubleClickConfirmPick = usePreferencesStore((s) => s.setDraftDoubleClickConfirmPick);
   const cardPreviewHoverDelayMs = usePreferencesStore((s) => s.cardPreviewHoverDelayMs) ?? 0;
   const setCardPreviewHoverDelayMs = usePreferencesStore((s) => s.setCardPreviewHoverDelayMs);
   const showCardPreviewFooter = usePreferencesStore((s) => s.showCardPreviewFooter) ?? true;
@@ -544,6 +553,29 @@ export function PreferencesModal({
                     </p>
                   </SettingGroup>
 
+                  <SettingGroup label={t("visual.draftCardPreview")}>
+                    <SegmentedControl
+                      options={DRAFT_CARD_PREVIEW_MODES}
+                      value={draftCardPreviewMode}
+                      onChange={setDraftCardPreviewMode}
+                      renderLabel={(option) => option === "none"
+                        ? t("visual.draftCardPreviewOff")
+                        : t(`visual.cardPreviewOptions.${option}`)}
+                    />
+                    <p className="mt-1.5 text-xs text-slate-400">
+                      {t("visual.draftCardPreviewHint")}
+                    </p>
+                  </SettingGroup>
+
+                  <SettingGroup label={t("visual.draftDoubleClickConfirmPick")}>
+                    <SegmentedControl
+                      options={DRAFT_DOUBLE_CLICK_CONFIRM_PICK_OPTIONS}
+                      value={draftDoubleClickConfirmPick ? "enabled" : "disabled"}
+                      onChange={(option) => setDraftDoubleClickConfirmPick(option === "enabled")}
+                      renderLabel={(option) => t(`visual.draftDoubleClickConfirmPickOptions.${option}`)}
+                    />
+                  </SettingGroup>
+
                   {/* Hover latency only applies to the hover-driven modes; the
                       "shift" bind-key mode is keypress-triggered, so the control
                       is mutually exclusive with it and hidden in that mode. */}
@@ -775,6 +807,7 @@ export function PreferencesModal({
 
               {activeTab === "data" && (
         <>
+          <VisualPackManager />
           <CloudSyncSection />
           <DataSection />
         </>
@@ -1367,12 +1400,6 @@ const ART_CHAIN_RULE_OPTIONS: { type: ArtChainEntry["type"]; labelKey: string }[
   { type: "prefer_extended", labelKey: "artChain.rules.preferExtended" },
 ];
 
-interface ScryfallSetInfo {
-  name: string;
-  icon_svg_uri: string;
-  released_at: string;
-}
-
 function artChainEntryLabel(entry: ArtChainEntry, t: TFunction<"settings">): string {
   switch (entry.type) {
     // `entry.label` is the Scryfall set name (engine/asset data) — left raw.
@@ -1402,14 +1429,7 @@ function ArtChainEditor({
 }) {
   const { t } = useTranslation("settings");
   const [setInput, setSetInput] = useState("");
-  const [scryfallSets, setScryfallSets] = useState<Record<string, ScryfallSetInfo> | null>(null);
-
-  useEffect(() => {
-    fetch(__SCRYFALL_SETS_URL__)
-      .then((r) => r.json() as Promise<Record<string, ScryfallSetInfo>>)
-      .then(setScryfallSets)
-      .catch(() => {});
-  }, []);
+  const { catalog: scryfallSets } = useSetCatalog();
 
   const resolveSetCode = useCallback(
     (input: string): { code: string; label: string } | null => {

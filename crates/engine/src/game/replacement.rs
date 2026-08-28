@@ -5062,6 +5062,7 @@ fn bind_search_found_definition(
                         cast_cost_raise: None,
                         land_enter_tapped,
                         invalidation: None,
+                        provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
                     },
                 target: TargetFilter::ParentTarget,
                 grantee: PermissionGrantee::AbilityController,
@@ -7720,6 +7721,7 @@ impl ReplacementPromptCauses {
         Self(cause.bit())
     }
 
+    #[cfg(test)]
     pub(crate) const fn contains(self, cause: ReplacementPromptCause) -> bool {
         self.0 & cause.bit() != 0
     }

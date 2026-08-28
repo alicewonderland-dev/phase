@@ -416,6 +416,7 @@ pub fn room_effects(
             let grant = simple(
                 Effect::GrantCastingPermission {
                     permission: CastingPermission::PlayFromExile {
+                        provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
                         duration: Duration::UntilEndOfTurn,
                         // Placeholder — rewritten to ability.controller at
                         // grant time by `grant_permission::resolve`.

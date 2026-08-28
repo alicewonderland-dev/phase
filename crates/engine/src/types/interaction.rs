@@ -551,6 +551,7 @@ pub enum InteractionActionCode {
     CastSpellAsMiracle,
     CastSpellAsMadness,
     DecideOptionalEffect,
+    ChooseResolutionOptionalPaymentBranch,
     RespondToSpliceOffer,
     DecideOptionalEffectAndRemember,
     PayUnlessCost,

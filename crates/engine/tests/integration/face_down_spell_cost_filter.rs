@@ -339,6 +339,7 @@ fn exile_morph_with_competing_permissions(
     });
     obj.casting_permissions
         .push(CastingPermission::PlayFromExile {
+            provenance: engine::types::ability::PlayFromExileProvenance::Impulse,
             duration: Duration::UntilEndOfTurn,
             granted_to: P0,
             frequency: CastFrequency::Unlimited,
@@ -363,28 +364,33 @@ fn exile_morph_with_competing_permissions(
 /// (no raise) and displays {3} while the payment takes {5}.
 #[test]
 fn the_face_down_offer_from_exile_prices_the_play_from_exile_raise() {
-    use engine::types::actions::AlternativeCastDecision;
-    use engine::types::game_state::{AlternativeCastKeyword, WaitingFor};
+    use engine::types::game_state::WaitingFor;
 
     let (mut runner, morph) = exile_morph_with_competing_permissions(5);
 
     assert!(cast(&mut runner, morph), "the cast must be accepted");
-    match &runner.state().waiting_for {
-        WaitingFor::AlternativeCastChoice {
-            keyword: AlternativeCastKeyword::FaceDown,
-            alternative_cost: Some(cost),
-            ..
-        } => assert_eq!(
-            cost.mana_value(),
-            5,
-            "the offer must price the PlayFromExile raise: {{3}}+{{2}}, got {cost:?}"
-        ),
-        other => panic!("expected the face-down AlternativeCastChoice, got {other:?}"),
-    }
+    // #7948: with the face-down cast now a first-class exile CANDIDATE, the
+    // method election surfaces as a `CastingVariantChoice` (FaceDown beside
+    // Foretell) instead of the old normal-vs-face-down offer — the priced
+    // option must still show the `PlayFromExile` raise: {3}+{2}={5}.
+    let index = match &runner.state().waiting_for {
+        WaitingFor::CastingVariantChoice { options, .. } => {
+            let index = options
+                .iter()
+                .position(|o| o.variant == engine::types::game_state::CastingVariant::FaceDown)
+                .expect("the face-down variant must be offered");
+            assert_eq!(
+                options[index].mana_cost.mana_value(),
+                5,
+                "the offer must price the PlayFromExile raise: {{3}}+{{2}}, got {:?}",
+                options[index].mana_cost
+            );
+            index
+        }
+        other => panic!("expected the casting-variant choice, got {other:?}"),
+    };
     runner
-        .act(GameAction::ChooseAlternativeCast {
-            choice: AlternativeCastDecision::Alternative,
-        })
+        .act(GameAction::ChooseCastingVariant { index })
         .expect("the priced face-down cast must complete");
     assert!(
         runner.state().objects[&morph].face_down

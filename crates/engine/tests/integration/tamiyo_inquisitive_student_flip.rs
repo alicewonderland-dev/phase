@@ -88,6 +88,7 @@ fn tamiyo_third_draw_returns_transformed_not_stranded_in_exile() {
         .get_mut(&tamiyo)
         .unwrap()
         .back_face = Some(BackFaceData {
+        is_swap_snapshot: false,
         name: "Tamiyo, Seasoned Scholar".to_string(),
         power: None,
         toughness: None,

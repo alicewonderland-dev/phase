@@ -123,22 +123,17 @@ jobs:
           fi
           ./scripts/check-test-card-data-load.sh "$BASE"
 
-  rust-test:
-    name: Rust tests (shard ${{ matrix.shard }}/4)
+  rust-test-build:
+    name: Rust tests (build archive)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
 
       - name: Free runner disk for Rust test linking
-        # The nextest count partition splits execution, but each shard still
-        # runs `cargo test --no-run` for the whole workspace. Keep the Rust
-        # caches intact and reclaim only unused hosted-image payloads before
-        # setup-rust-toolchain restores/saves Cargo state.
+        # Build the workspace's test binaries once. Keep the Rust caches intact
+        # and reclaim only unused hosted-image payloads before setup-rust-toolchain
+        # restores/saves Cargo state.
         run: |
           echo "Disk before cleanup:"
           df -h /
@@ -174,13 +169,89 @@ jobs:
         with:
           tool: cargo-nextest
 
+      - name: Build test archive
+        # This is the only Rust test compilation. The archive includes all
+        # test binaries and their runtime dependencies for the shard jobs.
+        run: cargo nextest archive --profile ci --workspace --exclude phase-tauri --features engine/proptest --archive-file nextest-archive.tar.zst
+
+      - name: Build binaries launched by integration tests
+        # `CARGO_BIN_EXE_*` embeds target/debug paths. Nextest's archive does
+        # not preserve those launcher paths, so share the two binaries the
+        # integration tests execute directly with every shard.
+        run: |
+          cargo build -p probe-pin
+          cargo build -p phase-ai --bin ai-commander
+
+      - name: Upload test archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive
+          path: nextest-archive.tar.zst
+          compression-level: 0
+          retention-days: 1
+
+      - name: Upload test runtime binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-runtime-binaries
+          path: |
+            target/debug/probe-pin
+            target/debug/ai-commander
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  rust-test:
+    name: Rust tests (shard ${{ matrix.shard }}/4)
+    needs: rust-test-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Some snapshot tests query Cargo metadata at runtime. This makes Cargo
+      # available but does not build test binaries; those come from the archive.
+      # Do not restore or save a Rust target cache: the archive is the cache.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: wasm32-unknown-unknown
+          cache: false
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Download test archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+
+      - name: Prepare test archive destination
+        run: mkdir -p target
+
+      - name: Download test runtime binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: test-runtime-binaries
+          path: target/debug
+
+      - name: Restore test runtime binary permissions
+        # Actions artifacts preserve file contents but not executable bits.
+        run: chmod +x target/debug/probe-pin target/debug/ai-commander
+
       - name: Run tests
+        # The archive retains build options. Each shard only extracts it and
+        # executes its partition; it does not invoke Cargo or compile Rust.
         # PROPTEST_CASES split: PRs run a smaller case count for fast feedback;
         # pushes to main run the default (256) so any property regression is
         # caught before it lands on the branch that feeds staging/preview.
         env:
           PROPTEST_CASES: ${{ github.event_name == 'pull_request' && '32' || '256' }}
-        run: cargo nextest run --profile ci --partition count:${{ matrix.shard }}/4 --workspace --exclude phase-tauri --features engine/proptest --status-level fail --final-status-level fail
+        run: cargo-nextest nextest run --profile ci --partition count:${{ matrix.shard }}/4 --archive-file nextest-archive.tar.zst --extract-to target --status-level fail --final-status-level fail
 
   card-data-gate:
     name: Card data (generate, validate, coverage)
@@ -795,6 +866,7 @@ jobs:
     timeout-minutes: 5
     needs:
       - rust-lint
+      - rust-test-build
       - rust-test
       - card-data-gate
       - draft-pools
@@ -806,6 +878,7 @@ jobs:
       - name: Check split Rust jobs
         env:
           RUST_LINT_RESULT: ${{ needs.rust-lint.result }}
+          RUST_TEST_BUILD_RESULT: ${{ needs.rust-test-build.result }}
           RUST_TEST_RESULT: ${{ needs.rust-test.result }}
           CARD_DATA_RESULT: ${{ needs.card-data-gate.result }}
           DRAFT_POOLS_RESULT: ${{ needs.draft-pools.result }}
@@ -813,6 +886,10 @@ jobs:
           TAURI_RESULT: ${{ needs.tauri-check.result }}
           ANDROID_RESULT: ${{ needs.android-debug-apk.result }}
         run: |
+          if [ "$RUST_TEST_BUILD_RESULT" != "success" ]; then
+            echo "Rust test archive build failed: $RUST_TEST_BUILD_RESULT"
+            exit 1
+          fi
           results="$RUST_LINT_RESULT $RUST_TEST_RESULT $CARD_DATA_RESULT $DRAFT_POOLS_RESULT $WASM_RESULT $TAURI_RESULT $ANDROID_RESULT"
           # `skipped` is a pass: draft-pools is main-only and is skipped on PRs.
           for result in $results; do

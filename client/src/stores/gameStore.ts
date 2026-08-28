@@ -16,12 +16,14 @@ import type {
   PlayerId,
   PersistedGameState,
   RewindOption,
+  RestoredStackAutomationPresentation,
   StuckDecisionDiagnostic,
   WaitingFor,
 } from "../adapter/types";
 import type { ViewerInteraction } from "../adapter/generated/interaction";
 import { MAX_UNDO_HISTORY, UNDOABLE_ACTIONS } from "../constants/game";
 import { applySpellPaymentPreference } from "../game/castPaymentMode";
+import { reportStructuredActionRejection } from "../game/actionRejectionReporter";
 import { getPlayerId } from "../hooks/usePlayerId";
 import { loadCheckpoints, saveAuthoritativeGame } from "../services/gamePersistence";
 import { resetStackThroughput } from "../utils/stackThroughput";
@@ -235,19 +237,8 @@ interface GameStoreState {
    * game has started).
    */
   lobbyProgress: { joined: number; total: number } | null;
-  /**
-   * Live stack-resolution progress during a large auto-resolve / "Resolve All"
-   * drain, populated per chunk by `dispatchResolveAll` and cleared when the
-   * drain finishes. `null` when no resolution storm is in flight. Display-only:
-   * `resolved`/`total` are engine-provided counts, never frontend-derived.
-   */
-  resolutionProgress: { resolved: number; total: number } | null;
-  /**
-   * True while the worker is draining a Resolve All batch. Separate from
-   * `resolutionProgress` because small drains may finish without showing the
-   * storm progress overlay, but controls should still be disabled.
-   */
-  isResolvingAll: boolean;
+  /** One-shot engine-authored summary of automation completed during a restore. */
+  restoredStackAutomation: RestoredStackAutomationPresentation | null;
   /**
    * Pure-data carrier for the starting-player d20 contest (CR 103.1): the
    * game-start `DieRolled` batch plus the engine's authoritative starting
@@ -390,8 +381,7 @@ interface GameStoreActions {
   setGameMode: (mode: GameMode) => void;
   setEngineMode: (mode: "native" | "wasm" | null, fallbackReason?: string | null) => void;
   setLobbyProgress: (progress: { joined: number; total: number } | null) => void;
-  setResolutionProgress: (progress: { resolved: number; total: number } | null) => void;
-  setIsResolvingAll: (isResolvingAll: boolean) => void;
+  dismissRestoredStackAutomation: () => void;
   setManaPaymentPreviewSourceIds: (sourceIds: ObjectId[]) => void;
   clearManaPaymentPreview: () => void;
   /** Clear the starting-player contest after the overlay has consumed it. */
@@ -423,9 +413,10 @@ async function seedResumedServerGame(
   // one just played; stale churn must not carry across.
   resetStackThroughput();
   await adapter.initialize();
-  // Fetched after `initialize()` restored/attached the engine state, so the
-  // snapshot is newest-by-construction and always passes the commit gate.
-  const snapshot = await adapter.getSnapshot();
+  const resumed = await adapter.resumeRestoredGameState?.() ?? null;
+  // P2P host initialization completes its persisted automation before a guest
+  // reconnects. Consume that exact pair rather than making a second read.
+  const snapshot = resumed?.snapshot ?? await adapter.getSnapshot();
   get().commitEngineSnapshot(snapshot, {
     extraState: {
       gameId,
@@ -438,6 +429,7 @@ async function seedResumedServerGame(
       stateHistory: [],
       turnCheckpoints: [],
       rewindTargets: [],
+      restoredStackAutomation: resumed?.presentation ?? null,
     },
   });
 }
@@ -467,8 +459,7 @@ const initialState: GameStoreState = {
   turnCheckpoints: [],
   rewindTargets: [],
   lobbyProgress: null,
-  resolutionProgress: null,
-  isResolvingAll: false,
+  restoredStackAutomation: null,
   startingContest: null,
   aiSeatIds: [],
   lastCommittedSeq: 0,
@@ -592,6 +583,7 @@ export const useGameStore = create<GameStore>()(
           turnCheckpoints: [],
           rewindTargets: [],
           startingContest,
+          restoredStackAutomation: null,
         },
       });
       void saveAuthoritativeGame(gameId, adapter, state);
@@ -603,8 +595,10 @@ export const useGameStore = create<GameStore>()(
       resetStackThroughput();
       await adapter.initialize();
       await adapter.restoreState(savedState);
-      // Post-restore fetch — newest-by-construction, so it always passes the gate.
-      const snapshot = await adapter.getSnapshot();
+      // Saved-game loading is the sole client restore boundary that resumes an
+      // engine-owned stack session. Undo and developer restores stay pure.
+      const resumed = await adapter.resumeRestoredGameState?.() ?? null;
+      const snapshot = resumed?.snapshot ?? await adapter.getSnapshot();
       const savedCheckpoints = await loadCheckpoints(gameId);
       get().commitEngineSnapshot(snapshot, {
         extraState: {
@@ -618,8 +612,10 @@ export const useGameStore = create<GameStore>()(
           stateHistory: [],
           turnCheckpoints: savedCheckpoints,
           rewindTargets: [],
+          restoredStackAutomation: resumed?.presentation ?? null,
         },
       });
+      await saveAuthoritativeGame(gameId, adapter, snapshot.state);
     },
 
     resumeP2PHost: async (gameId, adapter) => {
@@ -661,7 +657,18 @@ export const useGameStore = create<GameStore>()(
       // `getPlayerId()` returns the local human's authenticated seat ID.
       // The engine rejects the action if this doesn't match the authorized
       // submitter — never trust the UI to route actions to the right seat.
-      const result = await adapter.submitAction(submittedAction, getPlayerId());
+      let result: Awaited<ReturnType<EngineAdapter["submitAction"]>>;
+      try {
+        result = await adapter.submitAction(submittedAction, getPlayerId());
+      } catch (err) {
+        if (reportStructuredActionRejection(err) === "stale") {
+          const snapshot = await adapter.getSnapshot();
+          get().commitEngineSnapshot(snapshot, { events: [], logEntries: [] });
+          if (gameId) void saveAuthoritativeGame(gameId, adapter, snapshot.state);
+          return [];
+        }
+        throw err;
+      }
       // ONE atomic pair — a separate getState()/getLegalActions() pair could
       // straddle an engine advance and commit a mismatched state/actions pair.
       const snapshot = await adapter.getSnapshot();
@@ -674,6 +681,7 @@ export const useGameStore = create<GameStore>()(
         events: result.events,
         logEntries: result.log_entries ?? [],
         stateHistory,
+        extraState: { restoredStackAutomation: null },
       });
 
       if (gameId) void saveAuthoritativeGame(gameId, adapter, snapshot.state);
@@ -699,6 +707,7 @@ export const useGameStore = create<GameStore>()(
         extraState: {
           events: [],
           stateHistory: stateHistory.slice(0, -1),
+          restoredStackAutomation: null,
         },
       });
     },
@@ -731,12 +740,8 @@ export const useGameStore = create<GameStore>()(
       set({ lobbyProgress: progress });
     },
 
-    setResolutionProgress: (progress) => {
-      set({ resolutionProgress: progress });
-    },
-
-    setIsResolvingAll: (isResolvingAll) => {
-      set({ isResolvingAll });
+    dismissRestoredStackAutomation: () => {
+      set({ restoredStackAutomation: null });
     },
 
     setManaPaymentPreviewSourceIds: (sourceIds) => {

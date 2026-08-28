@@ -301,5 +301,6 @@ fn candidate_discards_controller(ctx: &PolicyContext<'_>) -> bool {
         | GameAction::DeclineShortcut
         | GameAction::PrecastCopyShortcut { .. }
         | GameAction::EndContinuousEffect { .. } => false,
+        GameAction::ChooseResolutionOptionalPaymentBranch { .. } => false,
     }
 }

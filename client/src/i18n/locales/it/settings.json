@@ -89,6 +89,14 @@
       "side": "L'anteprima si ancora al bordo dello schermo, così non copre mai il campo di battaglia.",
       "shift": "L'anteprima appare solo mentre tieni premuto il tasto Shift, come in Tabletop Simulator."
     },
+    "draftCardPreview": "Anteprima carte durante il draft",
+    "draftCardPreviewOff": "Disattivata",
+    "draftCardPreviewHint": "Si applica solo durante il draft e la costruzione del mazzo draft.",
+    "draftDoubleClickConfirmPick": "Conferma scelta con doppio clic nel draft",
+    "draftDoubleClickConfirmPickOptions": {
+      "disabled": "Disabilitata",
+      "enabled": "Abilitata"
+    },
     "cardPreviewFooter": "Informazioni dell'anteprima",
     "showCardPreviewFooter": "Mostra le informazioni sotto le anteprime delle carte",
     "cardPreviewFooterHint": "Include il nome della carta, le abilità attivate disponibili e i suggerimenti da tastiera. Alt apre comunque i dettagli di analisi quando questa opzione è nascosta.",
@@ -199,6 +207,134 @@
     "skippedMalformed_other": "Saltate {{count}} voci malformate.",
     "telemetry": "Invia segnalazioni anonime di arresti anomali e utilizzo",
     "telemetryDescription": "Aiuta a correggere gli arresti anomali e a dare priorità al supporto delle carte. Nessun account, nessun dato personale — solo conteggi di errori e riepiloghi di partita."
+  },
+  "visualPacks": {
+    "title": "Catalogo visivo offline",
+    "description": "Scegli le immagini da conservare su questo dispositivo. Il catalogo delle carte viene memorizzato nella cache da Scryfall, poi ogni immagine viene scaricata direttamente da Scryfall.",
+    "availability": {
+      "loading": "Verifica del supporto del catalogo visivo offline…",
+      "browser": "Questo browser non offre le funzioni di archiviazione locale necessarie per i download di immagini offline.",
+      "browserFuture": "Usa un browser desktop aggiornato con Cache Storage, IndexedDB e supporto alla decompressione gzip.",
+      "unsupported": "Questa app desktop è troppo vecchia per gestire i cataloghi visivi offline. Aggiorna l'app per continuare.",
+      "empty": "Nessun catalogo visivo attendibile è stato ancora scaricato.",
+      "invalid": "Non è possibile considerare attendibile il catalogo visivo locale. Aggiornalo prima di continuare."
+    },
+    "selector": {
+      "title": "Selezione del catalogo",
+      "core": "Retro della carta",
+      "printing": "Stampe inglesi",
+      "locale": "Stampe di set localizzate",
+      "complete": "Tutte le immagini attuali delle carte inglesi",
+      "setCode": "Codice del set",
+      "setPlaceholder": "ad es. fin",
+      "language": "Linguaggio dell'immagine",
+      "currentRoot": "Radice del catalogo corrente: {{root}}",
+      "invalidSet": "Immettere un codice set di caratteri valido da tre a sei caratteri."
+    },
+    "actions": {
+      "estimate": "Scarica preventivo",
+      "estimating": "Scansione del catalogo Scryfall…",
+      "install": "Installa la selezione",
+      "cancel": "Annulla l'operazione",
+      "resume": "Riprendere l'operazione",
+      "retry": "Riprova",
+      "refresh": "Controlla il catalogo Scryfall",
+      "refreshing": "Controllo del catalogo Scryfall…",
+      "verifyMetadata": "Verifica i metadati",
+      "verifyFull": "Verifica tutti i file",
+      "repair": "Riparazione selezionata",
+      "removeSelected": "Rimuovi selezionato",
+      "removeComplete": "Rimuovere il catalogo completo",
+      "removeAll": "Rimuovi tutti gli elementi visivi offline"
+    },
+    "estimate": {
+      "title": "Analisi dell'istantanea di Scryfall"
+    },
+    "metrics": {
+      "assetRecords": "Registri patrimoniali",
+      "uniqueObjects": "Oggetti unici",
+      "logicalImageBytes": "Byte di immagine logici",
+      "uniqueImageBytes": "Byte di immagine univoci",
+      "shardCount": "Frammenti",
+      "shardBytes": "Byte shard"
+    },
+    "operation": {
+      "title": "Operazione attuale",
+      "states": {
+        "downloading": "Download in corso",
+        "cancel_requested": "Richiesta cancellazione",
+        "finalizing": "Finalizzazione",
+        "failed": "Non riuscito: pronto per riprendere",
+        "completed": "Completato",
+        "cancelled": "Annullato"
+      },
+      "id": "Operazione",
+      "root": "Radice del catalogo",
+      "packs": "Pacchetti: {{current}} di {{total}}",
+      "objects": "Immagini: {{current}} di {{total}}",
+      "scanNote": "Il totale cresce durante la scansione dell’istantanea Scryfall. Le immagini già scaricate restano locali e vengono ignorate alla ripresa.",
+      "finalizing": "Finalizzazione dell'installazione del catalogo"
+    },
+    "status": {
+      "title": "Stato del catalogo installato",
+      "root": "Radice del catalogo",
+      "epoch": "Epoca",
+      "revision": "Revisione installata",
+      "selectorCount": "Selettori",
+      "shardCount": "Frammenti",
+      "installed": "Pacchetti installati",
+      "noneInstalled": "Nessun pacchetto visivo è installato.",
+      "upgradeAvailable": "Aggiornamento disponibile",
+      "receiptRoot": "Radice della ricevuta: {{root}}"
+    },
+    "verification": {
+      "revision": "Revisione installata verificata {{revision}}.",
+      "healthy": "Nessun problema di verifica trovato.",
+      "issues": {
+        "missing_root_witness": "Testimone della radice del catalogo mancante",
+        "invalid_root_witness": "Testimone radice catalogo non valido",
+        "receipt_metadata": "I metadati della ricevuta differiscono dal catalogo attendibile",
+        "missing_shard": "Frammento di catalogo mancante",
+        "invalid_shard": "Frammento di catalogo non valido",
+        "missing_object": "Oggetto immagine mancante",
+        "invalid_object_metadata": "Metadati dell'oggetto immagine non validi",
+        "corrupt_object": "Oggetto immagine danneggiato",
+        "dependency_drift": "I record delle dipendenze installati differiscono dal catalogo attendibile",
+        "projection_drift": "I record di ricerca installati differiscono dal catalogo attendibile"
+      }
+    },
+    "removal": {
+      "committed": "Rimozione commessa alla revisione {{revision}}."
+    },
+    "cleanup": {
+      "malformed_entry": "Non è stato possibile recuperare una voce della cache dal formato errato",
+      "unsafe_entry": "Una voce della cache non sicura è stata lasciata intatta",
+      "remove_failed": "Impossibile rimuovere un file di cache",
+      "catalog_state": "Impossibile recuperare lo stato del catalogo storico"
+    },
+    "errors": {
+      "unsupported_shell": "Questa versione dell'app non supporta i cataloghi visivi offline.",
+      "unauthorized": "Questa finestra non è autorizzata a gestire cataloghi visivi offline.",
+      "unavailable": "La gestione del catalogo visivo offline è temporaneamente non disponibile.",
+      "invalid_input": "La selezione del catalogo richiesta non è valida.",
+      "conflict": "I pacchetti installati dipendono da questa selezione.",
+      "cancelled": "L'operazione è stata annullata.",
+      "network": "La richiesta della rete del catalogo non è riuscita.",
+      "storage": "Non è stato possibile scrivere il catalogo nella memoria del dispositivo.",
+      "trust": "Non è possibile considerare attendibile la risposta del catalogo.",
+      "emit": "L'app non è riuscita a segnalare l'avanzamento del catalogo.",
+      "internal": "Impossibile completare l'operazione del catalogo."
+    },
+    "confirm": {
+      "cascadeTitle": "Rimuovere i pacchetti dipendenti?",
+      "cascadeMessage": "Gli altri pacchetti installati dipendono da {{selection}}. Rimuovere la selezione congelata e i suoi dipendenti?",
+      "cascadeAction": "Rimuovi pacchetti dipendenti",
+      "completeTitle": "Rimuovere questo catalogo completo?",
+      "completeMessage": "Rimuovere tutti i pacchetti installati dalla radice del catalogo {{selection}}?",
+      "allTitle": "Rimuovere tutte le immagini offline?",
+      "allMessage": "Rimuovere tutti i pacchetti visivi installati da questo dispositivo?",
+      "removeAction": "Rimuovi"
+    }
   },
   "resetAll": {
     "confirm": "Reimpostare tutte le preferenze ai valori predefiniti? Questo cancella ogni impostazione in questa finestra.",

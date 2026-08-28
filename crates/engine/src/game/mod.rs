@@ -217,12 +217,14 @@ pub use deck_validation::{
     DeckCompatibilityResult, DeckCoverage, SignatureSpellSelectionPolicy, UnsupportedCard,
 };
 pub use engine::{
-    apply, apply_as_current, new_game, preflight_debug_action, start_game,
-    start_game_skip_mulligan, start_game_with_starting_player, EngineError,
+    apply, apply_as_current, apply_with_rejection, new_game, preflight_debug_action,
+    preflight_debug_action_with_rejection, require_explicit_debug_permission,
+    resolve_all_ready_prefix_with_rejection, start_game, start_game_skip_mulligan,
+    start_game_with_starting_player, EngineError,
 };
 pub use engine_debug::{
-    create_debug_cards, debug_card_entry_source, route_debug_create_to_battlefield,
-    DebugCardCreateRequest,
+    create_debug_cards, create_debug_cards_with_rejection, debug_card_entry_source,
+    route_debug_create_to_battlefield, DebugCardCreateRequest,
 };
 pub use engine_resolve_batch::{
     resolve_all_fast_forward, ResolveAllCallbackDecision, ResolveAllFastForwardResult,

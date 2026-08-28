@@ -38,6 +38,7 @@ use crate::legacy_join_guard::guard_legacy_join_game;
 use crate::protocol::{ClientMessage, ServerMessage, ServerMode};
 use crate::seat_mutation_wire_guard::guard_seat_mutation;
 use crate::spectator_wire_guard::{guard_spectate_draft, guard_spectator_join};
+use engine::types::action_rejection::{ActionRejection, ActionRejectionCode};
 
 /// Validate wire fields for any inbound `ClientMessage` before handler work.
 ///
@@ -58,7 +59,6 @@ pub fn guard_client_message_before_dispatch(
         ClientMessage::Action { action } | ClientMessage::PreviewManaPayment { action, .. } => {
             guard_game_action_payload(action)
         }
-        ClientMessage::ResolveAll { .. } => Ok(()),
         ClientMessage::Interaction { submission } => {
             guard_interaction_submission_payload(submission)
         }
@@ -176,7 +176,7 @@ pub fn guard_client_message_before_dispatch(
         ClientMessage::UnregisterLobby { game_code } => validate_unregister_lobby_fields(game_code),
         ClientMessage::CreateDraftWithSettings {
             display_name,
-            set_code,
+            set_codes,
             password,
             timer_seconds,
             pod_size,
@@ -184,7 +184,7 @@ pub fn guard_client_message_before_dispatch(
             ..
         } => guard_create_draft_with_settings(
             display_name,
-            set_code,
+            set_codes,
             password,
             *timer_seconds,
             *pod_size,
@@ -222,16 +222,28 @@ pub fn wire_rejection_message(msg: &ClientMessage, reason: String) -> ServerMess
         // `MAX_INTERACTION_STRING_LEN` is 256, so a long paste is a rejected
         // decision, not a malformed frame. `ServerMessage::error` here would
         // end the match on a paste.
-        ClientMessage::Interaction { .. } => ServerMessage::ActionRejected { reason },
+        ClientMessage::Interaction { .. } => {
+            let _ = reason;
+            ServerMessage::ActionRejected {
+                rejection: ActionRejection::new(ActionRejectionCode::InteractionPayloadTooLarge),
+            }
+        }
+        ClientMessage::Action { .. } => ServerMessage::ActionRejected {
+            rejection: ActionRejection::new(ActionRejectionCode::InvalidAction),
+        },
+        ClientMessage::PreviewManaPayment { request_id, .. } => {
+            ServerMessage::ManaPaymentPreviewRejected {
+                request_id: *request_id,
+                rejection: ActionRejection::new(ActionRejectionCode::InvalidAction),
+            }
+        }
 
-        // Every other variant keeps today's behavior exactly: a bounds failure
-        // on these is a malformed frame, not a rejected decision.
+        // Every remaining variant keeps the operational-error behavior: a
+        // bounds failure on these is a malformed frame, not a rejected game
+        // decision.
         ClientMessage::ClientHello { .. }
         | ClientMessage::CreateGame { .. }
         | ClientMessage::JoinGame { .. }
-        | ClientMessage::Action { .. }
-        | ClientMessage::ResolveAll { .. }
-        | ClientMessage::PreviewManaPayment { .. }
         | ClientMessage::Reconnect { .. }
         | ClientMessage::AbandonGame
         | ClientMessage::SubscribeLobby
@@ -337,7 +349,6 @@ pub fn guard_broker_projection_inbound(msg: &ClientMessage) -> Result<(), String
         ClientMessage::CreateGame { .. }
         | ClientMessage::JoinGame { .. }
         | ClientMessage::Action { .. }
-        | ClientMessage::ResolveAll { .. }
         | ClientMessage::Interaction { .. }
         | ClientMessage::PreviewManaPayment { .. }
         | ClientMessage::Reconnect { .. }
@@ -557,12 +568,15 @@ mod tests {
     #[test]
     fn interaction_wire_rejection_answers_on_the_benign_channel() {
         let interaction = oversized_interaction_frame();
-        let reason =
+        let _reason =
             guard_client_message_before_dispatch(&interaction, ServerMode::Full).unwrap_err();
 
-        match wire_rejection_message(&interaction, reason.clone()) {
-            ServerMessage::ActionRejected { reason: answered } => {
-                assert_eq!(answered, reason);
+        match wire_rejection_message(&interaction, _reason) {
+            ServerMessage::ActionRejected { rejection } => {
+                assert_eq!(
+                    rejection.code,
+                    ActionRejectionCode::InteractionPayloadTooLarge
+                );
             }
             other => panic!("an interaction rejection must not tear the session down: {other:?}"),
         }
@@ -578,9 +592,14 @@ mod tests {
         assert!(
             matches!(
                 wire_rejection_message(&action, action_reason),
-                ServerMessage::Error { .. }
+                ServerMessage::ActionRejected {
+                    rejection: ActionRejection {
+                        code: ActionRejectionCode::InvalidAction,
+                        ..
+                    }
+                }
             ),
-            "an oversized action stays a malformed frame"
+            "an oversized action is a typed invalid action"
         );
     }
 }

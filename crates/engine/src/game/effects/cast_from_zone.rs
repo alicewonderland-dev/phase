@@ -1431,6 +1431,15 @@ fn record_lingering_permissions(
                 };
                 CastingPermission::ExileWithAltCost {
                     cost,
+                    // CR 118.9a: "without paying" substitutes the printed cost
+                    // (alternative); otherwise this grant restates the card's
+                    // own cost for a NORMAL cast — a normal-cost route that may
+                    // authorize the face-down cast (CR 702.168b).
+                    cost_provenance: if without_paying {
+                        crate::types::ability::ExileGrantCostProvenance::Alternative
+                    } else {
+                        crate::types::ability::ExileGrantCostProvenance::NormalCost
+                    },
                     cast_transformed,
                     constraint: constraint.clone(),
                     granted_to,
@@ -1488,6 +1497,7 @@ fn record_lingering_permissions(
                 });
 
                 let play_permission = CastingPermission::PlayFromExile {
+                    provenance: crate::types::ability::PlayFromExileProvenance::LandLookCompanion,
                     duration: play_duration,
                     granted_to: ability.controller,
                     frequency: CastFrequency::Unlimited,

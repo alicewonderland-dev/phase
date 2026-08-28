@@ -45,6 +45,7 @@ fn white_mana_cost() -> ManaCost {
 /// reusing the double-faced applicator would violate CR 710.1c.
 fn kenzo_alternative_face() -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
         name: "Kenzo the Hardhearted".to_string(),
         power: Some(3),
         toughness: Some(4),
@@ -105,6 +106,7 @@ Whenever this creature deals damage to an opponent, flip it.";
 /// A 2/2 Legendary Creature — Goblin Shaman with a damage-prevention static.
 fn tok_tok_alternative_face() -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
         name: "Tok-Tok, Volcano Born".to_string(),
         power: Some(2),
         toughness: Some(2),

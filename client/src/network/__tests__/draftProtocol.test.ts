@@ -8,6 +8,29 @@ import {
   validateDraftMessage,
 } from "../draftProtocol";
 import type { DraftP2PMessage } from "../draftProtocol";
+import { MAX_DRAFT_WORKSPACE_NETWORK_PLACEMENTS } from "../../components/draft/workspace/types";
+
+const validWorkspace = {
+  schemaVersion: 1 as const,
+  placements: {
+    "pool-1": { zone: "deck" as const, row: 0, column: 2, order: 0 },
+    "basic-1": { zone: "sideboard" as const, row: 1, column: 3, order: 1 },
+  },
+  virtualBasics: [{ instanceId: "basic-1", name: "Island" }],
+};
+
+function workspaceWithPlacementCount(count: number) {
+  return {
+    schemaVersion: 1 as const,
+    placements: Object.fromEntries(
+      Array.from({ length: count }, (_, index) => [
+        `card-${index}`,
+        { zone: "deck" as const, row: 0, column: 0, order: index },
+      ]),
+    ),
+    virtualBasics: [],
+  };
+}
 
 describe("draftProtocol", () => {
   it("uses a locale-independent multiset fingerprint for deck submissions", () => {
@@ -17,8 +40,8 @@ describe("draftProtocol", () => {
   });
 
   describe("DRAFT_PROTOCOL_VERSION", () => {
-    it("is version 14", () => {
-      expect(DRAFT_PROTOCOL_VERSION).toBe(14);
+    it("is version 21", () => {
+      expect(DRAFT_PROTOCOL_VERSION).toBe(21);
     });
   });
 
@@ -50,7 +73,15 @@ describe("draftProtocol", () => {
             color_counts: { white: 1, blue: 0, black: 0, red: 0, green: 0 },
           },
         },
-      }) as { view: { pool_groups: { rarity_groups: unknown[]; type_groups: Array<{ cards: Array<{ instance_ids: string[] }> }> } } };
+      }) as { view: { pool_groups: {
+        rarity_groups: unknown[];
+        type_groups: Array<{ cards: Array<{ instance_ids: string[] }> }>;
+        workspace_capabilities: { rarity_group_order: unknown };
+        workspace_row_classification: {
+          creature_instance_ids: unknown[];
+          noncreature_instance_ids: unknown[];
+        };
+      } } };
 
       expect(msg.view.pool_groups.rarity_groups).toEqual([]);
       const upgraded = msg.view.pool_groups as unknown as {
@@ -60,6 +91,9 @@ describe("draftProtocol", () => {
       expect(upgraded.type_filter_options).toEqual([]);
       expect(upgraded.color_filter_options).toEqual([]);
       expect(msg.view.pool_groups.type_groups[0].cards[0].instance_ids).toEqual(["adept-1"]);
+      expect(msg.view.pool_groups.workspace_capabilities.rarity_group_order).toBeNull();
+      expect(msg.view.pool_groups.workspace_row_classification.creature_instance_ids).toEqual([]);
+      expect(msg.view.pool_groups.workspace_row_classification.noncreature_instance_ids).toEqual([]);
     });
 
     it("passes a v11 view through unchanged", () => {
@@ -77,9 +111,24 @@ describe("draftProtocol", () => {
             cmc_groups: [],
             rarity_groups: [{ kind: "common", total: 2, cards: [entry] }],
             color_counts: { white: 2, blue: 0, black: 0, red: 0, green: 0 },
+            workspace_capabilities: {
+              rarity_group_order: ["mythic", "rare", "uncommon", "common", "rarity_other"],
+            },
+            workspace_row_classification: {
+              creature_instance_ids: ["adept-1", "adept-2"],
+              noncreature_instance_ids: [],
+            },
           },
         },
-      }) as { view: { pool_groups: { rarity_groups: Array<{ cards: Array<{ instance_ids: string[] }> }>; type_groups: Array<{ cards: Array<{ instance_ids: string[] }> }> } } };
+      }) as { view: { pool_groups: {
+        rarity_groups: Array<{ cards: Array<{ instance_ids: string[] }> }>;
+        type_groups: Array<{ cards: Array<{ instance_ids: string[] }> }>;
+        workspace_capabilities: { rarity_group_order: string[] };
+        workspace_row_classification: {
+          creature_instance_ids: string[];
+          noncreature_instance_ids: string[];
+        };
+      } } };
 
       expect(msg.view.pool_groups.type_groups[0].cards[0].instance_ids).toEqual([
         "adept-1",
@@ -89,6 +138,125 @@ describe("draftProtocol", () => {
         "adept-1",
         "adept-2",
       ]);
+      expect(msg.view.pool_groups.workspace_capabilities.rarity_group_order).toEqual([
+        "mythic",
+        "rare",
+        "uncommon",
+        "common",
+        "rarity_other",
+      ]);
+      expect(msg.view.pool_groups.workspace_row_classification.creature_instance_ids).toEqual([
+        "adept-1",
+        "adept-2",
+      ]);
+    });
+
+    const validateNestedMetadata = (
+      workspace_capabilities: unknown,
+      workspace_row_classification: unknown,
+    ) => validateDraftMessage({
+      type: "draft_state_update",
+      view: {
+        draft_effects: [],
+        seats: [],
+        pool_groups: {
+          color_groups: [],
+          type_groups: [],
+          cmc_groups: [],
+          rarity_groups: [],
+          workspace_capabilities,
+          workspace_row_classification,
+          color_counts: { white: 0, blue: 0, black: 0, red: 0, green: 0 },
+        },
+      },
+    });
+
+    it("preserves valid empty nested metadata", () => {
+      const msg = validateNestedMetadata(
+        { rarity_group_order: null },
+        { creature_instance_ids: [], noncreature_instance_ids: [] },
+      );
+      expect(msg).toMatchObject({
+        view: {
+          pool_groups: {
+            workspace_capabilities: { rarity_group_order: null },
+            workspace_row_classification: {
+              creature_instance_ids: [],
+              noncreature_instance_ids: [],
+            },
+          },
+        },
+      });
+    });
+
+    it.each(["workspace_capabilities", "workspace_row_classification"] as const)(
+      "defaults an independently absent legacy %s outer field",
+      (field) => {
+        const poolGroups = {
+          color_groups: [],
+          type_groups: [],
+          cmc_groups: [],
+          rarity_groups: [],
+          workspace_capabilities: { rarity_group_order: null },
+          workspace_row_classification: {
+            creature_instance_ids: [],
+            noncreature_instance_ids: [],
+          },
+          color_counts: { white: 0, blue: 0, black: 0, red: 0, green: 0 },
+        };
+        delete poolGroups[field];
+
+        const msg = validateDraftMessage({
+          type: "draft_state_update",
+          view: { draft_effects: [], seats: [], pool_groups: poolGroups },
+        });
+        expect(msg).toMatchObject({
+          view: {
+            pool_groups: {
+              workspace_capabilities: { rarity_group_order: null },
+              workspace_row_classification: {
+                creature_instance_ids: [],
+                noncreature_instance_ids: [],
+              },
+            },
+          },
+        });
+      },
+    );
+
+    it.each([
+      ["null capabilities", null],
+      ["scalar capabilities", "invalid"],
+      ["array capabilities", []],
+      ["empty capabilities", {}],
+      ["missing rarity order", { other: [] }],
+      ["non-array rarity order", { rarity_group_order: "common" }],
+      ["invalid rarity kind", { rarity_group_order: ["legendary"] }],
+      ["non-rarity group kind", { rarity_group_order: ["creature"] }],
+      ["non-string rarity kind", { rarity_group_order: [1] }],
+    ])("rejects %s", (_label, capabilities) => {
+      expect(() => validateNestedMetadata(
+        capabilities,
+        { creature_instance_ids: [], noncreature_instance_ids: [] },
+      )).toThrow();
+    });
+
+    it.each([
+      ["null row classification", null],
+      ["scalar row classification", "invalid"],
+      ["array row classification", []],
+      ["empty row classification", {}],
+      ["missing creature ids", { noncreature_instance_ids: [] }],
+      ["missing noncreature ids", { creature_instance_ids: [] }],
+      ["non-array creature ids", { creature_instance_ids: "a", noncreature_instance_ids: [] }],
+      ["non-array noncreature ids", { creature_instance_ids: [], noncreature_instance_ids: "a" }],
+      ["non-string creature id", { creature_instance_ids: [1], noncreature_instance_ids: [] }],
+      ["non-string noncreature id", { creature_instance_ids: [], noncreature_instance_ids: [1] }],
+    ])("rejects %s", (_label, rows) => {
+      expect(() => validateNestedMetadata(
+        { rarity_group_order: null },
+        rows,
+      )).toThrow();
     });
   });
 
@@ -103,20 +271,141 @@ describe("draftProtocol", () => {
     });
 
     it("accepts valid draft_pick message", () => {
-      const msg = validateDraftMessage({ type: "draft_pick", cardInstanceId: "card-001" });
-      expect(msg.type).toBe("draft_pick");
+      const msg = validateDraftMessage({ type: "draft_pick", cardInstanceIds: ["card-001"] });
+      expect(msg).toMatchObject({ type: "draft_pick", cardInstanceIds: ["card-001"] });
     });
 
+    // CR 903.13b: a Commander pod's pick step is two cards, and an odd pack's
+    // final step is one. The wire bound is therefore a RANGE — a `=== 2` check
+    // would reject every CR 905.1a kind, and a `=== 1` check every Commander
+    // step.
+    it("accepts a two-card draft_pick step", () => {
+      const msg = validateDraftMessage({
+        type: "draft_pick",
+        cardInstanceIds: ["card-001", "card-002"],
+      });
+      expect(msg).toMatchObject({
+        type: "draft_pick",
+        cardInstanceIds: ["card-001", "card-002"],
+      });
+    });
+
+    it.each([
+      { cardInstanceIds: undefined },
+      { cardInstanceIds: null },
+      { cardInstanceIds: {} },
+      { cardInstanceIds: "card-001" },
+      { cardInstanceIds: [] },
+      { cardInstanceIds: ["card-001", "card-002", "card-003"] },
+      { cardInstanceIds: ["card-001", "card-001"] },
+      { cardInstanceIds: [null] },
+      { cardInstanceIds: ["card-001", 7] },
+      { cardInstanceIds: [""] },
+      { cardInstanceIds: ["x".repeat(257)] },
+    ])("rejects malformed draft_pick payloads", (payload) => {
+      expect(() => validateDraftMessage({ type: "draft_pick", ...payload })).toThrow(
+        "Invalid draft pick",
+      );
+    });
+
+    // ── draft_submit_deck: the CR 903.3 designation's wire bound ──────
+    //
+    // This suite is the ONLY one in client/src that runs
+    // `validateDraftMessage` at all, so every claim about the new validator's
+    // bound is owed here and nowhere else. The P2P host-seam suite invokes
+    // `handleGuestMessage` directly and never reaches this code.
+
+    it("accepts a deck submission carrying a designation", () => {
+      const msg = validateDraftMessage({
+        type: "draft_submit_deck",
+        submissionId: "submission-1",
+        mainDeck: ["Plains", "Island"],
+        commanders: ["Kenrith, the Returned King"],
+      });
+      expect(msg).toMatchObject({
+        type: "draft_submit_deck",
+        mainDeck: ["Plains", "Island"],
+        commanders: ["Kenrith, the Returned King"],
+      });
+    });
+
+    // CR 702.124h designates two legendary CARDS, and CR 903.13e's filler case
+    // is two copies of ONE name — so a distinctness check would wrongly refuse
+    // a legal payload. Neither landed sibling's form (`[0] === [1]`, or
+    // `new Set(...).size`) may be copied into `validateSubmitDeck`, and this is
+    // the row that pins it.
+    it("accepts two designations with the same name", () => {
+      const msg = validateDraftMessage({
+        type: "draft_submit_deck",
+        submissionId: "submission-1",
+        mainDeck: ["The Prismatic Piper", "The Prismatic Piper"],
+        commanders: ["The Prismatic Piper", "The Prismatic Piper"],
+      });
+      expect(msg).toMatchObject({
+        commanders: ["The Prismatic Piper", "The Prismatic Piper"],
+      });
+    });
+
+    // THE FLOOR IS 0, and this is the only instrument in the phase that reds
+    // on a floor of 1. CR 903.1 scopes the commander designation to the
+    // Commander variant, and a P2P host pod is `Exclude<DraftKind, "Quick">` —
+    // Premier, Traditional and Sealed all submit `commanders: []`. Copying
+    // `validatePick`'s middle disjunct (`length === 0`) here would refuse every
+    // one of those submissions, and `draftPeerSession`'s decode `.catch` would
+    // drop the refusal silently. Assert on the RETURNED VALUE, not merely that
+    // nothing threw: `[]` must be neither refused nor defaulted into a name.
+    it("accepts an empty designation and returns it empty", () => {
+      const msg = validateDraftMessage({
+        type: "draft_submit_deck",
+        submissionId: "submission-1",
+        mainDeck: ["Plains", "Island"],
+        commanders: [],
+      });
+      expect(msg).toMatchObject({ type: "draft_submit_deck", commanders: [] });
+    });
+
+    it.each([
+      { commanders: undefined },
+      { commanders: null },
+      { commanders: {} },
+      { commanders: "Kenrith, the Returned King" },
+      // Over the bound of 2 (CR 702.124g). Written as a literal three-name
+      // array, the way this file's landed `draft_pick` sweep writes every
+      // over-bound payload: the bound is module-private in `draftProtocol.ts`
+      // and this suite imports no constant. If the bound ever moves, this row
+      // goes stale LOUDLY — a third name becomes legal and `toThrow` finds no
+      // throw.
+      { commanders: ["Kenrith", "Gyruda", "Ludevic"] },
+      { commanders: [null] },
+      { commanders: ["Kenrith", 7] },
+      { commanders: [""] },
+      { commanders: ["x".repeat(257)] },
+    ])("rejects malformed draft_submit_deck payloads", (payload) => {
+      expect(() =>
+        validateDraftMessage({
+          type: "draft_submit_deck",
+          submissionId: "submission-1",
+          mainDeck: ["Plains"],
+          ...payload,
+        }),
+      ).toThrow("Invalid deck submission: commanders");
+    });
+
+    // v14's `submissionId` and v17's `commanders` are independent required
+    // fields on this one message. Each half carries the OTHER field valid, so
+    // neither refusal can be satisfied by the other's guard firing first.
     it("requires a stable identifier on a deck submission", () => {
       expect(validateDraftMessage({
         type: "draft_submit_deck",
         submissionId: "submission-1",
         mainDeck: ["Island"],
+        commanders: [],
       })).toMatchObject({ type: "draft_submit_deck", submissionId: "submission-1" });
       expect(() => validateDraftMessage({
         type: "draft_submit_deck",
         mainDeck: ["Island"],
-      })).toThrow("Invalid deck submission");
+        commanders: [],
+      })).toThrow("Invalid deck submission: submissionId");
     });
 
     it("rejects a malformed deck acknowledgement before it can clear an outbox", () => {
@@ -166,14 +455,106 @@ describe("draftProtocol", () => {
     it("accepts valid draft_welcome message", () => {
       const msg = validateDraftMessage({
         type: "draft_welcome",
-        draftProtocolVersion: 1,
+        draftProtocolVersion: DRAFT_PROTOCOL_VERSION,
         draftToken: "token-123",
         seatIndex: 3,
         view: {},
         draftCode: "draft-abc",
+        workspaceState: validWorkspace,
       });
       expect(msg.type).toBe("draft_welcome");
     });
+
+    it.each(["draft_welcome", "draft_reconnect_ack"])(
+      "accepts nullable workspace state for %s",
+      (type) => {
+        const msg = validateDraftMessage({ type, view: {}, workspaceState: null });
+        expect(msg).toMatchObject({ type, workspaceState: null });
+      },
+    );
+
+    it("accepts a complete workspace update without a seat field", () => {
+      const msg = validateDraftMessage({
+        type: "draft_workspace_update",
+        workspaceState: validWorkspace,
+      });
+      expect(msg).toEqual({ type: "draft_workspace_update", workspaceState: validWorkspace });
+      expect(msg).not.toHaveProperty("seatIndex");
+    });
+
+    it("accepts the network placement limit and rejects one more before reading placement values", () => {
+      expect(validateDraftMessage({
+        type: "draft_workspace_update",
+        workspaceState: workspaceWithPlacementCount(MAX_DRAFT_WORKSPACE_NETWORK_PLACEMENTS),
+      }).type).toBe("draft_workspace_update");
+
+      const placements = workspaceWithPlacementCount(
+        MAX_DRAFT_WORKSPACE_NETWORK_PLACEMENTS,
+      ).placements;
+      Object.defineProperty(placements, "too-many", {
+        enumerable: true,
+        get: () => {
+          throw new Error("placement value was read");
+        },
+      });
+
+      expect(() => validateDraftMessage({
+        type: "draft_workspace_update",
+        workspaceState: { schemaVersion: 1, placements, virtualBasics: [] },
+      })).toThrow(`placements cannot exceed ${MAX_DRAFT_WORKSPACE_NETWORK_PLACEMENTS} entries`);
+    });
+
+    it.each(["seat", "seatIndex"])("rejects caller-supplied %s authority", (field) => {
+      expect(() => validateDraftMessage({
+        type: "draft_workspace_update",
+        workspaceState: validWorkspace,
+        [field]: 4,
+      })).toThrow("must not include a seat");
+    });
+
+    it.each(["draft_welcome", "draft_reconnect_ack", "draft_workspace_update"])(
+      "rejects missing workspace state for %s",
+      (type) => {
+        expect(() => validateDraftMessage({ type, view: {} })).toThrow("missing workspaceState");
+      },
+    );
+
+    it("rejects null workspace updates while accepting a valid update", () => {
+      expect(validateDraftMessage({
+        type: "draft_workspace_update",
+        workspaceState: validWorkspace,
+      }).type).toBe("draft_workspace_update");
+      expect(() => validateDraftMessage({
+        type: "draft_workspace_update",
+        workspaceState: null,
+      })).toThrow("workspace state must be a plain object");
+    });
+
+    const malformedWorkspaces = [
+      ["row outside the workspace", {
+        ...validWorkspace,
+        placements: { "pool-1": { zone: "deck", row: 2, column: 0, order: 0 } },
+      }],
+      ["duplicate virtual ids", {
+        ...validWorkspace,
+        virtualBasics: [
+          { instanceId: "basic-1", name: "Island" },
+          { instanceId: "basic-1", name: "Plains" },
+        ],
+      }],
+    ] as const;
+
+    it.each(["draft_welcome", "draft_reconnect_ack", "draft_workspace_update"] as const)(
+      "validates complete snapshots for %s",
+      (type) => {
+        expect(validateDraftMessage({ type, view: {}, workspaceState: validWorkspace }))
+          .toMatchObject({ type, workspaceState: validWorkspace });
+        for (const [, workspaceState] of malformedWorkspaces) {
+          expect(() => validateDraftMessage({ type, view: {}, workspaceState }))
+            .toThrow("Invalid draft message");
+        }
+      },
+    );
 
     it("normalizes missing face-up draft arrays in received player views", () => {
       const msg = validateDraftMessage({
@@ -260,6 +641,7 @@ describe("draftProtocol", () => {
       "draft_pick",
       "draft_pick_with_draft_effect",
       "draft_submit_deck",
+      "draft_workspace_update",
       "draft_welcome",
       "draft_reconnect_ack",
       "draft_reconnect_rejected",
@@ -291,25 +673,54 @@ describe("draftProtocol", () => {
       "draft_bo3_score_update",
       "draft_bo3_match_complete",
     ])("accepts message type '%s'", (msgType) => {
-      // Types with a bespoke validator need a well-formed payload; every other
-      // member still reaches `validateDraftMessage`'s bare fall-through. One
-      // row per bespoke validator, so the next one costs a line rather than
-      // another nesting level.
-      const BESPOKE_PAYLOADS: Record<string, Record<string, unknown>> = {
+      const bespokePayloads: Record<string, Record<string, unknown>> = {
+        draft_pick: { cardInstanceIds: ["card-001"] },
         draft_pick_with_draft_effect: {
           effectCardInstanceId: "cogwork-1",
           cardInstanceIds: ["card-001", "card-002"],
         },
+        draft_submit_deck: {
+          submissionId: "submission-1",
+          mainDeck: ["Plains"],
+          commanders: ["Kenrith, the Returned King"],
+        },
         draft_reconnect_rejected: { kind: "NoReconnectWindow", reason: "No grace window" },
-        draft_submit_deck: { submissionId: "submission-1", mainDeck: [] },
         draft_deck_submit_ack: { submissionId: "submission-1", view: {} },
       };
-      const msg = validateDraftMessage({ type: msgType, ...BESPOKE_PAYLOADS[msgType] });
+      const msg = validateDraftMessage(
+        msgType === "draft_workspace_update"
+            ? { type: msgType, workspaceState: validWorkspace }
+            : msgType === "draft_welcome" || msgType === "draft_reconnect_ack"
+              ? { type: msgType, view: {}, workspaceState: null }
+              : { type: msgType, ...bespokePayloads[msgType] },
+      );
       expect(msg.type).toBe(msgType);
     });
   });
 
   describe("wire encoding/decoding round-trip", () => {
+    it.each([
+      ["raw", { schemaVersion: 1 as const, placements: {}, virtualBasics: [] }],
+      ["gzip", validWorkspace],
+    ])("round-trips a non-null workspace update on the %s path", async (format, workspaceState) => {
+      const expandedState = format === "gzip"
+        ? {
+            ...workspaceState,
+            virtualBasics: Array.from({ length: 20 }, (_, index) => ({
+              instanceId: `basic-${index}`,
+              name: `Basic land ${index}`,
+            })),
+          }
+        : workspaceState;
+      const msg: DraftP2PMessage = {
+        type: "draft_workspace_update",
+        workspaceState: expandedState,
+      };
+      const encoded = await encodeDraftWireMessage(msg);
+      expect(encoded[0]).toBe(format === "raw" ? 0x00 : 0x01);
+      expect(await decodeDraftWireMessage(encoded)).toEqual(msg);
+    });
+
     it("round-trips a small message (raw path)", async () => {
       const msg: DraftP2PMessage = {
         type: "draft_join",
@@ -321,6 +732,41 @@ describe("draftProtocol", () => {
       expect(encoded[0]).toBe(0x00);
 
       const decoded = await decodeDraftWireMessage(encoded);
+      expect(decoded).toEqual(msg);
+    });
+
+    it("rejects an oversized workspace update decoded from the wire", async () => {
+      const encoded = await encodeDraftWireMessage({
+        type: "draft_workspace_update",
+        workspaceState: workspaceWithPlacementCount(MAX_DRAFT_WORKSPACE_NETWORK_PLACEMENTS + 1),
+      });
+
+      await expect(decodeDraftWireMessage(encoded)).rejects
+        .toThrow(`placements cannot exceed ${MAX_DRAFT_WORKSPACE_NETWORK_PLACEMENTS} entries`);
+    });
+
+    it("round-trips a deck submission carrying its designation", async () => {
+      // `decodeDraftWireMessage` runs `validateDraftMessage`, so this covers
+      // the production path a guest's deck submission actually takes
+      // (CR 903.3).
+      const msg: DraftP2PMessage = {
+        type: "draft_submit_deck",
+        submissionId: "submission-1",
+        mainDeck: ["Plains", "Island"],
+        commanders: ["Kenrith, the Returned King"],
+      };
+      const decoded = await decodeDraftWireMessage(await encodeDraftWireMessage(msg));
+      expect(decoded).toEqual(msg);
+    });
+
+    it("round-trips a whole two-card pick step through the validator", async () => {
+      // `decodeDraftWireMessage` runs `validateDraftMessage`, so this covers
+      // the production path a guest's pick actually takes (CR 903.13b).
+      const msg: DraftP2PMessage = {
+        type: "draft_pick",
+        cardInstanceIds: ["card-001", "card-002"],
+      };
+      const decoded = await decodeDraftWireMessage(await encodeDraftWireMessage(msg));
       expect(decoded).toEqual(msg);
     });
 
@@ -457,6 +903,13 @@ describe("draftProtocol", () => {
           type_filter_options: ["creature", "instant"],
           color_filter_options: ["white", "blue"],
           color_counts: { white: 1, blue: 1, black: 0, red: 0, green: 0 },
+          workspace_capabilities: {
+            rarity_group_order: ["mythic", "rare", "uncommon", "common", "rarity_other"],
+          },
+          workspace_row_classification: {
+            creature_instance_ids: ["pack-1-card-1"],
+            noncreature_instance_ids: ["pack-2-card-1"],
+          },
         },
         sealed_packs: [
           [{

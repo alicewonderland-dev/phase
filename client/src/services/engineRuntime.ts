@@ -226,14 +226,28 @@ export async function isCardCommanderEligibleForFormat(
  * co-commander? The engine is the single authority for the partner family
  * (Partner, Partner with [Name], Friends Forever, Character Select, Doctor's
  * Companion, Choose a Background) — the frontend never re-derives these rules.
+ *
+ * `draftSetCodes` is every set whose draft boosters this deck's draft CONTAINED,
+ * or an empty array for constructed play. CR 903.13f(3) extends the partner
+ * ability at deckbuilding "if the draft contained draft boosters from Commander
+ * Masters" — a property of the DRAFT, not of a card. A LIST because that rule
+ * asks about containment: a mixed draft that opened Commander Masters boosters
+ * among others contained them, and the grant is in force. The client passes the
+ * set codes through and the engine decides what they grant; which sets grant
+ * what is engine knowledge and must never be mirrored here.
  */
 export async function commanderPartnerCandidates(
   firstCommander: string,
   candidates: string[],
+  draftSetCodes: readonly string[],
 ): Promise<string[]> {
   await ensureCardDatabase();
   const engine = await loadEngineModule();
-  return engine.commanderPartnerCandidates(firstCommander, candidates) as string[];
+  return engine.commanderPartnerCandidates(
+    firstCommander,
+    candidates,
+    [...draftSetCodes],
+  ) as string[];
 }
 
 export type SignatureSpellSelectionPolicy =

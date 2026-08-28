@@ -674,7 +674,7 @@ pub fn unsupported_protocol_capabilities() -> &'static [UnsupportedCapability] {
 /// `upstream.` = the protocol has no primitive for something the engine can do.
 /// `local.` = the protocol has the primitive but this engine cannot source it,
 /// or a documented adapter-local extension is intentionally in use.
-static UNSUPPORTED_PROTOCOL_CAPABILITIES: [UnsupportedCapability; 89] = [
+static UNSUPPORTED_PROTOCOL_CAPABILITIES: [UnsupportedCapability; 90] = [
     UnsupportedCapability {
         code: "upstream.object-selection-missing",
         area: "prompts",
@@ -740,6 +740,12 @@ static UNSUPPORTED_PROTOCOL_CAPABILITIES: [UnsupportedCapability; 89] = [
         area: "prompts",
         reason: "Corrected after auditing each named prompt against the protocol rather than against this list. Surveil, discard, optional triggers (CR 603.12), and unless-costs (CR 118.12) DID have exact upstream shapes — Scry+zones, ChooseCards, and ChooseBoolean respectively — and are now mapped. What genuinely lacks a shape is selection over battlefield permanents by an aggregate constraint (keep-with-total-power, keep-exact-permanents) and pay-combat-cost, because ChooseBoardTargets carries only min/max counts, not a summed-attribute bound.",
         suggested_protocol_extension: "Give ChooseBoardTargets an optional aggregate constraint (attribute + comparator + value) so 'keep creatures with total power N or less' is expressible without a new family.",
+    },
+    UnsupportedCapability {
+        code: "local.resolution-optional-payment-selection-unsupported",
+        area: "prompts",
+        reason: "Phase exposes one decline plus server-indexed heterogeneous cost branches. Manabrew protocol 3 has no prompt that can carry those typed payment alternatives without flattening their semantics.",
+        suggested_protocol_extension: "Add a typed choose-payment-branch prompt whose response carries only the server-authored branch id.",
     },
     UnsupportedCapability {
         code: "local.blocker-damage-banding-unsupported",
@@ -1629,6 +1635,10 @@ fn build_prompt_input(
                 deny_label: "No".to_string(),
             }))
         }
+        WaitingFor::ResolutionOptionalPaymentChoice { .. } => unsupported_prompt(
+            waiting_for,
+            "local.resolution-optional-payment-selection-unsupported",
+        ),
         // CR 702.94a + CR 603.11: The miracle offer is a yes/no on casting the
         // revealed card for its miracle cost. The cast itself is already
         // advertised as an `AvailableAction`; without this prompt the offer was
@@ -2688,6 +2698,11 @@ pub fn convert_available_action(
         // `DecideOptionalEffect` answers the ChooseBoolean prompt emitted for
         // `WaitingFor::OptionalEffectChoice` / `OpponentMayChoice` / `MiracleReveal`.
         GameAction::DecideOptionalEffect { .. } => AvailableActionConversion::Skip,
+        GameAction::ChooseResolutionOptionalPaymentBranch { .. } => {
+            AvailableActionConversion::Unsupported(
+                "local.resolution-optional-payment-selection-unsupported",
+            )
+        }
         GameAction::DecideOptionalCost { .. }
         | GameAction::DecideOptionalEffectAndRemember { .. } => {
             AvailableActionConversion::Unsupported("local.optional-trigger-unsupported")
@@ -4589,7 +4604,8 @@ fn source_object_id(waiting_for: &WaitingFor) -> Option<ObjectId> {
         | WaitingFor::CostTypeChoice { pending_cast, .. } => Some(pending_cast.object_id),
         WaitingFor::TriggerTargetSelection { source_id, .. } => *source_id,
         WaitingFor::OptionalEffectChoice { source_id, .. }
-        | WaitingFor::OpponentMayChoice { source_id, .. } => Some(*source_id),
+        | WaitingFor::OpponentMayChoice { source_id, .. }
+        | WaitingFor::ResolutionOptionalPaymentChoice { source_id, .. } => Some(*source_id),
         _ => None,
     }
 }
@@ -4612,6 +4628,7 @@ fn waiting_for_type(waiting_for: &WaitingFor) -> &'static str {
         WaitingFor::ModeChoice { .. } => "ModeChoice",
         WaitingFor::AbilityModeChoice { .. } => "AbilityModeChoice",
         WaitingFor::OptionalEffectChoice { .. } => "OptionalEffectChoice",
+        WaitingFor::ResolutionOptionalPaymentChoice { .. } => "ResolutionOptionalPaymentChoice",
         WaitingFor::OpponentMayChoice { .. } => "OpponentMayChoice",
         WaitingFor::UnlessPayment { .. } => "UnlessPayment",
         WaitingFor::UnlessPaymentChooseCost { .. } => "UnlessPaymentChooseCost",
@@ -5735,6 +5752,25 @@ mod tests {
             result,
             Err(AdapterError::UnsupportedPrompt {
                 code: "local.keep-with-total-power-unsupported",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn resolution_optional_payment_prompt_is_explicitly_unsupported() {
+        let result = build_prompt(
+            &prepared_for(WaitingFor::ResolutionOptionalPaymentChoice {
+                player: PlayerId(0),
+                source_id: ObjectId(1),
+                costs: vec![],
+            }),
+            &lookup,
+        );
+        assert!(matches!(
+            result,
+            Err(AdapterError::UnsupportedPrompt {
+                code: "local.resolution-optional-payment-selection-unsupported",
                 ..
             })
         ));
@@ -8171,13 +8207,13 @@ mod tests {
     #[test]
     fn unsupported_capability_registry_is_well_formed() {
         let capabilities = unsupported_protocol_capabilities();
-        assert_eq!(capabilities.len(), 89);
+        assert_eq!(capabilities.len(), 90);
 
         let codes: HashSet<_> = capabilities
             .iter()
             .map(|capability| capability.code)
             .collect();
-        assert_eq!(codes.len(), 89, "capability codes must be unique");
+        assert_eq!(codes.len(), 90, "capability codes must be unique");
 
         for capability in capabilities {
             assert!(

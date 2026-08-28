@@ -17,14 +17,14 @@ use engine::types::ability::{
     CounterCostSelection, Effect, ManaContribution, ManaProduction, QuantityExpr, ResolvedAbility,
     SacrificeCost, TargetFilter, TargetRef, TypedFilter, ZoneOwner,
 };
-use engine::types::actions::{GameAction, MulliganChoice};
+use engine::types::actions::{GameAction, MulliganChoice, ResolutionOptionalPaymentChoice};
 use engine::types::card::CardFace;
 use engine::types::counter::{CounterMatch, CounterType};
 use engine::types::format::FormatConfig;
 use engine::types::game_state::{
     AlternativeCastKeyword, AutoPassMode, CastPaymentMode, GameState, MulliganBottomEntry,
     MulliganDecisionEntry, MulliganDecisionPhase, OpeningHandBottomReason, PendingTriggerSummary,
-    PlayerDeckPool, TurnBoundary, WaitingFor,
+    PlayerDeckPool, ResolutionOptionalPaymentOption, TurnBoundary, WaitingFor,
 };
 use engine::types::identifiers::{CardId, ObjectId};
 use engine::types::interaction::{
@@ -3742,6 +3742,51 @@ fn untap_choice_direct_authority_includes_accept_and_decline() {
 }
 
 #[test]
+fn resolution_optional_payment_ai_candidates_are_exact() {
+    let mut state = GameState::new_two_player(42);
+    state.waiting_for = WaitingFor::ResolutionOptionalPaymentChoice {
+        player: P0,
+        source_id: ObjectId(7),
+        costs: vec![
+            ResolutionOptionalPaymentOption {
+                index: 0,
+                cost: AbilityCost::Mana {
+                    cost: ManaCost::generic(1),
+                },
+            },
+            ResolutionOptionalPaymentOption {
+                index: 2,
+                cost: AbilityCost::Mana {
+                    cost: ManaCost::generic(2),
+                },
+            },
+        ],
+    };
+
+    let actions: Vec<_> = engine::ai_support::candidate_actions(&state)
+        .into_iter()
+        .map(|candidate| candidate.action)
+        .collect();
+    assert_eq!(
+        actions,
+        vec![
+            GameAction::ChooseResolutionOptionalPaymentBranch {
+                choice: ResolutionOptionalPaymentChoice::Decline,
+            },
+            GameAction::ChooseResolutionOptionalPaymentBranch {
+                choice: ResolutionOptionalPaymentChoice::Pay { index: 0 },
+            },
+            GameAction::ChooseResolutionOptionalPaymentBranch {
+                choice: ResolutionOptionalPaymentChoice::Pay { index: 2 },
+            },
+        ]
+    );
+    assert!(engine::ai_support::legal_actions_for_viewer(&state, P1)
+        .0
+        .is_empty());
+}
+
+#[test]
 fn recursive_outbound_budget_counts_nested_choice_surfaces() {
     let mut state = GameState::new_two_player(42);
     state.waiting_for = WaitingFor::OrderTriggers {
@@ -3934,9 +3979,10 @@ fn partition_choice_ids(
     candidates.iter().map(|choice| choice.id.clone()).collect()
 }
 
-/// CR 100.2a + CR 100.4a + CR 100.5: `deck_size` is a *minimum* and non-Commander
-/// decks have no maximum, so the between-games schema must publish the interval
-/// the engine will accept — `[minimum, whole pool]` — not one exact size. A
+/// CR 100.2a + CR 100.4a + CR 100.5: `deck_size.min_cards()` is the floor of the
+/// format's `DeckSizeRule` and non-Commander decks have no maximum, so the
+/// between-games schema must publish the interval the engine will accept —
+/// `[minimum, whole pool]` — not one exact size. A
 /// player who registered 60/15 may legally present anything from 60 up to all
 /// 75 cards; the sideboard cap is what pins the floor at 60.
 ///

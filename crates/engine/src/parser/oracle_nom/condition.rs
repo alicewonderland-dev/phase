@@ -1138,6 +1138,11 @@ fn parse_control_named_condition_action_lead(
         value((), tag("return ")),
         value((), tag("discard ")),
         value((), tag("choose ")),
+        // Die-roll result tables commonly follow an intervening-if named-count
+        // condition (for example Name Sticker Goblin). Treat the verb as an
+        // effect lead so the preceding card name is not extended through the
+        // comma into the trigger's execute clause.
+        value((), tag("roll ")),
     ))
     .parse(input)
 }
@@ -1462,7 +1467,8 @@ pub(crate) fn parse_attached_subject_target_filter(input: &str) -> OracleResult<
 }
 
 /// CR 508.1a + CR 509.1a + CR 611.3a: Parse "enchanted/equipped creature is
-/// attacking|blocking" into the attached-subject's `TargetFilter` plus the
+/// attacking alone|attacking|blocking" into the attached-subject's
+/// `TargetFilter` plus the
 /// combat-state `FilterProp`. Unlike `parse_attached_subject_is_filter` (which
 /// folds a STATIC characteristic — color/type/supertype — into the subject
 /// filter), combat state is re-evaluated each layer cycle (CR 611.3a), so the
@@ -1479,6 +1485,7 @@ pub(crate) fn parse_attached_subject_combat_state(
     let (rest, subject) = parse_attached_condition_subject(input)?;
     let (rest, _) = tag("is ").parse(rest)?;
     let (rest, prop) = alt((
+        value(FilterProp::AttackingAlone, tag("attacking alone")),
         value(FilterProp::Attacking { defender: None }, tag("attacking")),
         value(FilterProp::Blocking, tag("blocking")),
     ))
@@ -4581,7 +4588,12 @@ fn parse_control_count_le(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, n) = parse_number(rest)?;
     let rest = rest.trim_start();
     let (rest, _) = tag("or fewer ").parse(rest)?;
-    let type_text = rest.trim_end_matches('.');
+    // A named-count condition may be followed by an execute clause. Preserve
+    // the comma-prefixed clause as the condition remainder before handing the
+    // typed, named phrase to `parse_type_phrase`; otherwise that parser treats
+    // the effect text as part of the literal card name.
+    let (condition_remainder, type_text) = parse_control_named_final_name(rest)?;
+    let type_text = type_text.trim_end_matches('.');
     let (filter, remainder) = parse_type_phrase(type_text);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
@@ -4590,9 +4602,14 @@ fn parse_control_count_le(input: &str) -> OracleResult<'_, StaticCondition> {
         )));
     }
     let filter = inject_controller_you(filter);
-    let consumed = remainder.as_ptr() as usize - input.as_ptr() as usize;
+    let remainder = if remainder.trim().is_empty() {
+        condition_remainder
+    } else {
+        let consumed = remainder.as_ptr() as usize - input.as_ptr() as usize;
+        &input[consumed..]
+    };
     Ok((
-        &input[consumed..],
+        remainder,
         make_quantity_comparison(QuantityRef::ObjectCount { filter }, Comparator::LE, n),
     ))
 }
@@ -4701,6 +4718,7 @@ fn parse_a_player_controls_no(input: &str) -> OracleResult<'_, StaticCondition> 
             QuantityRef::ControlledByEachPlayer {
                 filter,
                 aggregate: AggregateFunction::Min,
+                relation: PlayerRelation::All,
             },
             Comparator::EQ,
             0,
@@ -11964,6 +11982,35 @@ mod tests {
         }
     }
 
+    /// CR 201.2 + CR 603.4: the quoted-card named-count condition on Name
+    /// Sticker Goblin must leave its die-roll clause for trigger effect parsing.
+    #[test]
+    fn control_named_count_stops_before_roll_die_effect() {
+        let (rest, condition) = parse_control_count_le(
+            "you control 9 or fewer creatures named \"name sticker\" goblin, roll a 20-sided die",
+        )
+        .expect("named count must parse");
+        assert_eq!(rest, ", roll a 20-sided die");
+        let StaticCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount { filter },
+                },
+            comparator: Comparator::LE,
+            rhs: QuantityExpr::Fixed { value: 9 },
+        } = condition
+        else {
+            panic!("expected a <= 9 object count, got {condition:?}");
+        };
+        let TargetFilter::Typed(filter) = filter else {
+            panic!("expected a typed creature filter, got {filter:?}");
+        };
+        assert!(filter.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::Named { name } if name == "\"name sticker\" goblin"
+        )));
+    }
+
     #[test]
     fn test_max_speed_conditions() {
         let (rest, c) = parse_inner_condition("you have max speed").unwrap();
@@ -12691,6 +12738,7 @@ mod tests {
                             QuantityRef::ControlledByEachPlayer {
                                 filter,
                                 aggregate: AggregateFunction::Min,
+                                relation: PlayerRelation::All,
                             },
                     },
                 comparator: Comparator::EQ,
@@ -14461,6 +14509,48 @@ mod tests {
         assert!(angel
             .type_filters
             .contains(&TypeFilter::Subtype("Angel".to_string())));
+    }
+
+    #[test]
+    fn attached_subject_combat_state_parses_attacking_alone_before_attacking() {
+        let (rest, (filter, prop)) =
+            parse_attached_subject_combat_state("enchanted creature is attacking alone")
+                .expect("attached attacking-alone condition must parse");
+        assert_eq!(rest, "");
+        assert_eq!(prop, FilterProp::AttackingAlone);
+        assert_eq!(
+            filter,
+            TargetFilter::Typed(TypedFilter::creature().properties(vec![FilterProp::EnchantedBy]))
+        );
+    }
+
+    #[test]
+    fn attached_subject_combat_state_preserves_equipped_and_broad_attacking_forms() {
+        let (rest, (filter, prop)) =
+            parse_attached_subject_combat_state("equipped creature is attacking alone")
+                .expect("equipped attacking-alone condition must parse");
+        assert_eq!(rest, "");
+        assert_eq!(prop, FilterProp::AttackingAlone);
+        assert_eq!(
+            filter,
+            TargetFilter::Typed(TypedFilter::creature().properties(vec![FilterProp::EquippedBy]))
+        );
+
+        let (rest, (_, prop)) =
+            parse_attached_subject_combat_state("enchanted creature is attacking")
+                .expect("existing broad attacking condition must still parse");
+        assert_eq!(rest, "");
+        assert_eq!(prop, FilterProp::Attacking { defender: None });
+    }
+
+    #[test]
+    fn attached_subject_combat_state_leaves_hostile_trailing_text_for_caller() {
+        let (rest, (_, prop)) = parse_attached_subject_combat_state(
+            "enchanted creature is attacking alone during your turn",
+        )
+        .expect("the building block should parse its exact predicate");
+        assert_eq!(prop, FilterProp::AttackingAlone);
+        assert_eq!(rest, " during your turn");
     }
 
     // -- Anaphoric "it" recipient conditions (CR 611.3a) --

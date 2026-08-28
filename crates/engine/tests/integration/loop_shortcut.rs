@@ -4818,12 +4818,15 @@ fn exactly_two_waiting_for_variants_carry_a_decision_template_and_both_are_redac
     // ── the classifier's own reach-guard: the enum was actually found ──
     let total = enum_variants(&enum_src, "WaitingFor").len();
     assert_eq!(
-        total, 132,
-        "`WaitingFor` has 132 variants at this tip, read off the `syn` parse. This number is \
+        total, 133,
+        "`WaitingFor` has 133 variants at this tip, read off the `syn` parse. This number is \
          pinned so a variant REMOVED is as visible as one added; if you added a variant and it \
          carries no `DecisionTemplate`, update this number. A wildly different count means the \
          reader lost its anchor, and every assertion below would then be measuring an empty enum"
     );
+    // 132 -> 133 is adjudicated: `ResolutionOptionalPaymentChoice` carries no
+    // `DecisionTemplate`; it is a direct server-authored branch list, so the
+    // two template carriers asserted below remain unchanged.
     // 128 ⇒ 129 is ADJUDICATED, not bumped: upstream #7336 ("make dig entries attack") added
     // `EntryAttackTargetChoice { player, object_id, valid_targets }`. Measured, because the
     // number alone cannot say it: that variant carries NO `DecisionTemplate` (zero matches in

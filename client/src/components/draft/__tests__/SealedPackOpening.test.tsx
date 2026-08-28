@@ -15,6 +15,7 @@ const VIEW: DraftPlayerView = {
   pick_number: 0,
   pass_direction: "Left",
   current_pack: null,
+  required_pick_count: 0,
   pool: [
     {
       instance_id: "creature",
@@ -67,10 +68,21 @@ const VIEW: DraftPlayerView = {
     type_filter_options: [],
     color_filter_options: [],
     color_counts: { white: 1, blue: 0, black: 0, red: 1, green: 0 },
+    workspace_capabilities: {
+      rarity_group_order: ["mythic", "rare", "uncommon", "common", "rarity_other"],
+    },
+    workspace_row_classification: {
+      creature_instance_ids: ["creature"],
+      noncreature_instance_ids: ["instant"],
+    },
   },
   sealed_packs: [],
   seats: [],
   cards_per_pack: 1,
+  pack_sizes: [1, 1, 1],
+  pack_set_codes: ["TST", "TST", "TST"],
+  pack_pick_steps: [1, 1, 1],
+  pick_steps_per_pack: 1,
   pack_count: 2,
   min_deck_size: 40,
   addable_cards: ["Plains"],

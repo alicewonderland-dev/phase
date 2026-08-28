@@ -52,6 +52,7 @@ fn stolen_goodies_can_be_cast_with_no_targets() {
         .get_mut(&picnic)
         .unwrap()
         .back_face = Some(BackFaceData {
+        is_swap_snapshot: false,
         name: "Stolen Goodies".to_string(),
         power: None,
         toughness: None,

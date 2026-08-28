@@ -1552,6 +1552,14 @@ pub fn fallback_action(
         }),
 
         // Binary accept/decline decisions: decline is always safe.
+        WaitingFor::ResolutionOptionalPaymentChoice { .. } => issued(|action| {
+            matches!(
+                action,
+                GameAction::ChooseResolutionOptionalPaymentBranch {
+                    choice: engine::types::ResolutionOptionalPaymentChoice::Decline,
+                }
+            )
+        }),
         WaitingFor::OptionalEffectChoice { .. }
         | WaitingFor::OpponentMayChoice { .. }
         | WaitingFor::TributeChoice { .. }

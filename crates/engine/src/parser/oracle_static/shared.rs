@@ -578,6 +578,45 @@ pub(crate) fn try_parse_inverted_attached_combat_grant(
     defs
 }
 
+/// CR 506.5 + CR 509.1b + CR 611.3a: Inverted attached-subject evasion gated
+/// on the host creature's live combat state — "As long as enchanted/equipped
+/// creature is attacking alone, it can't be blocked." The restriction belongs
+/// to the attached host, not the Aura/Equipment source. Reuses the canonical
+/// evasion classifier and the same recipient gate as attached combat grants.
+pub(crate) fn try_parse_inverted_attached_combat_evasion(
+    split: &InvertedSplit,
+    description: &str,
+) -> Option<StaticDefinition> {
+    let condition_lower = split.condition_text.to_lowercase();
+    let (rest, (affected, combat_prop)) =
+        nom_condition::parse_attached_subject_combat_state(&condition_lower).ok()?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+
+    let effect_lower = split.effect_text.to_lowercase();
+    let effect_tp = TextPair::new(&split.effect_text, &effect_lower);
+    let predicate = nom_tag_tp(&effect_tp, "it ").or_else(|| nom_tag_tp(&effect_tp, "they "))?;
+    let (mode, evasion_condition) = super::evasion::cant_be_blocked_mode(predicate.lower.trim())?;
+
+    let recipient_gate = StaticCondition::RecipientMatchesFilter {
+        filter: TargetFilter::Typed(TypedFilter::creature().properties(vec![combat_prop])),
+    };
+    let condition = match evasion_condition {
+        Some(evasion_condition) => StaticCondition::And {
+            conditions: vec![recipient_gate, evasion_condition],
+        },
+        None => recipient_gate,
+    };
+
+    Some(
+        StaticDefinition::new(mode)
+            .affected(affected)
+            .condition(condition)
+            .description(description.to_string()),
+    )
+}
+
 fn parse_grant_conjunct_verb(input: &str) -> OracleResult<'_, ()> {
     value(
         (),
@@ -2362,18 +2401,22 @@ fn parse_static_line_multi_dispatch(text: &str) -> Vec<StaticDefinition> {
         return Vec::new();
     }
 
-    // CR 508.1a + CR 611.3a + CR 613.1f: Inverted attached-subject grant gated on
-    // the host creature's COMBAT STATE — "As long as equipped/enchanted creature
-    // is attacking|blocking, it has/gets <X> [and <unmodeled conjunct>]" (Ace's
-    // Baseball Bat). This must run on the multi-static path (and before the
-    // single-return fallback) for two reasons: (1) the generic inverted rewrite
-    // would gate the grant on `SourceIsAttacking` (the Equipment, never an
-    // attacker) with `affected = SelfRef` — both wrong; (2) the compound effect
-    // may carry an unmodeled conjunct (the "must be blocked by a Dalek if able"
-    // lure) that must surface as a sibling `Effect::Unimplemented` residual
-    // rather than being silently dropped. The single-return path can carry only
-    // one def, so the residual would have nowhere to live there.
+    // CR 508.1a + CR 509.1b + CR 611.3a + CR 613.1f: Inverted attached-subject
+    // grant/evasion gated on the host creature's COMBAT STATE — "As long as
+    // equipped/enchanted creature is attacking[ alone]|blocking, it has/gets
+    // <X>" or "it can't be blocked" (Ace's Baseball Bat, Security Bypass).
+    // This must run on the multi-static path (and before the single-return
+    // fallback) for two reasons: (1) the generic inverted rewrite would gate on
+    // the Aura/Equipment source and set `affected = SelfRef` — both wrong; (2)
+    // a compound grant may carry an unmodeled conjunct (the "must be blocked by
+    // a Dalek if able" lure) that must surface as a sibling
+    // `Effect::Unimplemented` residual rather than being silently dropped. The
+    // single-return path can carry only one def, so that residual would have
+    // nowhere to live there.
     if let Some(split) = try_split_inverted_as_long_as(&tp) {
+        if let Some(def) = try_parse_inverted_attached_combat_evasion(&split, &stripped) {
+            return vec![def];
+        }
         let defs = try_parse_inverted_attached_combat_grant(&split, &stripped);
         if !defs.is_empty() {
             return defs;
@@ -3666,11 +3709,15 @@ pub(crate) fn parse_dynamic_x_clause(input: &str) -> OracleResult<'_, QuantityRe
     use crate::parser::oracle_nom::error::OracleError;
 
     let (input, _) = tag_no_case::<_, _, OracleError<'_>>(", where x is ").parse(input)?;
+    let input = input.trim_end_matches('.');
 
-    // CR 122.1: Untyped counter anaphor — consume the rest of the clause and
-    // emit `AnyCountersOnTarget`. Accepted variants mirror the counter-on-target
-    // anaphor family (no type prefix).
-    if let Ok((_, _)) = alt((
+    // CR 122.1: Untyped counter anaphor — only matches when it consumes the
+    // ENTIRE clause after terminal sentence punctuation is removed. A bare
+    // `Ok((_, _))` check here would discard whatever followed the anaphor
+    // instead of rejecting it, the same class of bug
+    // fixed below for the general delegate — see that comment for the
+    // concrete misparse this guards against.
+    if let Ok(("", _)) = alt((
         tag_no_case::<_, _, OracleError<'_>>("the number of counters on that creature"),
         tag_no_case::<_, _, OracleError<'_>>("the number of counters on that permanent"),
     ))
@@ -3688,16 +3735,36 @@ pub(crate) fn parse_dynamic_x_clause(input: &str) -> OracleResult<'_, QuantityRe
     // Delegate to the shared quantity-ref combinator which is case-sensitive on
     // lowercase patterns ("the number of"). Normalize to lowercase for the
     // remaining phrase so the upstream combinators match.
+    //
+    // Both callers of this function (`try_parse_dynamic_x_cost_reduction`'s
+    // "where X is <count>" cost-reduction tail, and the combat-tax
+    // `dynamic_qty` slot in `evasion.rs`) treat this function's returned
+    // remainder as authoritative: they resume parsing (or check
+    // full-consumption) from whatever `&str` comes back here, not from
+    // `input`. `parse_quantity_ref` (non-complete) matches a recognized
+    // phrase as a PREFIX and happily returns leftover text as its remainder
+    // — but unconditionally collapsing that remainder to `""` below would
+    // silently swallow a qualifier the phrase never actually matched. E.g.
+    // "the amount of damage dealt this way" only matches the bare
+    // "damage dealt" arm up to that point; the leftover " this way" would be
+    // discarded and the clause misread as `EventContextAmount` instead of
+    // the distinct `PreviousEffectAmount` meaning "this way" carries (CR
+    // 608.2h vs the "this way" family below it in quantity.rs), or instead
+    // of staying an honest unsupported gap when no arm actually spans the
+    // full qualified phrase. `parse_quantity_ref_complete` requires the
+    // entire (trimmed) phrase to be consumed and errors instead of
+    // truncating, so an unrecognized qualified phrase stays an honest gap.
     let lowered = input.to_lowercase();
-    let (_, quantity) =
-        super::oracle_nom::quantity::parse_quantity_ref(&lowered).map_err(|e| match e {
+    let (_, quantity) = super::oracle_nom::quantity::parse_quantity_ref_complete(&lowered)
+        .map_err(|e| match e {
             nom::Err::Error(_) | nom::Err::Failure(_) => {
                 nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Fail))
             }
             nom::Err::Incomplete(n) => nom::Err::Incomplete(n),
         })?;
-    // Don't try to keep a &str reference into the lowered string — accept that the
-    // dynamic-X clause consumes the rest of the phrase and return empty remainder.
+    // `parse_quantity_ref_complete` already required full consumption of
+    // `lowered`, so returning an empty remainder here is honest, not
+    // discarding — unlike the direct `parse_quantity_ref` call this replaced.
     Ok(("", quantity))
 }
 

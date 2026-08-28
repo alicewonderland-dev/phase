@@ -343,6 +343,7 @@ mod tests {
 
     fn play_from_exile_permission(duration: Duration, source_id: ObjectId) -> CastingPermission {
         CastingPermission::PlayFromExile {
+            provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
             duration,
             granted_to: PlayerId(0),
             frequency: CastFrequency::Unlimited,

@@ -68,7 +68,7 @@ describe("P2P draft first-contact gate", () => {
     const host = new P2PDraftHost(
       { id: "phase2-ABCDE" } as never,
       () => () => {},
-      { type: "Set", data: { set_pool_json: "{}" } } as never,
+      { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } } as never,
       "Premier",
       8,
       "Host",

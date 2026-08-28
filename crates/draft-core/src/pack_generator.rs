@@ -6,32 +6,86 @@ use crate::pack_source::PackSource;
 use crate::set_pool::{
     LimitedSetPool, PackVariant, SheetCard, SheetDefinition, WeightedSheetChoice,
 };
-use crate::types::{DraftCardInstance, DraftPack};
+use crate::types::{entry_for_pack, DraftCardInstance, DraftError, DraftPack};
 
-/// Generates draft packs from a `LimitedSetPool` using weighted random selection.
+/// Generates draft packs from `LimitedSetPool`s using weighted random selection.
 /// Set-specific exceptions (bonus sheets, Mystical Archive, etc.) are expressed
 /// as different sheet configurations in the pool data — no special-case code.
+///
+/// A draft opens one booster per pack round, and which set that booster comes
+/// from is a per-pack property: a block or chaos draft mixes sets, and may
+/// repeat one. The generator therefore holds the distinct pools it can draw
+/// from plus the pack-ordered sequence naming which pool fills each booster.
 pub struct PackGenerator {
-    pub set_pool: LimitedSetPool,
+    /// Distinct set pools this generator can draw from.
+    pools: Vec<LimitedSetPool>,
+    /// Index into `pools` for each booster, in pack order. Shorter than the
+    /// session's pack count repeats its last entry, so a single-set generator
+    /// is a one-element sequence.
+    sequence: Vec<usize>,
 }
 
 impl PackGenerator {
+    /// A generator whose every booster comes from one set.
     pub fn new(set_pool: LimitedSetPool) -> Self {
-        Self { set_pool }
+        Self {
+            pools: vec![set_pool],
+            sequence: vec![0],
+        }
+    }
+
+    /// A generator that opens one booster per entry of `sequence`, in pack
+    /// order. `pools` supplies the distinct sets; `sequence` names which of
+    /// them fills each booster, so the same set may appear more than once.
+    pub fn for_sequence(
+        pools: Vec<LimitedSetPool>,
+        sequence: &[String],
+    ) -> Result<Self, DraftError> {
+        if sequence.is_empty() {
+            return Err(DraftError::InvalidPackSequence {
+                reason: "a draft must open at least one pack".to_string(),
+            });
+        }
+        let resolved = sequence
+            .iter()
+            .map(|code| {
+                pools
+                    .iter()
+                    .position(|pool| pool.code.eq_ignore_ascii_case(code))
+                    .ok_or_else(|| DraftError::InvalidPackSequence {
+                        reason: format!("no pool data was supplied for set '{code}'"),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            pools,
+            sequence: resolved,
+        })
+    }
+
+    /// The pool filling booster `pack_number`.
+    fn pool_for_pack(&self, pack_number: u8) -> &LimitedSetPool {
+        let index = entry_for_pack(&self.sequence, pack_number).copied().expect(
+            "PackGenerator is constructed with a non-empty sequence, so every pack resolves",
+        );
+        &self.pools[index]
     }
 
     /// Select a pack variant by weighted random from `pack_variants`.
-    fn select_variant(&self, rng: &mut dyn rand::RngCore) -> &PackVariant {
+    fn select_variant<'a>(
+        &self,
+        rng: &mut dyn rand::RngCore,
+        pool: &'a LimitedSetPool,
+    ) -> &'a PackVariant {
         let idx = weighted_select(
             rng,
-            u64::from(self.set_pool.pack_variants_total_weight),
-            self.set_pool
-                .pack_variants
+            u64::from(pool.pack_variants_total_weight),
+            pool.pack_variants
                 .iter()
                 .enumerate()
                 .map(|(i, v)| (i, u64::from(v.weight))),
         );
-        &self.set_pool.pack_variants[idx]
+        &pool.pack_variants[idx]
     }
 
     /// Resolve which sheet name to use for a slot's choices via weighted selection.
@@ -57,12 +111,16 @@ impl PackGenerator {
 
     /// Largest non-foil, non-empty sheet referenced by `variant` — the sheet to
     /// pull a replacement card from when another slot's sheet came up short.
-    fn backfill_sheet(&self, variant: &PackVariant) -> Option<&SheetDefinition> {
+    fn backfill_sheet<'a>(
+        &self,
+        pool: &'a LimitedSetPool,
+        variant: &PackVariant,
+    ) -> Option<&'a SheetDefinition> {
         variant
             .contents
             .iter()
             .flat_map(|slot| slot.choices.iter())
-            .filter_map(|choice| self.set_pool.sheets.get(&choice.sheet))
+            .filter_map(|choice| pool.sheets.get(&choice.sheet))
             .filter(|sheet| !sheet.foil && !sheet.cards.is_empty())
             .max_by_key(|sheet| sheet.cards.len())
     }
@@ -70,7 +128,8 @@ impl PackGenerator {
 
 impl PackSource for PackGenerator {
     fn generate_pack(&self, rng: &mut dyn rand::RngCore, seat: u8, pack_number: u8) -> DraftPack {
-        let variant = self.select_variant(rng);
+        let pool = self.pool_for_pack(pack_number);
+        let variant = self.select_variant(rng, pool);
 
         // A booster always contains a fixed number of cards. Some sheets a variant
         // references — e.g. "specialGuest", "theList", "mysticalArchive" — resolve
@@ -84,7 +143,7 @@ impl PackSource for PackGenerator {
         let mut picks: Vec<&SheetCard> = Vec::with_capacity(target_size);
         for slot in &variant.contents {
             let sheet_name = self.resolve_sheet_name(rng, &slot.choices);
-            let Some(sheet) = self.set_pool.sheets.get(sheet_name) else {
+            let Some(sheet) = pool.sheets.get(sheet_name) else {
                 continue;
             };
             for idx in select_sheet_cards(rng, sheet, slot.count as usize) {
@@ -98,7 +157,7 @@ impl PackSource for PackGenerator {
             // (every variant has a `common` slot whose printings live in the
             // set's own file). If it ever happened, the pack would stay short;
             // the `draft-wasm` empty-pack `continue` is the bot-side backstop.
-            if let Some(sheet) = self.backfill_sheet(variant) {
+            if let Some(sheet) = self.backfill_sheet(pool, variant) {
                 let shortfall = target_size - picks.len();
                 let extra = {
                     let used: HashSet<(&str, &str)> = picks
@@ -117,10 +176,7 @@ impl PackSource for PackGenerator {
             .into_iter()
             .enumerate()
             .map(|(card_index, card)| DraftCardInstance {
-                instance_id: format!(
-                    "{}-{}-{}-{}",
-                    self.set_pool.code, seat, pack_number, card_index
-                ),
+                instance_id: format!("{}-{}-{}-{}", pool.code, seat, pack_number, card_index),
                 name: card.name.clone(),
                 set_code: card.set_code.clone(),
                 collector_number: card.collector_number.clone(),
@@ -349,6 +405,101 @@ mod tests {
             prints: vec![],
             basic_lands: vec![],
         }
+    }
+
+    /// A one-sheet pool of `size` commons under `code` — enough to prove which
+    /// set filled a given pack, and to give a multi-set sequence packs of
+    /// genuinely different sizes.
+    fn sized_pool(code: &str, size: u8) -> LimitedSetPool {
+        let mut sheets = BTreeMap::new();
+        sheets.insert(
+            "common".to_string(),
+            SheetDefinition {
+                total_weight: 40,
+                foil: false,
+                balance_colors: false,
+                cards: make_sheet_cards(&format!("{code}_common"), code, 40, Rarity::Common, 1),
+                ..Default::default()
+            },
+        );
+        LimitedSetPool {
+            code: code.to_string(),
+            name: format!("{code} Set"),
+            release_date: None,
+            pack_variants: vec![PackVariant {
+                contents: vec![PackSlot {
+                    slot: "common".to_string(),
+                    count: size,
+                    choices: single_choice("common"),
+                }],
+                weight: 1,
+            }],
+            pack_variants_total_weight: 1,
+            sheets,
+            prints: vec![],
+            basic_lands: vec![],
+        }
+    }
+
+    #[test]
+    fn a_pack_sequence_draws_each_pack_from_the_set_that_names_it() {
+        let generator = PackGenerator::for_sequence(
+            vec![sized_pool("AAA", 15), sized_pool("BBB", 14)],
+            &["AAA".to_string(), "BBB".to_string(), "AAA".to_string()],
+        )
+        .expect("every named set has pool data");
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+
+        let packs: Vec<DraftPack> = (0..3)
+            .map(|pack| generator.generate_pack(&mut rng, 0, pack))
+            .collect();
+
+        let sets: Vec<&str> = packs
+            .iter()
+            .map(|pack| pack.0[0].set_code.as_str())
+            .collect();
+        assert_eq!(sets, ["AAA", "BBB", "AAA"]);
+        // A multi-set draft mixes MTGJSON booster sizes.
+        assert_eq!(
+            packs.iter().map(|pack| pack.0.len()).collect::<Vec<_>>(),
+            [15, 14, 15]
+        );
+    }
+
+    #[test]
+    fn a_single_set_generator_fills_every_pack_from_its_one_pool() {
+        let generator = PackGenerator::new(sized_pool("AAA", 15));
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+
+        // Pack 5 is far past the one-element sequence: repeat-last resolves it.
+        for pack in [0u8, 1, 2, 5] {
+            let generated = generator.generate_pack(&mut rng, 0, pack);
+            assert_eq!(generated.0[0].set_code, "AAA");
+            assert_eq!(generated.0.len(), 15);
+        }
+    }
+
+    #[test]
+    fn a_pack_sequence_naming_an_unsupplied_set_is_rejected() {
+        let error = PackGenerator::for_sequence(
+            vec![sized_pool("AAA", 15)],
+            &["AAA".to_string(), "MISSING".to_string()],
+        )
+        .err()
+        .expect("the sequence names a set with no pool");
+
+        assert!(
+            matches!(&error, DraftError::InvalidPackSequence { reason } if reason.contains("MISSING")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn an_empty_pack_sequence_is_rejected() {
+        assert!(matches!(
+            PackGenerator::for_sequence(vec![sized_pool("AAA", 15)], &[]).err(),
+            Some(DraftError::InvalidPackSequence { .. })
+        ));
     }
 
     /// Two-variant pool: variant 1 (weight 9) is standard, variant 2 (weight 1) includes bonus sheet.

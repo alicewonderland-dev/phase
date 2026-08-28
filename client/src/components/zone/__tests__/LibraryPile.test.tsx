@@ -13,6 +13,7 @@ import { buildGameState, buildPlayers, buildPriorityWaitingFor } from "../../../
 import { LibraryPile } from "../LibraryPile.tsx";
 
 vi.mock("../../../hooks/useCardImage", () => ({
+  useCardBackImage: () => ({ src: "/test-card-back.png", isLoading: false }),
   useCardImage: () => ({ src: null, isLoading: false }),
 }));
 
@@ -197,9 +198,10 @@ describe("LibraryPile play/cast surfacing (#297)", () => {
     render(<LibraryPile playerId={1} />);
     const button = screen.getByRole("button", { name: /library \(1 card\)/i });
     expect(button).toBeInTheDocument();
+    expect(button).toHaveAttribute("data-grouped-ids", "77");
     // Peeked tops use the cyan border; card-back alt text is hidden.
     expect(button.className).toContain("border-cyan-600");
-    expect(screen.queryByAltText("Library")).not.toBeInTheDocument();
+    expect(screen.queryByAltText("Card back")).not.toBeInTheDocument();
   });
 
   it("keeps an opponent library top hidden when nothing reveals it (no leak)", () => {
@@ -210,7 +212,8 @@ describe("LibraryPile play/cast surfacing (#297)", () => {
     render(<LibraryPile playerId={1} />);
     const button = screen.getByRole("button", { name: /library \(1 card\)/i });
     expect(button.className).toContain("border-gray-600");
-    expect(screen.getByAltText("Library")).toBeInTheDocument();
+    expect(button).not.toHaveAttribute("data-grouped-ids");
+    expect(screen.getByAltText("Card back")).toBeInTheDocument();
   });
 
   it("uses reveal state only for the public-reveal treatment, not visibility", () => {
@@ -218,7 +221,7 @@ describe("LibraryPile play/cast surfacing (#297)", () => {
     render(<LibraryPile playerId={1} />);
     const button = screen.getByRole("button", { name: /library \(1 card\)/i });
     expect(button.className).toContain("border-amber-500");
-    expect(screen.queryByAltText("Library")).not.toBeInTheDocument();
+    expect(screen.queryByAltText("Card back")).not.toBeInTheDocument();
   });
 
   it("keeps a masked opponent library top hidden", () => {
@@ -226,7 +229,7 @@ describe("LibraryPile play/cast surfacing (#297)", () => {
     render(<LibraryPile playerId={1} />);
     const button = screen.getByRole("button", { name: /library \(1 card\)/i });
     expect(button.className).toContain("border-gray-600");
-    expect(screen.getByAltText("Library")).toBeInTheDocument();
+    expect(screen.getByAltText("Card back")).toBeInTheDocument();
   });
 
   it("does not dispatch when there is no play action", () => {

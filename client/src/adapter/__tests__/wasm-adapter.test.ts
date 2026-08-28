@@ -11,6 +11,7 @@ import { AdapterError, AdapterErrorCode } from "../types";
 import { buildGameState } from "../../test/factories/gameStateFactory";
 
 const ensureWasmInit = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const resumeRestoredGameState = vi.hoisted(() => vi.fn());
 const resumeMultiplayerHostState = vi.hoisted(() => vi.fn());
 
 vi.mock("../../services/cardData", () => ({
@@ -19,6 +20,7 @@ vi.mock("../../services/cardData", () => ({
 }));
 
 vi.mock("@wasm/engine", () => ({
+  resume_restored_game_state: resumeRestoredGameState,
   resume_multiplayer_host_state: resumeMultiplayerHostState,
 }));
 
@@ -41,6 +43,8 @@ const mockWorkerClient = {
     .fn()
     .mockResolvedValue({ events: [], log_entries: [] } as SubmitResult),
   submitInteraction: vi.fn().mockResolvedValue({ events: [], log_entries: [] } as SubmitResult),
+  previewManaPayment: vi.fn().mockResolvedValue([]),
+  resolveAll: vi.fn().mockResolvedValue({ items_resolved: 0 }),
   getAiActionProposal: vi.fn(),
   getAiActionProposalWithDiagnostics: vi.fn(),
   getAiTacticalActionProposal: vi.fn(),
@@ -56,7 +60,8 @@ const mockWorkerClient = {
   getLegalActions: vi.fn().mockResolvedValue({ actions: [], autoPassRecommended: false }),
   exportState: vi.fn().mockResolvedValue("{}"),
   restoreState: vi.fn().mockResolvedValue(undefined),
-  resumeMultiplayerHostState: vi.fn().mockResolvedValue(undefined),
+  resumeRestoredGameState: vi.fn(),
+  resumeMultiplayerHostState: vi.fn(),
   setMultiplayerMode: vi.fn().mockResolvedValue(undefined),
   resetGame: vi.fn().mockResolvedValue(undefined),
   applySeatMutation: vi.fn().mockResolvedValue({ state: {}, delta: {} }),
@@ -97,6 +102,20 @@ describe("WasmAdapter", () => {
       status: "stale",
       reason: "test",
     });
+    const restored = {
+      presentation: {
+        outcome: "noop" as const,
+        automatedResolutionCount: 0,
+        omittedEventCount: 0,
+        logEntries: [],
+      },
+      snapshot: {
+        state: buildGameState({ turn_number: 3, phase: "PreCombatMain" }),
+        legalResult: { actions: [], autoPassRecommended: false },
+      },
+    };
+    mockWorkerClient.resumeRestoredGameState.mockResolvedValue(restored);
+    mockWorkerClient.resumeMultiplayerHostState.mockResolvedValue(restored);
   });
 
   describe("AI decision diagnostics", () => {
@@ -139,7 +158,15 @@ describe("WasmAdapter", () => {
     it("publishes only after apply and retains a rejected proposal for retry", async () => {
       mockWorkerClient.getAiActionProposalWithDiagnostics.mockResolvedValue({ proposal, receipt });
       mockWorkerClient.submitAiActionProposal
-        .mockResolvedValueOnce({ status: "rejected", reason: "retry" })
+        .mockResolvedValueOnce({
+          status: "rejected",
+          rejection: {
+            code: "action_not_allowed",
+            disposition: "unavailable",
+            message: "That action is not allowed right now.",
+            related_object_ids: [7],
+          },
+        })
         .mockResolvedValueOnce({ status: "applied", result: { events: [], log_entries: [] } });
       await adapter.initialize();
       const listener = vi.fn();
@@ -147,7 +174,10 @@ describe("WasmAdapter", () => {
       adapter.subscribeAiDecisionDiagnostics(listener);
 
       await expect(adapter.getAiActionProposal("Medium", 0)).resolves.toEqual(proposal);
-      await expect(adapter.submitAiActionProposal(proposal)).resolves.toMatchObject({ status: "rejected" });
+      await expect(adapter.submitAiActionProposal(proposal)).resolves.toMatchObject({
+        status: "rejected",
+        rejection: { related_object_ids: [7] },
+      });
       expect(listener).not.toHaveBeenCalled();
 
       await expect(adapter.submitAiActionProposal(proposal)).resolves.toMatchObject({ status: "applied" });
@@ -448,6 +478,24 @@ describe("WasmAdapter", () => {
       expect(mockWorkerClient.loadCardDbFromUrl).not.toHaveBeenCalled();
     });
 
+    it("preserves a structured rejection without parsing its message", async () => {
+      const rejection = {
+        code: "wrong_player" as const,
+        disposition: "unauthorized" as const,
+        message: "That action belongs to a different player.",
+        related_object_ids: [42],
+      };
+      mockWorkerClient.submitAction.mockRejectedValueOnce(
+        new AdapterError(AdapterErrorCode.ACTION_REJECTED, rejection.message, true, undefined, rejection),
+      );
+      await adapter.initialize();
+
+      await expect(adapter.submitAction({ type: "PassPriority" }, 0)).rejects.toMatchObject({
+        code: AdapterErrorCode.ACTION_REJECTED,
+        rejection,
+      });
+    });
+
     it("loads the card database and retries only after Rust admits a nonzero create", async () => {
       mockWorkerClient.submitAction
         .mockRejectedValueOnce(new Error("Engine error: card database not loaded"))
@@ -647,6 +695,22 @@ describe("WasmAdapter", () => {
         "resume failed",
       );
       expect(resumeMultiplayerHostState).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe("resumeRestoredGameState", () => {
+    it("returns the engine-authored presentation with its matching snapshot", async () => {
+      await adapter.initialize();
+
+      const resumed = await adapter.resumeRestoredGameState();
+
+      expect(mockWorkerClient.resumeRestoredGameState).toHaveBeenCalledOnce();
+      expect(resumed.presentation).toMatchObject({
+        outcome: "noop",
+        automatedResolutionCount: 0,
+        omittedEventCount: 0,
+      });
+      expect(resumed.snapshot.state.turn_number).toBe(3);
     });
   });
 

@@ -2112,6 +2112,7 @@ fn scan_quantity_ref(x: &QuantityRef, mode: ScanMode) -> Axes {
         QuantityRef::ControlledByEachPlayer {
             filter,
             aggregate: _,
+            relation: _,
         } => {
             let mut acc = Axes {
                 event: false,

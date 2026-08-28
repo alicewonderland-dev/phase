@@ -515,7 +515,8 @@ fn resolve_choice(
             .cloned()
             .ok_or(BailReason::NoLegalManaPayment)?,
 
-        WaitingFor::OptionalEffectChoice { .. }
+        WaitingFor::ResolutionOptionalPaymentChoice { .. }
+        | WaitingFor::OptionalEffectChoice { .. }
         | WaitingFor::OpponentMayChoice { .. }
         | WaitingFor::OptionalCostChoice { .. }
         | WaitingFor::TributeChoice { .. }
@@ -1228,6 +1229,64 @@ mod tests {
             is_policy_choice,
             "declining a shortcut is a policy decision"
         );
+    }
+
+    #[test]
+    fn resolution_optional_payment_projection_roundtrips_issued_action() {
+        use engine::game::effects::resolve_ability_chain;
+        use engine::types::ability::{
+            AbilityCost, CardSelectionMode, DiscardSelfScope, Effect, QuantityExpr,
+            ResolvedAbility, TargetFilter,
+        };
+
+        let mut scenario = GameScenario::new();
+        let source = scenario.add_creature(P0, "Payment Source", 1, 1).id();
+        scenario.add_card_to_hand(P0, "Payment Card");
+        let mut runner = scenario.build();
+        let mut ability = ResolvedAbility::new(
+            Effect::PayCost {
+                cost: AbilityCost::OneOf {
+                    costs: vec![AbilityCost::Discard {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        filter: None,
+                        selection: CardSelectionMode::Chosen,
+                        self_scope: DiscardSelfScope::FromHand,
+                    }],
+                },
+                scale: None,
+                payer: TargetFilter::Controller,
+            },
+            vec![],
+            source,
+            P0,
+        );
+        ability.optional = true;
+        resolve_ability_chain(runner.state_mut(), &ability, &mut Vec::new(), 0).unwrap();
+
+        let original = runner.state().clone();
+        let (actor, action, is_policy_choice, _successor) =
+            resolve_choice(&original, P0, PlayerId(1))
+                .expect("projection consumes the issued domain");
+        assert_eq!(
+            action,
+            GameAction::ChooseResolutionOptionalPaymentBranch {
+                choice: engine::types::ResolutionOptionalPaymentChoice::Decline,
+            }
+        );
+        let json = serde_json::to_value(&action).unwrap();
+        assert_eq!(serde_json::from_value::<GameAction>(json).unwrap(), action);
+        assert_eq!(
+            crate::decision_kind::classify(&original.waiting_for, &action),
+            crate::policies::DecisionKind::ActivateAbility
+        );
+        assert!(is_policy_choice);
+        let mut projected = original.clone();
+        engine::game::engine::apply(&mut projected, actor, action)
+            .expect("projection action re-applies through the production reducer");
+        assert!(!matches!(
+            projected.waiting_for,
+            WaitingFor::ResolutionOptionalPaymentChoice { .. }
+        ));
     }
 
     fn precast_offer_state() -> GameState {

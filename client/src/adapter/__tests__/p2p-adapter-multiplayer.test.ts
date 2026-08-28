@@ -12,11 +12,12 @@ import type Peer from "peerjs";
 import type { DataConnection } from "peerjs";
 
 import { P2PGuestAdapter, P2PHostAdapter, playerSlotsFromSeatView, type P2PAdapterEvent } from "../p2p-adapter";
-import { AdapterError, AdapterErrorCode, supportsAiDecisionDiagnostics, supportsMatchConcede, type EngineSnapshot, type FormatConfig, type GameAction, type GameEvent, type GameLogEntry, type GameState } from "../types";
+import { AdapterError, AdapterErrorCode, supportsAiDecisionDiagnostics, supportsMatchConcede, type EngineSnapshot, type FormatConfig, type GameAction, type GameEvent, type GameLogEntry, type GameState, type PersistedGameState, type RestoredGameStateResult } from "../types";
 import type { WsAdapterEvent } from "../ws-adapter";
 import { FakeDataConnection } from "../../network/__tests__/fakeDataConnection";
 import { WIRE_PROTOCOL_VERSION } from "../../network/protocol";
 import { p2pFinalStateCommitment } from "../../services/p2pTerminalResult";
+import { ownsP2PHostLease } from "../../services/p2pSession";
 
 // `vi.mock` is hoisted above imports, so the factory can't reference module
 // scope. Inline the wire-format stub. See `./protocolTestStub.ts` for the
@@ -42,12 +43,37 @@ vi.mock("../../network/protocol", async (orig) => {
   };
 });
 
+const terminalMocks = vi.hoisted(() => ({
+  clearP2PTerminalResult: vi.fn(async () => undefined),
+  commitP2PTerminalResult: vi.fn(async () => true),
+}));
+
 vi.mock("../../services/p2pTerminalResult", async (orig) => {
   const actual = await orig<typeof import("../../services/p2pTerminalResult")>();
   return {
     ...actual,
-    clearP2PTerminalResult: vi.fn(async () => undefined),
-    commitP2PTerminalResult: vi.fn(async () => true),
+    clearP2PTerminalResult: terminalMocks.clearP2PTerminalResult,
+    commitP2PTerminalResult: terminalMocks.commitP2PTerminalResult,
+  };
+});
+
+const persistenceMocks = vi.hoisted(() => ({
+  clearGame: vi.fn(async () => undefined),
+  clearP2PHostSession: vi.fn(async () => undefined),
+  saveGame: vi.fn(async () => undefined),
+  saveP2PHostSession: vi.fn(async () => undefined),
+  saveResumableGameStrict: vi.fn<() => Promise<void>>(async () => undefined),
+}));
+
+vi.mock("../../services/gamePersistence", async (orig) => {
+  const actual = await orig<typeof import("../../services/gamePersistence")>();
+  return {
+    ...actual,
+    clearGame: persistenceMocks.clearGame,
+    clearP2PHostSession: persistenceMocks.clearP2PHostSession,
+    saveGame: persistenceMocks.saveGame,
+    saveP2PHostSession: persistenceMocks.saveP2PHostSession,
+    saveResumableGameStrict: persistenceMocks.saveResumableGameStrict,
   };
 });
 
@@ -106,6 +132,20 @@ const mocks = vi.hoisted(() => {
       status: "applied",
       result: { events: [], log_entries: [] },
     })),
+    exportPersistenceState: vi.fn(async () => JSON.stringify({ players: [], objects: {} })),
+    resumeMultiplayerHostState: vi.fn<() => Promise<RestoredGameStateResult>>(async () => ({
+      snapshot: {
+        state: { players: [], objects: {}, waiting_for: { type: "Priority", data: { player: 0 } } } as unknown as GameState,
+        legalResult: { actions: [], autoPassRecommended: false },
+        seq: 1,
+      },
+      presentation: {
+        outcome: "noop",
+        automatedResolutionCount: 0,
+        omittedEventCount: 0,
+        logEntries: [],
+      },
+    })),
     projectSeatView: vi.fn(async (stateJson: string) => {
       const state = JSON.parse(stateJson) as {
         seats: Array<{ type: string }>;
@@ -134,7 +174,7 @@ const mocks = vi.hoisted(() => {
           starting_life: 20,
           min_players: 2,
           max_players: 2,
-          deck_size: 60,
+          deck_size: { type: "Minimum", data: 60 },
           singleton: false,
           command_zone: false,
           commander_damage_threshold: null,
@@ -244,6 +284,7 @@ function remoteState(label: string): GameState {
     phase: "PreCombatMain",
     players: [],
     objects: {},
+    waiting_for: { type: "Priority", data: { player: 0 } },
   } as unknown as GameState;
 }
 
@@ -291,6 +332,8 @@ vi.mock("../wasm-adapter", () => {
     getViewerSnapshot: mocks.getViewerSnapshot,
     getAiActionProposal: mocks.getAiActionProposal,
     submitAiActionProposal: mocks.submitAiActionProposal,
+    exportPersistenceState: mocks.exportPersistenceState,
+    resumeMultiplayerHostState: mocks.resumeMultiplayerHostState,
     applySeatMutation: mocks.applySeatMutation,
     projectSeatView: mocks.projectSeatView,
     setMultiplayerMode: mocks.setMultiplayerMode,
@@ -322,6 +365,36 @@ beforeEach(() => {
   mockGetState.mockClear();
   mockGetAiActionProposal.mockClear();
   mockSubmitAiActionProposal.mockClear();
+  mocks.exportPersistenceState.mockReset();
+  mocks.exportPersistenceState.mockResolvedValue(JSON.stringify({ players: [], objects: {} }));
+  mocks.resumeMultiplayerHostState.mockReset();
+  mocks.resumeMultiplayerHostState.mockResolvedValue({
+    snapshot: {
+      state: { players: [], objects: {}, waiting_for: { type: "Priority", data: { player: 0 } } } as unknown as GameState,
+      legalResult: { actions: [], autoPassRecommended: false },
+      seq: 1,
+    },
+    presentation: {
+        outcome: "noop",
+        automatedResolutionCount: 0,
+        omittedEventCount: 0,
+        logEntries: [],
+      },
+  });
+  persistenceMocks.clearGame.mockReset();
+  persistenceMocks.clearGame.mockResolvedValue(undefined);
+  persistenceMocks.clearP2PHostSession.mockReset();
+  persistenceMocks.clearP2PHostSession.mockResolvedValue(undefined);
+  persistenceMocks.saveGame.mockReset();
+  persistenceMocks.saveGame.mockResolvedValue(undefined);
+  persistenceMocks.saveP2PHostSession.mockReset();
+  persistenceMocks.saveP2PHostSession.mockResolvedValue(undefined);
+  persistenceMocks.saveResumableGameStrict.mockReset();
+  persistenceMocks.saveResumableGameStrict.mockResolvedValue(undefined);
+  terminalMocks.clearP2PTerminalResult.mockReset();
+  terminalMocks.clearP2PTerminalResult.mockResolvedValue(undefined);
+  terminalMocks.commitP2PTerminalResult.mockReset();
+  terminalMocks.commitP2PTerminalResult.mockResolvedValue(true);
   mocks.setAiDecisionDiagnosticsEnabled.mockClear();
   mocks.subscribeAiDecisionDiagnostics.mockClear();
   // `mockReset`, not `mockClear`: these two carry per-test
@@ -399,7 +472,7 @@ function twoHeadedGiantConfig(): FormatConfig {
     starting_life: 30,
     min_players: 4,
     max_players: 4,
-    deck_size: 60,
+    deck_size: { type: "Minimum", data: 60 },
     singleton: false,
     command_zone: false,
     commander_damage_threshold: null,
@@ -417,7 +490,7 @@ function commanderConfig(): FormatConfig {
     starting_life: 40,
     min_players: 2,
     max_players: 6,
-    deck_size: 100,
+    deck_size: { type: "Exactly", data: 100 },
     singleton: true,
     command_zone: true,
     commander_damage_threshold: 21,
@@ -444,6 +517,46 @@ function makeHost(playerCount: number, gracePeriodMs = 5_000, formatConfig?: For
     formatConfig,
     undefined,
     gracePeriodMs,
+  );
+  return { adapter, emitConnection };
+}
+
+function makeResumedHost() {
+  const { peer, onGuestConnected, emitConnection } = createFakePeer();
+  const hostDeck = {
+    player: { main_deck: ["Mountain"], sideboard: [] },
+    opponent: { main_deck: ["Forest"], sideboard: [] },
+    ai_decks: [],
+  };
+  const persistedSession = {
+    gameId: "resume-game",
+    roomCode: "ABCDE",
+    sessionKey: "resume-session",
+    useBroker: false,
+    playerTokens: { 1: "guest-token" },
+    guestDecks: { 1: { main_deck: ["Forest"], sideboard: [] } },
+    kickedTokens: [],
+    eliminatedSeats: [],
+    playerCount: 2,
+    hostDeckData: hostDeck,
+    gameStarted: true,
+  };
+  const adapter = new P2PHostAdapter(
+    hostDeck,
+    peer as unknown as Peer,
+    onGuestConnected,
+    2,
+    undefined,
+    undefined,
+    5_000,
+    undefined,
+    true,
+    undefined,
+    {
+      gameId: "resume-game",
+      roomCode: "ABCDE",
+      resumeData: { state: { persisted: true } as unknown as PersistedGameState, session: persistedSession },
+    },
   );
   return { adapter, emitConnection };
 }
@@ -494,7 +607,7 @@ async function joinGuest(
   const conn = new FakeOpenableConnection();
   emitConnection(conn as unknown as DataConnection);
   conn.fireOpen();
-  await conn.simulateData(msg);
+  await conn.simulateData({ ...msg, wireProtocolVersion: msg.wireProtocolVersion ?? WIRE_PROTOCOL_VERSION });
   return conn;
 }
 
@@ -730,6 +843,149 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     current.dispose();
   });
 
+  it("persists resumed authority before acknowledging a reconnect", async () => {
+    const persisted = deferred<void>();
+    persistenceMocks.saveResumableGameStrict.mockImplementationOnce(() => persisted.promise);
+    const { adapter, emitConnection } = makeResumedHost();
+
+    const initialize = adapter.initialize();
+    await flushPromises();
+    expect(mocks.resumeMultiplayerHostState).toHaveBeenCalledOnce();
+    expect(persistenceMocks.saveResumableGameStrict).toHaveBeenCalledOnce();
+
+    const reconnect = new FakeOpenableConnection();
+    const send = vi.spyOn(reconnect, "send");
+    emitConnection(reconnect as unknown as DataConnection);
+    reconnect.fireOpen();
+    await reconnect.simulateData({
+      type: "reconnect",
+      playerToken: "guest-token",
+      wireProtocolVersion: WIRE_PROTOCOL_VERSION,
+    });
+    await flushPromises();
+
+    expect(send).not.toHaveBeenCalled();
+
+    persisted.resolve();
+    await initialize;
+    await flushPromises();
+
+    expect(await reconnect.getSentMessages()).toContainEqual(expect.objectContaining({ type: "reconnect_ack" }));
+    expect(persistenceMocks.saveResumableGameStrict.mock.invocationCallOrder[0])
+      .toBeLessThan(send.mock.invocationCallOrder[0]!);
+    adapter.dispose();
+  });
+
+  it("releases unpublished resumed authority after a strict-save failure without acknowledging guests", async () => {
+    persistenceMocks.saveResumableGameStrict.mockRejectedValueOnce(new Error("IndexedDB unavailable"));
+    const { adapter, emitConnection } = makeResumedHost();
+    const authority = (adapter as unknown as { authority: { sessionKey: string; hostIncarnation: string } }).authority;
+
+    const initialize = adapter.initialize();
+    await flushPromises();
+    const reconnect = new FakeOpenableConnection();
+    emitConnection(reconnect as unknown as DataConnection);
+    reconnect.fireOpen();
+    await reconnect.simulateData({
+      type: "reconnect",
+      playerToken: "guest-token",
+      wireProtocolVersion: WIRE_PROTOCOL_VERSION,
+    });
+
+    await expect(initialize).rejects.toThrow("IndexedDB unavailable");
+    await flushPromises();
+
+    expect(ownsP2PHostLease(authority)).toBe(false);
+    expect(mocks.releaseHostSession).toHaveBeenCalledWith(true);
+    expect(await reconnect.getSentMessages()).toEqual([]);
+  });
+
+  it("commits a terminal resumed result before clearing its stale resumable save or publishing it", async () => {
+    const terminalState = {
+      players: [],
+      objects: {},
+      waiting_for: { type: "GameOver", data: { winner: 0 } },
+    } as unknown as GameState;
+    mocks.resumeMultiplayerHostState.mockResolvedValueOnce({
+      snapshot: {
+        state: terminalState,
+        legalResult: { actions: [], autoPassRecommended: false },
+        seq: 1,
+      },
+      presentation: {
+        outcome: "noop",
+        automatedResolutionCount: 0,
+        omittedEventCount: 0,
+        logEntries: [],
+      },
+    });
+    (mockGetViewerSnapshot as unknown as { mockResolvedValue: (value: unknown) => void }).mockResolvedValue({
+      state: terminalState,
+      actions: [],
+      autoPassRecommended: false,
+    });
+    const committed = deferred<boolean>();
+    terminalMocks.commitP2PTerminalResult.mockImplementationOnce(() => committed.promise);
+    const { adapter, emitConnection } = makeResumedHost();
+
+    const initialize = adapter.initialize();
+    await vi.waitFor(() => expect(terminalMocks.commitP2PTerminalResult).toHaveBeenCalledOnce());
+    expect(persistenceMocks.clearGame).not.toHaveBeenCalled();
+
+    const reconnect = new FakeOpenableConnection();
+    const send = vi.spyOn(reconnect, "send");
+    emitConnection(reconnect as unknown as DataConnection);
+    reconnect.fireOpen();
+    await reconnect.simulateData({
+      type: "reconnect",
+      playerToken: "guest-token",
+      wireProtocolVersion: WIRE_PROTOCOL_VERSION,
+    });
+    await flushPromises();
+    expect(send).not.toHaveBeenCalled();
+
+    committed.resolve(true);
+    await initialize;
+    await flushPromises();
+
+    expect(persistenceMocks.clearGame).toHaveBeenCalledWith("resume-game");
+    expect(terminalMocks.commitP2PTerminalResult.mock.invocationCallOrder[0])
+      .toBeLessThan(persistenceMocks.clearGame.mock.invocationCallOrder[0]!);
+    expect(persistenceMocks.clearGame.mock.invocationCallOrder[0])
+      .toBeLessThan(send.mock.invocationCallOrder[0]!);
+    await vi.waitFor(async () => {
+      expect((await reconnect.getSentMessages()).map((message) => (message as { type: string }).type))
+        .toEqual(["reconnect_ack", "terminal_result"]);
+    });
+    adapter.dispose();
+  });
+
+  it("consumes a resumed automation result exactly once", async () => {
+    const restored: RestoredGameStateResult = {
+      snapshot: {
+        state: remoteState("resumed"),
+        legalResult: { actions: [], autoPassRecommended: false },
+        seq: 1,
+      },
+      presentation: {
+        outcome: "noop",
+        automatedResolutionCount: 0,
+        omittedEventCount: 0,
+        logEntries: [],
+      },
+    };
+    mocks.resumeMultiplayerHostState.mockResolvedValueOnce(restored);
+    const { adapter } = makeResumedHost();
+
+    await adapter.initialize();
+    await adapter.initialize();
+
+    expect(mocks.resumeMultiplayerHostState).toHaveBeenCalledOnce();
+    await expect(adapter.resumeRestoredGameState()).resolves.toBe(restored);
+    await expect(adapter.resumeRestoredGameState()).resolves.toBeNull();
+    adapter.dispose();
+  });
+
   it("retries failed initialization without duplicating guest connections", async () => {
     const { adapter, emitConnection } = makeHost(2);
     mockInitialize
@@ -903,6 +1159,7 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     const secondJoin = secondConn.simulateData({
       type: "guest_deck",
       deckData: { player: { main_deck: ["Swamp"], sideboard: [] } },
+      wireProtocolVersion: WIRE_PROTOCOL_VERSION,
     });
     await flushPromises();
 
@@ -1149,16 +1406,60 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
       action: { type: "PassPriority" },
     });
 
-    // Spoofing guest receives action_rejected.
+    // Envelope spoofing is an operational transport fault, not an engine
+    // rejection payload.
     const rejected = (await g2.getSentMessages()).find(
       (m) =>
         typeof m === "object" &&
         m !== null &&
-        (m as { type: string }).type === "action_rejected",
+        (m as { type: string }).type === "action_failed",
     );
     expect(rejected).toBeDefined();
     // And the spoofed action did NOT reach the engine.
     expect(mockSubmitAction).not.toHaveBeenCalled();
+  });
+
+  it("separates engine rejections from host operational action failures", async () => {
+    const { adapter, emitConnection } = makeHost(2);
+    await adapter.initialize();
+    const guest = await joinGuest(emitConnection, {
+      type: "guest_deck",
+      deckData: { player: { main_deck: [], sideboard: [] } },
+    });
+    await adapter.initializeGame();
+    guest.sent.length = 0;
+
+    const rejection = {
+      code: "invalid_action" as const,
+      disposition: "invalid" as const,
+      message: "Engine error: invalid action",
+      related_object_ids: [42],
+    };
+    mockSubmitAction.mockRejectedValueOnce(
+      new AdapterError(AdapterErrorCode.ACTION_REJECTED, rejection.message, true, undefined, rejection),
+    );
+    await guest.simulateData({
+      type: "action",
+      senderPlayerId: 1,
+      action: { type: "PassPriority" },
+    });
+    expect(await guest.getSentMessages()).toContainEqual(expect.objectContaining({
+      type: "action_rejected",
+      rejection,
+    }));
+
+    guest.sent.length = 0;
+    mockSubmitAction.mockRejectedValueOnce(new Error("engine transport unavailable"));
+    await guest.simulateData({
+      type: "action",
+      senderPlayerId: 1,
+      action: { type: "PassPriority" },
+    });
+    expect(await guest.getSentMessages()).toContainEqual(expect.objectContaining({
+      type: "action_failed",
+      message: "engine transport unavailable",
+    }));
+    adapter.dispose();
   });
 
   it("fan-outs filtered state per-guest on submitAction", async () => {
@@ -2477,12 +2778,7 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     );
   });
 
-  // Issue #5913: the host relays the engine's verdict verbatim, so a guest must
-  // classify a stale ReorderHand exactly as the local-WASM seat does. Before the
-  // shared classifier this path built a generic ACTION_REJECTED, and
-  // `dispatchAction` — which suppresses only STALE_ACTION — still surfaced the
-  // red error to P2P guests.
-  it("guest classifies a stale ReorderHand rejection from the host as STALE_ACTION", async () => {
+  it("guest preserves a structured stale engine rejection from the host", async () => {
     const { peer } = createFakePeer();
     const conn = new FakeDataConnection();
     const adapter = new P2PGuestAdapter(
@@ -2491,6 +2787,8 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
       "host-peer",
       conn as unknown as DataConnection,
     );
+    const emitted = vi.fn();
+    adapter.onEvent(emitted);
     await adapter.initialize();
     await conn.simulateData({
       type: "game_setup",
@@ -2511,23 +2809,76 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     );
     await conn.simulateData({
       type: "action_rejected",
-      reason: "Engine error: ReorderHand: expected 6 ids, got 5",
+      rejection: {
+        code: "stale_action",
+        disposition: "stale",
+        message: "Engine error: ReorderHand no longer matches the hand",
+        related_object_ids: [1],
+      },
     });
     await expect(stale).rejects.toMatchObject({
       code: "STALE_ACTION",
       recoverable: false,
+      rejection: expect.objectContaining({ related_object_ids: [1] }),
     });
 
     // A genuine rejection must still surface as a recoverable ACTION_REJECTED.
     const real = adapter.submitAction({ type: "PassPriority" }, 1);
     await conn.simulateData({
       type: "action_rejected",
-      reason: "Engine error: Something genuinely wrong",
+      rejection: {
+        code: "invalid_action",
+        disposition: "invalid",
+        message: "Engine error: Something genuinely wrong",
+        related_object_ids: [],
+      },
     });
     await expect(real).rejects.toMatchObject({
       code: "ACTION_REJECTED",
       recoverable: true,
     });
+  });
+
+  it("guest rejects a malformed rejection DTO without exposing its arbitrary message", async () => {
+    const { peer } = createFakePeer();
+    const conn = new FakeDataConnection();
+    const adapter = new P2PGuestAdapter(
+      { player: { main_deck: [], sideboard: [] } },
+      peer as unknown as Peer,
+      "host-peer",
+      conn as unknown as DataConnection,
+    );
+    const emitted = vi.fn();
+    adapter.onEvent(emitted);
+    await adapter.initialize();
+    await conn.simulateData({
+      type: "game_setup",
+      wireProtocolVersion: WIRE_PROTOCOL_VERSION,
+      assignedPlayerId: 1,
+      playerToken: "seat-token",
+      state: remoteState("setup"),
+      events: [],
+      legalActions: [],
+      autoPassRecommended: false,
+      manaPaymentShortcutActions: [],
+    });
+    await adapter.initializeGame();
+
+    const pending = adapter.submitAction({ type: "PassPriority" }, 1);
+    await conn.simulateData({
+      type: "action_rejected",
+      rejection: { message: "untrusted host payload" },
+    } as never);
+    await expect(pending).rejects.toMatchObject({
+      code: "ACTION_REJECTED",
+      message: "Host sent an invalid action rejection",
+      rejection: undefined,
+    });
+
+    await conn.simulateData({ type: "action_failed", message: "Match concession unavailable" });
+    await conn.simulateData({ type: "action_rejected", rejection: { message: "untrusted" } } as never);
+    expect(emitted).toHaveBeenCalledWith({ type: "error", message: "Match concession unavailable" });
+    expect(emitted).toHaveBeenCalledWith({ type: "error", message: "Host sent an invalid action rejection" });
   });
 
   it("guest snapshots stay coherent and strictly ordered across successive state updates", async () => {
@@ -3031,8 +3382,8 @@ describe("P2PHostAdapter — bound draft match concession", () => {
     await guest.simulateData({ type: "match_concede" });
 
     expect(await guest.getSentMessages()).toContainEqual(expect.objectContaining({
-      type: "action_rejected",
-      reason: "Whole-match concession is unavailable for this game",
+      type: "action_failed",
+      message: "Whole-match concession is unavailable for this game",
     }));
     adapter.dispose();
   });
@@ -3275,14 +3626,14 @@ describe("P2P wire-protocol version gate", () => {
   // Both halves stamp LITERALS. A frame built from WIRE_PROTOCOL_VERSION
   // cannot tell a bumped client from an unbumped one, which is why every
   // other handshake fixture in the suite is useless as an instrument for a
-  // bump. Revert 30 → 29 and BOTH halves red: the v29 frame stops being
-  // refused, and the v30 frame stops being admitted. The admitting half is
-  // the reach-guard — without it "refuses v29" is also satisfied by a client
+  // bump. Revert 33 → 32 and BOTH halves red: the v32 frame stops being
+  // refused, and the v33 frame stops being admitted. The admitting half is
+  // the reach-guard — without it "refuses v32" is also satisfied by a client
   // that refuses everything.
-  it("refuses the previous wire protocol (v29) and admits its own (v30)", async () => {
+  it("refuses the previous wire protocol (v32) and admits its own (v33)", async () => {
     const refusing = makeGuest();
     await refusing.adapter.initialize();
-    await refusing.conn.simulateData(setupFrameAt(29));
+    await refusing.conn.simulateData(setupFrameAt(32));
 
     await expect(refusing.adapter.initializeGame()).rejects.toMatchObject({
       code: "P2P_REJECTED",
@@ -3294,12 +3645,30 @@ describe("P2P wire-protocol version gate", () => {
 
     const admitting = makeGuest();
     await admitting.adapter.initialize();
-    await admitting.conn.simulateData(setupFrameAt(30));
+    await admitting.conn.simulateData(setupFrameAt(33));
 
     await expect(admitting.adapter.initializeGame()).resolves.toBeDefined();
     expect(admitting.emitted).not.toHaveBeenCalledWith(
       expect.objectContaining({ type: "reconnectFailed" }),
     );
+  });
+
+  it("rejects a malformed present authority before bootstrap adoption", async () => {
+    const guest = makeGuest();
+    await guest.adapter.initialize();
+    await guest.conn.simulateData({
+      ...setupFrameAt(WIRE_PROTOCOL_VERSION),
+      authority: { sessionKey: "session", hostIncarnation: "host", extra: true },
+    } as never);
+
+    await expect(guest.adapter.initializeGame()).rejects.toMatchObject({
+      code: "P2P_REJECTED",
+      message: "Host sent a malformed P2P authority",
+    });
+    expect(guest.emitted).toHaveBeenCalledWith(expect.objectContaining({
+      type: "reconnectFailed",
+      reason: "Host sent a malformed P2P authority",
+    }));
   });
 
   // Derived, not a literal: this gate tests "unequal", not any particular
@@ -3328,30 +3697,30 @@ describe("P2P wire-protocol version gate", () => {
     adapter.dispose();
   });
 
-  // The discriminator for "absent means admit". Without it this gate is
-  // indistinguishable from one that treats a missing field as a mismatch —
-  // which would refuse every guest on an older bundle, including the ones
-  // that pair fine today.
-  it("admits a guest that stamps no wire version at all", async () => {
+  it("refuses a guest that omits the mandatory v28 wire version", async () => {
     const { adapter, emitConnection } = makeHost(2);
     await adapter.initialize();
 
-    const guest = await joinGuest(emitConnection, {
+    const guest = new FakeOpenableConnection();
+    emitConnection(guest as unknown as DataConnection);
+    guest.fireOpen();
+    await guest.simulateData({
       type: "guest_deck",
       deckData: { player: { main_deck: [], sideboard: [] } },
     });
-    await adapter.initializeGame();
 
-    expect(await sentOfType(guest, "reconnect_rejected")).toBeUndefined();
-    expect(guest.open).toBe(true);
-    expect(await sentOfType(guest, "game_setup")).toBeDefined();
+    expect(await sentOfType(guest, "reconnect_rejected")).toEqual(expect.objectContaining({
+      reason: expect.stringContaining("Wire protocol version required"),
+    }));
+    expect(guest.open).toBe(false);
+    expect(await sentOfType(guest, "game_setup")).toBeUndefined();
     adapter.dispose();
   });
 
   // The two first-contact stamp sites, asserted on the OUTBOUND frame. Neither
   // was covered before: deleting either stamp left the whole suite green,
-  // because a guest that fails to stamp is indistinguishable from an older
-  // bundle and the host's absent-means-admit branch swallows it silently. A
+  // because a guest that fails to stamp is rejected before the host allocates
+  // a seat. A
   // refactor dropping the `guest_deck` stamp would turn Unit 2 into a no-op
   // for every fresh join — the common path — with nothing red.
   it("stamps the wire version on both first-contact guest messages", async () => {

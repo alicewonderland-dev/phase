@@ -3102,31 +3102,109 @@ pub(crate) fn effective_spell_keyword_kinds_for(
     kinds
 }
 
+/// CR 702.168b + CR 118.9a: does `obj` carry an `ExileWithAltCost` grant
+/// whose cost is the card's own printed cost restated (`NormalCost`
+/// provenance) and that supports `player`'s cast? Such a grant is a
+/// normal-cost route — the face-down {3} is then the sole alternative
+/// applied to the spell.
+fn normal_cost_grant_supports_cast(
+    state: &GameState,
+    obj: &crate::game::game_object::GameObject,
+    player: PlayerId,
+) -> bool {
+    obj.casting_permissions.iter().any(|p| {
+        matches!(
+            p,
+            crate::types::ability::CastingPermission::ExileWithAltCost {
+                cost_provenance: crate::types::ability::ExileGrantCostProvenance::NormalCost,
+                ..
+            }
+        ) && exile_alt_cost_permission_supports_cast(state, obj, player, p, None)
+    })
+}
+
 /// Check if an object has any permission allowing it to be cast from exile.
 /// Uses explicit match arms (not `matches!`) so the compiler catches new variants.
+///
+/// `variant` is the casting method this zone-authority check serves. CR 118.9a
+/// ("Only one alternative cost can be applied to any one spell as it's being
+/// cast") + CR 601.2b ("A player can't apply two alternative methods of
+/// casting or two alternative costs to a single spell"): a permission that is
+/// itself an alternative cost — cast "without paying its mana cost" or for a
+/// substitute cost (`ExileWithAltCost`, ability costs, energy, plot, foretell)
+/// — cannot lend zone authority to the `FaceDown` {3} cast, which is a second
+/// alternative method+cost. Normal-cost routes (Adventure creature face,
+/// Warp's later cast, `PlayFromExile`, battlefield exile-cast statics) are
+/// method-agnostic zone authority and remain available to every variant.
 fn has_exile_cast_permission(
     state: &GameState,
     obj: &crate::game::game_object::GameObject,
     player: PlayerId,
     turn_number: u32,
+    variant: Option<CastingVariant>,
 ) -> bool {
-    play_from_exile_permission_source(state, obj, player, turn_number).is_some()
+    // CR 601.2b: the face-down cast may only ride a normal-cost route.
+    let face_down = matches!(variant, Some(CastingVariant::FaceDown));
+    // CR 118.9a + CR 601.2b + CR 305.1: elected-authority provenance — the
+    // land/look companion installed alongside an alt-cost grant
+    // (`PlayFromExileProvenance::LandLookCompanion`, see `cast_from_zone.rs`) is not cast authority,
+    // so the face-down cast accepts only a genuine impulse-class grant as its
+    // normal-cost route. Every other variant keeps the plain scan: where a
+    // companion exists, its alt-cost sibling authorizes those casts anyway.
+    let play_from_exile_route = if face_down {
+        obj.casting_permissions
+            .iter()
+            .enumerate()
+            .any(|(index, p)| {
+                !matches!(
+                    p,
+                    crate::types::ability::CastingPermission::PlayFromExile {
+                        provenance:
+                            crate::types::ability::PlayFromExileProvenance::LandLookCompanion,
+                        ..
+                    }
+                ) && play_from_exile_permission_source_at_index(
+                    state,
+                    obj,
+                    player,
+                    CastingPermissionIndex(index),
+                )
+                .is_some()
+            })
+    } else {
+        play_from_exile_permission_source(state, obj, player, turn_number).is_some()
+    };
+    play_from_exile_route
         || obj.casting_permissions.iter().any(|p| match p {
-            crate::types::ability::CastingPermission::AdventureCreature
-            | crate::types::ability::CastingPermission::ExileWithEnergyCost => obj.owner == player,
-            crate::types::ability::CastingPermission::ExileWithAltCost { .. }
-            | crate::types::ability::CastingPermission::ExileWithAltAbilityCost { .. } => {
-                exile_alt_cost_permission_supports_cast(state, obj, player, p, None)
+            crate::types::ability::CastingPermission::AdventureCreature => obj.owner == player,
+            crate::types::ability::CastingPermission::ExileWithEnergyCost => {
+                !face_down && obj.owner == player
+            }
+            crate::types::ability::CastingPermission::ExileWithAltCost {
+                cost_provenance, ..
+            } => {
+                // CR 702.168b + CR 118.9a: a `NormalCost` grant restates the
+                // card's own printed cost — a normal cast route that admits
+                // the face-down cast; an `Alternative` grant does not.
+                (!face_down
+                    || matches!(
+                        cost_provenance,
+                        crate::types::ability::ExileGrantCostProvenance::NormalCost
+                    ))
+                    && exile_alt_cost_permission_supports_cast(state, obj, player, p, None)
+            }
+            crate::types::ability::CastingPermission::ExileWithAltAbilityCost { .. } => {
+                !face_down && exile_alt_cost_permission_supports_cast(state, obj, player, p, None)
             }
             crate::types::ability::CastingPermission::PlayFromExile { .. } => false,
             crate::types::ability::CastingPermission::WarpExile {
                 castable_after_turn,
             } => obj.owner == player && turn_number > *castable_after_turn,
             crate::types::ability::CastingPermission::Plotted { turn_plotted } => {
-                obj.owner == player && turn_number > *turn_plotted
+                !face_down && obj.owner == player && turn_number > *turn_plotted
             }
             crate::types::ability::CastingPermission::Foretold { turn_foretold, .. } => {
-                obj.owner == player && turn_number > *turn_foretold
+                !face_down && obj.owner == player && turn_number > *turn_foretold
             }
         })
         // CR 601.2a + CR 113.6b: A `StaticMode::ExileCastPermission` static on a
@@ -3135,7 +3213,24 @@ fn has_exile_cast_permission(
         // per-turn pool + per-source filter; the helper performs the same checks
         // (per-turn frequency, pool membership, affected filter) used by
         // `exile_objects_castable_by_permission`.
-        || exile_cast_permission_source(state, player, obj.id).is_some()
+        //
+        // CR 118.9a + CR 601.2b: a free static (Maralen-class
+        // `WithoutPayingManaCost`) is itself an alternative cost and lends the
+        // face-down cast no authority; a `PayNormalCost` static (The Matrix of
+        // Time class) stays a normal-cost route. The face-down case SEARCHES
+        // for an eligible normal-cost source — an earlier free source must
+        // not hide a later normal-cost authority (first-match hazard).
+        || if face_down {
+            exile_cast_permission_source_matching(
+                state,
+                player,
+                obj.id,
+                static_source_eligible_for_face_down,
+            )
+            .is_some()
+        } else {
+            exile_cast_permission_source(state, player, obj.id).is_some()
+        }
 }
 
 /// CR 305.1 + CR 601.2a: Lands in exile may be played by permissions that say
@@ -3183,7 +3278,7 @@ fn exile_object_castable_by_permission(
     player: PlayerId,
 ) -> bool {
     play_from_exile_object_in_cast_path(obj)
-        && has_exile_cast_permission(state, obj, player, state.turn_number)
+        && has_exile_cast_permission(state, obj, player, state.turn_number, None)
 }
 
 pub(super) fn cast_permission_constraint_allows_cast(
@@ -3279,11 +3374,10 @@ fn simulate_chosen_split_spell_back_face(obj: &mut crate::game::game_object::Gam
     swap_to_alternative_spell_face(obj);
     // Mirror `ChooseModalFace { back_face: true }` so affordability preview and
     // alt-cost resolution use the chosen face without re-prompting or swapping
-    // back to the front half (#3987).
+    // back to the front half (#3987). #7565: the mirror is the transient
+    // choice flag, not a layout_kind erasure.
     obj.modal_back_face = true;
-    if let Some(ref mut bf) = obj.back_face {
-        bf.layout_kind = None;
-    }
+    obj.cast_face_committed = true;
 }
 
 pub(super) fn exile_alt_cost_permission_supports_cast(
@@ -3745,20 +3839,25 @@ fn selected_object_cast_permission_index(
             });
     }
 
-    let selected_alt_cost = matches!(
-        selected_variant,
-        None | Some(CastingVariant::Normal | CastingVariant::Suspend)
-    )
-    .then(|| {
-        obj.casting_permissions
+    let selected_alt_cost = match selected_variant {
+        None | Some(CastingVariant::Normal | CastingVariant::Suspend) => obj
+            .casting_permissions
             .iter()
             .enumerate()
             .find_map(|(index, permission)| {
                 exile_alt_cost_permission_supports_cast(state, obj, player, permission, None)
                     .then_some(CastingPermissionIndex(index))
-            })
-    })
-    .flatten();
+            }),
+        // CR 702.168b + CR 118.9a: the face-down cast never elects an
+        // `ExileWithAltCost` slot — even a `NormalCost` grant only lends zone
+        // authority (`has_exile_cast_permission`), while the cast's cost is
+        // the face-down {3}; electing the slot would let cost preparation
+        // substitute the grant's restated cost for the {3}. Named limit: a
+        // `single_use` normal-cost grant is therefore not consumed by a
+        // face-down cast through it.
+        Some(CastingVariant::FaceDown) => None,
+        _ => None,
+    };
 
     // CR 601.2a + CR 118.9a: A PlayFromExile grant supplies zone authority,
     // independently of the card-native casting method chosen for the spell
@@ -3781,8 +3880,32 @@ fn selected_object_cast_permission_index(
         if !play_from_exile_can_authorize_variant {
             return None;
         }
-        play_from_exile_permission_source_with_index(state, obj, player, state.turn_number)
-            .map(|(index, _, _)| index)
+        // CR 118.9a: elected-authority provenance — the land/look companion
+        // of an alt-cost grant (`PlayFromExileProvenance::LandLookCompanion`) is never elected as a
+        // cast authority; the sibling alt-cost grant is that sentence's cast
+        // route. A genuine impulse grant further down the vector still wins.
+        obj.casting_permissions
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                !matches!(
+                    p,
+                    CastingPermission::PlayFromExile {
+                        provenance:
+                            crate::types::ability::PlayFromExileProvenance::LandLookCompanion,
+                        ..
+                    }
+                )
+            })
+            .find_map(|(index, _)| {
+                play_from_exile_permission_source_at_index(
+                    state,
+                    obj,
+                    player,
+                    CastingPermissionIndex(index),
+                )
+                .map(|_| CastingPermissionIndex(index))
+            })
     })
 }
 
@@ -4375,6 +4498,43 @@ pub(crate) fn exile_cast_permission_source(
     player: PlayerId,
     exiled_id: ObjectId,
 ) -> Option<(ObjectId, CastFrequency, ExileCastCost)> {
+    exile_cast_permission_source_matching(state, player, exiled_id, |_| true)
+}
+
+/// CR 118.9a: THE face-down eligibility predicate for a static exile source
+/// — `PayNormalCost` base mode AND no `CastCostMode::Alternative` extra-cost
+/// rider (a Valgavoth-class rider replaces the mana payment and makes the
+/// source an alternative-cost authority; an `Additional` rider preserves
+/// ordinary payment). Shared by the admission (`has_exile_cast_permission`)
+/// and every rider/cost read (`elected_exile_permission_source`), so the
+/// admitted authority and the paying authority can never diverge.
+fn static_source_eligible_for_face_down(source: &ExilePermissionSource<'_>) -> bool {
+    matches!(source.cost, ExileCastCost::PayNormalCost)
+        && !matches!(
+            source.extra_cost,
+            Some(crate::types::statics::CastExtraCost {
+                mode: crate::types::statics::CastCostMode::Alternative,
+                ..
+            })
+        )
+}
+
+/// Predicate-aware sibling of [`exile_cast_permission_source`]: returns the
+/// first authorizing static whose SOURCE satisfies `source_ok`, applying the
+/// same source gates (frequency slot, your-turn timing, pool membership,
+/// affected filter). CR 118.9a: the face-down admission must SEARCH for an
+/// eligible source — filtering the result of a first-match scan lets an
+/// earlier ineligible source hide a later eligible one (the multi-source
+/// first-match hazard documented on [`exile_cast_permission_source_full`]).
+/// The predicate sees the whole source so it can weigh the cost mode AND the
+/// extra-cost rider (a `CastCostMode::Alternative` rider makes a
+/// `PayNormalCost` source an alternative-cost authority — Valgavoth).
+fn exile_cast_permission_source_matching(
+    state: &GameState,
+    player: PlayerId,
+    exiled_id: ObjectId,
+    source_ok: impl Fn(&ExilePermissionSource<'_>) -> bool,
+) -> Option<(ObjectId, CastFrequency, ExileCastCost)> {
     let obj = state.objects.get(&exiled_id)?;
     if !exile_object_can_enter_cast_path(obj) {
         return None;
@@ -4402,6 +4562,9 @@ pub(crate) fn exile_cast_permission_source(
         let ctx =
             super::filter::FilterContext::from_source_with_controller(source.source_id, player);
         if !super::filter::matches_target_filter(state, exiled_id, source.filter, &ctx) {
+            return None;
+        }
+        if !source_ok(&source) {
             return None;
         }
         Some((source.source_id, source.frequency, source.cost))
@@ -4538,7 +4701,23 @@ pub(crate) fn elected_exile_permission_source(
     variant
         .and_then(CastingVariant::exile_permission_source)
         .or_else(|| {
-            exile_cast_permission_source(state, player, exiled_id).map(|(source, _, _)| source)
+            // CR 118.9a + CR 601.2a: the face-down cast reselects with the
+            // SAME eligibility predicate its admission used — the ordinary
+            // first-match scan could elect an earlier ineligible source
+            // (Valgavoth alternative rider) and charge ITS cost treatment,
+            // while admission was granted by a later eligible normal-cost
+            // source.
+            if variant == Some(CastingVariant::FaceDown) {
+                exile_cast_permission_source_matching(
+                    state,
+                    player,
+                    exiled_id,
+                    static_source_eligible_for_face_down,
+                )
+                .map(|(source, _, _)| source)
+            } else {
+                exile_cast_permission_source(state, player, exiled_id).map(|(source, _, _)| source)
+            }
         })
 }
 
@@ -5875,6 +6054,18 @@ fn casting_variant_candidates(
             .casting_permissions
             .iter()
             .any(|p| matches!(p, CastingPermission::ExileWithAltCost { .. }));
+        // CR 702.37c / CR 702.168b + CR 708.4: the face-down cast is a
+        // candidate from exile exactly when it is a candidate from hand —
+        // effective keyword present and the FaceDown prepare admitted
+        // (normal-cost route per the round-5 authority predicate). Without
+        // this, a payable exile-permission variant short-circuits the cast
+        // as a single candidate and the legal face-down election is never
+        // surfaced (#7948).
+        if object_has_effective_face_down_keyword(state, object_id)
+            && face_down_cast_is_permitted(state, player, object_id)
+        {
+            candidates.push(CastingVariant::FaceDown);
+        }
         // CR 702.62a: Suspend candidate selection. Runtime-granted Suspend
         // (CR 604.1, e.g. Jhoira of the Ghitu / The Tenth Doctor) lives in
         // the effective off-zone keyword set, not `obj.keywords`, so query
@@ -6225,7 +6416,7 @@ fn prepare_spell_cast_with_variant_override_inner(
     // are excluded in both zones (CR 305.1) via
     // `play_from_exile_object_in_cast_path`.
     let has_object_tagged_play_permission = play_from_exile_object_in_cast_path(obj)
-        && has_exile_cast_permission(state, obj, player, state.turn_number);
+        && has_exile_cast_permission(state, obj, player, state.turn_number, variant_override);
     let has_madness = obj.zone == Zone::Exile
         && matches!(variant_override, Some(CastingVariant::Madness))
         && obj.owner == player
@@ -6318,9 +6509,20 @@ fn prepare_spell_cast_with_variant_override_inner(
     let has_unowned_exile_permission = obj.zone == Zone::Exile
         && obj.owner != player
         && has_alt_cost_permission_for(obj, state, player);
-    let castable_zone = has_unowned_exile_permission
+    // CR 118.9a ("Only one alternative cost can be applied to any one spell
+    // as it's being cast") + CR 601.2b ("A player can't apply two alternative
+    // methods of casting or two alternative costs to a single spell"): an
+    // alternative-cost authority — exile/graveyard alt-cost grants,
+    // during-resolution free-cast windows, graveyard cast keywords — cannot
+    // admit the {3} face-down cast, which is itself an alternative
+    // method+cost. Normal-cost authorities (hand, command zone,
+    // `has_object_tagged_play_permission` = PlayFromExile/Adventure/Warp,
+    // Lurrus-class graveyard permissions, top-of-library play) admit every
+    // variant: there the face-down {3} is the single alternative applied.
+    let face_down_variant = variant_override == Some(CastingVariant::FaceDown);
+    let castable_zone = ((has_unowned_exile_permission || has_during_resolution_alt_cost)
+        && (!face_down_variant || normal_cost_grant_supports_cast(state, obj, player)))
         || has_object_tagged_play_permission
-        || has_during_resolution_alt_cost
         || (obj.owner == player
             && (obj.zone == Zone::Hand
                 || (state.format_config.command_zone
@@ -6331,10 +6533,10 @@ fn prepare_spell_cast_with_variant_override_inner(
                     && obj.is_signature_spell()
                     && oathbreaker_on_battlefield(state, player))
                 || has_madness
-                || has_graveyard_cast_keyword
-                || has_mayhem
+                || ((has_graveyard_cast_keyword || has_mayhem || has_graveyard_alt_cost)
+                    && (!face_down_variant
+                        || normal_cost_grant_supports_cast(state, obj, player)))
                 || has_graveyard_permission
-                || has_graveyard_alt_cost
                 || has_top_of_library_permission));
     if !castable_zone {
         return Err(EngineError::InvalidAction(
@@ -9124,13 +9326,22 @@ pub(super) fn consume_pending_spell_cost_reduction(
 /// spell face for casting. Saves the normal face in `back_face` for later
 /// restoration.
 fn swap_to_alternative_spell_face(obj: &mut crate::game::game_object::GameObject) {
-    let alternative = match obj.back_face.take() {
-        Some(b) => b,
-        None => return,
-    };
-    let normal_snapshot = super::printed_cards::snapshot_object_face(obj);
-    super::printed_cards::apply_back_face_to_object(obj, alternative);
-    obj.back_face = Some(normal_snapshot);
+    // #7565: the shared swap preserves the stored slot's layout_kind.
+    super::printed_cards::swap_object_faces(obj);
+    // CR 715.2a (#7714): while the Adventure/Omen face IS in use, the stored
+    // slot holds the NORMAL face — it must not read as "has an Adventure"
+    // (`SpellCastRecord.has_adventure`, Garenbrig Squire's qualifier).
+    // `restore_alternative_spell_normal_face` re-stamps the marker from the
+    // cast's variant when the normal face returns. Split/MDFC markers are a
+    // different semantic (card-level layout class) and stay preserved.
+    if let Some(back) = obj.back_face.as_mut() {
+        if matches!(
+            back.layout_kind,
+            Some(LayoutKind::Adventure) | Some(LayoutKind::Omen)
+        ) {
+            back.layout_kind = None;
+        }
+    }
 }
 
 /// CR 715 / CR 720: Returns the Adventure-family spell layout if this object
@@ -9220,7 +9431,11 @@ fn is_castable_split_face(types: &crate::types::card_type::CardType) -> bool {
 /// CR 712.11b + CR 709.3: Cast-time face choice for spell//spell MDFCs and
 /// spell//spell split cards.
 fn cast_spell_face_choice_available(obj: &crate::game::game_object::GameObject) -> bool {
-    modal_spell_face_choice_available(obj) || split_spell_face_choice_available(obj)
+    // CR 601.2b (#7565): a choice already made for the CURRENT cast is not
+    // offered again on pipeline re-entry; the transient flag clears once the
+    // cast conversation ends, so a later recast prompts afresh.
+    !obj.cast_face_committed
+        && (modal_spell_face_choice_available(obj) || split_spell_face_choice_available(obj))
 }
 
 /// CR 712.11b: Returns true if `obj` is a Modal double-faced card whose two
@@ -9236,9 +9451,11 @@ fn cast_spell_face_choice_available(obj: &crate::game::game_object::GameObject) 
 /// face normally and plays its land (back) face via PlayLand, so neither needs
 /// a cast-time choice here.
 ///
-/// The gate keys off `back_face.layout_kind == Modal`, which
-/// `snapshot_object_face` clears to `None` after a swap — so re-entry into the
-/// cast pipeline for the chosen face does not re-prompt.
+/// The gate keys off `back_face.layout_kind == Modal`. #7565: a swap now
+/// preserves that layout ([`crate::game::printed_cards::swap_object_faces`]), so
+/// re-entry into the cast pipeline for the chosen face is stopped one level up
+/// instead — [`cast_spell_face_choice_available`] returns `false` once
+/// `cast_face_committed` is set (CR 601.2b).
 fn modal_spell_face_choice_available(obj: &crate::game::game_object::GameObject) -> bool {
     use crate::types::card_type::CoreType;
     let Some(back) = obj.back_face.as_ref() else {
@@ -11417,6 +11634,16 @@ pub(super) fn initiate_cast_during_resolution(
     // Pickpocket). `AlternativeMana` charges a specific explicit mana cost
     // borrowed from a keyword (The Face of Boe's suspend cost) and pauses for
     // manual payment at that cost rather than the card's printed cost.
+    // CR 118.9a: `FullCost` restates the card's own printed cost — a normal
+    // cast; `Free` / `AlternativeMana` substitute it (alternative costs).
+    let cost_provenance = if matches!(
+        &cost,
+        crate::types::ability::ResolutionCastCost::FullCost { .. }
+    ) {
+        crate::types::ability::ExileGrantCostProvenance::NormalCost
+    } else {
+        crate::types::ability::ExileGrantCostProvenance::Alternative
+    };
     let (perm_cost, mana_spend_permission, payment_mode) = match cost {
         crate::types::ability::ResolutionCastCost::Free => {
             (ManaCost::zero(), None, CastPaymentMode::Auto)
@@ -11453,6 +11680,7 @@ pub(super) fn initiate_cast_during_resolution(
         obj.casting_permissions
             .push(CastingPermission::ExileWithAltCost {
                 cost: perm_cost,
+                cost_provenance,
                 cast_transformed,
                 constraint,
                 granted_to: Some(player),
@@ -14246,8 +14474,10 @@ pub fn can_cast_modal_face_now(
     };
     if back_face {
         simulate_chosen_split_spell_back_face(obj);
-    } else if let Some(back) = obj.back_face.as_mut() {
-        back.layout_kind = None;
+    } else {
+        // #7565: mirror the front-face choice on the simulation clone the same
+        // way the real handler records it.
+        obj.cast_face_committed = true;
     }
     if obj
         .card_types
@@ -14861,9 +15091,11 @@ fn can_cast_prepared_now_with_probe(
     // (Esika, God of the Tree needs {1}{G}{G}) while the back face is castable
     // (The Prismatic Bridge needs {W}{U}{B}{R}{G}); the card is still legally
     // castable and will prompt ModalFaceChoice (CR 712.11b). Mirror the Adventure
-    // recursion: swap to the back face and re-test. `simulate_chosen_split_spell_back_face`
-    // clears the stashed face's `layout_kind`, so the recursive call does not
-    // re-enter this branch (no infinite recursion).
+    // recursion: swap to the back face and re-test. #7565: the recursion stops
+    // because `simulate_chosen_split_spell_back_face` sets `cast_face_committed`,
+    // which `cast_spell_face_choice_available` reads (CR 601.2b — a choice already
+    // made for the current cast is not offered again). The swap itself no longer
+    // erases the stashed `layout_kind`, so that erasure can no longer be the guard.
     if cast_spell_face_choice_available(obj) {
         let mut sim = state.clone();
         if let Some(sim_obj) = sim.objects.get_mut(&prepared.object_id) {
@@ -20304,6 +20536,12 @@ pub fn handle_cancel_cast(
         if let Some(obj) = state.objects.get_mut(&pending.object_id) {
             obj.modal_back_face = false;
         }
+    }
+    // #7565: a cancelled cast releases its face choice — the object may never
+    // move zones (it stays in hand), so the zone-change clear cannot cover
+    // this path. Unconditional: harmless when no choice was made.
+    if let Some(obj) = state.objects.get_mut(&pending.object_id) {
+        obj.cast_face_committed = false;
     }
 
     if pending.casting_variant == CastingVariant::Prototype {

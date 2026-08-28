@@ -248,6 +248,7 @@ fn exiled_card_with_play_permission_stays_on_exile_path() {
         };
         obj.casting_permissions
             .push(CastingPermission::PlayFromExile {
+                provenance: engine::types::ability::PlayFromExileProvenance::Impulse,
                 duration: Duration::UntilEndOfTurn,
                 granted_to: P0,
                 frequency: engine::types::statics::CastFrequency::Unlimited,

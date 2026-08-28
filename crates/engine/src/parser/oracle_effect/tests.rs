@@ -429,6 +429,111 @@ fn beseech_suffix_constraint_unchanged_after_refactor() {
     );
 }
 
+/// CR 120.2a + CR 608.2h (issue #5923): Kotis, the Fangkeeper's combat-damage
+/// trigger — "exile the top X cards of their library, where X is the amount
+/// of damage dealt. You may cast any number of spells with mana value X or
+/// less from among them without paying their mana costs." Before the
+/// `parse_event_context_refs` fix, the "the amount of damage dealt"
+/// paraphrase was not recognized by the "the damage dealt" bare-phrase arm
+/// (`oracle_nom/quantity.rs`), so the where-X binding was left unresolved and
+/// the totality guard in `lower.rs` collapsed BOTH the `ExileTop` step and its
+/// `CastFromZone` sub-ability to `Effect::unimplemented("where_x_binding",
+/// ..)`. Revert-fail: with the bug present this test's positive-shape
+/// assertions fail (both effects were `Unimplemented`, not `ExileTop` /
+/// `CastFromZone`) and the no-Unimplemented sweep below also fails.
+#[test]
+fn kotis_the_fangkeeper_full_trigger_binds_damage_dealt_where_x() {
+    let parsed = parse_oracle_text(
+        "Indestructible\nWhenever Kotis deals combat damage to a player, exile the top X cards of their library, where X is the amount of damage dealt. You may cast any number of spells with mana value X or less from among them without paying their mana costs.",
+        "Kotis, the Fangkeeper",
+        &["Indestructible".to_string()],
+        &["Legendary".to_string(), "Creature".to_string()],
+        &["Zombie".to_string(), "Warrior".to_string()],
+    );
+
+    let execute = parsed
+        .triggers
+        .iter()
+        .find_map(|t| t.execute.as_deref())
+        .expect("Kotis's combat-damage trigger must produce an executable ability");
+
+    // Outer effect: exile the top X cards of the damaged player's library,
+    // where X is bound to the triggering event's damage amount.
+    let Effect::ExileTop {
+        ref player,
+        ref count,
+        ..
+    } = *execute.effect
+    else {
+        panic!("expected ExileTop, got {:?}", execute.effect);
+    };
+    assert_eq!(
+        *player,
+        TargetFilter::TriggeringPlayer,
+        "Oracle-text grammar: \"their library\" in a DamageDone trigger binds to the \
+         damaged player (\"deals combat damage to a player\"), not to Kotis's controller \
+         — a pronoun-antecedent reading, not a specific CR citation (CR 608.2c governs \
+         the ORDER effects apply their instructions, not pronoun antecedents)"
+    );
+    assert_eq!(
+        *count,
+        QuantityExpr::Ref {
+            qty: QuantityRef::EventContextAmount
+        },
+        "CR 608.2h: \"where X is the amount of damage dealt\" must bind X to the \
+         triggering event's damage amount, not fall back to an unbound sentinel"
+    );
+
+    // Sub-ability: cast any number of the exiled spells with mana value X or
+    // less, without paying their mana costs.
+    let sub_ability = execute
+        .sub_ability
+        .as_deref()
+        .expect("the \"you may cast\" sentence must attach as a sub-ability");
+    let Effect::CastFromZone {
+        ref target,
+        without_paying_mana_cost,
+        ref constraint,
+        ..
+    } = *sub_ability.effect
+    else {
+        panic!("expected CastFromZone, got {:?}", sub_ability.effect);
+    };
+    assert_eq!(*target, TargetFilter::ExiledBySource);
+    assert!(without_paying_mana_cost);
+    assert_eq!(
+        *constraint,
+        Some(CastPermissionConstraint::ManaValue {
+            comparator: Comparator::LE,
+            value: QuantityExpr::Ref {
+                qty: QuantityRef::EventContextAmount
+            },
+        }),
+        "the free-cast offer must be capped at mana value X (the same dynamic \
+         damage-dealt amount), not left unconstrained or Fixed"
+    );
+
+    // No clause of the trigger may have fallen back to Unimplemented.
+    fn effect_has_unimplemented(effect: &Effect) -> bool {
+        matches!(effect, Effect::Unimplemented { .. })
+    }
+    fn ability_has_unimplemented(ability: &AbilityDefinition) -> bool {
+        effect_has_unimplemented(&ability.effect)
+            || ability
+                .sub_ability
+                .as_deref()
+                .is_some_and(ability_has_unimplemented)
+            || ability
+                .else_ability
+                .as_deref()
+                .is_some_and(ability_has_unimplemented)
+    }
+    assert!(
+        !ability_has_unimplemented(execute),
+        "Kotis's trigger must have zero Unimplemented nodes: {execute:#?}"
+    );
+}
+
 /// A1 (full line): Cosmic Cube's whole attack trigger lowers to a
 /// `CastFromZone` whose `constraint` carries the dynamic ceiling. Revert-fail:
 /// today the constraint serializes as `null` (verified in card-data.json).
@@ -8143,6 +8248,33 @@ fn effect_unless_each_opponent_sacrifice_or_discard_binds_scoped_player() {
         panic!("sacrifice target should be typed, got {0:?}", sac.target);
     };
     assert_eq!(tf.controller, Some(ControllerRef::You));
+}
+
+/// CR 101.4 + CR 118.12a: the prepositional player scope used by the
+/// aggregate token grammar must bind "they" to its iterated opponent just as
+/// the subject-form scope above does. The spell controller creates every token;
+/// the opponents only decide whether to pay the sacrifice cost.
+#[test]
+fn effect_for_each_opponent_token_unless_sacrifice_binds_scoped_player() {
+    let def = parse_effect_chain(
+        "For each opponent, you create a 2/2 black Zombie creature token unless they sacrifice a creature.",
+        AbilityKind::Spell,
+    );
+
+    assert_eq!(def.player_scope, Some(PlayerFilter::Opponent));
+    assert!(matches!(
+        *def.effect,
+        Effect::Token {
+            count: QuantityExpr::Fixed { value: 1 },
+            ..
+        }
+    ));
+    let unless_pay = def.unless_pay.expect("should attach unless_pay");
+    assert_eq!(unless_pay.payer, TargetFilter::ScopedPlayer);
+    assert!(matches!(
+        unless_pay.cost,
+        AbilityCost::Sacrifice(ref cost) if cost.requirement.fixed_count() == Some(1)
+    ));
 }
 
 #[test]
@@ -47754,6 +47886,11 @@ fn attach_just_moved_gilgamesh_any_number_equipment_reflexive_attach() {
         attach.optional,
         "\"you may attach\" makes the attach step optional"
     );
+    assert_eq!(
+        attach.target_choice_timing,
+        TargetChoiceTiming::Resolution,
+        "Gilgamesh says 'a Samurai', not 'target Samurai', so the host is chosen while resolving"
+    );
 }
 
 /// Quest for the Holy Relic / Stonehewer Giant pattern:
@@ -54567,6 +54704,7 @@ fn assert_uneven_land_search_shape(
             qty: QuantityRef::ControlledByEachPlayer {
                 filter: TargetFilter::Typed(lands),
                 aggregate: AggregateFunction::Max,
+                relation: PlayerRelation::All,
             },
         } if lands == &TypedFilter::land()
     ));

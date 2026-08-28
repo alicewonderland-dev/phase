@@ -94,6 +94,7 @@ fn add_aang_dfc(state: &mut GameState) -> ObjectId {
     };
     obj.base_card_types = obj.card_types.clone();
     obj.back_face = Some(BackFaceData {
+        is_swap_snapshot: false,
         name: "Avatar Aang, Master of Elements".to_string(),
         power: Some(6),
         toughness: Some(6),

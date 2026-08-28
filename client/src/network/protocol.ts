@@ -8,6 +8,7 @@ import type {
   ManaCost,
   ObjectId,
   ObjectAction,
+  ActionRejection,
 } from "../adapter/types";
 import type { InteractionSubmission, ViewerInteraction } from "../adapter/generated/interaction";
 import type { SeatMutation, SeatView } from "../multiplayer/seatTypes";
@@ -88,12 +89,33 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * connecting screen with no layer able to tell the user. Only the adapter
  * holds the state needed to perform the response.
  *
- * The guest → host direction has its own single site: guests stamp this version
- * on `guest_deck` / `reconnect`, and `P2PHostAdapter`'s first-contact gate
- * refuses a stamped mismatch. That field is optional and an absent one is
- * admitted; see the gate for why.
+ * The guest → host direction has its own single site: current guests must stamp
+ * this version on `guest_deck` / `reconnect`, and `P2PHostAdapter`'s
+ * first-contact gate rejects a missing or unequal value before it allocates a
+ * seat or adopts reconnect state.
  *
  * Bumps to date:
+ *  33 — Resolution-time optional PayCost(OneOf) branch choice added a
+ *       serialized WaitingFor/GameAction pair.
+ *  32 — FormatConfig.deck_size changed from a bare u16 to the adjacently
+ *       tagged DeckSizeRule enum (Minimum(u16) / Exactly(u16)), because
+ *       CR 903.13f(1) makes Commander Draft a command-zone format with a
+ *       minimum rather than an exact size, and GameFormat gained a
+ *       CommanderDraft variant (CR 903.13a). A PARSE bump like 16, not a
+ *       silent capability loss like 24: FormatConfig::deck_size carries
+ *       neither a serde default nor a deserialize_with, so a v31 peer's
+ *       "deck_size": 60 cannot deserialize against the adjacently tagged enum
+ *       and a v32 peer's {"type":"Minimum","data":60} cannot deserialize
+ *       against a v31 u16 — the break is unconditional, runs in BOTH
+ *       directions, and hits every format's snapshot, not just Commander
+ *       Draft's. GameState.format_config's serde default does NOT rescue it:
+ *       a field-level default applies only when the key is ABSENT, and an old
+ *       peer sends the key present with the old inner shape. The
+ *       GameFormat::CommanderDraft variant is the second and narrower half —
+ *       it breaks only when that variant is actually serialized.
+ *  31 — Action and mana-payment-preview rejections carry engine-owned,
+ *       viewer-filtered ActionRejection DTOs. First-contact versioning keeps
+ *       legacy peers from treating a typed rejection as a transport string.
  *  30 — ManaRestriction.CannotCastSpellFromZone adds a serialized
  *       GameState/ManaUnit restriction used by Karolina Dean. Older peers
  *       cannot deserialize that externally tagged enum variant.
@@ -175,15 +197,16 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  *       sub-phase on WaitingFor::MulliganDecision; the MulliganBottomCards
  *       variant was removed
  */
-export const WIRE_PROTOCOL_VERSION = 30 as const;
+export const WIRE_PROTOCOL_VERSION = 33 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
-  // `wireProtocolVersion` is optional on both first-contact guest messages:
-  // guests on an older bundle cannot stamp it, and the host admits those.
-  // Typed `number` rather than `typeof WIRE_PROTOCOL_VERSION` on purpose —
-  // the literal type would narrow the host's "present and unequal" branch
-  // to `never`.
-  | { type: "guest_deck"; deckData: unknown; displayName?: string; reservationToken?: string; wireProtocolVersion?: number }
+  | {
+      type: "guest_deck";
+      deckData: unknown;
+      displayName?: string;
+      reservationToken?: string;
+      wireProtocolVersion: typeof WIRE_PROTOCOL_VERSION;
+    }
   | ({
       type: "game_setup";
       wireProtocolVersion: typeof WIRE_PROTOCOL_VERSION;
@@ -204,10 +227,12 @@ export type P2PMessage = P2PAuthorityWire & (
       events: GameEvent[];
       logEntries?: GameLogEntry[];
     } & LegalActionsWire)
-  | { type: "action_rejected"; reason: string }
+  | { type: "action_rejected"; rejection: ActionRejection }
+  | { type: "action_failed"; message: string }
   | { type: "action_noop" }
   | { type: "mana_payment_preview"; requestId: number; sourceIds: ObjectId[] }
-  | { type: "mana_payment_preview_rejected"; requestId: number; reason: string }
+  | { type: "mana_payment_preview_rejected"; requestId: number; rejection: ActionRejection }
+  | { type: "mana_payment_preview_failed"; requestId: number; message: string }
   | { type: "ping"; timestamp: number }
   | { type: "pong"; timestamp: number }
   | { type: "disconnect"; reason: string }
@@ -216,7 +241,12 @@ export type P2PMessage = P2PAuthorityWire & (
   /** Protected by a draft-installed match capability on the host. */
   | { type: "match_concede" }
   // Reconnect: guest presents prior token; host accepts (with fresh state) or rejects.
-  | { type: "reconnect"; playerToken: string; sessionKey?: P2PSessionKey; wireProtocolVersion?: number }
+  | {
+      type: "reconnect";
+      playerToken: string;
+      sessionKey?: P2PSessionKey;
+      wireProtocolVersion: typeof WIRE_PROTOCOL_VERSION;
+    }
   | ({
       type: "reconnect_ack";
       wireProtocolVersion: typeof WIRE_PROTOCOL_VERSION;
@@ -225,7 +255,13 @@ export type P2PMessage = P2PAuthorityWire & (
       state: GameState;
       playerNames?: Record<number, string>;
     } & LegalActionsWire)
-  | { type: "reconnect_rejected"; reason: string }
+  | {
+      type: "reconnect_rejected";
+      reason: string;
+      reasonCode?: "first_message_invalid" | "wire_protocol_version_required" | "wire_protocol_mismatch" | "malformed_authority";
+      hostWireProtocolVersion?: number;
+      guestWireProtocolVersion?: number;
+    }
   // Kick / forced removal (host → target).
   | { type: "kick"; reason: string; format?: string }
   // Host explicitly quit the game (host → all guests). Terminal: guests set
@@ -270,9 +306,11 @@ const VALID_TYPES = new Set([
   "preview_mana_payment",
   "state_update",
   "action_rejected",
+  "action_failed",
   "action_noop",
   "mana_payment_preview",
   "mana_payment_preview_rejected",
+  "mana_payment_preview_failed",
   "ping",
   "pong",
   "disconnect",

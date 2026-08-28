@@ -53,6 +53,7 @@ fn stage_esper_origins_in_graveyard() -> (engine::game::scenario::GameRunner, Ob
         card_types.core_types.push(CoreType::Creature);
         card_types.subtypes = vec!["Saga".to_string(), "Elemental".to_string()];
         obj.back_face = Some(BackFaceData {
+            is_swap_snapshot: false,
             name: "Summon: Esper Maduin".to_string(),
             power: Some(4),
             toughness: Some(4),

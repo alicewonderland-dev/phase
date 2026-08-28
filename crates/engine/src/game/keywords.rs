@@ -129,12 +129,15 @@ pub fn effective_disturb_cost(state: &GameState, object_id: ObjectId) -> Option<
     let keyword =
         effective_keyword_for_object(state, object_id, KeywordKind::Disturb).or_else(|| {
             let obj = state.objects.get(&object_id)?;
-            // `snapshot_object_face` clears layout_kind; a still-unswapped DFC
-            // back face retains its layout kind and must not grant Disturb.
+            // #7565: the explicit swap-snapshot marker says "the live face is
+            // the alternative and this slot holds the stashed normal face" —
+            // a still-unswapped DFC back face must not grant Disturb. (The old
+            // discriminator was layout_kind.is_none(), an implicit contract
+            // with snapshot_object_face's erasure.)
             let stored_front_face = obj
                 .back_face
                 .as_ref()
-                .filter(|face| face.layout_kind.is_none())?;
+                .filter(|face| face.is_swap_snapshot)?;
             stored_front_face
                 .keywords
                 .iter()

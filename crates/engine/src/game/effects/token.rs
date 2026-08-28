@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -18,9 +19,9 @@ use crate::types::card_type::{CardType, CoreType, Supertype};
 use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    DelayedTrigger, GameState, LiminalEntry, LiminalTokenAbilityInjection, PendingCopyTokenBatch,
-    PendingCounterAddition, PendingCounterPostAction, PendingEffectResolutionEvent,
-    PendingTokenBattlefieldEntry, TokenEntryEventEmission, WaitingFor,
+    DelayedTrigger, GameState, LiminalEntry, LiminalTokenAbilityInjection, PendingCounterAddition,
+    PendingCounterPostAction, PendingEffectResolutionEvent, PendingTokenBattlefieldEntry,
+    TokenEntryEventEmission, WaitingFor,
 };
 use crate::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef, TrackedSetId};
 use crate::types::keywords::{Keyword, WardCost};
@@ -2418,6 +2419,7 @@ pub(crate) fn realize_settled_token_battlefield_entry(
 /// `characteristics` / `script_name` / `static_abilities` / `tapped` /
 /// `source_id` / `controller` are INERT: they set object fields directly or
 /// feed the ETB probe and emit no creation-time event beyond the ETB pair.
+#[cfg(test)]
 pub(crate) fn spec_emits_only_etb_pair(spec: &TokenSpec) -> bool {
     spec.enter_with_counters.is_empty() // no CounterAdded event / AddCounter replacement
         && !spec.enters_attacking // no combat-state mutation (CR 508.4)
@@ -2433,6 +2435,7 @@ pub(crate) fn spec_emits_only_etb_pair(spec: &TokenSpec) -> bool {
 /// `EnterBattlefield(None)`, one narrow `EnterBattlefield(Some(ct))` per core
 /// type, and `TokenCreated`. Kept in lockstep with the deriver so the §2.3a gate
 /// reasons about exactly the events siblings would observe.
+#[cfg(test)]
 fn produced_token_emitted_keys(
     produced_core_types: &[CoreType],
 ) -> Vec<crate::types::triggers::TriggerEventKey> {
@@ -2474,6 +2477,7 @@ fn produced_token_emitted_keys(
 ///
 /// Conservatively rejects any trigger routed to unclassified (catch-all/dynamic
 /// modes fire on everything, so they always observe siblings).
+#[cfg(test)]
 pub(crate) fn produced_token_is_non_observer(
     triggers: &[TriggerDefinition],
     produced_core_types: &[CoreType],
@@ -2494,6 +2498,7 @@ pub(crate) fn produced_token_is_non_observer(
 /// (Doubling Season's mandatory Double) are fine and stay per-token (§5.2) —
 /// they never produce `NeedsChoice`. Reuses the live pipeline's exact decision
 /// functions, side-effect-free (`&GameState`, no `apply_single_replacement`).
+#[cfg(test)]
 fn token_creation_needs_choice(
     state: &GameState,
     spec: &TokenSpec,
@@ -2529,6 +2534,7 @@ fn token_creation_needs_choice(
 /// type predicate the disjointness check can reason about (negation,
 /// subtype-only, broad `Permanent`/`Card`/`Any`) — the caller then conserves by
 /// refusing the batch.
+#[cfg(test)]
 fn type_filter_core_types(filter: &TypeFilter) -> Option<Vec<CoreType>> {
     match filter {
         TypeFilter::Creature => Some(vec![CoreType::Creature]),
@@ -2559,6 +2565,7 @@ fn type_filter_core_types(filter: &TypeFilter) -> Option<Vec<CoreType>> {
 
 /// CR 205: The concrete `CoreType` set a `TargetFilter` counts, when it is a
 /// single-`TypeFilter` `Typed` filter. Any other shape yields `None`.
+#[cfg(test)]
 fn target_filter_counted_core_types(filter: &TargetFilter) -> Option<Vec<CoreType>> {
     match filter {
         TargetFilter::Typed(TypedFilter { type_filters, .. }) => {
@@ -2578,6 +2585,7 @@ fn target_filter_counted_core_types(filter: &TargetFilter) -> Option<Vec<CoreTyp
 /// quantity inside a `QuantityCheck` is provably disjoint from `token_core_types`.
 /// Any other condition shape (or an un-provable filter) returns `false` →
 /// conserve.
+#[cfg(test)]
 fn condition_invariant_for_token(
     condition: &crate::types::ability::AbilityCondition,
     token_core_types: &[CoreType],
@@ -2668,6 +2676,7 @@ pub(crate) fn token_effect_is_source_independent(ability: &ResolvedAbility) -> b
 /// `run_source_ids` are the per-entry source object ids of the contiguous run
 /// (resolution order, top-down), needed only by the met-copy prefix path to
 /// gather each entry's `SelfRef` copy source. The base-token path ignores them.
+#[cfg(test)]
 pub(crate) fn try_resolve_batch(
     state: &GameState,
     ability: &ResolvedAbility,
@@ -2745,6 +2754,13 @@ pub(crate) fn try_resolve_batch(
     Some(super::BatchPlan::token(spec, run_len))
 }
 
+/// Token handler-owned admission for the stack's clone-and-proof runner.
+/// This is deliberately read-only; `resolve` remains the sole production
+/// authority for creating each token.
+pub(crate) fn supports_sequential_batch_proof(ability: &ResolvedAbility) -> bool {
+    token_effect_is_source_independent(ability)
+}
+
 /// CR 608.2c + CR 707.2: A met `ConditionInstead` whose swapped effect is a
 /// bare `CopyTokenOf { target: SelfRef, … }` copies the run's own source object
 /// per entry. When a contiguous prefix of the run's copy sources share
@@ -2756,6 +2772,7 @@ pub(crate) fn try_resolve_batch(
 /// `sub` is the override sub-ability (its effect is the swapped `CopyTokenOf`);
 /// `inner` is the already-fired `ConditionInstead` condition. `run_source_ids`
 /// are the per-entry source ids (top-down resolution order).
+#[cfg(test)]
 fn try_resolve_copy_batch(
     state: &GameState,
     ability: &ResolvedAbility,
@@ -2839,35 +2856,8 @@ fn try_resolve_copy_batch(
         return None;
     }
 
-    // 6. Build the count-aware copy-token batch directly. This uses the same
-    //    replacement/apply primitive as `CopyTokenOf`, but avoids re-resolving the
-    //    self target and recomputing identical copiable values once per stack
-    //    entry.
-    let top_source_id = *run_source_ids.first()?;
-    let top_source = state.objects.get(&top_source_id)?;
-    let copy_batch = PendingCopyTokenBatch {
-        owner,
-        count: prefix_len,
-        copy: Box::new(CopyTokenSpec {
-            values: Box::new(prefix_values.clone()),
-            display_source: top_source.display_source,
-            printed_ref: top_source.printed_ref.clone(),
-            token_image_ref: top_source.token_image_ref.clone(),
-            extra_keywords: extra_keywords.clone(),
-            additional_modifications: additional_modifications.clone(),
-            tapped: false,
-            enters_attacking: false,
-            sacrifice_at: ability.duration.clone(),
-            source_id: ability.source_id,
-            controller: ability.controller,
-        }),
-    };
-
-    // 7. Hand back the copy-prefix batch.
+    // 6. Retain only the read-only probe facts needed by legacy observer tests.
     Some(super::BatchPlan::copy_token(
-        copy_batch,
-        EffectKind::from(&sub.effect),
-        ability.source_id,
         probe_spec,
         prefix_values.mana_cost.mana_value(),
         prefix_len,
@@ -2879,6 +2869,7 @@ fn try_resolve_copy_batch(
 /// `CounterAdded` and may pause for replacement choices, so the copy-prefix
 /// batch may only collapse values whose creation still emits exactly the ETB
 /// pair.
+#[cfg(test)]
 fn copy_token_values_emit_only_etb_pair(values: &crate::types::ability::CopiableValues) -> bool {
     crate::game::printed_cards::intrinsic_face_counters(values.loyalty, None).is_empty()
         && crate::game::printed_cards::self_etb_counter_replacements(
@@ -2892,6 +2883,7 @@ fn copy_token_values_emit_only_etb_pair(values: &crate::types::ability::Copiable
 /// only the copiable values (CR 707.2): token art comes from the live source at
 /// resolution time (`token_copy::resolve`), so no `PrintedCardRef` is threaded
 /// through the probe.
+#[cfg(test)]
 pub(crate) fn copy_probe_spec(
     ability: &ResolvedAbility,
     values: &crate::types::ability::CopiableValues,
@@ -2944,6 +2936,7 @@ pub(crate) fn copy_probe_spec_for(
 /// passing spec injects no triggers. Collected explicitly (defense in depth):
 /// if a future spec ever carries a Role subtype while passing the gate, its
 /// triggers are surfaced here for classification.
+#[cfg(test)]
 fn base_token_trigger_defs(spec: &TokenSpec) -> Vec<TriggerDefinition> {
     let mut out: Vec<TriggerDefinition> = Vec::new();
     if spec.characteristics.subtypes.iter().any(|s| s == "Role") {
@@ -3785,6 +3778,7 @@ fn junk_ability() -> AbilityDefinition {
         AbilityKind::Activated,
         Effect::GrantCastingPermission {
             permission: CastingPermission::PlayFromExile {
+                provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
                 duration: Duration::UntilEndOfTurn,
                 granted_to: PlayerId(0),
                 frequency: CastFrequency::Unlimited,
@@ -3862,6 +3856,7 @@ fn incubator_phyrexian_back_face() -> BackFaceData {
         // no parse to have gone wrong.
         parse_warnings: vec![],
         layout_kind: None,
+        is_swap_snapshot: false,
     }
 }
 

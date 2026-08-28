@@ -44,10 +44,11 @@
     "respondSubtitle": "Accept the verified route or stop at one of your issued boundaries.",
     "shortenAtBreakpoint": "Stop at boundary {{breakpointId}}"
   },
-  "resolutionProgress": {
-    "label": "Auflösen {{resolved}} / {{total}}",
-    "collapse": "Auflösungsfortschritt einklappen",
-    "expand": "Auflösungsfortschritt ausklappen"
+  "restoredAutomation": {
+    "dismiss": "Schließen",
+    "noop": {"title": "Gespeichertes Spiel geladen", "summary_one": "Keine Stapelautomatisierung zum Fortsetzen erforderlich.", "summary_other": "Keine Stapelautomatisierung zum Fortsetzen erforderlich."},
+    "progressed": {"title": "Stapelautomatisierung fortgesetzt", "summary_one": "Die Engine hat {{count}} automatisierte Auflösung abgeschlossen.", "summary_other": "Die Engine hat {{count}} automatisierte Auflösungen abgeschlossen.", "omitted_one": "{{count}} Zwischenereignis wurde ausgelassen.", "omitted_other": "{{count}} Zwischenereignisse wurden ausgelassen."},
+    "zeroResolutionRepair": {"title": "Stapelautomatisierung repariert", "summary_one": "Die gespeicherte Automatisierung wurde vor der Fortsetzung sicher repariert.", "summary_other": "Die gespeicherte Automatisierung wurde vor der Fortsetzung sicher repariert."}
   },
   "resolveAllConsent": {
     "eyebrow": "Alles auflösen",
@@ -2142,6 +2143,26 @@
     "no": "Nein",
     "dontAskAgain": "Dieses Spiel nicht mehr fragen",
     "dontAskAgainForSameCard": "Auf jede Kopie dieser Karte anwenden"
+  },
+  "resolutionOptionalPayment": {
+    "title": "Optionale Zahlung wählen",
+    "pay": "{{cost}} bezahlen",
+    "decline": "Ablehnen",
+    "cost": {
+      "card": "Karte",
+      "cards": "Karten",
+      "filteredCard": "{{types}}-Karte",
+      "filteredCards": "{{types}}-Karten",
+      "nonType": "Nicht-{{type}}",
+      "orSeparator": " oder ",
+      "zoneBattlefield": "dem Schlachtfeld",
+      "zoneGraveyard": "deinem Friedhof",
+      "zoneLibrary": "deiner Bibliothek",
+      "zoneExile": "dem Exil",
+      "zoneHand": "deiner Hand",
+      "discard": "Wirf {{count}} {{cards}} ab",
+      "exile": "Schicke {{count}} {{cards}} aus {{zone}} ins Exil"
+    }
   },
   "topOrBottom": {
     "cardFallback": "Card",

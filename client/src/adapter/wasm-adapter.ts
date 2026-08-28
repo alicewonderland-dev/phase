@@ -3,7 +3,6 @@ import type {
   AiDecisionDiagnosticReceipt,
   AiDecisionDiagnosticsCapability,
   AiProposalSubmission,
-  BatchResolveResult,
   EngineAdapter,
   EngineSnapshot,
   FormatConfig,
@@ -14,11 +13,20 @@ import type {
   ObjectId,
   PersistedGameState,
   PlayerId,
+  RestoredGameStateResult,
+  RestoredStackAutomationPresentation,
   SubmitResult,
   ViewerSnapshot,
 } from "./types";
 import type { InteractionSubmission } from "./generated/interaction";
-import { AdapterError, AdapterErrorCode, isStaleRejectionMessage, isStateLostMessage, nextSnapshotSeq } from "./types";
+import {
+  actionRejectionError,
+  AdapterError,
+  AdapterErrorCode,
+  isActionOutcome,
+  isStateLostMessage,
+  nextSnapshotSeq,
+} from "./types";
 import type { BracketDeckRequest, BracketEstimate } from "../types/bracketEstimate";
 import { isBracketEstimate } from "../types/bracketEstimate";
 import { EngineWorkerClient } from "./engine-worker-client";
@@ -49,6 +57,21 @@ function isDebugCreateCard(action: GameAction): boolean {
 
 function isDebugCreateCardDbMissing(error: unknown): boolean {
   return error instanceof Error && error.message === DEBUG_CREATE_CARD_DB_MISSING;
+}
+
+function unwrapActionOutcome<T>(value: unknown): T {
+  if (typeof value === "string") throw new Error(value);
+  if (!isActionOutcome(value)) {
+    throw new AdapterError(
+      AdapterErrorCode.ACTION_REJECTED,
+      "The engine rejected that action.",
+      true,
+    );
+  }
+  if (value.status === "rejected") {
+    throw actionRejectionError(value.rejection);
+  }
+  return value.result as T;
 }
 
 class AiPoolScoreTimeoutError extends Error {
@@ -90,16 +113,12 @@ async function classifyEngineErrorAsync(
   err: unknown,
   takePanic: () => Promise<string | null>,
 ): Promise<Error> {
+  if (err instanceof AdapterError) return err;
   // Returns (rather than throws) the error to surface so call sites can
   // write `throw await classifyEngineErrorAsync(...)`. TypeScript doesn't
   // always narrow control flow through an awaited `Promise<never>`, so
   // making the throw explicit keeps the surrounding methods type-clean.
   const message = err instanceof Error ? err.message : String(err);
-  // Actor-authorization rejection (stale action after a priority/turn shift).
-  // Typed so dispatch can treat it as a benign no-op rather than a crash.
-  if (isStaleRejectionMessage(message)) {
-    return new AdapterError(AdapterErrorCode.STALE_ACTION, message, false);
-  }
   if (isStateLostMessage(message)) {
     let panic: string | null = null;
     try {
@@ -188,6 +207,20 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
   private readonly receiptByToken = new Map<string, AiDecisionDiagnosticReceipt>();
   private readonly tokenBySemanticOwner = new Map<PlayerId, string>();
   private readonly aiDecisionDiagnosticListeners = new Set<(receipt: AiDecisionDiagnosticReceipt) => void>();
+
+  // ── #7920: pod-issued whole-match concede ──────────────────────────────
+  // Mirrors the P2P adapters' conditional MatchConcedeCapability: the duck-
+  // typed `supportsMatchConcede(adapter)` guard passes only after a pod
+  // match binding installs the members. Plain AI games never bind it, so
+  // their menu keeps the engine-dispatch concede path.
+  supportsMatchConcede?: true;
+  sendMatchConcede?: () => void;
+
+  /** Installed only by a pod-issued bot-match binding (multiplayerDraftStore). */
+  bindMatchConcede(run: () => void): void {
+    this.supportsMatchConcede = true;
+    this.sendMatchConcede = run;
+  }
 
   /** Invalidate local observations whenever the WASM authority invalidates proposals. */
   private invalidateAiDecisionDiagnostics(): void {
@@ -685,20 +718,6 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
     }
   }
 
-  async resolveAll(
-    requester: number,
-    aiSeats: { playerId: number; difficulty: string }[],
-    maxResolutions: number = 0,
-  ): Promise<BatchResolveResult> {
-    this.assertInitialized();
-    if (this.engine) {
-      const result = await this.engine.resolveAll(requester, aiSeats, maxResolutions);
-      this.invalidateAiDecisionDiagnostics();
-      return result;
-    }
-    throw new Error("resolveAll requires worker-based engine");
-  }
-
   private async requireCardDbForRestore(): Promise<void> {
     await this.ensureCardDb();
     // Soft-failed ensureCardDb leaves cardDbLoaded false and skips
@@ -717,6 +736,26 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
     if (this.engine) await this.engine.restoreState(json);
     else await this.fallback!.restoreState(json);
     this.invalidateAiDecisionDiagnostics();
+  }
+
+  async resumeRestoredGameState(): Promise<RestoredGameStateResult> {
+    this.assertInitialized();
+    try {
+      const resumed = this.engine
+        ? await this.engine.resumeRestoredGameState()
+        : await this.fallback!.resumeRestoredGameState();
+      this.invalidateAiDecisionDiagnostics();
+      return {
+        presentation: resumed.presentation,
+        snapshot: {
+          state: unwrapClientGameState(resumed.snapshot.state),
+          legalResult: resumed.snapshot.legalResult,
+          seq: nextSnapshotSeq(),
+        },
+      };
+    } catch (err) {
+      throw await classifyEngineErrorAsync(err, this.takePanic);
+    }
   }
 
   /**
@@ -791,15 +830,24 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
    * Distinct from `restoreState` (undo semantics, deterministic re-seed).
    * Mirrors `server-core::GameSession::from_persisted`.
    */
-  async resumeMultiplayerHostState(state: PersistedGameState): Promise<void> {
+  async resumeMultiplayerHostState(state: PersistedGameState): Promise<RestoredGameStateResult> {
     this.assertInitialized();
     // Same CARD_DB requirement as restoreState — resume rehydrates abilities
     // only when the DB is loaded (engine-wasm resume_multiplayer_host_state).
     await this.requireCardDbForRestore();
     const json = JSON.stringify(state);
-    if (this.engine) await this.engine.resumeMultiplayerHostState(json);
-    else await this.fallback!.resumeMultiplayerHostState(json);
+    const resumed = this.engine
+      ? await this.engine.resumeMultiplayerHostState(json)
+      : await this.fallback!.resumeMultiplayerHostState(json);
     this.invalidateAiDecisionDiagnostics();
+    return {
+      presentation: resumed.presentation,
+      snapshot: {
+        state: unwrapClientGameState(resumed.snapshot.state),
+        legalResult: resumed.snapshot.legalResult,
+        seq: nextSnapshotSeq(),
+      },
+    };
   }
 
   /** Clear the WASM game state without terminating the worker. */
@@ -1054,7 +1102,8 @@ interface MainThreadFallback {
   submitAiActionProposal(proposal: AiActionProposal): Promise<AiProposalSubmission>;
   exportState(): Promise<string>;
   restoreState(stateJson: string): Promise<void>;
-  resumeMultiplayerHostState(stateJson: string): Promise<void>;
+  resumeRestoredGameState(): Promise<RestoredFallbackResult>;
+  resumeMultiplayerHostState(stateJson: string): Promise<RestoredFallbackResult>;
   setMultiplayerMode(enabled: boolean): void;
   applySeatMutation(stateJson: string, mutationJson: string): Promise<unknown>;
   projectSeatView(stateJson: string): Promise<unknown>;
@@ -1081,6 +1130,11 @@ interface MainThreadFallback {
   getCardParseDetails(cardName: string): Promise<unknown>;
   getCardRulings(cardName: string): Promise<unknown>;
 }
+
+type RestoredFallbackResult = {
+  presentation: RestoredStackAutomationPresentation;
+  snapshot: { state: GameState; legalResult: LegalActionsResult };
+};
 
 /**
  * Raise an initialize-envelope failure as the typed error the worker path
@@ -1127,23 +1181,23 @@ async function createMainThreadFallback(): Promise<MainThreadFallback> {
 
     submitAction: (action: GameAction, actor: PlayerId) =>
       enqueue(() => {
-        const r = wasm.submit_action(actor, action);
-        if (typeof r === "string") throw new Error(r);
+        const r = unwrapActionOutcome<{ events?: SubmitResult["events"]; log_entries?: SubmitResult["log_entries"] }>(
+          wasm.submit_action(actor, action),
+        );
         return { events: r.events ?? [], log_entries: r.log_entries ?? [] };
       }),
 
     submitInteraction: (submission: InteractionSubmission, actor: PlayerId) =>
       enqueue(() => {
-        const r = wasm.submit_interaction_js(actor, submission);
-        if (typeof r === "string") throw new Error(r);
+        const r = unwrapActionOutcome<{ events?: SubmitResult["events"]; log_entries?: SubmitResult["log_entries"] }>(
+          wasm.submit_interaction_js(actor, submission),
+        );
         return { events: r.events ?? [], log_entries: r.log_entries ?? [] };
       }),
 
     previewManaPayment: (action: GameAction, actor: PlayerId) =>
       enqueue(() => {
-        const sources = wasm.preview_mana_payment_js(actor, action);
-        if (typeof sources === "string") throw new Error(sources);
-        return sources as ObjectId[];
+        return unwrapActionOutcome<ObjectId[]>(wasm.preview_mana_payment_js(actor, action));
       }),
 
     // null from any of these three getters means WASM `GAME_STATE` is None
@@ -1221,8 +1275,23 @@ async function createMainThreadFallback(): Promise<MainThreadFallback> {
     restoreState: (stateJson: string) =>
       enqueue(() => wasm.restore_game_state(stateJson)),
 
+    resumeRestoredGameState: () =>
+      enqueue(() => ({
+        presentation: wasm.resume_restored_game_state() as RestoredStackAutomationPresentation,
+        snapshot: {
+          state: wasm.get_game_state() as GameState,
+          legalResult: wasm.get_legal_actions_js() as LegalActionsResult,
+        },
+      })),
+
     resumeMultiplayerHostState: (stateJson: string) =>
-      enqueue(() => wasm.resume_multiplayer_host_state(stateJson)),
+      enqueue(() => ({
+        presentation: wasm.resume_multiplayer_host_state(stateJson) as RestoredStackAutomationPresentation,
+        snapshot: {
+          state: wasm.get_game_state() as GameState,
+          legalResult: wasm.get_legal_actions_js() as LegalActionsResult,
+        },
+      })),
 
     setMultiplayerMode: (enabled: boolean) => {
       enqueue(() => wasm.set_multiplayer_mode(enabled));

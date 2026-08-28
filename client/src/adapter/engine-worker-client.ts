@@ -8,17 +8,22 @@ import type {
   AiActionProposal,
   AiDecisionDiagnosticReceipt,
   AiProposalSubmission,
-  BatchResolveResult,
   FormatConfig,
   GameAction,
   GameState,
   LegalActionsResult,
   MatchConfig,
   ReplayHeader,
+  RestoredStackAutomationPresentation,
   SubmitResult,
   ViewerSnapshot,
 } from "./types";
-import { AdapterError, AdapterErrorCode } from "./types";
+import {
+  actionRejectionError,
+  AdapterError,
+  AdapterErrorCode,
+  isActionRejection,
+} from "./types";
 import type { InteractionSubmission } from "./generated/interaction";
 import type { BracketDeckRequest, BracketEstimate } from "../types/bracketEstimate";
 import { debugLog } from "../game/debugLog";
@@ -32,7 +37,13 @@ type EngineResponse =
       message: string;
       bracketViolation?: true;
       engineOccupied?: true;
+      actionRejection?: unknown;
     };
+
+type RestoredWorkerResult = {
+  presentation: RestoredStackAutomationPresentation;
+  snapshot: { state: GameState; legalResult: LegalActionsResult };
+};
 
 /**
  * Watchdog timeout for gameplay round-trip calls. Generous on purpose: a
@@ -51,6 +62,7 @@ const ENGINE_REQUEST_TIMEOUT_MS = 60_000;
  * WasmAdapter dispose the stalled worker and activate its main-thread fallback.
  */
 const ENGINE_INITIALIZATION_TIMEOUT_MS = 30_000;
+const MALFORMED_ACTION_REJECTION_MESSAGE = "The engine rejected that action.";
 
 type RequestTimeoutBehavior = "notify" | "reject";
 
@@ -105,7 +117,21 @@ export class EngineWorkerClient {
             // rejections so the caller can match by code rather than by string
             // substring on the error message.
             let err: Error;
-            if (msg.bracketViolation) {
+            if ("actionRejection" in msg && isActionRejection(msg.actionRejection)) {
+              err = actionRejectionError(msg.actionRejection);
+            } else if (
+              msg.actionRejection !== undefined
+              || (
+                "actionRejection" in msg
+                && msg.message === MALFORMED_ACTION_REJECTION_MESSAGE
+              )
+            ) {
+              err = new AdapterError(
+                AdapterErrorCode.ACTION_REJECTED,
+                MALFORMED_ACTION_REJECTION_MESSAGE,
+                true,
+              );
+            } else if (msg.bracketViolation) {
               err = new AdapterError(AdapterErrorCode.BRACKET_VIOLATION, msg.message, false);
             } else if (msg.engineOccupied) {
               err = new AdapterError(AdapterErrorCode.ENGINE_OCCUPIED, msg.message, false);
@@ -427,6 +453,10 @@ export class EngineWorkerClient {
     await this.request<null>({ type: "restoreState", stateJson });
   }
 
+  async resumeRestoredGameState(): Promise<RestoredWorkerResult> {
+    return this.request<RestoredWorkerResult>({ type: "resumeRestoredGameState" });
+  }
+
   /**
    * Host-resume entry point. Unlike `restoreState` (undo semantics, stale
    * RNG seed, refused when multiplayer is already on), this loads a
@@ -434,8 +464,8 @@ export class EngineWorkerClient {
    * flips the engine's multiplayer flag. Mirrors server-core's
    * `GameSession::from_persisted`.
    */
-  async resumeMultiplayerHostState(stateJson: string): Promise<void> {
-    await this.request<null>({ type: "resumeMultiplayerHostState", stateJson });
+  async resumeMultiplayerHostState(stateJson: string): Promise<RestoredWorkerResult> {
+    return this.request<RestoredWorkerResult>({ type: "resumeMultiplayerHostState", stateJson });
   }
 
   async resetGame(): Promise<void> {
@@ -463,26 +493,6 @@ export class EngineWorkerClient {
     return this.request<unknown>({
       type: "projectSeatView",
       stateJson,
-    });
-  }
-
-  async resolveAll(
-    requester: number,
-    aiSeats: { playerId: number; difficulty: string }[],
-    maxResolutions: number = 0,
-  ): Promise<BatchResolveResult> {
-    // Intentionally no watchdog timeout: a batch resolve can be legitimately
-    // very long (a multi-thousand-item storm draining one chunk at a time),
-    // and a false timeout mid-drain is worse than a long wait. Residual risk:
-    // if the worker wedges *inside* resolveAll itself the promise never settles
-    // and the "Resolving…" overlay sticks. Accepted as a lower-severity UX
-    // bug than false-positiving a healthy long drain — revisit only if a
-    // bounded per-chunk timeout proves safe.
-    return this.request<BatchResolveResult>({
-      type: "resolveAll",
-      requester,
-      aiSeatsJson: JSON.stringify(aiSeats),
-      maxResolutions,
     });
   }
 

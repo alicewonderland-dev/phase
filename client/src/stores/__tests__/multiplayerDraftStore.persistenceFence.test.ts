@@ -80,7 +80,7 @@ describe("multiplayerDraftStore recovered-host persistence fence", () => {
       }),
     );
     const config = {
-      poolInput: { type: "Set" as const, data: { set_pool_json: "{}" } },
+      poolInput: { type: "Set" as const, data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
       kind: "Premier" as const,
       podSize: 8,
       hostDisplayName: "Host",
@@ -138,7 +138,7 @@ describe("multiplayerDraftStore recovered-host persistence fence", () => {
       };
     });
     const config = {
-      poolInput: { type: "Set" as const, data: { set_pool_json: "{}" } },
+      poolInput: { type: "Set" as const, data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
       kind: "Premier" as const,
       podSize: 8,
       hostDisplayName: "Host",

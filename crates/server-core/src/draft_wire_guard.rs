@@ -5,7 +5,7 @@
 //! through `lobby_broker::validate_lobby_message`, so client-supplied names,
 //! codes, passwords, and tokens must be bounded before clone-heavy work.
 
-use draft_core::types::DraftKind;
+use draft_core::types::{DraftKind, MAX_PACK_COUNT};
 use lobby_broker::validation::{
     validate_optional_token, validate_required_label, validate_token, MAX_DISPLAY_NAME_LEN,
     MAX_DRAFT_SET_CODE_LEN, MAX_GAME_CODE_LEN, MAX_PASSWORD_LEN, MAX_PLAYER_COUNT,
@@ -16,16 +16,25 @@ use lobby_broker::validation::{
 /// registration.
 pub fn guard_create_draft_with_settings(
     display_name: &str,
-    set_code: &str,
+    set_codes: &[String],
     password: &Option<String>,
     timer_seconds: Option<u32>,
     pod_size: u8,
     kind: DraftKind,
 ) -> Result<(), String> {
     validate_required_label("display_name", display_name, MAX_DISPLAY_NAME_LEN)?;
-    validate_token("set_code", set_code, MAX_DRAFT_SET_CODE_LEN)?;
+    // Bound the sequence before its entries, and its entries before any pool
+    // lookup: each code costs a map probe and a pool clone on the accept path.
+    if !(1..=usize::from(MAX_PACK_COUNT)).contains(&set_codes.len()) {
+        return Err(format!(
+            "set_codes must name between 1 and {MAX_PACK_COUNT} packs"
+        ));
+    }
+    for code in set_codes {
+        validate_token("set_code", code, MAX_DRAFT_SET_CODE_LEN)?;
+    }
     validate_optional_token("password", password.as_deref(), MAX_PASSWORD_LEN)?;
-    let minimum_pod_size = if kind == DraftKind::Quick { 1 } else { 2 };
+    let minimum_pod_size = kind.procedure().min_pod_size;
     if !(minimum_pod_size..=MAX_PLAYER_COUNT).contains(&pod_size) {
         return Err(format!(
             "pod_size must be between {minimum_pod_size} and {MAX_PLAYER_COUNT}"
@@ -65,8 +74,8 @@ pub fn guard_draft_action(draft_code: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use draft_core::types::DraftKind;
-    use lobby_broker::validation::MAX_GAME_CODE_LEN;
+    use draft_core::types::{DraftKind, MAX_PACK_COUNT};
+    use lobby_broker::validation::{MAX_DRAFT_SET_CODE_LEN, MAX_GAME_CODE_LEN};
 
     use super::{
         guard_create_draft_with_settings, guard_draft_action, guard_join_draft_with_password,
@@ -77,7 +86,7 @@ mod tests {
     fn create_draft_accepts_valid_fields() {
         assert!(guard_create_draft_with_settings(
             "Alice",
-            "TST",
+            &["TST".to_string()],
             &None,
             None,
             4,
@@ -86,11 +95,106 @@ mod tests {
         .is_ok());
     }
 
+    /// CR 903.13a + CR 800.1: a Commander pod's floor is three seats — the
+    /// smallest pod that can still deliver the multiplayer game the format is
+    /// defined as — so the four-seat product default must pass the wire guard.
+    ///
+    /// This is the REACH-GUARD half of the pod-floor claim: the guard reads
+    /// `kind.procedure().min_pod_size`, so this test fails if that derivation
+    /// is ever replaced by a literal 8 (the four older kinds' pod size).
+    #[test]
+    fn wire_guard_admits_four_seat_commander_pod() {
+        assert!(guard_create_draft_with_settings(
+            "Alice",
+            &["CMM".to_string()],
+            &None,
+            None,
+            4,
+            DraftKind::CommanderDraft
+        )
+        .is_ok());
+    }
+
+    /// The paired negative: two seats is not a multiplayer game (CR 800.1), so
+    /// the floor must refuse it — and must say so by naming `pod_size`, not by
+    /// failing on some unrelated field.
+    #[test]
+    fn wire_guard_refuses_two_seat_commander_pod() {
+        let err = guard_create_draft_with_settings(
+            "Alice",
+            &["CMM".to_string()],
+            &None,
+            None,
+            2,
+            DraftKind::CommanderDraft,
+        )
+        .unwrap_err();
+        assert!(err.contains("pod_size"), "unexpected rejection: {err}");
+        assert!(
+            err.contains('3'),
+            "the floor must name the CR 800.1 minimum: {err}"
+        );
+    }
+
+    /// The multi-set claim at the guard: an ordered, repeating sequence is a
+    /// legal pod pool, so the guard must admit one rather than only the
+    /// single-code shape it was written for.
+    #[test]
+    fn create_draft_accepts_an_ordered_multi_set_sequence() {
+        assert!(guard_create_draft_with_settings(
+            "Alice",
+            &["ISD".to_string(), "DKA".to_string(), "ISD".to_string(),],
+            &None,
+            None,
+            8,
+            DraftKind::Premier
+        )
+        .is_ok());
+    }
+
+    /// Both ends of the sequence bound, checked BEFORE any pool lookup: an
+    /// empty sequence names no booster at all, and an unbounded one would cost
+    /// a map probe and a pool clone per entry on the accept path.
+    #[test]
+    fn create_draft_rejects_an_empty_or_oversized_sequence() {
+        for codes in [
+            Vec::new(),
+            vec!["TST".to_string(); usize::from(MAX_PACK_COUNT) + 1],
+        ] {
+            let err = guard_create_draft_with_settings(
+                "Alice",
+                &codes,
+                &None,
+                None,
+                8,
+                DraftKind::Premier,
+            )
+            .unwrap_err();
+            assert!(err.contains("set_codes"), "unexpected rejection: {err}");
+        }
+    }
+
+    /// Every entry is bounded, not just the first — a sequence whose LAST code
+    /// is junk must be refused as loudly as one whose first is.
+    #[test]
+    fn create_draft_rejects_an_oversized_code_anywhere_in_the_sequence() {
+        let err = guard_create_draft_with_settings(
+            "Alice",
+            &["TST".to_string(), "z".repeat(MAX_DRAFT_SET_CODE_LEN + 1)],
+            &None,
+            None,
+            8,
+            DraftKind::Premier,
+        )
+        .unwrap_err();
+        assert!(err.contains("set_code"), "unexpected rejection: {err}");
+    }
+
     #[test]
     fn create_draft_rejects_oversized_display_name() {
         let err = guard_create_draft_with_settings(
             &"a".repeat(21),
-            "TST",
+            &["TST".to_string()],
             &None,
             None,
             4,

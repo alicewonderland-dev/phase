@@ -1080,6 +1080,16 @@ fn parse_search_found_replacement(original: &str, lower: &str) -> Option<Replace
         AbilityKind::Spell,
         Effect::GrantCastingPermission {
             permission: CastingPermission::PlayFromExile {
+                // CR 118.9a + CR 609.4b: this sentence grants a plain "you
+                // may play it" permission — the card is played for its normal
+                // costs (the any-color concession changes only HOW they are
+                // paid, CR 609.4b), no alternative cost is applied. Such a
+                // self-standing permission is full cast authority
+                // (`Impulse`); only the land/look half installed alongside an
+                // alt-cost grant is a `LandLookCompanion`, which keeps the
+                // one-alternative-cost invariant (CR 118.9a) decidable at
+                // cast election.
+                provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
                 duration: parsed.play_permission.duration,
                 granted_to: crate::types::player::PlayerId(0),
                 frequency: CastFrequency::Unlimited,

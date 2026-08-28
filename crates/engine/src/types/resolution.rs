@@ -379,8 +379,8 @@ impl ResolutionFrame {
             Self::RepeatedOptionalPayment(RepeatedOptionalPaymentFrame {
                 pending: Some(_),
                 ..
-            })
-            | Self::OptionalEffect(_) => FrameGate::DirectChoice(DirectChoiceGate::OptionalEffect),
+            }) => FrameGate::DirectChoice(DirectChoiceGate::RepeatedOptionalPayment),
+            Self::OptionalEffect(_) => FrameGate::DirectChoice(DirectChoiceGate::OptionalEffect),
             Self::CoinFlip(_) => FrameGate::DirectChoice(DirectChoiceGate::CoinFlipKeep),
             Self::Proliferate(_) => FrameGate::DirectChoice(DirectChoiceGate::Proliferate),
             Self::MutateMerge(_) => FrameGate::DirectChoice(DirectChoiceGate::MutateMerge),
@@ -431,6 +431,7 @@ pub enum FrameGate {
 /// A concrete prompt that a direct-choice frame is permitted to consume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DirectChoiceGate {
+    RepeatedOptionalPayment,
     OptionalEffect,
     CoinFlipKeep,
     Proliferate,
@@ -443,9 +444,19 @@ impl DirectChoiceGate {
         matches!(
             (self, waiting_for),
             (
+                Self::RepeatedOptionalPayment,
+                WaitingFor::OptionalEffectChoice { .. }
+            ) | (
+                Self::RepeatedOptionalPayment,
+                WaitingFor::OpponentMayChoice { .. }
+            ) | (
                 Self::OptionalEffect,
                 WaitingFor::OptionalEffectChoice { .. }
             ) | (Self::OptionalEffect, WaitingFor::OpponentMayChoice { .. })
+                | (
+                    Self::OptionalEffect,
+                    WaitingFor::ResolutionOptionalPaymentChoice { .. }
+                )
                 | (Self::CoinFlipKeep, WaitingFor::CoinFlipKeepChoice { .. })
                 | (Self::Proliferate, WaitingFor::ProliferateChoice { .. })
                 | (Self::MutateMerge, WaitingFor::MutateMergeChoice { .. })
@@ -928,6 +939,21 @@ impl ResolutionStack {
                 actual: frame.kind(),
             }),
         }
+    }
+
+    /// Consume only an active continuation that owns an Attach
+    /// `EffectZoneChoice`; callers must never take a generic continuation just
+    /// because the current UI prompt happens to be an Attach choice.
+    pub fn take_active_attachment_choice_continuation(
+        &mut self,
+    ) -> Result<Option<AbilityContinuationFrame>, ResolutionStackError> {
+        if !self
+            .active_ability_continuation()
+            .is_some_and(|frame| frame.pending.attachment_choice.is_some())
+        {
+            return Ok(None);
+        }
+        self.take_active_ability_continuation()
     }
 
     /// Consumes the active continuation, or its exact parent when a
@@ -2798,6 +2824,62 @@ impl ResolutionStack {
     pub fn active_predecessor(&self) -> Option<&ResolutionFrame> {
         let top = self.frames.top()?;
         self.frames.get(self.frames.below(top)?)
+    }
+
+    /// True only when the active post-replacement frame is immediately above
+    /// the typed Attach-choice child that owns the interrupted operation.
+    ///
+    /// This is a positional lifecycle predicate, not a search for a buried
+    /// continuation. The child must remain marked until both frames retire
+    /// together; otherwise the ordinary continuation drain would replay its
+    /// already-resolved Attach instruction.
+    pub fn has_active_post_replacement_attach_choice_pair(&self) -> bool {
+        let Some(post_replacement) = self.frames.top() else {
+            return false;
+        };
+        let Some(attachment_child) = self.frames.below(post_replacement) else {
+            return false;
+        };
+        if !matches!(
+            (self.frames.get(attachment_child), self.frames.get(post_replacement)),
+            (
+                Some(ResolutionFrame::AbilityContinuation(child)),
+                Some(ResolutionFrame::PostReplacement(_)),
+            ) if child.pending.attachment_choice.is_some()
+        ) {
+            return false;
+        }
+        true
+    }
+
+    /// Retires the exact empty post-replacement/Attach-choice pair at the
+    /// active boundary.
+    ///
+    /// The post-replacement frame is popped first so its marked Attach child
+    /// becomes active, then the child is popped before generic continuation
+    /// draining can replay the consumed Attach operation. A nonempty drain or
+    /// any other frame shape is deliberately left untouched.
+    pub fn take_active_empty_post_replacement_attach_choice_pair(&mut self) -> bool {
+        if !self.has_active_post_replacement_attach_choice_pair()
+            || !self.last().is_some_and(|frame| {
+                matches!(
+                    frame,
+                    ResolutionFrame::PostReplacement(drains) if drains.is_empty()
+                )
+            })
+        {
+            return false;
+        }
+
+        let _ = self
+            .take_active_post_replacement()
+            .expect("an empty post-replacement Attach pair must keep its owner active")
+            .expect("an empty post-replacement Attach pair must retain its owner");
+        let _ = self
+            .take_active_attachment_choice_continuation()
+            .expect("the post-replacement Attach pair must expose its child")
+            .expect("the post-replacement Attach pair must retain its child");
+        true
     }
 
     /// True only for the live general-drain/draw pair at the active stack
@@ -5420,6 +5502,54 @@ mod tests {
             }),
             Err(ResolutionStackError::MultipleDirectChoiceOwners)
         );
+    }
+
+    #[test]
+    fn v2_replayed_resolution_optional_payment_prompt_requires_optional_effect_frame() {
+        let waiting_for = WaitingFor::ResolutionOptionalPaymentChoice {
+            player: PlayerId(0),
+            source_id: ObjectId(8),
+            costs: Vec::new(),
+        };
+
+        let mut repeated_state = GameState::new_two_player(8);
+        repeated_state.waiting_for = waiting_for.clone();
+        let mut repeated_frames = ResolutionStack::default();
+        repeated_frames.push_inner(ResolutionFrame::RepeatedOptionalPayment(
+            RepeatedOptionalPaymentFrame {
+                pending: Some(Box::new(PendingRepeatedOptionalPayment {
+                    payment_unit: Box::new(resolved_draw(8)),
+                    reflexive: Box::new(resolved_draw(9)),
+                    remaining: 1,
+                })),
+                optional_cost_payments_this_resolution: 0,
+            },
+        ));
+        let repeated_payload = v2_fixture_with_frames(repeated_state, repeated_frames);
+        let error = serde_json::from_value::<ResolutionStateWire>(repeated_payload)
+            .expect_err("a replayed repeated-payment frame cannot own the Phase 1 prompt");
+        assert!(
+            error
+                .to_string()
+                .contains("ResolutionOptionalPaymentChoice"),
+            "the wire rejection must identify the mismatched prompt: {error}"
+        );
+
+        let mut optional_state = GameState::new_two_player(10);
+        optional_state.waiting_for = waiting_for;
+        let mut optional_frames = ResolutionStack::default();
+        optional_frames.push_inner(ResolutionFrame::OptionalEffect(OptionalEffectFrame {
+            ability: Box::new(resolved_draw(10)),
+            trigger_event: None,
+            trigger_events: Vec::new(),
+            trigger_match_count: None,
+        }));
+        let optional_payload = v2_fixture_with_frames(optional_state, optional_frames);
+        let restored: ResolutionStateWire = serde_json::from_value(optional_payload)
+            .expect("an OptionalEffect frame owns the Phase 1 prompt after deserialize");
+        let replayed = serde_json::to_value(restored).expect("restored state reserializes");
+        serde_json::from_value::<ResolutionStateWire>(replayed)
+            .expect("the accepted OptionalEffect prompt remains valid on replay");
     }
 
     #[test]

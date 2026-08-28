@@ -100,6 +100,7 @@ pub(crate) fn empty_back_face() -> BackFaceData {
         casting_options: vec![],
         parse_warnings: vec![],
         layout_kind: None,
+        is_swap_snapshot: false,
     }
 }
 

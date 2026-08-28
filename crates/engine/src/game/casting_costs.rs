@@ -10250,6 +10250,9 @@ fn evaluate_cascade_constraint_with_resulting_mv(
         if let Some(obj) = state.objects.get_mut(&object_id) {
             obj.casting_permissions[index] = CastingPermission::ExileWithAltCost {
                 cost: crate::types::mana::ManaCost::SelfManaCost,
+                // CR 609.4b + CR 118.9a: `SelfManaCost` is the card's own
+                // printed cost — a normal-payment shape, not an alternative.
+                cost_provenance: crate::types::ability::ExileGrantCostProvenance::NormalCost,
                 cast_transformed: false,
                 constraint: None,
                 granted_to,
@@ -12062,9 +12065,9 @@ pub(super) fn max_x_value_excluding(
     else {
         return formula_max;
     };
-    if pending.base_cost.is_none() {
+    let Some(base_cost) = pending.base_cost.as_ref() else {
         return formula_max;
-    }
+    };
 
     // CR 601.2b / CR 601.2f: The concrete total is monotonic non-decreasing in X.
     // `concretize_x` adds `x * x_count` generic; non-floor and target-dependent
@@ -12080,10 +12083,21 @@ pub(super) fn max_x_value_excluding(
     // order is safe. The explicit `!probe(0)` early return below reproduces the
     // old linear loop's `saturating_sub(1)` floor exactly: when even X=0
     // overshoots, the cap is 0 (not an underflow).
-    largest_x_satisfying(formula_max, |x| {
+    // CR 601.2b: the announced X can also live only in an ADDITIONAL cost
+    // (kicker {X}: Thieving Skydiver, Toxic Deluge, Hatred, …). The recompute
+    // above reads `pending.base_cost`, so its predicate does not depend on X
+    // when the printed cost has none. In that shape `formula_max`, calculated
+    // from the complete pending cost, is the finite authority; use the existing
+    // bounded search instead of an unbounded exponential probe.
+    let predicate = |x| {
         super::casting::recompute_pending_mana_total(state, player, pending, Some(x)).mana_value()
             <= available
-    })
+    };
+    if cost_has_x(base_cost) {
+        largest_x_satisfying(formula_max, predicate)
+    } else {
+        largest_x_satisfying_at_most(formula_max, predicate)
+    }
 }
 
 /// Largest `x` for which `predicate(x)` holds, given `predicate` is a monotone
@@ -12094,8 +12108,8 @@ pub(super) fn max_x_value_excluding(
 ///
 /// `formula_max` is only a starting estimate for the exponential probe;
 /// correctness does NOT depend on it (the true cap can be lower — Trinisphere
-/// floor — or higher — reductions exceeding the fixed generic). Returns `0` when
-/// even `predicate(0)` is false, reproducing the linear ascent's
+/// floor — or higher — reductions exceeding the fixed generic). Returns `0`
+/// when even `predicate(0)` is false, reproducing the linear ascent's
 /// `saturating_sub(1)` floor at the `X=0` boundary. O(log cap) evaluations of
 /// `predicate` versus the linear scan's O(cap); identical result by monotonicity.
 fn largest_x_satisfying(formula_max: u32, predicate: impl Fn(u32) -> bool) -> u32 {
@@ -12109,6 +12123,10 @@ fn largest_x_satisfying(formula_max: u32, predicate: impl Fn(u32) -> bool) -> u3
     // overflow; `max(saturating_add(1))` guards `hi == 0`.
     let mut hi = formula_max.max(1);
     while predicate(hi) {
+        debug_assert_ne!(hi, u32::MAX, "callers must bound constant-true gates");
+        if hi == u32::MAX {
+            return u32::MAX;
+        }
         hi = hi.saturating_mul(2).max(hi.saturating_add(1));
     }
 
@@ -18870,6 +18888,7 @@ mod tests {
             hit_obj
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::zero(),
                     cast_transformed: false,
                     constraint: Some(CastPermissionConstraint::ManaValue {
@@ -18989,6 +19008,7 @@ mod tests {
                 .unwrap()
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::zero(),
                     cast_transformed: false,
                     constraint: None,
@@ -19060,6 +19080,7 @@ mod tests {
                 .unwrap()
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::zero(),
                     cast_transformed: false,
                     constraint: None,
@@ -19111,6 +19132,7 @@ mod tests {
                 .unwrap()
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::zero(),
                     cast_transformed: false,
                     constraint: Some(CastPermissionConstraint::ManaValue {
@@ -19168,6 +19190,7 @@ mod tests {
             hit_obj
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: selected_cost.clone(),
                     cast_transformed: false,
                     constraint: Some(CastPermissionConstraint::ManaValue {
@@ -19186,6 +19209,7 @@ mod tests {
             hit_obj
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::generic(5),
                     cast_transformed: false,
                     constraint: None,
@@ -19235,6 +19259,7 @@ mod tests {
             hit_obj
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::zero(),
                     cast_transformed: false,
                     constraint: None,
@@ -19301,6 +19326,7 @@ mod tests {
             hit_obj
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: selected_cost.clone(),
                     cast_transformed: false,
                     constraint: Some(CastPermissionConstraint::ManaValue {
@@ -19319,6 +19345,7 @@ mod tests {
             hit_obj
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::zero(),
                     cast_transformed: false,
                     constraint: Some(CastPermissionConstraint::ManaValue {
@@ -19377,6 +19404,7 @@ mod tests {
             hit_obj
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::zero(),
                     cast_transformed: false,
                     constraint: Some(CastPermissionConstraint::ManaValue {
@@ -19400,6 +19428,7 @@ mod tests {
             hit_obj
                 .casting_permissions
                 .push(CastingPermission::ExileWithAltCost {
+                    cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
                     cost: ManaCost::zero(),
                     cast_transformed: false,
                     constraint: None,

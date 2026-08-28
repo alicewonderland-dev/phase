@@ -16,7 +16,8 @@
 
 import { create } from "zustand";
 
-import type { CubeDraftSettings, TournamentFormat, PodPolicy, DraftKind as CoreDraftKind } from "../adapter/draft-adapter";
+import { DraftAdapter, distinctJoined, setPackSequence, type CubeDraftSettings, type DraftProcedure, type PoolInput, type SetPackSequence, type TournamentFormat, type PodPolicy } from "../adapter/draft-adapter";
+import type { DraftPackChoice } from "./draftStore";
 import type { DraftPodHostConfig } from "../adapter/draftPodHostAdapter";
 import type { DraftPodGuestConfig } from "../adapter/draftPodGuestAdapter";
 import {
@@ -26,10 +27,9 @@ import {
   persistedDraftHostSessionState,
 } from "../services/draftPersistence";
 import { useMultiplayerDraftStore } from "./multiplayerDraftStore";
+import type { DraftKind } from "../components/draft/draftKind";
 
 // ── Types ──────────────────────────────────────────────────────────────
-
-export type DraftKind = Exclude<CoreDraftKind, "Quick">;
 
 export type PoolMode = "set" | "cube";
 
@@ -43,6 +43,17 @@ export interface CubeForm {
 }
 
 export interface PodConfig {
+  /**
+   * The set filling each booster, in the order the host arranged them. One
+   * entry per pack the pod opens; the same set may fill several. Empty until
+   * the host picks, and a Cube pod leaves it empty — its pool is `cubeForm`.
+   */
+  packs: DraftPackChoice[];
+  /**
+   * Display label for the whole pool. Mirrors the engine's own source label
+   * (`DraftSource::set_code`), which joins the DISTINCT set codes in
+   * first-appearance order, so a mixed pod reads as "ISD+DKA+AVR".
+   */
   setCode: string;
   setName: string;
   kind: DraftKind;
@@ -72,11 +83,39 @@ interface DraftPodState {
   loadingPool: boolean;
   /** Error from pool loading or pod creation. */
   configError: string | null;
+  /**
+   * CR 903.13a + CR 800.1: the kind's engine-published seat floor
+   * (`DraftProcedure.min_pod_size`), cached for the lobby's Start gate.
+   *
+   * A CACHE of an engine value, never a client derivation, and deliberately
+   * outside `PodConfig` — that is host INTENT, is persisted, and is rewritten
+   * by `normalizePodConfig`, none of which is true of a published floor.
+   * `null` until loaded and after `reset()`, and `null` is fail-CLOSED: the
+   * reducer is the authority, so a stale or absent client value can never
+   * admit an illegal pod, only refuse a legal one until the engine answers.
+   */
+  minPodSize: number | null;
+  /**
+   * The kind's engine-published booster count (`DraftProcedure.packs_per_player`),
+   * cached alongside `minPodSize` and on the same terms: a copy of an engine
+   * value, never a client derivation. It fixes how many sets the host arranges,
+   * so a Sealed pod asks for six and a draft pod for three without the page
+   * knowing either number.
+   *
+   * `null` until loaded and after `reset()`. Fail-CLOSED like the seat floor:
+   * with no answer yet the selector cannot be filled in, and the engine still
+   * refuses a sequence longer than the kind opens regardless of this cache.
+   */
+  packsPerPlayer: number | null;
 }
 
 interface DraftPodActions {
   /** Update pod configuration fields. */
   setConfig: (partial: Partial<PodConfig>) => void;
+  /** Enter pod setup for `kind`, adopting the ENGINE's per-kind table default for
+   *  pod size (`DraftProcedure.pod_size`) rather than re-deriving one in the client.
+   *  The host may still override it with the pod-size selector before creating. */
+  enterKind: (kind: DraftKind) => Promise<void>;
   /** Toggle bot-fill on/off. */
   toggleBotFill: () => void;
   /** Set host display name. */
@@ -85,6 +124,16 @@ interface DraftPodActions {
   setGuestDisplayName: (name: string) => void;
   /** Set join code for guest. */
   setJoinCode: (code: string) => void;
+  /**
+   * Refresh the cached engine procedure axes for the currently selected kind.
+   *
+   * `setConfig({ kind })` — what the kind radios call — records the host's
+   * intent but publishes nothing, so the cached axes would otherwise describe
+   * whichever kind was loaded last. Unlike `enterKind` this does NOT adopt the
+   * kind's default pod size: the host may already have chosen one, and
+   * switching kinds must not silently discard it.
+   */
+  refreshProcedure: () => Promise<void>;
   /** Switch between Set-pool and Cube-list pool modes. */
   setPoolMode: (mode: PoolMode) => void;
   /** Set the cube form (name + list text + settings) for cube-mode host setup. */
@@ -105,6 +154,7 @@ interface DraftPodActions {
 
 const initialState: DraftPodState = {
   config: {
+    packs: [],
     setCode: "",
     setName: "",
     kind: "Premier",
@@ -121,7 +171,25 @@ const initialState: DraftPodState = {
   setPoolJson: null,
   loadingPool: false,
   configError: null,
+  minPodSize: null,
+  packsPerPlayer: null,
 };
+
+/**
+ * The pack list a persisted pod was configured with.
+ *
+ * Only the live `SetPackSequence` spelling carries one. A pod persisted before
+ * multi-set pods existed holds a single serialized pool and no sequence at all;
+ * draft-wasm still starts it (every booster from that one set), so resuming
+ * must not fail — it just has no per-pack list to show, and returns empty.
+ * Names are not persisted, so each entry is labelled by its own code.
+ */
+function persistedPodPacks(poolInput: PoolInput): DraftPackChoice[] {
+  if (poolInput.type !== "Set") return [];
+  const sequence = (poolInput.data as Partial<SetPackSequence>).sequence;
+  if (!Array.isArray(sequence)) return [];
+  return sequence.map((code) => ({ code, name: code }));
+}
 
 function normalizePodConfig(config: PodConfig): PodConfig {
   if (config.tournamentFormat === "SingleElimination") {
@@ -138,6 +206,26 @@ interface HostedPodResumeAttempt {
 
 let resumeHostedPodAttempt: HostedPodResumeAttempt | null = null;
 
+/**
+ * Fetch `kind`'s engine-published procedure and cache the axes the lobby needs.
+ *
+ * CR 903.13a + CR 800.1: `min_pod_size` is the ENGINE's per-kind seat floor.
+ * The client holds a copy so `DraftPodLobby` can gate its Start button without
+ * a second wasm call; it never re-derives the value, and the reducer refuses a
+ * below-floor pod regardless of what this cache says.
+ */
+async function loadProcedure(
+  kind: DraftKind,
+  set: (partial: Partial<DraftPodState>) => void,
+): Promise<DraftProcedure> {
+  const procedure = await new DraftAdapter().draftProcedure(kind);
+  set({
+    minPodSize: procedure.min_pod_size,
+    packsPerPlayer: procedure.packs_per_player,
+  });
+  return procedure;
+}
+
 // ── Store ──────────────────────────────────────────────────────────────
 
 export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
@@ -150,6 +238,36 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
         poolMode: (partial.kind ?? prev.config.kind) === "Sealed" ? "set" : prev.poolMode,
         configError: null,
       }));
+    },
+
+    enterKind: async (kind) => {
+      // Apply the kind first: it is the entry point's whole purpose and must not
+      // depend on the wasm load succeeding. `setConfig` is the single authority for
+      // normalization (`normalizePodConfig`) and the Sealed pool-mode rule.
+      get().setConfig({ kind });
+      try {
+        const procedure = await loadProcedure(kind, set);
+        get().setConfig({ podSize: procedure.pod_size });
+      } catch (err) {
+        set({ configError: err instanceof Error ? err.message : String(err) });
+      }
+    },
+
+    refreshProcedure: async () => {
+      const kind = get().config.kind;
+      try {
+        const procedure = await new DraftAdapter().draftProcedure(kind);
+        // The host may have switched kinds while this was in flight; a late
+        // answer for the previous kind would publish the wrong booster count
+        // and seat floor, so drop it rather than write it.
+        if (get().config.kind !== kind) return;
+        set({
+          minPodSize: procedure.min_pod_size,
+          packsPerPlayer: procedure.packs_per_player,
+        });
+      } catch (err) {
+        set({ configError: err instanceof Error ? err.message : String(err) });
+      }
     },
 
     toggleBotFill: () => {
@@ -192,13 +310,24 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
         return;
       }
 
+      // CR 903.13a + CR 800.1: cache the kind's seat floor for the lobby's
+      // Start gate. Once, before the poolMode branch, because the set branch
+      // returns before reaching the cube branch and both lead to the lobby.
+      try {
+        await loadProcedure(config.kind, set);
+      } catch (err) {
+        set({ configError: err instanceof Error ? err.message : String(err) });
+      }
+
       if (poolMode === "set") {
-        if (!config.setCode) {
+        if (config.packs.length === 0) {
           set({ configError: "Select a set first" });
           return;
         }
 
-        set({ loadingPool: true, configError: null });
+        // No `configError: null`: every other writer above in this function
+        // returns, so clearing here would only erase `loadProcedure`'s catch.
+        set({ loadingPool: true });
 
         try {
           const resp = await fetch(__DRAFT_POOLS_URL__);
@@ -206,19 +335,13 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
             throw new Error(`Failed to load draft pools: ${resp.status}`);
           }
           const allPools: Record<string, unknown> = await resp.json();
-          const setPool =
-            allPools[config.setCode.toLowerCase()] ??
-            allPools[config.setCode.toUpperCase()];
-          if (!setPool) {
-            throw new Error(`No pool data for set: ${config.setCode}`);
-          }
+          const selection = setPackSequence(config.packs, allPools);
 
-          const poolJson = JSON.stringify(setPool);
-          set({ setPoolJson: poolJson, loadingPool: false });
+          set({ setPoolJson: JSON.stringify(selection), loadingPool: false });
 
           const persistenceId = crypto.randomUUID();
           const hostConfig: DraftPodHostConfig = {
-            poolInput: { type: "Set", data: { set_pool_json: poolJson } },
+            poolInput: { type: "Set", data: selection },
             kind: config.kind,
             podSize: config.podSize,
             hostDisplayName: hostDisplayName.trim(),
@@ -343,6 +466,7 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
           const cubeData = persisted.poolInput.data;
           set({
             config: {
+              packs: [],
               setCode: "custom-cube",
               setName: cubeData.cube_name,
               kind: persisted.kind,
@@ -362,10 +486,16 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
             configError: null,
           });
         } else {
+          // Restore the pack sequence the pod was configured with, so a host
+          // who refreshes mid-lobby sees the sets they arranged rather than an
+          // unlabelled pod. A snapshot in the pre-multi-set spelling has no
+          // sequence to restore; its packs stay empty and the label falls back.
+          const packs = persistedPodPacks(persisted.poolInput);
           set({
             config: {
-              setCode: "",
-              setName: "Draft Pod",
+              packs,
+              setCode: distinctJoined(packs.map((pack) => pack.code), "+"),
+              setName: packs.length > 0 ? distinctJoined(packs.map((pack) => pack.name), " · ") : "Draft Pod",
               kind: persisted.kind,
               podSize: persisted.podSize,
               tournamentFormat: persisted.tournamentFormat,
@@ -374,10 +504,17 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
             hostDisplayName: persisted.hostDisplayName,
             poolMode: "set",
             cubeForm: null,
-            setPoolJson: persisted.poolInput.data.set_pool_json,
+            setPoolJson: JSON.stringify(persisted.poolInput.data),
             loadingPool: false,
             configError: null,
           });
+        }
+
+        // CR 903.13a + CR 800.1: the resumed lobby needs the floor too.
+        try {
+          await loadProcedure(persisted.kind, set);
+        } catch (err) {
+          set({ configError: err instanceof Error ? err.message : String(err) });
         }
 
         const hostConfig: DraftPodHostConfig = {

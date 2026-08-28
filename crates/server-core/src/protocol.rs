@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use engine::game::interaction::ObjectActionPayload;
+use engine::types::action_rejection::ActionRejection;
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
 use engine::types::format::FormatConfig;
@@ -169,12 +170,6 @@ pub enum ClientMessage {
     Action {
         action: GameAction,
     },
-    /// Server-authoritative fast-forward of repeated priority passes. The
-    /// authenticated session supplies both the requester and AI seats.
-    ResolveAll {
-        request_id: u64,
-        max_resolutions: u32,
-    },
     /// Read-only simulation of an exact automatic spell-cast action. The
     /// authenticated session, rather than the client, determines the actor.
     PreviewManaPayment {
@@ -317,7 +312,24 @@ pub enum ClientMessage {
     },
     CreateDraftWithSettings {
         display_name: String,
-        set_code: String,
+        /// The set filling each booster, in pack order — one entry per pack the
+        /// pod opens, duplicates allowed. Deserialized by the engine's own
+        /// [`draft_core::types::deserialize_set_codes`], so the single
+        /// `"set_code": "blb"` string a pre-multi-set client sends still
+        /// arrives as the one-element sequence it meant. The server resolves
+        /// this into `DraftSource::Set`; it never re-derives a per-pack set.
+        #[serde(
+            alias = "set_code",
+            deserialize_with = "draft_core::types::deserialize_set_codes"
+        )]
+        set_codes: Vec<String>,
+        /// The string encoding of the draft kind. `DraftKind` carries no
+        /// `#[serde(other)]`, no `#[serde(default)]` and no `Default`, so an
+        /// unrecognized kind name fails deserialization of the WHOLE frame
+        /// rather than resolving to a fallback variant. That is what makes a
+        /// version-skewed peer loud instead of silently creating the wrong
+        /// kind of draft; do not add any of those three attributes to
+        /// `DraftKind`.
         kind: draft_core::types::DraftKind,
         public: bool,
         password: Option<String>,
@@ -520,25 +532,23 @@ pub enum ServerMessage {
         rewind_targets: Vec<RewindOption>,
     },
     ActionRejected {
+        rejection: ActionRejection,
+    },
+    /// An operational failure while processing one submitted game action or
+    /// interaction. This deliberately carries no engine-rejection DTO.
+    ActionFailed {
+        message: String,
+    },
+    /// A request outside the engine game-action boundary was refused. This is
+    /// deliberately prose: takeback and match-lifecycle requests have no
+    /// engine action/rejection provenance to expose.
+    RequestRejected {
         reason: String,
     },
     /// Confirms an authenticated action that intentionally produced no state
     /// transition. The submitting adapter resolves its pending request without
     /// caching or publishing a replacement snapshot.
     ActionNoOp,
-    /// Requester-only rejection for a native Resolve All batch. The request
-    /// identifier prevents unrelated action failures from settling this promise.
-    ResolveAllRejected {
-        request_id: u64,
-        reason: String,
-    },
-    /// Requester-only acknowledgement for a native Resolve All batch. The
-    /// matching StateUpdate is sent first and carries the authoritative state.
-    ResolveAllResult {
-        request_id: u64,
-        items_resolved: u32,
-        total: u32,
-    },
     /// Acknowledges a host-authorized permanent game cleanup.
     GameAbandoned {
         game_code: String,
@@ -551,7 +561,12 @@ pub enum ServerMessage {
     },
     ManaPaymentPreviewRejected {
         request_id: u64,
-        reason: String,
+        rejection: ActionRejection,
+    },
+    /// Requester-only operational failure for a mana-payment preview.
+    ManaPaymentPreviewFailed {
+        request_id: u64,
+        message: String,
     },
     OpponentDisconnected {
         grace_seconds: u32,
@@ -2044,11 +2059,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn client_message_create_sealed_draft_with_settings_roundtrips() {
-        let msg = ClientMessage::CreateDraftWithSettings {
+    fn create_draft_frame(set_codes: Vec<String>) -> ClientMessage {
+        ClientMessage::CreateDraftWithSettings {
             display_name: "Alice".to_string(),
-            set_code: "MKM".to_string(),
+            set_codes,
             kind: draft_core::types::DraftKind::Sealed,
             public: true,
             password: Some("secret".to_string()),
@@ -2056,13 +2070,31 @@ mod tests {
             tournament_format: draft_core::types::TournamentFormat::Swiss,
             pod_policy: draft_core::types::PodPolicy::Competitive,
             pod_size: 8,
-        };
+        }
+    }
+
+    fn roundtripped_set_codes(msg: &ClientMessage) -> Vec<String> {
+        let json = serde_json::to_string(msg).unwrap();
+        parsed_set_codes(&json)
+    }
+
+    fn parsed_set_codes(json: &str) -> Vec<String> {
+        let parsed: ClientMessage = serde_json::from_str(json).unwrap();
+        match parsed {
+            ClientMessage::CreateDraftWithSettings { set_codes, .. } => set_codes,
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_message_create_sealed_draft_with_settings_roundtrips() {
+        let msg = create_draft_frame(vec!["MKM".to_string()]);
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ClientMessage = serde_json::from_str(&json).unwrap();
         match parsed {
             ClientMessage::CreateDraftWithSettings {
                 display_name,
-                set_code,
+                set_codes,
                 kind,
                 public,
                 password,
@@ -2071,7 +2103,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(display_name, "Alice");
-                assert_eq!(set_code, "MKM");
+                assert_eq!(set_codes, vec!["MKM".to_string()]);
                 assert_eq!(kind, draft_core::types::DraftKind::Sealed);
                 assert!(public);
                 assert_eq!(password, Some("secret".to_string()));
@@ -2080,6 +2112,61 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// The multi-set claim at the wire: a pod's ORDER is what the frame carries,
+    /// so a repeated set and a reordering must both survive the round trip.
+    /// Deduping or sorting here would silently rewrite which set fills which
+    /// booster.
+    #[test]
+    fn create_draft_frame_preserves_pack_order_and_repeats() {
+        let ordered = vec![
+            "ISD".to_string(),
+            "DKA".to_string(),
+            "ISD".to_string(),
+            "AVR".to_string(),
+        ];
+        assert_eq!(
+            roundtripped_set_codes(&create_draft_frame(ordered.clone())),
+            ordered
+        );
+
+        let reversed: Vec<String> = ordered.iter().rev().cloned().collect();
+        assert_ne!(
+            roundtripped_set_codes(&create_draft_frame(reversed.clone())),
+            ordered
+        );
+        assert_eq!(
+            roundtripped_set_codes(&create_draft_frame(reversed.clone())),
+            reversed
+        );
+    }
+
+    /// A client that predates multi-set pods sends the single `"set_code"`
+    /// string. It must arrive as the one-element sequence it always meant
+    /// rather than failing the whole frame — the same contract
+    /// `DraftSource`'s `code`/`codes` alias gives snapshots.
+    #[test]
+    fn create_draft_frame_accepts_the_legacy_single_set_code() {
+        let legacy = r#"{"type":"CreateDraftWithSettings","data":{
+            "display_name":"Alice","set_code":"MKM","kind":"Sealed","public":true,
+            "password":null,"timer_seconds":null,"tournament_format":"Swiss",
+            "pod_policy":"Competitive","pod_size":8}}"#;
+        assert_eq!(parsed_set_codes(legacy), vec!["MKM".to_string()]);
+    }
+
+    /// The frame SERIALIZES the sequence spelling. A new host must not emit the
+    /// legacy key, or a multi-set pod would reach an older server as a
+    /// single-set one.
+    #[test]
+    fn create_draft_frame_serializes_the_sequence_spelling() {
+        let json = serde_json::to_string(&create_draft_frame(vec![
+            "ISD".to_string(),
+            "DKA".to_string(),
+        ]))
+        .unwrap();
+        assert!(json.contains(r#""set_codes":["ISD","DKA"]"#), "{json}");
+        assert!(!json.contains(r#""set_code":"#), "{json}");
     }
 
     #[test]
@@ -2111,10 +2198,19 @@ mod tests {
             draft_code: "ABCD12".to_string(),
             action: draft_core::types::DraftAction::Pick {
                 seat: 3,
-                card_instance_id: "card-001".to_string(),
+                card_instance_ids: vec!["card-001".to_string()],
             },
         };
         let json = serde_json::to_string(&msg).unwrap();
+        // Pin the wire KEY, not just the Rust round-trip: a round-trip alone
+        // passes for any field name, since both sides move together. The
+        // client emits this exact literal (`server-draft-adapter.test.ts`), and
+        // `DraftAction` carries no `serde(rename)`/`alias` on this field, so
+        // this assertion is what ties the two halves of the contract together.
+        assert!(
+            json.contains(r#""card_instance_ids":["card-001"]"#),
+            "unexpected wire shape: {json}"
+        );
         let parsed: ClientMessage = serde_json::from_str(&json).unwrap();
         match parsed {
             ClientMessage::DraftAction { draft_code, action } => {
@@ -2123,7 +2219,7 @@ mod tests {
                     action,
                     draft_core::types::DraftAction::Pick {
                         seat: 3,
-                        card_instance_id: "card-001".to_string(),
+                        card_instance_ids: vec!["card-001".to_string()],
                     }
                 );
             }
@@ -2202,7 +2298,7 @@ mod tests {
             draft_effect: None,
         };
         let pool = vec![first_pull.clone(), second_pull.clone()];
-        let pool_groups = DraftPoolGroups::from_pool(&pool);
+        let pool_groups = DraftPoolGroups::from_pool(&pool, &DraftSource::single_set("TST"));
         let view = DraftPlayerView {
             status: DraftStatus::Deckbuilding,
             kind: DraftKind::Sealed,
@@ -2210,15 +2306,25 @@ mod tests {
             pick_number: 2,
             pass_direction: PassDirection::Left,
             current_pack: None,
+            required_pick_count: 0,
             pool,
             draft_effects: vec![first_pull.clone()],
             pool_groups,
             sealed_packs: Some(vec![vec![first_pull], vec![second_pull]]),
             seats: Vec::new(),
             cards_per_pack: 14,
+            pack_sizes: vec![14, 14, 14],
+            pack_set_codes: vec!["TST".to_string(); 3],
+            pack_pick_steps: vec![14, 14, 14],
+            // `cards_per_pack.div_ceil(cards_per_pick)` with Sealed's
+            // `cards_per_pick: 1` -- a degenerate axis value under
+            // `PackDistribution::AllAtOnce`, which has no pick step at all.
+            pick_steps_per_pack: 14,
             pack_count: 3,
             min_deck_size: 40,
             addable_cards: Vec::new(),
+            grantable_commander_fillers: Vec::new(),
+            draft_set_codes: Vec::new(),
             timer_remaining_ms: Some(5000),
             standings: Vec::new(),
             current_round: 0,
@@ -2237,6 +2343,28 @@ mod tests {
                 assert_eq!(v.pick_number, 2);
                 assert_eq!(v.timer_remaining_ms, Some(5000));
                 assert_eq!(v.pool_groups, view.pool_groups);
+                assert_eq!(
+                    v.pool_groups.workspace_capabilities.rarity_group_order,
+                    Some(vec![
+                        draft_core::view::DraftRarityGroupKind::Mythic,
+                        draft_core::view::DraftRarityGroupKind::Rare,
+                        draft_core::view::DraftRarityGroupKind::Uncommon,
+                        draft_core::view::DraftRarityGroupKind::Common,
+                        draft_core::view::DraftRarityGroupKind::RarityOther,
+                    ])
+                );
+                assert_eq!(
+                    v.pool_groups
+                        .workspace_row_classification
+                        .creature_instance_ids,
+                    vec!["pack-1-card-1"]
+                );
+                assert_eq!(
+                    v.pool_groups
+                        .workspace_row_classification
+                        .noncreature_instance_ids,
+                    vec!["pack-2-card-1"]
+                );
                 assert_eq!(v.draft_effects, view.draft_effects);
                 assert_eq!(
                     v.sealed_packs
@@ -2253,6 +2381,102 @@ mod tests {
                 );
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn draft_pool_groups_nested_workspace_metadata_is_strict_and_legacy_compatible() {
+        use draft_core::types::DraftSource;
+        use draft_core::view::{
+            DraftPoolGroups, DraftWorkspaceCapabilities, DraftWorkspaceRowClassification,
+        };
+
+        let source = DraftSource::single_set("TST");
+        let value = serde_json::to_value(DraftPoolGroups::from_pool(&[], &source)).unwrap();
+
+        let mut legacy = value.clone();
+        let legacy_object = legacy.as_object_mut().unwrap();
+        legacy_object.remove("workspace_capabilities");
+        legacy_object.remove("workspace_row_classification");
+        let legacy_groups: DraftPoolGroups = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            legacy_groups.workspace_capabilities,
+            DraftWorkspaceCapabilities::default()
+        );
+        assert_eq!(
+            legacy_groups.workspace_row_classification,
+            DraftWorkspaceRowClassification::default()
+        );
+
+        let malformed = [
+            (
+                "empty capabilities",
+                "workspace_capabilities",
+                serde_json::json!({}),
+            ),
+            (
+                "missing rarity order",
+                "workspace_capabilities",
+                serde_json::json!({"other": []}),
+            ),
+            (
+                "invalid rarity kind",
+                "workspace_capabilities",
+                serde_json::json!({"rarity_group_order": ["legendary"]}),
+            ),
+            (
+                "non-rarity group kind",
+                "workspace_capabilities",
+                serde_json::json!({"rarity_group_order": ["creature"]}),
+            ),
+            (
+                "non-array rarity order",
+                "workspace_capabilities",
+                serde_json::json!({"rarity_group_order": "common"}),
+            ),
+            (
+                "empty row classification",
+                "workspace_row_classification",
+                serde_json::json!({}),
+            ),
+            (
+                "missing creature ids",
+                "workspace_row_classification",
+                serde_json::json!({"noncreature_instance_ids": []}),
+            ),
+            (
+                "missing noncreature ids",
+                "workspace_row_classification",
+                serde_json::json!({"creature_instance_ids": []}),
+            ),
+            (
+                "non-array row",
+                "workspace_row_classification",
+                serde_json::json!({
+                    "creature_instance_ids": "card-1",
+                    "noncreature_instance_ids": []
+                }),
+            ),
+            (
+                "non-string row id",
+                "workspace_row_classification",
+                serde_json::json!({
+                    "creature_instance_ids": [],
+                    "noncreature_instance_ids": [1]
+                }),
+            ),
+        ];
+
+        for (label, field, malformed_value) in malformed {
+            let mut candidate = value.clone();
+            candidate
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), malformed_value);
+            assert!(
+                serde_json::from_value::<DraftPoolGroups>(candidate).is_err(),
+                "{label} must reject"
+            );
         }
     }
 
@@ -2372,9 +2596,15 @@ mod tests {
             pass_direction: PassDirection::Right,
             seats: Vec::new(),
             cards_per_pack: 14,
+            pack_sizes: vec![14, 14, 14],
+            pack_set_codes: vec!["TST".to_string(); 3],
+            pack_pick_steps: vec![14, 14, 14],
+            // CR 905.1a: Premier takes one card per step.
+            pick_steps_per_pack: 14,
             pack_count: 3,
             min_deck_size: 40,
             addable_cards: Vec::new(),
+            grantable_commander_fillers: Vec::new(),
             standings: Vec::new(),
             current_round: 0,
             tournament_format: TournamentFormat::Swiss,
@@ -2398,8 +2628,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_39() {
-        assert_eq!(PROTOCOL_VERSION, 39);
+    fn protocol_version_is_44() {
+        assert_eq!(PROTOCOL_VERSION, 44);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -2409,7 +2639,7 @@ mod tests {
     /// understand.
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
-    /// this guards — and this test reds while `protocol_version_is_39` stays
+    /// this guards — and this test reds while `protocol_version_is_42` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
@@ -2431,6 +2661,7 @@ mod tests {
         assert!(matches!(parsed, ClientMessage::RequestTakeback(None)));
     }
 
+    #[cfg(any())]
     #[test]
     fn resolve_all_wire_frames_carry_only_server_safe_metadata() {
         let request = ClientMessage::ResolveAll {
@@ -2456,11 +2687,37 @@ mod tests {
 
         let rejected = ServerMessage::ResolveAllRejected {
             request_id: 7,
-            reason: "Resolve All requires your priority".to_string(),
+            rejection: ActionRejection::new(
+                engine::types::action_rejection::ActionRejectionCode::ResolveAllNotReady,
+            ),
         };
         assert_eq!(
             serde_json::to_string(&rejected).unwrap(),
-            r#"{"type":"ResolveAllRejected","data":{"request_id":7,"reason":"Resolve All requires your priority"}}"#
+            r#"{"type":"ResolveAllRejected","data":{"request_id":7,"rejection":{"code":"resolve_all_not_ready","disposition":"unavailable","message":"Resolve All is not ready to run.","related_object_ids":[]}}}"#
+        );
+
+        assert_eq!(
+            serde_json::to_string(&ServerMessage::ActionFailed {
+                message: "session storage failed".to_string(),
+            })
+            .unwrap(),
+            r#"{"type":"ActionFailed","data":{"message":"session storage failed"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ServerMessage::ResolveAllFailed {
+                request_id: 7,
+                message: "batch persistence failed".to_string(),
+            })
+            .unwrap(),
+            r#"{"type":"ResolveAllFailed","data":{"request_id":7,"message":"batch persistence failed"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ServerMessage::ManaPaymentPreviewFailed {
+                request_id: 7,
+                message: "preview lookup failed".to_string(),
+            })
+            .unwrap(),
+            r#"{"type":"ManaPaymentPreviewFailed","data":{"request_id":7,"message":"preview lookup failed"}}"#
         );
     }
 

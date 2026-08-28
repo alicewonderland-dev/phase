@@ -263,6 +263,13 @@ pub struct BackFaceData {
     /// so the engine can offer face-choice for MDFCs (CR 712.12).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout_kind: Option<LayoutKind>,
+    /// #7565: set when this stored face is a swap SNAPSHOT of the object's
+    /// other half (the live face is currently the alternative). Replaces the
+    /// old implicit contract "snapshot => layout_kind erased", which muted the
+    /// layout for every other consumer (cast-face prompt, MDFC land checks).
+    /// `false` for a still-unswapped printed back face.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_swap_snapshot: bool,
 }
 
 /// CR 719.3b: Tracks the solve state of a Case enchantment.
@@ -461,6 +468,17 @@ pub struct GameObject {
     /// `transformed` flag.
     #[serde(default)]
     pub modal_back_face: bool,
+    /// CR 601.2b + CR 712.11b / CR 709.3 (#7565): a cast-time face choice for
+    /// the CURRENT cast has been made — the cast pipeline's re-entries must
+    /// not re-prompt. Transient to the cast conversation: cleared on any zone
+    /// change that is not onto the stack, and when the cast is cancelled.
+    /// Deliberately NOT the old `back_face.layout_kind = None` erasure, which
+    /// poisoned every other `layout_kind` consumer (MDFC land playability,
+    /// split-cost handling, the recast prompt) for the object's lifetime:
+    /// `layout_kind` answers "what shape is this card", this flag answers
+    /// "is this cast's choice already made".
+    #[serde(default)]
+    pub cast_face_committed: bool,
 
     // Combat
     pub damage_marked: u32,
@@ -1343,6 +1361,9 @@ fn _gameobject_partition_is_total(o: &GameObject) {
         transformed: _,
         transformation_count: _,
         modal_back_face: _,
+        // #7565: transient cast-conversation bookkeeping, same bucket as
+        // `modal_back_face` — not a copiable value.
+        cast_face_committed: _,
         damage_marked: _,
         dealt_deathtouch_damage: _,
         attached_to: _,
@@ -2279,6 +2300,7 @@ impl GameObject {
             transformed: false,
             transformation_count: 0,
             modal_back_face: false,
+            cast_face_committed: false,
             damage_marked: 0,
             dealt_deathtouch_damage: false,
             attached_to: None,

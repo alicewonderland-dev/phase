@@ -114,7 +114,51 @@ type SerializedCost = {
   count?: QuantityExpr | number;
   costs?: SerializedCost[];
   cost?: { type: string; shards?: string[]; generic?: number };
+  filter?: { type: string; type_filters?: unknown[] } | null;
+  zone?: string | null;
 };
+
+function formatTypeFilter(filter: unknown): string {
+  if (typeof filter === "string") return filter;
+  if (!filter || typeof filter !== "object") {
+    return i18n.t("game:resolutionOptionalPayment.cost.card");
+  }
+  if ("Non" in filter) {
+    return i18n.t("game:resolutionOptionalPayment.cost.nonType", {
+      type: formatTypeFilter((filter as { Non: unknown }).Non),
+    });
+  }
+  if ("Subtype" in filter) return String((filter as { Subtype: unknown }).Subtype);
+  if ("AnyOf" in filter) {
+    const alternatives = (filter as { AnyOf: unknown[] }).AnyOf ?? [];
+    return alternatives
+      .map(formatTypeFilter)
+      .join(i18n.t("game:resolutionOptionalPayment.cost.orSeparator"));
+  }
+  return i18n.t("game:resolutionOptionalPayment.cost.card");
+}
+
+function formatFilteredCard(filter: SerializedCost["filter"], plural: boolean): string {
+  const types = filter?.type === "Typed" ? filter.type_filters ?? [] : [];
+  const meaningful = types.filter((type) => type !== "Card" && type !== "Any");
+  if (meaningful.length === 0) {
+    return i18n.t(`game:resolutionOptionalPayment.cost.${plural ? "cards" : "card"}`);
+  }
+  return i18n.t(
+    `game:resolutionOptionalPayment.cost.${plural ? "filteredCards" : "filteredCard"}`,
+    { types: meaningful.map(formatTypeFilter).join(" ") },
+  );
+}
+
+function formatZone(zone: string | null | undefined): string {
+  switch (zone) {
+    case "Battlefield": return i18n.t("game:resolutionOptionalPayment.cost.zoneBattlefield");
+    case "Graveyard": return i18n.t("game:resolutionOptionalPayment.cost.zoneGraveyard");
+    case "Library": return i18n.t("game:resolutionOptionalPayment.cost.zoneLibrary");
+    case "Exile": return i18n.t("game:resolutionOptionalPayment.cost.zoneExile");
+    default: return i18n.t("game:resolutionOptionalPayment.cost.zoneHand");
+  }
+}
 
 /** Render a QuantityExpr (or legacy raw number) for display in cost labels. */
 function formatQuantity(q: QuantityExpr | number | undefined, fallback = 1): string {
@@ -288,7 +332,17 @@ export function formatCost(cost: SerializedCost): string {
     case "Sacrifice": return "Sacrifice";
     case "Discard": {
       const label = formatQuantity(cost.count, 1);
-      return `Discard ${label} card${quantityIsPlural(cost.count) ? "s" : ""}`;
+      const cards = formatFilteredCard(cost.filter, quantityIsPlural(cost.count));
+      return i18n.t("game:resolutionOptionalPayment.cost.discard", { count: label, cards });
+    }
+    case "Exile": {
+      const count = formatQuantity(cost.count, 1);
+      const cards = formatFilteredCard(cost.filter, quantityIsPlural(cost.count));
+      return i18n.t("game:resolutionOptionalPayment.cost.exile", {
+        count,
+        cards,
+        zone: formatZone(cost.zone),
+      });
     }
     case "Blight": return `Blight ${cost.count ?? 1}`;
     case "CollectEvidence":

@@ -13,6 +13,11 @@
 import { createStore, del, get, set } from "idb-keyval";
 
 import type { DraftKind, DraftStatus, PoolInput } from "../adapter/draft-adapter";
+import {
+  isPlainRecord,
+  validateWorkspaceState,
+  type DraftWorkspaceState,
+} from "../components/draft/workspace/types";
 import type { DraftMatchBinding, DraftMatchLaunch, DraftMatchSettlement } from "../network/draftProtocol";
 import { parseRoomCode } from "../network/connection";
 import { ACTIVE_DRAFT_GUEST_KEY, ACTIVE_DRAFT_POD_KEY } from "../constants/storage";
@@ -88,6 +93,8 @@ export interface PersistedDraftHostSession {
     submissionId: string;
     payloadFingerprint: string;
   }>;
+  /** Complete, validated workspace state per authoritative seat. */
+  perSeatWorkspaceSnapshots?: Record<number, DraftWorkspaceState>;
 }
 
 /**
@@ -118,6 +125,14 @@ export interface PersistedDraftDeckSubmission {
   draftToken: string;
   submissionId: string;
   mainDeck: string[];
+  /**
+   * CR 903.3: the commander designation this submission carried. Persisted
+   * because `draft_submit_deck` REQUIRES it (draft protocol 17) — a reconnect
+   * replay that omitted it would be refused by `validateSubmitDeck` on the
+   * host, and `draftPeerSession`'s decode `.catch` would drop the frame
+   * silently rather than surfacing an error.
+   */
+  commanders: string[];
   timestamp: number;
 }
 
@@ -219,7 +234,28 @@ export async function loadDraftHostSession(
       getDraftStore(),
     );
     if (!s) return null;
-    return isPersistedDraftHostSession(s) ? s : null;
+    if (!isPersistedDraftHostSession(s)) return null;
+
+    const snapshots: Record<number, DraftWorkspaceState> = {};
+    if (s.perSeatWorkspaceSnapshots !== undefined) {
+      if (!isPlainRecord(s.perSeatWorkspaceSnapshots)) return null;
+      const rawSnapshots = s.perSeatWorkspaceSnapshots as unknown as Record<PropertyKey, unknown>;
+      for (const key of Reflect.ownKeys(rawSnapshots)) {
+        if (
+          typeof key !== "string"
+          || !Object.prototype.propertyIsEnumerable.call(rawSnapshots, key)
+        ) {
+          return null;
+        }
+        const seat = Number(key);
+        if (!Number.isSafeInteger(seat) || seat < 0 || String(seat) !== key) return null;
+        const snapshot = validateWorkspaceState(rawSnapshots[key]);
+        if ("error" in snapshot) return null;
+        snapshots[seat] = snapshot;
+      }
+    }
+
+    return { ...s, perSeatWorkspaceSnapshots: snapshots };
   } catch {
     return null;
   }
@@ -423,6 +459,13 @@ function isDraftKind(value: unknown): value is Exclude<DraftKind, "Quick"> {
 function isPoolInput(value: unknown): value is PoolInput {
   if (!isRecord(value) || !isRecord(value.data)) return false;
   if (value.type === "Set") {
+    // Two spellings reach here. The live one is a `SetPackSequence`: the
+    // distinct pools plus the pack-ordered sequence naming which fills each
+    // booster. A pod persisted before multi-set pods existed carries one
+    // serialized pool under `set_pool_json`; draft-wasm still promotes that to
+    // the one-element sequence it meant, so a host mid-lobby across the upgrade
+    // resumes instead of having its snapshot discarded as corrupt.
+    if (isSetPackSequence(value.data)) return true;
     return typeof value.data.set_pool_json === "string" && isJsonRecord(value.data.set_pool_json);
   }
   if (value.type !== "Cube") return false;
@@ -441,6 +484,22 @@ function isPoolInput(value: unknown): value is PoolInput {
       settings.addable_cards.policy === "StandardBasicsPlusCustom") &&
     Array.isArray(settings.addable_cards.custom) &&
     settings.addable_cards.custom.every((card) => typeof card === "string")
+  );
+}
+
+/**
+ * A pack sequence carries one pool object per distinct set and one set code per
+ * booster. The sequence must be non-empty — a pod that named no booster has no
+ * pool at all — and every entry a string, since draft-wasm resolves each
+ * against the supplied pools by name.
+ */
+function isSetPackSequence(data: Record<string, unknown>): boolean {
+  return (
+    Array.isArray(data.pools) &&
+    data.pools.every(isRecord) &&
+    Array.isArray(data.sequence) &&
+    data.sequence.length > 0 &&
+    data.sequence.every((code) => typeof code === "string")
   );
 }
 
@@ -577,6 +636,7 @@ export async function saveDraftDeckSubmission(
     draftToken: submission.draftToken,
     submissionId: submission.submissionId,
     mainDeck: [...submission.mainDeck],
+    commanders: [...submission.commanders],
     timestamp: Date.now(),
   };
   await set(`${DRAFT_DECK_SUBMISSION_PREFIX}${hostPeerId}`, value, getDraftStore());
@@ -596,7 +656,12 @@ export async function loadDraftDeckSubmission(
     if (!value || value.hostPeerId !== hostPeerId || !isNonEmptyString(value.draftCode)
       || !isCanonicalRoomCode(value.roomCode)
       || !isNonEmptyString(value.draftToken) || !isNonEmptyString(value.submissionId)
-      || !Array.isArray(value.mainDeck) || !value.mainDeck.every((card) => typeof card === "string")) {
+      || !Array.isArray(value.mainDeck) || !value.mainDeck.every((card) => typeof card === "string")
+      // A record written before the designation existed cannot be replayed:
+      // the host would refuse it. Discarding it is the fail-safe answer — the
+      // guest simply builds a fresh submission.
+      || !Array.isArray(value.commanders)
+      || !value.commanders.every((card) => typeof card === "string")) {
       return null;
     }
     if (identity && (value.roomCode !== roomCode || value.draftToken !== identity.draftToken)) {

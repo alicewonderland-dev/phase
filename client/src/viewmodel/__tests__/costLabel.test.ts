@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { AdditionalCost, GameAction, GameObject, Keyword, ManaCost } from "../../adapter/types.ts";
 import { buildGameObject } from "../../test/factories/gameObjectFactory.ts";
+import i18n from "../../i18n";
 import {
   abilityChoiceLabel,
   abilityLabel,
@@ -489,6 +490,51 @@ describe("formatAbilityCost", () => {
         { type: "PayLife", amount: { type: "Fixed", value: 2 } },
       ],
     })).toBe("{1} or Pay 2 life");
+  });
+
+  it("formats the external-tag mana wire shape", () => {
+    expect(formatAbilityCost({
+      type: "Mana",
+      cost: { type: "Cost", shards: ["Blue"], generic: 2 },
+    })).toBe("{2}{U}");
+  });
+
+  it("formats typed discard filters from the server wire shape", () => {
+    expect(formatAbilityCost({
+      type: "Discard",
+      count: { type: "Fixed", value: 1 },
+      filter: { type: "Typed", type_filters: [{ Non: "Land" }], controller: null, properties: [] },
+      random: "Chosen",
+      self_ref: "AnyCard",
+    })).toBe("Discard 1 nonLand card");
+  });
+
+  it("formats exile filters and zones from the server wire shape", () => {
+    expect(formatAbilityCost({
+      type: "Exile",
+      count: { type: "Fixed", value: 2 },
+      zone: "Graveyard",
+      filter: { type: "Typed", type_filters: ["Creature"], controller: null, properties: [] },
+    })).toBe("Exile 2 Creature cards from your graveyard");
+  });
+
+  it("routes exile templates through the active locale with engine values as interpolation", async () => {
+    const key = "resolutionOptionalPayment.cost.exile";
+    const previousLanguage = i18n.language;
+    const previousTemplate = String(i18n.getResource("de", "game", key));
+    i18n.addResource("de", "game", key, "LOK {{count}} {{cards}} / {{zone}}");
+    await i18n.changeLanguage("de");
+    try {
+      expect(formatAbilityCost({
+        type: "Exile",
+        count: { type: "Fixed", value: 2 },
+        zone: "Graveyard",
+        filter: { type: "Typed", type_filters: ["Creature"], controller: null, properties: [] },
+      })).toBe("LOK 2 Creature-Karten / deinem Friedhof");
+    } finally {
+      i18n.addResource("de", "game", key, previousTemplate);
+      await i18n.changeLanguage(previousLanguage);
+    }
   });
 });
 

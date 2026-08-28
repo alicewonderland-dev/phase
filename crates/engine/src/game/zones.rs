@@ -15,7 +15,7 @@ use crate::types::statics::StaticMode;
 use crate::types::zones::Zone;
 
 use super::game_object::GameObject;
-use super::printed_cards::{apply_back_face_to_object, snapshot_object_face};
+use super::printed_cards::{apply_back_face_to_object, swap_object_faces};
 
 /// CR 109.1 + CR 601.2a + CR 405.1: A spell is an object on the stack from
 /// announcement, even while this engine retains its origin-zone field until
@@ -288,25 +288,28 @@ pub(crate) fn apply_zone_exit_cleanup(
 
         // CR 712.8a + CR 400.7: Transformed permanents revert to front face on any
         // zone exit (transform DFCs are only valid in transformed state on the battlefield).
-        if obj_mut.transformed {
-            if let Some(back_face) = obj_mut.back_face.clone() {
-                let current_back = snapshot_object_face(obj_mut);
-                apply_back_face_to_object(obj_mut, back_face);
-                obj_mut.back_face = Some(current_back);
-                obj_mut.transformed = false;
-            }
+        if obj_mut.transformed && obj_mut.back_face.is_some() {
+            swap_object_faces(obj_mut);
+            obj_mut.transformed = false;
+        }
+
+        // CR 601.2b + CR 400.7 (#7565): the cast conversation ends with any
+        // move that is not onto the stack (resolve, counter, discard, bounce,
+        // battlefield entry) — a later cast must offer the face choice afresh.
+        if to != Zone::Stack {
+            obj_mut.cast_face_committed = false;
         }
 
         // CR 712.8a + CR 400.7: MDFC objects showing their back face revert to
         // front face in any zone other than the stack or battlefield (back face is
         // valid on the stack while the spell is being cast, and on the battlefield).
-        if obj_mut.modal_back_face && to != Zone::Stack && to != Zone::Battlefield {
-            if let Some(back_face) = obj_mut.back_face.clone() {
-                let current_back = snapshot_object_face(obj_mut);
-                apply_back_face_to_object(obj_mut, back_face);
-                obj_mut.back_face = Some(current_back);
-                obj_mut.modal_back_face = false;
-            }
+        if obj_mut.modal_back_face
+            && to != Zone::Stack
+            && to != Zone::Battlefield
+            && obj_mut.back_face.is_some()
+        {
+            swap_object_faces(obj_mut);
+            obj_mut.modal_back_face = false;
         }
 
         // CR 708.9: A face-down permanent leaving the battlefield, or a
@@ -3801,6 +3804,7 @@ mod tests {
             };
             obj.base_card_types = obj.card_types.clone();
             obj.back_face = Some(BackFaceData {
+                is_swap_snapshot: false,
                 name: "Summon: Esper Maduin".to_string(),
                 power: None,
                 toughness: None,
@@ -3868,6 +3872,7 @@ mod tests {
             };
             obj.base_card_types = obj.card_types.clone();
             obj.back_face = Some(BackFaceData {
+                is_swap_snapshot: false,
                 name: "Summon: Esper Maduin".to_string(),
                 power: None,
                 toughness: None,
@@ -4315,6 +4320,7 @@ mod tests {
             obj.base_toughness = Some(1);
             // Store back face data (original MDFC back face).
             obj.back_face = Some(BackFaceData {
+                is_swap_snapshot: false,
                 name: "Back Face".to_string(),
                 power: Some(6),
                 toughness: Some(6),
@@ -4550,6 +4556,7 @@ mod tests {
         {
             let obj = state.objects.get_mut(&id).unwrap();
             obj.back_face = Some(BackFaceData {
+                is_swap_snapshot: false,
                 name: "Back Face".to_string(),
                 power: Some(6),
                 toughness: Some(6),

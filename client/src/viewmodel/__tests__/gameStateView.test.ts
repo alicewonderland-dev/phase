@@ -1131,6 +1131,7 @@ const PARTITION_FIXTURES: Record<
   CollectEvidenceChoice: NO_TARGET_REF_LEGAL_SET,
   HarmonizeTapChoice: NO_TARGET_REF_LEGAL_SET,
   OptionalEffectChoice: NO_TARGET_REF_LEGAL_SET,
+  ResolutionOptionalPaymentChoice: NO_TARGET_REF_LEGAL_SET,
   PairChoice: NO_TARGET_REF_LEGAL_SET,
   OpponentMayChoice: NO_TARGET_REF_LEGAL_SET,
   LoopShortcut: NO_TARGET_REF_LEGAL_SET,

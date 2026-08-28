@@ -90,6 +90,7 @@ import { SpliceOfferModal } from "../components/modal/SpliceOfferModal.tsx";
 import { CardChoiceModal } from "../components/modal/CardChoiceModal.tsx";
 import { ChoiceModal } from "../components/modal/ChoiceModal.tsx";
 import { OptionalEffectModalContent } from "../components/modal/OptionalEffectModal.tsx";
+import { ResolutionOptionalPaymentModalContent } from "../components/modal/ResolutionOptionalPaymentModal.tsx";
 import { OptionalCostModalContent } from "../components/modal/OptionalCostModal.tsx";
 import { ChooseOneOfBranchModal } from "../components/modal/ChooseOneOfBranchModal.tsx";
 import { LifeRedistributionModal } from "../components/modal/LifeRedistributionModal.tsx";
@@ -1992,6 +1993,11 @@ function GamePageContent({
             <OptionalEffectModal />
           )}
 
+        {/* Optional immediate payment branch ("discard a card or pay {2}") */}
+        {waitingFor?.type === "ResolutionOptionalPaymentChoice" && (
+          <ResolutionOptionalPaymentModal />
+        )}
+
         {/* CR 401.4: Owner puts permanent on top or bottom of library */}
         {(waitingFor?.type === "TopOrBottomChoice" || waitingFor?.type === "ClashCardPlacement") &&
           canActForWaitingState && (
@@ -3347,6 +3353,22 @@ function OptionalEffectModal() {
   if (waitingFor?.type !== "OptionalEffectChoice" && waitingFor?.type !== "OpponentMayChoice") return null;
 
   return <OptionalEffectModalContent waitingFor={waitingFor} objects={objects} dispatch={dispatch} />;
+}
+
+function ResolutionOptionalPaymentModal() {
+  const dispatch = useGameDispatch();
+  const waitingFor = useGameStore((s) => s.waitingFor);
+  const canActForWaitingState = useCanActForWaitingState();
+
+  if (waitingFor?.type !== "ResolutionOptionalPaymentChoice") return null;
+
+  return (
+    <ResolutionOptionalPaymentModalContent
+      waitingFor={waitingFor}
+      canActForWaitingState={canActForWaitingState}
+      dispatch={dispatch}
+    />
+  );
 }
 
 // ── Top or Bottom Choice Modal (CR 401.4) ──────────────────────────────

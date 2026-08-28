@@ -50,10 +50,25 @@
     "respondSubtitle": "Accept the verified route or stop at one of your issued boundaries.",
     "shortenAtBreakpoint": "Stop at boundary {{breakpointId}}"
   },
-  "resolutionProgress": {
-    "label": "Resolving {{resolved}} / {{total}}",
-    "collapse": "Collapse resolving progress",
-    "expand": "Expand resolving progress"
+  "restoredAutomation": {
+    "dismiss": "Dismiss",
+    "noop": {
+      "title": "Saved game loaded",
+      "summary_one": "No stack automation needed to resume.",
+      "summary_other": "No stack automation needed to resume."
+    },
+    "progressed": {
+      "title": "Stack automation resumed",
+      "summary_one": "The engine completed {{count}} automated resolution.",
+      "summary_other": "The engine completed {{count}} automated resolutions.",
+      "omitted_one": "{{count}} intermediate event was omitted.",
+      "omitted_other": "{{count}} intermediate events were omitted."
+    },
+    "zeroResolutionRepair": {
+      "title": "Stack automation repaired",
+      "summary_one": "The saved automation was safely repaired before play resumed.",
+      "summary_other": "The saved automation was safely repaired before play resumed."
+    }
   },
   "resolveAllConsent": {
     "eyebrow": "Resolve All",
@@ -2186,6 +2201,26 @@
     "no": "No",
     "dontAskAgain": "Don't ask again this game",
     "dontAskAgainForSameCard": "Apply this to every copy of this card"
+  },
+  "resolutionOptionalPayment": {
+    "title": "Choose an optional payment",
+    "pay": "Pay {{cost}}",
+    "decline": "Decline",
+    "cost": {
+      "card": "card",
+      "cards": "cards",
+      "filteredCard": "{{types}} card",
+      "filteredCards": "{{types}} cards",
+      "nonType": "non{{type}}",
+      "orSeparator": " or ",
+      "zoneBattlefield": "the battlefield",
+      "zoneGraveyard": "your graveyard",
+      "zoneLibrary": "your library",
+      "zoneExile": "exile",
+      "zoneHand": "your hand",
+      "discard": "Discard {{count}} {{cards}}",
+      "exile": "Exile {{count}} {{cards}} from {{zone}}"
+    }
   },
   "topOrBottom": {
     "cardFallback": "Card",

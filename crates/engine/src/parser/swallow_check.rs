@@ -5156,11 +5156,10 @@ mod tests {
     /// registration line in `check_swallowed_clauses` → no diagnostic → fails.
     #[test]
     fn modal_dynamic_max_dropped_registered_via_real_parse() {
-        // A cross-player "greatest number of creatures" count that no
-        // `parse_cda_quantity` arm recognizes ⇒ the dynamic cap is genuinely
-        // dropped. Shared const feeds both the guard and the fixture so they
-        // cannot drift.
-        const DROPPED_EXPR: &str = "the greatest number of creatures a player controls";
+        // A stored-die-result extremum that no `parse_cda_quantity` arm
+        // recognizes ⇒ the dynamic cap is genuinely dropped. Shared const
+        // feeds both the guard and the fixture so they cannot drift.
+        const DROPPED_EXPR: &str = "the greatest number of stored results on it of the same value";
         assert!(
             crate::parser::oracle_quantity::parse_cda_quantity(DROPPED_EXPR).is_none(),
             "fixture expr must stay unsupported so the modal cap is genuinely \

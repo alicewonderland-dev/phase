@@ -654,6 +654,12 @@ fn cmp_payload(a: &GameAction, b: &GameAction) -> Ordering {
             };
             cmp_val(a0, b0)
         }
+        GameAction::ChooseResolutionOptionalPaymentBranch { choice: a0 } => {
+            let GameAction::ChooseResolutionOptionalPaymentBranch { choice: b0 } = b else {
+                unreachable!("cmp_payload: same-variant invariant");
+            };
+            cmp_val(a0, b0)
+        }
         GameAction::RespondToSpliceOffer { card: a0 } => {
             let GameAction::RespondToSpliceOffer { card: b0 } = b else {
                 unreachable!("cmp_payload: same-variant invariant");

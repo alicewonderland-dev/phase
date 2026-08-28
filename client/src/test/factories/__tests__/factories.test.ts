@@ -4,6 +4,7 @@ import { gameObjectFactory } from "../gameObjectFactory.ts";
 import {
   castOfferWaitingForFactory,
   gameStateFactory,
+  resolutionOptionalPaymentWaitingForFactory,
   targetSelectionWaitingForFactory,
   waitingForFactory,
 } from "../gameStateFactory.ts";
@@ -88,6 +89,15 @@ describe("waitingForFactory", () => {
         target_slots: [{ legal_targets: [], optional: false }],
       },
     });
+  });
+
+  it("preserves original indices in resolution optional payment choices", () => {
+    const waitingFor = resolutionOptionalPaymentWaitingForFactory
+      .forPlayer(1)
+      .withData({ costs: [{ index: 2, cost: { type: "Mana", cost: { type: "Cost", shards: [], generic: 2 } } }] })
+      .build();
+    expect(waitingFor.data).toMatchObject({ player: 1, source_id: 1 });
+    expect(waitingFor.data.costs.map((option) => option.index)).toEqual([2]);
   });
 
   it("exposes CastOffer's domain fields through chainable factory methods", () => {

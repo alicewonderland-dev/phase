@@ -118,6 +118,7 @@ mod tests {
     /// presence of `back_face` is read by `existing_doors`.
     fn room_back_face() -> BackFaceData {
         BackFaceData {
+            is_swap_snapshot: false,
             name: "Right Door".to_string(),
             power: None,
             toughness: None,

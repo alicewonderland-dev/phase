@@ -2,6 +2,7 @@ use crate::types::format::FormatTopology;
 use crate::types::format::GameFormat;
 use crate::types::game_state::GameState;
 use crate::types::player::PlayerId;
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TeamId(pub u8);
@@ -201,6 +202,26 @@ pub(crate) fn priority_pass_representative(state: &GameState, player: PlayerId) 
     normalize_shared_turn_recipient(state, player)
 }
 
+/// Canonicalize a set of semantic priority seats to their currently living
+/// representatives (CR 117.6 + CR 805.5b).
+///
+/// Resolution sessions store representatives, never incidental teammate seats.
+/// Reusing this at construction and at each live priority beat makes a changed
+/// team topology observable before an automated pass can consume a stack entry.
+pub(crate) fn canonical_priority_representatives<I>(
+    state: &GameState,
+    players: I,
+) -> BTreeSet<PlayerId>
+where
+    I: IntoIterator<Item = PlayerId>,
+{
+    players
+        .into_iter()
+        .map(|player| priority_pass_representative(state, player))
+        .filter(|&player| super::players::is_alive(state, player))
+        .collect()
+}
+
 /// CR 805.4: In shared-team-turn formats, each team takes turns rather than
 /// each player.
 pub(crate) fn next_turn_representative(state: &GameState, current: PlayerId) -> PlayerId {
@@ -288,6 +309,11 @@ mod tests {
         assert_eq!(
             priority_pass_participants(&state),
             vec![PlayerId(1), PlayerId(2)]
+        );
+        assert_eq!(
+            canonical_priority_representatives(&state, [PlayerId(0), PlayerId(1)]),
+            [PlayerId(1)].into_iter().collect(),
+            "a frozen session re-canonicalizes an eliminated teammate to its living team seat"
         );
     }
 

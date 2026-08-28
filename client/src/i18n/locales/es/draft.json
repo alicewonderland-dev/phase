@@ -2,19 +2,25 @@
   "intro": {
     "quickTitle": "Draft Rápido",
     "podTitle": "Pod Draft",
+    "commanderTitle": "Commander Draft",
     "subtitle": "Así funciona",
     "startDrafting": "Empezar a draftear",
     "quick": {
       "step1": "Abrirás 3 sobres de 14 cartas cada uno",
       "step2": "Elige una carta por sobre y luego pasa el resto a los drafters de IA",
       "step3": "Los sobres alternan de dirección en cada ronda — izquierda, derecha, izquierda",
-      "step4": "Tras todas las elecciones, construye un mazo de 40 cartas y juega una partida"
+      "step4": "Tras todas las elecciones, construye un mazo de 40 cartas y juega una partida",
+      "step1Mixed": "Abrirás {{packCount}} sobres de tamaños distintos: {{packSizes}} cartas, en ese orden"
     },
     "pod": {
       "step1": "Estás haciendo draft con {{count}} jugadores en un pod",
       "step2": "Abre 3 sobres de 14 cartas — elige una, pasa el resto",
       "step3": "Los sobres alternan de dirección en cada ronda — izquierda, derecha, izquierda",
       "step4": "Tras el draft, construye un mazo de 40 cartas y juega partidas de torneo"
+    },
+    "commander": {
+      "step2": "Elige dos cartas de cada sobre y pasa el resto",
+      "step4": "Tras el draft, construye un mazo Commander de 60 cartas y juega una partida multijugador"
     }
   },
   "steps": {
@@ -71,18 +77,48 @@
       "Hard": "Difícil",
       "VeryHard": "Muy difícil"
     },
-    "chooseSet": "Elige una colección",
     "noPools": "No hay grupos de draft disponibles. Ejecuta primero la canalización de datos del draft.",
     "setIconAlt": "Icono de la colección {{name}}",
-    "loadFailed": "Error al cargar las colecciones"
+    "loadFailed": "Error al cargar las colecciones",
+    "packOrder": "Orden de los sobres",
+    "clearPacks": "Vaciar",
+    "emptyPacks_one": "Elige una colección para cada sobre. Un draft abre {{count}} sobre por defecto: repite una colección o mezcla varias.",
+    "emptyPacks_other": "Elige una colección para cada sobre. Un draft abre {{count}} sobres por defecto: repite una colección o mezcla varias para draftear un bloque.",
+    "emptyPacksFixed_one": "El sellado abre exactamente {{count}} sobre. Elige una colección para él.",
+    "emptyPacksFixed_other": "El sellado abre exactamente {{count}} sobres. Elige una colección para cada uno: repite una o mezcla varias.",
+    "packCountFixed": "{{selected}} de {{required}} sobres elegidos",
+    "packCountFlexible": "{{selected}} sobres elegidos — hasta {{max}}",
+    "addPackFromSet": "Añadir un sobre",
+    "packsFull": "La lista de sobres está llena",
+    "addPackOf": "Añadir un sobre de {{name}}",
+    "movePackEarlier": "Adelantar el sobre {{number}}",
+    "movePackLater": "Retrasar el sobre {{number}}",
+    "removePack": "Quitar el sobre {{number}}",
+    "chooseSet": "Elige una colección",
+    "draftSet": "Draftear {{name}}",
+    "fillRemaining_one": "Llenar el último sobre con {{name}}",
+    "fillRemaining_other": "Llenar los {{count}} sobres restantes con {{name}}",
+    "startDraft": "Empezar draft",
+    "startSealed": "Empezar sellado"
   },
   "pack": {
     "confirmPick": "Confirmar elección",
+    "selected": "Seleccionada",
     "draftEffects": "Efectos de draft:",
     "waitingNext": "Esperando el siguiente sobre...",
-    "cardsInPack": "{{count}} cartas en el sobre",
+    "cardsInPack_one": "{{count}} carta en el sobre",
+    "cardsInPack_few": "{{count}} cartas en el sobre",
+    "cardsInPack_many": "{{count}} cartas en el sobre",
+    "cardsInPack_other": "{{count}} cartas en el sobre",
+    "currentPick": "Sobre {{pack}} Elección {{pick}}",
     "picking": "Eligiendo…",
-    "autoPick": "Elección automática"
+    "autoPick": "Elección automática",
+    "scale": "Tamaño del sobre",
+    "scaleDecrease": "Reducir tamaño del sobre",
+    "scaleReset": "Restablecer tamaño del sobre",
+    "scaleIncrease": "Aumentar tamaño del sobre",
+    "pickToDeck": "Elegir {{card}} para el mazo",
+    "pickToSideboard": "Elegir {{card}} para el banquillo"
   },
   "sealedOpening": {
     "title": "Abre tu pool de sellado",
@@ -94,15 +130,22 @@
     "nextPack": "Siguiente sobre",
     "viewPool": "Ver tu pool",
     "poolTitle": "Tu pool de sellado",
-    "poolSubtitle": "Las {{count}} cartas, agrupadas por tipo.",
+    "poolSubtitle_one": "La {{count}} carta, agrupada por tipo.",
+    "poolSubtitle_few": "Las {{count}} cartas, agrupadas por tipo.",
+    "poolSubtitle_many": "Las {{count}} cartas, agrupadas por tipo.",
+    "poolSubtitle_other": "Las {{count}} cartas, agrupadas por tipo.",
     "buildDeck": "Construir mazo"
   },
   "pool": {
-    "cardsDrafted": "{{count}} cartas drafteadas",
+    "cardsDrafted_one": "{{count}} carta drafteada",
+    "cardsDrafted_few": "{{count}} cartas drafteadas",
+    "cardsDrafted_many": "{{count}} cartas drafteadas",
+    "cardsDrafted_other": "{{count}} cartas drafteadas",
     "empty": "Aún no se ha drafteado ninguna carta",
     "sortColor": "Color",
     "sortType": "Tipo",
     "sortCmc": "CMC",
+    "grantedFiller": "+ hasta {{maximum}} × {{name}} (solo como comandante)",
     "groups": {
       "white": "Blanco",
       "blue": "Azul",
@@ -133,6 +176,79 @@
       "manaValue6Plus": "6+ CMC"
     }
   },
+  "workspace": {
+    "locked": "Elección en curso.",
+    "shell": { "label": "Espacio de trabajo del mazo", "show": "Mostrar espacio de trabajo del mazo", "hide": "Ocultar espacio de trabajo del mazo", "title": "Construye tu mazo" },
+    "view": { "label": "Vista del espacio de trabajo", "board": "Tablero", "compact": "Compacta" },
+    "preview": { "label": "Vista previa de carta", "none": "Ninguna", "follow": "Seguir", "side": "Lateral", "shift": "Mayús" },
+    "count": {
+      "deck_one": "Mazo ({{count}} carta)",
+      "deck_few": "Mazo ({{count}} cartas)",
+      "deck_many": "Mazo ({{count}} cartas)",
+      "deck_other": "Mazo ({{count}} cartas)",
+      "sideboard_one": "Banquillo ({{count}} carta)",
+      "sideboard_few": "Banquillo ({{count}} cartas)",
+      "sideboard_many": "Banquillo ({{count}} cartas)",
+      "sideboard_other": "Banquillo ({{count}} cartas)"
+    },
+    "empty": { "sideboard": "No hay cartas en el banquillo" },
+    "sideboard": {
+      "expand_one": "Mostrar banquillo ({{count}} carta)",
+      "expand_few": "Mostrar banquillo ({{count}} cartas)",
+      "expand_many": "Mostrar banquillo ({{count}} cartas)",
+      "expand_other": "Mostrar banquillo ({{count}} cartas)",
+      "collapse": "Ocultar banquillo"
+    },
+    "pool": {
+      "label": "Pool de cartas",
+      "filterLabel": "Filtro de zona del pool",
+      "sortLabel": "Orden del pool",
+      "empty": "No hay cartas en esta vista",
+      "filter": {
+        "combined_one": "Todas ({{count}})",
+        "combined_few": "Todas ({{count}})",
+        "combined_many": "Todas ({{count}})",
+        "combined_other": "Todas ({{count}})",
+        "deck_one": "Mazo ({{count}})",
+        "deck_few": "Mazo ({{count}})",
+        "deck_many": "Mazo ({{count}})",
+        "deck_other": "Mazo ({{count}})",
+        "sideboard_one": "Banquillo ({{count}})",
+        "sideboard_few": "Banquillo ({{count}})",
+        "sideboard_many": "Banquillo ({{count}})",
+        "sideboard_other": "Banquillo ({{count}})"
+      }
+    },
+    "compact": { "sideboardRegion": "Banquillo compacto" },
+    "toolbar": { "label": "Diseño del tablero" },
+    "layout": { "label": "Diseño", "columns": "Columnas", "maxPerRow": "Máximo de columnas por fila", "decreaseMaxPerRow": "Reducir máximo de columnas por fila", "increaseMaxPerRow": "Aumentar máximo de columnas por fila" },
+    "sort": { "label": "Ordenar tablero", "cmc": "Valor de maná", "color": "Color", "rarity": "Rareza", "type": "Tipo" },
+    "rows": { "label": "Filas del tablero", "one": "Una fila", "two": "Dos filas" },
+    "rowHeaders": { "creatures": "Criaturas", "nonCreatures": "No criaturas" },
+    "columns": { "label": "Columnas del tablero", "add": "Añadir columna", "removeFinal": "Quitar última columna", "removeHeader": "Quitar columna {{column}}" },
+    "headers": {
+      "compact": "Encabezados",
+      "show": "Mostrar encabezados",
+      "addedBasics": "Tierras básicas añadidas",
+      "unclassified": "Sin clasificar",
+      "emptyOrdinal": "Columna vacía {{column}}",
+      "accessible_one": "Columna {{column}}: {{labels}}, {{count}} carta",
+      "accessible_few": "Columna {{column}}: {{labels}}, {{count}} cartas",
+      "accessible_many": "Columna {{column}}: {{labels}}, {{count}} cartas",
+      "accessible_other": "Columna {{column}}: {{labels}}, {{count}} cartas"
+    },
+    "card": {
+      "inspect": "Inspeccionar {{card}}",
+      "moveToZone": "Mover {{card}} a {{zone}}"
+    },
+    "zone": { "deck": "Mazo", "sideboard": "Banquillo" },
+    "drop": { "zone": "Soltar en esta zona", "column": "Soltar en esta columna", "row": "Soltar en esta fila" },
+    "drag": { "started": "Arrastrando {{card}}.", "target": "Soltar en {{zone}}, columna {{column}}.", "success": "Se eligió {{card}}.", "moved": "Se movió {{card}}.", "cancelled": "Elección cancelada.", "rejected": "No se pudo elegir {{card}} y se restauró.", "dispatchError": "No se pudo enviar {{card}}. Inténtalo de nuevo." },
+    "announcement": {
+      "moved": "Se movió {{card}} a {{zone}}, columna {{column}}, posición {{position}}.",
+      "columnRemoved": "Se quitó la columna {{column}} y se reconstruyó el tablero."
+    }
+  },
   "standings": {
     "title": "Clasificación — Ronda {{round}}",
     "rank": "#",
@@ -152,7 +268,17 @@
     "emptyDeckHint": "Haz clic en las cartas del grupo para añadirlas a tu mazo.",
     "addableCards": "Cartas añadibles",
     "searchAddableCards": "Buscar cartas añadibles...",
+    "addLands": "Añadir tierras",
+    "snowCovered": "Nevadas",
     "autoLands": "Tierras automáticas",
+    "averageManaCost": "Coste de maná medio",
+    "manaColor": "Color de maná",
+    "countInCost": "Cantidad en el coste",
+    "type": "Tipo",
+    "count": "Cantidad",
+    "percent": "%",
+    "basicLand": "Tierra básica",
+    "total": "Total",
     "suggestDeck": "Sugerir mazo",
     "submitDeck": "Enviar mazo",
     "validationTitle": "El mazo necesita atención",
@@ -161,11 +287,18 @@
     "addCard": "Añadir {{name}}",
     "cardCount": "/ {{min}} cartas",
     "spellCount_one": "{{count}} hechizo",
+    "spellCount_few": "{{count}} hechizos",
+    "spellCount_many": "{{count}} hechizos",
     "spellCount_other": "{{count}} hechizos",
     "landCount_one": "{{count}} tierra",
+    "landCount_few": "{{count}} tierras",
+    "landCount_many": "{{count}} tierras",
     "landCount_other": "{{count}} tierras",
     "readyToSubmit": "listo para enviar",
-    "moreNeeded": "{{count}} más necesarias"
+    "moreNeeded": "{{count}} más necesarias",
+    "commanderRequired": "Designa un comandante de tu reserva para enviar.",
+    "commanderUnavailable": "La designación de comandante no está disponible ahora mismo: no se pudo cargar la base de datos de cartas.",
+    "grantedFiller": "Tu reserva también incluye hasta {{maximum}} × {{name}}, utilizable solo como tu comandante."
   },
   "landing": {
     "title": "Draft",
@@ -187,6 +320,10 @@
     "podDraft": {
       "title": "Pod Draft",
       "description": "Hospeda o únete a un pod con hasta 8 jugadores, draftea en directo juntos y luego juega un torneo suizo o de eliminación."
+    },
+    "commanderDraft": {
+      "title": "Commander Draft",
+      "description": "Draftea dos cartas a la vez en un pod, construye un mazo Commander de 60 cartas y juega una partida multijugador."
     },
     "podInProgress": "Pod Draft en curso",
     "guestPodInProgress": "Pod unido listo para reconectar",
@@ -328,6 +465,8 @@
     "kindTraditionalDesc": "Partidas de torneo al mejor de tres tras la construcción de mazo, con banquillo entre juegos.",
     "kindSealed": "Sellado",
     "kindSealedDesc": "Abre seis sobres directamente en el pool de cada jugador y luego construye un mazo de torneo al mejor de uno.",
+    "kindCommanderDraft": "Commander",
+    "kindCommanderDraftDesc": "Cada jugador draftea dos cartas a la vez y construye un mazo Commander de 60 cartas; después el pod juega una partida multijugador.",
     "tournamentFormat": "Formato de torneo",
     "tournamentSwiss": "Suizo",
     "tournamentSwissDesc": "Todos siguen jugando durante tres rondas, incluso tras una derrota.",
@@ -341,7 +480,8 @@
     "podSize": "Tamaño del pod",
     "podSizeDesc": "{{count}} asientos en total. Los asientos vacíos se pueden rellenar con bots desde la sala de espera antes de que empiece el draft.",
     "playerCount": "{{count}} jugadores",
-    "setSelectorHint": "Elige la colección del draft al final. Seleccionar una colección carga su grupo de cartas y crea la sala del pod.",
+    "setSelectorHint": "Ordena los sets que draftea tu grupo: uno por sobre, en el orden en que se abren. Nombra un solo set para llenar todos los sobres con él. Al crear el grupo se cargan las reservas.",
+    "createPod": "Crear grupo",
     "loadingPool": "Cargando los datos del grupo de la colección...",
     "roomCode": "Código de sala",
     "roomCodePlaceholder": "Introduce el código de sala...",
@@ -390,6 +530,7 @@
   },
   "podComplete": {
     "title": "Draft completado",
+    "launchCommanderGame": "Iniciar partida de Commander",
     "returnToMenu": "Volver al menú"
   },
   "podError": {

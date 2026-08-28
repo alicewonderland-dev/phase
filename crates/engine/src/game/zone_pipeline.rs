@@ -1195,7 +1195,12 @@ pub(crate) fn move_objects_simultaneously_then(
             );
             // Synchronous completion (the common single-redirect path): run the
             // cleanup now, and surface a pause it raises to the enclosing caller.
-            completion.map_or(BatchMoveResult::Done, |completion| {
+            completion.map_or(BatchMoveResult::Done, |mut completion| {
+                crate::types::game_state::settle_dig_delivery_outcome(
+                    &mut completion,
+                    state,
+                    &logical_zone_change_group,
+                );
                 run_batch_completion(state, completion, events)
             })
         }
@@ -1612,7 +1617,7 @@ pub(crate) fn drain_pending_batch_deliveries(state: &mut GameState, events: &mut
                     .expect("settled batch delivery frame must exist");
                 // CR 603.10a + CR 616.1: logical settlement has completed before
                 // the one post-batch cleanup can run.
-                if let Some(completion) = completion {
+                if let Some(mut completion) = completion {
                     // The parked/settled result is deliberately unused here: the
                     // drain's callers are state-mediated (engine_replacement
                     // re-reads `state.waiting_for` after the drain and gates
@@ -1621,6 +1626,11 @@ pub(crate) fn drain_pending_batch_deliveries(state: &mut GameState, events: &mut
                     // prompt + fresh BatchDelivery frame, not via
                     // this return value. Witnessed by the compound double-pause
                     // test (miss batch redirect, then hit-delivery redirect).
+                    crate::types::game_state::settle_dig_delivery_outcome(
+                        &mut completion,
+                        state,
+                        &logical_zone_change_group,
+                    );
                     let _ = run_batch_completion(state, completion, events);
                 }
             }
@@ -6275,6 +6285,7 @@ mod effect_driven_transformed_entry_tests {
             };
             obj.base_card_types = obj.card_types.clone();
             obj.back_face = Some(BackFaceData {
+                is_swap_snapshot: false,
                 name: "MDFC Back".to_string(),
                 power: None,
                 toughness: None,

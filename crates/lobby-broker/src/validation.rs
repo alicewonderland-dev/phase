@@ -41,6 +41,15 @@ pub const MAX_CONSUMED_TOKENS: usize = 64;
 /// Max draft set-code length, in bytes. Real set codes are much shorter; this
 /// leaves room for the synthetic cube sentinel while rejecting stored junk.
 pub const MAX_DRAFT_SET_CODE_LEN: usize = 32;
+/// Max length, in bytes, of the draft SOURCE label a lobby listing carries.
+///
+/// Not one set code: a multi-set draft joins its distinct set codes with `+`
+/// into a single label (`draft_core::types::DraftSource::set_code`, e.g.
+/// `"ISD+DKA+AVR"`), so a listing may name one code per pack the event opens.
+/// The multiplier is `draft_core`'s `MAX_PACK_COUNT`, inlined because the
+/// broker deliberately carries no draft-core dependency — it validates the
+/// shape of a listing, never the rules of a draft.
+pub const MAX_DRAFT_SET_LABEL_LEN: usize = 8 * (MAX_DRAFT_SET_CODE_LEN + 1);
 /// Max draft kind label length, in bytes.
 pub const MAX_DRAFT_KIND_LEN: usize = 32;
 
@@ -127,7 +136,7 @@ pub fn validate_create_game_settings_fields(
         validate_token(
             "draft_metadata.set_code",
             &draft.set_code,
-            MAX_DRAFT_SET_CODE_LEN,
+            MAX_DRAFT_SET_LABEL_LEN,
         )?;
         validate_token(
             "draft_metadata.draft_kind",
@@ -426,7 +435,7 @@ mod tests {
         let mut msg = create_with("Alice");
         if let M::CreateGameWithSettings { draft_metadata, .. } = &mut msg {
             *draft_metadata = Some(DraftLobbyMetadata {
-                set_code: "a".repeat(MAX_DRAFT_SET_CODE_LEN + 1),
+                set_code: "a".repeat(MAX_DRAFT_SET_LABEL_LEN + 1),
                 draft_kind: "Quick".to_string(),
                 cube_name: None,
             });

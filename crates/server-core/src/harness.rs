@@ -27,9 +27,7 @@ impl TournamentHarness {
     pub fn new_premier_draft() -> Self {
         let mut manager = DraftSessionManager::new();
         let config = DraftConfig {
-            source: DraftSource::Set {
-                code: "TST".to_string(),
-            },
+            source: DraftSource::single_set("TST".to_string()),
             set_code: "TST".to_string(),
             kind: DraftKind::Premier,
             pod_size: 8,
@@ -85,7 +83,7 @@ impl TournamentHarness {
                         &self.tokens[seat],
                         DraftAction::Pick {
                             seat: seat as u8,
-                            card_instance_id: card.instance_id.clone(),
+                            card_instance_ids: vec![card.instance_id.clone()],
                         },
                         Some(&self.source),
                     );
@@ -119,6 +117,7 @@ impl TournamentHarness {
                 DraftAction::SubmitDeck {
                     seat: seat as u8,
                     main_deck,
+                    commanders: Vec::new(),
                 },
                 Some(&self.source),
             );

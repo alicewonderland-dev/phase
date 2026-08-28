@@ -5852,6 +5852,40 @@ fn ghalta_self_cost_reduction_is_active_from_command_zone() {
 }
 
 #[test]
+fn cavern_hoard_dragon_reduction_uses_greatest_opponent_artifact_count() {
+    let def = parse_static_line(
+        "This spell costs {X} less to cast, where X is the greatest number of artifacts an opponent controls.",
+    )
+    .expect("Cavern-Hoard Dragon cost reduction must parse");
+
+    let StaticMode::ModifyCost {
+        mode: CostModifyMode::Reduce,
+        amount,
+        dynamic_count:
+            Some(QuantityRef::ControlledByEachPlayer {
+                filter: TargetFilter::Typed(filter),
+                aggregate: AggregateFunction::Max,
+                relation: PlayerRelation::Opponent,
+            }),
+        ..
+    } = def.mode
+    else {
+        panic!(
+            "expected opponent-scoped dynamic self-cost reduction, got {:?}",
+            def.mode
+        );
+    };
+    assert_eq!(amount, ManaCost::generic(1));
+    assert_eq!(filter.type_filters, vec![TypeFilter::Artifact]);
+    assert_eq!(filter.controller, None);
+    assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
+    assert_eq!(
+        def.active_zones,
+        crate::types::zones::self_spell_cost_mod_active_zones()
+    );
+}
+
+#[test]
 fn self_cost_reduction_where_x_distinct_named_lands_uses_static_cost_seam() {
     let def = parse_static_line(
         "This spell costs {X} less to cast, where X is the number of differently named lands you control.",
@@ -10317,6 +10351,136 @@ fn static_as_long_as_enchanted_creature_is_attacking_gate_binds_to_host() {
                 TypedFilter::creature().properties(vec![FilterProp::Attacking { defender: None }])
             ),
         }),
+    );
+}
+
+/// CR 506.5 + CR 509.1b + CR 611.3a: Security Bypass's evasion applies to the
+/// enchanted host only while that recipient is the sole attacker. The Aura is
+/// not the affected object and its combat state is irrelevant.
+#[test]
+fn security_bypass_attacking_alone_evasion_binds_to_enchanted_host() {
+    let line = "As long as enchanted creature is attacking alone, it can't be blocked.";
+    let defs = parse_static_line_multi(line);
+    assert_eq!(defs.len(), 1, "expected one typed restriction: {defs:?}");
+    assert_eq!(defs[0].mode, StaticMode::CantBeBlocked);
+    assert_eq!(
+        defs[0].affected,
+        Some(TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::EnchantedBy])
+        ))
+    );
+    assert_eq!(
+        defs[0].condition,
+        Some(StaticCondition::RecipientMatchesFilter {
+            filter: TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::AttackingAlone])
+            ),
+        })
+    );
+}
+
+/// The generic route also covers Equipment and the curly apostrophe used by
+/// some Oracle sources; neither variation may fall back to source/self binding.
+#[test]
+fn equipped_attacking_alone_evasion_accepts_curly_apostrophe() {
+    let defs = parse_static_line_multi(
+        "As long as equipped creature is attacking alone, it can’t be blocked.",
+    );
+    assert_eq!(defs.len(), 1, "expected one typed restriction: {defs:?}");
+    assert_eq!(defs[0].mode, StaticMode::CantBeBlocked);
+    assert_eq!(
+        defs[0].affected,
+        Some(TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::EquippedBy])
+        ))
+    );
+    assert_eq!(
+        defs[0].condition,
+        Some(StaticCondition::RecipientMatchesFilter {
+            filter: TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::AttackingAlone])
+            ),
+        })
+    );
+}
+
+/// The attached-combat consumer is all-consuming. A longer, unsupported
+/// condition must not be silently truncated into the supported Security
+/// Bypass shape.
+#[test]
+fn attached_attacking_alone_rejects_hostile_trailing_condition() {
+    let defs = parse_static_line_multi(
+        "As long as enchanted creature is attacking alone during your turn, it can't be blocked.",
+    );
+    assert!(
+        !defs.iter().any(|def| {
+            def.mode == StaticMode::CantBeBlocked
+                && def.affected
+                    == Some(TargetFilter::Typed(
+                        TypedFilter::creature().properties(vec![FilterProp::EnchantedBy]),
+                    ))
+                && def.condition
+                    == Some(StaticCondition::RecipientMatchesFilter {
+                        filter: TargetFilter::Typed(
+                            TypedFilter::creature().properties(vec![FilterProp::AttackingAlone]),
+                        ),
+                    })
+        }),
+        "hostile trailing text must not be swallowed into the exact typed shape: {defs:?}"
+    );
+}
+
+/// Full production Oracle for Security Bypass: the evasion condition, attached
+/// host binding, granted combat-damage trigger, and Connive effect must all be
+/// typed with no permissive fallback or unsupported residual.
+#[test]
+fn security_bypass_full_oracle_is_fully_typed() {
+    const ORACLE: &str = "Enchant creature\nAs long as enchanted creature is attacking alone, it can't be blocked.\nEnchanted creature has \"Whenever this creature deals combat damage to a player, it connives.\" (Its controller draws a card, then discards a card. If they discarded a nonland card, they put a +1/+1 counter on this creature.)";
+
+    let parsed = crate::parser::oracle::parse_oracle_text(
+        ORACLE,
+        "Security Bypass",
+        &["Enchant".to_string()],
+        &["Enchantment".to_string()],
+        &["Aura".to_string()],
+    );
+    let evasion = parsed
+        .statics
+        .iter()
+        .find(|def| def.mode == StaticMode::CantBeBlocked)
+        .expect("full Oracle must contain the typed evasion static");
+    assert_eq!(
+        evasion.affected,
+        Some(TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::EnchantedBy])
+        ))
+    );
+    assert_eq!(
+        evasion.condition,
+        Some(StaticCondition::RecipientMatchesFilter {
+            filter: TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::AttackingAlone])
+            ),
+        })
+    );
+
+    let serialized = serde_json::to_string(&parsed).expect("parsed card must serialize");
+    for expected in ["DamageDone", "Connive"] {
+        assert!(
+            serialized.contains(expected),
+            "full Oracle must retain typed {expected}: {parsed:?}"
+        );
+    }
+    for forbidden in ["Unrecognized", "Unimplemented"] {
+        assert!(
+            !serialized.contains(forbidden),
+            "full Oracle must not contain {forbidden}: {parsed:?}"
+        );
+    }
+    assert!(
+        parsed.parse_warnings.is_empty(),
+        "full Oracle must not emit parser warnings: {:?}",
+        parsed.parse_warnings
     );
 }
 
@@ -26408,6 +26572,123 @@ fn combat_tax_nils_per_affected_with_ref() {
             ));
         }
         other => panic!("expected PerAffectedWithRef, got {other:?}"),
+    }
+}
+
+/// CR 608.2h: bare "the amount of damage dealt" (no qualifier)
+/// through `parse_dynamic_x_clause` — the exact combat-tax dynamic-X entry
+/// point the maintainer cited on PR #7969 (`shared.rs`, reached via the
+/// `dynamic_qty` slot in `evasion.rs`'s combat-tax parser) — binds to
+/// `QuantityRef::EventContextAmount`. Positive control for the rejection
+/// tests below: proves the unqualified phrase still parses once that entry
+/// point requires full consumption.
+///
+/// Exercises `parse_dynamic_x_clause` directly rather than through
+/// `parse_static_line`: the full combat-tax dispatch chain has a deliberate,
+/// unrelated fallback (`parse_subject_combat_rule_static` →
+/// `parse_unless_static_condition`) that always succeeds with an honest
+/// `StaticCondition::Unrecognized` rider when the dedicated combat-tax
+/// combinator fails, so asserting `parse_static_line(..).is_none()` would
+/// not actually discriminate this fix from that pre-existing, correct
+/// fallback.
+#[test]
+fn dynamic_x_clause_damage_dealt_bare_binds_event_context_amount() {
+    let (rest, quantity) = parse_dynamic_x_clause(", where x is the amount of damage dealt")
+        .expect("bare damage-dealt dynamic-X clause should parse");
+    assert_eq!(rest, "");
+    assert!(matches!(quantity, QuantityRef::EventContextAmount));
+}
+
+/// CR 122.1: the untyped-counter dynamic-X anaphor still accepts the ordinary
+/// terminal sentence period after the complete-consumption hardening.
+#[test]
+fn dynamic_x_clause_untyped_counter_anaphor_accepts_terminal_period() {
+    let (rest, quantity) =
+        parse_dynamic_x_clause(", where x is the number of counters on that creature.")
+            .expect("terminal punctuation must not reject the untyped-counter anaphor");
+    assert_eq!(rest, "");
+    assert!(matches!(
+        quantity,
+        QuantityRef::CountersOn {
+            scope: ObjectScope::Target,
+            counter_type: None,
+        }
+    ));
+}
+
+/// Regression for the false-green the maintainer flagged on PR #7969, through
+/// the exact code path they cited (`shared.rs`'s `parse_dynamic_x_clause`):
+/// that function used to call the non-complete `parse_quantity_ref` and
+/// unconditionally discard its remainder, so "the amount of damage dealt
+/// this way" would match only the bare "damage dealt" prefix and silently
+/// lose the "this way" qualifier — misread as `EventContextAmount` instead
+/// of staying an honest unsupported gap (no arm spans the full qualified
+/// phrase). `parse_dynamic_x_clause` now requires full consumption via
+/// `parse_quantity_ref_complete`, so this must error rather than truncate.
+#[test]
+fn dynamic_x_clause_damage_dealt_this_way_stays_unsupported() {
+    assert!(
+        parse_dynamic_x_clause(", where x is the amount of damage dealt this way").is_err(),
+        "qualified \"this way\" continuation must not truncate to EventContextAmount"
+    );
+}
+
+/// Sibling of the "this way" regression above: a "to <object>" qualifier
+/// after "damage dealt" must not be dropped either.
+#[test]
+fn dynamic_x_clause_damage_dealt_to_continuation_stays_unsupported() {
+    assert!(
+        parse_dynamic_x_clause(", where x is the amount of damage dealt to that player").is_err(),
+        "qualified \"to\" continuation must not truncate to EventContextAmount"
+    );
+}
+
+/// Sibling of the "this way" regression above: a "by <object>" qualifier
+/// after "damage dealt" must not be dropped either.
+#[test]
+fn dynamic_x_clause_damage_dealt_by_continuation_stays_unsupported() {
+    assert!(
+        parse_dynamic_x_clause(", where x is the amount of damage dealt by that creature").is_err(),
+        "qualified \"by\" continuation must not truncate to EventContextAmount"
+    );
+}
+
+/// End-to-end companion to the direct `parse_dynamic_x_clause` tests above:
+/// through the full combat-tax dispatch (`parse_static_line`), a qualified
+/// "damage dealt this way" dynamic-X clause must not come back bound as
+/// `PerQuantityRef(EventContextAmount)` — the misparse the maintainer
+/// flagged. The dedicated combat-tax combinator honestly fails (proven
+/// directly above), so the unrelated `Unrecognized`-condition fallback in
+/// `parse_subject_combat_rule_static` takes over and preserves the raw
+/// unless-clause text instead of a wrong dynamic quantity binding.
+#[test]
+fn combat_tax_damage_dealt_this_way_does_not_bind_event_context_amount() {
+    let def = parse_static_line(
+        "Creatures can't attack you unless their controller pays {X}, where X is the amount of damage dealt this way.",
+    )
+    .expect("combat-tax line falls back to an Unrecognized unless-condition, not None");
+    assert_eq!(def.mode, StaticMode::CantAttack);
+    match def.condition {
+        // The dedicated combat-tax combinator honestly failed to bind {X}, so
+        // dispatch fell through to the generic unless-condition fallback,
+        // which preserves the raw clause text instead of a dynamic quantity.
+        Some(StaticCondition::Not { .. }) | None => {}
+        // If some other path DID produce a typed `UnlessPay`, it must not be
+        // the misparsed bare-`EventContextAmount` scaling — this is the
+        // concrete failure mode this regression guards against.
+        Some(ref cond) => {
+            if let Some((_, scaling)) = find_unless_pay(cond) {
+                assert!(
+                    !matches!(
+                        scaling,
+                        UnlessPayScaling::PerQuantityRef {
+                            quantity: QuantityRef::EventContextAmount
+                        }
+                    ),
+                    "qualified \"this way\" continuation must not truncate to EventContextAmount, got {scaling:?}"
+                );
+            }
+        }
     }
 }
 

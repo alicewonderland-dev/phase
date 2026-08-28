@@ -44,10 +44,11 @@
     "respondSubtitle": "Accept the verified route or stop at one of your issued boundaries.",
     "shortenAtBreakpoint": "Stop at boundary {{breakpointId}}"
   },
-  "resolutionProgress": {
-    "label": "Risoluzione {{resolved}} / {{total}}",
-    "collapse": "Comprimi avanzamento risoluzione",
-    "expand": "Espandi avanzamento risoluzione"
+  "restoredAutomation": {
+    "dismiss": "Chiudi",
+    "noop": {"title": "Partita salvata caricata", "summary_one": "Non è stato necessario riprendere l’automazione della pila.", "summary_other": "Non è stato necessario riprendere l’automazione della pila."},
+    "progressed": {"title": "Automazione della pila ripresa", "summary_one": "Il motore ha completato {{count}} risoluzione automatizzata.", "summary_other": "Il motore ha completato {{count}} risoluzioni automatizzate.", "omitted_one": "È stato omesso {{count}} evento intermedio.", "omitted_other": "Sono stati omessi {{count}} eventi intermedi."},
+    "zeroResolutionRepair": {"title": "Automazione della pila riparata", "summary_one": "L’automazione salvata è stata riparata in modo sicuro prima di riprendere.", "summary_other": "L’automazione salvata è stata riparata in modo sicuro prima di riprendere."}
   },
   "resolveAllConsent": {
     "eyebrow": "Risolvi tutto",
@@ -2142,6 +2143,26 @@
     "no": "No",
     "dontAskAgain": "Non chiedere di nuovo in questa partita",
     "dontAskAgainForSameCard": "Applica a ogni copia di questa carta"
+  },
+  "resolutionOptionalPayment": {
+    "title": "Scegli un pagamento opzionale",
+    "pay": "Paga {{cost}}",
+    "decline": "Rifiuta",
+    "cost": {
+      "card": "carta",
+      "cards": "carte",
+      "filteredCard": "carta {{types}}",
+      "filteredCards": "carte {{types}}",
+      "nonType": "non {{type}}",
+      "orSeparator": " o ",
+      "zoneBattlefield": "il campo di battaglia",
+      "zoneGraveyard": "il tuo cimitero",
+      "zoneLibrary": "la tua biblioteca",
+      "zoneExile": "l’esilio",
+      "zoneHand": "la tua mano",
+      "discard": "Scarta {{count}} {{cards}}",
+      "exile": "Esilia {{count}} {{cards}} da {{zone}}"
+    }
   },
   "topOrBottom": {
     "cardFallback": "Card",

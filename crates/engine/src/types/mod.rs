@@ -1,5 +1,6 @@
 pub mod ability;
 pub mod ability_visit;
+pub mod action_rejection;
 pub mod action_stable_order;
 pub mod actions;
 pub mod attribution;
@@ -39,7 +40,8 @@ pub use ability::{
     ReplacementDefinition, ResolvedAbility, StaticCondition, StaticDefinition, TargetFilter,
     TargetRef, TriggerCondition, TriggerDefinition, TypeFilter, TypedFilter,
 };
-pub use actions::GameAction;
+pub use action_rejection::{ActionRejection, ActionRejectionCode, ActionRejectionDisposition};
+pub use actions::{GameAction, ResolutionOptionalPaymentChoice};
 pub use attribution::{EffectRef, ObjectAttribution};
 pub use card::{CardFace, CardLayout, CardRules, Rarity};
 pub use card_type::{is_land_subtype, CardType, CoreType, Supertype};
@@ -51,8 +53,8 @@ pub use game_state::{
     ActionResult, BattlefieldEntryRecord, CommanderDamageEntry, CostResume, GameState, LKISnapshot,
     LandPlayRecord, LoopDetectSample, NextSpellModifier, PayCostKind, PendingNextSpellModifier,
     PendingReplacement, PendingSpellCostReduction, PlayerDeckPool, PriorityPassingMode,
-    ScheduledTurnControl, SpellCastRecord, StackEntry, StackEntryKind, TransientContinuousEffect,
-    WaitingFor, ZoneChangeRecord,
+    ResolutionOptionalPaymentOption, ScheduledTurnControl, SpellCastRecord, StackEntry,
+    StackEntryKind, TransientContinuousEffect, WaitingFor, ZoneChangeRecord,
 };
 pub use identifiers::{
     CardId, ObjectId, ObjectIdentityBinding, ObjectIncarnationRef, ObjectProvenance,
@@ -80,7 +82,9 @@ pub use phase::Phase;
 pub use player::{Player, PlayerId};
 pub use proposed_event::{AppliedReplacementKey, ProposedEvent, ReplacementId};
 pub use replacements::ReplacementEvent;
-pub use replay::{RecordedAction, ReplayHeader, ReplayLog, REPLAY_FORMAT_VERSION};
+pub use replay::{
+    RecordedAction, RecordedActionKind, ReplayHeader, ReplayLog, REPLAY_FORMAT_VERSION,
+};
 pub use resolution::{
     AbilityContinuationFrame, ChangeZoneFrame, ChildStackDepth, DirectChoiceGate, FrameGate,
     FrameKind, MultiDrawFrame, OptionalEffectFrame, PerCategoryZoneChoiceFrame,

@@ -1,17 +1,23 @@
 use super::*;
 use std::sync::Arc;
 
+use crate::ai_support::AiDecisionContract;
+use crate::game::combat::AttackTarget;
 use crate::game::zones::create_object;
 use crate::types::ability::{
-    AbilityDefinition, AbilityKind, CopyRetargetPermission, Effect, QuantityExpr, ResolvedAbility,
-    TargetFilter,
+    AbilityDefinition, AbilityKind, CopyRetargetPermission, Effect, PtValue, QuantityExpr,
+    ResolvedAbility, StaticDefinition, TargetFilter,
 };
 use crate::types::actions::GameAction;
 use crate::types::card_type::CoreType;
 use crate::types::events::GameEvent;
-use crate::types::game_state::{CastingVariant, TurnBoundary};
+use crate::types::game_state::{
+    CastingVariant, StackResolutionBudget, StackResolutionPolicy, TurnBoundary,
+};
 use crate::types::identifiers::{CardId, ObjectId};
+use crate::types::mana::ManaColor;
 use crate::types::phase::{PhaseStop, PhaseStopScope};
+use crate::types::statics::StaticMode;
 use crate::types::zones::Zone;
 
 fn stack_entry(controller: PlayerId) -> StackEntry {
@@ -56,6 +62,20 @@ fn priority_state() -> GameState {
     state.priority_passes.clear();
     state.priority_pass_count = 0;
     state
+}
+
+fn add_untapped_creature(state: &mut GameState, controller: PlayerId, card_id: u64) -> ObjectId {
+    let object_id = create_object(
+        state,
+        CardId(card_id),
+        controller,
+        "Combat creature".to_string(),
+        Zone::Battlefield,
+    );
+    let object = state.objects.get_mut(&object_id).unwrap();
+    object.card_types.core_types.push(CoreType::Creature);
+    object.summoning_sick = false;
+    object_id
 }
 
 #[test]
@@ -123,6 +143,280 @@ fn set_auto_pass_carries_requested_boundary_via_dispatch() {
     }
 }
 
+#[test]
+fn declare_attackers_accepts_turn_boundary_auto_pass_but_rejects_stack_empty() {
+    let waiting_for = WaitingFor::DeclareAttackers {
+        player: PlayerId(0),
+        valid_attacker_ids: Vec::new(),
+        valid_attack_targets: Vec::new(),
+        valid_attack_targets_by_attacker: None,
+        attacker_constraints: Default::default(),
+    };
+    let mut state = priority_state();
+    state.phase = Phase::DeclareAttackers;
+    state.waiting_for = waiting_for;
+    state.phase_stops.insert(
+        PlayerId(0),
+        vec![stop(Phase::DeclareAttackers, PhaseStopScope::AllTurns)],
+    );
+
+    let result = apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+            },
+        },
+    )
+    .expect("turn-boundary auto-pass is valid at Declare Attackers");
+    assert_eq!(
+        state.auto_pass.get(&PlayerId(0)),
+        Some(&AutoPassMode::UntilTurnBoundary {
+            until: TurnBoundary::EndOfCurrentTurn,
+        })
+    );
+    assert!(matches!(
+        result.waiting_for,
+        WaitingFor::DeclareAttackers {
+            player: PlayerId(0),
+            ..
+        }
+    ));
+    assert!(
+        !result
+            .events
+            .iter()
+            .any(|event| matches!(event, GameEvent::AttackersDeclared { .. })),
+        "the phase stop must leave the attacker prompt unsubmitted"
+    );
+
+    let error = apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .expect_err("UntilStackEmpty must not bypass attacker declaration");
+    assert!(matches!(error, EngineError::ActionNotAllowed(_)));
+}
+
+#[test]
+fn declare_blockers_accepts_turn_boundary_auto_pass_but_rejects_stack_empty() {
+    let waiting_for = WaitingFor::DeclareBlockers {
+        player: PlayerId(0),
+        valid_blocker_ids: Vec::new(),
+        valid_block_targets: Default::default(),
+        block_requirements: Default::default(),
+        blocker_constraints: Default::default(),
+    };
+    let mut state = priority_state();
+    state.phase = Phase::DeclareBlockers;
+    state.active_player = PlayerId(1);
+    state.waiting_for = waiting_for;
+    state.phase_stops.insert(
+        PlayerId(0),
+        vec![stop(Phase::DeclareBlockers, PhaseStopScope::AllTurns)],
+    );
+
+    let result = apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+            },
+        },
+    )
+    .expect("turn-boundary auto-pass is valid at Declare Blockers");
+    assert_eq!(
+        state.auto_pass.get(&PlayerId(0)),
+        Some(&AutoPassMode::UntilTurnBoundary {
+            until: TurnBoundary::EndOfCurrentTurn,
+        })
+    );
+    assert!(matches!(
+        result.waiting_for,
+        WaitingFor::DeclareBlockers {
+            player: PlayerId(0),
+            ..
+        }
+    ));
+    assert!(
+        !result
+            .events
+            .iter()
+            .any(|event| matches!(event, GameEvent::BlockersDeclared { .. })),
+        "the phase stop must leave the blocker prompt unsubmitted"
+    );
+
+    let error = apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .expect_err("UntilStackEmpty must not bypass blocker declaration");
+    assert!(matches!(error, EngineError::ActionNotAllowed(_)));
+}
+
+#[test]
+fn turn_boundary_auto_pass_submits_a_legal_empty_attacker_declaration() {
+    let mut state = priority_state();
+    let attacker = add_untapped_creature(&mut state, PlayerId(0), 910);
+    state.phase = Phase::DeclareAttackers;
+    state.combat = Some(crate::game::combat::CombatState::default());
+    state.waiting_for = WaitingFor::DeclareAttackers {
+        player: PlayerId(0),
+        valid_attacker_ids: vec![attacker],
+        valid_attack_targets: vec![AttackTarget::Player(PlayerId(1))],
+        valid_attack_targets_by_attacker: None,
+        attacker_constraints: Default::default(),
+    };
+
+    let result = apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+            },
+        },
+    )
+    .expect("a legal empty attack declaration may be auto-submitted");
+
+    assert!(!matches!(
+        result.waiting_for,
+        WaitingFor::DeclareAttackers { .. }
+    ));
+}
+
+#[test]
+fn turn_boundary_auto_pass_does_not_bypass_must_attack() {
+    let mut state = priority_state();
+    let attacker = add_untapped_creature(&mut state, PlayerId(0), 911);
+    state
+        .objects
+        .get_mut(&attacker)
+        .unwrap()
+        .static_definitions
+        .push(StaticDefinition::new(StaticMode::MustAttack).affected(TargetFilter::SelfRef));
+    state.phase = Phase::DeclareAttackers;
+    state.combat = Some(crate::game::combat::CombatState::default());
+    state.waiting_for = WaitingFor::DeclareAttackers {
+        player: PlayerId(0),
+        valid_attacker_ids: vec![attacker],
+        valid_attack_targets: vec![AttackTarget::Player(PlayerId(1))],
+        valid_attack_targets_by_attacker: None,
+        attacker_constraints: Default::default(),
+    };
+
+    let result = apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+            },
+        },
+    )
+    .expect("the preference itself is valid at Declare Attackers");
+
+    assert!(matches!(
+        result.waiting_for,
+        WaitingFor::DeclareAttackers { .. }
+    ));
+    assert_eq!(
+        state.auto_pass.get(&PlayerId(0)),
+        Some(&AutoPassMode::UntilTurnBoundary {
+            until: TurnBoundary::EndOfCurrentTurn,
+        }),
+        "an unsatisfied must-attack requirement leaves the requested session armed"
+    );
+}
+
+fn blockers_declaration_state(must_block: bool) -> GameState {
+    let mut state = priority_state();
+    let attacker = add_untapped_creature(&mut state, PlayerId(1), 912);
+    let blocker = add_untapped_creature(&mut state, PlayerId(0), 913);
+    if must_block {
+        state
+            .objects
+            .get_mut(&blocker)
+            .unwrap()
+            .static_definitions
+            .push(StaticDefinition::new(StaticMode::MustBlock).affected(TargetFilter::SelfRef));
+    }
+    state.phase = Phase::DeclareBlockers;
+    state.active_player = PlayerId(1);
+    state.combat = Some(crate::game::combat::CombatState {
+        attackers: vec![crate::game::combat::AttackerInfo::attacking_player(
+            attacker,
+            PlayerId(0),
+        )],
+        ..Default::default()
+    });
+    state.waiting_for = WaitingFor::DeclareBlockers {
+        player: PlayerId(0),
+        valid_blocker_ids: vec![blocker],
+        valid_block_targets: [(blocker, vec![attacker])].into_iter().collect(),
+        block_requirements: Default::default(),
+        blocker_constraints: Default::default(),
+    };
+    state
+}
+
+#[test]
+fn turn_boundary_auto_pass_submits_a_legal_empty_blocker_declaration() {
+    let mut state = blockers_declaration_state(false);
+
+    let result = apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+            },
+        },
+    )
+    .expect("a legal empty block declaration may be auto-submitted");
+
+    assert!(!matches!(
+        result.waiting_for,
+        WaitingFor::DeclareBlockers { .. }
+    ));
+}
+
+#[test]
+fn turn_boundary_auto_pass_does_not_bypass_must_block() {
+    let mut state = blockers_declaration_state(true);
+
+    let result = apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+            },
+        },
+    )
+    .expect("the preference itself is valid at Declare Blockers");
+
+    assert!(matches!(
+        result.waiting_for,
+        WaitingFor::DeclareBlockers { .. }
+    ));
+    assert_eq!(
+        state.auto_pass.get(&PlayerId(0)),
+        Some(&AutoPassMode::UntilTurnBoundary {
+            until: TurnBoundary::EndOfCurrentTurn,
+        }),
+        "an unsatisfied must-block requirement leaves the requested session armed"
+    );
+}
+
 fn push_simple_stack_entry(state: &mut GameState, id: u64, controller: PlayerId) {
     state.stack.push_back(StackEntry {
         id: ObjectId(id),
@@ -169,6 +463,20 @@ fn add_non_mana_activated_artifact(state: &mut GameState, controller: PlayerId) 
     object_id
 }
 
+fn add_basic_mana_land(state: &mut GameState, controller: PlayerId) -> ObjectId {
+    let object_id = create_object(
+        state,
+        CardId(901),
+        controller,
+        "Forest".to_string(),
+        Zone::Battlefield,
+    );
+    let obj = state.objects.get_mut(&object_id).unwrap();
+    obj.card_types.core_types.push(CoreType::Land);
+    obj.card_types.subtypes.push("Forest".to_string());
+    object_id
+}
+
 fn push_spell(state: &mut GameState, id: ObjectId, controller: PlayerId, ability: ResolvedAbility) {
     state.stack.push_back(StackEntry {
         id,
@@ -181,6 +489,56 @@ fn push_spell(state: &mut GameState, id: ObjectId, controller: PlayerId, ability
             actual_mana_spent: 0,
         },
     });
+}
+
+fn insect_token_effect() -> Effect {
+    Effect::Token {
+        name: "Insect".to_string(),
+        power: PtValue::Fixed(1),
+        toughness: PtValue::Fixed(1),
+        types: vec!["Creature".to_string()],
+        colors: vec![ManaColor::Green],
+        keywords: vec![],
+        tapped: false,
+        count: QuantityExpr::Fixed { value: 1 },
+        owner: TargetFilter::Controller,
+        attach_to: None,
+        enters_attacking: false,
+        supertypes: vec![],
+        static_abilities: vec![],
+        enter_with_counters: vec![],
+    }
+}
+
+fn push_natural_token_batch(
+    state: &mut GameState,
+    source_id: ObjectId,
+    first_entry_id: u64,
+    count: u64,
+) {
+    for entry_id in first_entry_id..first_entry_id + count {
+        state.stack.push_back(StackEntry {
+            id: ObjectId(entry_id),
+            source_id,
+            controller: PlayerId(0),
+            kind: StackEntryKind::TriggeredAbility {
+                source_id,
+                ability: Box::new(ResolvedAbility::new(
+                    insect_token_effect(),
+                    Vec::new(),
+                    source_id,
+                    PlayerId(0),
+                )),
+                condition: None,
+                trigger_event: None,
+                description: Some("Landfall".to_string()),
+                source_name: "Batch source".to_string(),
+                subject_match_count: None,
+                die_result: None,
+                provenance: None,
+            },
+        });
+    }
 }
 
 #[test]
@@ -540,48 +898,6 @@ fn phase_stop_hit_is_independent_of_auto_pass_mode() {
 }
 
 #[test]
-fn until_end_of_turn_does_not_auto_submit_available_blockers() {
-    let waiting_for = WaitingFor::DeclareBlockers {
-        player: PlayerId(0),
-        valid_blocker_ids: vec![ObjectId(10)],
-        valid_block_targets: [(ObjectId(10), vec![ObjectId(20)])].into_iter().collect(),
-        block_requirements: Default::default(),
-        blocker_constraints: Default::default(),
-    };
-    let mut state = GameState {
-        phase: Phase::DeclareBlockers,
-        active_player: PlayerId(1),
-        waiting_for: waiting_for.clone(),
-        ..GameState::default()
-    };
-    state.auto_pass.insert(
-        PlayerId(0),
-        AutoPassMode::UntilTurnBoundary {
-            until: TurnBoundary::EndOfCurrentTurn,
-        },
-    );
-
-    let mut result = ActionResult {
-        events: Vec::new(),
-        waiting_for,
-        log_entries: Vec::new(),
-    };
-    run_auto_pass_loop(&mut state, &mut result);
-
-    assert!(matches!(
-        result.waiting_for,
-        WaitingFor::DeclareBlockers {
-            player: PlayerId(0),
-            ..
-        }
-    ));
-    assert!(
-        state.auto_pass.contains_key(&PlayerId(0)),
-        "the defender's auto-pass session should stay armed after pausing for legal blockers"
-    );
-}
-
-#[test]
 fn declare_blockers_opponents_turns_stop_pauses_empty_blocker_submit() {
     // Matrix row 6: owner = defender P0; the attacker P1 is the active player.
     // An OpponentsTurns stop on Declare Blockers fires (owner != active_player),
@@ -604,6 +920,12 @@ fn declare_blockers_opponents_turns_stop_pauses_empty_blocker_submit() {
         PlayerId(0),
         vec![stop(Phase::DeclareBlockers, PhaseStopScope::OpponentsTurns)],
     );
+    state.auto_pass.insert(
+        PlayerId(0),
+        AutoPassMode::UntilTurnBoundary {
+            until: TurnBoundary::EndOfCurrentTurn,
+        },
+    );
 
     let mut result = ActionResult {
         events: Vec::new(),
@@ -622,6 +944,13 @@ fn declare_blockers_opponents_turns_stop_pauses_empty_blocker_submit() {
         ),
         "OpponentsTurns stop fires on the attacker's turn → the empty-blocker \
          auto-submit is paused"
+    );
+    assert!(
+        !result
+            .events
+            .iter()
+            .any(|event| matches!(event, GameEvent::BlockersDeclared { .. })),
+        "the phase stop must not submit an empty blocker declaration"
     );
 }
 
@@ -739,6 +1068,13 @@ fn declare_attackers_own_turn_stop_pauses_empty_attacker_submit() {
         "OwnTurn stop fires on the owner's own turn → the empty-attacker \
          auto-submit is paused"
     );
+    assert!(
+        !result
+            .events
+            .iter()
+            .any(|event| matches!(event, GameEvent::AttackersDeclared { .. })),
+        "the phase stop must not submit an empty attacker declaration"
+    );
 }
 
 #[test]
@@ -819,6 +1155,811 @@ fn until_stack_empty_resolves_large_stack_in_one_apply() {
 }
 
 #[test]
+fn direct_until_stack_empty_installs_a_fenced_session_before_auto_resolving() {
+    let mut state = priority_state();
+    push_simple_stack_entry(&mut state, 19_900, PlayerId(0));
+    add_non_mana_activated_artifact(&mut state, PlayerId(1));
+
+    apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .unwrap();
+
+    let session = state
+        .stack_resolution_session
+        .as_ref()
+        .expect("a nonempty direct UntilStackEmpty request installs a session");
+    assert_eq!(session.cursor, 0);
+    assert_eq!(session.entries.len(), 1);
+    assert_eq!(
+        session.representatives,
+        [PlayerId(0)].into_iter().collect(),
+        "the direct request stores the semantic priority representative"
+    );
+    assert_eq!(session.policy, StackResolutionPolicy::Committed);
+    assert_eq!(
+        session.budget,
+        crate::types::game_state::StackResolutionBudget::Unlimited
+    );
+    assert!(matches!(
+        state.auto_pass.get(&PlayerId(0)),
+        Some(AutoPassMode::UntilStackEmpty {
+            policy: StackResolutionPolicy::Committed,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn fenced_session_stops_before_passing_when_the_top_entry_changes() {
+    let mut state = priority_state();
+    push_simple_stack_entry(&mut state, 19_901, PlayerId(0));
+    let priority_action = add_non_mana_activated_artifact(&mut state, PlayerId(1));
+    state.auto_pass.insert(
+        PlayerId(1),
+        AutoPassMode::UntilTurnBoundary {
+            until: TurnBoundary::EndOfCurrentTurn,
+        },
+    );
+
+    apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .unwrap();
+    state.objects.remove(&priority_action);
+    state.stack.back_mut().unwrap().source_id = ObjectId(19_902);
+
+    let mut result = ActionResult {
+        events: Vec::new(),
+        waiting_for: state.waiting_for.clone(),
+        log_entries: Vec::new(),
+    };
+    run_auto_pass_loop(&mut state, &mut result);
+
+    assert!(
+        state.stack_resolution_session.is_none(),
+        "a changed top fence tears down the authorization"
+    );
+    assert!(
+        result.events.is_empty(),
+        "the changed entry was never passed or resolved"
+    );
+    assert!(matches!(
+        result.waiting_for,
+        WaitingFor::Priority {
+            player: PlayerId(1)
+        }
+    ));
+    assert_eq!(
+        state.auto_pass.get(&PlayerId(1)),
+        Some(&AutoPassMode::UntilTurnBoundary {
+            until: TurnBoundary::EndOfCurrentTurn,
+        }),
+        "teardown restores the complete pre-overlay preference map"
+    );
+    assert!(
+        !state.auto_pass.contains_key(&PlayerId(0)),
+        "the temporary representative overlay is removed with the session"
+    );
+}
+
+#[test]
+fn fenced_session_with_an_empty_stack_preserves_the_current_priority_window() {
+    let mut state = priority_state();
+    push_simple_stack_entry(&mut state, 19_902, PlayerId(0));
+    let priority_action = add_non_mana_activated_artifact(&mut state, PlayerId(1));
+    let phase = state.phase;
+
+    apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .unwrap();
+    state.objects.remove(&priority_action);
+    state.stack.clear();
+
+    let mut result = ActionResult {
+        events: Vec::new(),
+        waiting_for: state.waiting_for.clone(),
+        log_entries: Vec::new(),
+    };
+    run_auto_pass_loop(&mut state, &mut result);
+
+    assert!(state.stack_resolution_session.is_none());
+    assert!(result.events.is_empty());
+    assert_eq!(
+        state.phase, phase,
+        "empty-session teardown must not advance a phase"
+    );
+    assert!(matches!(
+        result.waiting_for,
+        WaitingFor::Priority {
+            player: PlayerId(1)
+        }
+    ));
+}
+
+#[test]
+fn fenced_session_with_a_new_top_entry_preserves_the_current_priority_window() {
+    let mut state = priority_state();
+    push_simple_stack_entry(&mut state, 19_903, PlayerId(0));
+    let priority_action = add_non_mana_activated_artifact(&mut state, PlayerId(1));
+    let phase = state.phase;
+
+    apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .unwrap();
+    state.objects.remove(&priority_action);
+    push_simple_stack_entry(&mut state, 19_904, PlayerId(1));
+
+    let mut result = ActionResult {
+        events: Vec::new(),
+        waiting_for: state.waiting_for.clone(),
+        log_entries: Vec::new(),
+    };
+    run_auto_pass_loop(&mut state, &mut result);
+
+    assert!(state.stack_resolution_session.is_none());
+    assert!(
+        result.events.is_empty(),
+        "the new entry is not auto-passed or resolved"
+    );
+    assert_eq!(state.stack.back().unwrap().id, ObjectId(19_904));
+    assert_eq!(state.phase, phase);
+    assert!(matches!(
+        result.waiting_for,
+        WaitingFor::Priority {
+            player: PlayerId(1)
+        }
+    ));
+}
+
+#[test]
+fn fenced_session_budget_caps_the_resolver_before_a_natural_batch_can_escape() {
+    let mut state = priority_state();
+    push_simple_stack_entry(&mut state, 19_903, PlayerId(0));
+    push_simple_stack_entry(&mut state, 19_904, PlayerId(0));
+    let priority_action = add_non_mana_activated_artifact(&mut state, PlayerId(1));
+
+    apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .unwrap();
+    state.stack_resolution_session.as_mut().unwrap().budget =
+        crate::types::game_state::StackResolutionBudget::from_legacy_max_resolutions(1);
+    state.objects.remove(&priority_action);
+
+    let mut result = ActionResult {
+        events: Vec::new(),
+        waiting_for: state.waiting_for.clone(),
+        log_entries: Vec::new(),
+    };
+    run_auto_pass_loop(&mut state, &mut result);
+
+    assert_eq!(state.stack.len(), 1, "the one-entry budget is exact");
+    assert_eq!(
+        result
+            .events
+            .iter()
+            .filter(|event| matches!(event, GameEvent::StackResolved { .. }))
+            .count(),
+        1
+    );
+    assert!(state.stack_resolution_session.is_none());
+    assert!(matches!(
+        result.waiting_for,
+        WaitingFor::Priority {
+            player: PlayerId(0)
+        }
+    ));
+}
+
+#[test]
+fn fenced_session_caps_a_natural_token_batch_at_its_matching_prefix() {
+    let mut state = priority_state();
+    let source_id = create_object(
+        &mut state,
+        CardId(19_911),
+        PlayerId(0),
+        "Batch source".to_string(),
+        Zone::Battlefield,
+    );
+    push_natural_token_batch(&mut state, source_id, 19_912, 3);
+    let priority_action = add_non_mana_activated_artifact(&mut state, PlayerId(1));
+
+    apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .unwrap();
+    state.objects.remove(&priority_action);
+    if let StackEntryKind::TriggeredAbility { source_name, .. } =
+        &mut state.stack.get_mut(0).unwrap().kind
+    {
+        *source_name = "Changed captured provenance".to_string();
+    }
+
+    let mut result = ActionResult {
+        events: Vec::new(),
+        waiting_for: state.waiting_for.clone(),
+        log_entries: Vec::new(),
+    };
+    run_auto_pass_loop(&mut state, &mut result);
+
+    assert_eq!(
+        state.stack.len(),
+        1,
+        "the third natural batch member remains frozen out"
+    );
+    assert_eq!(
+        result
+            .events
+            .iter()
+            .filter(|event| matches!(event, GameEvent::StackResolved { .. }))
+            .count(),
+        2,
+        "the resolver receives the matching two-entry fence prefix, not its natural three-entry batch"
+    );
+    assert_eq!(
+        state
+            .battlefield
+            .iter()
+            .filter_map(|id| state.objects.get(id))
+            .filter(|object| object.is_token)
+            .count(),
+        2,
+        "the true token batch ran, but its execution was capped at the authorized prefix"
+    );
+    assert!(state.stack_resolution_session.is_none());
+}
+
+#[test]
+fn fenced_session_stops_after_the_matching_top_when_a_lower_entry_changes() {
+    let mut state = priority_state();
+    push_simple_stack_entry(&mut state, 19_905, PlayerId(0));
+    push_simple_stack_entry(&mut state, 19_906, PlayerId(0));
+    push_simple_stack_entry(&mut state, 19_907, PlayerId(0));
+    let priority_action = add_non_mana_activated_artifact(&mut state, PlayerId(1));
+
+    apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .unwrap();
+    state.objects.remove(&priority_action);
+    state.stack.get_mut(1).unwrap().source_id = ObjectId(29_906);
+
+    let mut result = ActionResult {
+        events: Vec::new(),
+        waiting_for: state.waiting_for.clone(),
+        log_entries: Vec::new(),
+    };
+    run_auto_pass_loop(&mut state, &mut result);
+
+    assert_eq!(
+        result
+            .events
+            .iter()
+            .filter(|event| matches!(event, GameEvent::StackResolved { .. }))
+            .count(),
+        1,
+        "the still-matching top reaches the ordinary resolver"
+    );
+    assert_eq!(state.stack.len(), 2);
+    assert_eq!(state.stack.back().unwrap().id, ObjectId(19_906));
+    assert!(state.stack_resolution_session.is_none());
+    assert!(matches!(
+        result.waiting_for,
+        WaitingFor::Priority {
+            player: PlayerId(0)
+        }
+    ));
+}
+
+#[test]
+fn nonrepresentative_set_auto_pass_survives_later_session_teardown() {
+    let mut state = priority_state();
+    push_simple_stack_entry(&mut state, 19_908, PlayerId(0));
+    add_non_mana_activated_artifact(&mut state, PlayerId(1));
+
+    apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .unwrap();
+    assert!(
+        state.stack_resolution_session.is_some(),
+        "P1's action keeps the session paused"
+    );
+
+    apply(
+        &mut state,
+        PlayerId(1),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilTurnBoundary {
+                until: TurnBoundary::MyNextTurnStart,
+            },
+        },
+    )
+    .unwrap();
+
+    assert!(
+        state.stack_resolution_session.is_none(),
+        "the exhausted cohort tears down"
+    );
+    assert_eq!(
+        state.auto_pass.get(&PlayerId(1)),
+        Some(&AutoPassMode::UntilTurnBoundary {
+            until: TurnBoundary::MyNextTurnStart,
+        }),
+        "the nonrepresentative's accepted standing preference merged into the restore baseline"
+    );
+}
+
+#[test]
+fn nonrepresentative_cancel_does_not_resurrect_at_session_teardown() {
+    let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 3, 42);
+    state.turn_number = 1;
+    state.phase = Phase::PreCombatMain;
+    state.active_player = PlayerId(0);
+    state.priority_player = PlayerId(0);
+    state.waiting_for = WaitingFor::Priority {
+        player: PlayerId(0),
+    };
+    push_simple_stack_entry(&mut state, 19_908, PlayerId(0));
+    add_non_mana_activated_artifact(&mut state, PlayerId(1));
+    add_non_mana_activated_artifact(&mut state, PlayerId(2));
+
+    apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .unwrap();
+    apply(
+        &mut state,
+        PlayerId(1),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilTurnBoundary {
+                until: TurnBoundary::MyNextTurnStart,
+            },
+        },
+    )
+    .unwrap();
+    assert!(state.stack_resolution_session.is_some());
+    assert!(state
+        .stack_resolution_session
+        .as_ref()
+        .unwrap()
+        .auto_pass_overlay
+        .baseline
+        .contains_key(&PlayerId(1)));
+
+    apply(&mut state, PlayerId(1), GameAction::CancelAutoPass).unwrap();
+    assert!(!state.auto_pass.contains_key(&PlayerId(1)));
+    assert!(!state
+        .stack_resolution_session
+        .as_ref()
+        .unwrap()
+        .auto_pass_overlay
+        .baseline
+        .contains_key(&PlayerId(1)));
+
+    // A fresh top invalidates P0's frozen cohort and exercises the ordinary
+    // session teardown path after P1's out-of-turn preference cancellation.
+    push_simple_stack_entry(&mut state, 19_909, PlayerId(2));
+    let mut result = ActionResult {
+        events: Vec::new(),
+        waiting_for: state.waiting_for.clone(),
+        log_entries: Vec::new(),
+    };
+    run_auto_pass_loop(&mut state, &mut result);
+
+    assert!(state.stack_resolution_session.is_none());
+    assert!(
+        !state.auto_pass.contains_key(&PlayerId(1)),
+        "teardown must not restore P1's cancelled preference"
+    );
+}
+
+#[test]
+fn nonrepresentative_deliberate_action_does_not_resurrect_at_session_teardown() {
+    let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 3, 42);
+    state.turn_number = 1;
+    state.phase = Phase::PreCombatMain;
+    state.active_player = PlayerId(0);
+    state.priority_player = PlayerId(0);
+    state.waiting_for = WaitingFor::Priority {
+        player: PlayerId(0),
+    };
+    push_simple_stack_entry(&mut state, 19_910, PlayerId(0));
+    let p1_action = add_non_mana_activated_artifact(&mut state, PlayerId(1));
+    add_non_mana_activated_artifact(&mut state, PlayerId(2));
+
+    apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .unwrap();
+    apply(
+        &mut state,
+        PlayerId(1),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilTurnBoundary {
+                until: TurnBoundary::MyNextTurnStart,
+            },
+        },
+    )
+    .unwrap();
+    assert!(state.stack_resolution_session.is_some());
+
+    // P2's meaningful action paused the session. Give P1 an ordinary priority
+    // window, then activate its artifact through the production action route.
+    state.priority_player = PlayerId(1);
+    state.waiting_for = WaitingFor::Priority {
+        player: PlayerId(1),
+    };
+    apply(
+        &mut state,
+        PlayerId(1),
+        GameAction::ActivateAbility {
+            source_id: p1_action,
+            ability_index: 0,
+        },
+    )
+    .unwrap();
+
+    assert!(state.stack_resolution_session.is_none());
+    assert!(
+        !state.auto_pass.contains_key(&PlayerId(1)),
+        "a deliberate action must not be undone by the session's baseline restore"
+    );
+}
+
+/// A mana ability is an off-stack, deliberate action. The frozen session must
+/// end before its reducer boundary re-enters the authorization runner:
+/// resolving its captured top entry after this tap would turn the
+/// representative's decision to act into an unwanted pass.
+#[test]
+fn representative_mana_action_ends_session_without_resolving_frozen_entry() {
+    let mut state = priority_state();
+    let frozen_entry_id = ObjectId(19_911);
+    push_simple_stack_entry(&mut state, frozen_entry_id.0, PlayerId(0));
+    let p1_action = add_non_mana_activated_artifact(&mut state, PlayerId(1));
+    let forest = add_basic_mana_land(&mut state, PlayerId(0));
+    state.auto_pass.insert(
+        PlayerId(0),
+        AutoPassMode::UntilTurnBoundary {
+            until: TurnBoundary::MyNextTurnStart,
+        },
+    );
+
+    // P1's actionable artifact pauses the newly installed P0 cohort before
+    // any captured entry resolves.
+    apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .unwrap();
+    assert!(state.stack_resolution_session.is_some());
+    assert_eq!(state.stack.back().unwrap().id, frozen_entry_id);
+
+    // Give P0 a normal priority window with an otherwise inert opponent. The
+    // mana action below is driven through the production reducer, not by
+    // mutating the session or its cursor directly.
+    state.objects.remove(&p1_action);
+    state.priority_player = PlayerId(0);
+    state.waiting_for = WaitingFor::Priority {
+        player: PlayerId(0),
+    };
+    state.priority_passes.clear();
+    state.priority_pass_count = 0;
+    let selection =
+        crate::game::mana_sources::activatable_mana_source_selections(&state, PlayerId(0))
+            .into_iter()
+            .find(|selection| selection.source.object_id == forest)
+            .expect("the basic land exposes its production mana action");
+
+    let result = apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::TapLandForMana { selection },
+    )
+    .unwrap();
+
+    assert!(state.stack_resolution_session.is_none());
+    assert_eq!(state.stack.back().unwrap().id, frozen_entry_id);
+    assert!(
+        !result
+            .events
+            .iter()
+            .any(|event| matches!(event, GameEvent::StackResolved { .. })),
+        "the former cohort must not resolve after the representative acts"
+    );
+    assert!(
+        !state.auto_pass.contains_key(&PlayerId(0)),
+        "teardown must not resurrect P0's pre-overlay auto-pass preference"
+    );
+}
+
+/// A turn controller's deliberate Priority action belongs to the controlled
+/// semantic seat. The frozen session and its restored preference must therefore
+/// be keyed by P0, rather than the authenticated controller P2.
+#[test]
+fn turn_controller_action_ends_controlled_representative_session_without_resolving() {
+    let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 3, 42);
+    state.turn_number = 1;
+    state.phase = Phase::PreCombatMain;
+    state.active_player = PlayerId(0);
+    state.turn_decision_controller = Some(PlayerId(2));
+    state.priority_player = PlayerId(2);
+    state.waiting_for = WaitingFor::Priority {
+        player: PlayerId(0),
+    };
+    state.priority_passes.clear();
+    state.priority_pass_count = 0;
+
+    let frozen_entry_id = ObjectId(19_912);
+    push_simple_stack_entry(&mut state, frozen_entry_id.0, PlayerId(0));
+    let p1_action = add_non_mana_activated_artifact(&mut state, PlayerId(1));
+    let forest = add_basic_mana_land(&mut state, PlayerId(0));
+    state.auto_pass.insert(
+        PlayerId(0),
+        AutoPassMode::UntilTurnBoundary {
+            until: TurnBoundary::MyNextTurnStart,
+        },
+    );
+
+    // P2 is the authenticated controller, but this installs P0's semantic
+    // Priority preference and pauses at P1's meaningful response.
+    apply(
+        &mut state,
+        PlayerId(2),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .unwrap();
+    assert!(state.stack_resolution_session.is_some());
+    assert_eq!(state.stack.back().unwrap().id, frozen_entry_id);
+
+    // Give the controlled P0 seat another normal Priority window with no
+    // opponent response. Activating a mana ability is a deliberate, off-stack
+    // action that remains legal while the frozen entry is on the stack.
+    state.objects.remove(&p1_action);
+    state.priority_player = PlayerId(2);
+    state.waiting_for = WaitingFor::Priority {
+        player: PlayerId(0),
+    };
+    state.priority_passes.clear();
+    state.priority_pass_count = 0;
+    let selection =
+        crate::game::mana_sources::activatable_mana_source_selections(&state, PlayerId(0))
+            .into_iter()
+            .find(|selection| selection.source.object_id == forest)
+            .expect("the basic land exposes its production mana action");
+    let result = apply(
+        &mut state,
+        PlayerId(2),
+        GameAction::TapLandForMana { selection },
+    )
+    .unwrap();
+
+    assert!(state.stack_resolution_session.is_none());
+    assert_eq!(state.stack.back().unwrap().id, frozen_entry_id);
+    assert!(
+        !result
+            .events
+            .iter()
+            .any(|event| matches!(event, GameEvent::StackResolved { .. })),
+        "the former cohort must not resolve after P2 acts for P0"
+    );
+    assert!(
+        !state.auto_pass.contains_key(&PlayerId(0)),
+        "teardown must not resurrect P0's pre-overlay preference"
+    );
+}
+
+#[test]
+fn fenced_session_uses_the_captured_entry_when_its_source_id_is_reused() {
+    let mut state = priority_state();
+    let source_id = create_object(
+        &mut state,
+        CardId(19_909),
+        PlayerId(0),
+        "Original source".to_string(),
+        Zone::Battlefield,
+    );
+    state.stack.push_back(StackEntry {
+        id: ObjectId(19_910),
+        source_id,
+        controller: PlayerId(0),
+        kind: StackEntryKind::ActivatedAbility {
+            source_id,
+            ability: Box::new(ResolvedAbility::new(
+                Effect::NoOp,
+                Vec::new(),
+                source_id,
+                PlayerId(0),
+            )),
+        },
+    });
+    let priority_action = add_non_mana_activated_artifact(&mut state, PlayerId(1));
+
+    apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .unwrap();
+    state.objects.remove(&priority_action);
+    let mut reused_source = state
+        .objects
+        .remove(&source_id)
+        .expect("the original source exists before reuse");
+    reused_source.name = "Reused source id".to_string();
+    state.objects.insert(source_id, reused_source);
+
+    let mut result = ActionResult {
+        events: Vec::new(),
+        waiting_for: state.waiting_for.clone(),
+        log_entries: Vec::new(),
+    };
+    run_auto_pass_loop(&mut state, &mut result);
+
+    assert!(state.stack.is_empty());
+    assert!(result
+        .events
+        .iter()
+        .any(|event| matches!(event, GameEvent::StackResolved { .. })));
+    assert!(state.stack_resolution_session.is_none());
+}
+
+#[test]
+fn fenced_session_tears_down_when_resolution_ends_the_game() {
+    let mut state = priority_state();
+    state.players[1].life = 1;
+    let ability = ResolvedAbility::new(
+        Effect::LoseLife {
+            amount: QuantityExpr::Fixed { value: 1 },
+            target: None,
+        },
+        vec![crate::types::ability::TargetRef::Player(PlayerId(1))],
+        ObjectId(19_916),
+        PlayerId(0),
+    );
+    state.stack.push_back(StackEntry {
+        id: ObjectId(19_916),
+        source_id: ObjectId(19_916),
+        controller: PlayerId(0),
+        kind: StackEntryKind::TriggeredAbility {
+            source_id: ObjectId(19_916),
+            ability: Box::new(ability),
+            condition: None,
+            trigger_event: None,
+            description: Some("Lose the last life".to_string()),
+            source_name: "Terminal trigger".to_string(),
+            subject_match_count: None,
+            die_result: None,
+            provenance: None,
+        },
+    });
+
+    let result = apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(
+        result.waiting_for,
+        WaitingFor::GameOver {
+            winner: Some(PlayerId(0))
+        }
+    ));
+    assert!(state.stack_resolution_session.is_none());
+    assert!(!state.auto_pass.contains_key(&PlayerId(0)));
+}
+
+#[test]
+fn two_hg_session_uses_team_representatives_in_the_live_runner() {
+    let mut state = GameState::new(
+        crate::types::format::FormatConfig::two_headed_giant(),
+        4,
+        42,
+    );
+    state.turn_number = 1;
+    state.phase = Phase::PreCombatMain;
+    state.active_player = PlayerId(0);
+    state.priority_player = PlayerId(0);
+    state.waiting_for = WaitingFor::Priority {
+        player: PlayerId(0),
+    };
+    push_simple_stack_entry(&mut state, 19_917, PlayerId(0));
+    let priority_action = add_non_mana_activated_artifact(&mut state, PlayerId(2));
+
+    apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        state
+            .stack_resolution_session
+            .as_ref()
+            .unwrap()
+            .representatives,
+        [PlayerId(0)].into_iter().collect()
+    );
+    assert!(matches!(
+        state.waiting_for,
+        WaitingFor::Priority {
+            player: PlayerId(2)
+        }
+    ));
+
+    state.objects.remove(&priority_action);
+    let mut result = ActionResult {
+        events: Vec::new(),
+        waiting_for: state.waiting_for.clone(),
+        log_entries: Vec::new(),
+    };
+    run_auto_pass_loop(&mut state, &mut result);
+
+    assert!(state.stack.is_empty());
+    assert!(state.stack_resolution_session.is_none());
+    assert!(result
+        .events
+        .iter()
+        .any(|event| matches!(event, GameEvent::StackResolved { .. })));
+}
+
+#[test]
 fn until_stack_empty_stops_on_non_requester_meaningful_action() {
     let mut state = priority_state();
     push_simple_stack_entry(&mut state, 20_000, PlayerId(1));
@@ -884,6 +2025,207 @@ fn priority_probe_false_when_only_pass_available() {
 }
 
 #[test]
+fn verified_ai_pass_installs_rechecking_session_and_pauses_for_unverified_priority() {
+    let mut state = priority_state();
+    push_simple_stack_entry(&mut state, 30_101, PlayerId(1));
+    let contract = AiDecisionContract::issue(&state, PlayerId(0));
+
+    let result = apply_verified_ai_priority_pass(
+        &mut state,
+        PlayerId(0),
+        &contract,
+        GameAction::PassPriority,
+    )
+    .expect("the issued AI pass starts its fenced recheck session");
+
+    assert!(matches!(
+        result.waiting_for,
+        WaitingFor::Priority {
+            player: PlayerId(1)
+        }
+    ));
+    let session = state
+        .stack_resolution_session
+        .as_ref()
+        .expect("an unverified follow-up priority window retains the AI session");
+    assert_eq!(
+        session.policy,
+        StackResolutionPolicy::RecheckNoMeaningfulPriorityAction
+    );
+    assert_eq!(session.cursor, 0);
+    assert!(session.representatives.contains(&PlayerId(0)));
+}
+
+#[test]
+fn verified_ai_pass_cache_never_passes_an_unverified_representative() {
+    let mut state = priority_state();
+    push_simple_stack_entry(&mut state, 30_110, PlayerId(1));
+    push_simple_stack_entry(&mut state, 30_111, PlayerId(1));
+    let contract = AiDecisionContract::issue(&state, PlayerId(0));
+
+    crate::game::perf_counters::reset();
+    apply_verified_ai_priority_pass(&mut state, PlayerId(0), &contract, GameAction::PassPriority)
+        .expect("the issued pass starts the retained session");
+    let counters = crate::game::perf_counters::snapshot();
+
+    assert_eq!(
+        counters.priority_cast_probe_builds, 0,
+        "the cache must avoid a synthetic probe before the next verified pass"
+    );
+    assert_eq!(
+        counters.priority_cast_probe_state_clones, 0,
+        "the cache must not clone state for a synthetic priority probe"
+    );
+    assert!(
+        state.stack_resolution_session.is_some(),
+        "the fenced cohort remains available for an unverified representative"
+    );
+    assert_eq!(state.stack.len(), 2, "no entry resolves without a new pass");
+    assert!(matches!(
+        state.waiting_for,
+        WaitingFor::Priority {
+            player: PlayerId(1)
+        }
+    ));
+    assert!(
+        apply_verified_ai_priority_pass(
+            &mut state,
+            PlayerId(0),
+            &contract,
+            GameAction::PassPriority,
+        )
+        .is_err(),
+        "the prior contract cannot authorize P1's distinct priority window"
+    );
+}
+
+#[test]
+fn stale_verified_ai_pass_does_not_install_a_session() {
+    let mut state = priority_state();
+    push_simple_stack_entry(&mut state, 30_102, PlayerId(1));
+    let contract = AiDecisionContract::issue(&state, PlayerId(0));
+    state.state_revision = state.state_revision.saturating_add(1);
+
+    assert!(apply_verified_ai_priority_pass(
+        &mut state,
+        PlayerId(0),
+        &contract,
+        GameAction::PassPriority,
+    )
+    .is_err());
+    assert!(
+        state.stack_resolution_session.is_none(),
+        "a stale AI contract must not promote an ordinary priority window"
+    );
+}
+
+#[test]
+fn verified_ai_pass_rejects_foreign_and_nonpass_submissions_without_mutation() {
+    let mut state = priority_state();
+    push_simple_stack_entry(&mut state, 30_105, PlayerId(1));
+    let contract = AiDecisionContract::issue(&state, PlayerId(0));
+    let before = state.clone();
+
+    assert!(apply_verified_ai_priority_pass(
+        &mut state,
+        PlayerId(1),
+        &contract,
+        GameAction::PassPriority,
+    )
+    .is_err());
+    assert_eq!(state, before, "a foreign actor must not install a session");
+
+    assert!(apply_verified_ai_priority_pass(
+        &mut state,
+        PlayerId(0),
+        &contract,
+        GameAction::Concede {
+            player_id: PlayerId(0)
+        },
+    )
+    .is_err());
+    assert_eq!(state, before, "a non-pass must not install a session");
+}
+
+#[test]
+fn another_canonical_representative_can_continue_a_rechecking_session() {
+    let mut state = priority_state();
+    push_simple_stack_entry(&mut state, 30_106, PlayerId(1));
+    push_simple_stack_entry(&mut state, 30_107, PlayerId(1));
+    add_non_mana_activated_artifact(&mut state, PlayerId(0));
+    add_non_mana_activated_artifact(&mut state, PlayerId(1));
+    let first_contract = AiDecisionContract::issue(&state, PlayerId(0));
+
+    apply_verified_ai_priority_pass(
+        &mut state,
+        PlayerId(0),
+        &first_contract,
+        GameAction::PassPriority,
+    )
+    .expect("the first AI representative starts the session");
+    let second_contract = AiDecisionContract::issue(&state, PlayerId(1));
+
+    let second_result = apply_verified_ai_priority_pass(
+        &mut state,
+        PlayerId(1),
+        &second_contract,
+        GameAction::PassPriority,
+    )
+    .expect("a second representative may supply its own fresh AI pass");
+
+    assert!(
+        state.stack_resolution_session.is_none(),
+        "once every representative has a verified pass, the fenced cohort drains"
+    );
+    assert!(state.stack.is_empty());
+    assert!(second_result.events.iter().any(|event| matches!(
+        event,
+        GameEvent::StackResolved {
+            object_id: ObjectId(30_107)
+        }
+    )));
+}
+
+#[test]
+fn explicit_pass_advances_the_recheck_session_cursor_at_one_resolution_boundary() {
+    let mut state = priority_state();
+    push_simple_stack_entry(&mut state, 30_103, PlayerId(1));
+    push_simple_stack_entry(&mut state, 30_104, PlayerId(1));
+    add_non_mana_activated_artifact(&mut state, PlayerId(0));
+    add_non_mana_activated_artifact(&mut state, PlayerId(1));
+    let baseline = state
+        .auto_pass
+        .iter()
+        .map(|(&player, &mode)| (player, mode))
+        .collect();
+    install_stack_resolution_session(
+        &mut state,
+        [PlayerId(0)].into_iter().collect(),
+        StackResolutionBudget::Unlimited,
+        StackResolutionPolicy::RecheckNoMeaningfulPriorityAction,
+        baseline,
+    );
+
+    apply(&mut state, PlayerId(0), GameAction::PassPriority)
+        .expect("the first explicit pass changes priority");
+    apply(&mut state, PlayerId(1), GameAction::PassPriority)
+        .expect("the all-pass boundary resolves exactly one rechecked entry");
+
+    let session = state
+        .stack_resolution_session
+        .as_ref()
+        .expect("the next fenced entry remains available for a fresh AI recheck");
+    assert_eq!(session.cursor, 1);
+    assert_eq!(state.stack.len(), 1);
+    assert!(matches!(
+        state.waiting_for,
+        WaitingFor::Priority {
+            player: PlayerId(0)
+        }
+    ));
+}
+
+#[test]
 fn until_stack_empty_non_requester_own_stack_shortcut_does_not_hide_action() {
     let mut state = priority_state();
     push_simple_stack_entry(&mut state, 21_000, PlayerId(1));
@@ -896,6 +2238,7 @@ fn until_stack_empty_non_requester_own_stack_shortcut_does_not_hide_action() {
         PlayerId(0),
         AutoPassMode::UntilStackEmpty {
             initial_stack_len: 1,
+            policy: StackResolutionPolicy::Committed,
         },
     );
 
@@ -959,6 +2302,11 @@ fn until_stack_empty_stops_on_interactive_waiting_for() {
             ..
         }
     ));
+    assert!(state.stack_resolution_session.is_none());
+    assert!(
+        !state.auto_pass.contains_key(&PlayerId(0)),
+        "the prompt tears down the temporary representative overlay"
+    );
 }
 
 /// CR 732.2: the halt helper pauses a runaway cascade to a settled Priority

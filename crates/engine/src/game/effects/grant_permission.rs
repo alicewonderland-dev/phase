@@ -325,6 +325,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::GrantCastingPermission {
                 permission: CastingPermission::PlayFromExile {
+                    provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
                     duration: Duration::UntilNextTurnOf {
                         player: PlayerScope::Controller,
                     },
@@ -390,6 +391,7 @@ mod tests {
             Zone::Exile,
         );
         let permission = CastingPermission::PlayFromExile {
+            provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
             duration: Duration::Permanent,
             granted_to: PlayerId(0),
             frequency: crate::types::statics::CastFrequency::Unlimited,
@@ -468,6 +470,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::GrantCastingPermission {
                 permission: CastingPermission::PlayFromExile {
+                    provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
                     duration: Duration::UntilEndOfNextTurnOf {
                         player: PlayerScope::Controller,
                     },
@@ -691,6 +694,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::GrantCastingPermission {
                 permission: CastingPermission::PlayFromExile {
+                    provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
                     duration: Duration::UntilNextTurnOf {
                         player: PlayerScope::Controller,
                     },
@@ -748,6 +752,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::GrantCastingPermission {
                 permission: CastingPermission::PlayFromExile {
+                    provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
                     duration: Duration::UntilNextTurnOf {
                         player: PlayerScope::Controller,
                     },
@@ -817,6 +822,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::GrantCastingPermission {
                 permission: CastingPermission::PlayFromExile {
+                    provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
                     duration: Duration::UntilNextStepOf {
                         step: Phase::End,
                         player: PlayerScope::Controller,
@@ -902,6 +908,7 @@ mod tests {
         );
 
         let mk_perm = |duration: Duration, granted_to: PlayerId| CastingPermission::PlayFromExile {
+            provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
             duration,
             granted_to,
             frequency: CastFrequency::Unlimited,
@@ -977,6 +984,7 @@ mod tests {
             Zone::Exile,
         );
         let permission = CastingPermission::PlayFromExile {
+            provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
             duration: Duration::UntilNextStepOf {
                 step: Phase::End,
                 player: PlayerScope::Controller,
@@ -1041,6 +1049,7 @@ mod tests {
             .get_mut(&exiled_pre_prune)
             .unwrap()
             .casting_permissions = vec![CastingPermission::PlayFromExile {
+            provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
             duration: Duration::UntilNextStepOf {
                 step: Phase::End,
                 player: PlayerScope::Controller,
@@ -1078,6 +1087,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::GrantCastingPermission {
                 permission: CastingPermission::PlayFromExile {
+                    provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
                     duration: Duration::UntilNextStepOf {
                         step: Phase::End,
                         player: PlayerScope::Controller,
@@ -1148,6 +1158,7 @@ mod tests {
         );
         state.objects.get_mut(&card).unwrap().casting_permissions =
             vec![CastingPermission::PlayFromExile {
+                provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
                 duration: Duration::UntilNextStepOf {
                     step: Phase::End,
                     player: PlayerScope::Controller,
@@ -1191,6 +1202,7 @@ mod tests {
         );
         state.objects.get_mut(&card).unwrap().casting_permissions =
             vec![CastingPermission::PlayFromExile {
+                provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
                 duration: Duration::UntilNextStepOf {
                     step: Phase::End,
                     player: PlayerScope::Controller,
@@ -1252,6 +1264,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::GrantCastingPermission {
                 permission: CastingPermission::PlayFromExile {
+                    provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
                     duration: Duration::Permanent,
                     granted_to: PlayerId(0),
                     frequency: crate::types::statics::CastFrequency::Unlimited,

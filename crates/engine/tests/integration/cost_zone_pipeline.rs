@@ -239,6 +239,124 @@ fn dig_rest_pile_library_redirect_pauses_before_tracked_set_publish() {
     assert_eq!(runner.state().objects[&parked_order[0]].zone, Zone::Library);
 }
 
+/// CR 608.2c + CR 616.1: declining an up-to Dig selection publishes its empty
+/// kept set after a deferred rest-pile delivery; it must not publish the cards
+/// that merely completed the rest route.
+#[test]
+fn dig_zero_kept_deferred_rest_pile_publishes_an_empty_tracked_set() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario.add_creature(P0, "Zero-Kept Dig Source", 1, 1).id();
+    let rest_a = scenario
+        .add_spell_to_library_top(P0, "Zero-Kept Rest A", true)
+        .id();
+    let rest_b = scenario
+        .add_spell_to_library_top(P0, "Zero-Kept Rest B", true)
+        .id();
+    let redirect_sources = [
+        scenario
+            .add_creature(P0, "Zero-Kept Library To Graveyard", 0, 0)
+            .as_enchantment()
+            .with_replacement_definition(redirect_moved_to(Zone::Library, Zone::Graveyard))
+            .id(),
+        scenario
+            .add_creature(P0, "Zero-Kept Library To Exile", 0, 0)
+            .as_enchantment()
+            .with_replacement_definition(redirect_moved_to(Zone::Library, Zone::Exile))
+            .id(),
+    ];
+
+    let mut runner = scenario.build();
+    runner.state_mut().players[P0.0 as usize].library = im::vector![rest_a, rest_b];
+    let ability = ResolvedAbility::new(
+        Effect::Dig {
+            player: TargetFilter::Controller,
+            count: QuantityExpr::Fixed { value: 2 },
+            destination: None,
+            keep_count: Some(1),
+            keep_count_expr: None,
+            up_to: true,
+            filter: TargetFilter::Any,
+            rest_destination: Some(Zone::Library),
+            rest_order: DigRestOrder::Preserve,
+            reveal: true,
+            enter_tapped: false,
+            enters_attacking: false,
+            source: DigSource::Library,
+        },
+        vec![],
+        source,
+        P0,
+    );
+    let mut initial_events = Vec::new();
+    resolve_ability_chain(runner.state_mut(), &ability, &mut initial_events, 0)
+        .expect("Dig reaches its up-to selection");
+
+    let paused = runner
+        .act(GameAction::SelectCards { cards: vec![] })
+        .expect("an empty up-to selection reaches the rest-pile replacement choice");
+    assert!(matches!(
+        paused.waiting_for,
+        WaitingFor::ReplacementChoice { .. }
+    ));
+
+    let reparking = runner
+        .act(GameAction::ChooseReplacement { index: 0 })
+        .expect("the first rest redirect reaches the remaining rest card");
+    assert!(matches!(
+        reparking.waiting_for,
+        WaitingFor::ReplacementChoice { .. }
+    ));
+    for redirect_source in redirect_sources {
+        let redirect_source = runner
+            .state_mut()
+            .objects
+            .get_mut(&redirect_source)
+            .expect("synthetic redirect source remains on the battlefield");
+        redirect_source.replacement_definitions.clear();
+        Arc::make_mut(&mut redirect_source.base_replacement_definitions).clear();
+    }
+    let completed = runner
+        .act(GameAction::ChooseReplacement { index: 0 })
+        .expect("the remaining rest-pile delivery completes");
+    assert!(matches!(completed.waiting_for, WaitingFor::Priority { .. }));
+    let redirected_rest = [rest_a, rest_b]
+        .into_iter()
+        .find(|id| {
+            matches!(
+                runner.state().objects[id].zone,
+                Zone::Graveyard | Zone::Exile
+            )
+        })
+        .expect("one rest-pile card must take the configured redirect");
+    let returned_rest = [rest_a, rest_b]
+        .into_iter()
+        .find(|id| runner.state().objects[id].zone == Zone::Library)
+        .expect("the other rest-pile card must complete its library placement");
+    assert_ne!(redirected_rest, returned_rest);
+    assert!(
+        runner.state().players[P0.0 as usize]
+            .library
+            .contains(&returned_rest),
+        "the unredirected rest-pile card must be present in P0's library"
+    );
+
+    let tracked = runner
+        .state()
+        .tracked_object_sets
+        .get(
+            &runner
+                .state()
+                .chain_tracked_set_id
+                .expect("the deferred Dig completion publishes a tracked set"),
+        )
+        .expect("the freshly-published Dig tracked set exists");
+    assert!(
+        tracked.is_empty(),
+        "the rest-pile delivery must not replace an empty kept selection"
+    );
+}
+
 /// W-R3 (red first): deterministic Dig's nonbattlefield kept batch must defer
 /// its tracked-set publication and downstream tracked-set consumer until every
 /// selected card has either reached the requested destination or been
@@ -535,9 +653,10 @@ fn uninterrupted_dig_rest_and_mass_put_all_complete_synchronously() {
     assert_eq!(mass_tracked, &vec![selected_a, selected_b]);
 }
 
-/// W-R2: A `RevealRestPile` already deferred behind a kept-card replacement can
-/// itself start a Library-bottom batch that re-pauses while draining. Its cleanup
-/// must survive both pause boundaries and publish exactly once at the true end.
+/// W-R2: A Dig's deferred completion can itself start a Library-bottom batch
+/// that re-pauses while draining. Its cleanup must survive both pause boundaries
+/// and publish exactly once at the true end, regardless of which completion
+/// carrier owns the kept-card delivery.
 #[test]
 fn dig_deferred_reveal_rest_pile_repauses_and_completes_once() {
     let mut scenario = GameScenario::new();
@@ -609,13 +728,19 @@ fn dig_deferred_reveal_rest_pile_repauses_and_completes_once() {
         kept_pause.waiting_for,
         WaitingFor::ReplacementChoice { .. }
     ));
-    assert!(matches!(
-        runner
-            .state()
-            .active_batch_delivery()
-            .and_then(|pending| pending.completion.as_ref()),
-        Some(BatchCompletion::RevealRestPile { .. })
-    ));
+    assert!(
+        matches!(
+            runner
+                .state()
+                .active_batch_delivery()
+                .and_then(|pending| pending.completion.as_ref()),
+            Some(BatchCompletion::RevealRestPile {
+                delivery_stage: engine::types::game_state::DigDeliveryStage::Kept,
+                ..
+            })
+        ),
+        "the kept-card pause must retain a RevealRestPile completion for the deferred rest pile"
+    );
 
     let rest_pause = runner
         .act(GameAction::ChooseReplacement { index: 0 })
@@ -629,10 +754,16 @@ fn dig_deferred_reveal_rest_pile_repauses_and_completes_once() {
         .active_batch_delivery()
         .expect("the second rest placement is parked behind the first redirect");
     assert_eq!(first_rest_park.remaining.len(), 1);
-    assert!(matches!(
-        first_rest_park.completion.as_ref(),
-        Some(BatchCompletion::RevealRestPile { .. })
-    ));
+    assert!(
+        matches!(
+            first_rest_park.completion.as_ref(),
+            Some(BatchCompletion::RevealRestPile {
+                delivery_stage: engine::types::game_state::DigDeliveryStage::Rest,
+                ..
+            })
+        ),
+        "the first rest redirect must retain the RevealRestPile completion"
+    );
     assert!(runner.state().chain_tracked_set_id.is_none());
 
     let reparking = runner
@@ -642,13 +773,19 @@ fn dig_deferred_reveal_rest_pile_repauses_and_completes_once() {
         reparking.waiting_for,
         WaitingFor::ReplacementChoice { .. }
     ));
-    assert!(matches!(
-        runner
-            .state()
-            .active_batch_delivery()
-            .and_then(|pending| pending.completion.as_ref()),
-        Some(BatchCompletion::RevealRestPile { .. })
-    ));
+    assert!(
+        matches!(
+            runner
+                .state()
+                .active_batch_delivery()
+                .and_then(|pending| pending.completion.as_ref()),
+            Some(BatchCompletion::RevealRestPile {
+                delivery_stage: engine::types::game_state::DigDeliveryStage::Rest,
+                ..
+            })
+        ),
+        "the re-parked rest delivery must retain its RevealRestPile completion"
+    );
     assert!(runner.state().chain_tracked_set_id.is_none());
 
     for redirect_source in library_redirect_sources {
@@ -664,6 +801,13 @@ fn dig_deferred_reveal_rest_pile_repauses_and_completes_once() {
         .act(GameAction::ChooseReplacement { index: 0 })
         .expect("the final rest placement drains the deferred completion");
     assert!(matches!(completed.waiting_for, WaitingFor::Priority { .. }));
+    assert!(
+        matches!(
+            runner.state().objects[&kept].zone,
+            Zone::Graveyard | Zone::Exile
+        ),
+        "the kept battlefield entry must take one configured redirect"
+    );
     let tracked = runner
         .state()
         .tracked_object_sets
@@ -674,7 +818,10 @@ fn dig_deferred_reveal_rest_pile_repauses_and_completes_once() {
                 .expect("the Dig completion publishes after the true batch end"),
         )
         .expect("the tracked set exists");
-    assert_eq!(tracked, &vec![kept]);
+    assert!(
+        tracked.is_empty(),
+        "the kept delivery was redirected away from the requested battlefield destination"
+    );
 }
 
 fn redirect_self_moved_to(destination: Zone, redirected_to: Zone) -> ReplacementDefinition {
@@ -11796,7 +11943,14 @@ fn dig_kept_nonbattlefield_redirect_pauses_before_tail() {
                 .expect("Dig publishes its kept set after the delivery settles"),
         )
         .expect("Dig tracked set exists");
-    assert_eq!(tracked, &vec![kept]);
+    assert!(
+        tracked.is_empty(),
+        "a kept card redirected away from its requested destination is absent from the settled delivery"
+    );
+    assert!(
+        runner.state().last_zone_changed_ids.is_empty(),
+        "a redirected kept card must not satisfy a requested-destination reflexive gate"
+    );
     assert_eq!(
         initial_events
             .iter()

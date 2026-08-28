@@ -34,6 +34,7 @@ const P0: PlayerId = PlayerId(0);
 /// presence of `back_face` is consulted by `room::eligible_doors`.
 fn room_back_face() -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
         name: "Right Door".to_string(),
         power: None,
         toughness: None,

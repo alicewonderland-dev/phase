@@ -20,6 +20,7 @@ import {
 import type { DraftMatchLaunch, DraftMatchSettlement, DraftPauseReason } from "../network/draftProtocol";
 import type { DraftIntergameCommand, DraftIntergameCommandAck } from "../services/intergameCommandLedger";
 import { joinRoom, type JoinResult } from "../network/connection";
+import type { DraftWorkspaceState } from "../components/draft/workspace/types";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -39,6 +40,7 @@ export type DraftPodGuestEvent =
   | { type: "statusChanged"; status: DraftPodGuestStatus }
   | { type: "joined"; seatIndex: number; draftCode: string }
   | { type: "reconnected"; seatIndex: number }
+  | { type: "workspaceRestored"; workspaceState: DraftWorkspaceState | null }
   | { type: "viewUpdated"; view: DraftPlayerView }
   | { type: "pickAcknowledged"; view: DraftPlayerView }
   | { type: "deckSubmissionAcknowledged"; submissionId: string; view: DraftPlayerView }
@@ -261,6 +263,9 @@ export class DraftPodGuestAdapter {
         this._seatIndex = event.seatIndex;
         this.emit({ type: "reconnected", seatIndex: event.seatIndex });
         break;
+      case "workspaceRestored":
+        this.emit({ type: "workspaceRestored", workspaceState: event.workspaceState });
+        break;
       case "viewUpdated":
         this._currentView = event.view;
         this.updateStatusFromView(event.view);
@@ -415,9 +420,9 @@ export class DraftPodGuestAdapter {
 
   // ── Draft actions ──────────────────────────────────────────────────
 
-  async submitPick(cardInstanceId: string): Promise<void> {
+  async submitPick(cardInstanceIds: string[]): Promise<void> {
     if (!this.guest) throw new Error("Guest not initialized");
-    await this.guest.submitPick(cardInstanceId);
+    await this.guest.submitPick(cardInstanceIds);
   }
 
   async submitPickWithDraftEffect(
@@ -428,9 +433,14 @@ export class DraftPodGuestAdapter {
     await this.guest.submitPickWithDraftEffect(effectCardInstanceId, cardInstanceIds);
   }
 
-  async submitDeck(mainDeck: string[]): Promise<void> {
+  async submitDeck(mainDeck: string[], commanders: string[]): Promise<void> {
     if (!this.guest) throw new Error("Guest not initialized");
-    await this.guest.submitDeck(mainDeck);
+    await this.guest.submitDeck(mainDeck, commanders);
+  }
+
+  async updateWorkspace(state: DraftWorkspaceState): Promise<void> {
+    if (!this.guest) throw new Error("Guest not initialized");
+    await this.guest.updateWorkspace(state);
   }
 
   sendMatchSettlement(settlement: DraftMatchSettlement): void {
