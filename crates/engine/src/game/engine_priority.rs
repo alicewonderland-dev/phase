@@ -129,6 +129,12 @@ fn run_post_action_pipeline_from_with_policy(
     // Capture stack depth before any trigger/SBA processing so we can detect
     // whether new triggered abilities were added during this pipeline pass.
     let stack_before = state.stack.len();
+    // A queue present on entry was parked by an earlier non-priority action
+    // (for example, an SBA commander-zone choice). Only that queued batch must
+    // be combined with delayed triggers from this action's answer. A queue
+    // created while processing this action still follows the ordinary drain
+    // path; re-batching it against the same events replays its trigger scan.
+    let deferred_trigger_batch_was_parked = !state.deferred_triggers.is_empty();
     let mut consumed_trigger_events =
         std::mem::take(&mut state.consumed_before_priority_trigger_events);
     let mut delayed_trigger_events = Vec::new();
@@ -268,7 +274,7 @@ fn run_post_action_pipeline_from_with_policy(
         if super::engine_resolution_choices::handles(&state.waiting_for)
             || state.pending_replacement.is_some()
             || state.pending_resolution_completion.is_some()
-            || !state.deferred_triggers.is_empty()
+            || deferred_trigger_batch_was_parked
         {
             triggers::collect_triggers_into_deferred(state, &filtered_events);
         } else {
@@ -434,13 +440,7 @@ fn run_post_action_pipeline_from_with_policy(
     } else if matches!(state.waiting_for, WaitingFor::Priority { .. })
         && !state.deferred_triggers.is_empty()
     {
-        if delayed_trigger_events.is_empty() {
-            if let Some(wf) =
-                triggers::drain_deferred_trigger_queue_with_policy(state, events, drain_policy)
-            {
-                state.waiting_for = wf;
-            }
-        } else {
+        if deferred_trigger_batch_was_parked && !delayed_trigger_events.is_empty() {
             let pending = std::mem::take(&mut state.deferred_triggers);
             let outcome = triggers::process_collected_triggers_with_delayed_events(
                 state,
@@ -451,6 +451,10 @@ fn run_post_action_pipeline_from_with_policy(
             if let Some(wf) = outcome.prompt {
                 state.waiting_for = wf;
             }
+        } else if let Some(wf) =
+            triggers::drain_deferred_trigger_queue_with_policy(state, events, drain_policy)
+        {
+            state.waiting_for = wf;
         }
     }
 

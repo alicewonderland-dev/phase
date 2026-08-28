@@ -393,19 +393,22 @@ fn register_transient_effect(
         }
     }
 
-    // CR 608.2c + CR 611.2c: Use the same effective application filter for
-    // dependency classification and registration. An inherited inner affected
-    // filter overrides the outer targeting descriptor, including at the early
-    // SelfRef / LastCreated binding seams below.
-    let application_filter =
-        generic_effect_application_filter(target_filter, static_def.affected.as_ref());
-
     // CR 608.2c (issue #323 class): SelfRef is the printed-name anaphor and
     // always refers to the source object regardless of `ability.targets`.
     // Short-circuit BEFORE the chosen-targets branch so chained Effect
     // sub-abilities with `target: SelfRef` don't inherit the parent's targets
     // via chain propagation in `effects::mod.rs::resolve_ability_chain`.
-    if matches!(application_filter, Some(TargetFilter::SelfRef)) {
+    let static_affected_is_event_context = static_def.affected.as_ref().is_some_and(|filter| {
+        matches!(
+            filter,
+            TargetFilter::TriggeringSource | TargetFilter::CostPaidObject
+        )
+    });
+    if matches!(
+        target_filter.or(static_def.affected.as_ref()),
+        Some(TargetFilter::SelfRef)
+    ) && !static_affected_is_event_context
+    {
         install_transient(
             state,
             end_permission,
@@ -424,7 +427,10 @@ fn register_transient_effect(
     // target `LastCreated` — bind directly to the just-created token(s) instead
     // of broadcasting across the battlefield (issue #3297: Rite of the Raging
     // Storm was granting haste/trample/sacrifice to the enchantment source).
-    if matches!(application_filter, Some(TargetFilter::LastCreated)) {
+    if matches!(
+        target_filter.or(static_def.affected.as_ref()),
+        Some(TargetFilter::LastCreated)
+    ) {
         for obj_id in state.last_created_token_ids.clone() {
             install_transient(
                 state,
@@ -449,9 +455,12 @@ fn register_transient_effect(
     // here. We must NOT short-circuit when targets exist: `affected:
     // TriggeringSource` with chosen targets is the inherited-target form that the
     // branch below resolves against `ability.targets` (Earthbender Ascension).
-    if matches!(application_filter, Some(TargetFilter::TriggeringSource))
-        && (matches!(target_filter, Some(TargetFilter::TriggeringSource))
-            || ability.targets.is_empty())
+    let affected_is_triggering_source = static_def
+        .affected
+        .as_ref()
+        .is_some_and(|filter| matches!(filter, TargetFilter::TriggeringSource));
+    if matches!(target_filter, Some(TargetFilter::TriggeringSource))
+        || (affected_is_triggering_source && ability.targets.is_empty())
     {
         if let Some(TargetRef::Object(obj_id)) =
             crate::game::targeting::resolve_event_context_target(
@@ -481,6 +490,8 @@ fn register_transient_effect(
     // otherwise `target_filter.or(affected)` prefers the broadcast
     // targeting descriptor and fans the grant to every matching permanent
     // (issue #2922: Mu Yanling +2).
+    let application_filter =
+        generic_effect_application_filter(target_filter, static_def.affected.as_ref());
     let static_affected_references_target_player = target_filter.is_none()
         && static_def
             .affected
