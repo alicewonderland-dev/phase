@@ -131,6 +131,7 @@ fn run_post_action_pipeline_from_with_policy(
     let stack_before = state.stack.len();
     let mut consumed_trigger_events =
         std::mem::take(&mut state.consumed_before_priority_trigger_events);
+    let mut delayed_trigger_events = Vec::new();
 
     // CR 603.2: Triggered abilities trigger at the moment the event occurs.
     // Scan for triggers BEFORE SBAs so that objects still on the battlefield
@@ -208,8 +209,18 @@ fn run_post_action_pipeline_from_with_policy(
             })
             .cloned()
             .collect();
+        delayed_trigger_events = events[event_start..]
+            .iter()
+            .filter(|event| {
+                !matches!(event, GameEvent::PhaseChanged { .. })
+                    && !state.deferred_entry_events.contains(event)
+                    && !retained_logical_zone_events.contains(event)
+            })
+            .cloned()
+            .collect();
         if skip_trigger_scan {
             filtered_events.retain(|event| matches!(event, GameEvent::SpellCast { .. }));
+            delayed_trigger_events.retain(|event| matches!(event, GameEvent::SpellCast { .. }));
         }
         // CR 603.3b: If the resolution step that just ran paused for a player
         // resolution-choice (Scry/Surveil/Dig/Search/...), the triggered
@@ -257,6 +268,7 @@ fn run_post_action_pipeline_from_with_policy(
         if super::engine_resolution_choices::handles(&state.waiting_for)
             || state.pending_replacement.is_some()
             || state.pending_resolution_completion.is_some()
+            || !state.deferred_triggers.is_empty()
         {
             triggers::collect_triggers_into_deferred(state, &filtered_events);
         } else {
@@ -308,14 +320,34 @@ fn run_post_action_pipeline_from_with_policy(
             if !matches!(state.waiting_for, WaitingFor::GameOver { .. })
                 && events.len() > events_before
             {
-                let sba_events: Vec<_> = events[events_before..].to_vec();
+                consumed_trigger_events.extend(std::mem::take(
+                    &mut state.consumed_before_priority_trigger_events,
+                ));
+                let raw_sba_events: Vec<_> = events[events_before..].to_vec();
+                let sba_events = triggers::filter_already_collected_trigger_events_from(
+                    state,
+                    events,
+                    events_before,
+                    &consumed_trigger_events,
+                );
                 triggers::collect_triggers_into_deferred(state, &sba_events);
-                triggers::collect_delayed_triggers_into_deferred(state, &sba_events);
+                // Logical zone-change owners collect ordinary observers only.
+                // Delayed triggers remain entitled to the raw occurrences; the
+                // ordinary queued-context witness must not suppress them.
+                triggers::collect_delayed_triggers_into_deferred(state, &raw_sba_events);
             }
             break;
         }
         if events.len() > events_before {
-            let sba_events: Vec<_> = events[events_before..].to_vec();
+            consumed_trigger_events.extend(std::mem::take(
+                &mut state.consumed_before_priority_trigger_events,
+            ));
+            let sba_events = triggers::filter_already_collected_trigger_events_from(
+                state,
+                events,
+                events_before,
+                &consumed_trigger_events,
+            );
             // CR 603.3b: SBA-generated triggers join the terminal batch rather
             // than being ordered before its final cast trigger is collected.
             if state.pending_resolution_completion.is_some() {
@@ -402,10 +434,23 @@ fn run_post_action_pipeline_from_with_policy(
     } else if matches!(state.waiting_for, WaitingFor::Priority { .. })
         && !state.deferred_triggers.is_empty()
     {
-        if let Some(wf) =
-            triggers::drain_deferred_trigger_queue_with_policy(state, events, drain_policy)
-        {
-            state.waiting_for = wf;
+        if delayed_trigger_events.is_empty() {
+            if let Some(wf) =
+                triggers::drain_deferred_trigger_queue_with_policy(state, events, drain_policy)
+            {
+                state.waiting_for = wf;
+            }
+        } else {
+            let pending = std::mem::take(&mut state.deferred_triggers);
+            let outcome = triggers::process_collected_triggers_with_delayed_events(
+                state,
+                pending,
+                &delayed_trigger_events,
+                events,
+            );
+            if let Some(wf) = outcome.prompt {
+                state.waiting_for = wf;
+            }
         }
     }
 

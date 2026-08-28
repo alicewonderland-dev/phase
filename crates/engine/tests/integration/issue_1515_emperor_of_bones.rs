@@ -455,6 +455,11 @@ fn empty_forward_result_preserves_triggering_source_generic_effect() {
     );
     assert_eq!(state.players[P0.0 as usize].hand.len(), 1);
     assert_eq!(state.players[P0.0 as usize].life, 21);
+    assert!(
+        state.transient_continuous_effects.is_empty(),
+        "the inner TriggeringSource application filter must override the outer SelfRef; \
+         without an event-context source, no transient may bind to the spell source"
+    );
 }
 
 /// `affected: CostPaidObject` likewise overrides outer SelfRef. It must not be
@@ -471,6 +476,57 @@ fn empty_forward_result_preserves_cost_paid_object_generic_effect() {
     );
     assert_eq!(state.players[P0.0 as usize].hand.len(), 1);
     assert_eq!(state.players[P0.0 as usize].life, 21);
+    assert!(
+        state.transient_continuous_effects.is_empty(),
+        "the inner CostPaidObject application filter must override the outer SelfRef; \
+         without a cost-paid object, no transient may bind to the spell source"
+    );
+}
+
+/// A mixed GenericEffect is retained after an empty forwarded move, but its
+/// individual SelfRef definition still depends on the missing object. Prune
+/// that definition while preserving the independent player-bound definition
+/// and the node's continuation edges.
+#[test]
+fn empty_forward_result_prunes_self_ref_static_from_mixed_generic_effect() {
+    let state = resolve_empty_forward_result_generic_spell(
+        vec![
+            StaticDefinition::continuous()
+                .affected(TargetFilter::SelfRef)
+                .modifications(vec![ContinuousModification::AddKeyword {
+                    keyword: Keyword::Haste,
+                }]),
+            StaticDefinition::continuous()
+                .affected(TargetFilter::Controller)
+                .modifications(vec![ContinuousModification::AddKeyword {
+                    keyword: Keyword::Vigilance,
+                }]),
+        ],
+        None,
+    );
+
+    assert_eq!(state.players[P0.0 as usize].hand.len(), 1);
+    assert_eq!(
+        state.players[P0.0 as usize].life, 21,
+        "retaining the mixed node must preserve its dependent continuation"
+    );
+    assert_eq!(
+        state.transient_continuous_effects.len(),
+        1,
+        "only the independent static definition may survive the missing forward result"
+    );
+    let effect = &state.transient_continuous_effects[0];
+    assert_eq!(
+        effect.affected,
+        TargetFilter::SpecificPlayer { id: P0 },
+        "the surviving Controller definition must bind to the ability controller"
+    );
+    assert!(effect.modifications.iter().any(|modification| matches!(
+        modification,
+        ContinuousModification::AddKeyword {
+            keyword: Keyword::Vigilance
+        }
+    )));
 }
 
 /// Only an all-effective-SelfRef GenericEffect depends on the missing result.
@@ -479,14 +535,6 @@ fn empty_forward_result_preserves_cost_paid_object_generic_effect() {
 #[test]
 fn empty_forward_result_preserves_non_self_ref_generic_effect_forms() {
     let cases = vec![
-        (
-            "mixed",
-            vec![
-                StaticDefinition::continuous().affected(TargetFilter::SelfRef),
-                StaticDefinition::continuous().affected(TargetFilter::Controller),
-            ],
-            None,
-        ),
         (
             "broadcast",
             vec![StaticDefinition::continuous().affected(TargetFilter::Controller)],

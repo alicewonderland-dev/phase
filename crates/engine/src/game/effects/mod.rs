@@ -13598,10 +13598,10 @@ fn effect_chain_depends_on_missing_forward_result(effect: &Effect) -> bool {
         )
 }
 
-/// A GenericEffect depends on the forwarded object only when every static it
-/// installs is bound to SelfRef. An inner `affected` inherited reference wins
-/// over the outer target descriptor, so use the shared application-filter
-/// classifier instead of examining `target` directly.
+/// A GenericEffect contains a forwarded-object dependency when any static it
+/// installs is effectively bound to SelfRef. An inner `affected` inherited
+/// reference wins over the outer target descriptor, so use the shared
+/// application-filter classifier instead of examining `target` directly.
 fn generic_effect_depends_on_missing_forward_result(effect: &Effect) -> bool {
     let Effect::GenericEffect {
         static_abilities,
@@ -13612,16 +13612,15 @@ fn generic_effect_depends_on_missing_forward_result(effect: &Effect) -> bool {
         return false;
     };
 
-    !static_abilities.is_empty()
-        && static_abilities.iter().all(|static_def| {
-            matches!(
-                effect::generic_effect_application_filter(
-                    target.as_ref(),
-                    static_def.affected.as_ref(),
-                ),
-                Some(TargetFilter::SelfRef)
-            )
-        })
+    static_abilities.iter().any(|static_def| {
+        matches!(
+            effect::generic_effect_application_filter(
+                target.as_ref(),
+                static_def.affected.as_ref(),
+            ),
+            Some(TargetFilter::SelfRef)
+        )
+    })
 }
 
 /// CR 608.2c: Remove only continuation nodes whose effects require the absent
@@ -13632,11 +13631,31 @@ fn generic_effect_depends_on_missing_forward_result(effect: &Effect) -> bool {
 fn without_missing_forward_result_dependencies(
     ability: &ResolvedAbility,
 ) -> Option<ResolvedAbility> {
-    if effect_chain_depends_on_missing_forward_result(&ability.effect) {
+    let mut remaining = ability.clone();
+    if let Effect::GenericEffect {
+        static_abilities,
+        target,
+        ..
+    } = &mut remaining.effect
+    {
+        static_abilities.retain(|static_def| {
+            !matches!(
+                effect::generic_effect_application_filter(
+                    target.as_ref(),
+                    static_def.affected.as_ref(),
+                ),
+                Some(TargetFilter::SelfRef)
+            )
+        });
+        if static_abilities.is_empty() {
+            return first_independent_forward_result_sibling(ability.sub_ability.as_deref());
+        }
+    }
+
+    if effect_chain_depends_on_missing_forward_result(&remaining.effect) {
         return first_independent_forward_result_sibling(ability.sub_ability.as_deref());
     }
 
-    let mut remaining = ability.clone();
     remaining.sub_ability = ability
         .sub_ability
         .as_deref()
