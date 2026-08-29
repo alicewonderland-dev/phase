@@ -398,17 +398,20 @@ fn register_transient_effect(
     // Short-circuit BEFORE the chosen-targets branch so chained Effect
     // sub-abilities with `target: SelfRef` don't inherit the parent's targets
     // via chain propagation in `effects::mod.rs::resolve_ability_chain`.
-    let static_affected_is_event_context = static_def.affected.as_ref().is_some_and(|filter| {
-        matches!(
-            filter,
-            TargetFilter::TriggeringSource | TargetFilter::CostPaidObject
-        )
-    });
+    //
+    // Classify through `generic_effect_application_filter`, the single authority
+    // that gives an inherited-reference `affected` precedence over the outer
+    // targeting descriptor (`generic_effect_affected_uses_inherited_targets`:
+    // `TriggeringSource`, `ParentTarget`, `CostPaidObject`, `AmassedArmy`).
+    // Enumerating a subset here would pin those to `ability.source_id` and skip
+    // their resolution-local binding arms in the `match application_filter`
+    // below, and would let this install path drift from the prune path in
+    // `effects::mod.rs::generic_effect_depends_on_missing_forward_result`, which
+    // already classifies with the same helper.
     if matches!(
-        target_filter.or(static_def.affected.as_ref()),
+        generic_effect_application_filter(target_filter, static_def.affected.as_ref()),
         Some(TargetFilter::SelfRef)
-    ) && !static_affected_is_event_context
-    {
+    ) {
         install_transient(
             state,
             end_permission,

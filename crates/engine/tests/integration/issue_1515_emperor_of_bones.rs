@@ -483,6 +483,52 @@ fn empty_forward_result_preserves_cost_paid_object_generic_effect() {
     );
 }
 
+/// `affected: ParentTarget` is the third inherited-target reference and behaves
+/// exactly like its `TriggeringSource` / `CostPaidObject` siblings: the outer
+/// SelfRef descriptor must not pin the grant to the spell source. With no
+/// chosen target, no cost-paid object, and an empty tracked set, the dedicated
+/// resolution-local arm binds nothing at all.
+#[test]
+fn empty_forward_result_preserves_parent_target_generic_effect() {
+    let state = resolve_empty_forward_result_generic_spell(
+        vec![StaticDefinition::continuous()
+            .affected(TargetFilter::ParentTarget)
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Haste,
+            }])],
+        Some(TargetFilter::SelfRef),
+    );
+    assert_eq!(state.players[P0.0 as usize].hand.len(), 1);
+    assert_eq!(state.players[P0.0 as usize].life, 21);
+    assert!(
+        state.transient_continuous_effects.is_empty(),
+        "the inner ParentTarget application filter must override the outer SelfRef; \
+         without a parent binding, no transient may bind to the spell source"
+    );
+}
+
+/// `affected: AmassedArmy` is the fourth inherited-target reference (CR 701.47c)
+/// and must reach its `amassed_army_object` arm rather than the outer SelfRef
+/// short-circuit. With no Army stamped on the resolution, nothing binds.
+#[test]
+fn empty_forward_result_preserves_amassed_army_generic_effect() {
+    let state = resolve_empty_forward_result_generic_spell(
+        vec![StaticDefinition::continuous()
+            .affected(TargetFilter::AmassedArmy)
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Haste,
+            }])],
+        Some(TargetFilter::SelfRef),
+    );
+    assert_eq!(state.players[P0.0 as usize].hand.len(), 1);
+    assert_eq!(state.players[P0.0 as usize].life, 21);
+    assert!(
+        state.transient_continuous_effects.is_empty(),
+        "the inner AmassedArmy application filter must override the outer SelfRef; \
+         without an amassed Army, no transient may bind to the spell source"
+    );
+}
+
 /// A mixed GenericEffect is retained after an empty forwarded move, but its
 /// individual SelfRef definition still depends on the missing object. Prune
 /// that definition while preserving the independent player-bound definition
