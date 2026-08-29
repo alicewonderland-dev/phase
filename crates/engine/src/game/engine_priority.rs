@@ -129,12 +129,12 @@ fn run_post_action_pipeline_from_with_policy(
     // Capture stack depth before any trigger/SBA processing so we can detect
     // whether new triggered abilities were added during this pipeline pass.
     let stack_before = state.stack.len();
-    // A queue present on entry was parked by an earlier non-priority action
-    // (for example, an SBA commander-zone choice). Only that queued batch must
-    // be combined with delayed triggers from this action's answer. A queue
-    // created while processing this action still follows the ordinary drain
-    // path; re-batching it against the same events replays its trigger scan.
-    let deferred_trigger_batch_was_parked = !state.deferred_triggers.is_empty();
+    // Only a batch parked by an SBA-owned player choice joins the answer's
+    // trigger events. Other deferred queues are construction tails whose
+    // ordinary drains must neither absorb later events nor rescan delayed
+    // triggers.
+    let deferred_trigger_batch_was_sba_choice_parked =
+        triggers::has_sba_choice_trigger_batch(state);
     let mut consumed_trigger_events =
         std::mem::take(&mut state.consumed_before_priority_trigger_events);
     let mut delayed_trigger_events = Vec::new();
@@ -274,7 +274,7 @@ fn run_post_action_pipeline_from_with_policy(
         if super::engine_resolution_choices::handles(&state.waiting_for)
             || state.pending_replacement.is_some()
             || state.pending_resolution_completion.is_some()
-            || deferred_trigger_batch_was_parked
+            || deferred_trigger_batch_was_sba_choice_parked
         {
             triggers::collect_triggers_into_deferred(state, &filtered_events);
         } else {
@@ -336,11 +336,22 @@ fn run_post_action_pipeline_from_with_policy(
                     events_before,
                     &consumed_trigger_events,
                 );
-                triggers::collect_triggers_into_deferred(state, &sba_events);
+                if sba_choice_requires_combined_trigger_batch(&state.waiting_for) {
+                    triggers::collect_sba_choice_triggers_into_deferred(state, &sba_events);
+                } else {
+                    triggers::collect_triggers_into_deferred(state, &sba_events);
+                }
                 // Logical zone-change owners collect ordinary observers only.
                 // Delayed triggers remain entitled to the raw occurrences; the
                 // ordinary queued-context witness must not suppress them.
-                triggers::collect_delayed_triggers_into_deferred(state, &raw_sba_events);
+                if sba_choice_requires_combined_trigger_batch(&state.waiting_for) {
+                    triggers::collect_sba_choice_delayed_triggers_into_deferred(
+                        state,
+                        &raw_sba_events,
+                    );
+                } else {
+                    triggers::collect_delayed_triggers_into_deferred(state, &raw_sba_events);
+                }
             }
             break;
         }
@@ -440,7 +451,7 @@ fn run_post_action_pipeline_from_with_policy(
     } else if matches!(state.waiting_for, WaitingFor::Priority { .. })
         && !state.deferred_triggers.is_empty()
     {
-        if deferred_trigger_batch_was_parked && !delayed_trigger_events.is_empty() {
+        if deferred_trigger_batch_was_sba_choice_parked && !delayed_trigger_events.is_empty() {
             let pending = std::mem::take(&mut state.deferred_triggers);
             let outcome = triggers::process_collected_triggers_with_delayed_events(
                 state,
@@ -525,6 +536,18 @@ fn run_post_action_pipeline_from_with_policy(
         default_wf.clone(),
         default_wf.acting_player(),
     ))
+}
+
+/// CR 903.9a + CR 704.5j + CR 310.11: the complete set of player-choice
+/// pauses the SBA fixpoint itself opens. Only their parked trigger batches must
+/// merge with events emitted by the answer before CR 603.3b ordering.
+fn sba_choice_requires_combined_trigger_batch(waiting_for: &WaitingFor) -> bool {
+    matches!(
+        waiting_for,
+        WaitingFor::CommanderZoneChoice { .. }
+            | WaitingFor::ChooseLegend { .. }
+            | WaitingFor::BattleProtectorChoice { .. }
+    )
 }
 
 /// CR 117.3c + CR 117.5: persist a carried priority recipient across any

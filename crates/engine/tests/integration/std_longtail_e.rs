@@ -2351,6 +2351,10 @@ fn sba_commander_choice_defers_ordinary_and_delayed_dies_triggers() {
         cast.state().stack.is_empty(),
         "answer-generated ordinary triggers must not be dispatched ahead of the parked SBA batch"
     );
+    assert!(
+        cast.state().deferred_triggers.is_empty(),
+        "the SBA-owned batch and commander-answer events must be consumed by this one APNAP ordering step"
+    );
     for _ in 0..4 {
         if !cast.state().stack.is_empty() {
             break;
