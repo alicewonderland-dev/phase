@@ -102,23 +102,24 @@ use crate::parser::oracle_effect::subject::parse_subject_application;
 use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag, AggregateFunction,
-    BounceSelection, CardPlayMode, CastFromZoneDriver, CastPermissionConstraint, CastingPermission,
-    ChoiceType, ChooseFromZoneConstraint, Chooser, CombatDamageScope, Comparator, ConjureCard,
-    ConjureSource, ContinuousModification, ControlWindow, ControllerRef, CopyChooseScope,
-    CopyRetargetPermission, CopyScale, DamageModification, DamageSource, DelayedTriggerCondition,
-    DelayedTriggerLifetime, DieResultBranch, DoubleTarget, Duration, Effect, EffectOutcomeSignal,
-    EffectScope, FilterProp, GameRestriction, GuessSubject, IntensityScope, IterationKindBinding,
-    KeeperConstraint, LibraryPosition, ManaProduction, ManaSpendPermission, ManaTargetRole,
-    MultiTargetSpec, NumberDistinctness, ObjectProperty, ObjectScope, OriginConstraint,
-    PerPlayerScope, PerpetualModification, PlayPermissionInvalidation, PlayerChoiceDistinctness,
-    PlayerFilter, PlayerRelation, PlayerScope, PreventionAmount, PreventionScope,
-    ProhibitedActivity, PtValue, QuantityExpr, QuantityRef, ReplacementCondition,
-    ReplacementDefinition, RestrictionExpiry, RestrictionPlayerScope, RevealUntilDisposition,
-    RoundingMode, SharedQuality, SharedQualityRelation, SiblingCondition, SkipScope,
-    SpellStackToGraveyardReplacement, StaticCondition, StaticDefinition, StepSkipTarget,
-    SubAbilityLink, TapStateChange, TargetFilter, TargetSelectionMode, ThisWayCause,
-    TrackedAnaphorSource, TriggerCondition, TriggerDefinition, TurnGate, TypeFilter, TypedFilter,
-    UnlessPayModifier, UntilCondition, WheneverEventExpiry, ZoneOwner,
+    BounceSelection, CardPlayMode, CardTypeSetSource, CastFromZoneDriver, CastPermissionConstraint,
+    CastingPermission, ChoiceType, ChooseFromZoneConstraint, Chooser, CombatDamageScope,
+    Comparator, ConjureCard, ConjureSource, ContinuousModification, ControlWindow, ControllerRef,
+    CopyChooseScope, CopyRetargetPermission, CopyScale, DamageModification, DamageSource,
+    DelayedTriggerCondition, DelayedTriggerLifetime, DieResultBranch, DoubleTarget, Duration,
+    Effect, EffectOutcomeSignal, EffectScope, FilterProp, GameRestriction, GuessSubject,
+    IntensityScope, IterationKindBinding, KeeperConstraint, LibraryPosition, ManaProduction,
+    ManaSpendPermission, ManaTargetRole, MultiTargetSpec, NumberDistinctness, ObjectProperty,
+    ObjectScope, OriginConstraint, PerPlayerScope, PerpetualModification,
+    PlayPermissionInvalidation, PlayerChoiceDistinctness, PlayerFilter, PlayerRelation,
+    PlayerScope, PreventionAmount, PreventionScope, ProhibitedActivity, PropertyAggregate, PtValue,
+    QuantityExpr, QuantityRef, ReplacementCondition, ReplacementDefinition, RestrictionExpiry,
+    RestrictionPlayerScope, RevealUntilDisposition, RoundingMode, SharedQuality,
+    SharedQualityRelation, SiblingCondition, SkipScope, SpellStackToGraveyardReplacement,
+    StaticCondition, StaticDefinition, StepSkipTarget, SubAbilityLink, TapStateChange,
+    TargetFilter, TargetSelectionMode, ThisWayCause, TrackedAnaphorSource, TriggerCondition,
+    TriggerDefinition, TurnGate, TypeFilter, TypedFilter, UnlessPayModifier, UntilCondition,
+    WheneverEventExpiry, ZoneOwner,
 };
 #[cfg(test)]
 use crate::types::ability::{AttackScope, AttackSubject};
@@ -1582,7 +1583,7 @@ fn has_unless_clause(text: &str) -> bool {
 /// introduce its effect clause.
 const DELAYED_TRIGGER_WINDOWS: [&str; 2] = [" this turn, ", " this combat, "];
 
-/// CR 603.7c: Parse "whenever [trigger condition] this turn, [effect]" delayed triggers.
+/// CR 603.7b: Parse "whenever [trigger condition] this turn, [effect]" delayed triggers.
 /// (Also "whenever [trigger condition] this combat, [effect]".)
 /// These create multi-fire delayed triggers that persist until end of turn.
 /// Example: "whenever a creature you control deals combat damage to a player this turn, draw a card"
@@ -1650,7 +1651,7 @@ fn try_parse_whenever_this_turn(tp: TextPair) -> Option<ParsedEffectClause> {
     // terminates the condition, and the rightmost split point is correct if the
     // condition itself contains an earlier occurrence of the window phrase.
     //
-    // CR 603.7b/603.7c + CR 510: An inline delayed trigger scoped to "this turn"
+    // CR 603.7b + CR 510: An inline delayed trigger scoped to "this turn"
     // (most cards) or "this combat" (prepare-mechanic combat-damage triggers, e.g.
     // Stensian Sanguinist) lowers to a multi-fire WheneverEvent delayed trigger
     // purged at end-of-turn cleanup (CR 603.7b). "this combat" is modeled as the
@@ -1671,7 +1672,7 @@ fn try_parse_whenever_this_turn(tp: TextPair) -> Option<ParsedEffectClause> {
                 }
             });
 
-    // CR 603.7b + CR 603.7c: When no "this turn" / "this combat" infix window is
+    // CR 603.7b: When no "this turn" / "this combat" infix window is
     // present, the duration was supplied as a consumed PREFIX ("Until end of
     // turn, whenever <trigger>, <effect>" — The Sea Devils III). The clause then
     // reaches here as a bare "whenever <trigger>, <effect>" with the duration
@@ -1718,7 +1719,7 @@ fn try_parse_whenever_this_turn(tp: TextPair) -> Option<ParsedEffectClause> {
         });
     trigger_def.execute = None; // Effect lives in DelayedTrigger.ability, not here
 
-    // CR 109.4 + CR 115.1 + CR 506.2 + CR 603.7c: The trigger condition may
+    // CR 109.4 + CR 115.1 + CR 506.2: The trigger condition may
     // introduce a relative player ("...deals combat damage to a player ...")
     // that the effect body's `"that player controls"` reference must bind to.
     // Derive the same scope the in-line trigger body parser would (single
@@ -3581,11 +3582,20 @@ pub(crate) fn parse_cast_this_way_enters_with_counter(lower: &str) -> Option<(Co
         tag("that permanent enters with "),
         tag("that artifact enters with "),
         // Self-granting permission (Undead Sprinter) refers to itself as "this
-        // creature", normalized to the `~` self-reference token upstream before
-        // this parser runs — distinct from the anaphoric "that creature" a
+        // creature" in the printed Oracle text. The main parse pipeline
+        // normalizes that phrase to the `~` self-reference token upstream
+        // before this parser runs, but this recognizer is also the shared
+        // authority `swallow_check`'s carrier-scoping detectors call directly
+        // against RAW, un-normalized unit text (by design — see
+        // `enters_with_counter_carrier_is_only_enters_with_marker`), so both
+        // the normalized and literal CR 201.5 self-reference forms must be
+        // accepted here — distinct from the anaphoric "that creature" a
         // separate-source grant uses.
         tag("~ enters with "),
         tag("it enters with "),
+        tag("this creature enters with "),
+        tag("this permanent enters with "),
+        tag("this artifact enters with "),
     ))
     .parse(lower)
     .ok()?;
@@ -3739,7 +3749,7 @@ fn parse_self_disjunctive_event_trigger(
         .parse(condition_text)
         .ok()?;
     let (right, _) = tag::<_, _, OracleError<'_>>(" or ").parse(right).ok()?;
-    // CR 603.7c: `WhenNextEvent` carries exactly two event slots (`trigger` +
+    // `WhenNextEvent` carries exactly two event slots (`trigger` +
     // `or_trigger`). A three-or-more-way self-event disjunction ("A or B or C")
     // can't be represented without silently dropping the tail, so reject it here
     // rather than capturing only the first two — no current card pairs three
@@ -8981,6 +8991,7 @@ fn rebind_controller_scope(filter: &mut TargetFilter, from: ControllerRef, to: C
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
@@ -9715,7 +9726,7 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
         }
     }
 
-    // CR 603.7c: "Whenever X this turn, Y" — multi-fire delayed trigger creation.
+    // CR 603.7b: "Whenever X this turn, Y" — multi-fire delayed trigger creation.
     if let Some(clause) = try_parse_whenever_this_turn(tp) {
         return clause;
     }
@@ -12149,7 +12160,7 @@ fn try_parse_equal_to_quantity_effect(tp: TextPair) -> Option<ParsedEffectClause
     })?;
     let rest_lower = &tp.lower[tp.lower.len() - rest_orig.len()..];
     let rest = rest_lower.trim().trim_end_matches('.');
-    // CR 603.7c: Prefer event context quantity for triggered effects — keeps
+    // Prefer event context quantity for triggered effects — keeps
     // "that much"/"this way"/"that many" bound to the triggering-event amount.
     // CR 121.1 + CR 107.1b: When the count is a static/dynamic CDA expression
     // rather than an event-context reference (e.g. Narset's "spells you've cast
@@ -13111,6 +13122,7 @@ fn try_parse_reveal_until(tp: TextPair, player: TargetFilter) -> Option<ParsedEf
             enters_attacking: false,
             kept_optional_to: None,
             enters_under: None,
+            kept_destination_if: None,
         }));
     }
 
@@ -13163,6 +13175,7 @@ fn try_parse_reveal_until(tp: TextPair, player: TargetFilter) -> Option<ParsedEf
         enters_attacking: false,
         kept_optional_to: None,
         enters_under: None,
+        kept_destination_if: None,
     }))
 }
 
@@ -18333,7 +18346,7 @@ fn try_parse_compound_player_object_damage(lower: &str) -> Option<ParsedEffectCl
     })
 }
 
-/// CR 120.3 + CR 119.3a: Compound object+player damage — type-first variant.
+/// CR 120.1 + CR 120.3: Compound object+player damage — type-first variant.
 /// Detects "deals N damage to each [type-phrase] and each player" and emits a
 /// single `Effect::DamageAll` carrying both the object filter and a
 /// `player_filter: Some(PlayerFilter::All)` so the resolver damages every
@@ -19335,7 +19348,7 @@ fn try_split_damage_compound(text: &str, ctx: &mut ParseContext) -> Option<Parse
         return Some(clause);
     }
 
-    // CR 120.3 + CR 119.3a: Same shape, type-first ordering — "each creature
+    // CR 120.1 + CR 120.3: Same shape, type-first ordering — "each creature
     // [with X | without X] and each player" (Pyrohemia / Earthquake / Hurricane
     // class). Must run before the general split so the player half isn't dropped.
     if let Some(clause) = try_parse_compound_object_player_damage(&lower) {
@@ -23195,7 +23208,7 @@ fn inject_subject_target(effect: &mut Effect, subject: &SubjectPhraseAst) {
         Effect::ExtraTurn { target } if *target == TargetFilter::Controller => {
             *target = subject_filter;
         }
-        // CR 104.3e + CR 603.7c: "that player loses the game" / "target player
+        // CR 104.3e: "that player loses the game" / "target player
         // loses the game" — bind the named player into the effect's
         // optional target field. The subject parser ("subject.rs") maps "that
         // player" → `TargetFilter::TriggeringPlayer` (a context ref resolved
@@ -27798,12 +27811,23 @@ fn def_slots_reference_triggering_batch(def: &AbilityDefinition) -> bool {
     fn expr_references_batch(expr: &QuantityExpr) -> bool {
         match expr {
             QuantityExpr::Ref {
-                qty:
-                    QuantityRef::TrackedSetAggregate {
-                        source: TrackedAnaphorSource::TriggeringBatch,
-                        ..
+                qty: QuantityRef::PropertyAggregate(aggregate),
+            } => {
+                let mut found = false;
+                let complete = aggregate.source().try_for_each_member(
+                    crate::types::ability::UNION_DEPTH_BUDGET,
+                    &mut |leaf| {
+                        found |= matches!(
+                            leaf,
+                            CardTypeSetSource::TrackedSet {
+                                set: TrackedAnaphorSource::TriggeringBatch,
+                                ..
+                            }
+                        );
                     },
-            } => true,
+                );
+                found || !complete
+            }
             QuantityExpr::Ref { .. } | QuantityExpr::Fixed { .. } => false,
             QuantityExpr::DivideRounded { inner, .. }
             | QuantityExpr::Multiply { inner, .. }
@@ -27843,12 +27867,23 @@ fn def_slots_reference_triggering_batch(def: &AbilityDefinition) -> bool {
 fn rebind_tracked_aggregate_expr(expr: &mut QuantityExpr) {
     match expr {
         QuantityExpr::Ref {
-            qty:
-                QuantityRef::TrackedSetAggregate {
-                    source: source @ TrackedAnaphorSource::TriggeringBatch,
-                    ..
+            qty: QuantityRef::PropertyAggregate(aggregate),
+        } => {
+            let mut source = aggregate.source().clone();
+            let complete = source.try_for_each_member_mut(
+                crate::types::ability::UNION_DEPTH_BUDGET,
+                &mut |leaf| {
+                    if let CardTypeSetSource::TrackedSet { set, .. } = leaf {
+                        if *set == TrackedAnaphorSource::TriggeringBatch {
+                            *set = TrackedAnaphorSource::ChainSet;
+                        }
+                    }
                 },
-        } => *source = TrackedAnaphorSource::ChainSet,
+            );
+            assert!(complete, "validated property aggregate source depth");
+            *aggregate = PropertyAggregate::new(aggregate.function(), aggregate.property(), source)
+                .expect("retargeting a tracked population preserves aggregate validity");
+        }
         QuantityExpr::Ref { .. } | QuantityExpr::Fixed { .. } => {}
         QuantityExpr::DivideRounded { inner, .. }
         | QuantityExpr::Multiply { inner, .. }
@@ -28490,8 +28525,9 @@ pub(crate) fn each_quantity_expr_mut(effect: &mut Effect, f: &mut impl FnMut(&mu
         Effect::Discover {
             mana_value_limit, ..
         } => f(mana_value_limit),
-        // CR 603.7c: A delayed payload retains the player scope of the ability
-        // that creates it, so its nested quantity references need the same
+        // CR 109.5: "you"/"your" in a delayed payload resolve to the delayed
+        // ability's controller (the creating spell's or ability's controller,
+        // per CR 603.7d-f), so its nested quantity references need the same
         // rewrite as direct effect fields.
         Effect::CreateDelayedTrigger { effect, .. } => {
             each_quantity_expr_mut(&mut effect.effect, f);
@@ -28588,8 +28624,9 @@ pub(crate) fn each_target_filter_mut(effect: &mut Effect, f: &mut impl FnMut(&mu
             target: Some(target),
             ..
         } => f(target),
-        // CR 603.7c: A delayed payload retains the player scope of the ability
-        // that creates it, so its nested target references need the same
+        // CR 109.5: "you"/"your" in a delayed payload resolve to the delayed
+        // ability's controller (the creating spell's or ability's controller,
+        // per CR 603.7d-f), so its nested target references need the same
         // rewrite as direct effect fields.
         Effect::CreateDelayedTrigger { effect, .. } => {
             each_target_filter_mut(&mut effect.effect, f);
@@ -28950,13 +28987,13 @@ fn apply_player_scope_rewrites(def: &mut AbilityDefinition) {
     }
 }
 
-/// CR 603.7c + CR 119.3 + CR 120.3: Rebind the event-bound player possessive
+/// CR 119.3 + CR 120.3: Rebind the event-bound player possessive
 /// inside a "deals [combat] damage to a player" / "attacks a player" trigger
 /// body from the *targeting* reading (`PlayerScope::Target`, emitted by the
 /// generic "their life" / "their hand" possessive parser) to the
 /// *event* reading (`PlayerScope::ScopedPlayer`).
 ///
-/// These triggers are NOT targeted (CR 603.6f): "they"/"their" binds to the
+/// These triggers are NOT targeted (CR 115.1d): "they"/"their" binds to the
 /// damaged/attacked player carried on the triggering event, which the engine
 /// stamps onto `ResolvedAbility::scoped_player` at resolution. Without this
 /// rewrite, "they lose half their life" parses its amount as

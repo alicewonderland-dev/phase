@@ -16,7 +16,7 @@ use super::card::TokenImageRef;
 use super::card_type::CoreType;
 use super::counter::CounterType;
 use super::game_state::{
-    DelayedTrigger, SpellCastRecord, StackEntry, StackEntryKind, StackPaidSnapshot,
+    CastOccurrence, DelayedTrigger, SpellCastRecord, StackEntry, StackEntryKind, StackPaidSnapshot,
     TransientContinuousEffect, ZoneChangeRecord,
 };
 use super::identifiers::{
@@ -1142,6 +1142,12 @@ pub struct ResolvedStackEntryFinalizeCommand {
     pub resulting_kind: Box<StackEntryKind>,
     pub expected_old_paid_facts: Option<Box<StackPaidSnapshot>>,
     pub resulting_paid_facts: Box<StackPaidSnapshot>,
+    /// The spell object's occurrence carrier settles with the finalized entry.
+    /// Legacy journals predate this provenance and therefore replay `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_old_cast_occurrence: Option<CastOccurrence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resulting_cast_occurrence: Option<CastOccurrence>,
     pub cause: RulesExecutionNodeRef,
 }
 
@@ -1160,6 +1166,8 @@ pub enum ResolvedStackEntryFinalizeReplayInvariantError {
     EntryKindMismatch(usize),
     #[error("stack-entry finalize expected different pre-existing paid facts for {0:?}")]
     PaidFactsMismatch(ObjectId),
+    #[error("stack-entry finalize expected different cast provenance for {0:?}")]
+    CastOccurrenceMismatch(ObjectId),
 }
 
 /// One exact CR 603.3d removal of an uncommitted triggered ability.
@@ -3056,19 +3064,60 @@ impl ResolvedRulesJournal {
                 }
             }
             ResolvedRulesCommand::StackEntryFinalize(command) => {
-                // Cause-only. There is no allocator receipt to cross-check:
-                // CR 601.2i retags an entry that CR 601.2a already created, so
-                // this authority draws no id and no timestamp and holds no
-                // high-water a forged journal could jump. Its remaining
-                // preconditions (CR 405.2 position, entry identity, the
-                // pre-finalize kind, and the prior paid facts) are all
-                // state-dependent and are enforced by
-                // `stack::apply_resolved_stack_entry_finalize`, where
-                // the state exists to check them against.
                 if entry.node != command.cause {
                     return Err(ResolvedRulesJournalError::InvalidSerializedAuthority(
                         "stack-entry finalize command has an unrelated cause".to_string(),
                     ));
+                }
+                // CR 601.2i: a non-legacy occurrence is not free-form metadata.
+                // It must name the earlier SpellCast edit at the recorded
+                // per-caster coordinate, and that record must identify the
+                // finalized spell object. The ledger write and the finalizer
+                // can be emitted by adjacent rules nodes in the casting
+                // pipeline, so their shared receipt is the occurrence/object
+                // tuple rather than node identity.
+                if let Some(occurrence) = command.resulting_cast_occurrence {
+                    let matching_cast = self
+                        .entries
+                        .iter()
+                        .take_while(|candidate| candidate.ordinal != entry.ordinal)
+                        .any(|candidate| {
+                            matches!(
+                                candidate.command.as_ref(),
+                                Some(ResolvedRulesCommand::LedgerEdit(ledger))
+                                    if matches!(
+                                        &ledger.edit,
+                                        ResolvedLedgerEdit::SpellCast {
+                                            player,
+                                            record,
+                                            expected_turn_history_len,
+                                            ..
+                                        } if *player == occurrence.caster
+                                            && *expected_turn_history_len
+                                                == occurrence.turn_journal_index
+                                            && record.spell_object_id == Some(command.object)
+                                    )
+                            )
+                        });
+                    if !matching_cast {
+                        return Err(ResolvedRulesJournalError::InvalidSerializedAuthority(
+                            "stack-entry finalize cast provenance has no matching prior spell-cast ledger edit"
+                                .to_string(),
+                        ));
+                    }
+                    let graph_matches = matches!(
+                        command.resulting_kind.as_ref(),
+                        StackEntryKind::Spell { ability, .. }
+                            if ability.as_deref().is_none_or(|ability| {
+                                ability.cast_occurrence_matches_recursive(occurrence)
+                            })
+                    );
+                    if !graph_matches {
+                        return Err(ResolvedRulesJournalError::InvalidSerializedAuthority(
+                            "stack-entry finalize cast provenance disagrees with its resulting ability graph"
+                                .to_string(),
+                        ));
+                    }
                 }
             }
             ResolvedRulesCommand::UncommittedTriggerRemoval(command) => {

@@ -5,6 +5,7 @@ use crate::parser::oracle_ir::doc::{
     UnsupportedAbilityCategory, UnsupportedAbilityIr,
 };
 use crate::parser::oracle_ir::static_ir::StaticIr;
+use crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER;
 use crate::types::ability::{
     AdditionalCostOrigin, AdditionalCostPaymentSource, CountScope, CounterAdjustment, DoorLockOp,
     PlayerRelation, SpellStackToGraveyardReplacement,
@@ -20088,17 +20089,23 @@ fn assert_abzan_greatest_toughness_gate(condition: &AbilityCondition) {
             comparator: Comparator::GE,
             value:
                 QuantityExpr::Ref {
-                    qty:
-                        QuantityRef::Aggregate {
-                            function: AggregateFunction::Max,
-                            property: ObjectProperty::Toughness,
-                            filter: TargetFilter::Typed(population),
-                        },
+                    qty: QuantityRef::PropertyAggregate(aggregate),
                 },
         } = prop
         else {
             return false;
         };
+        let crate::types::ability::CardTypeSetSource::Objects {
+            filter: TargetFilter::Typed(population),
+        } = aggregate.source()
+        else {
+            return false;
+        };
+        if aggregate.function() != AggregateFunction::Max
+            || aggregate.property() != ObjectProperty::Toughness
+        {
+            return false;
+        }
         population.type_filters == vec![TypeFilter::Creature] && population.controller.is_none()
     });
     assert!(
@@ -20663,17 +20670,23 @@ fn assert_controlled_creature_greatest_power_filter(filter: &TargetFilter) {
             comparator: Comparator::GE,
             value:
                 QuantityExpr::Ref {
-                    qty:
-                        QuantityRef::Aggregate {
-                            function: AggregateFunction::Max,
-                            property: ObjectProperty::Power,
-                            filter: TargetFilter::Typed(population),
-                        },
+                    qty: QuantityRef::PropertyAggregate(aggregate),
                 },
         } = prop
         else {
             return false;
         };
+        let crate::types::ability::CardTypeSetSource::Objects {
+            filter: TargetFilter::Typed(population),
+        } = aggregate.source()
+        else {
+            return false;
+        };
+        if aggregate.function() != AggregateFunction::Max
+            || aggregate.property() != ObjectProperty::Power
+        {
+            return false;
+        }
         population.type_filters == vec![TypeFilter::Creature]
             && population.properties.iter().any(|prop| {
                 matches!(
@@ -26899,20 +26912,21 @@ fn you_attack_trigger_binds_its_attacked_player_object() {
     );
 }
 
-/// CR 201.5a: `scrub_modification_descriptions`'s `GrantReplacement` arm must
+/// CR 201.5a: `render_modification_descriptions`'s `GrantReplacement` arm must
 /// reach the nested `ReplacementDefinition`'s description, the same as its
 /// `GrantAbility`/`GrantTrigger`/`GrantStaticAbility` siblings. The production
 /// `GrantReplacement` producer (`leave_battlefield_exile_replacement`) never
-/// carries a description today, so this is a direct unit test of the scrub
-/// function itself rather than an end-to-end parse, proving the sweep is
+/// carries a description today, so this is a direct unit test of the render
+/// function itself rather than an end-to-end parse, proving the net is
 /// complete for the day a producer does attach one (or a self-referencing
 /// granted "would leave the battlefield" rider is added).
 ///
 /// Revert-to-red: removing the `GrantReplacement` arm (falling through to the
 /// wildcard `_ => {}`) leaves the raw placeholder character in the nested
-/// definition's description, flipping the assertion below to a failure.
+/// definition's description, so the `assert_eq!` below prints the escaped
+/// `\u{e0002}` where the granting card's printed name belongs.
 #[test]
-fn scrub_modification_descriptions_reaches_grant_replacement() {
+fn render_modification_descriptions_reaches_grant_replacement() {
     let mut replacement = ReplacementDefinition::new(ReplacementEvent::Moved);
     replacement.description = Some(format!(
         "If {GRANTING_SELF_PLACEHOLDER} would leave the battlefield, exile it instead."
@@ -26920,18 +26934,961 @@ fn scrub_modification_descriptions_reaches_grant_replacement() {
     let mut modification = ContinuousModification::GrantReplacement {
         replacement: Box::new(replacement),
     };
-    scrub_modification_descriptions(&mut modification);
+    render_modification_descriptions(&mut modification, "Ghoulcaller's Bell");
     let ContinuousModification::GrantReplacement { replacement } = &modification else {
-        panic!("expected GrantReplacement to survive scrubbing unchanged in shape");
+        panic!("expected GrantReplacement to survive rendering unchanged in shape");
     };
+    assert_eq!(
+        replacement.description.as_deref(),
+        Some("If Ghoulcaller's Bell would leave the battlefield, exile it instead."),
+        "the render loop must render the granter marker as the granting card's \
+         printed name in a granted replacement's description"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CR 201.5a — the display-render net's standing completeness instruments.
+// ---------------------------------------------------------------------------
+
+/// The brace-matched BODY of the declaration `header` opens: the text between
+/// the first `{` at or after `header`'s start and its matching `}`.
+///
+/// One rule serves both call shapes — an enum header that already ends in the
+/// brace (`"pub enum Effect {"`) and a function header that does not
+/// (`"fn render_effect_descriptions("`, whose signature carries no brace).
+///
+/// Test-only source lexing, in the `src/source_census.rs` family: it reads Rust
+/// SOURCE TEXT for a census, never Oracle text for parsing dispatch. The comment
+/// policy is not ours — callers pass text already through
+/// `source_census::code_lines`, so a header quoted in a doc comment cannot be
+/// what `find` lands on.
+fn census_body<'a>(src: &'a str, header: &str) -> &'a str {
+    let start = src
+        .find(header)
+        .unwrap_or_else(|| panic!("census: `{header}` not found in the scanned source"));
+    let open = start
+        + src[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("census: no opening brace after `{header}`"));
+    let mut depth = 0usize;
+    for (offset, ch) in src[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[open + 1..open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("census: unbalanced braces after `{header}`");
+}
+
+/// The variant (or field) names declared at depth 0 of a `census_body` slice.
+///
+/// Splits on depth-0 commas, drops `#[..]` attributes, and takes the leading
+/// identifier of each part. Struct-like, tuple-like, and unit variants all yield
+/// exactly their name.
+fn census_variant_names(body: &str) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+    let mut current = String::new();
+    for ch in body.chars() {
+        match ch {
+            '{' | '(' | '[' => depth += 1,
+            '}' | ')' | ']' => depth -= 1,
+            _ => {}
+        }
+        if ch == ',' && depth == 0 {
+            parts.push(std::mem::take(&mut current));
+        } else {
+            current.push(ch);
+        }
+    }
+    parts.push(current);
+
+    let mut names = Vec::new();
+    for part in parts {
+        // Drop attributes so `#[serde(default)] Foo` yields `Foo`, not `serde`.
+        let mut without_attrs = String::new();
+        let mut rest = part.as_str();
+        while let Some(hash) = rest.find("#[") {
+            without_attrs.push_str(&rest[..hash]);
+            let mut depth = 0i32;
+            let mut end = None;
+            for (offset, ch) in rest[hash..].char_indices() {
+                match ch {
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(hash + offset + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match end {
+                Some(e) => rest = &rest[e..],
+                None => {
+                    rest = "";
+                    break;
+                }
+            }
+        }
+        without_attrs.push_str(rest);
+
+        let trimmed = without_attrs.trim_start();
+        let ident: String = trimmed
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !ident.is_empty() && trimmed.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+            names.push(ident);
+        }
+    }
+    names
+}
+
+/// CR 201.5a — STANDING CENSUS for the display-render net's carrier set.
+///
+/// `render_effect_descriptions` (`parser/oracle.rs`) ends in `_ => {}` on
+/// purpose: a wildcard-free match would duplicate `types::ability_visit`'s
+/// ~206-name leaf list, the duplication CLAUDE.md forbids. This census restores
+/// the decision-forcing property the wildcard gives up, in the shape
+/// `src/source_census.rs` documents ("a producer added or deleted without
+/// adjudication is a counted event"), and routes through that module's
+/// comment-stripping authority rather than bringing its own policy.
+///
+/// MEASURED: adding an `Effect` variant with an `AbilityDefinition` payload
+/// breaks 20 wildcard-free matches elsewhere in the crate and NONE of them is
+/// the render net; this census is what fails.
+///
+/// THREE PINS, for the three ways the descend set can silently rot:
+///
+/// 1. `EFFECT_VARIANT_PIN` — a new `Effect` VARIANT.
+/// 2. `PAYLOAD_ENUM_PINS` — a new variant on an INTERMEDIATE PAYLOAD ENUM. Each
+///    of these five enums has exactly ONE description-reaching variant today, so
+///    the net's arms destructure that one variant and every sibling falls
+///    through the outer `_ => {}` — silently, since neither the `Effect`-variant
+///    pin nor the planted-marker fixture can see it. `types::ability_visit` has
+///    the same shape for `VoteSubject`/`CounterSourceRider` and only DISCLOSES
+///    it in prose; pinning is chosen here instead because the cost is one table
+///    row per enum rather than a leaf-name list, and because prose disclosure is
+///    exactly what let four carriers escape a careful manual enumeration.
+///    `DelayedTriggerCondition` is deliberately ABSENT from the table:
+///    `render_delayed_condition_descriptions`'s match is wildcard-free, so a new
+///    variant there is a COMPILE ERROR — strictly stronger than a pin.
+/// 3. `RENDER_DESCEND` — the net's own arm set, scanned out of its body, so
+///    deleting an arm reds independently of any behavioral fixture.
+///
+/// `ModalChoice` is deliberately ABSENT from all three. It is a STRUCT reached by
+/// FIELD (`ParsedAbilities::modal`, `AbilityDefinition::modal`), not an `Effect`
+/// variant and not a payload ENUM, so no mechanism here can see it — a new field
+/// on it is drift class (c). `parser::oracle::render_modal_descriptions`
+/// destructures it EXHAUSTIVELY instead, making that addition a COMPILE ERROR,
+/// which is strictly stronger than a pin — the same trade
+/// `render_delayed_condition_descriptions`' wildcard-free match makes.
+///
+/// Regenerate the descend set (the derivation rule is FIELD TYPES followed
+/// transitively into named types, with `AbilityCost` blocked as a separate
+/// axis — unblocked it makes 184 of 232 variants carriers via
+/// `TargetFilter -> TypedFilter -> FilterProp -> Keyword -> AbilityCost`) with
+/// the closure script in the plan's carrier-enumeration section.
+///
+/// Revert-to-red (a): add any `Effect` variant -> the count pin fails, naming
+/// the classification decision. (b): add a variant to any of the five payload
+/// enums -> that row fails, naming the outer-wildcard hole. (c): delete any arm
+/// from `render_effect_descriptions` -> the descend-set equality fails, naming
+/// it.
+#[test]
+fn render_net_effect_carrier_census() {
+    const EFFECT_VARIANT_PIN: usize = 232;
+    /// `(enum header, pinned variant count, the ONE variant the net destructures)`.
+    const PAYLOAD_ENUM_PINS: &[(&str, usize, &str)] = &[
+        ("pub enum CastingPermission {", 8, "ExileWithAltCost"),
+        ("pub enum ExiledSpellRider {", 2, "ReturnTo"),
+        ("pub enum CounterSourceRider {", 2, "LosesAbilities"),
+        ("pub enum VoteSubject {", 2, "Objects"),
+    ];
+    const RENDER_DESCEND: &[&str] = &[
+        "AddPendingEntersModifications",
+        "AddTargetReplacement",
+        "BecomeCopy",
+        "ChooseOneOf",
+        "CopySpell",
+        "CopyTokenOf",
+        "Counter",
+        "CreateDelayedTrigger",
+        "CreateDrawReplacement",
+        "CreateEmblem",
+        "CreatePlaneswalkReplacement",
+        "EachPlayerCopyChosen",
+        "ExileResolvingSpellInsteadOfGraveyard",
+        "FlipCoin",
+        "FlipCoinUntilLose",
+        "FlipCoins",
+        "GenericEffect",
+        "GrantCastingPermission",
+        "Mana",
+        "ReturnAsAura",
+        "RevealFromHand",
+        "RollDie",
+        "SeparateIntoPiles",
+        "Token",
+        "Unimplemented",
+        "Vote",
+    ];
+
+    let ability_src = crate::source_census::code_lines(include_str!("../types/ability.rs"));
+    let variants = census_variant_names(census_body(&ability_src, "pub enum Effect {"));
     assert!(
-        !replacement
-            .description
-            .as_deref()
-            .unwrap()
-            .contains(GRANTING_SELF_PLACEHOLDER),
-        "the scrub loop must remove the raw placeholder char from a granted \
-         replacement's description, got {:?}",
-        replacement.description
+        variants.len() > 200 && variants.iter().any(|v| v == "GenericEffect"),
+        "reach-guard: the scan found `pub enum Effect`'s body (n={}), not an \
+         empty or wrong region",
+        variants.len()
+    );
+    assert_eq!(
+        variants.len(),
+        EFFECT_VARIANT_PIN,
+        "`Effect` gained or lost a variant. Decide whether any of its FIELD TYPES \
+         transitively reaches a `description` string; if so add a descend arm to \
+         `render_effect_descriptions` (parser/oracle.rs) and list it in \
+         RENDER_DESCEND, then bump this pin."
+    );
+
+    let mana_src = crate::source_census::code_lines(include_str!("../types/mana.rs"));
+    for (header, pin, destructured) in PAYLOAD_ENUM_PINS.iter().copied().chain([(
+        "pub enum ManaSpellGrant {",
+        4usize,
+        "TriggerOnSpend",
+    )]) {
+        let src = if header.contains("ManaSpellGrant") {
+            &mana_src
+        } else {
+            &ability_src
+        };
+        let payload = census_variant_names(census_body(src, header));
+        assert!(
+            payload.iter().any(|v| v == destructured),
+            "reach-guard: the scan found `{header}`'s body, which must contain the \
+             one variant the render net destructures ({destructured}); got {payload:?}"
+        );
+        assert_eq!(
+            payload.len(),
+            pin,
+            "`{header}` gained or lost a variant. `render_effect_descriptions` \
+             destructures only `{destructured}` from this enum, and every sibling \
+             falls through its outer `_ => {{}}` UNSEEN — neither the `Effect` \
+             variant pin nor the planted-marker fixture catches that. Decide \
+             whether the new variant reaches a `description`; if so give it its \
+             own arm, then bump this pin."
+        );
+    }
+
+    let oracle_src = crate::source_census::code_lines(include_str!("oracle.rs"));
+    let net = census_body(&oracle_src, "fn render_effect_descriptions(");
+    let mut arms: Vec<String> = Vec::new();
+    for (i, _) in net.match_indices("Effect::") {
+        let name: String = net[i + "Effect::".len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() && !arms.contains(&name) {
+            arms.push(name);
+        }
+    }
+    arms.sort();
+    assert!(
+        !arms.is_empty(),
+        "reach-guard: the arm scan found the net's body"
+    );
+    let mut pinned: Vec<String> = RENDER_DESCEND.iter().map(|s| s.to_string()).collect();
+    pinned.sort();
+    assert_eq!(arms, pinned, "render_effect_descriptions' descend arms");
+    for name in RENDER_DESCEND {
+        assert!(
+            variants.iter().any(|v| v == name),
+            "{name} is pinned as a descend arm but is not an `Effect` variant"
+        );
+    }
+}
+
+/// CR 201.5a — CARRIER-SHAPED completeness fixture for the display-render net,
+/// written in `types::ability_visit`'s planted-marker idiom (that module's doc
+/// names this fixture beside
+/// `game::printed_cards::tests::walker_covers_every_nested_carrier` and
+/// `ai_support::targeted_exchange::tests::predicate_sees_a_fight_in_every_nested_carrier`,
+/// and instructs contributors to extend all three).
+///
+/// This is the complement `render_net_effect_carrier_census` cannot be: a new
+/// description-bearing FIELD on an existing carrier's payload is field access,
+/// not a variant, so no count pin can see it. Planting a marker in every carrier
+/// the net claims to descend is what does.
+///
+/// Every one of `render_effect_descriptions`' 26 descend arms is planted, plus
+/// both `DelayedTriggerCondition` sub-arms (`WheneverEvent`, and `WhenNextEvent`
+/// including its `or_trigger`), plus the structural recursions
+/// `sub_ability` / `else_ability` / `mode_abilities` / trigger `execute` /
+/// static `modifications` / replacement `execute`, plus both
+/// `ModalChoice::mode_descriptions` carriers (CR 700.2) — `ParsedAbilities::modal`
+/// and `AbilityDefinition::modal`. The modal pair is the one planted site that is
+/// NOT a field named `description`, which is precisely why it escaped the net
+/// until it was measured leaking; see [`modal_mode_description_renders_the_granter`]
+/// for the production-parse half of the same property.
+///
+/// Assertion order is deliberate: the pre-run reach-guards prove the tree really
+/// carries the markers (so a green is never a green-on-nothing), then (a) the
+/// serde oracle proves no marker survives anywhere at any depth, and (b) every
+/// tag reads `"<tag> sacrifice Probeblade"` — (b) is (a)'s positive reach-guard
+/// AND it NAMES the carrier that failed, which (a) alone cannot.
+///
+/// Revert-to-red: delete any single arm from `render_effect_descriptions` (or
+/// `render_delayed_condition_descriptions`) and (b) fails naming that carrier's
+/// tag, with (a) failing on the surviving raw marker.
+#[test]
+fn render_net_reaches_every_nested_description_carrier() {
+    use crate::types::ability::{
+        CastingPermission, CopyChooseScope, CopyRetargetPermission, CounterSourceRider,
+        DelayedTriggerCondition, DieResultBranch, Duration, ExiledSpellRider, ManaProduction,
+        ModalChoice, PermissionGrantee, PtValue, VoteSubject, VoteTally, VoteVisibility,
+        VoterScope,
+    };
+    use crate::types::mana::ManaSpellGrant;
+
+    const NAME: &str = "Probeblade";
+    // Every planted description is `<tag> sacrifice <MARKER>`; after the net runs
+    // it must read `<tag> sacrifice Probeblade`.
+    fn planted(tag: &str) -> String {
+        format!("{tag} sacrifice {GRANTING_SELF_PLACEHOLDER}")
+    }
+    fn rendered(tag: &str) -> String {
+        format!("{tag} sacrifice {NAME}")
+    }
+    /// A leaf `AbilityDefinition` whose own `description` carries the tag.
+    fn ability(tag: &str) -> AbilityDefinition {
+        let mut def = AbilityDefinition::new(AbilityKind::Spell, Effect::Investigate);
+        def.description = Some(planted(tag));
+        def
+    }
+    /// A leaf `StaticDefinition` whose own `description` carries the tag.
+    fn static_def(tag: &str) -> StaticDefinition {
+        let mut st = StaticDefinition::new(StaticMode::Continuous);
+        st.description = Some(planted(tag));
+        st
+    }
+    /// A leaf `TriggerDefinition` whose own `description` carries the tag.
+    fn trigger_def(tag: &str) -> TriggerDefinition {
+        let mut tr = TriggerDefinition::new(TriggerMode::ChangesZone);
+        tr.description = Some(planted(tag));
+        tr
+    }
+    /// A leaf `ReplacementDefinition` whose own `description` carries the tag.
+    fn replacement_def(tag: &str) -> ReplacementDefinition {
+        let mut rep = ReplacementDefinition::new(ReplacementEvent::Moved);
+        rep.description = Some(planted(tag));
+        rep
+    }
+    /// A `ContinuousModification` that nests a tagged ability.
+    fn granted(tag: &str) -> ContinuousModification {
+        ContinuousModification::GrantAbility {
+            definition: Box::new(ability(tag)),
+        }
+    }
+    /// Wrap a carrier effect in an otherwise description-free ability, so the
+    /// only marker it contributes is the nested one under test.
+    fn carrier(effect: Effect) -> AbilityDefinition {
+        AbilityDefinition::new(AbilityKind::Spell, effect)
+    }
+
+    let mut tags: Vec<&str> = Vec::new();
+    // `ParsedAbilities` has no `Default`; start from the real production
+    // constructor on empty Oracle text so the tree under test is the same shape
+    // production builds, then plant into it.
+    let mut parsed = parse("", NAME, &[], &[], &[]);
+    assert!(
+        parsed.abilities.is_empty()
+            && parsed.triggers.is_empty()
+            && parsed.statics.is_empty()
+            && parsed.replacements.is_empty()
+            && parsed.modal.is_none(),
+        "reach-guard: empty Oracle text must yield an empty tree to plant into"
+    );
+
+    // ---- structural recursions on the four top-level vectors ----------------
+    let mut root = ability("ability_desc");
+    *root.effect = Effect::unimplemented("probe", planted("unimplemented"));
+    root.sub_ability = Some(Box::new(ability("sub_ability")));
+    root.else_ability = Some(Box::new(ability("else_ability")));
+    root.mode_abilities.push(ability("mode_ability"));
+    parsed.abilities.push(root);
+    tags.extend([
+        "ability_desc",
+        "unimplemented",
+        "sub_ability",
+        "else_ability",
+        "mode_ability",
+    ]);
+
+    let mut root_trigger = trigger_def("trigger_desc");
+    root_trigger.execute = Some(Box::new(ability("trigger_execute")));
+    parsed.triggers.push(root_trigger);
+    tags.extend(["trigger_desc", "trigger_execute"]);
+
+    let mut root_static = static_def("static_desc");
+    root_static
+        .modifications
+        .push(granted("static_modification"));
+    parsed.statics.push(root_static);
+    tags.extend(["static_desc", "static_modification"]);
+
+    let mut root_replacement = replacement_def("replacement_desc");
+    root_replacement.execute = Some(Box::new(ability("replacement_execute")));
+    parsed.replacements.push(root_replacement);
+    tags.extend(["replacement_desc", "replacement_execute"]);
+
+    // CR 700.2: the two `ModalChoice` carriers. `mode_descriptions` is a plain
+    // `Vec<String>` rather than a `description` field, so neither the serde
+    // oracle's sibling carriers nor any census pin plants it — it has to be
+    // planted here, at both sites a `ModalChoice` hangs off the parse tree.
+    parsed.modal = Some(ModalChoice {
+        mode_descriptions: vec![planted("parsed_modal_mode")],
+        ..ModalChoice::default()
+    });
+    tags.push("parsed_modal_mode");
+
+    let mut modal_host = carrier(Effect::Investigate);
+    modal_host.modal = Some(ModalChoice {
+        mode_descriptions: vec![planted("ability_modal_mode")],
+        ..ModalChoice::default()
+    });
+    parsed.abilities.push(modal_host);
+    tags.push("ability_modal_mode");
+
+    // ---- one planted site per `render_effect_descriptions` descend arm ------
+    parsed
+        .abilities
+        .push(carrier(Effect::AddPendingEntersModifications {
+            modifications: vec![granted("add_pending_enters")],
+        }));
+    tags.push("add_pending_enters");
+
+    let mut atr = replacement_def("add_target_replacement");
+    atr.execute = Some(Box::new(ability("add_target_replacement_execute")));
+    parsed.abilities.push(carrier(Effect::AddTargetReplacement {
+        replacement: Box::new(atr),
+        target: TargetFilter::Any,
+    }));
+    tags.extend(["add_target_replacement", "add_target_replacement_execute"]);
+
+    parsed.abilities.push(carrier(Effect::BecomeCopy {
+        target: TargetFilter::Any,
+        recipient: TargetFilter::SelfRef,
+        duration: None,
+        mana_value_limit: None,
+        additional_modifications: vec![granted("become_copy")],
+    }));
+    tags.push("become_copy");
+
+    parsed.abilities.push(carrier(Effect::CopySpell {
+        target: TargetFilter::Any,
+        retarget: CopyRetargetPermission::MayChooseNewTargets,
+        copier: None,
+        additional_modifications: vec![granted("copy_spell")],
+        starting_loyalty_from_casualty_sacrifice: false,
+    }));
+    tags.push("copy_spell");
+
+    parsed.abilities.push(carrier(Effect::CopyTokenOf {
+        target: TargetFilter::Any,
+        owner: TargetFilter::Controller,
+        source_filter: None,
+        enters_attacking: false,
+        tapped: false,
+        count: QuantityExpr::Fixed { value: 1 },
+        extra_keywords: vec![],
+        additional_modifications: vec![granted("copy_token_of")],
+    }));
+    tags.push("copy_token_of");
+
+    parsed.abilities.push(carrier(Effect::ChooseOneOf {
+        chooser: PlayerFilter::Controller,
+        branches: vec![ability("choose_one_of")],
+    }));
+    tags.push("choose_one_of");
+
+    let mut counter_static = static_def("counter_rider");
+    counter_static
+        .modifications
+        .push(granted("counter_rider_mod"));
+    parsed.abilities.push(carrier(Effect::Counter {
+        target: TargetFilter::Any,
+        source_rider: Some(CounterSourceRider::LosesAbilities {
+            static_def: Box::new(counter_static),
+            duration: Box::new(Duration::UntilHostLeavesPlay),
+        }),
+        countered_spell_zone: None,
+    }));
+    tags.extend(["counter_rider", "counter_rider_mod"]);
+
+    // CR 603.7a: both `condition` sub-arms that nest a `TriggerDefinition`.
+    parsed.abilities.push(carrier(Effect::CreateDelayedTrigger {
+        condition: DelayedTriggerCondition::WheneverEvent {
+            trigger: Box::new(trigger_def("delayed_whenever")),
+            expiry: crate::types::ability::WheneverEventExpiry::default(),
+        },
+        effect: Box::new(ability("delayed_effect")),
+        uses_tracked_set: false,
+    }));
+    tags.extend(["delayed_whenever", "delayed_effect"]);
+
+    parsed.abilities.push(carrier(Effect::CreateDelayedTrigger {
+        condition: DelayedTriggerCondition::WhenNextEvent {
+            trigger: Box::new(trigger_def("delayed_when_next")),
+            or_trigger: Some(Box::new(trigger_def("delayed_or_trigger"))),
+            lifetime: crate::types::ability::DelayedTriggerLifetime::default(),
+        },
+        effect: Box::new(ability("delayed_when_next_effect")),
+        uses_tracked_set: false,
+    }));
+    tags.extend([
+        "delayed_when_next",
+        "delayed_or_trigger",
+        "delayed_when_next_effect",
+    ]);
+
+    parsed
+        .abilities
+        .push(carrier(Effect::CreateDrawReplacement {
+            replacement_effect: Box::new(Effect::unimplemented(
+                "probe",
+                planted("create_draw_replacement"),
+            )),
+        }));
+    tags.push("create_draw_replacement");
+
+    parsed
+        .abilities
+        .push(carrier(Effect::CreatePlaneswalkReplacement {
+            replacement_effect: Box::new(Effect::unimplemented(
+                "probe",
+                planted("create_planeswalk_replacement"),
+            )),
+        }));
+    tags.push("create_planeswalk_replacement");
+
+    parsed.abilities.push(carrier(Effect::CreateEmblem {
+        statics: vec![static_def("emblem_static")],
+        triggers: vec![trigger_def("emblem_trigger")],
+    }));
+    tags.extend(["emblem_static", "emblem_trigger"]);
+
+    parsed.abilities.push(carrier(Effect::EachPlayerCopyChosen {
+        choose_filter: TargetFilter::Any,
+        min: 1,
+        max: 1,
+        copy_modifications: vec![granted("each_player_copy_chosen")],
+        scale: None,
+        choose_scope: CopyChooseScope::Chooser,
+    }));
+    tags.push("each_player_copy_chosen");
+
+    // CR 614.1 + CR 603.7a: the exile-instead rider's own delayed condition.
+    parsed
+        .abilities
+        .push(carrier(Effect::ExileResolvingSpellInsteadOfGraveyard {
+            on_exile: Some(ExiledSpellRider::ReturnTo {
+                destination: Zone::Hand,
+                timing: DelayedTriggerCondition::WheneverEvent {
+                    trigger: Box::new(trigger_def("exiled_spell_rider")),
+                    expiry: crate::types::ability::WheneverEventExpiry::default(),
+                },
+            }),
+        }));
+    tags.push("exiled_spell_rider");
+
+    parsed.abilities.push(carrier(Effect::FlipCoin {
+        win_effect: Some(Box::new(ability("flip_coin_win"))),
+        lose_effect: Some(Box::new(ability("flip_coin_lose"))),
+        flipper: TargetFilter::Controller,
+    }));
+    tags.extend(["flip_coin_win", "flip_coin_lose"]);
+
+    parsed.abilities.push(carrier(Effect::FlipCoins {
+        count: QuantityExpr::Fixed { value: 2 },
+        win_effect: Some(Box::new(ability("flip_coins_win"))),
+        lose_effect: Some(Box::new(ability("flip_coins_lose"))),
+        flipper: TargetFilter::Controller,
+    }));
+    tags.extend(["flip_coins_win", "flip_coins_lose"]);
+
+    parsed.abilities.push(carrier(Effect::FlipCoinUntilLose {
+        win_effect: Box::new(ability("flip_until_lose")),
+    }));
+    tags.push("flip_until_lose");
+
+    let mut generic_static = static_def("generic_effect");
+    generic_static
+        .modifications
+        .push(granted("generic_effect_mod"));
+    parsed.abilities.push(carrier(Effect::GenericEffect {
+        static_abilities: vec![generic_static],
+        duration: None,
+        target: None,
+        end_cost: None,
+    }));
+    tags.extend(["generic_effect", "generic_effect_mod"]);
+
+    // CR 611.2: the exile-with-alt-cost permission's enters-with modifications.
+    parsed
+        .abilities
+        .push(carrier(Effect::GrantCastingPermission {
+            permission: CastingPermission::ExileWithAltCost {
+                cost: crate::types::mana::ManaCost::default(),
+                cost_provenance: Default::default(),
+                cast_transformed: false,
+                constraint: None,
+                granted_to: None,
+                resolution_cleanup: None,
+                duration: None,
+                graveyard_replacement: None,
+                enters_with_counter: None,
+                enters_with_modifications: vec![granted("grant_casting_permission")],
+                mana_spend_permission: None,
+            },
+            target: TargetFilter::Any,
+            grantee: PermissionGrantee::AbilityController,
+        }));
+    tags.push("grant_casting_permission");
+
+    // CR 106.6 + CR 603.3: the mana-spend grant's reflexive triggered ability.
+    parsed.abilities.push(carrier(Effect::Mana {
+        produced: ManaProduction::Colorless {
+            count: QuantityExpr::Fixed { value: 1 },
+        },
+        restrictions: vec![],
+        grants: vec![ManaSpellGrant::TriggerOnSpend {
+            filter: TargetFilter::Any,
+            ability: Box::new(ability("mana_trigger_on_spend")),
+        }],
+        expiry: None,
+        target: None,
+    }));
+    tags.push("mana_trigger_on_spend");
+
+    parsed.abilities.push(carrier(Effect::ReturnAsAura {
+        enchant_filter: TargetFilter::Any,
+        grants: vec![granted("return_as_aura")],
+    }));
+    tags.push("return_as_aura");
+
+    parsed.abilities.push(carrier(Effect::RevealFromHand {
+        filter: TargetFilter::Any,
+        on_decline: Some(Box::new(ability("reveal_on_decline"))),
+    }));
+    tags.push("reveal_on_decline");
+
+    parsed.abilities.push(carrier(Effect::RollDie {
+        count: QuantityExpr::Fixed { value: 1 },
+        sides: 6,
+        results: vec![DieResultBranch {
+            min: 1,
+            max: 6,
+            effect: Box::new(ability("roll_die")),
+        }],
+        modifier: None,
+    }));
+    tags.push("roll_die");
+
+    parsed.abilities.push(carrier(Effect::SeparateIntoPiles {
+        partition_subject: VoterScope::EachOpponent,
+        object_filter: TargetFilter::Any,
+        chooser: PlayerScope::Controller,
+        chosen_pile_effect: Box::new(ability("piles_chosen")),
+        pile_source: crate::types::ability::PileSource::Battlefield,
+        unchosen_pile_effect: Some(Box::new(ability("piles_unchosen"))),
+    }));
+    tags.extend(["piles_chosen", "piles_unchosen"]);
+
+    let mut token_static = static_def("token_static");
+    token_static.modifications.push(granted("token_static_mod"));
+    parsed.abilities.push(carrier(Effect::Token {
+        name: "Probe".to_string(),
+        power: PtValue::Fixed(1),
+        toughness: PtValue::Fixed(1),
+        types: vec!["Creature".to_string()],
+        colors: vec![],
+        keywords: vec![],
+        tapped: false,
+        count: QuantityExpr::Fixed { value: 1 },
+        owner: TargetFilter::Controller,
+        attach_to: None,
+        enters_attacking: false,
+        supertypes: vec![],
+        static_abilities: vec![token_static],
+        enter_with_counters: vec![],
+    }));
+    tags.extend(["token_static", "token_static_mod"]);
+
+    parsed.abilities.push(carrier(Effect::Vote {
+        choices: vec!["x".to_string()],
+        per_choice_effect: vec![Box::new(ability("vote_per_choice"))],
+        starting_with: ControllerRef::You,
+        voter_scope: VoterScope::AllPlayers,
+        tally_mode: VoteTally::PerVote,
+        subject: VoteSubject::Objects {
+            candidate_filter: TargetFilter::Any,
+            outcome_template: Box::new(ability("vote_outcome_template")),
+        },
+        visibility: VoteVisibility::Open,
+    }));
+    tags.extend(["vote_per_choice", "vote_outcome_template"]);
+
+    // ---- PRE-RUN REACH-GUARDS ----------------------------------------------
+    // Without these the whole test could pass on an empty or mis-shaped tree.
+    let before = serde_json::to_string(&parsed).expect("ParsedAbilities serializes");
+    assert!(
+        before.contains(GRANTING_SELF_PLACEHOLDER),
+        "reach-guard: the hand-built tree must carry raw markers before the net runs"
+    );
+    for tag in &tags {
+        assert!(
+            before.contains(&planted(tag)),
+            "reach-guard: planted site `{tag}` is missing from the tree, so the \
+             post-run assertion for it would be vacuous"
+        );
+    }
+
+    render_granting_self_descriptions(&mut parsed, NAME);
+
+    // ---- (a) the serde ORACLE: no marker survives anywhere, at any depth ----
+    let after = serde_json::to_string(&parsed).expect("ParsedAbilities serializes");
+    assert!(
+        !after.contains(GRANTING_SELF_PLACEHOLDER),
+        "a raw CR 201.5a marker survived the render net; see the per-tag \
+         assertions below for which carrier"
+    );
+    // ---- (b) the POSITIVE reach-guard for (a), which NAMES the carrier ------
+    for tag in &tags {
+        assert!(
+            after.contains(&rendered(tag)),
+            "carrier `{tag}` was not reached by `render_effect_descriptions` / \
+             `render_delayed_condition_descriptions` — its planted description \
+             did not render to the granting card's printed name"
+        );
+    }
+}
+
+/// CR 611.2 + CR 201.5a — carrier fixture for `Effect::GenericEffect`, a
+/// resolution-time grant onto a target. This route is a PRE-EXISTING PARSER
+/// LEAK at BASE_SHA: `try_parse_gain_quoted_ability` sets the description
+/// directly and never went through `parse_quoted_ability`'s old sanitizer, so
+/// the parser would emit a raw U+E0002 into `client/public/card-data.json` for
+/// any card with this shape. MEASURED: no card in the current corpus parses to
+/// that shape — a scan of the exported `card-data.json` finds zero U+E0002,
+/// raw or escaped, on either side of the change — so the leak is LATENT IN
+/// THE PARSER, not shipped. The `GenericEffect | Token` arm is what closes it;
+/// the arm is load-bearing for this fixture regardless of corpus coverage.
+///
+/// Revert-to-red: delete the `GenericEffect | Token` arm from
+/// `render_effect_descriptions` — the outer description reverts to
+/// `gain "{T}, Sacrifice \u{e0002}: Draw a card."`.
+#[test]
+fn resolution_time_grant_renders_the_granter_in_both_descriptions() {
+    let parsed = parse(
+        "Target creature gains \"{T}, Sacrifice Probeblade: Draw a card.\" until end of turn.",
+        "Probeblade",
+        &[],
+        &[],
+        &[],
+    );
+    let json = serde_json::to_string(&parsed).expect("ParsedAbilities serializes");
+    // POSITIVE REACH-GUARD: the typed channel must have consumed the marker as
+    // `TargetFilter::GrantingObject`, or the negative below is vacuous — an
+    // unmasked parse would carry no marker to leak in the first place.
+    assert!(
+        json.contains("GrantingObject"),
+        "reach-guard: the granter self-reference must reach the typed channel: {json}"
+    );
+    assert!(
+        !json.contains(GRANTING_SELF_PLACEHOLDER),
+        "a raw CR 201.5a marker survived into a resolution-time grant's descriptions"
+    );
+
+    let Effect::GenericEffect {
+        static_abilities, ..
+    } = parsed.abilities[0].effect.as_ref()
+    else {
+        panic!(
+            "expected a GenericEffect resolution-time grant, got {:?}",
+            parsed.abilities[0].effect
+        );
+    };
+    assert_eq!(
+        static_abilities[0].description.as_deref(),
+        Some("gain \"{T}, Sacrifice Probeblade: Draw a card.\""),
+        "the outer granting static's display description must name the granter"
+    );
+    let ContinuousModification::GrantAbility { definition } = &static_abilities[0].modifications[0]
+    else {
+        panic!(
+            "expected a GrantAbility modification, got {:?}",
+            static_abilities[0].modifications[0]
+        );
+    };
+    assert_eq!(
+        definition.description.as_deref(),
+        Some("{T}, Sacrifice Probeblade: Draw a card."),
+        "CR 201.5a: the granted body's own description must name the GRANTER, \
+         not collapse to the host token `~`"
+    );
+}
+
+/// CR 111.1 + CR 201.5a — carrier fixture for `Effect::Token`. A created token's
+/// own quoted body is a granted body whose granter is the CREATING card, so the
+/// marker must render there too. This is the measured regression risk: the
+/// `Token` half of the `GenericEffect | Token` arm is what keeps it from
+/// leaking.
+///
+/// Revert-to-red: delete that arm — the token static's description reverts to
+/// `Sacrifice \u{e0002}: Draw a card.`.
+#[test]
+fn token_body_grant_renders_the_granter() {
+    let parsed = parse(
+        "Create a 1/1 white Soldier creature token with \"Sacrifice Probeblade: Draw a card.\"",
+        "Probeblade",
+        &[],
+        &[],
+        &[],
+    );
+    let json = serde_json::to_string(&parsed).expect("ParsedAbilities serializes");
+    // POSITIVE REACH-GUARD, as above.
+    assert!(
+        json.contains("GrantingObject"),
+        "reach-guard: the granter self-reference must reach the typed channel: {json}"
+    );
+    assert!(
+        !json.contains(GRANTING_SELF_PLACEHOLDER),
+        "a raw CR 201.5a marker survived into a created token's granted body"
+    );
+    assert!(
+        json.contains("Sacrifice Probeblade"),
+        "CR 201.5a: the token's granted body must name the creating card: {json}"
+    );
+}
+
+/// CR 700.2 + CR 201.5a — carrier fixture for `ModalChoice::mode_descriptions`,
+/// the one player-facing description surface the net's four top-level vectors
+/// do NOT reach.
+///
+/// `mode_descriptions` is built from each mode's RAW line (`oracle_modal.rs`
+/// copies `mode.raw`), and that raw line is already MASKED, because `parse`
+/// normalizes card-name self-references BEFORE it splits lines. So the marker
+/// rides straight into a display string that no `description` field owns. It is
+/// player-facing for real: `game::interaction` projects `mode_descriptions` into
+/// the mode-choice prompt and the client renders it verbatim, so an unrendered
+/// marker would show as an invisible private-use character exactly where the
+/// granter's printed name belongs.
+///
+/// Revert-to-red: delete the `render_modal_descriptions` call from
+/// `render_granting_self_descriptions` — `mode_descriptions[0]` reverts to
+/// `Target creature gains "Sacrifice \u{e0002}: Draw a card." until end of turn.`
+#[test]
+fn modal_mode_description_renders_the_granter() {
+    let parsed = parse(
+        "Choose one —\n\
+         • Target creature gains \"Sacrifice Probeblade: Draw a card.\" until end of turn.\n\
+         • Draw a card.",
+        "Probeblade",
+        &[],
+        &[],
+        &[],
+    );
+    let json = serde_json::to_string(&parsed).expect("ParsedAbilities serializes");
+    // POSITIVE REACH-GUARD: the masker must actually have fired on this text and
+    // the typed channel must have consumed the marker as `GrantingObject`. An
+    // unmasked parse carries no marker at all, which would make the negative
+    // below pass on nothing.
+    assert!(
+        json.contains("GrantingObject"),
+        "reach-guard: the granter self-reference must reach the typed channel: {json}"
+    );
+    let modal = parsed
+        .modal
+        .as_ref()
+        .expect("reach-guard: the modal header must parse into `ParsedAbilities::modal`");
+    assert_eq!(
+        modal.mode_descriptions.first().map(String::as_str),
+        Some("Target creature gains \"Sacrifice Probeblade: Draw a card.\" until end of turn."),
+        "CR 201.5a: a mode's player-facing description must name the GRANTER"
+    );
+    assert!(
+        !json.contains(GRANTING_SELF_PLACEHOLDER),
+        "a raw CR 201.5a marker survived into a modal spell's mode descriptions"
+    );
+}
+
+/// CR 118 + CR 201.5a — the `AbilityCost` axis is the render net's NAMED
+/// BOUNDARY, and no production parse shape crosses it. Two halves.
+///
+/// **(i) The boundary itself.** A marker hand-planted in
+/// `AbilityCost::Unimplemented.description` SURVIVES the net. That is the
+/// current, deliberate contract, not a bug to fix here: `AbilityCost` is blocked
+/// as a traversal edge because unblocking it makes 184 of `Effect`'s 232
+/// variants "carriers" via `TargetFilter -> TypedFilter -> FilterProp ->
+/// Keyword -> AbilityCost` — the cost axis is reachable from nearly every
+/// `TargetFilter` in the tree, not a sidecar on `def.cost`. Precedent:
+/// `types::ability_visit`'s module doc keeps the effect walk and the cost walk
+/// separate for the same type-level reason. **If this half ever reds, the net
+/// grew a cost walk and point 5 of its traversal contract must be rewritten —
+/// it does NOT mean this test is wrong.**
+///
+/// **(ii) No production shape reaches it.** A granted body engineered to defeat
+/// cost parsing still leaks nothing, WITH `GrantingObject` present as the
+/// positive reach-guard. (The `unless you discard a card` shape was measured
+/// `reach=false` and would make this negative vacuous, so it is deliberately not
+/// the fixture here.)
+#[test]
+fn granted_cost_axis_is_not_walked_and_no_parse_shape_reaches_it() {
+    // (i) BOUNDARY.
+    let mut boundary = parse("", "Probeblade", &[], &[], &[]);
+    let mut def = AbilityDefinition::new(AbilityKind::Activated, Effect::Investigate);
+    def.cost = Some(AbilityCost::Unimplemented {
+        description: format!("sacrifice {GRANTING_SELF_PLACEHOLDER}"),
+    });
+    boundary.abilities.push(def);
+    render_granting_self_descriptions(&mut boundary, "Probeblade");
+    let boundary_json = serde_json::to_string(&boundary).expect("ParsedAbilities serializes");
+    assert!(
+        boundary_json.contains(GRANTING_SELF_PLACEHOLDER),
+        "the `AbilityCost` axis is the net's declared boundary — a marker on \
+         `def.cost` must SURVIVE. A red here means the net grew a cost walk; \
+         update traversal-contract point 5 in `render_granting_self_descriptions`'s \
+         doc rather than this assertion."
+    );
+
+    // (ii) PRODUCTION.
+    let parsed = parse(
+        "Equipped creature has \"{T}, Sacrifice Probeblade, Pay 3 life, Remove a fervor counter: Draw a card.\"",
+        "Probeblade",
+        &[],
+        &[],
+        &["Equipment"],
+    );
+    let json = serde_json::to_string(&parsed).expect("ParsedAbilities serializes");
+    // POSITIVE REACH-GUARD: without this the negative below would pass on any
+    // parse that never masked a granter reference at all.
+    assert!(
+        json.contains("GrantingObject"),
+        "reach-guard: the granter self-reference must reach the typed channel \
+         for this cost-hostile shape: {json}"
+    );
+    assert!(
+        !json.contains(GRANTING_SELF_PLACEHOLDER),
+        "no production parse shape may plant a marker on the excluded \
+         `AbilityCost` axis: {json}"
     );
 }

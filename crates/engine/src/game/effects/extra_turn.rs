@@ -73,6 +73,7 @@ mod tests {
             scoped_player: None,
             target_chooser: None,
             source_id: ObjectId(1),
+            cast_occurrence: None,
             source_incarnation: None,
             trigger_source: None,
             trigger_definition_ref: None,

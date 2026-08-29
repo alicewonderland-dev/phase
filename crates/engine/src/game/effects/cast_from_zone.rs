@@ -12,6 +12,12 @@ use crate::types::statics::CastFrequency;
 use crate::types::zones::{EtbTapState, Zone};
 use std::collections::HashSet;
 
+pub(crate) fn stack_spell_copy_cast_ledger_error(
+    error: crate::types::resolved_commands::ResolvedLedgerEditReplayInvariantError,
+) -> EffectError {
+    EffectError::InvalidParam(format!("failed to record stack spell copy cast: {error}"))
+}
+
 /// CR 400.1/400.2: Recursively extract a filter's own `controller` axis,
 /// looking through the composed forms (`Not`/`And`/`Or`) a real card's target
 /// filter may be built from rather than only matching a bare `Typed`. `And`/
@@ -1040,12 +1046,6 @@ fn cast_stack_spell_copy_during_resolution(
     copy_id: ObjectId,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    events.push(GameEvent::EffectResolved {
-        kind: EffectKind::CastFromZone,
-        source_id: ability.source_id,
-        subject: None,
-    });
-
     let Some(obj) = state.objects.get(&copy_id).cloned() else {
         return Err(EffectError::InvalidParam(format!(
             "stack spell copy {copy_id:?} not found"
@@ -1056,6 +1056,16 @@ fn cast_stack_spell_copy_during_resolution(
             "ParentTarget {copy_id:?} is not a stack spell copy"
         )));
     }
+    crate::game::ledger::validate_spell_cast_recording(state, ability.controller)
+        .map_err(stack_spell_copy_cast_ledger_error)?;
+    crate::game::casting_costs::validate_cast_occurrence_stack_spell_carrier(state, copy_id)
+        .map_err(|error| EffectError::InvalidParam(error.to_string()))?;
+
+    events.push(GameEvent::EffectResolved {
+        kind: EffectKind::CastFromZone,
+        source_id: ability.source_id,
+        subject: None,
+    });
 
     // CR 113.2c + CR 601.2i + CR 608.2g: this copy is now being CAST, so
     // snapshot its effective spell keywords before recording SpellCast. This
@@ -1075,13 +1085,16 @@ fn cast_stack_spell_copy_during_resolution(
         object_id: copy_id,
         cast_mana_value: Some(obj.spell_mana_value()),
     });
-    crate::game::restrictions::record_spell_cast_from_zone(
+    let occurrence = crate::game::restrictions::record_spell_cast_from_zone(
         state,
         ability.controller,
         &obj,
         origin,
         CastingVariant::Normal,
-    );
+    )
+    .map_err(stack_spell_copy_cast_ledger_error)?;
+    crate::game::casting_costs::stamp_cast_occurrence_on_stack_spell(state, copy_id, occurrence)
+        .map_err(|error| EffectError::InvalidParam(error.to_string()))?;
 
     if crate::game::effects::prepare::open_copy_target_selection(
         state,
@@ -2039,6 +2052,8 @@ mod tests {
         let mut events = Vec::new();
         copy_spell::resolve(&mut state, &copy_ability, &mut events).unwrap();
         let copy_id = state.stack.back().expect("copy on stack").id;
+        assert_eq!(state.objects[&copy_id].cast_occurrence, None);
+        assert!(state.spells_cast_this_turn_by_player.is_empty());
 
         let cast_ability = ResolvedAbility::new(
             Effect::CastFromZone {
@@ -2074,6 +2089,24 @@ mod tests {
             }),
             "CastFromZone must complete the copy cast with SpellCast"
         );
+        let occurrence = state.objects[&copy_id]
+            .cast_occurrence
+            .expect("the newly cast stack copy receives a fresh coordinate");
+        assert_eq!(occurrence.caster, PlayerId(0));
+        assert_eq!(occurrence.turn_journal_index, 0);
+        assert_eq!(
+            state
+                .stack
+                .iter()
+                .find(|entry| entry.id == copy_id)
+                .and_then(StackEntry::ability)
+                .and_then(|ability| ability.cast_occurrence),
+            Some(occurrence)
+        );
+        assert_eq!(
+            state.spells_cast_this_turn_by_player[&PlayerId(0)][0].spell_object_id,
+            Some(copy_id)
+        );
         assert!(
             matches!(
                 state.waiting_for,
@@ -2104,6 +2137,87 @@ mod tests {
             }),
             "copy spell must remain on the stack after targeting"
         );
+    }
+
+    #[test]
+    fn spell_cast_writer_error_mappings_are_explicit_and_non_panicking_for_stack_copy() {
+        use crate::types::game_state::{StackEntry, StackEntryKind};
+        use crate::types::resolved_commands::{ResolvedLedgerEdit, ResolvedRulesCommand};
+
+        let mut state = make_test_state();
+        state.waiting_for = WaitingFor::ResolveAllReady { epoch: 42 };
+        let copy_id = create_object(
+            &mut state,
+            CardId(68_655),
+            PlayerId(0),
+            "Overflow Stack Copy".to_string(),
+            Zone::Stack,
+        );
+        state.objects.get_mut(&copy_id).unwrap().is_copy = true;
+        state.stack.push_back(StackEntry {
+            id: copy_id,
+            source_id: copy_id,
+            controller: PlayerId(0),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(68_655),
+                ability: None,
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        });
+        state.spells_cast_this_game.insert(PlayerId(0), u32::MAX);
+        let cast = ResolvedAbility::new(
+            Effect::CastFromZone {
+                target: TargetFilter::ParentTarget,
+                without_paying_mana_cost: true,
+                mode: CardPlayMode::Cast,
+                cast_transformed: false,
+                alt_ability_cost: None,
+                constraint: None,
+                duration: None,
+                driver: CastFromZoneDriver::DuringResolution,
+                mana_spend_permission: None,
+            },
+            vec![TargetRef::Object(copy_id)],
+            ObjectId(68_656),
+            PlayerId(0),
+        );
+        let object_before = serde_json::to_value(&state.objects[&copy_id]).unwrap();
+        let stack_before = state.stack.clone();
+        let next_object_id_before = state.next_object_id;
+        let journal_len_before = state.resolved_rules_journal.entries().len();
+        let mut events = Vec::new();
+
+        let error = resolve(&mut state, &cast, &mut events)
+            .expect_err("the real stack-copy writer must propagate ledger overflow");
+        assert!(matches!(
+            error,
+            EffectError::InvalidParam(ref message)
+                if message == "failed to record stack spell copy cast: resolved ledger command overflows a counter"
+        ));
+        assert_eq!(
+            serde_json::to_value(&state.objects[&copy_id]).unwrap(),
+            object_before
+        );
+        assert_eq!(state.stack, stack_before);
+        assert_eq!(state.next_object_id, next_object_id_before);
+        assert!(events.is_empty());
+        assert!(state.spells_cast_this_turn_by_player.is_empty());
+        assert_eq!(
+            state.resolved_rules_journal.entries().len(),
+            journal_len_before
+        );
+        assert!(!state.resolved_rules_journal.entries().iter().any(|entry| {
+            matches!(
+                entry.command.as_ref(),
+                Some(ResolvedRulesCommand::LedgerEdit(command))
+                    if matches!(command.edit, ResolvedLedgerEdit::SpellCast { .. })
+            )
+        }));
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::ResolveAllReady { epoch: 42 }
+        ));
     }
 
     /// CR 310.12b (#2876): Siege defeat — "exile it, then you may cast it

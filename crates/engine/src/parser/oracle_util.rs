@@ -2122,13 +2122,65 @@ fn unmask_card_named_literal_spans(text: String, originals: &[String]) -> String
 /// [`mask_granting_self_reference_in_quotes`] when a card's own printed name
 /// appears in a self-reference (verb-object) position inside a *quoted granted
 /// body*. Unlike the other placeholders in this module it is deliberately NOT
-/// unmasked at the end of normalization — it survives into the parser, where
-/// `parse_self_reference` and the cost self-ref combinators map it to
-/// `TargetFilter::GrantingObject` (concretized to the granting object at
-/// grant-clone time). Any un-migrated parser path that still sees it degrades it
-/// to `~` (host `SelfRef`) via a final cleanup in `parse_quoted_ability`, so a
-/// missed site is never worse than the pre-fix host binding.
+/// unmasked at the end of normalization — it survives into the parser and feeds
+/// TWO channels:
+///
+/// * the TYPED channel — `parse_self_reference` (`oracle_nom/target.rs`) and the
+///   cost self-ref combinators map it to `TargetFilter::GrantingObject`,
+///   concretized to the granting object at each Layer-6 grant; and
+/// * the DISPLAY channel — [`render_granting_self_reference`], invoked from the
+///   two production parse entry points `parser::oracle::parse_oracle_text` and
+///   `game::effects::token::catalog_rules_text_abilities`, which renders the
+///   marker as the granting object's PRINTED name.
+///
+/// Naming both entry points here makes the leak surface auditable from the
+/// constant itself. The standing completeness authority for the display channel
+/// is not this comment: it is `parser::oracle::tests::render_net_effect_carrier_census`
+/// (a new `Effect` variant, or a new variant on an intermediate payload enum,
+/// reds it), `parser::oracle::tests::render_net_reaches_every_nested_description_carrier`
+/// (a new description-bearing FIELD on an existing carrier reds it), and the
+/// corpus-wide `serde_json` leak guards.
 pub(crate) const GRANTING_SELF_PLACEHOLDER: &str = "\u{E0002}";
+
+/// CR 201.5a + CR 201.5c: Render a granting-object self-reference for DISPLAY.
+///
+/// [`mask_granting_self_reference_in_quotes`] marks a granted quoted body's
+/// by-name reference to its GRANTING object with [`GRANTING_SELF_PLACEHOLDER`],
+/// keeping it distinct from the host self-reference `~`. The typed channel
+/// consumes the marker as `TargetFilter::GrantingObject`; this is that channel's
+/// display mirror — the marker renders as the granting object's PRINTED name, so
+/// the client's host-name substitution (`~` -> the object the ability is on;
+/// CR 201.5b, `client/src/utils/description.ts::renderDescription`) can never
+/// capture a granter reference.
+///
+/// WHY PARSE TIME, NOT THE LAYER-6 GRANT (CR 201.5a, last sentence — "This is
+/// also true if the second ability is copied onto a new object"):
+/// `GrantAllActivatedAbilitiesOf` is expanded at continuous-effect collection
+/// time into one synthesized `GrantAbility` per donated ability, each emitted
+/// with `source_id: recipient_id` (`game::layers::expand_granted_activated_abilities`).
+/// Layer 6 concretizes against that `source_id`, so a live name lookup there
+/// would stamp the RE-GRANTING object's name rather than the original granter's.
+/// The printed name resolved once, here, travels through the copy correctly.
+///
+/// CR 201.5c: a printed shortened name is treated as the card's full name, so
+/// emitting the full printed name is correct even where the body printed a short
+/// form ("Sacrifice Captain Kirk" on "Captain James T. Kirk").
+///
+/// PRECONDITION: `card_name` must be a real printed name. With an empty
+/// (or empty-after-`A-`-strip) name there is nothing to render, so the marker is
+/// left in place — a visible failure rather than a silently DELETED CR 201.5a
+/// reference. `game::coverage`'s `normalize_for_matching` passes `""` in three
+/// unit tests whose inputs carry no marker; production always passes a real name.
+///
+/// Single authority: every site that finalizes a display description calls this.
+pub(crate) fn render_granting_self_reference(text: &str, card_name: &str) -> String {
+    let printed = alchemy_effective_name(card_name);
+    if printed.is_empty() {
+        return text.to_string();
+    }
+    // allow-noncombinator: display-string sentinel rendering; not parsing dispatch.
+    text.replace(GRANTING_SELF_PLACEHOLDER, printed)
+}
 
 /// CR 201.5a: Self-reference verb-object trigger phrases — the positions whose
 /// downstream combinator (`parse_cost_self_reference` in `oracle_cost.rs` /
@@ -3173,6 +3225,65 @@ mod tests {
         );
     }
 
+    /// H1 — CR 201.5b: a host self-reference (`~`) is NOT a granter reference and
+    /// must survive the render byte-for-byte. The helper's only production branch
+    /// on a marker-free string is `String::replace` with zero matches.
+    #[test]
+    fn render_granting_self_reference_leaves_a_host_reference_alone() {
+        assert_eq!(
+            render_granting_self_reference("Sacrifice ~: Draw a card.", "Spare Dagger"),
+            "Sacrifice ~: Draw a card."
+        );
+    }
+
+    /// H2 — the render reuses [`alchemy_effective_name`], the same helper the
+    /// masker uses, so a rebalanced Alchemy card renders its base printed name.
+    #[test]
+    fn render_granting_self_reference_strips_the_alchemy_prefix() {
+        assert_eq!(
+            render_granting_self_reference(
+                &format!("Sacrifice {GRANTING_SELF_PLACEHOLDER}: Draw a card."),
+                "A-Spare Dagger",
+            ),
+            "Sacrifice Spare Dagger: Draw a card."
+        );
+    }
+
+    /// H3 — CR 201.5c: printed text may use a shortened name, but the reference
+    /// is to the card, so the FULL printed name is what renders. Composed with
+    /// the real masker rather than a hand-planted marker, with a positive
+    /// reach-guard that the masker actually fired.
+    #[test]
+    fn render_granting_self_reference_emits_the_full_printed_name() {
+        let masked = normalize_card_name_refs(
+            "Creatures you control have \"Sacrifice Captain Kirk: Draw a card.\"",
+            "Captain James T. Kirk",
+        );
+        assert!(
+            masked.contains(GRANTING_SELF_PLACEHOLDER),
+            "reach-guard: the masker must place the granter marker, or the \
+             render assertion below proves nothing; got {masked}"
+        );
+        let rendered = render_granting_self_reference(&masked, "Captain James T. Kirk");
+        // allow-noncombinator: assertion over a rendered display string, not parsing dispatch.
+        let emits_full_name = rendered.contains("Sacrifice Captain James T. Kirk");
+        assert!(
+            emits_full_name,
+            "CR 201.5c: the full printed name must be emitted, got {rendered}"
+        );
+    }
+
+    /// H4 — the precondition branch. With no printed name there is nothing to
+    /// render, and DELETING a CR 201.5a reference would be worse than leaving a
+    /// visible marker. `game::coverage::normalize_for_matching` passes `""` in
+    /// three unit tests whose inputs carry no marker.
+    #[test]
+    fn render_granting_self_reference_keeps_the_marker_without_a_printed_name() {
+        let text = format!("x{GRANTING_SELF_PLACEHOLDER}y");
+        assert_eq!(render_granting_self_reference(&text, ""), text);
+        assert_eq!(render_granting_self_reference(&text, "A-"), text);
+    }
+
     #[test]
     fn normalize_of_based_short_name() {
         assert_eq!(
@@ -3928,12 +4039,9 @@ mod tests {
         assert!(matches!(
             qty,
             QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: AggregateFunction::Max,
-                    property: ObjectProperty::ManaValue,
-                    ..
-                }
-            }
+                qty: QuantityRef::PropertyAggregate(aggregate),
+            } if aggregate.function() == AggregateFunction::Max
+                && aggregate.property() == ObjectProperty::ManaValue
         ));
         assert!(rest.is_empty());
     }

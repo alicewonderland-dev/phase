@@ -25,11 +25,11 @@ use crate::parser::oracle_target::{
 };
 use crate::parser::oracle_util::parse_subtype;
 use crate::types::ability::{
-    AbilityCondition, AggregateFunction, CastManaObjectScope, CastManaSpentMetric,
-    CommanderOwnership, Comparator, ControllerRef, CountScope, DamageChannel, DamageGroupKey,
-    DamageKindFilter, FilterProp, ObjectProperty, ObjectScope, PlayerFilter, PlayerRelation,
-    PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef, SharedQuality, StaticCondition,
-    TargetFilter, TypeFilter, TypedFilter, ZoneRef,
+    AbilityCondition, AggregateFunction, CardTypeSetSource, CastManaObjectScope,
+    CastManaSpentMetric, CommanderOwnership, Comparator, ControllerRef, CountScope, DamageChannel,
+    DamageGroupKey, DamageKindFilter, FilterProp, ObjectProperty, ObjectScope, PlayerFilter,
+    PlayerRelation, PlayerScope, PropertyAggregate, PtStat, PtValueScope, QuantityExpr,
+    QuantityRef, SharedQuality, StaticCondition, TargetFilter, TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::events::PlayerActionKind;
@@ -3140,11 +3140,16 @@ fn parse_you_control_superlative_object_condition(
             scope: PtValueScope::Current,
             comparator,
             value: QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: aggregate,
-                    property,
-                    filter: population_filter,
-                },
+                qty: QuantityRef::PropertyAggregate(
+                    PropertyAggregate::new(
+                        aggregate,
+                        property,
+                        CardTypeSetSource::Objects {
+                            filter: population_filter,
+                        },
+                    )
+                    .expect("object property aggregate is valid"),
+                ),
             },
         },
     );
@@ -3192,11 +3197,16 @@ fn build_superlative_comparison(
         lhs: QuantityExpr::Ref { qty: lhs_qty },
         comparator,
         rhs: QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate {
-                function: aggregate,
-                property,
-                filter: aggregate_filter,
-            },
+            qty: QuantityRef::PropertyAggregate(
+                PropertyAggregate::new(
+                    aggregate,
+                    property,
+                    CardTypeSetSource::Objects {
+                        filter: aggregate_filter,
+                    },
+                )
+                .expect("object property aggregate is valid"),
+            ),
         },
     }
 }
@@ -3253,11 +3263,14 @@ pub(crate) fn parse_spell_target_has_superlative(
             lhs: QuantityExpr::Ref { qty: lhs_qty },
             comparator,
             rhs: QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: aggregate,
-                    property,
-                    filter,
-                },
+                qty: QuantityRef::PropertyAggregate(
+                    PropertyAggregate::new(
+                        aggregate,
+                        property,
+                        CardTypeSetSource::Objects { filter },
+                    )
+                    .expect("object property aggregate is valid"),
+                ),
             },
         },
     ))
@@ -3713,7 +3726,7 @@ fn parse_parent_target_referent(input: &str) -> OracleResult<'_, ParentTargetRef
 /// `parse_that_player_has_conditions` so any single-player subject ("that
 /// player", "target player") composes with these life-total tails.
 ///
-/// CR 119 (Life), CR 603.4 (intervening-if), CR 603.7c ("that player" anaphora
+/// CR 119 (Life), CR 603.4 (intervening-if), CR 120.3 ("that player" anaphora
 /// binds to the player event-context for damage triggers).
 fn parse_life_predicate(rest: &str, player: PlayerScope) -> Option<(&str, StaticCondition)> {
     // CR 119: "no life" → LifeTotal EQ 0 (defensive, mirrors hand-size's
@@ -4843,11 +4856,14 @@ fn parse_filter_have_total_property(input: &str) -> OracleResult<'_, StaticCondi
         rest,
         StaticCondition::QuantityComparison {
             lhs: QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: AggregateFunction::Sum,
-                    property,
-                    filter,
-                },
+                qty: QuantityRef::PropertyAggregate(
+                    PropertyAggregate::new(
+                        AggregateFunction::Sum,
+                        property,
+                        CardTypeSetSource::Objects { filter },
+                    )
+                    .expect("object property aggregate is valid"),
+                ),
             },
             comparator,
             rhs: QuantityExpr::Fixed { value: n as i32 },
@@ -10690,7 +10706,7 @@ mod tests {
         }
     }
 
-    /// CR 119 + CR 603.4 + CR 603.7c: "if that player has N or less life"
+    /// CR 119 + CR 603.4 + CR 120.3: "if that player has N or less life"
     /// intervening-if predicate on a combat-damage trigger. Canonical card:
     /// Ezio Auditore da Firenze. "That player" resolves to the damaged
     /// player (the event-context player), not the source's controller.
@@ -11583,6 +11599,71 @@ mod tests {
                 "controller axis mis-scoped for {text:?}"
             );
         }
+    }
+
+    /// CR 122.1 + CR 611.3a: Hundred-Battle Veteran's "there are three or more
+    /// different kinds of counters among creatures you control" must type as a
+    /// `QuantityComparison` over `DistinctCounterKindsAmong`, not fall back to
+    /// `StaticCondition::Unrecognized` (which `game/layers.rs` evaluates as
+    /// unconditionally true, making the P/T boost silently always-on). Registers
+    /// `parse_distinct_counter_kinds_among_tail` in `parse_quantity_ref`'s bare-
+    /// suffix `alt()` — the same dual-registration treatment already given to
+    /// `parse_distinct_colors_among_tail` (Puca's Eye).
+    #[test]
+    fn parse_inner_condition_distinct_counter_kinds_among_ge_3() {
+        let text =
+            "there are three or more different kinds of counters among creatures you control";
+        let (rest, cond) = parse_inner_condition(text)
+            .unwrap_or_else(|e| panic!("failed to parse {text:?}: {e:?}"));
+        assert_eq!(rest, "", "unconsumed remainder for {text:?}");
+        let StaticCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty: QuantityRef::DistinctCounterKindsAmong { filter },
+                },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 3 },
+        } = cond
+        else {
+            panic!("expected DistinctCounterKindsAmong >= 3 comparison for {text:?}, got {cond:?}");
+        };
+        let TargetFilter::Typed(tf) = filter else {
+            panic!("expected Typed filter for {text:?}, got {filter:?}");
+        };
+        assert!(
+            tf.type_filters.contains(&TypeFilter::Creature),
+            "population must be creatures for {text:?}, got {:?}",
+            tf.type_filters
+        );
+        assert_eq!(
+            tf.controller,
+            Some(ControllerRef::You),
+            "population must be scoped to creatures you control for {text:?}"
+        );
+    }
+
+    /// Sibling boundary test: "there are two or more ..." must produce a
+    /// distinct GE-2 comparison, proving the numeral is threaded through and
+    /// not hardcoded to 3 by the new bare-suffix registration.
+    #[test]
+    fn parse_inner_condition_distinct_counter_kinds_among_ge_2_boundary() {
+        let text = "there are two or more different kinds of counters among creatures you control";
+        let (rest, cond) = parse_inner_condition(text)
+            .unwrap_or_else(|e| panic!("failed to parse {text:?}: {e:?}"));
+        assert_eq!(rest, "");
+        assert!(
+            matches!(
+                cond,
+                StaticCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: QuantityRef::DistinctCounterKindsAmong { .. }
+                    },
+                    comparator: Comparator::GE,
+                    rhs: QuantityExpr::Fixed { value: 2 },
+                }
+            ),
+            "expected DistinctCounterKindsAmong >= 2, got {cond:?}"
+        );
     }
 
     /// Kavu Runner / Skittish Kavu: "... as long as no opponent controls a white
@@ -19610,15 +19691,13 @@ mod tests {
                 );
                 match lhs {
                     QuantityExpr::Ref {
-                        qty:
-                            QuantityRef::Aggregate {
-                                function,
-                                property,
-                                filter,
-                            },
+                        qty: QuantityRef::PropertyAggregate(aggregate),
                     } => {
-                        assert_eq!(function, AggregateFunction::Sum);
-                        assert_eq!(property, expected_property.0);
+                        assert_eq!(aggregate.function(), AggregateFunction::Sum);
+                        assert_eq!(aggregate.property(), expected_property.0);
+                        let CardTypeSetSource::Objects { filter } = aggregate.source() else {
+                            panic!("expected object source, got {:?}", aggregate.source());
+                        };
                         match filter {
                             TargetFilter::Typed(t) => {
                                 assert_eq!(t.controller, Some(ControllerRef::You));
@@ -19784,15 +19863,13 @@ mod tests {
                 );
                 match rhs {
                     QuantityExpr::Ref {
-                        qty:
-                            QuantityRef::Aggregate {
-                                function,
-                                property,
-                                filter,
-                            },
+                        qty: QuantityRef::PropertyAggregate(aggregate),
                     } => {
-                        assert_eq!(function, AggregateFunction::Max);
-                        assert_eq!(property, ObjectProperty::Power);
+                        assert_eq!(aggregate.function(), AggregateFunction::Max);
+                        assert_eq!(aggregate.property(), ObjectProperty::Power);
+                        let CardTypeSetSource::Objects { filter } = aggregate.source() else {
+                            panic!("expected object source, got {:?}", aggregate.source());
+                        };
                         match filter {
                             TargetFilter::Typed(tf) => {
                                 assert_eq!(tf.type_filters, vec![TypeFilter::Creature]);
@@ -19822,12 +19899,12 @@ mod tests {
                 comparator,
                 rhs:
                     QuantityExpr::Ref {
-                        qty: QuantityRef::Aggregate { function, .. },
+                        qty: QuantityRef::PropertyAggregate(aggregate),
                     },
                 ..
             } => {
                 assert_eq!(comparator, Comparator::LT);
-                assert_eq!(function, AggregateFunction::Min);
+                assert_eq!(aggregate.function(), AggregateFunction::Min);
             }
             other => panic!("expected QuantityComparison with Aggregate, got {other:?}"),
         }
@@ -19852,15 +19929,12 @@ mod tests {
                     },
                 rhs:
                     QuantityExpr::Ref {
-                        qty:
-                            QuantityRef::Aggregate {
-                                function, property, ..
-                            },
+                        qty: QuantityRef::PropertyAggregate(aggregate),
                     },
             } => {
                 assert_eq!(comparator, Comparator::GE);
-                assert_eq!(function, AggregateFunction::Max);
-                assert_eq!(property, ObjectProperty::Toughness);
+                assert_eq!(aggregate.function(), AggregateFunction::Max);
+                assert_eq!(aggregate.property(), ObjectProperty::Toughness);
             }
             other => panic!("expected QuantityComparison, got {other:?}"),
         }
@@ -19878,12 +19952,12 @@ mod tests {
                 comparator,
                 rhs:
                     QuantityExpr::Ref {
-                        qty: QuantityRef::Aggregate { function, .. },
+                        qty: QuantityRef::PropertyAggregate(aggregate),
                     },
                 ..
             } => {
                 assert_eq!(comparator, Comparator::GT);
-                assert_eq!(function, AggregateFunction::Max);
+                assert_eq!(aggregate.function(), AggregateFunction::Max);
             }
             other => panic!("expected QuantityComparison, got {other:?}"),
         }
@@ -20052,17 +20126,23 @@ mod tests {
                         comparator: Comparator::GE,
                         value:
                             QuantityExpr::Ref {
-                                qty:
-                                    QuantityRef::Aggregate {
-                                        function: AggregateFunction::Max,
-                                        property: ObjectProperty::Toughness,
-                                        filter: TargetFilter::Typed(population),
-                                    },
+                                qty: QuantityRef::PropertyAggregate(aggregate),
                             },
                     } = prop
                     else {
                         return false;
                     };
+                    let CardTypeSetSource::Objects {
+                        filter: TargetFilter::Typed(population),
+                    } = aggregate.source()
+                    else {
+                        return false;
+                    };
+                    if aggregate.function() != AggregateFunction::Max
+                        || aggregate.property() != ObjectProperty::Toughness
+                    {
+                        return false;
+                    }
                     population.type_filters == vec![TypeFilter::Creature]
                         && population.controller.is_none()
                 });
@@ -20108,17 +20188,23 @@ mod tests {
                         comparator: Comparator::GE,
                         value:
                             QuantityExpr::Ref {
-                                qty:
-                                    QuantityRef::Aggregate {
-                                        function: AggregateFunction::Max,
-                                        property: ObjectProperty::Power,
-                                        filter: TargetFilter::Typed(population),
-                                    },
+                                qty: QuantityRef::PropertyAggregate(aggregate),
                             },
                     } = prop
                     else {
                         return false;
                     };
+                    let CardTypeSetSource::Objects {
+                        filter: TargetFilter::Typed(population),
+                    } = aggregate.source()
+                    else {
+                        return false;
+                    };
+                    if aggregate.function() != AggregateFunction::Max
+                        || aggregate.property() != ObjectProperty::Power
+                    {
+                        return false;
+                    }
                     population.type_filters == vec![TypeFilter::Creature]
                         && population.properties.iter().any(|prop| {
                             matches!(

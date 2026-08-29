@@ -2076,11 +2076,16 @@ fn parse_highest_mana_value_library_suffix(
             FilterProp::Cmc {
                 comparator: Comparator::EQ,
                 value: QuantityExpr::Ref {
-                    qty: QuantityRef::Aggregate {
-                        function: AggregateFunction::Max,
-                        property: ObjectProperty::ManaValue,
-                        filter: eligible_filter,
-                    },
+                    qty: QuantityRef::PropertyAggregate(
+                        crate::types::ability::PropertyAggregate::new(
+                            AggregateFunction::Max,
+                            ObjectProperty::ManaValue,
+                            crate::types::ability::CardTypeSetSource::Objects {
+                                filter: eligible_filter,
+                            },
+                        )
+                        .expect("statically valid property aggregate"),
+                    ),
                 },
             },
         ],
@@ -2103,6 +2108,9 @@ fn object_scope_for_linked_reference(reference: &TargetFilter) -> Option<ObjectS
         TargetFilter::CostPaidObject => Some(ObjectScope::CostPaidObject),
         TargetFilter::ParentTarget => Some(ObjectScope::Target),
         TargetFilter::TriggeringSource => Some(ObjectScope::EventSource),
+        // CR 701.47c: "shares a creature type with the amassed Army" — bridge
+        // to the QuantityRef-side scope that already carries the same referent.
+        TargetFilter::AmassedArmy => Some(ObjectScope::AmassedArmy),
         _ => None,
     }
 }
@@ -5035,13 +5043,10 @@ mod tests {
             FilterProp::Cmc {
                 comparator: Comparator::EQ,
                 value: QuantityExpr::Ref {
-                    qty: QuantityRef::Aggregate {
-                        function: AggregateFunction::Max,
-                        property: ObjectProperty::ManaValue,
-                        ..
-                    },
+                    qty: QuantityRef::PropertyAggregate(aggregate),
                 },
-            }
+            } if aggregate.function() == AggregateFunction::Max
+                && aggregate.property() == ObjectProperty::ManaValue
         )));
         assert!(ctx.diagnostics.iter().all(|diagnostic| !matches!(
             diagnostic,
@@ -5077,13 +5082,10 @@ mod tests {
             FilterProp::Cmc {
                 comparator: Comparator::EQ,
                 value: QuantityExpr::Ref {
-                    qty: QuantityRef::Aggregate {
-                        function: AggregateFunction::Max,
-                        property: ObjectProperty::ManaValue,
-                        ..
-                    },
+                    qty: QuantityRef::PropertyAggregate(aggregate),
                 },
-            }
+            } if aggregate.function() == AggregateFunction::Max
+                && aggregate.property() == ObjectProperty::ManaValue
         )));
         assert!(ctx.diagnostics.iter().all(|diagnostic| !matches!(
             diagnostic,

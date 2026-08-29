@@ -1167,28 +1167,52 @@ fn split_single_quoted_ability(input: &str) -> Option<(&str, &str)> {
 /// replacement-form variant). The contracted negated-copula form `"it's not
 /// legendary"` (Delina, Wild Mage; Ember Island Production; Ratadrabik of
 /// Urborg; etc.) is also accepted with both ASCII and curly apostrophes.
+///
+/// Plural-token axis: The Notary Hobbits creates TWO copy tokens in one
+/// effect ("create two tokens that are copies of them, except the tokens
+/// aren't legendary"), so the exception's subject is the plural "the
+/// tokens" rather than singular "the token"/"it". Both apply
+/// `RemoveSupertype` per-token via the same `additional_modifications`
+/// channel (CR 707.9b) — the count axis is orthogonal to the subject-phrasing
+/// axis, so no separate modification variant is needed.
 fn parse_isnt_supertype(input: &str) -> Option<(&str, ContinuousModification)> {
+    // Nested by subject pronoun (mirrors the pronoun-axis convention used
+    // elsewhere in this module): nom's `alt` only implements `Parser` up to
+    // 21 tuple arms, so the singular/plural "the token(s)" group, which grew
+    // an extra 3 arms for The Notary Hobbits' plural "the tokens aren't",
+    // is nested as its own `alt` rather than flattened into one 22-arm tuple.
     let (rest, _) = alt((
-        tag::<_, _, OracleError<'_>>("the token isn't "),
-        tag("the token isnt "),
-        tag("the token is not "),
-        tag("the token's not "),
-        tag("the token\u{2019}s not "),
-        tag("it isn't "),
-        tag("it isnt "),
-        tag("it is not "),
-        tag("it's not "),
-        tag("it\u{2019}s not "),
-        tag("he isn't "),
-        tag("he isnt "),
-        tag("he is not "),
-        tag("he's not "),
-        tag("he\u{2019}s not "),
-        tag("she isn't "),
-        tag("she isnt "),
-        tag("she is not "),
-        tag("she's not "),
-        tag("she\u{2019}s not "),
+        alt((
+            tag::<_, _, OracleError<'_>>("the token isn't "),
+            tag("the token isnt "),
+            tag("the token is not "),
+            tag("the token's not "),
+            tag("the token\u{2019}s not "),
+            tag("the tokens aren't "),
+            tag("the tokens arent "),
+            tag("the tokens are not "),
+        )),
+        alt((
+            tag("it isn't "),
+            tag("it isnt "),
+            tag("it is not "),
+            tag("it's not "),
+            tag("it\u{2019}s not "),
+        )),
+        alt((
+            tag("he isn't "),
+            tag("he isnt "),
+            tag("he is not "),
+            tag("he's not "),
+            tag("he\u{2019}s not "),
+        )),
+        alt((
+            tag("she isn't "),
+            tag("she isnt "),
+            tag("she is not "),
+            tag("she's not "),
+            tag("she\u{2019}s not "),
+        )),
     ))
     .parse(input)
     .ok()?;

@@ -408,8 +408,11 @@ fn classify_parked_cost_move_root(state: &GameState) -> PaymentContinuationState
         // These are distinct cost/resolution continuations. They intentionally
         // retain their existing policies rather than being misidentified from a
         // coincidental PendingCast elsewhere in state.
+        PendingCostMoveResume::SacrificeForCost { pending: Some(pending), player, .. } => {
+            PaymentContinuationState::Affiliated(root_from_pending_cast(pending, *player))
+        }
         PendingCostMoveResume::Cast { .. }
-        | PendingCostMoveResume::SacrificeForCost { .. }
+        | PendingCostMoveResume::SacrificeForCost { pending: None, .. }
         | PendingCostMoveResume::WardSacrificePayment { .. }
         | PendingCostMoveResume::ReplacementMayCost { .. }
         | PendingCostMoveResume::Foretell { .. }
@@ -644,7 +647,7 @@ fn pending_cost_move_contains_root(
             pending: Some(pending),
             ..
         }) => pending_matches_root(pending, root),
-        Some(PendingCostMoveResume::SacrificeForCost { pending, .. }) => {
+        Some(PendingCostMoveResume::SacrificeForCost { pending: Some(pending), .. }) => {
             pending_matches_root(pending, root)
         }
         Some(PendingCostMoveResume::ManaAbilityPayment { pending, cursor }) => {
@@ -664,6 +667,7 @@ fn pending_cost_move_contains_root(
             CollectEvidenceResume::Effect { .. } => false,
         },
         Some(PendingCostMoveResume::Cast { pending: None, .. })
+        | Some(PendingCostMoveResume::SacrificeForCost { pending: None, .. })
         | Some(PendingCostMoveResume::WardSacrificePayment { .. })
         | Some(PendingCostMoveResume::ReplacementMayCost { .. })
         | Some(PendingCostMoveResume::Foretell { .. })
@@ -780,6 +784,9 @@ fn record_witness_attempts(_: usize) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ability::{Effect, ResolvedAbility};
+    use crate::types::game_state::PendingSacrificeCostCompletion;
+    use crate::types::resolution::OptionalEffectFrame;
 
     #[test]
     fn direct_mana_payment_without_a_live_root_fails_closed() {
@@ -809,6 +816,38 @@ mod tests {
         assert!(
             LAST_WITNESS_REDUCER_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed)
                 <= PAYMENT_CONTINUATION_MAX_REDUCER_ATTEMPTS
+        );
+    }
+
+    #[test]
+    fn resolution_optional_sacrifice_cursor_is_not_a_cast_root() {
+        let mut state = GameState::new_two_player(1);
+        state.pending_cost_move_resume = Some(PendingCostMoveResume::SacrificeForCost {
+            player: PlayerId(0),
+            pending: None,
+            chosen: Vec::new(),
+            paused_at_index: 0,
+            completion: PendingSacrificeCostCompletion::ResolutionOptionalPayment {
+                frame: Box::new(OptionalEffectFrame {
+                    ability: Box::new(ResolvedAbility::new(
+                        Effect::NoOp,
+                        vec![],
+                        ObjectId(7),
+                        PlayerId(0),
+                    )),
+                    trigger_event: None,
+                    trigger_events: Vec::new(),
+                    trigger_match_count: None,
+                }),
+                selected: Vec::new(),
+            },
+            deferred_cost_events: Vec::new(),
+            departure_record_indices: Vec::new(),
+        });
+
+        assert_eq!(
+            classify_payment_continuation(&state),
+            PaymentContinuationState::NotAffiliated
         );
     }
 }

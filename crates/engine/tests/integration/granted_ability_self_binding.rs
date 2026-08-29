@@ -3,12 +3,23 @@
 //! that refers to the granting object BY NAME, the name refers only to the
 //! granting object — never to the host it was granted to.
 //!
-//! Three independent channels are exercised, and must stay separate:
+//! Three independent channels are exercised, and must stay separate. Each now
+//! has a TYPED half (the AST the engine resolves) and a DISPLAY half (the
+//! `description` string the client renders), and the two must agree:
 //!   1. Granter-referential ("Exile/Sacrifice/Return <granter-name>") →
-//!      `TargetFilter::GrantingObject` → concretized to `SpecificObject{granter}`.
-//!   2. Host-referential ("Sacrifice this permanent") → stays `SelfRef` → host.
-//!   3. Host power read ("where X is this creature's power") → `QuantityRef::Power`
-//!      (never a `TargetFilter`) → unchanged.
+//!      TYPED: `TargetFilter::GrantingObject` → concretized to
+//!      `SpecificObject{granter}`. DISPLAY: the granting card's PRINTED name
+//!      (`oracle_util::render_granting_self_reference`, CR 201.5a + CR 201.5c).
+//!   2. Host-referential ("Sacrifice this permanent") → TYPED: stays `SelfRef` →
+//!      host. DISPLAY: stays the host token `~`, which the client substitutes
+//!      with the object's own name (CR 201.5b).
+//!   3. Host power read ("where X is this creature's power") → TYPED:
+//!      `QuantityRef::Power` (never a `TargetFilter`) → unchanged. DISPLAY:
+//!      unchanged.
+//!
+//! A display half that disagreed with its typed half would be strictly worse
+//! than a consistent error: the UI would say "sacrifice the Equipment" while the
+//! engine sacrificed the creature.
 //!
 //! Every behavioral test drives the production Layer-6 grant path
 //! (`evaluate_layers`) and, for Deconstruction Hammer, the full activate/resolve
@@ -107,9 +118,6 @@ fn granted_ability_index(
 // Direction A — granter-referential COST/EFFECT resolves to the GRANTING object.
 // ---------------------------------------------------------------------------
 
-const DECONSTRUCTION_HAMMER: &str = "Equipped creature gets +1/+1 and has \"{3}, {T}, \
-Sacrifice Deconstruction Hammer: Destroy target artifact or enchantment.\"\nEquip {1}";
-
 /// A1: Deconstruction Hammer's sacrifice cost sacrifices THE HAMMER (the granting
 /// equipment), not the equipped creature. Full activate/resolve pipeline; asserts
 /// which object left the battlefield.
@@ -178,6 +186,37 @@ fn deconstruction_hammer_sacrifice_hits_the_equipment_not_the_host() {
         "CR 201.5a: sacrifice cost must target the granting Hammer, not the host"
     );
 
+    // DISPLAY half of the same seam (matrix rows 1 and 3). This MUST run before
+    // the activate below: the Hammer is sacrificed, the grant ends, and
+    // `objects[&host].abilities` is empty afterwards (measured: index out of
+    // bounds, len 0).
+    let desc = runner.state().objects[&host].abilities[idx]
+        .description
+        .clone()
+        .expect("the granted ability carries a display description");
+    assert_eq!(
+        desc, "{3}, {T}, Sacrifice Deconstruction Hammer: Destroy target artifact or enchantment.",
+        "CR 201.5a: the granted body's description must name the GRANTING Hammer, \
+         not collapse to the host token `~`"
+    );
+    // CLIENT PARITY, weaker form. `renderDescription(desc, object.name)` on the
+    // host must not put the host's name anywhere in this body. This card's
+    // effect half carries no `~`, so this proves only "the host name appears
+    // NOWHERE"; the discriminating both-halves fixture is
+    // `game::effects::token::tests::catalog_toggo_rock_sacrifice_cost_binds_to_rock_not_host`
+    // (Rock's printed body carries a CR 201.5a granter reference in the cost AND
+    // a CR 201.5b host `~` in the effect).
+    let rendered = desc.replace('~', "Bearer");
+    assert!(
+        rendered.starts_with("{3}, {T}, Sacrifice Deconstruction Hammer:"),
+        "CR 201.5a: a blanket `~`-replace would render `Sacrifice Bearer:`; got {rendered}"
+    );
+    assert_eq!(
+        rendered.matches("Bearer").count(),
+        0,
+        "the host's name must not appear anywhere in this granted body; got {rendered}"
+    );
+
     // Runtime proof: activate the granted ability, paying the sacrifice cost with
     // the Hammer and targeting the artifact, then assert which permanents left the
     // battlefield.
@@ -202,11 +241,6 @@ fn deconstruction_hammer_sacrifice_hits_the_equipment_not_the_host() {
         "the targeted artifact is destroyed by the resolved effect"
     );
 }
-
-const THE_DOMINION_BRACELET: &str = "Equipped creature gets +1/+1 and has \"{15}, \
-Exile The Dominion Bracelet: You control target opponent during their next turn. \
-This ability costs {X} less to activate, where X is this creature's power. \
-Activate only as a sorcery.\"\nEquip {1}";
 
 /// A2 + B1: The Dominion Bracelet. The `{15}, Exile <self>` cost exiles THE
 /// BRACELET (granter-referential → GrantingObject → SpecificObject{bracelet}),
@@ -291,9 +325,6 @@ fn the_dominion_bracelet_exile_hits_the_bracelet_reduction_reads_the_host() {
     );
 }
 
-const TRUSTY_BOOMERANG: &str = "Equipped creature has \"{1}, {T}: Tap target creature. \
-Return Trusty Boomerang to its owner's hand.\"\nEquip {1}";
-
 /// A3 (effect-target channel): Trusty Boomerang's "Return <self> to its owner's
 /// hand" bounces THE EQUIPMENT. After grant-clone the Bounce effect target is
 /// `SpecificObject{boomerang}`, proving the effect channel (parse_self_reference)
@@ -365,6 +396,23 @@ fn sliver_host_ref_sacrifice_stays_on_the_host_not_the_granter() {
         !contains_granting_object(&granted),
         "a host-ref Sliver ability must contain no GrantingObject reference"
     );
+
+    // DISPLAY half. CR 201.5b: a host reference stays the host token `~` and must
+    // NOT gain the granting card's name — the render is sentinel-driven, not a
+    // blanket name substitution. Reach-guard: the `SelfRef` assertion above proves
+    // this body really is the host-referential shape.
+    let desc = granted
+        .description
+        .as_deref()
+        .expect("the granted Sliver ability carries a display description");
+    assert!(
+        desc.contains('~'),
+        "CR 201.5b: the host reference must stay `~`; got {desc}"
+    );
+    assert!(
+        !desc.contains("Acidic Sliver"),
+        "CR 201.5b: a host reference must never render as the GRANTER's name; got {desc}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -414,8 +462,9 @@ fn food_fight_named_self_filter_is_not_masked() {
         structural.to_lowercase().contains("food fight"),
         "the `named Food Fight` name-filter must preserve the card name; got {structural}"
     );
+    let json = serde_json::to_string(&granted).expect("the granted definition serializes");
     assert!(
-        !structural.contains('\u{E0002}'),
+        !json.contains(PLACEHOLDER),
         "the granting-object placeholder must never leak into the AST"
     );
     assert!(
@@ -510,50 +559,341 @@ fn granted_def_from(
 /// The private-use masker placeholder (U+E0002). Must NEVER survive into the AST.
 const PLACEHOLDER: char = '\u{E0002}';
 
+// ---------------------------------------------------------------------------
+// CR 201.5a — THE MEASURED CLASS CORPUS.
+//
+// Every card in `client/public/card-data.json` whose Oracle text contains, in a
+// `"`-quoted granted body, its own printed name immediately preceded by an
+// allowlisted verb-object prefix (`GRANTER_SELF_REF_VERB_PREFIXES`: `sacrifice `
+// / `exile ` / `return ` / `counter on `). Reproduced by the corpus script in
+// the plan's Pattern Coverage section, cross-checked against the independent
+// "the export carries a `GrantingObject`" query — both methods yield the SAME 16
+// names.
+//
+// Every text below is the VERBATIM export Oracle text, reminder text and all.
+// Abbreviated fixtures are what let the round-1 leak ship: a paraphrase can take
+// a different parser branch and go green while the real card stays broken.
+//
+// The seventeenth class member is the predefined token Rock, which is absent
+// from the export and reaches the parser through
+// `game::effects::token::catalog_rules_text_abilities`; its arm of this corpus
+// property lives in
+// `game::effects::token::tests::catalog_rules_text_abilities_never_leaks_the_placeholder`.
+// ---------------------------------------------------------------------------
+
+const BLAZING_TORCH: &str =
+    "Equipped creature can't be blocked by Vampires or Zombies.\nEquipped creature has \"{T}, Sacrifice Blazing Torch: Blazing Torch deals 2 damage to any target.\"\nEquip {1} ({1}: Attach to target creature you control. Equip only as a sorcery.)";
+const CITIZENS_CROWBAR: &str =
+    "When this Equipment enters, create a 1/1 green and white Citizen creature token, then attach this Equipment to it.\nEquipped creature gets +1/+1 and has \"{W}, {T}, Sacrifice Citizen's Crowbar: Destroy target artifact or enchantment.\"\nEquip {2} ({2}: Attach to target creature you control. Equip only as a sorcery.)";
+const DECONSTRUCTION_HAMMER: &str =
+    "Equipped creature gets +1/+1 and has \"{3}, {T}, Sacrifice Deconstruction Hammer: Destroy target artifact or enchantment.\"\nEquip {1} ({1}: Attach to target creature you control. Equip only as a sorcery.)";
 const FISHING_POLE: &str =
-    "Equipped creature has \"{1}, {T}, Tap Fishing Pole: Put a bait counter on Fishing Pole.\"\nEquip {2}";
-const HANKYU: &str = "Equipped creature has \"{T}: Put an aim counter on Hankyu\" and \"{T}, \
-Remove all aim counters from Hankyu: This creature deals damage to any target equal to the number \
-of aim counters removed this way.\"\nEquip {4}";
-/// The masker placeholder must NEVER leak the raw private-use char into any
-/// parsed output — including the outer static/trigger DESCRIPTION strings that
-/// embed the raw quoted text (a granted body's "…has \"…Sacrifice <self>…\""
-/// description). The single post-parse degrade sweep
-/// (`scrub_granting_placeholder_descriptions`) renders every residual placeholder
-/// as `~`. Revert-to-red: remove that sweep → the description carries the raw
-/// U+E0002 char → this flips. (Round-1 shipped this leak because the granted
-/// body's description was sanitized but the outer static description was not.)
+    "Equipped creature has \"{1}, {T}, Tap Fishing Pole: Put a bait counter on Fishing Pole.\"\nWhenever equipped creature becomes untapped, remove a bait counter from this Equipment. If you do, create a 1/1 blue Fish creature token.\nEquip {2} ({2}: Attach to target creature you control. Equip only as a sorcery.)";
+const HANKYU: &str =
+    "Equipped creature has \"{T}: Put an aim counter on Hankyu\" and \"{T}, Remove all aim counters from Hankyu: This creature deals damage to any target equal to the number of aim counters removed this way.\"\nEquip {4} ({4}: Attach to target creature you control. Equip only as a sorcery.)";
+const MEANDERED_TOWERSHELL: &str =
+    "Enchant creature\nEnchanted creature has islandwalk and \"Whenever this creature attacks, exile it and Meandered Towershell. Return it to the battlefield under your control tapped and attacking at the beginning of the declare attackers step on your next turn, then return Meandered Towershell to the battlefield under its owner's control attached to that creature.\"";
+const NINJAS_KUNAI: &str =
+    "Equipped creature has \"{1}, {T}, Sacrifice Ninja's Kunai: Ninja's Kunai deals 3 damage to any target.\"\nEquip {1} ({1}: Attach to target creature you control. Equip only as a sorcery.)";
+const RAKDOS_RITEKNIFE: &str =
+    "Equipped creature gets +1/+0 for each blood counter on this Equipment and has \"{T}, Sacrifice a creature: Put a blood counter on Rakdos Riteknife.\"\n{B}{R}, Sacrifice this Equipment: Target player sacrifices a permanent of their choice for each blood counter on this Equipment.\nEquip {2}";
+const RAZOR_BOOMERANG: &str =
+    "Equipped creature has \"{T}, Unattach Razor Boomerang: It deals 1 damage to any target. Return Razor Boomerang to its owner's hand.\"\nEquip {2}";
+const SAKASHIMA_THE_IMPOSTOR: &str =
+    "You may have Sakashima the Impostor enter as a copy of any creature on the battlefield, except its name is Sakashima the Impostor, it's legendary in addition to its other types, and it has \"{2}{U}{U}: Return Sakashima the Impostor to its owner's hand at the beginning of the next end step.\"";
+const SPARE_DAGGER: &str =
+    "Equipped creature gets +1/+0 and has \"Whenever this creature attacks, you may sacrifice Spare Dagger. When you do, this creature deals 1 damage to any target.\"\nEquip {1} ({1}: Attach to target creature you control. Equip only as a sorcery.)";
+const SUNFIRE_TORCH: &str =
+    "Equipped creature gets +1/+0 and has \"Whenever this creature attacks, you may sacrifice Sunfire Torch. When you do, this creature deals 2 damage to any target.\"\nEquip {1} ({1}: Attach to target creature you control. Equip only as a sorcery.)";
+const THE_DOMINION_BRACELET: &str =
+    "Equipped creature gets +1/+1 and has \"{15}, Exile The Dominion Bracelet: You control target opponent during their next turn. This ability costs {X} less to activate, where X is this creature's power. Activate only as a sorcery.\" (You see all cards that player could see and make all decisions for them.)\nEquip {1}";
+const TORALFS_HAMMER: &str =
+    "Equipped creature has \"{1}{R}, {T}, Unattach Toralf's Hammer: It deals 3 damage to any target. Return Toralf's Hammer to its owner's hand.\"\nEquipped creature gets +3/+0 as long as it's legendary.\nEquip {1}{R}";
+const TRICKSTERS_TALISMAN: &str =
+    "Invoke Duplicity \u{2014} Equipped creature gets +1/+1 and has \"Whenever this creature deals combat damage to a player, you may sacrifice Trickster's Talisman. If you do, create a token that's a copy of this creature.\"\nEquip {2}";
+const TRUSTY_BOOMERANG: &str =
+    "Equipped creature has \"{1}, {T}: Tap target creature. Return Trusty Boomerang to its owner's hand.\"\nEquip {1} ({1}: Attach to target creature you control. Equip only as a sorcery.)";
+
+/// `(oracle text, printed name, core types, subtypes)` for all 16 exported class
+/// members.
+const CLASS_CORPUS: &[(&str, &str, &[&str], &[&str])] = &[
+    (
+        BLAZING_TORCH,
+        "Blazing Torch",
+        &["Artifact"],
+        &["Equipment"],
+    ),
+    (
+        CITIZENS_CROWBAR,
+        "Citizen's Crowbar",
+        &["Artifact"],
+        &["Equipment"],
+    ),
+    (
+        DECONSTRUCTION_HAMMER,
+        "Deconstruction Hammer",
+        &["Artifact"],
+        &["Equipment"],
+    ),
+    (FISHING_POLE, "Fishing Pole", &["Artifact"], &["Equipment"]),
+    (HANKYU, "Hankyu", &["Artifact"], &["Equipment"]),
+    (
+        MEANDERED_TOWERSHELL,
+        "Meandered Towershell",
+        &["Enchantment"],
+        &["Aura"],
+    ),
+    (NINJAS_KUNAI, "Ninja's Kunai", &["Artifact"], &["Equipment"]),
+    (
+        RAKDOS_RITEKNIFE,
+        "Rakdos Riteknife",
+        &["Artifact"],
+        &["Equipment"],
+    ),
+    (
+        RAZOR_BOOMERANG,
+        "Razor Boomerang",
+        &["Artifact"],
+        &["Equipment"],
+    ),
+    (
+        SAKASHIMA_THE_IMPOSTOR,
+        "Sakashima the Impostor",
+        &["Creature"],
+        &["Human", "Rogue"],
+    ),
+    (SPARE_DAGGER, "Spare Dagger", &["Artifact"], &["Equipment"]),
+    (
+        SUNFIRE_TORCH,
+        "Sunfire Torch",
+        &["Artifact"],
+        &["Equipment"],
+    ),
+    (
+        THE_DOMINION_BRACELET,
+        "The Dominion Bracelet",
+        &["Artifact"],
+        &["Equipment"],
+    ),
+    (
+        TORALFS_HAMMER,
+        "Toralf's Hammer",
+        &["Artifact"],
+        &["Equipment"],
+    ),
+    (
+        TRICKSTERS_TALISMAN,
+        "Trickster's Talisman",
+        &["Artifact"],
+        &["Equipment"],
+    ),
+    (
+        TRUSTY_BOOMERANG,
+        "Trusty Boomerang",
+        &["Artifact"],
+        &["Equipment"],
+    ),
+];
+
+/// CR 201.5a: no raw U+E0002 may survive into ANY string reachable from
+/// `ParsedAbilities`' four top-level vectors through the render net's descend
+/// set — including the outer static/trigger DESCRIPTION strings that embed the
+/// raw quoted text (a granted body's "…has \"…Sacrifice <self>…\"" description).
+/// `parser::oracle::render_granting_self_descriptions` renders every residual
+/// marker to the granting card's printed name.
+///
+/// TWO REPAIRS to the round-1 form of this guard, both of which were measured
+/// vacuous:
+///
+/// 1. **`serde_json`, not `format!("{:?}")`.** `Debug` ESCAPES the raw
+///    private-use char to the literal text `\u{e0002}`, so searching a `Debug`
+///    dump for the real character was ALWAYS false — the guard could not fail.
+///    `serde_json` emits it raw, at every `String`, at every depth, which is
+///    strictly stronger than any hand-written `visit_*` walk.
+/// 2. **The whole measured class, not four constants.** Four cards cannot see a
+///    copy-family regression; Sakashima is the only shipped card whose granted
+///    description lives inside an `Effect::BecomeCopy` payload.
+///
+/// SCOPE NOTE: the serde ORACLE is WIDER than the net's REPAIR. It serializes
+/// `def.cost` too, so a cost-borne marker would red here even though the net
+/// deliberately does not walk the `AbilityCost` axis (the named excluded axis —
+/// see `parser::oracle::tests::granted_cost_axis_is_not_walked_and_no_parse_shape_reaches_it`).
+/// That is the correct polarity: this guard should red if a marker ever reaches
+/// a cost, because nothing downstream would render it.
+///
+/// Non-vacuity is proved by `placeholder_leak_guard_reports_a_planted_marker`.
+///
+/// Revert-to-red: remove the render net from `parse_oracle_text` → every card's
+/// outer static description carries the raw U+E0002 char.
 #[test]
 fn placeholder_never_leaks_into_any_description() {
-    let cards: &[(&str, &str, &[&str], &[&str])] = &[
-        (
-            DECONSTRUCTION_HAMMER,
-            "Deconstruction Hammer",
-            &["Artifact"],
-            &["Equipment"],
-        ),
-        (
-            THE_DOMINION_BRACELET,
-            "The Dominion Bracelet",
-            &["Artifact"],
-            &["Equipment"],
-        ),
-        (FISHING_POLE, "Fishing Pole", &["Artifact"], &["Equipment"]),
-        (HANKYU, "Hankyu", &["Artifact"], &["Equipment"]),
-    ];
-    for &(oracle, name, types, subtypes) in cards {
+    for &(oracle, name, types, subtypes) in CLASS_CORPUS {
         let types: Vec<String> = types.iter().map(|s| s.to_string()).collect();
         let subtypes: Vec<String> = subtypes.iter().map(|s| s.to_string()).collect();
         let p = parse_oracle_text(oracle, name, &[], &types, &subtypes);
-        let whole = format!(
-            "{:?}|{:?}|{:?}|{:?}",
-            p.statics, p.triggers, p.abilities, p.replacements
+        let json = serde_json::to_string(&p).expect("ParsedAbilities serializes");
+        // PER-CARD POSITIVE REACH-GUARD: this card must actually be a class
+        // member in the parsed tree — the masker fired and the typed channel
+        // consumed the marker as `TargetFilter::GrantingObject`. Without it, a
+        // card that silently stopped parsing its granted body would pass the
+        // negative below on an empty tree.
+        assert!(
+            json.contains("GrantingObject"),
+            "reach-guard: {name} must carry a granter self-reference in the typed \
+             channel, or its leak assertion below is vacuous"
         );
         assert!(
-            !whole.contains(PLACEHOLDER),
-            "{name}: the masker placeholder must be scrubbed to ~ in every description; leaked"
+            !json.contains(PLACEHOLDER),
+            "{name}: the masker placeholder must render to the granting card's \
+             printed name in every description; a raw U+E0002 leaked"
         );
     }
+}
+
+/// CR 201.5a — NON-VACUITY PROOF for `placeholder_never_leaks_into_any_description`.
+///
+/// A negative assertion is only worth what its ability to fail is worth. This
+/// plants a marker into a real parsed tree AFTER the net has run and asserts the
+/// same `serde_json` oracle DOES report it.
+///
+/// Revert-to-red: delete the injection — the guard passes on a clean tree and
+/// this test's own assertion flips, which is the point.
+#[test]
+fn placeholder_leak_guard_reports_a_planted_marker() {
+    let (types, subtypes) = equipment_types();
+    let mut p = parse_oracle_text(
+        DECONSTRUCTION_HAMMER,
+        "Deconstruction Hammer",
+        &[],
+        &types,
+        &subtypes,
+    );
+    assert!(
+        !serde_json::to_string(&p)
+            .expect("ParsedAbilities serializes")
+            .contains(PLACEHOLDER),
+        "reach-guard: the tree must be clean BEFORE the injection, or this test \
+         proves nothing about the guard's sensitivity"
+    );
+    p.statics[0].description = Some(format!("x{PLACEHOLDER}y"));
+    assert!(
+        serde_json::to_string(&p)
+            .expect("ParsedAbilities serializes")
+            .contains(PLACEHOLDER),
+        "the `serde_json` leak oracle must REPORT a planted marker — if it cannot \
+         fail, `placeholder_never_leaks_into_any_description` is vacuous (which is \
+         exactly what the round-1 `format!(\"{{:?}}\")` form was)"
+    );
+}
+
+/// CR 201.5a — HOSTILE FIXTURE: two self-name occurrences in ONE granted body,
+/// in DIFFERENT positions, bound independently.
+///
+/// Meandered Towershell's granted trigger body says, in order:
+///   * "Whenever this creature attacks"  → a HOST reference (CR 201.5b) → `~`
+///   * "exile it and Meandered Towershell" → a CR 201.5a granter reference whose
+///     lookbehind is `and `, NOT an allowlisted verb-object prefix, so it is
+///     host-bound today — the deferred gap documented in the
+///     `KNOWN CR 201.5a FOLLOW-UP` block in `oracle_util::mask_name_occurrences_in_segment`.
+///   * "return Meandered Towershell to the battlefield" → an ALLOWLISTED
+///     (`return `) granter reference → masked → rendered as the printed name.
+///
+/// The assertions are written so the advertised follow-up sweep CANNOT turn them
+/// red: (a) is a positive `contains`, and (b) pins only the LEADING host
+/// reference, which the sweep does not touch. A bare `contains('~')` would be
+/// the wrong assertion for exactly that reason.
+///
+/// Revert-to-red: replace the sentinel render with a blanket
+/// `text.replace('~', card_name)` → (b) fails, which is precisely the failure a
+/// naive implementation produces.
+#[test]
+fn meandered_towershell_binds_each_occurrence_independently() {
+    let parsed = parse_oracle_text(
+        MEANDERED_TOWERSHELL,
+        "Meandered Towershell",
+        &[],
+        &["Enchantment".to_string()],
+        &["Aura".to_string()],
+    );
+    let json = serde_json::to_string(&parsed).expect("ParsedAbilities serializes");
+    // POSITIVE REACH-GUARD: the allowlisted `return <granter>` occurrence really
+    // reached the typed channel.
+    assert!(
+        json.contains("GrantingObject"),
+        "reach-guard: the `return <granter>` occurrence must reach the typed channel"
+    );
+
+    let trigger = parsed
+        .statics
+        .iter()
+        .flat_map(|s| s.modifications.iter())
+        .find_map(|m| match m {
+            ContinuousModification::GrantTrigger { trigger } => Some(trigger.as_ref()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the quoted body must parse to a GrantTrigger: {parsed:#?}"));
+    let desc = trigger
+        .description
+        .as_deref()
+        .expect("the granted trigger carries a display description");
+
+    // (a) CR 201.5a: the allowlisted occurrence renders as the GRANTER's printed
+    // name. Stays true after the follow-up sweep lands (it can only add more).
+    assert!(
+        desc.contains("Meandered Towershell"),
+        "CR 201.5a: the `return <granter>` occurrence must render the printed \
+         name; got {desc}"
+    );
+    // (b) CR 201.5b: the LEADING occurrence is a host reference and stays `~`.
+    // The follow-up sweep targets the middle (`and <granter>`) occurrence, not
+    // this one, so it cannot turn this red.
+    assert!(
+        desc.starts_with("Whenever ~ attacks"),
+        "CR 201.5b: the leading host reference must stay `~` — a blanket \
+         `~`-replace renders `Whenever Meandered Towershell attacks`; got {desc}"
+    );
+}
+
+/// CR 201.5a (last sentence: "This is also true if the second ability is copied
+/// onto a new object") + CR 707.2 — HOSTILE FIXTURE: granter == host, via
+/// copy-except.
+///
+/// Sakashima the Impostor is the ONLY shipped card whose granted description
+/// lives inside an `Effect::BecomeCopy` payload. `types::ability_visit` treats
+/// `BecomeCopy`/`CopySpell`/`CopyTokenOf` as LEAVES, so no walker in the tree
+/// reaches this description without the render net's copy-family arm — which is
+/// why this card is a load-bearing structural fixture, not a footnote. (Its
+/// sibling `SetName` modification means the rendered output is the same before
+/// and after this change; the STRUCTURAL claim is what this test pins.)
+///
+/// Revert-to-red: delete the `BecomeCopy | CopySpell | CopyTokenOf` arm from
+/// `render_effect_descriptions` — the nested description retains the raw marker.
+#[test]
+fn sakashima_copy_except_grant_description_renders_the_granter() {
+    let parsed = parse_oracle_text(
+        SAKASHIMA_THE_IMPOSTOR,
+        "Sakashima the Impostor",
+        &[],
+        &["Creature".to_string()],
+        &["Human".to_string(), "Rogue".to_string()],
+    );
+    let json = serde_json::to_string(&parsed).expect("ParsedAbilities serializes");
+    // POSITIVE REACH-GUARD: the self-grant's `Return <self> to its owner's hand`
+    // really reached the typed channel as a granter reference.
+    assert!(
+        json.contains("GrantingObject"),
+        "reach-guard: the copy-except self-grant must reach the typed channel"
+    );
+    assert!(
+        !json.contains(PLACEHOLDER),
+        "a raw CR 201.5a marker survived inside an `Effect::BecomeCopy` payload — \
+         the copy-family descend arm is missing"
+    );
+    assert!(
+        json.contains("Sakashima the Impostor to its owner"),
+        "CR 201.5a: the granted body nested in the copy payload must name the \
+         granting object: {json}"
+    );
 }
 
 /// R4 (counter channel): the `put a … counter on <self>` (PutCounter target)
@@ -578,8 +918,13 @@ fn r4_counter_channel_targets_the_granter() {
             &TargetFilter::GrantingObject,
             "{name}: the PutCounter target names the granting equipment → GrantingObject"
         );
+        // `serde_json`, not `format!("{:?}")`: `Debug` ESCAPES the raw private-use
+        // char to the literal text `\u{e0002}`, so a Debug search for the real
+        // character is always false and this negative would be vacuous.
         assert!(
-            !format!("{def:?}").contains(PLACEHOLDER),
+            !serde_json::to_string(&def)
+                .expect("the granted definition serializes")
+                .contains(PLACEHOLDER),
             "{name}: no raw placeholder may survive into the AST"
         );
     }
@@ -633,6 +978,25 @@ fn archery_training_quantity_ref_channel_not_masked() {
     assert!(
         !contains_granting_object(&def),
         "a QuantityRef `counters on <self>` position must never become GrantingObject"
+    );
+
+    // DISPLAY half. The class must not silently widen: a non-allowlisted position
+    // stays host-bound in the description exactly as it does in the AST. Widening
+    // the DISPLAY channel alone would make the UI name the Aura while the engine
+    // counted the host's counters — the two channels would diverge.
+    // Reach-guards: `assert_masker_noop` above (the masker did not fire here) and
+    // the `CountersOn` assertion (the body really parsed).
+    let desc = def
+        .description
+        .as_deref()
+        .expect("the granted Archery Training ability carries a display description");
+    assert!(
+        desc.contains('~'),
+        "a non-allowlisted self-name position must stay the host token `~`; got {desc}"
+    );
+    assert!(
+        !desc.contains("Archery Training"),
+        "the display channel must not widen ahead of the typed channel; got {desc}"
     );
 }
 

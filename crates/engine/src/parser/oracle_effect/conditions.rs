@@ -7550,7 +7550,7 @@ mod tests {
     use crate::parser::oracle_nom::condition::parse_inner_condition;
     use crate::parser::parse_oracle_text;
     use crate::types::ability::{
-        AggregateFunction, CommanderOwnership, PlayerFilter, SharedQuality,
+        AggregateFunction, CardTypeSetSource, CommanderOwnership, PlayerFilter, SharedQuality,
     };
     use crate::types::counter::{CounterMatch, CounterType};
 
@@ -9206,11 +9206,16 @@ mod tests {
         assert_eq!(
             rhs,
             QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: AggregateFunction::Min,
-                    property: ObjectProperty::Power,
-                    filter: TargetFilter::Typed(TypedFilter::creature()),
-                }
+                qty: QuantityRef::PropertyAggregate(
+                    crate::types::ability::PropertyAggregate::new(
+                        AggregateFunction::Min,
+                        ObjectProperty::Power,
+                        crate::types::ability::CardTypeSetSource::Objects {
+                            filter: TargetFilter::Typed(TypedFilter::creature())
+                        }
+                    )
+                    .expect("statically valid property aggregate")
+                )
             }
         );
     }
@@ -9248,21 +9253,22 @@ mod tests {
             }
         );
         let QuantityExpr::Ref {
-            qty:
-                QuantityRef::Aggregate {
-                    function,
-                    property,
-                    filter,
-                },
+            qty: QuantityRef::PropertyAggregate(aggregate),
         } = rhs
         else {
             panic!("expected Aggregate rhs, got {rhs:?}");
         };
-        assert_eq!(function, AggregateFunction::Min);
-        assert_eq!(property, ObjectProperty::Power);
+        assert_eq!(aggregate.function(), AggregateFunction::Min);
+        assert_eq!(aggregate.property(), ObjectProperty::Power);
+        let CardTypeSetSource::Objects { filter } = aggregate.source() else {
+            panic!(
+                "expected object aggregate source, got {:?}",
+                aggregate.source()
+            );
+        };
         // The "on the battlefield" qualifier rides the aggregate population.
         assert!(
-            matches!(&filter, TargetFilter::Typed(tf)
+            matches!(filter, TargetFilter::Typed(tf)
             if tf.properties.iter().any(|p| matches!(
                 p,
                 FilterProp::InZone { zone: Zone::Battlefield }
@@ -9289,11 +9295,16 @@ mod tests {
         assert_eq!(
             rhs,
             QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: AggregateFunction::Max,
-                    property: ObjectProperty::Toughness,
-                    filter: TargetFilter::Typed(TypedFilter::creature()),
-                }
+                qty: QuantityRef::PropertyAggregate(
+                    crate::types::ability::PropertyAggregate::new(
+                        AggregateFunction::Max,
+                        ObjectProperty::Toughness,
+                        crate::types::ability::CardTypeSetSource::Objects {
+                            filter: TargetFilter::Typed(TypedFilter::creature())
+                        }
+                    )
+                    .expect("statically valid property aggregate")
+                )
             }
         );
     }

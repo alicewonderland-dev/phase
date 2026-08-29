@@ -120,18 +120,23 @@ fn oversimplify_per_player_fractal_counters_match_exiled_power() {
     let (counter_type, count_expr) = &enter_with_counters[0];
     assert_eq!(*counter_type, CounterType::Plus1Plus1);
     let expected_count = QuantityExpr::Ref {
-        qty: QuantityRef::Aggregate {
-            function: AggregateFunction::Sum,
-            property: ObjectProperty::Power,
-            filter: TargetFilter::And {
-                filters: vec![
-                    TargetFilter::Typed(
-                        TypedFilter::creature().controller(ControllerRef::ScopedPlayer),
-                    ),
-                    TargetFilter::ExiledBySource,
-                ],
-            },
-        },
+        qty: QuantityRef::PropertyAggregate(
+            engine::types::ability::PropertyAggregate::new(
+                AggregateFunction::Sum,
+                ObjectProperty::Power,
+                engine::types::ability::CardTypeSetSource::Objects {
+                    filter: TargetFilter::And {
+                        filters: vec![
+                            TargetFilter::Typed(
+                                TypedFilter::creature().controller(ControllerRef::ScopedPlayer),
+                            ),
+                            TargetFilter::ExiledBySource,
+                        ],
+                    },
+                },
+            )
+            .expect("statically valid property aggregate"),
+        ),
     };
     assert_eq!(
         count_expr, &expected_count,

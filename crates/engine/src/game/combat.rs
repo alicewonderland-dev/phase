@@ -8181,7 +8181,8 @@ mod tests {
             PlayerId(0),
             &spell_obj,
             crate::types::game_state::CastingVariant::Normal,
-        );
+        )
+        .expect("test spell-cast ledger is valid");
 
         // Now the remote CantAttack prohibition applies -> creature is excluded and
         // declaration is illegal. On main this assertion FAILS (SelfRef never

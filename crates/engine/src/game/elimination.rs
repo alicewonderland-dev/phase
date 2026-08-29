@@ -2,12 +2,14 @@ use std::collections::HashSet;
 
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    ActiveSearchDecisionAuthority, CollectEvidenceResume, DeferredLifeCostResume, GameState,
-    PendingCast, PendingCostMoveResume, WaitingFor,
+    ActiveSearchDecisionAuthority, CollectEvidenceResume, CostResume, DeferredLifeCostResume,
+    GameState, PayCostKind, PendingCast, PendingCostMoveResume, PendingSacrificeCostCompletion,
+    WaitingFor,
 };
 use crate::types::identifiers::ObjectIncarnationRef;
 use crate::types::match_config::MatchPhase;
 use crate::types::player::PlayerId;
+use crate::types::resolution::OptionalEffectFrame;
 use crate::types::resolved_commands::{
     ResolvedPlayerLeaveCommand, ResolvedPlayerLeaveReplayInvariantError,
 };
@@ -71,10 +73,11 @@ fn abandon_pending_spell_casts(
             PendingCostMoveResume::Cast {
                 pending: Some(pending),
                 ..
-            }
-            | PendingCostMoveResume::SacrificeForCost { pending, .. } => {
-                is_abandoned_spell(state, departing_player, spell_ids, pending)
-            }
+            } => is_abandoned_spell(state, departing_player, spell_ids, pending),
+            PendingCostMoveResume::SacrificeForCost {
+                pending: Some(pending),
+                ..
+            } => is_abandoned_spell(state, departing_player, spell_ids, pending),
             PendingCostMoveResume::CollectEvidencePayment { resume, .. } => matches!(
                 resume.as_ref(),
                 CollectEvidenceResume::Casting { pending_cast, .. }
@@ -84,6 +87,7 @@ fn abandon_pending_spell_casts(
                 is_abandoned_spell(state, departing_player, spell_ids, pending)
             }
             PendingCostMoveResume::Cast { pending: None, .. }
+            | PendingCostMoveResume::SacrificeForCost { pending: None, .. }
             | PendingCostMoveResume::WardSacrificePayment { .. }
             | PendingCostMoveResume::ReplacementMayCost { .. }
             | PendingCostMoveResume::Foretell { .. }
@@ -108,6 +112,66 @@ fn abandon_pending_spell_casts(
     {
         state.pending_discard_for_cost = None;
     }
+}
+
+/// Preserve the completed prefix of a replacement-paused resolution sacrifice
+/// before abandoning its unresolved current move. The deferred event ledger and
+/// departure records are settled exactly once; the returned frame still owns
+/// the optional branch's resolution context.
+/// CR 800.4f + CR 118.3: a departed payer cannot finish a resolving optional
+/// sacrifice payment. Park the canonical decline until after CR 800.4a has
+/// removed every leaving player and reverted their control effects, so the
+/// living controller's remaining instructions observe the final topology.
+/// Controller departure is instead owned by
+/// `abandon_source_bound_resolution_prompt` below.
+fn stage_resolution_optional_sacrifice_decline_for_departing_payer(
+    state: &mut GameState,
+    leaving_set: &HashSet<PlayerId>,
+    events: &mut [GameEvent],
+) -> Option<OptionalEffectFrame> {
+    let selecting_payer = match &state.waiting_for {
+        WaitingFor::PayCost {
+            player,
+            kind: PayCostKind::Sacrifice,
+            resume: CostResume::Resolution,
+            ..
+        } => Some(*player),
+        _ => None,
+    };
+    let selecting_controller = selecting_payer
+        .and_then(|_| state.active_optional_effect_frame())
+        .map(|frame| frame.ability.controller);
+    let parked = match state.pending_cost_move_resume.as_ref() {
+        Some(PendingCostMoveResume::SacrificeForCost {
+            player,
+            pending: None,
+            completion: PendingSacrificeCostCompletion::ResolutionOptionalPayment { frame, .. },
+            ..
+        }) => Some((*player, frame.ability.controller)),
+        _ => None,
+    };
+    let payer = selecting_payer.or_else(|| parked.map(|(payer, _)| payer));
+    let controller = selecting_controller.or_else(|| parked.map(|(_, controller)| controller));
+    let payer = payer?;
+    if !leaving_set.contains(&payer)
+        || controller.is_some_and(|controller| leaving_set.contains(&controller))
+    {
+        return None;
+    }
+
+    let frame = if selecting_payer.is_some() {
+        state
+            .take_active_optional_effect_frame()
+            .expect("elimination cannot stage a buried optional payment frame")
+            .expect("elimination cannot stage a missing optional payment frame")
+    } else {
+        super::casting_costs::take_and_settle_parked_resolution_optional_sacrifice(state, events)
+            .expect("parked optional sacrifice payment must own its resume cursor")
+    };
+    state.waiting_for = WaitingFor::Priority {
+        player: players::next_player(state, payer),
+    };
+    Some(frame)
 }
 
 /// Eliminate a player from the game per CR 800.4.
@@ -165,6 +229,12 @@ pub fn eliminate_players_simultaneously(
         super::turn_control::invalidate_resolve_all_consent_for_topology_change(state);
         super::engine::take_and_restore_stack_resolution_session(state);
     }
+    let staged_optional_sacrifice_decline =
+        stage_resolution_optional_sacrifice_decline_for_departing_payer(
+            state,
+            &leaving_set,
+            events,
+        );
 
     let interrupted_ordinary_search = state
         .pending_scoped_library_search
@@ -319,6 +389,9 @@ pub fn eliminate_players_simultaneously(
     prune_deferred_triggers_for_eliminated_players(state);
 
     if let Some(winner) = game_over_winner {
+        if staged_optional_sacrifice_decline.is_some() {
+            finish_abandoned_source_bound_resolution_carrier(state);
+        }
         // Terminal: drop trigger scaffolding the client would otherwise show as
         // a stuck stack / ordering prompt.
         let mut terminal_firings = state
@@ -353,6 +426,12 @@ pub fn eliminate_players_simultaneously(
         }
         state.waiting_for = WaitingFor::GameOver { winner };
     } else {
+        if let Some(frame) = staged_optional_sacrifice_decline {
+            state.push_optional_effect_frame(frame);
+            super::engine_payment_choices::handle_optional_effect_choice(state, false, events)
+                .expect("departed optional sacrifice payer must follow the canonical decline path");
+        }
+
         // CR 603.3b: If prune collapsed an ordering pass into
         // `deferred_triggers` while `waiting_for` is Priority, dispatch now so
         // combat auto-advance does not skip them (issue #1350).
@@ -852,7 +931,7 @@ fn do_eliminate(
     // cast-abandonment teardown can replace its prompt with priority.
     let leaving_is_latched_chooser = state.waiting_for.acting_player() == Some(player);
 
-    abandon_source_bound_resolution_prompt(state, player);
+    abandon_source_bound_resolution_prompt(state, player, events);
     retire_pending_zone_change_contexts_owned_by(state, player);
     abandon_change_zone_family_for_controller(state, player);
 
@@ -1350,59 +1429,86 @@ fn retire_pending_zone_change_contexts_owned_by(state: &mut GameState, player: P
 /// CR 800.4a: A response prompt owned by a player who left cannot retain a
 /// resolution context for a later same-ID object. The prompt, its deferred
 /// continuation, and the resolution-scoped re-latch form one atomic family.
-fn abandon_source_bound_resolution_prompt(state: &mut GameState, player: PlayerId) {
-    let abandon = match &state.waiting_for {
-        WaitingFor::NamedChoice {
-            free_entry: None,
-            player: chooser,
-            source,
-            persist_player,
+fn abandon_source_bound_resolution_prompt(
+    state: &mut GameState,
+    player: PlayerId,
+    events: &mut [GameEvent],
+) {
+    let selecting_resolution_sacrifice = matches!(
+        &state.waiting_for,
+        WaitingFor::PayCost {
+            kind: PayCostKind::Sacrifice,
+            resume: CostResume::Resolution,
             ..
-        } => {
-            *chooser == player
-                || *persist_player == Some(player)
-                || source
-                    .as_ref()
-                    .is_some_and(|source| source.prompt.controller == player)
         }
-        WaitingFor::OpponentGuess {
-            player: guesser,
-            source,
-            owner,
+    ) && state
+        .active_optional_effect_frame()
+        .is_some_and(|frame| frame.ability.controller == player);
+    let parked_resolution_sacrifice = matches!(
+        state.pending_cost_move_resume.as_ref(),
+        Some(PendingCostMoveResume::SacrificeForCost {
+            pending: None,
+            completion: PendingSacrificeCostCompletion::ResolutionOptionalPayment { frame, .. },
             ..
-        } => {
-            *guesser == player
-                || source.prompt.controller == player
-                || owner
-                    .as_ref()
-                    .is_some_and(|owner| owner.context.lki.controller == player)
-        }
-        _ => false,
-    };
+        }) if frame.ability.controller == player
+    );
+    let abandon = selecting_resolution_sacrifice
+        || parked_resolution_sacrifice
+        || match &state.waiting_for {
+            WaitingFor::NamedChoice {
+                free_entry: None,
+                player: chooser,
+                source,
+                persist_player,
+                ..
+            } => {
+                *chooser == player
+                    || *persist_player == Some(player)
+                    || source
+                        .as_ref()
+                        .is_some_and(|source| source.prompt.controller == player)
+            }
+            WaitingFor::OpponentGuess {
+                player: guesser,
+                source,
+                owner,
+                ..
+            } => {
+                *guesser == player
+                    || source.prompt.controller == player
+                    || owner
+                        .as_ref()
+                        .is_some_and(|owner| owner.context.lki.controller == player)
+            }
+            _ => false,
+        };
     if !abandon {
         return;
     }
 
-    let _ = state
-        .clear_active_ability_continuation()
-        .expect("elimination cannot clear a buried ability continuation");
-    crate::game::stack::finish_resolving_stack_entry(
-        state,
-        crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
-    );
-    state.resolution_source_relatch = None;
-    state.deferred_entry_events.clear();
-    // The prompt and its ability continuation are abandoned, so no realization point will ever be
-    // reached for a token battlefield entry parked by this resolution. Leaving the `Option` live
-    // would let a later token's park trip the fail-loud overwrite assert, and would let the
-    // action-boundary convergence write a CR 400.7 row and run a CR 603.6a trigger pass for a
-    // resolution that no longer exists. If the token itself survives the abandonment its entry row
-    // is lost — the same loss the `deferred_entry_events.clear()` above already accepts for that
-    // entry's trigger replay.
-    state.pending_token_battlefield_entry = None;
+    if selecting_resolution_sacrifice {
+        let _ = state
+            .take_active_optional_effect_frame()
+            .expect("elimination cannot consume a buried optional payment frame");
+    }
+    if parked_resolution_sacrifice {
+        let _ = super::casting_costs::take_and_settle_parked_resolution_optional_sacrifice(
+            state, events,
+        )
+        .expect("parked optional sacrifice payment must own its resume cursor");
+    }
+
+    finish_abandoned_source_bound_resolution_carrier(state);
     state.waiting_for = WaitingFor::Priority {
         player: players::next_player(state, player),
     };
+}
+
+fn finish_abandoned_source_bound_resolution_carrier(state: &mut GameState) {
+    crate::game::stack::abandon_active_resolution_carrier(
+        state,
+        crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
+    );
 }
 
 /// CR 800.4a: A paused ChangeZone iteration is a single resolving family's
@@ -1424,18 +1530,10 @@ fn abandon_change_zone_family_for_controller(state: &mut GameState, player: Play
     let _ = state
         .take_active_change_zone_frame()
         .expect("elimination cannot consume a buried ChangeZone frame");
-    let _ = state
-        .clear_active_ability_continuation()
-        .expect("elimination cannot clear a buried ability continuation");
-    crate::game::stack::finish_resolving_stack_entry(
+    crate::game::stack::abandon_active_resolution_carrier(
         state,
         crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
     );
-    state.resolution_source_relatch = None;
-    state.deferred_entry_events.clear();
-    // Same reasoning as `abandon_source_bound_resolution_prompt`: the owning resolution is gone,
-    // so a parked token battlefield entry has no realization point left.
-    state.pending_token_battlefield_entry = None;
     state.waiting_for = WaitingFor::Priority {
         player: players::next_player(state, player),
     };
@@ -1527,7 +1625,10 @@ mod tests {
         PendingReplacement, PendingSpellResolution, PendingZoneChangeDelivery, PromptSourceBinding,
         ResolutionSourceRelatch, StackEntry, StackEntryKind,
     };
-    use crate::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef};
+    use crate::types::identifiers::{
+        CardId, DelayedTriggerInstanceId, DelayedTriggerOrigin, DelayedTriggerToken, ObjectId,
+        ObjectIncarnationRef, TriggerFiring,
+    };
     use crate::types::mana::ManaCost;
     use crate::types::proposed_event::{CounterPlacement, ProposedEvent};
     use crate::types::replacements::ReplacementEvent;
@@ -1580,6 +1681,60 @@ mod tests {
             )),
             state,
         )
+    }
+
+    fn install_receipt_eligible_resolution_sacrifice(
+        state: &mut GameState,
+        source_id: ObjectId,
+        controller: PlayerId,
+        payer: PlayerId,
+        origin: DelayedTriggerOrigin,
+    ) {
+        let ability = ResolvedAbility::new(Effect::NoOp, Vec::new(), source_id, controller);
+        crate::game::stack::begin_resolving_stack_entry(
+            state,
+            StackEntry {
+                id: ObjectId(90_000),
+                source_id,
+                controller,
+                kind: StackEntryKind::TriggeredAbility {
+                    source_id,
+                    ability: Box::new(ability.clone()),
+                    condition: None,
+                    trigger_event: None,
+                    description: Some("receipt-eligible optional sacrifice".to_string()),
+                    source_name: "Receipt source".to_string(),
+                    subject_match_count: None,
+                    die_result: None,
+                    provenance: None,
+                },
+            },
+            Some(TriggerFiring::ReceiptEligible(origin)),
+        );
+        let continuation = PendingContinuation::new(
+            Box::new(ResolvedAbility::new(
+                Effect::NoOp,
+                Vec::new(),
+                source_id,
+                controller,
+            )),
+            state,
+        );
+        state.park_ability_continuation(continuation);
+        state.push_optional_effect_frame(OptionalEffectFrame {
+            ability: Box::new(ability),
+            trigger_event: None,
+            trigger_events: Vec::new(),
+            trigger_match_count: None,
+        });
+        state.waiting_for = WaitingFor::PayCost {
+            player: payer,
+            kind: PayCostKind::Sacrifice,
+            choices: Vec::new(),
+            count: 1,
+            min_count: 0,
+            resume: CostResume::Resolution,
+        };
     }
 
     fn pending_search_found_batch(
@@ -2022,6 +2177,86 @@ mod tests {
                 player: PlayerId(2)
             }
         ));
+    }
+
+    #[test]
+    fn controller_exit_terminalizes_receipt_eligible_resolution_as_eliminated() {
+        let mut state = setup_three_player();
+        let source = create_object(
+            &mut state,
+            CardId(702),
+            PlayerId(0),
+            "Receipt source".to_string(),
+            Zone::Battlefield,
+        );
+        let origin = DelayedTriggerOrigin {
+            token: DelayedTriggerToken(702),
+            instance: DelayedTriggerInstanceId(702),
+            source_id: source,
+        };
+        install_receipt_eligible_resolution_sacrifice(
+            &mut state,
+            source,
+            PlayerId(0),
+            PlayerId(1),
+            origin,
+        );
+
+        let lifecycle = crate::game::lifecycle::enter_action_frame();
+        eliminate_player(&mut state, PlayerId(0), &mut Vec::new());
+        let facts = lifecycle
+            .take_outer_facts()
+            .expect("outer elimination owns lifecycle facts");
+
+        assert_eq!(
+            facts.receipt_terminal_disposition(origin),
+            Some(crate::game::lifecycle::DelayedTerminalDisposition::Eliminated)
+        );
+        assert!(state.resolving_stack_entry.is_none());
+        assert!(state.resolving_trigger_firing.is_none());
+    }
+
+    #[test]
+    fn terminal_payer_exit_terminalizes_staged_receipt_as_eliminated() {
+        let mut state = setup_two_player();
+        let source = create_object(
+            &mut state,
+            CardId(703),
+            PlayerId(0),
+            "Receipt source".to_string(),
+            Zone::Battlefield,
+        );
+        let origin = DelayedTriggerOrigin {
+            token: DelayedTriggerToken(703),
+            instance: DelayedTriggerInstanceId(703),
+            source_id: source,
+        };
+        install_receipt_eligible_resolution_sacrifice(
+            &mut state,
+            source,
+            PlayerId(0),
+            PlayerId(1),
+            origin,
+        );
+
+        let lifecycle = crate::game::lifecycle::enter_action_frame();
+        eliminate_player(&mut state, PlayerId(1), &mut Vec::new());
+        let facts = lifecycle
+            .take_outer_facts()
+            .expect("outer elimination owns lifecycle facts");
+
+        assert_eq!(
+            facts.receipt_terminal_disposition(origin),
+            Some(crate::game::lifecycle::DelayedTerminalDisposition::Eliminated)
+        );
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::GameOver {
+                winner: Some(PlayerId(0))
+            }
+        ));
+        assert!(state.resolving_stack_entry.is_none());
+        assert!(state.resolving_trigger_firing.is_none());
     }
 
     #[test]

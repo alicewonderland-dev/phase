@@ -4662,7 +4662,6 @@ fn quantity_ref_target_slot_spec(qty: &QuantityRef) -> Option<TargetFilter> {
         | QuantityRef::ObjectCountDistinct { filter, .. }
         | QuantityRef::ObjectCountBySharedQuality { filter, .. }
         | QuantityRef::CountersOnObjects { filter, .. }
-        | QuantityRef::Aggregate { filter, .. }
         | QuantityRef::EnteredThisTurn { filter }
         // CR 608.2i: the look-back sibling of `EnteredThisTurn` carries the same
         // kind of population filter, so it must reach the same recursion instead
@@ -4685,6 +4684,9 @@ fn quantity_ref_target_slot_spec(qty: &QuantityRef) -> Option<TargetFilter> {
         | QuantityRef::DistinctSubtypes { source, .. }
         | QuantityRef::DistinctColorsAmong { source } => {
             characteristic_source_target_slot_filter(source)
+        }
+        QuantityRef::PropertyAggregate(aggregate) => {
+            characteristic_source_target_slot_filter(aggregate.source())
         }
         QuantityRef::ManaSpentToCast { metric, .. } => match metric {
             CastManaSpentMetric::FromSource { source_filter } => {
@@ -14334,6 +14336,7 @@ mod tests {
                 enters_attacking: false,
                 kept_optional_to: None,
                 enters_under: None,
+                kept_destination_if: None,
             },
             vec![],
             ObjectId(900),
@@ -14455,11 +14458,16 @@ mod tests {
         assert!(filter_references_target_creature_quantity(&shares_quality));
 
         let aggregate = QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate {
-                function: AggregateFunction::Max,
-                property: ObjectProperty::ManaValue,
-                filter: target_power_filter(),
-            },
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Max,
+                    ObjectProperty::ManaValue,
+                    crate::types::ability::CardTypeSetSource::Objects {
+                        filter: target_power_filter(),
+                    },
+                )
+                .expect("statically valid property aggregate"),
+            ),
         };
         assert!(quantity_expr_references_target_creature(&aggregate));
 

@@ -1682,7 +1682,7 @@ mod tests {
         // Gap A + Gap B composed. The Skullspore Nexus create clause (verbatim)
         // must lower to a dynamic-P/T token whose base P/T reads the triggering
         // batch's total power. Baseline: `Effect::Unimplemented` (measured).
-        use crate::types::ability::{AggregateFunction, ObjectProperty, TrackedAnaphorSource};
+        use crate::types::ability::{AggregateFunction, ObjectProperty};
         let txt = "Create a green Fungus Dinosaur creature token with base power and toughness each equal to the total power of those creatures.";
         let effect = try_parse_token(&txt.to_lowercase(), txt, &mut ParseContext::default())
             .expect("Skullspore token must parse (was Unimplemented)");
@@ -1698,11 +1698,17 @@ mod tests {
             panic!("expected Effect::Token, got {effect:?}");
         };
         let expected_pt = PtValue::Quantity(QuantityExpr::Ref {
-            qty: QuantityRef::TrackedSetAggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::Power,
-                source: TrackedAnaphorSource::TriggeringBatch,
-            },
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::Power,
+                    crate::types::ability::CardTypeSetSource::TrackedSet {
+                        set: crate::types::ability::TrackedAnaphorSource::TriggeringBatch,
+                        caused_by: None,
+                    },
+                )
+                .expect("statically valid property aggregate"),
+            ),
         });
         assert_eq!(power, expected_pt.clone(), "base power must be batch sum");
         assert_eq!(toughness, expected_pt, "base toughness must be batch sum");
@@ -1879,7 +1885,7 @@ mod tests {
 
     #[test]
     fn where_x_token_pt_covers_cards_exiled_this_way_aggregate() {
-        use crate::types::ability::{AggregateFunction, ObjectProperty, TrackedAnaphorSource};
+        use crate::types::ability::{AggregateFunction, ObjectProperty};
 
         let txt = "Create an X/X blue Zombie creature token, where X is the total power of the cards exiled this way.";
         let effect = try_parse_token(&txt.to_lowercase(), txt, &mut ParseContext::default())
@@ -1896,11 +1902,17 @@ mod tests {
             panic!("expected Effect::Token, got {effect:?}");
         };
         let expected_pt = PtValue::Quantity(QuantityExpr::Ref {
-            qty: QuantityRef::TrackedSetAggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::Power,
-                source: TrackedAnaphorSource::ChainSet,
-            },
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::Power,
+                    crate::types::ability::CardTypeSetSource::TrackedSet {
+                        set: crate::types::ability::TrackedAnaphorSource::ChainSet,
+                        caused_by: None,
+                    },
+                )
+                .expect("statically valid property aggregate"),
+            ),
         });
         assert_eq!(name, "Zombie");
         assert!(
@@ -1927,6 +1939,7 @@ mod tests {
             QuantityExpr::Ref {
                 qty: QuantityRef::DistinctCardTypes {
                     source: crate::types::ability::CardTypeSetSource::TrackedSet {
+                        set: crate::types::ability::TrackedAnaphorSource::ChainSet,
                         caused_by: Some(crate::types::ability::ThisWayCause::Discarded),
                     },
                 },

@@ -525,6 +525,19 @@ pub(crate) enum ContinuationAst {
     /// and Destroy the Evidence where "those cards" refers to all cards revealed
     /// during the RevealUntil resolution, not only the non-matching ones.
     RevealUntilAllToZone { destination: Zone },
+    /// CR 202.3 + CR 608.2c: "If its mana value is <comparator> <dynamic
+    /// quantity>, put it onto <zone>[. Otherwise, put it into <zone>]." after
+    /// RevealUntil — a card-property branch on the hit card's own mana value
+    /// (Part in Friendship), distinct from the player-choice `RevealUntilKept
+    /// { optional_decline }` shape. Absorbs into `kept_destination_if`
+    /// (the `if_true` branch) and, when the trailing "otherwise" clause is
+    /// present in the same sentence, `kept_destination` (the "otherwise"
+    /// branch) as well.
+    RevealUntilConditionalKept {
+        filter: Box<TargetFilter>,
+        if_true_destination: Zone,
+        otherwise_destination: Option<Zone>,
+    },
     /// CR 406.3 + CR 701.20e: "[then] exile it/them [face down]" after a private
     /// `Dig` (the "look at the top N cards of <player>'s library" look step).
     /// Rewrites the preceding `Dig` into an `Effect::ExileTop` so the looked-at

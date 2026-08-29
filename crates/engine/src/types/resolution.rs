@@ -17,15 +17,15 @@ use frame_vec::{FrameSlot, FrameVec};
 use crate::types::ability::{AbilityDefinition, DiscardedCardResult, ResolvedAbility, TargetRef};
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    DrainStatus, DrawSequenceStack, GameState, GameStateDecode, GameStateDecodeMode,
-    PendingBatchDeliveries, PendingChangeZoneIteration, PendingChooseOneOf, PendingConniveReentry,
-    PendingContinuation, PendingCopyTokenResolution, PendingCounterAdditionQueue,
-    PendingCounterMoveQueue, PendingCounterRemovalQueue, PendingDebugCardEntries,
-    PendingEachPlayerCopyChosen, PendingLifeTotalAssignment, PendingMultiDraw,
-    PendingPerCategoryZoneChoice, PendingPerPlayerZoneChoice, PendingRepeatIteration,
-    PendingRepeatUntil, PendingSpellResolution, PendingVoteBallotIteration, PostReplacementDrain,
-    PostReplacementDrainDispatch, PostReplacementDrainStack, PostReplacementFrameId,
-    ResidentDrainPolicy, ResolvingTriggerContext, WaitingFor,
+    CostResume, DrainStatus, DrawSequenceStack, GameState, GameStateDecode, GameStateDecodeMode,
+    PayCostKind, PendingBatchDeliveries, PendingChangeZoneIteration, PendingChooseOneOf,
+    PendingConniveReentry, PendingContinuation, PendingCopyTokenResolution,
+    PendingCounterAdditionQueue, PendingCounterMoveQueue, PendingCounterRemovalQueue,
+    PendingDebugCardEntries, PendingEachPlayerCopyChosen, PendingLifeTotalAssignment,
+    PendingMultiDraw, PendingPerCategoryZoneChoice, PendingPerPlayerZoneChoice,
+    PendingRepeatIteration, PendingRepeatUntil, PendingSpellResolution, PendingVoteBallotIteration,
+    PostReplacementDrain, PostReplacementDrainDispatch, PostReplacementDrainStack,
+    PostReplacementFrameId, ResidentDrainPolicy, ResolvingTriggerContext, WaitingFor,
 };
 use crate::types::identifiers::{DiscardFrameId, ObjectId};
 use crate::types::player::PlayerId;
@@ -456,6 +456,14 @@ impl DirectChoiceGate {
                 | (
                     Self::OptionalEffect,
                     WaitingFor::ResolutionOptionalPaymentChoice { .. }
+                )
+                | (
+                    Self::OptionalEffect,
+                    WaitingFor::PayCost {
+                        kind: PayCostKind::Sacrifice,
+                        resume: CostResume::Resolution,
+                        ..
+                    }
                 )
                 | (Self::CoinFlipKeep, WaitingFor::CoinFlipKeepChoice { .. })
                 | (Self::Proliferate, WaitingFor::ProliferateChoice { .. })

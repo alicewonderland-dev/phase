@@ -103,10 +103,10 @@
 use crate::types::ability::FilterProp;
 use crate::types::ability::{
     AbilityCondition, AbilityDefinition, CardTypeSetSource, ContinuousModification, ControllerRef,
-    Duration, Effect, GuessSubject, ModalChoice, MultiTargetSpec, ObjectScope, PlayerFilter,
-    PlayerScope, QuantityExpr, QuantityRef, RepeatContinuation, ReplacementDefinition,
-    ResolvedAbility, StaticCondition, StaticDefinition, TargetFilter, TriggerCondition,
-    TriggerDefinition, TurnJournalKind, TypeFilter, TypedFilter, ZoneRef,
+    Duration, Effect, GuessSubject, ModalChoice, MultiTargetSpec, ObjectProperty, ObjectScope,
+    PlayerFilter, PlayerScope, QuantityExpr, QuantityRef, RepeatContinuation,
+    ReplacementDefinition, ResolvedAbility, StaticCondition, StaticDefinition, TargetFilter,
+    TriggerCondition, TriggerDefinition, TurnJournalKind, TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::game_state::TargetSelectionConstraint;
 use crate::types::zones::Zone;
@@ -1448,6 +1448,7 @@ fn scope_of(target: &TargetFilter, chain_root: Option<WriteScope>) -> WriteScope
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
@@ -2177,7 +2178,7 @@ fn legacy_quantity_ref(x: &QuantityRef) -> bool {
         | QuantityRef::DistinctColorsAmong { .. }
         | QuantityRef::CountersOnObjects { .. }
         | QuantityRef::DistinctCounterKindsAmong { .. }
-        | QuantityRef::Aggregate { .. }
+        | QuantityRef::PropertyAggregate(_)
         | QuantityRef::PlayerCount { .. }
         | QuantityRef::EventContextPlayerCount { .. }
         | QuantityRef::TargetObjectManaValue { .. }
@@ -2195,7 +2196,6 @@ fn legacy_quantity_ref(x: &QuantityRef) -> bool {
         | QuantityRef::ExiledCardPower { .. }
         | QuantityRef::TrackedSetSize
         | QuantityRef::FilteredTrackedSetSize { .. }
-        | QuantityRef::TrackedSetAggregate { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
         | QuantityRef::PreviousEffectCount
@@ -2406,6 +2406,9 @@ fn legacy_target_filter(f: &TargetFilter) -> bool {
         | TargetFilter::LastCreated
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
+        // CR 701.47c: not one of the 12 frozen event-context tags, mirroring
+        // `ObjectScope::AmassedArmy`'s `legacy_object_scope` classification.
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
@@ -2647,6 +2650,10 @@ fn member_bound_target_filter(f: &TargetFilter) -> bool {
         | TargetFilter::ParentTargetOwner
         | TargetFilter::StackSpell
         | TargetFilter::CostPaidObject
+        // CR 701.47c: resolution-local, carried per-ability like `CostPaidObject`
+        // (`ResolvedAbility.amassed_army_object`), not per-source storage keyed
+        // by object id — not per-member-bound.
+        | TargetFilter::AmassedArmy
         | TargetFilter::ScopedPlayer
         | TargetFilter::LastCreated
         | TargetFilter::LastRevealed
@@ -4033,6 +4040,7 @@ fn walk_ability(
         mode_abilities,
         targets: _,
         source_id: _,
+        cast_occurrence: _,    // finalized-cast provenance, no read/write effect
         source_incarnation: _, // self-transform epoch latch, no read/write effect
         trigger_source: _,     // exact triggered-source authority, no read/write effect
         trigger_definition_ref: _, // exact trigger occurrence, no read/write effect
@@ -5130,6 +5138,7 @@ fn rw_effect(
             enter_tapped: _,
             enters_attacking: _,
             kept_optional_to: _,
+            kept_destination_if: _,
         } => {
             let mut p = ext_write(StateKind::SetMembership);
             p.writes_external.set(StateKind::HandLibrary);
@@ -6202,11 +6211,40 @@ fn rw_quantity_ref(x: &QuantityRef) -> RwProfile {
         | QuantityRef::DistinctCounterKindsAmong { filter } => {
             board_value_aggregate_read(filter, StateKind::ObjectCounters)
         }
-        QuantityRef::Aggregate {
-            filter,
-            function: _,
-            property: _,
-        } => board_value_aggregate_read(filter, StateKind::ObjectPt),
+        QuantityRef::PropertyAggregate(aggregate) => {
+            let mut profile = characteristic_source_read_bounded(aggregate.source());
+            let mut reads_live_object = false;
+            let mut reads_tracked = false;
+            aggregate.source().try_for_each_member(
+                crate::types::ability::UNION_DEPTH_BUDGET,
+                &mut |leaf| match leaf {
+                    CardTypeSetSource::TurnJournal { .. } => {}
+                    CardTypeSetSource::TrackedSet { .. } => {
+                        reads_live_object = true;
+                        reads_tracked = true;
+                    }
+                    CardTypeSetSource::Zone { .. }
+                    | CardTypeSetSource::ExiledBySource
+                    | CardTypeSetSource::Objects { .. } => reads_live_object = true,
+                    CardTypeSetSource::AnyOf { .. } => {}
+                },
+            );
+            if reads_live_object {
+                profile.merge(reads_board_of(StateKind::ObjectPt));
+                // CR 613.4: +1/+1-counter writes feed live current-P/T
+                // aggregates, but not intrinsic mana-value/symbol reads.
+                if matches!(
+                    aggregate.property(),
+                    ObjectProperty::Power | ObjectProperty::Toughness
+                ) {
+                    profile.current_pt_reads.add(PtReadScope::Board);
+                }
+            }
+            if reads_tracked {
+                profile.reads_member_bound = true;
+            }
+            profile
+        }
         QuantityRef::PlayerCount { filter: _ } => RwProfile::empty(),
         QuantityRef::EventContextPlayerCount { filter: _ } => reads_event_live(),
         QuantityRef::CountersOn { scope, .. } | QuantityRef::Intensity { scope, .. } => {
@@ -6264,15 +6302,6 @@ fn rw_quantity_ref(x: &QuantityRef) -> RwProfile {
         //     for any non-legacy-12 ref (ability_rw.rs `ability_rw_profile`),
         //     collapsing that mirror to a fail-open read-live path. So fail-closed
         //     member-bound is the correct, not merely safe, verdict.
-        QuantityRef::TrackedSetAggregate {
-            function: _,
-            property: _,
-            source: _,
-        } => {
-            let mut p = RwProfile::empty();
-            p.reads_member_bound = true;
-            p
-        }
         // CR 603.10a (PR-6.75 c5): per-source tracked/exiled/chosen storage and
         // per-instance cast-context memory (X paid, kicker/convoke/vote/additional-
         // cost counts) are bound per member instance — each trigger stack object
@@ -6912,6 +6941,9 @@ fn rw_target_filter(x: &TargetFilter) -> RwProfile {
         | TargetFilter::LastCreated
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
+        // CR 701.47c: not one of the 12 D5/legacy tags — a read-free selector
+        // (mirrors `ObjectScope::AmassedArmy`, which carries no event axis).
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
@@ -7083,10 +7115,83 @@ fn rw_controller_ref(x: &ControllerRef) -> RwProfile {
 mod tests {
     use super::*;
     use crate::types::ability::{
-        AbilityKind, ChoiceType, Comparator, CountScope, PtValue, TargetSelectionMode,
+        AbilityKind, AggregateFunction, ChoiceType, Comparator, CountScope, PropertyAggregate,
+        PtValue, TargetSelectionMode,
     };
 
     use crate::game::test_fixtures::mana_fixture_roles;
+
+    #[test]
+    fn property_aggregate_source_rw_profiles_are_exhaustive() {
+        use crate::types::ability::{
+            CardTypeSetSource, ObjectProperty, PropertyAggregate, TrackedAnaphorSource,
+            TurnJournalKind, ZoneRef,
+        };
+
+        fn expected(source: &CardTypeSetSource) -> RwProfile {
+            let mut profile = characteristic_source_read_bounded(source);
+            let mut live = false;
+            let mut tracked = false;
+            source.try_for_each_member(crate::types::ability::UNION_DEPTH_BUDGET, &mut |leaf| {
+                match leaf {
+                    CardTypeSetSource::TurnJournal { .. } => {}
+                    CardTypeSetSource::TrackedSet { .. } => {
+                        live = true;
+                        tracked = true;
+                    }
+                    CardTypeSetSource::Zone { .. }
+                    | CardTypeSetSource::ExiledBySource
+                    | CardTypeSetSource::Objects { .. } => live = true,
+                    CardTypeSetSource::AnyOf { .. } => unreachable!("walker flattens unions"),
+                }
+            });
+            if live {
+                profile.merge(reads_board_of(StateKind::ObjectPt));
+            }
+            if tracked {
+                profile.reads_member_bound = true;
+            }
+            profile
+        }
+
+        let objects = CardTypeSetSource::Objects {
+            filter: TargetFilter::Any,
+        };
+        let journal = CardTypeSetSource::TurnJournal {
+            journal: TurnJournalKind::SpellsCast,
+            scope: CountScope::Controller,
+            filter: None,
+        };
+        let sources = vec![
+            CardTypeSetSource::Zone {
+                zone: ZoneRef::Graveyard,
+                scope: CountScope::Controller,
+            },
+            CardTypeSetSource::ExiledBySource,
+            objects.clone(),
+            CardTypeSetSource::TrackedSet {
+                set: TrackedAnaphorSource::ChainSet,
+                caused_by: None,
+            },
+            CardTypeSetSource::TrackedSet {
+                set: TrackedAnaphorSource::TriggeringBatch,
+                caused_by: None,
+            },
+            journal.clone(),
+            CardTypeSetSource::any_of(vec![objects, journal]).unwrap(),
+        ];
+        for source in sources {
+            let qty = QuantityRef::PropertyAggregate(
+                PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::ManaValue,
+                    source.clone(),
+                )
+                .unwrap(),
+            );
+            assert_eq!(rw_quantity_ref(&qty), expected(&source), "{source:?}");
+        }
+    }
 
     /// Row 14. CR 603.3b: the same-event ordering gate reads this profile, and
     /// an OMITTED read is FAIL-OPEN. Every `CardTypeSetSource` must therefore map
@@ -7807,6 +7912,33 @@ mod tests {
             qcheck(power_src(), 6),
         );
         assert!(conflicts(&a, &se()));
+    }
+
+    #[test]
+    fn property_aggregate_live_power_read_vs_board_counter_write_conflict() {
+        let aggregate = PropertyAggregate::new(
+            AggregateFunction::Max,
+            ObjectProperty::Power,
+            CardTypeSetSource::Objects { filter: creature() },
+        )
+        .expect("live-object power aggregate");
+        let a = cond(
+            ra(put_counter_all(qfix(1), creature())),
+            qcheck(QuantityRef::PropertyAggregate(aggregate), 6),
+        );
+        assert!(conflicts(&a, &batch()));
+
+        let mana_value = PropertyAggregate::new(
+            AggregateFunction::Max,
+            ObjectProperty::ManaValue,
+            CardTypeSetSource::Objects { filter: creature() },
+        )
+        .expect("live-object mana-value aggregate");
+        let control = cond(
+            ra(put_counter_all(qfix(1), creature())),
+            qcheck(QuantityRef::PropertyAggregate(mana_value), 6),
+        );
+        assert!(!conflicts(&control, &batch()));
     }
 
     #[test]

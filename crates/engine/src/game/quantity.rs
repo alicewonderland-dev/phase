@@ -27,8 +27,8 @@ use crate::types::card_type::CoreType;
 use crate::types::counter::{positive_counter_types, CounterType};
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    BattlefieldDepartureSourceContext, DamageRecord, GameState, LinkedExileSnapshot,
-    TriggerSourceContext,
+    BattlefieldDepartureSourceContext, CastOccurrence, DamageRecord, GameState,
+    LinkedExileSnapshot, TriggerSourceContext,
 };
 use crate::types::identifiers::ObjectId;
 use crate::types::mana::{ManaColor, ManaCost};
@@ -152,7 +152,14 @@ fn cards_exiled_this_turn_for_context(state: &GameState, ctx: &QuantityContext) 
 /// targeting legality, the layer system, and combat).
 enum CharacteristicView<'a> {
     Object(&'a crate::game::game_object::GameObject),
+    Lki(&'a crate::types::game_state::LKISnapshot),
     SpellRecord(&'a crate::types::game_state::SpellCastRecord),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CharacteristicMember {
+    Object(ObjectId),
+    Cast(CastOccurrence),
 }
 
 impl<'a> CharacteristicView<'a> {
@@ -160,6 +167,7 @@ impl<'a> CharacteristicView<'a> {
     fn core_types(&self) -> &'a [CoreType] {
         match self {
             CharacteristicView::Object(obj) => &obj.card_types.core_types,
+            CharacteristicView::Lki(lki) => &lki.card_types,
             CharacteristicView::SpellRecord(record) => &record.core_types,
         }
     }
@@ -168,6 +176,7 @@ impl<'a> CharacteristicView<'a> {
     fn subtypes(&self) -> &'a [String] {
         match self {
             CharacteristicView::Object(obj) => &obj.card_types.subtypes,
+            CharacteristicView::Lki(lki) => &lki.subtypes,
             CharacteristicView::SpellRecord(record) => &record.subtypes,
         }
     }
@@ -176,7 +185,18 @@ impl<'a> CharacteristicView<'a> {
     fn colors(&self) -> &'a [ManaColor] {
         match self {
             CharacteristicView::Object(obj) => &obj.color,
+            CharacteristicView::Lki(lki) => &lki.colors,
             CharacteristicView::SpellRecord(record) => &record.colors,
+        }
+    }
+
+    /// CR 202.3: the member's mana value. Cast records carry the exact
+    /// cast-time snapshot; live objects include the stack-only X contribution.
+    fn mana_value(&self) -> i32 {
+        match self {
+            CharacteristicView::Object(obj) => u32_to_i32_saturating(obj.effective_mana_value()),
+            CharacteristicView::Lki(lki) => u32_to_i32_saturating(lki.mana_value),
+            CharacteristicView::SpellRecord(record) => u32_to_i32_saturating(record.mana_value),
         }
     }
 }
@@ -190,13 +210,50 @@ impl<'a> CharacteristicView<'a> {
 /// only its own characteristic extractor. Callers tally into a `HashSet`, so
 /// `AnyOf`'s recursion yields a genuine set UNION: a member present in two
 /// sources contributes its characteristics once.
+fn filter_without_current_cast_exclusion_marker(filter: &TargetFilter) -> TargetFilter {
+    match filter {
+        TargetFilter::Typed(typed) => {
+            let mut typed = typed.clone();
+            typed
+                .properties
+                .retain(|prop| prop != &FilterProp::OtherThanTriggerObject);
+            TargetFilter::Typed(typed)
+        }
+        TargetFilter::And { filters } => TargetFilter::And {
+            filters: filters
+                .iter()
+                .map(filter_without_current_cast_exclusion_marker)
+                .collect(),
+        },
+        TargetFilter::Or { filters } => TargetFilter::Or {
+            filters: filters
+                .iter()
+                .map(filter_without_current_cast_exclusion_marker)
+                .collect(),
+        },
+        TargetFilter::Not { filter } => TargetFilter::Not {
+            filter: Box::new(filter_without_current_cast_exclusion_marker(filter)),
+        },
+        TargetFilter::TrackedSetFiltered {
+            id,
+            filter,
+            caused_by,
+        } => TargetFilter::TrackedSetFiltered {
+            id: *id,
+            filter: Box::new(filter_without_current_cast_exclusion_marker(filter)),
+            caused_by: *caused_by,
+        },
+        other => other.clone(),
+    }
+}
+
 fn visit_characteristic_leaf<'s>(
     state: &'s GameState,
     source: &CardTypeSetSource,
     ctx: QuantityContext,
     filter_ctx: &FilterContext<'_>,
     controller: PlayerId,
-    visit: &mut impl FnMut(CharacteristicView<'s>),
+    visit: &mut impl FnMut(CharacteristicMember, CharacteristicView<'s>, bool),
 ) {
     match source {
         CardTypeSetSource::Zone { zone, scope } => match zone {
@@ -211,7 +268,11 @@ fn visit_characteristic_leaf<'s>(
                             obj.owner,
                         );
                         if owner_matches {
-                            visit(CharacteristicView::Object(obj));
+                            visit(
+                                CharacteristicMember::Object(obj_id),
+                                CharacteristicView::Object(obj),
+                                false,
+                            );
                         }
                     }
                 }
@@ -226,7 +287,11 @@ fn visit_characteristic_leaf<'s>(
                     };
                     for &obj_id in zone_ids {
                         if let Some(obj) = state.objects.get(&obj_id) {
-                            visit(CharacteristicView::Object(obj));
+                            visit(
+                                CharacteristicMember::Object(obj_id),
+                                CharacteristicView::Object(obj),
+                                false,
+                            );
                         }
                     }
                 }
@@ -235,38 +300,27 @@ fn visit_characteristic_leaf<'s>(
         CardTypeSetSource::ExiledBySource => {
             for linked in linked_exile_for_context(state, &ctx) {
                 if let Some(obj) = state.objects.get(&linked.exiled_id) {
-                    visit(CharacteristicView::Object(obj));
+                    visit(
+                        CharacteristicMember::Object(linked.exiled_id),
+                        CharacteristicView::Object(obj),
+                        false,
+                    );
                 }
             }
         }
-        // CR 400.1: EVERY zone the filter names, not just the first. The zone
-        // list comes from `CardTypeSetSource::population_zones` — the same
-        // authority `game::layers::characteristic_source_reads_zone` asks — so
-        // the set this walk enumerates and the set a zone transition dirties
-        // cannot drift apart.
-        //
-        // The previous `extract_in_zone().unwrap_or(Battlefield)` collapsed a
-        // multi-zone `FilterProp::InAnyZone` population to whichever zone the
-        // filter tree happened to yield first, silently undercounting every
-        // other zone in the union.
-        //
-        // CR 110.1: an empty list means the filter writes no zone constraint, so
-        // it denotes permanents. The default is substituted HERE and not inside
-        // `population_zones` — see that function on why the dependency half must
-        // not claim a defaulted battlefield read.
+        // The shared object-population authority preserves explicit zones,
+        // boolean branch defaults, LastZoneChanged/TrackedSet populations, and
+        // the triggering-object exclusion. Property aggregates must enumerate
+        // the exact same members as object-count quantities.
         CardTypeSetSource::Objects { filter } => {
-            let mut zones = source.population_zones();
-            if zones.is_empty() {
-                zones.push(crate::types::zones::Zone::Battlefield);
-            }
-            for zone in zones {
-                for obj_id in crate::game::targeting::zone_object_ids(state, zone) {
-                    if !matches_target_filter(state, obj_id, filter, filter_ctx) {
-                        continue;
-                    }
-                    if let Some(obj) = state.objects.get(&obj_id) {
-                        visit(CharacteristicView::Object(obj));
-                    }
+            for obj_id in object_count_matching_ids(state, filter, filter_ctx, ctx.source) {
+                let view = state
+                    .objects
+                    .get(&obj_id)
+                    .map(CharacteristicView::Object)
+                    .or_else(|| state.lki_cache.get(&obj_id).map(CharacteristicView::Lki));
+                if let Some(view) = view {
+                    visit(CharacteristicMember::Object(obj_id), view, false);
                 }
             }
         }
@@ -281,22 +335,41 @@ fn visit_characteristic_leaf<'s>(
         // `effects::publish_tracked_set`. Deliberately not routed through
         // `targeting::resolve_tracked_set_id`: that authority SKIPS empty sets, and
         // under mode scoping not skipping is the correct semantics here.
-        CardTypeSetSource::TrackedSet { caused_by } => {
-            if let Some((set_id, ids)) = state.tracked_object_sets.iter().max_by_key(|(id, _)| id.0)
-            {
-                for &oid in ids {
-                    let cause_ok = match caused_by {
-                        None => true,
-                        Some(cause) => state
+        CardTypeSetSource::TrackedSet { set, caused_by } => {
+            let tracked: Vec<(Option<crate::types::identifiers::TrackedSetId>, ObjectId)> =
+                match set {
+                    TrackedAnaphorSource::ChainSet => state
+                        .tracked_object_sets
+                        .iter()
+                        .max_by_key(|(id, _)| id.0)
+                        .map(|(set_id, ids)| ids.iter().map(|&id| (Some(*set_id), id)).collect())
+                        .unwrap_or_default(),
+                    TrackedAnaphorSource::TriggeringBatch => state
+                        .current_trigger_events
+                        .iter()
+                        .flat_map(crate::game::targeting::extract_sources_from_event)
+                        .map(|id| (None, id))
+                        .collect(),
+                };
+            for (set_id, oid) in tracked {
+                let cause_ok = match caused_by {
+                    None => true,
+                    Some(cause) => set_id.is_some_and(|set_id| {
+                        state
                             .tracked_set_member_causes
-                            .get(set_id)
+                            .get(&set_id)
                             .and_then(|causes| causes.get(&oid))
-                            .is_some_and(|member_cause| member_cause == cause),
-                    };
-                    if cause_ok {
-                        if let Some(obj) = state.objects.get(&oid) {
-                            visit(CharacteristicView::Object(obj));
-                        }
+                            .is_some_and(|member_cause| member_cause == cause)
+                    }),
+                };
+                if cause_ok {
+                    let view = state
+                        .objects
+                        .get(&oid)
+                        .map(CharacteristicView::Object)
+                        .or_else(|| state.lki_cache.get(&oid).map(CharacteristicView::Lki));
+                    if let Some(view) = view {
+                        visit(CharacteristicMember::Object(oid), view, false);
                     }
                 }
             }
@@ -316,13 +389,19 @@ fn visit_characteristic_leaf<'s>(
             filter,
         } => match journal {
             TurnJournalKind::SpellsCast => {
+                let excludes_current = filter
+                    .as_ref()
+                    .is_some_and(TargetFilter::contains_other_than_trigger_object);
+                let record_filter = filter
+                    .as_ref()
+                    .map(filter_without_current_cast_exclusion_marker);
                 for player in scoped_players(state, scope, ctx, controller) {
                     let Some(records) = state.spells_cast_this_turn_by_player.get(&player.id)
                     else {
                         continue;
                     };
-                    for record in records.iter() {
-                        let matches = match filter {
+                    for (index, record) in records.iter().enumerate() {
+                        let matches = match &record_filter {
                             None => true,
                             Some(filter) => spell_record_matches_filter(
                                 record,
@@ -332,7 +411,17 @@ fn visit_characteristic_leaf<'s>(
                             ),
                         };
                         if matches {
-                            visit(CharacteristicView::SpellRecord(record));
+                            let Ok(turn_journal_index) = u32::try_from(index) else {
+                                continue;
+                            };
+                            visit(
+                                CharacteristicMember::Cast(CastOccurrence {
+                                    caster: player.id,
+                                    turn_journal_index,
+                                }),
+                                CharacteristicView::SpellRecord(record),
+                                excludes_current,
+                            );
                         }
                     }
                 }
@@ -354,17 +443,65 @@ fn visit_characteristic_leaf<'s>(
 /// UNDERCOUNTS rather than over-counts, which is why the budget is set far above
 /// any printed union — the honest alternative would be refusing to resolve the
 /// quantity at all, and no card can reach the bound.
+#[derive(Clone, Copy)]
+struct CharacteristicFilterContexts<'a> {
+    base: &'a FilterContext<'a>,
+    scoped_owned_exile: Option<&'a FilterContext<'a>>,
+}
+
 fn visit_characteristic_source<'s>(
     state: &'s GameState,
     source: &CardTypeSetSource,
     ctx: QuantityContext,
-    filter_ctx: &FilterContext<'_>,
+    filter_contexts: CharacteristicFilterContexts<'_>,
     controller: PlayerId,
-    visit: &mut impl FnMut(CharacteristicView<'s>),
+    journal_controller: PlayerId,
+    visit: &mut impl FnMut(CharacteristicMember, CharacteristicView<'s>, bool),
 ) {
     source.try_for_each_member(crate::types::ability::UNION_DEPTH_BUDGET, &mut |leaf| {
-        visit_characteristic_leaf(state, leaf, ctx.clone(), filter_ctx, controller, visit);
+        let leaf_controller = if matches!(leaf, CardTypeSetSource::TurnJournal { .. }) {
+            journal_controller
+        } else {
+            controller
+        };
+        let leaf_filter_ctx = match leaf {
+            CardTypeSetSource::Objects { filter }
+                if filter.references_exiled_by_source() && filter_binds_owned_you(filter) =>
+            {
+                filter_contexts
+                    .scoped_owned_exile
+                    .unwrap_or(filter_contexts.base)
+            }
+            _ => filter_contexts.base,
+        };
+        visit_characteristic_leaf(
+            state,
+            leaf,
+            ctx.clone(),
+            leaf_filter_ctx,
+            leaf_controller,
+            visit,
+        );
     });
+}
+
+fn filter_binds_owned_you(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(TypedFilter { properties, .. }) => properties.iter().any(|prop| {
+            matches!(
+                prop,
+                FilterProp::Owned {
+                    controller: ControllerRef::You,
+                }
+            )
+        }),
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => {
+            filters.iter().any(filter_binds_owned_you)
+        }
+        TargetFilter::Not { filter } => filter_binds_owned_you(filter),
+        TargetFilter::TrackedSetFiltered { filter, .. } => filter_binds_owned_you(filter),
+        _ => false,
+    }
 }
 
 fn source_chosen_player_for_context(state: &GameState, ctx: &QuantityContext) -> Option<PlayerId> {
@@ -972,7 +1109,7 @@ fn quantity_ref_uses_unspent_mana(qty: &QuantityRef) -> bool {
         | QuantityRef::ObjectTypelineComponentCount { .. }
         | QuantityRef::ManaSymbolsInManaCost { .. }
         | QuantityRef::SelfManaValue
-        | QuantityRef::Aggregate { .. }
+        | QuantityRef::PropertyAggregate(_)
         | QuantityRef::ControlledByEachPlayer { .. }
         | QuantityRef::TargetZoneCardCount { .. }
         | QuantityRef::Devotion { .. }
@@ -984,7 +1121,6 @@ fn quantity_ref_uses_unspent_mana(qty: &QuantityRef) -> bool {
         | QuantityRef::BasicLandTypeCount { .. }
         | QuantityRef::TrackedSetSize
         | QuantityRef::FilteredTrackedSetSize { .. }
-        | QuantityRef::TrackedSetAggregate { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
         | QuantityRef::PreviousEffectCount
@@ -1250,7 +1386,6 @@ fn quantity_ref_uses_object_count(qty: &QuantityRef) -> bool {
         | QuantityRef::ObjectCountDistinct { .. }
         | QuantityRef::ObjectCountBySharedQuality { .. }
         | QuantityRef::CountersOnObjects { .. }
-        | QuantityRef::Aggregate { .. }
         | QuantityRef::ControlledByEachPlayer { .. }
         | QuantityRef::Devotion { .. }
         | QuantityRef::BasicLandTypeCount { .. }
@@ -1280,6 +1415,9 @@ fn quantity_ref_uses_object_count(qty: &QuantityRef) -> bool {
         | QuantityRef::DistinctSubtypes { source, .. }
         | QuantityRef::DistinctColorsAmong { source } => {
             characteristic_source_reads_object_count(source)
+        }
+        QuantityRef::PropertyAggregate(aggregate) => {
+            characteristic_source_reads_object_count(aggregate.source())
         }
         // Player-level, single-object, history-record, payment, and choice
         // references: unaffected by another object's battlefield entry/exit.
@@ -1315,7 +1453,6 @@ fn quantity_ref_uses_object_count(qty: &QuantityRef) -> bool {
         | QuantityRef::ZoneCardCount { .. }
         | QuantityRef::TrackedSetSize
         | QuantityRef::FilteredTrackedSetSize { .. }
-        | QuantityRef::TrackedSetAggregate { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
         | QuantityRef::PreviousEffectCount
@@ -1509,10 +1646,10 @@ fn quantity_ref_characteristic_reads(qty: &QuantityRef, depth: u32) -> Character
         } => target_filter_characteristic_reads_at(filter, depth)
             .union(shared_quality_characteristic_reads(quality)),
         // CR 202.3: aggregated object property plus the scanned filter.
-        QuantityRef::Aggregate {
-            property, filter, ..
-        } => object_property_characteristic_reads(property)
-            .union(target_filter_characteristic_reads_at(filter, depth)),
+        QuantityRef::PropertyAggregate(aggregate) => {
+            object_property_characteristic_reads(&aggregate.property())
+                .union(characteristic_source_reads_at(aggregate.source(), depth))
+        }
         // CR 109.5 + CR 613.1b: per-player partition of a live census.
         QuantityRef::ControlledByEachPlayer { filter, .. } => CharacteristicKinds::CONTROLLER
             .union(target_filter_characteristic_reads_at(filter, depth)),
@@ -1585,10 +1722,6 @@ fn quantity_ref_characteristic_reads(qty: &QuantityRef, depth: u32) -> Character
         QuantityRef::ObjectNameWordCount { .. } => CharacteristicKinds::NAME_TEXT,
         // CR 205.4a + CR 205.2a + CR 205.3: supertypes + card types + subtypes.
         QuantityRef::ObjectTypelineComponentCount { .. } => CharacteristicKinds::CARD_TYPES,
-        // CR 608.2c: aggregates an object property over an identity-addressed set.
-        QuantityRef::TrackedSetAggregate { property, .. } => {
-            object_property_characteristic_reads(property)
-        }
         // CR 122.1f + CR 109.4: reads the controller of the parent target.
         QuantityRef::TargetControllerCounter { .. } => CharacteristicKinds::CONTROLLER,
         // CR 400.7 + CR 613.1b: look-back attachment snapshot, optionally scoped
@@ -1791,7 +1924,6 @@ fn entered_object_perturbs_quantity_ref(
         | QuantityRef::ObjectCountDistinct { filter, .. }
         | QuantityRef::ObjectCountBySharedQuality { filter, .. }
         | QuantityRef::CountersOnObjects { filter, .. }
-        | QuantityRef::Aggregate { filter, .. }
         | QuantityRef::ControlledByEachPlayer { filter, .. }
         | QuantityRef::DistinctCounterKindsAmong { filter }
         | QuantityRef::EnteredThisTurn { filter }
@@ -1820,6 +1952,9 @@ fn entered_object_perturbs_quantity_ref(
         | QuantityRef::DistinctSubtypes { source, .. }
         | QuantityRef::DistinctColorsAmong { source } => {
             characteristic_source_perturbed_by_entry(state, entered, ctx, source)
+        }
+        QuantityRef::PropertyAggregate(aggregate) => {
+            characteristic_source_perturbed_by_entry(state, entered, ctx, aggregate.source())
         }
         // CR 700.5: devotion is perturbed iff the entered object's mana cost
         // contributes a symbol for one of the fixed colors. `ChosenColor`'s
@@ -1883,7 +2018,6 @@ fn entered_object_perturbs_quantity_ref(
         | QuantityRef::ZoneCardCount { .. }
         | QuantityRef::TrackedSetSize
         | QuantityRef::FilteredTrackedSetSize { .. }
-        | QuantityRef::TrackedSetAggregate { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
         | QuantityRef::PreviousEffectCount
@@ -2770,28 +2904,35 @@ pub(crate) fn aggregate_property_over(
     function: AggregateFunction,
     property: ObjectProperty,
 ) -> i32 {
-    let extract = |id: ObjectId| -> Option<i32> {
-        let live = state.objects.get(&id).and_then(|obj| match property {
-            ObjectProperty::Power => obj.power,
-            ObjectProperty::Toughness => obj.toughness,
-            // CR 202.3e: include X when on the stack (cost_x_paid).
-            ObjectProperty::ManaValue => Some(u32_to_i32_saturating(obj.effective_mana_value())),
-            // CR 107.4a + CR 107.4e + CR 202.1: colored mana symbols of `color`;
-            // hybrid symbols contribute to each of their colors.
-            ObjectProperty::ManaSymbolCount(color) => Some(u32_to_i32_saturating(
-                crate::game::devotion::count_cost_color_symbols(&obj.mana_cost, color),
-            )),
-        });
-        live.or_else(|| {
-            state.lki_cache.get(&id).and_then(|lki| match property {
-                ObjectProperty::Power => lki.power,
-                ObjectProperty::Toughness => lki.toughness,
-                ObjectProperty::ManaValue => Some(u32_to_i32_saturating(lki.mana_value)),
-                ObjectProperty::ManaSymbolCount(_) => None,
-            })
+    let values = ids
+        .iter()
+        .filter_map(|&id| object_property_value(state, id, property));
+    reduce_property_values(values, function)
+}
+
+fn object_property_value(state: &GameState, id: ObjectId, property: ObjectProperty) -> Option<i32> {
+    let live = state.objects.get(&id).and_then(|obj| match property {
+        ObjectProperty::Power => obj.power,
+        ObjectProperty::Toughness => obj.toughness,
+        // CR 202.3e: include X when on the stack (cost_x_paid).
+        ObjectProperty::ManaValue => Some(u32_to_i32_saturating(obj.effective_mana_value())),
+        // CR 107.4a + CR 107.4e + CR 202.1: colored mana symbols of `color`;
+        // hybrid symbols contribute to each of their colors.
+        ObjectProperty::ManaSymbolCount(color) => Some(u32_to_i32_saturating(
+            crate::game::devotion::count_cost_color_symbols(&obj.mana_cost, color),
+        )),
+    });
+    live.or_else(|| {
+        state.lki_cache.get(&id).and_then(|lki| match property {
+            ObjectProperty::Power => lki.power,
+            ObjectProperty::Toughness => lki.toughness,
+            ObjectProperty::ManaValue => Some(u32_to_i32_saturating(lki.mana_value)),
+            ObjectProperty::ManaSymbolCount(_) => None,
         })
-    };
-    let values = ids.iter().filter_map(|&id| extract(id));
+    })
+}
+
+fn reduce_property_values(values: impl Iterator<Item = i32>, function: AggregateFunction) -> i32 {
     match function {
         AggregateFunction::Max => values.max().unwrap_or(0),
         AggregateFunction::Min => values.min().unwrap_or(0),
@@ -3193,23 +3334,30 @@ pub(crate) fn object_count_matching_candidate_ids(
     ids
 }
 
-fn filter_binds_owned_you(filter: &TargetFilter) -> bool {
-    match filter {
-        TargetFilter::Typed(TypedFilter { properties, .. }) => properties.iter().any(|prop| {
-            matches!(
-                prop,
-                FilterProp::Owned {
-                    controller: ControllerRef::You,
-                }
-            )
-        }),
-        TargetFilter::And { filters } | TargetFilter::Or { filters } => {
-            filters.iter().any(filter_binds_owned_you)
-        }
-        TargetFilter::Not { filter } => filter_binds_owned_you(filter),
-        TargetFilter::TrackedSetFiltered { filter, .. } => filter_binds_owned_you(filter),
-        _ => false,
+fn current_cast_occurrence_matches(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    member: CharacteristicMember,
+) -> bool {
+    let Some(occurrence) = ability.cast_occurrence else {
+        return false;
+    };
+    if member != CharacteristicMember::Cast(occurrence)
+        || !state
+            .objects
+            .get(&ability.source_id)
+            .is_some_and(|object| object.zone == Zone::Stack)
+    {
+        return false;
     }
+    let Ok(index) = usize::try_from(occurrence.turn_journal_index) else {
+        return false;
+    };
+    state
+        .spells_cast_this_turn_by_player
+        .get(&occurrence.caster)
+        .and_then(|records| records.get(index))
+        .is_some_and(|record| record.spell_object_id == Some(ability.source_id))
 }
 
 fn resolve_ref(
@@ -3262,7 +3410,7 @@ fn resolve_ref(
     match qty {
         // CR 402: hand size for the scoped player(s).
         QuantityRef::HandSize { player: scope } => {
-            // CR 608.2e (§8): a cross-player `AllPlayers` hand extremum is the
+            // CR 608.2e: a cross-player `AllPlayers` hand extremum is the
             // discard-clause equalization minimum — freeze it against the
             // clause's pre-clause board if a snapshot was captured. Single-
             // player scopes (Controller/ScopedPlayer/Target/...) re-resolve
@@ -3692,43 +3840,67 @@ fn resolve_ref(
         // that were exiled this way"), the live object's `power`/`toughness`
         // are `None` because the at-exile layer values are not maintained off
         // battlefield. Fall back to the LKI snapshot captured by
-        // `change_zone` on leaving the battlefield (`game/zones.rs:65-92`),
+        // `change_zone` on leaving the battlefield (`game::zones`),
         // which holds the post-layer-7 values from the moment of departure —
         // exactly what the "as they last existed on the battlefield" ruling
         // requires. `ManaValue` doesn't need LKI: the printed mana cost is
         // stable across zones.
-        QuantityRef::Aggregate {
-            function,
-            property,
-            filter,
-        } => {
-            // CR 608.2h + CR 400.7: id population delegated to
-            // `object_count_matching_ids` (single source of truth for zone
-            // selection + the `OtherThanTriggerObject` exclusion); per-object
-            // aggregation delegated to `aggregate_property_over` (single
-            // summation authority, live-then-LKI per property).
-            let mut scoped_exile_filter_ctx;
-            let aggregate_filter_ctx = if filter.references_exiled_by_source()
-                && filter_binds_owned_you(filter)
-                && ability.is_some_and(|a| {
-                    a.scoped_player.is_some()
-                        || a.original_controller
-                            .is_some_and(|orig| orig != a.controller)
-                }) {
-                let scoped = ability
-                    .and_then(|a| a.scoped_player.or(Some(a.controller)))
-                    .unwrap_or(controller);
-                scoped_exile_filter_ctx = match ability {
-                    Some(a) => FilterContext::from_ability_with_controller(a, scoped),
-                    None => FilterContext::from_source_with_controller(source_id, scoped),
-                };
-                scoped_exile_filter_ctx.recipient_id = ctx.recipient;
-                &scoped_exile_filter_ctx
-            } else {
-                &filter_ctx
-            };
-            let ids = object_count_matching_ids(state, filter, aggregate_filter_ctx, source_id);
-            aggregate_property_over(state, &ids, *function, *property)
+        QuantityRef::PropertyAggregate(aggregate) => {
+            let journal_controller = ability
+                .and_then(|ability| ability.original_controller)
+                .unwrap_or(controller);
+            // Preserve the legacy Aggregate rule used by Skyclave Apparition:
+            // during a per-owner fanout, "cards you own exiled by this source"
+            // binds "you" to that owner. Other object filters and journal
+            // scopes keep their normal controller authority.
+            let scoped_owned_exile_filter_ctx = ability.and_then(|ability| {
+                (ability.scoped_player.is_some()
+                    || ability
+                        .original_controller
+                        .is_some_and(|original| original != ability.controller))
+                .then(|| {
+                    let scoped = ability.scoped_player.unwrap_or(ability.controller);
+                    let mut scoped_ctx =
+                        FilterContext::from_ability_with_controller(ability, scoped);
+                    scoped_ctx.recipient_id = ctx.recipient;
+                    scoped_ctx
+                })
+            });
+            let mut seen = HashSet::new();
+            let mut values = Vec::new();
+            visit_characteristic_source(
+                state,
+                aggregate.source(),
+                ctx.clone(),
+                CharacteristicFilterContexts {
+                    base: &filter_ctx,
+                    scoped_owned_exile: scoped_owned_exile_filter_ctx.as_ref(),
+                },
+                controller,
+                journal_controller,
+                &mut |member, view, excludes_current| {
+                    if excludes_current
+                        && ability.is_some_and(|ability| {
+                            current_cast_occurrence_matches(state, ability, member)
+                        })
+                    {
+                        return;
+                    }
+                    if !seen.insert(member) {
+                        return;
+                    }
+                    let value = match member {
+                        CharacteristicMember::Object(id) => {
+                            object_property_value(state, id, aggregate.property())
+                        }
+                        CharacteristicMember::Cast(_) => Some(view.mana_value()),
+                    };
+                    if let Some(value) = value {
+                        values.push(value);
+                    }
+                },
+            );
+            reduce_property_values(values.into_iter(), aggregate.function())
         }
         // CR 107.1 + CR 700.1: min/max across players of the count of
         // battlefield objects matching `filter` each player controls.
@@ -3737,7 +3909,7 @@ fn resolve_ref(
             aggregate,
             relation,
         } => {
-            // CR 608.2e (§8): prefer the clause-local snapshot if this clause
+            // CR 608.2e: prefer the clause-local snapshot if this clause
             // captured one — that freezes the extremum against the board as it
             // stood when the clause began, so an earlier APNAP player's
             // sacrifices do not shrink a later player's minimum.
@@ -3886,9 +4058,13 @@ fn resolve_ref(
                 state,
                 source,
                 ctx.clone(),
-                &filter_ctx,
+                CharacteristicFilterContexts {
+                    base: &filter_ctx,
+                    scoped_owned_exile: None,
+                },
                 controller,
-                &mut |view| {
+                controller,
+                &mut |_, view, _| {
                     for ct in view.core_types() {
                         seen.insert(*ct);
                     }
@@ -3931,9 +4107,13 @@ fn resolve_ref(
                 state,
                 source,
                 ctx.clone(),
-                &filter_ctx,
+                CharacteristicFilterContexts {
+                    base: &filter_ctx,
+                    scoped_owned_exile: None,
+                },
                 controller,
-                &mut |view| {
+                controller,
+                &mut |_, view, _| {
                     for sub in view.subtypes() {
                         if exclude_creature && creature_types.contains(sub.as_str()) {
                             continue;
@@ -4167,58 +4347,6 @@ fn resolve_ref(
                 .count();
             usize_to_i32_saturating(count)
         }
-        // CR 608.2c + CR 107.3e + CR 202.3: Reduce a numeric property
-        // over the most recent chain tracked set. Mirrors `FilteredTrackedSetSize`'s set
-        // selection (highest id = the set the preceding chain effect published)
-        // but aggregates a per-member value instead of counting. The members are
-        // addressed by identity, so cards the producer moved to exile are read in
-        // place (mirrors the `Aggregate` extract: live object first, LKI cache
-        // fallback). Drives "deals damage equal to the total mana value of those
-        // exiled cards" (Ensnared by the Mara).
-        QuantityRef::TrackedSetAggregate {
-            function,
-            property,
-            source,
-        } => {
-            // The id-set to reduce depends on which anaphor the parser matched.
-            let ids: Vec<ObjectId> = match source {
-                // Chain-published tracked set ("those exiled cards"): the set the
-                // immediately-preceding chain effect published (highest id).
-                // CR 700.2 + CR 608.2c: "highest id" == "the set the currently-resolving
-                // instruction published" — the ordering argument is written once, on
-                // `effects::publish_tracked_set`. Deliberately not routed through
-                // `targeting::resolve_tracked_set_id`: that authority SKIPS empty sets, and
-                // under mode scoping not skipping is the correct semantics here.
-                TrackedAnaphorSource::ChainSet => state
-                    .tracked_object_sets
-                    .iter()
-                    .max_by_key(|(id, _)| id.0)
-                    .map(|(_, ids)| ids.clone())
-                    .unwrap_or_default(),
-                // CR 603.2c + CR 603.10a: the current triggering event batch
-                // ("those creatures" on a batched dies trigger; "them" / "their
-                // total power" on a batched attack trigger). The subjects are
-                // read from `state.current_trigger_events`; each died creature's
-                // power comes from its last-known info (LKI), i.e. death-time
-                // power, via `aggregate_property_over`'s live-then-LKI extract.
-                //
-                // CR 508.1: `extract_sources_from_event` is the SET-valued
-                // extractor. The singleton `extract_source_from_event` collapses
-                // a multi-attacker `AttackersDeclared` to `None`, which reduced
-                // this aggregate over an EMPTY set — 0 attackers' worth of power
-                // on every board with 2+ attackers (Aloy, Shriekwood Devourer,
-                // Witch-king, Sky Scourge). Dies batches are unchanged: they
-                // arrive as one event per creature and are still collected here.
-                TrackedAnaphorSource::TriggeringBatch => state
-                    .current_trigger_events
-                    .iter()
-                    .flat_map(crate::game::targeting::extract_sources_from_event)
-                    .collect(),
-            };
-            // Per-object aggregation delegated to the shared
-            // `aggregate_property_over` summation authority (live-then-LKI).
-            aggregate_property_over(state, &ids, *function, *property)
-        }
         // CR 400.7 + CR 608.2c: Read the per-resolution counter populated by
         // ChangeZoneAll when it exiles cards from a hand. Used by "draws a card
         // for each card exiled from their hand this way" (Deadly Cover-Up).
@@ -4427,9 +4555,13 @@ fn resolve_ref(
                 state,
                 source,
                 ctx.clone(),
-                &filter_ctx,
+                CharacteristicFilterContexts {
+                    base: &filter_ctx,
+                    scoped_owned_exile: None,
+                },
                 controller,
-                &mut |view| {
+                controller,
+                &mut |_, view, _| {
                     for color in view.colors() {
                         seen.insert(*color);
                     }
@@ -5629,7 +5761,15 @@ fn object_for_scope<'a>(
     }
 }
 
-fn object_id_for_scope(
+/// Resolve an [`ObjectScope`] to a concrete object id under `ctx`.
+///
+/// `pub(crate)` for ONE reason: the resource loop firewall's
+/// `counters_on_source_provably_excludes_class` arm must ask THE SAME scope
+/// authority the `QuantityRef::CountersOn` resolver asks, rather than
+/// re-implementing "`ObjectScope::Source` means the ability's own source". Do not
+/// read this widened visibility as an invitation to resolve quantities outside
+/// `game::quantity` — every other caller is in this module.
+pub(crate) fn object_id_for_scope(
     state: &GameState,
     scope: ObjectScope,
     ctx: QuantityContext,
@@ -6701,7 +6841,7 @@ fn resolve_object_mana_value(
         // CR 608.2c + CR 701.20b + CR 108.3 + CR 202.3: "the mana value of the
         // card revealed by the OTHER player" in an exactly-two-target symmetric
         // reveal. This fan-out iteration's OWN revealed card is bound as
-        // `effect_context_object` (owner-keyed, §2.4b of the plan). The other
+        // `effect_context_object` (owner-keyed). The other
         // revealer's card is the single `last_revealed_ids` entry that is NOT the
         // own card (by-exclusion). MV is printed/zone-independent (CR 202.3), so
         // the read is stable whether or not the other card has already been put
@@ -7716,7 +7856,7 @@ mod tests {
     /// the refusal: the wrong shape silently under-counts; the right shape is
     /// available.
     #[test]
-    fn a_cross_zone_or_drops_a_leg_while_any_of_reads_both_zones() {
+    fn a_cross_zone_or_preserves_branch_local_zones_while_any_of_reads_both_zones() {
         let mut state = GameState::new_two_player(7);
         let controller = PlayerId(0);
 
@@ -7794,18 +7934,9 @@ mod tests {
              + blue (graveyard). A walk that kept only the first zone reads 1"
         );
 
-        // UNSUPPORTED SHAPE, and the boundary is asserted rather than assumed: a
-        // PARTIALLY zone-constrained `Or`. The first disjunct names no zone (so
-        // it means the battlefield, CR 110.1) while the second names the
-        // graveyard, and `population_zones` returns ONE FLAT LIST that cannot say
-        // "battlefield for that branch only". The list is `[Graveyard]`, which is
-        // non-empty, so the battlefield default never applies and the first
-        // disjunct's permanents are never scanned.
-        //
-        // The count is 1 — blue, from the graveyard — NOT the green the old
-        // comment here predicted. Both readings happen to be 1, which is exactly
-        // why the stale explanation survived: the number could not distinguish
-        // them. Asserting the identity below can.
+        // The shared object-population authority preserves each `Or` branch's
+        // own zone universe: an unconstrained permanent branch defaults to the
+        // battlefield while the explicitly constrained branch reads graveyard.
         let folded = QuantityExpr::Ref {
             qty: QuantityRef::DistinctColorsAmong {
                 source: CardTypeSetSource::Objects {
@@ -7817,13 +7948,11 @@ mod tests {
         };
         assert_eq!(
             resolve_quantity(&state, &folded, controller, bear),
-            1,
-            "a partially zone-constrained Or scans only the zone it names"
+            2,
+            "branch-local zone universes retain both the battlefield and graveyard legs"
         );
-        // The parser refuses to emit this shape, which is what keeps the
-        // undercount above unreachable from real Oracle text. If this guard ever
-        // goes green, the shape becomes expressible and the undercount becomes a
-        // live defect.
+        // The parser remains conservative about emitting this shape. Runtime
+        // support does not broaden the grammar accepted in Phase 2.
         assert!(
             !crate::parser::oracle_nom::quantity::objects_filter_zone_is_unambiguous(
                 &TargetFilter::Or {
@@ -8331,18 +8460,23 @@ mod tests {
         };
 
         let qty = QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::ManaSymbolCount(ManaColor::Black),
-                filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
-                    FilterProp::Owned {
-                        controller: ControllerRef::You,
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::ManaSymbolCount(ManaColor::Black),
+                    crate::types::ability::CardTypeSetSource::Objects {
+                        filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
+                            FilterProp::Owned {
+                                controller: ControllerRef::You,
+                            },
+                            FilterProp::InZone {
+                                zone: Zone::Graveyard,
+                            },
+                        ])),
                     },
-                    FilterProp::InZone {
-                        zone: Zone::Graveyard,
-                    },
-                ])),
-            },
+                )
+                .expect("statically valid property aggregate"),
+            ),
         };
 
         // P0 sees 3 black symbols in their own graveyard (battlefield + P1's
@@ -8537,18 +8671,23 @@ mod tests {
         );
 
         let qty = QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::ManaSymbolCount(ManaColor::Black),
-                filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
-                    FilterProp::Owned {
-                        controller: ControllerRef::You,
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::ManaSymbolCount(ManaColor::Black),
+                    crate::types::ability::CardTypeSetSource::Objects {
+                        filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
+                            FilterProp::Owned {
+                                controller: ControllerRef::You,
+                            },
+                            FilterProp::InZone {
+                                zone: Zone::Graveyard,
+                            },
+                        ])),
                     },
-                    FilterProp::InZone {
-                        zone: Zone::Graveyard,
-                    },
-                ])),
-            },
+                )
+                .expect("statically valid property aggregate"),
+            ),
         };
 
         // The card is counted for its OWNER (P0), not for the player who last
@@ -9815,20 +9954,25 @@ mod tests {
 
         let mut state = GameState::new(FormatConfig::commander(), 4, 42);
         let expr = QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate {
-                function: AggregateFunction::Max,
-                property: ObjectProperty::ManaValue,
-                filter: TargetFilter::Typed(
-                    TypedFilter::default()
-                        .controller(ControllerRef::You)
-                        .properties(vec![
-                            FilterProp::IsCommander,
-                            FilterProp::InAnyZone {
-                                zones: vec![Zone::Battlefield, Zone::Command],
-                            },
-                        ]),
-                ),
-            },
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Max,
+                    ObjectProperty::ManaValue,
+                    crate::types::ability::CardTypeSetSource::Objects {
+                        filter: TargetFilter::Typed(
+                            TypedFilter::default()
+                                .controller(ControllerRef::You)
+                                .properties(vec![
+                                    FilterProp::IsCommander,
+                                    FilterProp::InAnyZone {
+                                        zones: vec![Zone::Battlefield, Zone::Command],
+                                    },
+                                ]),
+                        ),
+                    },
+                )
+                .expect("statically valid property aggregate"),
+            ),
         };
 
         // Add two partners in command zone: 3-mana and 5-mana
@@ -11242,7 +11386,7 @@ mod tests {
     /// adds matching records; Max picks the largest; a non-matching destination
     /// is excluded (returns 0 when none match).
     #[test]
-    fn resolve_zone_change_aggregate_this_turn_sums_dies_power() {
+    fn zone_change_aggregate_this_turn_remains_occurrence_stream_lki() {
         let mut state = GameState::new_two_player(42);
         let source = create_object(
             &mut state,
@@ -15417,11 +15561,18 @@ mod tests {
             Zone::Battlefield,
         );
         let expr = QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate {
-                function: AggregateFunction::Max,
-                property: ObjectProperty::Power,
-                filter: TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
-            },
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Max,
+                    ObjectProperty::Power,
+                    crate::types::ability::CardTypeSetSource::Objects {
+                        filter: TargetFilter::Typed(
+                            TypedFilter::creature().controller(ControllerRef::You),
+                        ),
+                    },
+                )
+                .expect("statically valid property aggregate"),
+            ),
         };
         assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), source), 5);
     }
@@ -15453,11 +15604,18 @@ mod tests {
             Zone::Battlefield,
         );
         let expr = QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::Power,
-                filter: TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
-            },
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::Power,
+                    crate::types::ability::CardTypeSetSource::Objects {
+                        filter: TargetFilter::Typed(
+                            TypedFilter::creature().controller(ControllerRef::You),
+                        ),
+                    },
+                )
+                .expect("statically valid property aggregate"),
+            ),
         };
         assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), source), 10);
     }
@@ -15494,13 +15652,520 @@ mod tests {
             properties: vec![crate::types::ability::FilterProp::InZone { zone: Zone::Exile }],
         });
         let expr = QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate {
-                function: AggregateFunction::Max,
-                property: ObjectProperty::ManaValue,
-                filter,
-            },
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Max,
+                    ObjectProperty::ManaValue,
+                    CardTypeSetSource::Objects { filter },
+                )
+                .expect("valid object aggregate"),
+            ),
         };
         assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), source), 7);
+    }
+
+    #[test]
+    fn property_aggregate_valid_empty_sources_return_zero_for_sum_max_and_min() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(500),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        for function in [
+            AggregateFunction::Sum,
+            AggregateFunction::Max,
+            AggregateFunction::Min,
+        ] {
+            let expr = QuantityExpr::Ref {
+                qty: QuantityRef::PropertyAggregate(
+                    crate::types::ability::PropertyAggregate::new(
+                        function,
+                        ObjectProperty::ManaValue,
+                        CardTypeSetSource::Zone {
+                            zone: ZoneRef::Library,
+                            scope: CountScope::Controller,
+                        },
+                    )
+                    .unwrap(),
+                ),
+            };
+            assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), source), 0);
+        }
+    }
+
+    #[test]
+    fn property_aggregate_objects_preserves_sum_max_min_and_filters() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(510),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        for (card, power) in [(511, 2), (512, 5)] {
+            let id = create_object(
+                &mut state,
+                CardId(card),
+                PlayerId(0),
+                format!("Creature {card}"),
+                Zone::Battlefield,
+            );
+            let object = state.objects.get_mut(&id).unwrap();
+            object.card_types.core_types = vec![CoreType::Creature];
+            object.power = Some(power);
+        }
+        let artifact = create_object(
+            &mut state,
+            CardId(513),
+            PlayerId(0),
+            "Artifact".to_string(),
+            Zone::Battlefield,
+        );
+        let object = state.objects.get_mut(&artifact).unwrap();
+        object.card_types.core_types = vec![CoreType::Artifact];
+        object.power = Some(100);
+
+        for (function, expected) in [
+            (AggregateFunction::Sum, 7),
+            (AggregateFunction::Max, 5),
+            (AggregateFunction::Min, 2),
+        ] {
+            let expr = QuantityExpr::Ref {
+                qty: QuantityRef::PropertyAggregate(
+                    crate::types::ability::PropertyAggregate::new(
+                        function,
+                        ObjectProperty::Power,
+                        CardTypeSetSource::Objects {
+                            filter: TargetFilter::Typed(TypedFilter::creature()),
+                        },
+                    )
+                    .unwrap(),
+                ),
+            };
+            assert_eq!(
+                resolve_quantity(&state, &expr, PlayerId(0), source),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn property_aggregate_objects_preserves_last_zone_changed_population() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(514),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let departed = create_object(
+            &mut state,
+            CardId(515),
+            PlayerId(0),
+            "Departed creature".to_string(),
+            Zone::Graveyard,
+        );
+        let object = state.objects.get_mut(&departed).unwrap();
+        object.card_types.core_types = vec![CoreType::Creature];
+        object.power = Some(6);
+        state.last_zone_changed_ids = vec![departed];
+
+        let expr = QuantityExpr::Ref {
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::Power,
+                    CardTypeSetSource::Objects {
+                        filter: TargetFilter::And {
+                            filters: vec![
+                                TargetFilter::LastZoneChanged,
+                                TargetFilter::Typed(TypedFilter::creature()),
+                            ],
+                        },
+                    },
+                )
+                .unwrap(),
+            ),
+        };
+
+        assert_eq!(
+            resolve_quantity(&state, &expr, PlayerId(0), source),
+            6,
+            "LastZoneChanged is a population anchor; it must not collapse to the typed branch's battlefield default",
+        );
+    }
+
+    #[test]
+    fn property_aggregate_tracked_sources_keep_chain_set_and_triggering_batch_distinct() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(520),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let chain_member = create_object(
+            &mut state,
+            CardId(521),
+            PlayerId(0),
+            "Chain member".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&chain_member).unwrap().power = Some(2);
+        let batch_member = create_object(
+            &mut state,
+            CardId(522),
+            PlayerId(0),
+            "Batch member".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&batch_member).unwrap().power = Some(5);
+
+        let set_id = crate::types::identifiers::TrackedSetId(state.next_tracked_set_id);
+        state.next_tracked_set_id += 1;
+        state.tracked_object_sets.insert(set_id, vec![chain_member]);
+        state.current_trigger_events = vec![crate::types::events::GameEvent::AttackersDeclared {
+            attacker_ids: vec![batch_member],
+            defending_player: PlayerId(1),
+            attacks: vec![],
+        }];
+
+        let aggregate = |set| QuantityExpr::Ref {
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::Power,
+                    CardTypeSetSource::TrackedSet {
+                        set,
+                        caused_by: None,
+                    },
+                )
+                .unwrap(),
+            ),
+        };
+        assert_eq!(
+            resolve_quantity(
+                &state,
+                &aggregate(TrackedAnaphorSource::ChainSet),
+                PlayerId(0),
+                source,
+            ),
+            2,
+        );
+        assert_eq!(
+            resolve_quantity(
+                &state,
+                &aggregate(TrackedAnaphorSource::TriggeringBatch),
+                PlayerId(0),
+                source,
+            ),
+            5,
+        );
+    }
+
+    #[test]
+    fn property_aggregate_tracked_sources_preserve_departed_and_ceased_lki() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(523),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let departed = create_object(
+            &mut state,
+            CardId(524),
+            PlayerId(0),
+            "Departed".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&departed).unwrap().power = Some(4);
+        let departed_lki = state.objects[&departed].snapshot_public_characteristics();
+        state.lki_cache.insert(departed, departed_lki);
+        let departed_object = state.objects.get_mut(&departed).unwrap();
+        departed_object.zone = Zone::Graveyard;
+        departed_object.power = None;
+        state.battlefield.retain(|&id| id != departed);
+
+        let ceased = create_object(
+            &mut state,
+            CardId(525),
+            PlayerId(0),
+            "Ceased".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&ceased).unwrap().power = Some(7);
+        let ceased_lki = state.objects[&ceased].snapshot_public_characteristics();
+        state.lki_cache.insert(ceased, ceased_lki);
+        state.objects.remove(&ceased);
+        state.battlefield.retain(|&id| id != ceased);
+
+        let set_id = crate::types::identifiers::TrackedSetId(state.next_tracked_set_id);
+        state.next_tracked_set_id += 1;
+        state
+            .tracked_object_sets
+            .insert(set_id, vec![departed, ceased]);
+        let expr = QuantityExpr::Ref {
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::Power,
+                    CardTypeSetSource::TrackedSet {
+                        set: TrackedAnaphorSource::ChainSet,
+                        caused_by: None,
+                    },
+                )
+                .unwrap(),
+            ),
+        };
+
+        assert_eq!(
+            resolve_quantity(&state, &expr, PlayerId(0), source),
+            11,
+            "tracked populations retain both a departed live id's LKI and a ceased object's LKI",
+        );
+    }
+
+    #[test]
+    fn property_aggregate_any_of_deduplicates_objects_and_cast_occurrences() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(501),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let exiled = create_object(
+            &mut state,
+            CardId(502),
+            PlayerId(0),
+            "Exiled".to_string(),
+            Zone::Exile,
+        );
+        state.objects.get_mut(&exiled).unwrap().mana_cost = ManaCost::generic(5);
+        let object_union = CardTypeSetSource::any_of(vec![
+            CardTypeSetSource::Zone {
+                zone: ZoneRef::Exile,
+                scope: CountScope::Controller,
+            },
+            CardTypeSetSource::Objects {
+                filter: TargetFilter::Typed(
+                    TypedFilter::card().properties(vec![FilterProp::InZone { zone: Zone::Exile }]),
+                ),
+            },
+        ])
+        .unwrap();
+        let object_expr = QuantityExpr::Ref {
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::ManaValue,
+                    object_union,
+                )
+                .unwrap(),
+            ),
+        };
+        assert_eq!(
+            resolve_quantity(&state, &object_expr, PlayerId(0), source),
+            5
+        );
+
+        state.spells_cast_this_turn_by_player.insert(
+            PlayerId(0),
+            crate::im::Vector::unit(SpellCastRecord {
+                mana_value: 3,
+                spell_object_id: Some(ObjectId(700)),
+                ..SpellCastRecord::default()
+            }),
+        );
+        let journal = CardTypeSetSource::TurnJournal {
+            journal: TurnJournalKind::SpellsCast,
+            scope: CountScope::Controller,
+            filter: None,
+        };
+        let cast_expr = QuantityExpr::Ref {
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::ManaValue,
+                    CardTypeSetSource::any_of(vec![journal.clone(), journal]).unwrap(),
+                )
+                .unwrap(),
+            ),
+        };
+        assert_eq!(resolve_quantity(&state, &cast_expr, PlayerId(0), source), 3);
+    }
+
+    #[test]
+    fn property_aggregate_turn_journal_excludes_only_the_resolving_occurrence() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(503),
+            PlayerId(0),
+            "Resolving".to_string(),
+            Zone::Stack,
+        );
+        state.spells_cast_this_turn_by_player.insert(
+            PlayerId(0),
+            crate::im::Vector::from(vec![
+                SpellCastRecord {
+                    core_types: vec![CoreType::Instant],
+                    mana_value: 2,
+                    spell_object_id: Some(ObjectId(701)),
+                    ..SpellCastRecord::default()
+                },
+                SpellCastRecord {
+                    core_types: vec![CoreType::Instant],
+                    mana_value: 5,
+                    spell_object_id: Some(source),
+                    ..SpellCastRecord::default()
+                },
+            ]),
+        );
+        let aggregate = crate::types::ability::PropertyAggregate::new(
+            AggregateFunction::Sum,
+            ObjectProperty::ManaValue,
+            CardTypeSetSource::TurnJournal {
+                journal: TurnJournalKind::SpellsCast,
+                scope: CountScope::Controller,
+                filter: Some(TargetFilter::Typed(
+                    TypedFilter::card().properties(vec![FilterProp::OtherThanTriggerObject]),
+                )),
+            },
+        )
+        .unwrap();
+        let qty = QuantityRef::PropertyAggregate(aggregate);
+        let mut ability = ResolvedAbility::new(Effect::NoOp, vec![], source, PlayerId(0));
+        ability.cast_occurrence = Some(crate::types::game_state::CastOccurrence {
+            caster: PlayerId(0),
+            turn_journal_index: 1,
+        });
+        let ctx = QuantityContext {
+            entering: None,
+            source,
+            trigger_source: None,
+            recipient: None,
+            scoped_player: None,
+            damage_source: None,
+        };
+        assert_eq!(
+            resolve_ref(
+                &state,
+                &qty,
+                PlayerId(0),
+                ctx.clone(),
+                &[],
+                None,
+                Some(&ability)
+            ),
+            2
+        );
+        let excluding = CardTypeSetSource::TurnJournal {
+            journal: TurnJournalKind::SpellsCast,
+            scope: CountScope::Controller,
+            filter: Some(TargetFilter::Typed(
+                TypedFilter::card().properties(vec![FilterProp::OtherThanTriggerObject]),
+            )),
+        };
+        let inclusive = CardTypeSetSource::TurnJournal {
+            journal: TurnJournalKind::SpellsCast,
+            scope: CountScope::Controller,
+            filter: None,
+        };
+        for members in [
+            vec![excluding.clone(), inclusive.clone()],
+            vec![inclusive.clone(), excluding.clone()],
+        ] {
+            let union = QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::ManaValue,
+                    CardTypeSetSource::any_of(members).unwrap(),
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                resolve_ref(
+                    &state,
+                    &union,
+                    PlayerId(0),
+                    ctx.clone(),
+                    &[],
+                    None,
+                    Some(&ability),
+                ),
+                7,
+                "a union's inclusive leg keeps the current cast regardless of member order",
+            );
+        }
+        ability.cast_occurrence.as_mut().unwrap().turn_journal_index = 0;
+        assert_eq!(
+            resolve_ref(&state, &qty, PlayerId(0), ctx, &[], None, Some(&ability)),
+            7,
+            "a divergent occurrence must not exclude either record"
+        );
+    }
+
+    #[test]
+    fn property_aggregate_turn_journal_uses_original_controller_during_player_fanout() {
+        let mut state = GameState::new_two_player(42);
+        state.spells_cast_this_turn_by_player.insert(
+            PlayerId(0),
+            crate::im::Vector::unit(SpellCastRecord {
+                mana_value: 6,
+                ..SpellCastRecord::default()
+            }),
+        );
+        state.spells_cast_this_turn_by_player.insert(
+            PlayerId(1),
+            crate::im::Vector::unit(SpellCastRecord {
+                mana_value: 1,
+                ..SpellCastRecord::default()
+            }),
+        );
+        let qty = QuantityRef::PropertyAggregate(
+            crate::types::ability::PropertyAggregate::new(
+                AggregateFunction::Sum,
+                ObjectProperty::ManaValue,
+                CardTypeSetSource::TurnJournal {
+                    journal: TurnJournalKind::SpellsCast,
+                    scope: CountScope::Controller,
+                    filter: None,
+                },
+            )
+            .unwrap(),
+        );
+        let source = ObjectId(900);
+        let mut ability = ResolvedAbility::new(Effect::NoOp, vec![], source, PlayerId(1));
+        ability.original_controller = Some(PlayerId(0));
+        assert_eq!(
+            resolve_ref(
+                &state,
+                &qty,
+                PlayerId(1),
+                QuantityContext {
+                    entering: None,
+                    source,
+                    trigger_source: None,
+                    recipient: None,
+                    scoped_player: None,
+                    damage_source: None,
+                },
+                &[],
+                None,
+                Some(&ability),
+            ),
+            6
+        );
     }
 
     #[test]
@@ -15536,20 +16201,25 @@ mod tests {
         }
 
         let expr = QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::ManaValue,
-                filter: TargetFilter::And {
-                    filters: vec![
-                        TargetFilter::ExiledBySource,
-                        TargetFilter::Typed(TypedFilter::default().properties(vec![
-                            FilterProp::Owned {
-                                controller: ControllerRef::You,
-                            },
-                        ])),
-                    ],
-                },
-            },
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::ManaValue,
+                    crate::types::ability::CardTypeSetSource::Objects {
+                        filter: TargetFilter::And {
+                            filters: vec![
+                                TargetFilter::ExiledBySource,
+                                TargetFilter::Typed(TypedFilter::default().properties(vec![
+                                    FilterProp::Owned {
+                                        controller: ControllerRef::You,
+                                    },
+                                ])),
+                            ],
+                        },
+                    },
+                )
+                .expect("statically valid property aggregate"),
+            ),
         };
 
         assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), source), 5);
@@ -15620,20 +16290,25 @@ mod tests {
         });
 
         let expr = QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::ManaValue,
-                filter: TargetFilter::And {
-                    filters: vec![
-                        TargetFilter::ExiledBySource,
-                        TargetFilter::Typed(TypedFilter::default().properties(vec![
-                            FilterProp::Owned {
-                                controller: ControllerRef::You,
-                            },
-                        ])),
-                    ],
-                },
-            },
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::ManaValue,
+                    crate::types::ability::CardTypeSetSource::Objects {
+                        filter: TargetFilter::And {
+                            filters: vec![
+                                TargetFilter::ExiledBySource,
+                                TargetFilter::Typed(TypedFilter::default().properties(vec![
+                                    FilterProp::Owned {
+                                        controller: ControllerRef::You,
+                                    },
+                                ])),
+                            ],
+                        },
+                    },
+                )
+                .expect("statically valid property aggregate"),
+            ),
         };
 
         assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), source), 5);
@@ -17307,11 +17982,16 @@ mod tests {
         };
         // Max: triggering creature (power 6) must be excluded; max of remaining is 4.
         let max_expr = QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate {
-                function: AggregateFunction::Max,
-                property: ObjectProperty::Power,
-                filter: other_creatures(),
-            },
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Max,
+                    ObjectProperty::Power,
+                    crate::types::ability::CardTypeSetSource::Objects {
+                        filter: other_creatures(),
+                    },
+                )
+                .expect("statically valid property aggregate"),
+            ),
         };
         assert_eq!(resolve_quantity(&state, &max_expr, PlayerId(0), source), 4);
 
@@ -17319,11 +17999,16 @@ mod tests {
         // `OtherThanTriggerObject` exclusion — sum is 2 + 4 = 6 (NOT 12 with the
         // triggering 6/6 included).
         let sum_expr = QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::Power,
-                filter: other_creatures(),
-            },
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::Power,
+                    crate::types::ability::CardTypeSetSource::Objects {
+                        filter: other_creatures(),
+                    },
+                )
+                .expect("statically valid property aggregate"),
+            ),
         };
         assert_eq!(resolve_quantity(&state, &sum_expr, PlayerId(0), source), 6);
     }
@@ -17834,16 +18519,21 @@ mod tests {
         }
 
         let expr = QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::Power,
-                filter: TargetFilter::And {
-                    filters: vec![
-                        TargetFilter::Typed(TypedFilter::creature()),
-                        TargetFilter::ExiledBySource,
-                    ],
-                },
-            },
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::Power,
+                    crate::types::ability::CardTypeSetSource::Objects {
+                        filter: TargetFilter::And {
+                            filters: vec![
+                                TargetFilter::Typed(TypedFilter::creature()),
+                                TargetFilter::ExiledBySource,
+                            ],
+                        },
+                    },
+                )
+                .expect("statically valid property aggregate"),
+            ),
         };
 
         // 3 + 5 = 8 from LKI; pre-fix this returned 0 because obj.power was None.
@@ -18395,7 +19085,10 @@ mod tests {
         let count_for = |caused_by| {
             let expr = QuantityExpr::Ref {
                 qty: QuantityRef::DistinctCardTypes {
-                    source: CardTypeSetSource::TrackedSet { caused_by },
+                    source: CardTypeSetSource::TrackedSet {
+                        set: TrackedAnaphorSource::ChainSet,
+                        caused_by,
+                    },
                 },
             };
             resolve_quantity(&state, &expr, PlayerId(0), ObjectId(999))
@@ -18467,6 +19160,7 @@ mod tests {
         let expr = QuantityExpr::Ref {
             qty: QuantityRef::DistinctCardTypes {
                 source: CardTypeSetSource::TrackedSet {
+                    set: TrackedAnaphorSource::ChainSet,
                     caused_by: Some(ThisWayCause::Discarded),
                 },
             },

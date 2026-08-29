@@ -202,6 +202,15 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 47 — Resolution-time optional fixed sacrifice payments add a typed
+ *      replacement-resumable continuation to GameState.
+ * 46 — QuantityRef.Aggregate and QuantityRef.TrackedSetAggregate were
+ *      replaced in serialized GameState payloads by the canonical
+ *      QuantityRef.PropertyAggregate tag with a validated source object. New
+ *      peers migrate both old input tags, but a v45 peer cannot deserialize
+ *      the canonical tag emitted by v46, so the full-game handshake refuses
+ *      that one-way parse mismatch. Lobby messages are unchanged.
+ * 45 — GameState gained serialized cast-occurrence provenance and prepared-copy links.
  * 44 — Resolution-time optional PayCost(OneOf) branch choice added a
  *      serialized WaitingFor/GameAction pair.
  * 43 — Engine-owned stack-resolution automation retired the legacy native
@@ -325,7 +334,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      into a MulliganDecisionPhase::BottomCards sub-phase on
  *      WaitingFor::MulliganDecision.
  */
-export const PROTOCOL_VERSION = 44;
+export const PROTOCOL_VERSION = 47;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

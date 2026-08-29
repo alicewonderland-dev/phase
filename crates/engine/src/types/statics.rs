@@ -1129,7 +1129,11 @@ pub enum StaticMode {
         spell_filter: Option<TargetFilter>,
         /// Dynamic multiplier (e.g. "for each [thing] you control").
         /// Only meaningful for `Reduce` and `Raise` — always `None` for `Minimum`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "super::ability::deserialize_optional_quantity_ref_compat"
+        )]
         dynamic_count: Option<QuantityRef>,
     },
     /// CR 601.2f + CR 118.8: Imposes an additional non-mana cost on spells or
@@ -1170,7 +1174,11 @@ pub enum StaticMode {
         minimum_mana: Option<u32>,
         /// CR 601.2f: Dynamic multiplier for the adjustment (e.g., "for each Dragon you control").
         /// When present, the total adjustment is `amount * resolve_quantity(dynamic_count)`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "super::ability::deserialize_optional_quantity_ref_compat"
+        )]
         dynamic_count: Option<QuantityRef>,
         /// CR 605.1a: "unless they're mana abilities" / "that aren't mana abilities"
         /// exemption (Suppression Field, Zirda the Dawnwaker). Reuses the same
@@ -4038,7 +4046,10 @@ struct LegacyModifyCostPayload {
     amount: ManaCost,
     #[serde(default)]
     spell_filter: Option<TargetFilter>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::ability::deserialize_optional_quantity_ref_compat"
+    )]
     dynamic_count: Option<QuantityRef>,
 }
 
@@ -4774,6 +4785,53 @@ mod tests {
                     dynamic_count: None,
                 }
             );
+        }
+    }
+
+    #[test]
+    fn cost_modifiers_migrate_legacy_dynamic_aggregates_and_emit_canonical_non_null_values() {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            #[serde(deserialize_with = "deserialize_static_mode_fwd")]
+            mode: StaticMode,
+        }
+
+        let aggregate = r#"{"type":"Aggregate","function":"Sum","property":"Power","filter":{"type":"Typed","type_filters":["Creature"],"properties":[]}}"#;
+        let tracked = r#"{"type":"TrackedSetAggregate","function":"Max","property":"ManaValue","source":"TriggeringBatch"}"#;
+        let current_modify = format!(
+            r#"{{"ModifyCost":{{"mode":"Reduce","amount":{{"type":"Cost","shards":[],"generic":1}},"spell_filter":null,"dynamic_count":{aggregate}}}}}"#
+        );
+        let current_ability = format!(
+            r#"{{"ReduceAbilityCost":{{"keyword":"activated","amount":2,"dynamic_count":{tracked}}}}}"#
+        );
+        let legacy_reduce = format!(
+            r#"{{"mode":{{"ReduceCost":{{"amount":{{"type":"Cost","shards":[],"generic":3}},"spell_filter":null,"dynamic_count":{aggregate}}}}}}}"#
+        );
+
+        let modes = [
+            serde_json::from_str::<StaticMode>(&current_modify).unwrap(),
+            serde_json::from_str::<StaticMode>(&current_ability).unwrap(),
+            serde_json::from_str::<Wrapper>(&legacy_reduce)
+                .unwrap()
+                .mode,
+        ];
+
+        for mode in modes {
+            let dynamic_count = match &mode {
+                StaticMode::ModifyCost { dynamic_count, .. }
+                | StaticMode::ReduceAbilityCost { dynamic_count, .. } => dynamic_count,
+                other => panic!("expected a cost modifier, got {other:?}"),
+            };
+            assert!(matches!(
+                dynamic_count,
+                Some(QuantityRef::PropertyAggregate(_))
+            ));
+
+            let canonical = serde_json::to_string(&mode).unwrap();
+            assert!(canonical.contains(r#""dynamic_count":{"type":"PropertyAggregate""#));
+            assert!(!canonical.contains(r#""dynamic_count":null"#));
+            assert!(!canonical.contains(r#""type":"Aggregate""#));
+            assert!(!canonical.contains("TrackedSetAggregate"));
         }
     }
 

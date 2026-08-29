@@ -686,6 +686,32 @@ fn register_transient_effect(
                 );
             }
         }
+        // CR 701.47c: A grant whose affected object is "the amassed Army"
+        // (e.g. a future "amass N, then the amassed Army gains/gets ..."
+        // continuation) resolves directly from the recursively-stamped
+        // `amassed_army_object`, never a target — mirrors the `CostPaidObject`
+        // arm immediately above. Unlike `CostPaidObject`, the Army is always
+        // on the battlefield when this resolves, so the broadcast-scan branch
+        // below would coincidentally bind the same single object too; this arm
+        // is still the correct seam because it names the object directly
+        // instead of relying on a battlefield re-scan happening to narrow to
+        // exactly one match.
+        Some(TargetFilter::AmassedArmy)
+            if ability.targets.is_empty() && ability.amassed_army_object.is_some() =>
+        {
+            if let Some(snap) = &ability.amassed_army_object {
+                install_transient(
+                    state,
+                    end_permission,
+                    ability.source_id,
+                    ability.controller,
+                    duration.clone(),
+                    TargetFilter::SpecificObject { id: snap.object_id },
+                    modifications.clone(),
+                    static_def.condition.clone(),
+                );
+            }
+        }
         // TriggeringSource is handled via early short-circuit to avoid target propagation bugs.
         Some(TargetFilter::ParentTarget) if ability.targets.is_empty() => {
             let tracked = state
@@ -797,7 +823,18 @@ fn transient_bound_filters(
 pub fn generic_effect_affected_uses_inherited_targets(filter: &TargetFilter) -> bool {
     matches!(
         filter,
-        TargetFilter::TriggeringSource | TargetFilter::ParentTarget | TargetFilter::CostPaidObject
+        TargetFilter::TriggeringSource
+            | TargetFilter::ParentTarget
+            | TargetFilter::CostPaidObject
+            // CR 701.47c: "the amassed Army" is a resolution-local single-object
+            // reference (`ResolvedAbility.amassed_army_object`), not a broadcast
+            // population — mirrors `CostPaidObject` immediately above. This
+            // routes a future "amass N, then the amassed Army gains/gets ..."
+            // continuous grant to the dedicated `amassed_army_object` arm below
+            // (mirroring the `CostPaidObject` arm) and to the matching
+            // early-return guard in the broadcast-scan arm, instead of relying
+            // on the battlefield re-scan happening to narrow to one object.
+            | TargetFilter::AmassedArmy
     )
 }
 
@@ -1098,6 +1135,90 @@ mod tests {
             tce.modifications,
             vec![ContinuousModification::AddKeyword {
                 keyword: Keyword::Flying,
+            }]
+        );
+    }
+
+    /// CR 701.47c: a hypothetical "amass N, then the amassed Army gains/gets
+    /// ..." continuous grant (`GenericEffect { affected: AmassedArmy }`) must
+    /// bind directly to the exact Army object `amassed_army_object` names —
+    /// the sibling-coverage counterpart of the `SelfRef` test above, and of
+    /// the pre-existing `CostPaidObject` dedicated-arm handling in
+    /// `resolve()`. Revert-fail: if `AmassedArmy` were removed from either
+    /// `generic_effect_affected_uses_inherited_targets` or its dedicated
+    /// resolution arm (while the other half stayed), this test fails —
+    /// dropping the helper-only half makes the broadcast-scan arm's
+    /// early-return guard fire before ever finding the object, so ZERO
+    /// transient effects install (not merely a different-looking one), which
+    /// is exactly the silent-no-op class of bug `is_context_ref` was fixed
+    /// for elsewhere in this same card's implementation.
+    #[test]
+    fn generic_effect_registers_transient_effect_for_amassed_army() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let army = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Army Token".to_string(),
+            Zone::Battlefield,
+        );
+        // A second, unrelated battlefield object: if `AmassedArmy` fell
+        // through to a real broadcast scan with an unfiltered/mismatched
+        // resolved filter, this decoy would surface a second (wrong) TCE.
+        let _decoy = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Decoy".to_string(),
+            Zone::Battlefield,
+        );
+        let snapshot = crate::types::ability::CostPaidObjectSnapshot {
+            object_id: army,
+            lki: state.objects[&army].snapshot_public_characteristics(),
+        };
+
+        let static_def = StaticDefinition::continuous()
+            .affected(TargetFilter::AmassedArmy)
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Menace,
+            }]);
+
+        let mut ability = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![static_def],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: None,
+                end_cost: None,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        )
+        .duration(Duration::UntilEndOfTurn);
+        ability.set_amassed_army_object_recursive(snapshot);
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(
+            state.transient_continuous_effects.len(),
+            1,
+            "must bind exactly one TCE, to the amassed Army — not zero (silent \
+             no-op) and not a battlefield-wide broadcast"
+        );
+        let tce = &state.transient_continuous_effects[0];
+        assert_eq!(tce.affected, TargetFilter::SpecificObject { id: army });
+        assert_eq!(
+            tce.modifications,
+            vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Menace,
             }]
         );
     }

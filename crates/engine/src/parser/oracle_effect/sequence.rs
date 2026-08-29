@@ -353,6 +353,59 @@ pub(super) fn parse_rest_cards_reference(
     .parse(input)
 }
 
+/// CR 202.3 + CR 608.2c: "if its mana value is <comparator> <dynamic
+/// quantity>, put it onto <zone>[. otherwise, put it into <zone>]." — a
+/// card-property branch on the RevealUntil hit card's own mana value,
+/// distinct from the player-choice `kept_optional_to` shape ("you may put
+/// that card onto the battlefield"). Covers Part in Friendship ("If its mana
+/// value is less than or equal to the number of lands you control, put it
+/// onto the battlefield. Otherwise, put it into your hand."). The RHS
+/// quantity delegates to the shared `nom_quantity::parse_quantity`
+/// combinator, so this covers the whole class of dynamic-threshold
+/// conditional-destination reveal-until cards — not just "lands you
+/// control" — and the trailing "otherwise" clause is optional so the
+/// combinator also matches when the two sentences are split into separate
+/// continuation chunks (the second chunk then falls through to the existing
+/// bare "put it" absorption, which harmlessly refines `kept_destination` to
+/// the same "otherwise" zone).
+fn parse_reveal_until_conditional_kept(input: &str) -> OracleResult<'_, ContinuationAst> {
+    fn kept_zone_phrase(i: &str) -> OracleResult<'_, Zone> {
+        let (i, zone) = preceded(
+            alt((tag("onto the "), tag("into your "), tag("into "))),
+            crate::parser::oracle_target::parse_zone_word,
+        )
+        .parse(i)?;
+        let (i, _) = crate::parser::oracle_target::peek_zone_boundary(i)?;
+        Ok((i, zone))
+    }
+
+    let (i, _) = tag("if its mana value is ").parse(input)?;
+    let (i, comparator) = crate::parser::oracle_nom::condition::parse_life_total_comparator(i)?;
+    let (i, rhs) = crate::parser::oracle_nom::quantity::parse_quantity(i)?;
+    let (i, _) = tag(", put it ").parse(i)?;
+    let (i, if_true_destination) = kept_zone_phrase(i)?;
+    let (i, otherwise_destination) =
+        opt(preceded(tag(". otherwise, put it "), kept_zone_phrase)).parse(i)?;
+
+    let filter = TargetFilter::Typed(TypedFilter {
+        type_filters: Vec::new(),
+        controller: None,
+        properties: vec![FilterProp::Cmc {
+            comparator,
+            value: rhs,
+        }],
+    });
+
+    Ok((
+        i,
+        ContinuationAst::RevealUntilConditionalKept {
+            filter: Box::new(filter),
+            if_true_destination,
+            otherwise_destination,
+        },
+    ))
+}
+
 /// CR 701.20a: Detect the rest-pile zone in a `RevealUntil` continuation
 /// chunk. The "rest" subject may be phrased as "the rest" / "all other cards
 /// revealed this way" / "the other cards" — and may be governed by an
@@ -5103,6 +5156,35 @@ pub(super) fn apply_clause_continuation(
                 *rest_destination = destination;
             }
         }
+        // CR 202.3 + CR 608.2c: "If its mana value is <comparator> <dynamic
+        // quantity>, put it onto <zone>[. Otherwise, put it into <zone>]." —
+        // populates the card-property-driven `kept_destination_if` branch
+        // (Part in Friendship). `kept_destination` (the "otherwise" branch)
+        // is refined only when the trailing "otherwise" clause was captured
+        // in the same sentence; when the two sentences are separate
+        // continuation chunks, the following bare "put it" chunk refines
+        // `kept_destination` on its own (identical to the Songbirds'
+        // Blessing "you may … / if you don't …" GAP-1 precedent).
+        ContinuationAst::RevealUntilConditionalKept {
+            filter,
+            if_true_destination,
+            otherwise_destination,
+        } => {
+            let Some(previous) = defs.last_mut() else {
+                return;
+            };
+            if let Effect::RevealUntil {
+                kept_destination,
+                kept_destination_if,
+                ..
+            } = &mut *previous.effect
+            {
+                *kept_destination_if = Some((filter, if_true_destination));
+                if let Some(otherwise) = otherwise_destination {
+                    *kept_destination = otherwise;
+                }
+            }
+        }
         // CR 406.3 + CR 701.20e: Rewrite the preceding private `Dig` (the
         // "look at the top N cards of <player>'s library" look step) into an
         // `Effect::ExileTop` so the looked-at card(s) actually leave the
@@ -5439,6 +5521,7 @@ pub(super) fn continuation_absorbs_current(
         ContinuationAst::GrantExtraTurnAfterControlledTurn => true,
         ContinuationAst::RevealUntilKept { .. } => true,
         ContinuationAst::RevealUntilAllToZone { .. } => true,
+        ContinuationAst::RevealUntilConditionalKept { .. } => true,
         // Recognition was already gated on a preceding `Dig` in
         // parse_followup_continuation_ast; the "exile it [face down]" clause is
         // folded into that Dig (rewritten to ExileTop) and emits no sibling def.
@@ -7205,6 +7288,20 @@ pub(super) fn parse_followup_continuation_ast(
                 reorder_all: false,
                 rest_order: DigRestOrder::Preserve,
             })
+        }
+        // CR 202.3 + CR 608.2c: "If its mana value is <comparator> <dynamic
+        // quantity>, put it onto <zone>. [Otherwise, put it into <zone>.]" — a
+        // card-property branch on the hit card's own mana value (Part in
+        // Friendship). Checked BEFORE the bare "put it" arm below: that arm's
+        // substring scan for "onto the battlefield" cannot see the leading
+        // "if" condition and would otherwise treat the whole conditional
+        // sentence as an unconditional kept-destination override, silently
+        // dropping the "if" (and, per the DynamicQty swallow detector, its
+        // dynamic quantity).
+        Effect::RevealUntil { .. } if parse_reveal_until_conditional_kept(lower.trim()).is_ok() => {
+            parse_reveal_until_conditional_kept(lower.trim())
+                .ok()
+                .map(|(_, continuation)| continuation)
         }
         // CR 701.20a + CR 608.2c: "Put any number of those [filter] cards onto the
         // battlefield, then put the rest … on the bottom … in a random order"
@@ -10083,6 +10180,7 @@ mod tests {
             enters_attacking: false,
             kept_optional_to: None,
             enters_under: None,
+            kept_destination_if: None,
         };
         let result = parse_followup_continuation_ast(
             "Put those land cards onto the battlefield tapped and the rest on the bottom of your library in a random order.",
@@ -12613,18 +12711,23 @@ mod tests {
         };
         assert_eq!(counter_type, CounterType::Plus1Plus1);
         let expected_qty = QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::Power,
-                filter: TargetFilter::And {
-                    filters: vec![
-                        TargetFilter::Typed(
-                            TypedFilter::creature().controller(ControllerRef::ScopedPlayer),
-                        ),
-                        TargetFilter::ExiledBySource,
-                    ],
-                },
-            },
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::Power,
+                    crate::types::ability::CardTypeSetSource::Objects {
+                        filter: TargetFilter::And {
+                            filters: vec![
+                                TargetFilter::Typed(
+                                    TypedFilter::creature().controller(ControllerRef::ScopedPlayer),
+                                ),
+                                TargetFilter::ExiledBySource,
+                            ],
+                        },
+                    },
+                )
+                .expect("statically valid property aggregate"),
+            ),
         };
         assert_eq!(count, expected_qty);
     }

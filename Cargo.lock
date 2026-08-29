@@ -663,7 +663,7 @@ checksum = "780955b8b195a21ab8e4ac6b60dd1dbdcec1dc6c51c0617964b08c81785e12c9"
 
 [[package]]
 name = "draft-core"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "phase-engine",
  "rand 0.9.4",
@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "draft-wasm"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "console_error_panic_hook",
  "draft-core",
@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "engine-inventory-gen"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "anyhow",
  "proc-macro2",
@@ -754,7 +754,7 @@ dependencies = [
 
 [[package]]
 name = "engine-wasm"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "console_error_panic_hook",
  "getrandom 0.3.4",
@@ -806,7 +806,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "feed-scraper"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "clap",
  "reqwest",
@@ -1559,7 +1559,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "lobby-broker"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "phase-engine",
  "serde",
@@ -1596,7 +1596,7 @@ checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
 
 [[package]]
 name = "manabrew-compat"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "manabrew-protocol",
  "phase-engine",
@@ -1607,12 +1607,13 @@ dependencies = [
 
 [[package]]
 name = "manabrew-protocol"
-version = "3.0.0"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "899b03250b480a4449ea5ec7b7690ed55d537b943216e4600621b6caef2d8980"
+checksum = "85036b3a0b5195eb3fa099da3019ebe2278e19c836dd0ef4fb691216c8a3f104"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
  "strum_macros 0.28.0",
  "ts-rs 10.1.0",
 ]
@@ -1928,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "phase-ai"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "flate2",
  "mimalloc",
@@ -1946,7 +1947,7 @@ dependencies = [
 
 [[package]]
 name = "phase-engine"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "assert_matches",
  "flate2",
@@ -1978,7 +1979,7 @@ dependencies = [
 
 [[package]]
 name = "phase-server"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "axum",
  "clap",
@@ -2144,7 +2145,7 @@ dependencies = [
 
 [[package]]
 name = "probe-pin"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2669,7 +2670,7 @@ dependencies = [
 
 [[package]]
 name = "seat-reducer"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "phase-ai",
  "phase-engine",
@@ -2826,7 +2827,7 @@ dependencies = [
 
 [[package]]
 name = "server-core"
-version = "0.65.0"
+version = "0.66.0"
 dependencies = [
  "draft-core",
  "lobby-broker",

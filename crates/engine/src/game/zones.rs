@@ -187,6 +187,12 @@ pub(crate) fn apply_zone_exit_cleanup(
     // discard pipeline re-stamps it after the move-to-graveyard completes.
     if let Some(obj) = state.objects.get_mut(&object_id) {
         obj.discarded_turn = None;
+        // CR 400.7 + CR 601.2i: A cast occurrence belongs to the spell object
+        // represented on the stack, never to the new object after it leaves.
+        if from == Zone::Stack && to != Zone::Stack {
+            obj.cast_occurrence = None;
+            obj.prepared_copy_source = None;
+        }
     }
     // CR 400.7 + CR 403.4: Activation-use history belongs to the old
     // object. `ObjectId` is storage identity here, so clear per-object counts
@@ -264,6 +270,12 @@ pub(crate) fn apply_zone_exit_cleanup(
     // Immortal / Skullbriar keep their counters on a move to any zone outside
     // their `excluded_zones`; every other object follows the CR 122.2 default.
     let preserve_counters = counters_persist_on_move(state, object_id, to);
+
+    // CR 722.3c: the prepare-face copy remains in exile only while its linked
+    // permanent remains on the battlefield with the prepared designation.
+    if from == Zone::Battlefield {
+        crate::game::effects::prepare::remove_linked_prepared_copy_if_idle(state, object_id);
+    }
 
     if let Some(obj_mut) = state.objects.get_mut(&object_id) {
         // CR 400.7 + CR 614.1a: Rod of Absorption's stack-exile rider is a
@@ -931,13 +943,26 @@ pub fn apply_resolved_zone_change(
         );
     }
 
-    let destination_position = destination_position_after_removal(
+    let mut destination_position = destination_position_after_removal(
         state,
         command.object.object_id,
         command.from,
         command.to,
         command.owner,
     );
+    let linked_idle_copy = (command.from == Zone::Battlefield)
+        .then(|| {
+            crate::game::effects::prepare::linked_prepared_copy_if_idle_id(
+                state,
+                command.object.object_id,
+            )
+        })
+        .flatten();
+    if command.to == Zone::Exile && linked_idle_copy.is_some() {
+        destination_position = destination_position
+            .checked_sub(1)
+            .expect("the linked prepared copy occupies the replay exile container");
+    }
     if destination_position != command.destination_position {
         return Err(
             ResolvedZoneChangeReplayInvariantError::DestinationPositionMismatch {
@@ -947,6 +972,13 @@ pub fn apply_resolved_zone_change(
         );
     }
 
+    if command.from == Zone::Battlefield {
+        crate::game::effects::prepare::replay_remove_linked_prepared_copy_if_idle(
+            state,
+            command.object.object_id,
+            command.cause,
+        );
+    }
     remove_from_zone(state, command.object.object_id, command.from, command.owner);
     add_to_zone(state, command.object.object_id, command.to, command.owner);
 
@@ -955,6 +987,12 @@ pub fn apply_resolved_zone_change(
         .get_mut(&command.object.object_id)
         .expect("validated zone command object remains live");
     object.zone = command.to;
+    // CR 400.7 + CR 601.2i: replay bypasses `apply_zone_exit_cleanup`, so it
+    // must reproduce the live Stack-exit carrier clear from the recorded move.
+    if command.from == Zone::Stack && command.to != Zone::Stack {
+        object.cast_occurrence = None;
+        object.prepared_copy_source = None;
+    }
     if command.to == Zone::Battlefield {
         object.reset_for_battlefield_entry(
             turn_number,
@@ -4431,6 +4469,124 @@ mod tests {
         assert_eq!(
             replayed.objects[&id].cast_from_zone, None,
             "the replayed transition must clear the stamp exactly like the live one"
+        );
+    }
+
+    #[test]
+    fn cast_occurrence_is_cleared_on_stack_to_battlefield_and_nonbattlefield_moves() {
+        let occurrence = crate::types::game_state::CastOccurrence {
+            caster: PlayerId(0),
+            turn_journal_index: 3,
+        };
+
+        for destination in [Zone::Battlefield, Zone::Graveyard] {
+            let mut live = setup();
+            let id = create_object(
+                &mut live,
+                CardId(6865),
+                PlayerId(0),
+                "Stamped Spell".to_string(),
+                Zone::Stack,
+            );
+            {
+                let object = live.objects.get_mut(&id).unwrap();
+                object.cast_occurrence = Some(occurrence);
+                object.prepared_copy_source = Some(ObjectId(777));
+            }
+            let mut replayed = live.clone();
+            let record = crate::types::game_state::ZoneChangeRecord::test_minimal(
+                id,
+                Some(Zone::Stack),
+                destination,
+            );
+            let command = resolve_and_apply_zone_change(
+                &mut live,
+                id,
+                Zone::Stack,
+                destination,
+                PlayerId(0),
+                record,
+            )
+            .expect("live Stack exit resolves");
+            assert_eq!(live.objects[&id].cast_occurrence, None);
+            assert_eq!(live.objects[&id].prepared_copy_source, None);
+
+            apply_resolved_zone_change(&mut replayed, &command)
+                .expect("recorded Stack exit replays");
+            assert_eq!(replayed.objects[&id].cast_occurrence, None);
+            assert_eq!(replayed.objects[&id].prepared_copy_source, None);
+        }
+
+        let mut hostile = setup();
+        let id = create_object(
+            &mut hostile,
+            CardId(6866),
+            PlayerId(0),
+            "Not a Stack Exit".to_string(),
+            Zone::Hand,
+        );
+        hostile.objects.get_mut(&id).unwrap().cast_occurrence = Some(occurrence);
+        move_to_zone(&mut hostile, id, Zone::Exile, &mut Vec::new());
+        assert_eq!(
+            hostile.objects[&id].cast_occurrence,
+            Some(occurrence),
+            "only a Stack exit owns cast-occurrence cleanup"
+        );
+    }
+
+    #[test]
+    fn battlefield_exit_replay_ceases_the_linked_prepared_copy_like_live() {
+        let mut live = setup();
+        let source = create_object(
+            &mut live,
+            CardId(6867),
+            PlayerId(0),
+            "Prepared Source".to_string(),
+            Zone::Battlefield,
+        );
+        live.objects.get_mut(&source).unwrap().prepared =
+            Some(crate::game::game_object::PreparedState);
+        let copy = create_object(
+            &mut live,
+            CardId(6868),
+            PlayerId(0),
+            "Linked Prepared Copy".to_string(),
+            Zone::Exile,
+        );
+        live.objects.get_mut(&copy).unwrap().prepared_copy_source = Some(source);
+        let mut replayed = live.clone();
+        let replay_journal_before = replayed.resolved_rules_journal.clone();
+
+        move_to_zone(&mut live, source, Zone::Exile, &mut Vec::new());
+        let command = live
+            .resolved_rules_journal
+            .entries()
+            .iter()
+            .filter_map(|entry| entry.command.as_ref())
+            .find_map(|command| match command {
+                crate::types::resolved_commands::ResolvedRulesCommand::ZoneChange(command)
+                    if command.object.object_id == source =>
+                {
+                    Some(command.as_ref().clone())
+                }
+                _ => None,
+            })
+            .expect("the live battlefield exit records its zone command");
+
+        assert!(!live.objects.contains_key(&copy));
+        assert!(!live.exile.contains(&copy));
+        assert_eq!(live.objects[&source].zone, Zone::Exile);
+        assert_eq!(live.exile[command.destination_position], source);
+
+        apply_resolved_zone_change(&mut replayed, &command)
+            .expect("the recorded exit replays from the pre-cleanup state");
+        assert!(!replayed.objects.contains_key(&copy));
+        assert!(!replayed.exile.contains(&copy));
+        assert_eq!(replayed.objects[&source].zone, Zone::Exile);
+        assert_eq!(replayed.exile, live.exile);
+        assert_eq!(
+            replayed.resolved_rules_journal, replay_journal_before,
+            "applying a recorded transition must not allocate or journal fresh replay authority"
         );
     }
 

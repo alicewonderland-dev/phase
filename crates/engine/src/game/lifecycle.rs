@@ -93,6 +93,22 @@ impl ProspectiveLifecycleFacts {
             )
         })
     }
+
+    #[cfg(test)]
+    pub(super) fn receipt_terminal_disposition(
+        &self,
+        origin: DelayedTriggerOrigin,
+    ) -> Option<DelayedTerminalDisposition> {
+        self.facts.iter().find_map(|fact| match fact {
+            ReducerLifecycleFact::Terminal {
+                firing: TriggerFiring::ReceiptEligible(observed),
+                disposition,
+            } if *observed == origin => Some(*disposition),
+            ReducerLifecycleFact::Terminal { .. }
+            | ReducerLifecycleFact::Installed { .. }
+            | ReducerLifecycleFact::Due { .. } => None,
+        })
+    }
 }
 
 #[derive(Default)]

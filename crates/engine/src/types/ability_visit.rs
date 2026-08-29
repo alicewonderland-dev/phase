@@ -11,14 +11,28 @@
 //! that owns the answer.
 //!
 //! That guarantee is necessary but not sufficient. A new nested **struct field**
-//! is field access, not a match arm, so it compiles silently. Two fixtures are
+//! is field access, not a match arm, so it compiles silently. Three fixtures are
 //! the complementary safety nets:
 //!
 //! - `game::printed_cards::tests::walker_covers_every_nested_carrier`
 //! - `ai_support::targeted_exchange::tests::predicate_sees_a_fight_in_every_nested_carrier`
+//! - `parser::oracle::tests::render_net_reaches_every_nested_description_carrier`
 //!
-//! Both plant a marker effect in every carrier this module descends into.
-//! Extend **both** whenever a carrier is added.
+//! Each plants a marker in every carrier its walker descends into.
+//! Extend **all three** whenever a carrier is added.
+//!
+//! The third belongs to a **`description`-shaped** walker
+//! (`parser::oracle::render_effect_descriptions`, the CR 201.5a display-render
+//! net), not an `Effect`-shaped one, and at the `Effect`-ARM level its descend
+//! set is a strict SUPERSET of this module's: it also descends `Effect::Mana`,
+//! `GrantCastingPermission`, `ExileResolvingSpellInsteadOfGraveyard`,
+//! `CreateDelayedTrigger.condition`, the copy family,
+//! `AddPendingEntersModifications`, `EachPlayerCopyChosen`, and `ReturnAsAura`,
+//! all leaves here. So a carrier added there is not necessarily a carrier here,
+//! but a carrier added here is always one there. The superset relation does NOT
+//! extend one level down: this module descends
+//! `ContinuousModification::CopyValues` into `visit_copiable_values_scoped` and
+//! that net deliberately does not (`CopyValues` is parse-unreachable).
 //!
 //! Two narrower ad-hoc walkers remain unmigrated and are candidate future
 //! consumers: `game::coverage::ability_tree_any` (which has a `_ => {}`

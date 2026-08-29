@@ -9,11 +9,11 @@ use nom::sequence::{preceded, terminated};
 use nom::Parser;
 
 use crate::types::ability::{
-    AggregateFunction, AttachmentKind, ChoiceType, CombatRelation, CombatRelationSubject,
-    Comparator, ControllerRef, CountScope, DamageKindFilter, FilterProp, ObjectProperty,
-    ObjectScope, ParitySource, PlayerFilter, PtStat, PtValueScope, QuantityExpr, QuantityRef,
-    SeatDirection, SharedQuality, SharedQualityRelation, TargetFilter, TargetSelectionMode,
-    ThisWayCause, TypeFilter, TypedFilter,
+    AggregateFunction, AttachmentKind, CardTypeSetSource, ChoiceType, CombatRelation,
+    CombatRelationSubject, Comparator, ControllerRef, CountScope, DamageKindFilter, FilterProp,
+    ObjectProperty, ObjectScope, ParitySource, PlayerFilter, PropertyAggregate, PtStat,
+    PtValueScope, QuantityExpr, QuantityRef, SeatDirection, SharedQuality, SharedQualityRelation,
+    TargetFilter, TargetSelectionMode, ThisWayCause, TypeFilter, TypedFilter,
 };
 use crate::types::card_type::{noncreature_subtype_set, SubtypeSet, Supertype};
 use crate::types::counter::{CounterMatch, CounterType};
@@ -752,6 +752,15 @@ pub fn parse_target_with_syntax<'a>(
     if let Some((filter, rest)) = nom_on_lower(text, &lower, |input| {
         alt((
             |i| parse_cost_paid_object_reference(i, ctx),
+            // CR 701.47c: "the amassed Army" / "the Army you amassed" — the
+            // Army creature the current amass instruction chose. A
+            // resolution-local reference (mirrors `CostPaidObject` above),
+            // used by "amass Goblins 1, then attach this Equipment to the
+            // amassed Army" (Goblin Plate Mail).
+            value(
+                TargetFilter::AmassedArmy,
+                alt((tag("the amassed army"), tag("the army you amassed"))),
+            ),
             value(
                 TargetFilter::TriggeringSource,
                 (
@@ -1263,7 +1272,7 @@ pub fn parse_target_with_syntax<'a>(
         }
     }
 
-    // CR 608.2k / CR 603.7c: "the spell you cast" / bare "the spell" is an
+    // CR 608.2k: "the spell you cast" / bare "the spell" is an
     // untargeted anaphor to the triggering spell object on a cast trigger
     // (Taigam, Master Opportunist: "exile the spell you cast"). It maps to
     // TriggeringSource, mirroring the bare-"that spell" arm above. Disambiguate
@@ -5882,11 +5891,10 @@ fn superlative_property_filter_prop(
     filter: TargetFilter,
 ) -> FilterProp {
     let value = QuantityExpr::Ref {
-        qty: QuantityRef::Aggregate {
-            function,
-            property,
-            filter,
-        },
+        qty: QuantityRef::PropertyAggregate(
+            PropertyAggregate::new(function, property, CardTypeSetSource::Objects { filter })
+                .expect("object populations support every aggregate property"),
+        ),
     };
     match property {
         ObjectProperty::ManaValue => FilterProp::Cmc {
@@ -9162,8 +9170,8 @@ mod tests {
         };
         match value {
             QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate { function, .. },
-            } => function,
+                qty: QuantityRef::PropertyAggregate(aggregate),
+            } => aggregate.function(),
             other => panic!("expected Aggregate quantity, got {other:?}"),
         }
     }
@@ -9214,20 +9222,18 @@ mod tests {
         assert_eq!(stat, PtStat::Toughness);
         assert_eq!(comparator, Comparator::EQ);
         let QuantityExpr::Ref {
-            qty:
-                QuantityRef::Aggregate {
-                    function,
-                    property,
-                    filter,
-                },
+            qty: QuantityRef::PropertyAggregate(aggregate),
         } = value
         else {
             panic!("expected Aggregate quantity, got {value:?}");
         };
-        assert_eq!(function, AggregateFunction::Min);
-        assert_eq!(property, ObjectProperty::Toughness);
+        assert_eq!(aggregate.function(), AggregateFunction::Min);
+        assert_eq!(aggregate.property(), ObjectProperty::Toughness);
+        let CardTypeSetSource::Objects { filter } = aggregate.source() else {
+            panic!("expected object source, got {:?}", aggregate.source());
+        };
         // The eligible set is "creatures you control".
-        let tf = typed_leg(&filter).expect("aggregate filter should be a typed creature filter");
+        let tf = typed_leg(filter).expect("aggregate filter should be a typed creature filter");
         assert_eq!(tf.controller, Some(ControllerRef::You));
         assert!(tf.type_filters.contains(&TypeFilter::Creature));
     }
@@ -18662,23 +18668,21 @@ mod tests {
         };
         assert_eq!(comparator, Comparator::EQ);
         let QuantityExpr::Ref {
-            qty:
-                QuantityRef::Aggregate {
-                    function,
-                    property,
-                    filter,
-                },
+            qty: QuantityRef::PropertyAggregate(aggregate),
         } = value
         else {
             panic!("expected QuantityRef::Aggregate, got {value:?}");
         };
-        assert_eq!(function, AggregateFunction::Max);
-        assert_eq!(property, ObjectProperty::ManaValue);
+        assert_eq!(aggregate.function(), AggregateFunction::Max);
+        assert_eq!(aggregate.property(), ObjectProperty::ManaValue);
+        let CardTypeSetSource::Objects { filter } = aggregate.source() else {
+            panic!("expected object source, got {:?}", aggregate.source());
+        };
         // The eligible set is an Or of Creature/Planeswalker, controller You.
         match filter {
             TargetFilter::Or { filters } => {
                 assert_eq!(filters.len(), 2);
-                for leg in &filters {
+                for leg in filters {
                     let tf = typed_leg(leg).expect("each leg is Typed");
                     assert_eq!(tf.controller, Some(ControllerRef::You));
                 }
@@ -18793,19 +18797,17 @@ mod tests {
         assert_eq!(scope, PtValueScope::Current);
         assert_eq!(comparator, Comparator::EQ);
         let QuantityExpr::Ref {
-            qty:
-                QuantityRef::Aggregate {
-                    function,
-                    property,
-                    filter,
-                },
+            qty: QuantityRef::PropertyAggregate(aggregate),
         } = value
         else {
             panic!("expected QuantityRef::Aggregate, got {value:?}");
         };
-        assert_eq!(function, AggregateFunction::Max);
-        assert_eq!(property, ObjectProperty::Power);
-        let tf = typed_leg(&filter).expect("eligible set should be Typed");
+        assert_eq!(aggregate.function(), AggregateFunction::Max);
+        assert_eq!(aggregate.property(), ObjectProperty::Power);
+        let CardTypeSetSource::Objects { filter } = aggregate.source() else {
+            panic!("expected object source, got {:?}", aggregate.source());
+        };
+        let tf = typed_leg(filter).expect("eligible set should be Typed");
         assert_eq!(tf.controller, Some(ControllerRef::You));
         assert!(has_type(tf, TypeFilter::Creature));
     }
@@ -18832,13 +18834,10 @@ mod tests {
                     FilterProp::Cmc {
                         comparator: Comparator::EQ,
                         value: QuantityExpr::Ref {
-                            qty: QuantityRef::Aggregate {
-                                function: AggregateFunction::Max,
-                                property: ObjectProperty::ManaValue,
-                                ..
-                            },
+                            qty: QuantityRef::PropertyAggregate(aggregate),
                         },
-                    }
+                    } if aggregate.function() == AggregateFunction::Max
+                        && aggregate.property() == ObjectProperty::ManaValue
                 )
             });
             assert!(
@@ -19152,34 +19151,37 @@ mod tests {
                     p,
                     FilterProp::Cmc {
                         value: QuantityExpr::Ref {
-                            qty: QuantityRef::Aggregate { .. }
+                            qty: QuantityRef::PropertyAggregate(_)
                         },
                         ..
                     } | FilterProp::PtComparison {
                         value: QuantityExpr::Ref {
-                            qty: QuantityRef::Aggregate { .. }
+                            qty: QuantityRef::PropertyAggregate(_)
                         },
                         ..
                     }
                 )
             })
             .expect("expected a superlative FilterProp carrying an Aggregate");
-        let population = match prop {
+        let aggregate = match prop {
             FilterProp::Cmc {
                 value:
                     QuantityExpr::Ref {
-                        qty: QuantityRef::Aggregate { filter, .. },
+                        qty: QuantityRef::PropertyAggregate(aggregate),
                     },
                 ..
             }
             | FilterProp::PtComparison {
                 value:
                     QuantityExpr::Ref {
-                        qty: QuantityRef::Aggregate { filter, .. },
+                        qty: QuantityRef::PropertyAggregate(aggregate),
                     },
                 ..
-            } => filter,
+            } => aggregate,
             _ => unreachable!("matched above"),
+        };
+        let CardTypeSetSource::Objects { filter: population } = aggregate.source() else {
+            unreachable!("bare superlatives always rank an object population")
         };
         (prop, population)
     }
@@ -19208,15 +19210,13 @@ mod tests {
         };
         assert_eq!(*comparator, Comparator::EQ, "ties are all legal targets");
         let QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate {
-                function, property, ..
-            },
+            qty: QuantityRef::PropertyAggregate(aggregate),
         } = value
         else {
             unreachable!()
         };
-        assert_eq!(*function, AggregateFunction::Min, "lowest → Min");
-        assert_eq!(*property, ObjectProperty::ManaValue);
+        assert_eq!(aggregate.function(), AggregateFunction::Min, "lowest → Min");
+        assert_eq!(aggregate.property(), ObjectProperty::ManaValue);
 
         let pop = typed_leg(population).expect("population should be a Typed filter");
         assert!(pop.type_filters.contains(&TypeFilter::Permanent));
@@ -19246,12 +19246,16 @@ mod tests {
         };
         assert_eq!(*stat, PtStat::Power);
         let QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate { function, .. },
+            qty: QuantityRef::PropertyAggregate(aggregate),
         } = value
         else {
             unreachable!()
         };
-        assert_eq!(*function, AggregateFunction::Max, "greatest → Max");
+        assert_eq!(
+            aggregate.function(),
+            AggregateFunction::Max,
+            "greatest → Max"
+        );
         let pop = typed_leg(population).expect("typed population");
         assert_eq!(
             pop.controller,
@@ -19353,12 +19357,12 @@ mod tests {
                 p,
                 FilterProp::Cmc {
                     value: QuantityExpr::Ref {
-                        qty: QuantityRef::Aggregate { .. }
+                        qty: QuantityRef::PropertyAggregate(_)
                     },
                     ..
                 } | FilterProp::PtComparison {
                     value: QuantityExpr::Ref {
-                        qty: QuantityRef::Aggregate { .. }
+                        qty: QuantityRef::PropertyAggregate(_)
                     },
                     ..
                 }

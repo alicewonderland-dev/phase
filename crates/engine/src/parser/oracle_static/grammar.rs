@@ -1507,10 +1507,7 @@ pub(crate) fn parse_quoted_ability(text: &str) -> AbilityDefinition {
             });
         // CR 702.142b: Tag as Boast for meta-reference effects.
         def.ability_tag = Some(AbilityTag::Boast);
-        def.description = Some(format!(
-            "Boast \u{2014} {}",
-            sanitize_granting_placeholder(rest_original)
-        ));
+        def.description = Some(format!("Boast \u{2014} {rest_original}"));
         return def;
     }
 
@@ -1566,21 +1563,20 @@ pub(crate) fn parse_quoted_ability(text: &str) -> AbilityDefinition {
         // creature), an untouched third channel — no interaction with the
         // GrantingObject cost/effect rewrite. Enables The Dominion Bracelet.
         crate::parser::oracle::extract_cost_reduction_from_chain(&mut def);
-        def.description = Some(sanitize_granting_placeholder(text));
+        // CR 201.5a: the granter self-reference marker is rendered to the granting
+        // object's printed name by `oracle_util::render_granting_self_reference`, at
+        // the two parse entry points (`parse_oracle_text`,
+        // `catalog_rules_text_abilities`) — NOT collapsed to the host token `~` here,
+        // which is what made a granted "Sacrifice <granter>" print as the equipped
+        // creature's name.
+        def.description = Some(text.to_string());
         def
     } else {
         // No cost separator — treat as spell-like ability text
         let mut def = parse_effect_chain(text, AbilityKind::Spell);
-        def.description = Some(sanitize_granting_placeholder(text));
+        def.description = Some(text.to_string());
         def
     }
-}
-
-/// CR 201.5a: Descriptions render the granter self-reference as `~` (matching
-/// pre-fix display); the `GRANTING_SELF_PLACEHOLDER` marker is a parse-time
-/// signal only and must never leak the raw private-use char into stored text.
-fn sanitize_granting_placeholder(text: &str) -> String {
-    text.replace(crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER, "~")
 }
 
 /// True when `trimmed_prefix` is a bracketed planeswalker loyalty cost (`[+N]`,

@@ -105,6 +105,26 @@ pub(super) fn handle_resolution_optional_payment_choice(
     state
         .replace_active_optional_effect_frame(frame)
         .map_err(|error| EngineError::InvalidAction(error.to_string()))?;
+    if let AbilityCost::Sacrifice(cost) = &live_cost.cost {
+        let count = cost.requirement.fixed_count().ok_or_else(|| {
+            EngineError::InvalidAction("resolution sacrifice cost is not fixed".into())
+        })? as usize;
+        let choices = super::casting::find_eligible_sacrifice_targets(
+            state,
+            live_player,
+            advertised_source,
+            &cost.target,
+        );
+        state.waiting_for = WaitingFor::PayCost {
+            player: live_player,
+            kind: crate::types::game_state::PayCostKind::Sacrifice,
+            choices,
+            count,
+            min_count: count,
+            resume: crate::types::game_state::CostResume::Resolution,
+        };
+        return Ok(state.waiting_for.clone());
+    }
     handle_optional_effect_choice(state, true, events)
 }
 

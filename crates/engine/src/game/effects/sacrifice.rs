@@ -1631,11 +1631,16 @@ mod tests {
         let superlative = FilterProp::Cmc {
             comparator: Comparator::EQ,
             value: QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: AggregateFunction::Max,
-                    property: ObjectProperty::ManaValue,
-                    filter: eligible_set,
-                },
+                qty: QuantityRef::PropertyAggregate(
+                    crate::types::ability::PropertyAggregate::new(
+                        AggregateFunction::Max,
+                        ObjectProperty::ManaValue,
+                        crate::types::ability::CardTypeSetSource::Objects {
+                            filter: eligible_set,
+                        },
+                    )
+                    .expect("statically valid property aggregate"),
+                ),
             },
         };
         let soul_shatter_target = TargetFilter::Or {
@@ -1755,11 +1760,16 @@ mod tests {
             scope: PtValueScope::Current,
             comparator: Comparator::EQ,
             value: QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: AggregateFunction::Max,
-                    property: ObjectProperty::Power,
-                    filter: eligible_set,
-                },
+                qty: QuantityRef::PropertyAggregate(
+                    crate::types::ability::PropertyAggregate::new(
+                        AggregateFunction::Max,
+                        ObjectProperty::Power,
+                        crate::types::ability::CardTypeSetSource::Objects {
+                            filter: eligible_set,
+                        },
+                    )
+                    .expect("statically valid property aggregate"),
+                ),
             },
         };
         let target = TargetFilter::Typed(

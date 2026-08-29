@@ -65,6 +65,22 @@ pub(super) fn finish_resolving_stack_entry(
     }
 }
 
+/// Abandon the currently resolving family as one lifecycle unit. Prompt owners
+/// call this only after settling any events already completed by their cursor.
+pub(super) fn abandon_active_resolution_carrier(
+    state: &mut GameState,
+    disposition: super::lifecycle::DelayedTerminalDisposition,
+) {
+    super::priority::clear_priority_passes(state);
+    let _ = state
+        .clear_active_ability_continuation()
+        .expect("resolution abandonment cannot clear a buried ability continuation");
+    finish_resolving_stack_entry(state, disposition);
+    state.resolution_source_relatch = None;
+    state.deferred_entry_events.clear();
+    state.pending_token_battlefield_entry = None;
+}
+
 /// CR 405.1: Add an object to the stack.
 pub fn push_to_stack(state: &mut GameState, entry: StackEntry, events: &mut Vec<GameEvent>) {
     let trigger_firing = matches!(entry.kind, StackEntryKind::TriggeredAbility { .. })
@@ -176,6 +192,16 @@ pub(crate) fn push_copy_to_stack(
     copied_trigger_firing: Option<TriggerFiring>,
     events: &mut Vec<GameEvent>,
 ) {
+    // CR 707.10: Copying a spell on the stack is not casting it. A copied
+    // carrier must not inherit the original spell's cast coordinate.
+    if matches!(entry.kind, StackEntryKind::Spell { .. }) {
+        if let Some(object) = state.objects.get_mut(&entry.id) {
+            object.cast_occurrence = None;
+        }
+        if let Some(ability) = entry.ability_mut() {
+            ability.set_cast_occurrence_recursive(None);
+        }
+    }
     // CR 701.27f: an activated or triggered ability of a permanent may transform
     // that permanent only if it hasn't transformed since the ability was put
     // onto the stack. Copying such an ability puts a NEW ability onto the stack,
@@ -344,6 +370,46 @@ pub fn apply_resolved_stack_entry_finalize(
             ResolvedStackEntryFinalizeReplayInvariantError::PaidFactsMismatch(command.object),
         );
     }
+    let object = state.objects.get(&command.object).ok_or(
+        ResolvedStackEntryFinalizeReplayInvariantError::CastOccurrenceMismatch(command.object),
+    )?;
+    if object.cast_occurrence != command.expected_old_cast_occurrence {
+        return Err(
+            ResolvedStackEntryFinalizeReplayInvariantError::CastOccurrenceMismatch(command.object),
+        );
+    }
+    if let Some(occurrence) = command.resulting_cast_occurrence {
+        let matching_record = usize::try_from(occurrence.turn_journal_index)
+            .ok()
+            .and_then(|index| {
+                state
+                    .spells_cast_this_turn_by_player
+                    .get(&occurrence.caster)
+                    .and_then(|records| records.get(index))
+            })
+            .is_some_and(|record| record.spell_object_id == Some(command.object));
+        if !matching_record {
+            return Err(
+                ResolvedStackEntryFinalizeReplayInvariantError::CastOccurrenceMismatch(
+                    command.object,
+                ),
+            );
+        }
+        let graph_matches = matches!(
+            command.resulting_kind.as_ref(),
+            StackEntryKind::Spell { ability, .. }
+                if ability
+                    .as_deref()
+                    .is_none_or(|ability| ability.cast_occurrence_matches_recursive(occurrence))
+        );
+        if !graph_matches {
+            return Err(
+                ResolvedStackEntryFinalizeReplayInvariantError::CastOccurrenceMismatch(
+                    command.object,
+                ),
+            );
+        }
+    }
 
     state
         .stack
@@ -354,6 +420,11 @@ pub fn apply_resolved_stack_entry_finalize(
         command.object,
         command.resulting_paid_facts.as_ref().clone(),
     );
+    state
+        .objects
+        .get_mut(&command.object)
+        .expect("the spell object was just validated")
+        .cast_occurrence = command.resulting_cast_occurrence;
     Ok(())
 }
 
@@ -3224,6 +3295,7 @@ fn self_counter_ability_is_batch_candidate(ability: &ResolvedAbility) -> bool {
         effect,
         targets,
         source_id: _,
+        cast_occurrence,
         source_incarnation,
         trigger_source,
         trigger_definition_ref,
@@ -3292,6 +3364,7 @@ fn self_counter_ability_is_batch_candidate(ability: &ResolvedAbility) -> bool {
 
     self_counter
         && targets.is_empty()
+        && cast_occurrence.is_none()
         && source_incarnation.is_none()
         && trigger_source.is_none()
         && trigger_definition_ref.is_none()
@@ -3452,6 +3525,7 @@ fn fixed_controller_gain_life_ability_is_batch_candidate(ability: &ResolvedAbili
         effect,
         targets,
         source_id: _,
+        cast_occurrence,
         source_incarnation: _,
         trigger_source: _,
         trigger_definition_ref: _,
@@ -3519,6 +3593,7 @@ fn fixed_controller_gain_life_ability_is_batch_candidate(ability: &ResolvedAbili
 
     fixed_controller_gain_life
         && targets.is_empty()
+        && cast_occurrence.is_none()
         && scoped_player.is_none()
         && matches!(kind, AbilityKind::Spell | AbilityKind::Database)
         && sub_ability.is_none()
@@ -3660,6 +3735,7 @@ fn fixed_opponent_effect_ability_is_batch_candidate(ability: &ResolvedAbility) -
         effect,
         targets,
         source_id: _,
+        cast_occurrence,
         source_incarnation: _,
         trigger_source: _,
         trigger_definition_ref: _,
@@ -3731,6 +3807,7 @@ fn fixed_opponent_effect_ability_is_batch_candidate(ability: &ResolvedAbility) -
 
     fixed_opponent_effect
         && targets.is_empty()
+        && cast_occurrence.is_none()
         && scoped_player.is_none()
         && matches!(kind, AbilityKind::Spell | AbilityKind::Database)
         && sub_ability.is_none()
@@ -4129,6 +4206,7 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         effect: a_effect,
         targets: a_targets,
         source_id: _,
+        cast_occurrence: _,
         source_incarnation: _,
         trigger_source: _,
         trigger_definition_ref: _,
@@ -4201,6 +4279,7 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         effect: b_effect,
         targets: b_targets,
         source_id: _,
+        cast_occurrence: _,
         source_incarnation: _,
         trigger_source: _,
         trigger_definition_ref: _,
@@ -4746,6 +4825,105 @@ mod tests {
 
     fn setup() -> GameState {
         GameState::new_two_player(42)
+    }
+
+    #[test]
+    fn stack_spell_copy_has_no_cast_occurrence_and_writes_no_cast_record() {
+        let mut state = setup();
+        let source_id = ObjectId(70);
+        let copy_id = ObjectId(71);
+        let occurrence = crate::types::game_state::CastOccurrence {
+            caster: PlayerId(0),
+            turn_journal_index: 0,
+        };
+        let mut source = crate::game::game_object::GameObject::new(
+            source_id,
+            CardId(70),
+            PlayerId(0),
+            "Original".to_string(),
+            Zone::Stack,
+        );
+        source.cast_occurrence = Some(occurrence);
+        let mut copy = source.clone();
+        copy.id = copy_id;
+        state.objects.insert(source_id, source);
+        state.objects.insert(copy_id, copy);
+
+        let mut root = ResolvedAbility::new(
+            Effect::EpicCopy {
+                spell: Box::new(ResolvedAbility::new(
+                    Effect::Investigate,
+                    Vec::new(),
+                    source_id,
+                    PlayerId(0),
+                )),
+            },
+            Vec::new(),
+            source_id,
+            PlayerId(0),
+        );
+        root.sub_ability = Some(Box::new(ResolvedAbility::new(
+            Effect::Investigate,
+            Vec::new(),
+            source_id,
+            PlayerId(0),
+        )));
+        root.else_ability = Some(Box::new(ResolvedAbility::new(
+            Effect::Investigate,
+            Vec::new(),
+            source_id,
+            PlayerId(0),
+        )));
+        root.set_cast_occurrence_recursive(Some(occurrence));
+        let journal_len = state
+            .spells_cast_this_turn_by_player
+            .get(&PlayerId(0))
+            .map_or(0, |history| history.len());
+        let mut events = Vec::new();
+
+        push_copy_to_stack(
+            &mut state,
+            StackEntry {
+                id: copy_id,
+                source_id: copy_id,
+                controller: PlayerId(0),
+                kind: StackEntryKind::Spell {
+                    card_id: CardId(70),
+                    ability: Some(Box::new(root)),
+                    casting_variant: CastingVariant::Normal,
+                    actual_mana_spent: 0,
+                },
+            },
+            None,
+            &mut events,
+        );
+
+        fn graph_is_clear(ability: &ResolvedAbility) -> bool {
+            ability.cast_occurrence.is_none()
+                && ability.sub_ability.as_deref().is_none_or(graph_is_clear)
+                && ability.else_ability.as_deref().is_none_or(graph_is_clear)
+                && match &ability.effect {
+                    Effect::EpicCopy { spell } => graph_is_clear(spell),
+                    _ => true,
+                }
+        }
+
+        assert_eq!(state.objects[&source_id].cast_occurrence, Some(occurrence));
+        assert_eq!(state.objects[&copy_id].cast_occurrence, None);
+        assert!(graph_is_clear(
+            state.stack.back().and_then(StackEntry::ability).unwrap()
+        ));
+        assert_eq!(
+            state
+                .spells_cast_this_turn_by_player
+                .get(&PlayerId(0))
+                .map_or(0, |history| history.len()),
+            journal_len
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GameEvent::StackPushed { object_id } if *object_id == copy_id
+        )));
     }
 
     #[test]

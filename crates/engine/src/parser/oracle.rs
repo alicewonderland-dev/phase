@@ -120,8 +120,8 @@ use super::oracle_trigger::{
     parse_trigger_lines_at_index_ir,
 };
 use super::oracle_util::{
-    normalize_card_name_refs, parse_mana_symbols, parse_number, split_same_is_true_static_tail,
-    strip_reminder_text, TextPair, GRANTING_SELF_PLACEHOLDER,
+    normalize_card_name_refs, parse_mana_symbols, parse_number, render_granting_self_reference,
+    split_same_is_true_static_tail, strip_reminder_text, TextPair,
 };
 
 /// Collected parsed abilities from Oracle text.
@@ -1546,7 +1546,6 @@ fn quantity_ref_uses_filter_prop(qty: &QuantityRef, pred: &impl Fn(&FilterProp) 
         | QuantityRef::ObjectCountDistinct { filter, .. }
         | QuantityRef::ObjectCountBySharedQuality { filter, .. }
         | QuantityRef::CountersOnObjects { filter, .. }
-        | QuantityRef::Aggregate { filter, .. }
         | QuantityRef::ControlledByEachPlayer { filter, .. }
         | QuantityRef::DistinctCounterKindsAmong { filter }
         | QuantityRef::EnteredThisTurn { filter }
@@ -1564,6 +1563,9 @@ fn quantity_ref_uses_filter_prop(qty: &QuantityRef, pred: &impl Fn(&FilterProp) 
         | QuantityRef::DistinctSubtypes { source, .. }
         | QuantityRef::DistinctColorsAmong { source } => {
             characteristic_source_uses_filter_prop(source, pred)
+        }
+        QuantityRef::PropertyAggregate(aggregate) => {
+            characteristic_source_uses_filter_prop(aggregate.source(), pred)
         }
         _ => false,
     }
@@ -3370,7 +3372,7 @@ pub(crate) fn lower_oracle_ir(ir: &mut OracleDocIr) -> ParsedAbilities {
 
     // CR 607.1 + CR 610.3: Two-trigger exile-return synthesis (Journey to
     // Nowhere, Oblivion Ring — see `DocumentRelationIr::EtbExileLtbReturn`).
-    // CR 102.1 + CR 603.7c + CR 608.2c: active-player punisher rebinding (Siren's
+    // CR 102.1 + CR 608.2c: active-player punisher rebinding (Siren's
     // Call — see `DocumentRelationIr::ActivePlayerPunisher`). Applied here, after
     // the swallow audit, to preserve the pre-relocation order in which the two
     // former `synthesize`/`bind` passes ran (the audit reads `result` first).
@@ -3386,7 +3388,7 @@ pub(crate) fn lower_oracle_ir(ir: &mut OracleDocIr) -> ParsedAbilities {
     result
 }
 
-// --- CR 102.1 + CR 603.7c + CR 608.2c: active-player coerce → delayed punisher --
+// --- CR 102.1 + CR 608.2c: active-player coerce → delayed punisher --
 
 /// Whether an ability is the mass-`MustAttack` coerce clause over an
 /// `ActivePlayer` subject (Siren's Call, first line).
@@ -3419,7 +3421,7 @@ fn ability_is_active_player_punisher(def: &AbilityDefinition) -> bool {
         && target_filter_controller_ref(target) == Some(ControllerRef::You)
 }
 
-/// CR 102.1 + CR 603.7c + CR 608.2c: Pair the mass-attack coerce clause
+/// CR 102.1 + CR 608.2c: Pair the mass-attack coerce clause
 /// (`coerce`) with each sibling delayed punisher (`punisher`) on the same card.
 fn detect_active_player_punisher(items: &[OracleItemIr], relations: &mut Vec<DocumentRelationIr>) {
     let Some(coerce) = items
@@ -7181,7 +7183,7 @@ pub fn parse_oracle_text(
         subtypes,
     );
     let mut parsed = lower_oracle_ir(&mut ir);
-    scrub_granting_placeholder_descriptions(&mut parsed);
+    render_granting_self_descriptions(&mut parsed, card_name);
     demote_unbound_delayed_sweeps(&mut parsed);
     parsed
 }
@@ -7199,7 +7201,7 @@ pub fn parse_oracle_text(
 /// This runs as a post-lowering invariant rather than inside one grammar arm on
 /// purpose: several builders can emit a `CreateDelayedTrigger`, and the honesty
 /// requirement is a property of the FINAL tree, not of any single production. It
-/// sits beside `scrub_granting_placeholder_descriptions` for the same reason —
+/// sits beside `render_granting_self_descriptions` for the same reason —
 /// that pass is the existing precedent for a whole-tree degrade net.
 fn demote_unbound_delayed_sweeps(parsed: &mut ParsedAbilities) {
     for def in &mut parsed.abilities {
@@ -7237,87 +7239,514 @@ fn demote_sweeps_in_ability(def: &mut AbilityDefinition) {
     }
 }
 
-/// CR 201.5a: Single post-parse degrade net for [`GRANTING_SELF_PLACEHOLDER`].
-/// The masker inserts the placeholder into verb-object self-ref positions so the
+/// CR 201.5a: The DISPLAY-channel authority for [`GRANTING_SELF_PLACEHOLDER`] —
+/// the mirror of the typed channel's Layer-6 concretization
+/// (`game::ability_utils::concretize_granting_object`).
+///
+/// The masker inserts the marker into verb-object self-ref positions so the
 /// self-ref combinators can map it to `TargetFilter::GrantingObject`. After
-/// parsing, any residual placeholder lives ONLY in display `description` strings
-/// (which embed the raw quoted text, e.g. an equipment's outer "…has \"…\""
-/// static description); it must render as `~` and never leak the raw private-use
-/// char into card-data. This is the shared-parse-entry cleanup the plan promised
-/// — one sweep, not a per-consumer patch.
-fn scrub_granting_placeholder_descriptions(parsed: &mut ParsedAbilities) {
+/// parsing, the residual marker survives in exactly two kinds of DISPLAY
+/// surface, and this net renders both to the granting card's PRINTED name so the
+/// client's `~` substitution (CR 201.5b) can never capture a granter reference:
+///
+/// * the `description` field of an `AbilityDefinition` / `TriggerDefinition` /
+///   `StaticDefinition` / `ReplacementDefinition`, and of
+///   `Effect::Unimplemented` — all of which embed the raw quoted text (e.g. an
+///   equipment's outer "…has \"…\"" static description); and
+/// * `ModalChoice::mode_descriptions` (CR 700.2), which is not a `description`
+///   field at all but a `Vec<String>` copied from each mode's RAW Oracle line —
+///   already masked, because `parse` normalizes before it splits lines. See
+///   [`render_modal_descriptions`].
+///
+/// Those two bullets are the COMPLETE RENDERED SET — the whole of what this net
+/// writes to, checkable in one read against the arms below. EVERYTHING ELSE
+/// reachable from `ParsedAbilities` is UN-WALKED.
+///
+/// That complement is a PROPERTY, not a roster. This comment does not enumerate
+/// it and must not be read as if it did: an enumeration that must stay
+/// exhaustive to be true has repeatedly rotted here, so the exhaustive-list
+/// framing is retired on purpose. The standing authority that the un-walked
+/// complement is nonetheless marker-free is NOT this comment — it is the
+/// corpus-wide `serde_json` guard
+/// `granted_ability_self_binding::placeholder_never_leaks_into_any_description`,
+/// which serializes the WHOLE `ParsedAbilities` (every `String` at every depth,
+/// the `condition` fields and `parse_warnings` included — serde drops only
+/// `None`/empty values here, never a populated string) across every member of
+/// its class corpus, together with the token-catalog gate in the note below.
+///
+/// Notable un-walked axes, as NON-EXHAUSTIVE EXAMPLES: `AbilityCost`, the
+/// structurally forced exclusion (point 5); the two parse-unreachable carriers
+/// (point 4); the CONDITION axis — the `condition` field of `StaticDefinition`,
+/// `TriggerDefinition` and `ReplacementDefinition`, ONE axis spanning the three
+/// enums `StaticCondition` / `TriggerCondition` / `ReplacementCondition`,
+/// un-walked here EVERYWHERE and not just under a modal's `constraints` (see
+/// [`render_modal_descriptions`]); the DIAGNOSTIC axis
+/// `ParsedAbilities::parse_warnings`, whose text-bearing `OracleDiagnostic`
+/// variants no arm visits; and the un-rendered diagnostic axis in
+/// `game::effects::token`'s `unparsed_rules_text_lines` (the note below).
+///
+/// A contributor adding a member of this class must RE-MEASURE rather than
+/// trust those examples: put the card in that guard's class corpus and run it.
+/// If a marker reaches any un-walked string the guard reds, and the repair is a
+/// new render arm here — never a new entry in the example list above.
+///
+/// MEASURED OUT-OF-SCOPE AXIS — `game::effects::token`'s independent entry point
+/// returns `unparsed_rules_text_lines` taken from the SAME masked text and does
+/// NOT render them (they feed coverage gap text, not a player-facing string).
+/// That axis is unreachable in the production input domain rather than merely
+/// unlikely: of the 2,869 presets in `data/known-tokens.toml`, exactly ONE
+/// ("Rock") has a quoted granter self-reference in a masked verb-object
+/// position, and both of its lines parse, so its unparsed vector is empty. The
+/// measurement is a standing gate, not a claim — see
+/// `game::effects::token::tests::no_catalog_preset_leaks_the_placeholder_into_unparsed_lines`.
+///
+/// TRAVERSAL CONTRACT — read before changing an arm:
+///
+/// 1. At the `Effect`-ARM level the descend set is a strict SUPERSET of
+///    `types::ability_visit::visit_effect_scoped`'s: all 16 of that walker's
+///    descend arms appear in [`render_effect_descriptions`], plus
+///    `BecomeCopy`/`CopySpell`/`CopyTokenOf`, `AddPendingEntersModifications`,
+///    `EachPlayerCopyChosen`, `ReturnAsAura`, `Mana`, `GrantCastingPermission`,
+///    `ExileResolvingSpellInsteadOfGraveyard`, and
+///    `CreateDelayedTrigger.condition`, all leaves there. The superset claim is
+///    scoped to that level ON PURPOSE: ONE LEVEL DOWN it is FALSE.
+///    `ability_visit` descends `ContinuousModification::CopyValues` into
+///    `visit_copiable_values_scoped`; this net does NOT (see point 4).
+/// 2. It descends unconditionally, where `ability_visit` gates several arms
+///    behind `ResolutionScope::IncludeRegisteredLater` — display rendering has no
+///    resolution scope. In particular `Effect::Mana` is descended here and is a
+///    deliberate leaf there, for a reason that does not transfer (see that arm).
+/// 3. The descend set is derived by following FIELD TYPES transitively into
+///    named types declared under `crates/engine/src` (`ManaSpellGrant`,
+///    `CastingPermission`, `ExiledSpellRider`, `DelayedTriggerCondition`,
+///    `CounterSourceRider`, `VoteSubject`, `DieResultBranch`,
+///    `ContinuousModification`, the four `*Definition`s), NOT by scanning for
+///    `*Definition`/`ContinuousModification`/`Box<Effect>` payloads — that
+///    weaker rule is what previously missed four carriers. The regenerating
+///    closure script lives in the plan's carrier-enumeration section and is
+///    named again in the census's failure message.
+/// 4. Two carriers are deliberately NOT descended because they are
+///    PARSE-UNREACHABLE, not because they are description-free:
+///    `Effect::EpicCopy` (`ResolvedAbility.description`; synthesized at
+///    resolution by `game::triggers`) and `ContinuousModification::CopyValues`
+///    (`CopiableValues.abilities`/`trigger_definitions`/`replacement_definitions`
+///    /`static_definitions`; constructed only at runtime by `types::layers`,
+///    `game::derived_views`, `game::merge`). This is the one place the
+///    superset claim in point 1 breaks (`ability_visit` DOES descend
+///    `CopyValues`).
+/// 5. `AbilityCost` is an EXCLUDED AXIS, and structurally must be: blocking it
+///    is what keeps the closure at 27 carriers — unblocked, `TargetFilter` ->
+///    `TypedFilter` -> `FilterProp` -> `Keyword` -> `AbilityCost` makes 184 of
+///    `Effect`'s 232 variants "carriers", i.e. the cost axis is reachable from
+///    nearly every `TargetFilter` in the tree rather than being a sidecar on
+///    `def.cost`. Precedent: `ability_visit`'s module doc keeps the cost walk
+///    separate for the same type-level reason. MEASURED: a marker planted in
+///    `AbilityCost::Unimplemented.description` survives this net; no production
+///    parse path plants one.
+/// 6. [`render_effect_descriptions`] is NOT wildcard-free over `Effect`
+///    (duplicating `ability_visit`'s ~206-name leaf list here would be the
+///    duplication CLAUDE.md forbids; `game::coverage::ability_tree_any` is the
+///    in-tree precedent). Completeness therefore rests on named standing
+///    instruments plus one contributor obligation, across THREE distinct drift
+///    classes. (a) A new `Effect` VARIANT: caught by
+///    `tests::render_net_effect_carrier_census`. (b) A new VARIANT on an
+///    INTERMEDIATE PAYLOAD ENUM (`ManaSpellGrant`, `CastingPermission`,
+///    `ExiledSpellRider`, `CounterSourceRider`, `VoteSubject`) — each has
+///    exactly ONE description-reaching variant today, so a new sibling falls
+///    through this net's outer `_ => {}` unseen, and neither (a) nor (c) can
+///    see it: caught by that same census's `PAYLOAD_ENUM_PINS` table. (c) A
+///    new description-bearing FIELD on an existing carrier's payload: NOT
+///    caught automatically, and this is the weak class. Most descend arms below
+///    destructure with `..`, so a new field on those payloads is field access
+///    rather than a match arm — neither a compile error here nor planted by
+///    `tests::render_net_reaches_every_nested_description_carrier`, which
+///    plants markers only in the carriers it already names. (The arms that
+///    destructure exhaustively do break the build, but they are the minority.)
+///    The corpus-wide `serde_json` leak guards are the only automatic backstop,
+///    and only for shapes a SHIPPED card actually exercises — a parse-reachable
+///    but corpus-absent shape passes them green. (c) therefore rests on a
+///    CONTRIBUTOR OBLIGATION, framed exactly as `types::ability_visit`'s module
+///    doc frames the same limit for its own three fixtures:
+///    A carrier OR a description-bearing field added anywhere this net walks
+///    must extend all three planted-marker fixtures: `game::printed_cards`'s,
+///    `ai_support::targeted_exchange`'s, and this module's.
+/// 7. [`render_modification_descriptions`]'s `ContinuousModification` match and
+///    [`render_delayed_condition_descriptions`]'s `DelayedTriggerCondition`
+///    match remain WILDCARD-FREE, so a new variant on either is a compile error
+///    here. [`render_modal_descriptions`] destructures `ModalChoice`
+///    EXHAUSTIVELY for the same reason: it is a STRUCT reached by field, so none
+///    of the census's three pins can see a new field on it, and drift class (c)
+///    is exactly what let its `mode_descriptions` go unrendered until now. The
+///    compile-time guarantee is kept exactly where it is affordable.
+fn render_granting_self_descriptions(parsed: &mut ParsedAbilities, card_name: &str) {
     for def in &mut parsed.abilities {
-        scrub_ability_descriptions(def);
+        render_ability_descriptions(def, card_name);
     }
     for trig in &mut parsed.triggers {
-        scrub_trigger_descriptions(trig);
+        render_trigger_descriptions(trig, card_name);
     }
     for st in &mut parsed.statics {
-        scrub_static_descriptions(st);
+        render_static_descriptions(st, card_name);
     }
     for rep in &mut parsed.replacements {
-        scrub_replacement_descriptions(rep);
+        render_replacement_descriptions(rep, card_name);
+    }
+    if let Some(modal) = parsed.modal.as_mut() {
+        render_modal_descriptions(modal, card_name);
     }
 }
 
-fn scrub_description(desc: &mut Option<String>) {
+/// CR 700.2 + CR 201.5a: a modal header's per-mode display text is the ONE
+/// rendered surface that is not a field named `description`, so it needs its own
+/// arm rather than riding [`render_granter_ref_in_description`].
+///
+/// It is reached — not merely description-shaped — because `mode_descriptions`
+/// is copied from each mode's RAW Oracle line, and that line is already MASKED:
+/// `parse` runs `normalize_card_name_refs` before it splits lines, so the marker
+/// is present in `mode.raw` by construction. `mode_descriptions` is then
+/// serialized into `ParsedAbilities`, projected as a player-facing prompt by
+/// `game::interaction`, and rendered verbatim by the client's mode-choice modal.
+///
+/// The destructure is EXHAUSTIVE on purpose, in the spirit of traversal-contract
+/// point 7: `ModalChoice` is a struct reached by FIELD, not an `Effect` arm, so
+/// none of `tests::render_net_effect_carrier_census`' three pins can see a new
+/// field on it. Naming every field makes that addition a COMPILE ERROR here —
+/// strictly stronger than a pin, and affordable at twelve fields.
+///
+/// Every field bound to `_` below is numeric, boolean, a typed cost, a typed
+/// quantity, or a typed selection constraint, with ONE string-bearing thing
+/// reachable past them: `constraints` -> `ModalSelectionCondition::Static` ->
+/// `StaticCondition::{Unrecognized.text, ChosenLabelIs.label}`. That is NOT
+/// walked, and the omission is not a modal-specific decision — this net does not
+/// walk `StaticCondition` ANYWHERE (`render_static_descriptions` walks
+/// `st.description` and `st.modifications`, never `st.condition`), so it is the
+/// same whole-net axis that is un-walked at BASE_SHA rather than a hole this arm
+/// opens. `ChosenLabelIs.label` is an anchor WORD, never quoted prose;
+/// `Unrecognized.text` is a diagnostic condition fragment. MEASURED: the
+/// exported `client/public/card-data.json` carries zero markers, raw or escaped,
+/// at any depth, so no corpus card reaches this axis today.
+fn render_modal_descriptions(modal: &mut ModalChoice, card_name: &str) {
+    let ModalChoice {
+        mode_descriptions,
+        min_choices: _,
+        max_choices: _,
+        mode_count: _,
+        allow_repeat_modes: _,
+        constraints: _,
+        mode_costs: _,
+        mode_pawprints: _,
+        entwine_cost: _,
+        chooser: _,
+        selection: _,
+        dynamic_max_choices: _,
+    } = modal;
+    for description in mode_descriptions.iter_mut() {
+        *description = render_granting_self_reference(description, card_name);
+    }
+}
+
+fn render_granter_ref_in_description(desc: &mut Option<String>, card_name: &str) {
     if let Some(s) = desc {
-        if s.contains(GRANTING_SELF_PLACEHOLDER) {
-            *s = s.replace(GRANTING_SELF_PLACEHOLDER, "~");
-        }
+        *s = render_granting_self_reference(s, card_name);
     }
 }
 
-fn scrub_ability_descriptions(def: &mut AbilityDefinition) {
-    scrub_description(&mut def.description);
-    // allow-noncombinator: destructure-read of the Unimplemented gap description
-    // (a display string), not a hand-constructed literal or parsing dispatch.
-    if let Effect::Unimplemented { description, .. } = def.effect.as_mut() {
-        scrub_description(description);
+fn render_ability_descriptions(def: &mut AbilityDefinition, card_name: &str) {
+    render_granter_ref_in_description(&mut def.description, card_name);
+    render_effect_descriptions(def.effect.as_mut(), card_name);
+    if let Some(modal) = def.modal.as_mut() {
+        render_modal_descriptions(modal, card_name);
     }
     if let Some(sub) = def.sub_ability.as_mut() {
-        scrub_ability_descriptions(sub);
+        render_ability_descriptions(sub, card_name);
     }
     if let Some(els) = def.else_ability.as_mut() {
-        scrub_ability_descriptions(els);
+        render_ability_descriptions(els, card_name);
     }
     for mode in def.mode_abilities.iter_mut() {
-        scrub_ability_descriptions(mode);
+        render_ability_descriptions(mode, card_name);
     }
 }
 
-fn scrub_trigger_descriptions(trig: &mut TriggerDefinition) {
-    scrub_description(&mut trig.description);
+/// CR 603.7a: a delayed triggered ability's CONDITION carries its own
+/// `TriggerDefinition`, whose `description` is a display surface. Both
+/// `Effect::CreateDelayedTrigger.condition` and `ExiledSpellRider::ReturnTo.timing`
+/// are this same type, so one helper serves both. (`types::ability_visit` walks
+/// the delayed `effect` only, on the documented ground that the condition's
+/// trigger is a MATCHER with `execute: None`; that is a claim about `execute`,
+/// not about `description`.)
+///
+/// WILDCARD-FREE on purpose, for the same reason
+/// [`render_modification_descriptions`] is: `DelayedTriggerCondition` has nine
+/// variants, so the non-descending arm costs seven leaf names — not the ~206
+/// that justify the wildcard in [`render_effect_descriptions`]. A new variant
+/// carrying a `TriggerDefinition` must be a COMPILE ERROR here, not a silent
+/// pass-through.
+fn render_delayed_condition_descriptions(
+    condition: &mut crate::types::ability::DelayedTriggerCondition,
+    card_name: &str,
+) {
+    use crate::types::ability::DelayedTriggerCondition as D;
+    match condition {
+        D::WheneverEvent { trigger, .. } => render_trigger_descriptions(trigger, card_name),
+        D::WhenNextEvent {
+            trigger,
+            or_trigger,
+            ..
+        } => {
+            render_trigger_descriptions(trigger, card_name);
+            if let Some(other) = or_trigger.as_mut() {
+                render_trigger_descriptions(other, card_name);
+            }
+        }
+        // The remaining seven conditions are phase gates or object/filter
+        // matchers with no nested `TriggerDefinition`, hence no description.
+        D::AtNextPhase { .. }
+        | D::AtNextPhaseForPlayer { .. }
+        | D::WhenLeavesPlay { .. }
+        | D::WhenDies { .. }
+        | D::WhenLeavesPlayFiltered { .. }
+        | D::WhenEntersBattlefield { .. }
+        | D::WhenDiesOrExiled { .. } => {}
+    }
+}
+
+/// CR 201.5a: the `Effect`-level half of the display-render net. See
+/// [`render_granting_self_descriptions`]'s traversal contract for the descend
+/// set's derivation rule, the two deliberate parse-unreachable non-descents, the
+/// excluded `AbilityCost` axis, and why this match ends in `_ => {}` while its
+/// two sibling matches do not.
+fn render_effect_descriptions(effect: &mut Effect, card_name: &str) {
+    use crate::types::ability::{
+        CastingPermission, CounterSourceRider, ExiledSpellRider, VoteSubject,
+    };
+    use crate::types::mana::ManaSpellGrant;
+    match effect {
+        // allow-noncombinator: destructure-read of the Unimplemented gap description
+        // (a display string), not a hand-constructed literal or parsing dispatch.
+        Effect::Unimplemented { description, .. } => {
+            render_granter_ref_in_description(description, card_name)
+        }
+        Effect::AddPendingEntersModifications { modifications, .. } => {
+            for m in modifications.iter_mut() {
+                render_modification_descriptions(m, card_name);
+            }
+        }
+        // CR 201.5a: a copy-except SELF-grant nests the granted body's description
+        // inside the copy effect's payload (Sakashima the Impostor). MEASURED
+        // load-bearing: without this arm the raw U+E0002 marker ships into
+        // `client/public/card-data.json` for that card.
+        Effect::BecomeCopy {
+            additional_modifications,
+            ..
+        }
+        | Effect::CopySpell {
+            additional_modifications,
+            ..
+        }
+        | Effect::CopyTokenOf {
+            additional_modifications,
+            ..
+        } => {
+            for m in additional_modifications.iter_mut() {
+                render_modification_descriptions(m, card_name);
+            }
+        }
+        Effect::EachPlayerCopyChosen {
+            copy_modifications, ..
+        } => {
+            for m in copy_modifications.iter_mut() {
+                render_modification_descriptions(m, card_name);
+            }
+        }
+        Effect::ReturnAsAura { grants, .. } => {
+            for m in grants.iter_mut() {
+                render_modification_descriptions(m, card_name);
+            }
+        }
+        Effect::AddTargetReplacement { replacement, .. } => {
+            render_replacement_descriptions(replacement, card_name)
+        }
+        Effect::CreateDrawReplacement { replacement_effect }
+        | Effect::CreatePlaneswalkReplacement { replacement_effect } => {
+            render_effect_descriptions(replacement_effect, card_name)
+        }
+        // CR 611.2 + CR 111.1: a resolution-time grant onto a target, and a created
+        // token's own statics. MEASURED: the GenericEffect route leaks a raw
+        // U+E0002 at BASE_SHA today; the Token route regresses without this arm.
+        Effect::GenericEffect {
+            static_abilities, ..
+        }
+        | Effect::Token {
+            static_abilities, ..
+        } => {
+            for st in static_abilities.iter_mut() {
+                render_static_descriptions(st, card_name);
+            }
+        }
+        Effect::CreateEmblem { statics, triggers } => {
+            for st in statics.iter_mut() {
+                render_static_descriptions(st, card_name);
+            }
+            for tr in triggers.iter_mut() {
+                render_trigger_descriptions(tr, card_name);
+            }
+        }
+        // Destructured in the match head: an inner `if let` fails clippy::collapsible_match.
+        Effect::Counter {
+            source_rider: Some(CounterSourceRider::LosesAbilities { static_def, .. }),
+            ..
+        } => render_static_descriptions(static_def, card_name),
+        // CR 603.7a: BOTH the delayed payload and the condition's own matcher
+        // trigger carry a `description`.
+        Effect::CreateDelayedTrigger {
+            effect, condition, ..
+        } => {
+            render_ability_descriptions(effect, card_name);
+            render_delayed_condition_descriptions(condition, card_name);
+        }
+        // CR 614.1 + CR 603.7a: the exile-instead rider arms a delayed trigger
+        // (Feather, the Redeemed). Field is `on_exile`, not `rider`.
+        Effect::ExileResolvingSpellInsteadOfGraveyard {
+            on_exile: Some(ExiledSpellRider::ReturnTo { timing, .. }),
+            ..
+        } => render_delayed_condition_descriptions(timing, card_name),
+        // CR 106.6 + CR 603.3: a mana-spend grant can ride a reflexive triggered
+        // ability (Gilanra, Pyromancer's Goggles). `types::ability_visit` treats
+        // `Effect::Mana` as a DELIBERATE leaf on a RESOLUTION-SCOPE ground (the
+        // grant resolves later, separately) and to protect its CR 605.1a
+        // mana-ability guard. Neither reason transfers here: display rendering has
+        // no resolution scope and asks no mana-ability question, and
+        // `TriggerOnSpend`'s `AbilityDefinition.description` is a live display
+        // surface. Do NOT "restore parity" by deleting this arm.
+        Effect::Mana { grants, .. } => {
+            for grant in grants.iter_mut() {
+                if let ManaSpellGrant::TriggerOnSpend { ability, .. } = grant {
+                    render_ability_descriptions(ability, card_name);
+                }
+            }
+        }
+        // CR 611.2: an exile-with-alt-cost permission can carry enters-with
+        // continuous modifications, which nest granted definitions.
+        // Destructured in the match head: clippy::collapsible_match — MEASURED.
+        Effect::GrantCastingPermission {
+            permission:
+                CastingPermission::ExileWithAltCost {
+                    enters_with_modifications,
+                    ..
+                },
+            ..
+        } => {
+            for m in enters_with_modifications.iter_mut() {
+                render_modification_descriptions(m, card_name);
+            }
+        }
+        Effect::ChooseOneOf { branches, .. } => {
+            for b in branches.iter_mut() {
+                render_ability_descriptions(b, card_name);
+            }
+        }
+        Effect::FlipCoin {
+            win_effect,
+            lose_effect,
+            ..
+        }
+        | Effect::FlipCoins {
+            win_effect,
+            lose_effect,
+            ..
+        } => {
+            if let Some(w) = win_effect.as_mut() {
+                render_ability_descriptions(w, card_name);
+            }
+            if let Some(l) = lose_effect.as_mut() {
+                render_ability_descriptions(l, card_name);
+            }
+        }
+        Effect::FlipCoinUntilLose { win_effect } => {
+            render_ability_descriptions(win_effect, card_name)
+        }
+        Effect::RevealFromHand { on_decline, .. } => {
+            if let Some(d) = on_decline.as_mut() {
+                render_ability_descriptions(d, card_name);
+            }
+        }
+        Effect::RollDie { results, .. } => {
+            for branch in results.iter_mut() {
+                render_ability_descriptions(&mut branch.effect, card_name);
+            }
+        }
+        Effect::SeparateIntoPiles {
+            chosen_pile_effect,
+            unchosen_pile_effect,
+            ..
+        } => {
+            render_ability_descriptions(chosen_pile_effect, card_name);
+            if let Some(u) = unchosen_pile_effect.as_mut() {
+                render_ability_descriptions(u, card_name);
+            }
+        }
+        Effect::Vote {
+            per_choice_effect,
+            subject,
+            ..
+        } => {
+            for sub in per_choice_effect.iter_mut() {
+                render_ability_descriptions(sub, card_name);
+            }
+            if let VoteSubject::Objects {
+                outcome_template, ..
+            } = subject
+            {
+                render_ability_descriptions(outcome_template, card_name);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn render_trigger_descriptions(trig: &mut TriggerDefinition, card_name: &str) {
+    render_granter_ref_in_description(&mut trig.description, card_name);
     if let Some(execute) = trig.execute.as_mut() {
-        scrub_ability_descriptions(execute);
+        render_ability_descriptions(execute, card_name);
     }
 }
 
-pub(crate) fn scrub_static_descriptions(st: &mut StaticDefinition) {
-    scrub_description(&mut st.description);
+pub(crate) fn render_static_descriptions(st: &mut StaticDefinition, card_name: &str) {
+    render_granter_ref_in_description(&mut st.description, card_name);
     for modification in st.modifications.iter_mut() {
-        scrub_modification_descriptions(modification);
+        render_modification_descriptions(modification, card_name);
     }
 }
 
-pub(crate) fn scrub_modification_descriptions(modification: &mut ContinuousModification) {
+pub(crate) fn render_modification_descriptions(
+    modification: &mut ContinuousModification,
+    card_name: &str,
+) {
     match modification {
         ContinuousModification::GrantAbility { definition } => {
-            scrub_ability_descriptions(definition)
+            render_ability_descriptions(definition, card_name)
         }
-        ContinuousModification::GrantTrigger { trigger } => scrub_trigger_descriptions(trigger),
+        ContinuousModification::GrantTrigger { trigger } => {
+            render_trigger_descriptions(trigger, card_name)
+        }
         ContinuousModification::GrantStaticAbility { definition } => {
-            scrub_static_descriptions(definition)
+            render_static_descriptions(definition, card_name)
         }
         ContinuousModification::GrantReplacement { replacement } => {
-            scrub_replacement_descriptions(replacement)
+            render_replacement_descriptions(replacement, card_name)
         }
         // Remaining modifications carry no nested ability/trigger/static/
-        // replacement description to scrub — mirrors the exhaustive-match
+        // replacement description to render — mirrors the exhaustive-match
         // model in `ability_visit.rs`'s `visit_continuous_mod_scoped`, minus
-        // that walker's `CopyValues` recursion (it copies P/T/color/type
-        // values from a source, not a description-bearing structure, so it
-        // has nothing for this scrubber to reach).
+        // that walker's `CopyValues` recursion. `CopyValues` is the one leaf
+        // here that IS description-bearing — `CopiableValues` carries
+        // `abilities`, `trigger_definitions`, `replacement_definitions`, and
+        // `static_definitions` (CR 707.2 copiable values). It is not walked
+        // because it is PARSE-UNREACHABLE: every construction site is runtime
+        // (`types::layers`, `game::derived_views`, `game::merge`), and the
+        // parser only matches on it. The earlier claim that it carries no
+        // description was simply false.
         ContinuousModification::GrantAllActivatedAbilitiesOf { .. }
         | ContinuousModification::GrantAllTriggeredAbilitiesOf { .. }
         | ContinuousModification::CopyValues { .. }
@@ -7374,10 +7803,10 @@ pub(crate) fn scrub_modification_descriptions(modification: &mut ContinuousModif
     }
 }
 
-fn scrub_replacement_descriptions(rep: &mut ReplacementDefinition) {
-    scrub_description(&mut rep.description);
+fn render_replacement_descriptions(rep: &mut ReplacementDefinition, card_name: &str) {
+    render_granter_ref_in_description(&mut rep.description, card_name);
     if let Some(execute) = rep.execute.as_mut() {
-        scrub_ability_descriptions(execute);
+        render_ability_descriptions(execute, card_name);
     }
 }
 

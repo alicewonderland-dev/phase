@@ -762,11 +762,17 @@ mod tests {
         let damage = ResolvedAbility::new(
             Effect::DealDamage {
                 amount: QuantityExpr::Ref {
-                    qty: QuantityRef::TrackedSetAggregate {
-                        function: AggregateFunction::Sum,
-                        property: ObjectProperty::ManaValue,
-                        source: crate::types::ability::TrackedAnaphorSource::ChainSet,
-                    },
+                    qty: QuantityRef::PropertyAggregate(
+                        crate::types::ability::PropertyAggregate::new(
+                            AggregateFunction::Sum,
+                            ObjectProperty::ManaValue,
+                            crate::types::ability::CardTypeSetSource::TrackedSet {
+                                set: crate::types::ability::TrackedAnaphorSource::ChainSet,
+                                caused_by: None,
+                            },
+                        )
+                        .expect("statically valid property aggregate"),
+                    ),
                 },
                 target: TargetFilter::Controller,
                 damage_source: None,

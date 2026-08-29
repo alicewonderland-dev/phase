@@ -591,6 +591,8 @@ fn fmt_target(filter: &TargetFilter) -> String {
         TargetFilter::LastRevealed => "last revealed".into(),
         TargetFilter::LastZoneChanged => "last zone changed".into(),
         TargetFilter::CostPaidObject => "cost-paid object".into(),
+        // CR 701.47c: matches `ObjectScope::AmassedArmy`'s description string.
+        TargetFilter::AmassedArmy => "amassed Army".into(),
         TargetFilter::ChosenCard => "last chosen card".into(),
         TargetFilter::TriggeringSpellController => "triggering spell's controller".into(),
         TargetFilter::TriggeringSpellOwner => "triggering spell's owner".into(),
@@ -1515,23 +1517,24 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             }
         }
         QuantityRef::SelfManaValue => "self mana value".into(),
-        QuantityRef::Aggregate {
-            function,
-            property,
-            filter,
-        } => {
-            let func = match function {
+        QuantityRef::PropertyAggregate(aggregate) => {
+            let func = match aggregate.function() {
                 AggregateFunction::Max => "max",
                 AggregateFunction::Min => "min",
                 AggregateFunction::Sum => "total",
             };
-            let prop = match property {
+            let prop = match aggregate.property() {
                 ObjectProperty::Power => "power",
                 ObjectProperty::Toughness => "toughness",
                 ObjectProperty::ManaValue => "mana value",
                 ObjectProperty::ManaSymbolCount(_) => "mana symbols",
             };
-            format!("{func} {prop} of {}", fmt_target(filter))
+            let population = if matches!(aggregate.source(), CardTypeSetSource::TrackedSet { .. }) {
+                "those cards".into()
+            } else {
+                fmt_characteristic_population_bounded(aggregate.source())
+            };
+            format!("{func} {prop} of {population}")
         }
         QuantityRef::Devotion { colors } => match colors {
             crate::types::ability::DevotionColors::Fixed(colors) => {
@@ -1641,24 +1644,6 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
         QuantityRef::TrackedSetSize => "cards moved".into(),
         QuantityRef::FilteredTrackedSetSize { filter, .. } => {
             format!("filtered tracked set ({})", fmt_target(filter))
-        }
-        QuantityRef::TrackedSetAggregate {
-            function,
-            property,
-            source: _,
-        } => {
-            let func = match function {
-                AggregateFunction::Max => "max",
-                AggregateFunction::Min => "min",
-                AggregateFunction::Sum => "total",
-            };
-            let prop = match property {
-                ObjectProperty::Power => "power",
-                ObjectProperty::Toughness => "toughness",
-                ObjectProperty::ManaValue => "mana value",
-                ObjectProperty::ManaSymbolCount(_) => "mana symbols",
-            };
-            format!("{func} {prop} of those cards")
         }
         QuantityRef::ExiledFromHandThisResolution => "cards exiled from hand this way".into(),
         QuantityRef::LifeLostThisTurn { player } => {
@@ -2383,7 +2368,7 @@ fn fmt_characteristic_population(source: &CardTypeSetSource) -> String {
         }
         CardTypeSetSource::ExiledBySource => "cards exiled with source".into(),
         CardTypeSetSource::Objects { filter } => fmt_target(filter),
-        CardTypeSetSource::TrackedSet { caused_by } => match caused_by {
+        CardTypeSetSource::TrackedSet { caused_by, .. } => match caused_by {
             Some(cause) => {
                 use crate::types::ability::ThisWayCause;
                 let verb = match cause {
@@ -3670,12 +3655,23 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             filter,
             kept_destination,
             rest_destination,
+            kept_destination_if,
             ..
         } => {
             d.push(("player".into(), fmt_target(player)));
             d.push(("until".into(), fmt_target(filter)));
             d.push(("kept".into(), format!("{:?}", kept_destination)));
             d.push(("rest".into(), format!("{:?}", rest_destination)));
+            // CR 202.3 + CR 608.2c: surface the card-property-driven destination
+            // branch (Part in Friendship) so coverage output distinguishes it
+            // from the unconditional `kept` default it repurposes as the
+            // "otherwise" zone.
+            if let Some((cond_filter, if_true_zone)) = kept_destination_if {
+                d.push((
+                    "kept if".into(),
+                    format!("{} -> {:?}", fmt_target(cond_filter), if_true_zone),
+                ));
+            }
         }
         Effect::Discover {
             mana_value_limit,
@@ -8441,7 +8437,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::BatchSource => ("BatchSourceManaSymbolsInManaCost", Handled),
         },
         QuantityRef::SelfManaValue => ("SelfManaValue", Handled),
-        QuantityRef::Aggregate { .. } => ("Aggregate", Handled),
+        QuantityRef::PropertyAggregate(_) => ("PropertyAggregate", Handled),
         QuantityRef::Devotion { .. } => ("Devotion", Handled),
         QuantityRef::DistinctCardTypes { .. } => ("DistinctCardTypes", Handled),
         QuantityRef::DistinctSubtypes { .. } => ("DistinctSubtypes", Handled),
@@ -8456,7 +8452,6 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
         QuantityRef::PreviousEffectCount => ("PreviousEffectCount", Handled),
         QuantityRef::TrackedSetSize => ("TrackedSetSize", Handled),
         QuantityRef::FilteredTrackedSetSize { .. } => ("FilteredTrackedSetSize", Handled),
-        QuantityRef::TrackedSetAggregate { .. } => ("TrackedSetAggregate", Handled),
         QuantityRef::ExiledFromHandThisResolution => ("ExiledFromHandThisResolution", Handled),
         QuantityRef::LifeLostThisTurn { .. } => ("LifeLostThisTurn", Handled),
         QuantityRef::EventContextAmount => ("EventContextAmount", Handled),
@@ -9438,8 +9433,18 @@ impl<'a> ParsedElement<'a> {
 /// with `~` so they match parsed descriptions (which use `~` normalization).
 fn normalize_for_matching(lower: &str, card_name_lower: &str) -> String {
     // Keep coverage matching byte-equivalent to the parser's self-reference
-    // authority. Coverage adds only its historical "this spell" alias.
-    normalize_card_name_refs(lower, card_name_lower).replace("this spell", "~")
+    // authority — BOTH halves of it. CR 201.5a: the granter self-reference
+    // marker must render exactly as it does in the descriptions this function's
+    // output is compared against, or the Oracle side and the description side
+    // disagree for every card whose granted body names its granter (measured:
+    // all 16 currently fail description matching outright for exactly this
+    // reason). Both sides are lowercased here, so both carry the lowercased
+    // printed name. Coverage adds only its historical "this spell" alias.
+    crate::parser::oracle_util::render_granting_self_reference(
+        &normalize_card_name_refs(lower, card_name_lower),
+        card_name_lower,
+    )
+    .replace("this spell", "~")
 }
 
 fn split_trigger_variants(norm: &str) -> Option<Vec<String>> {
@@ -15166,6 +15171,30 @@ mod tests {
                 "coverage and parser normalization must not drift for {name}"
             );
         }
+    }
+
+    /// CR 201.5a: coverage compares Oracle text against parsed descriptions, so
+    /// both sides must share ONE self-reference authority. Before this, the
+    /// description side rendered the granter marker to the granting card's
+    /// printed name while the Oracle side left the raw marker in place, so every
+    /// card whose granted body names its granter failed description matching.
+    #[test]
+    fn normalize_for_matching_renders_the_granter_name_on_the_oracle_side() {
+        const ORACLE: &str = "equipped creature gets +1/+1 and has \"{3}, {t}, sacrifice \
+                              deconstruction hammer: destroy target artifact or enchantment.\"";
+        // POSITIVE REACH-GUARD: the assertion below is an identity over ORACLE,
+        // so it would pass vacuously if the masker never fired on this lowercased
+        // input. Prove it fires BEFORE the render composes over it.
+        assert!(
+            normalize_card_name_refs(ORACLE, "deconstruction hammer")
+                .contains(crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER),
+            "reach-guard: the masker must place the granter marker on the Oracle side, \
+             or the identity assertion below proves nothing"
+        );
+        assert_eq!(
+            normalize_for_matching(ORACLE, "deconstruction hammer"),
+            ORACLE
+        );
     }
 
     #[test]

@@ -622,6 +622,12 @@ pub fn resume_begin_game_abilities(
 
     state.resolving_begin_game_abilities = false;
     crate::game::planechase::reveal_starting_plane(state);
+    // The pregame conversation is complete before the phase driver crosses the
+    // first turn boundary. Install its settled sentinel explicitly, including
+    // the common case where there were no beginning-of-game abilities to drain.
+    state.waiting_for = WaitingFor::Priority {
+        player: state.priority_player,
+    };
     turns::auto_advance(state, events)
 }
 

@@ -364,6 +364,15 @@ fn future_scheduled_control_cannot_replace_active_control_provenance() {
     // Finish P1's current controlled turn, then advance P2, P3, and P0. The
     // newly scheduled effect must survive that first boundary and activate when
     // P1's next turn begins.
+    // This test advances turns directly rather than through Cleanup, so it must
+    // construct the same settled boundary that the production phase driver owns.
+    runner.state_mut().stack.clear();
+    *runner.state_mut().resolution_stack = Default::default();
+    runner.state_mut().resolving_stack_entry = None;
+    let priority_player = runner.state().priority_player;
+    runner.state_mut().waiting_for = WaitingFor::Priority {
+        player: priority_player,
+    };
     let mut turn_events = Vec::new();
     for _ in 0..4 {
         engine::game::turns::start_next_turn(runner.state_mut(), &mut turn_events);

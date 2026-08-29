@@ -3307,6 +3307,7 @@ fn classify_attach_host_authority(filter: &TargetFilter) -> AttachHostAuthority 
         | TargetFilter::None
         | TargetFilter::GrantingObject
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::ChosenDamageSource { .. }
         | TargetFilter::TrackedSet { .. }
@@ -4397,15 +4398,17 @@ fn catalog_rules_text_abilities(
             );
         }
     }
-    // CR 201.5a: catch any residual `GRANTING_SELF_PLACEHOLDER` left in the
-    // parsed statics'/modifications' display `description`s, mirroring
-    // `scrub_granting_placeholder_descriptions`'s whole-tree sweep in
-    // `oracle.rs` for this independent parse entry point.
+    // CR 201.5a: render every residual `GRANTING_SELF_PLACEHOLDER` left in the
+    // parsed statics'/modifications' display `description`s as the granting
+    // object's PRINTED name, mirroring `render_granting_self_descriptions`'s
+    // whole-tree net in `oracle.rs` for this independent parse entry point.
+    // This entry point is a predefined token's own rules text, so `card_name`
+    // is the token's printed name (e.g. "Rock").
     for def in &mut static_definitions {
-        crate::parser::oracle::scrub_static_descriptions(def);
+        crate::parser::oracle::render_static_descriptions(def, card_name);
     }
     for modification in &mut modifications {
-        crate::parser::oracle::scrub_modification_descriptions(modification);
+        crate::parser::oracle::render_modification_descriptions(modification, card_name);
     }
     (static_definitions, modifications, unparsed_lines)
 }
@@ -8877,15 +8880,23 @@ mod tests {
     /// immediately below is the one check in this test that is actually
     /// load-bearing for this regression.
     ///
-    /// For the placeholder-leak assertion: Rock's granted ability is a
-    /// granted *activated* ability, routed through `parse_quoted_ability`
-    /// (`oracle_static/grammar.rs`), which already calls its own
-    /// `sanitize_granting_placeholder` independent of the two scrub loops
-    /// added to `catalog_rules_text_abilities` in this diff — so disabling
-    /// only those two loops does not reproduce a leak here. See
-    /// `catalog_synthetic_equipment_grant_trigger_scrub_removes_placeholder`
-    /// for the case (a granted TRIGGER, with no independent scrubber) that
-    /// actually exercises the new scrub loops.
+    /// For the display assertions: `parse_quoted_ability`
+    /// (`oracle_static/grammar.rs`) no longer sanitizes the granter marker at
+    /// all — the old `sanitize_granting_placeholder` collapse to the host token
+    /// `~` is exactly the defect, and it is deleted. So BOTH halves of this
+    /// entry point (the granted *activated* ability here and the granted
+    /// *trigger* in
+    /// `catalog_synthetic_equipment_grant_trigger_renders_the_granter_name`)
+    /// now depend on `catalog_rules_text_abilities`' two `render_*` loops. That
+    /// makes the revert-to-red STRONGER than before, not weaker: deleting those
+    /// two loops leaves the raw marker in this ability's description and reds
+    /// the `assert_eq!` below.
+    ///
+    /// This is also the CLIENT-PARITY fixture. Rock is the one class member
+    /// whose printed body carries BOTH a CR 201.5a granter reference (the
+    /// sacrifice cost) and a CR 201.5b host reference (the damage source), so it
+    /// is the only shipped fixture that can discriminate a correct sentinel
+    /// render from a naive blanket `~`-replace.
     #[test]
     fn catalog_toggo_rock_sacrifice_cost_binds_to_rock_not_host() {
         use crate::game::scenario::{GameScenario, P0, P1};
@@ -8945,6 +8956,30 @@ mod tests {
             "granted ability description must not leak the raw placeholder char"
         );
 
+        // These display assertions MUST run before the activate below: the
+        // activation sacrifices Rock, the grant ends, and `objects[&host]
+        // .abilities` is empty afterwards (measured: index out of bounds).
+        //
+        // CR 201.5a: the COST half names the granting object (Rock); CR 201.5b:
+        // the EFFECT half stays the host token `~`.
+        let desc = runner.state().objects[&host].abilities[idx]
+            .description
+            .clone()
+            .expect("the granted ability carries a display description");
+        assert_eq!(
+            desc, "{1}, {T}, Sacrifice Rock: ~ deals 2 damage to any target.",
+            "CR 201.5a: the sacrifice cost must name Rock, and CR 201.5b: the \
+             damage source must stay the host token"
+        );
+        // CLIENT PARITY: what `renderDescription(desc, object.name)` produces on
+        // the host. The host's name must appear ONLY in the effect half.
+        let rendered = desc.replace('~', "Bearer");
+        assert_eq!(
+            rendered, "{1}, {T}, Sacrifice Rock: Bearer deals 2 damage to any target.",
+            "CR 201.5b: only the host reference may render as the host's name — a \
+             blanket `~`-replace produces `Sacrifice Bearer: Bearer deals 2 damage`"
+        );
+
         let outcome = runner
             .activate(host, idx)
             .target_player(P1)
@@ -8969,25 +9004,25 @@ mod tests {
         );
     }
 
-    /// CR 201.5a: proves the two `scrub_static_descriptions` /
-    /// `scrub_modification_descriptions` loops at the end of
-    /// `catalog_rules_text_abilities` actually do something. Rock's own test
-    /// above (a granted *activated* ability, routed through
-    /// `parse_quoted_ability`) is scrubbed independently by that grammar's own
-    /// `sanitize_granting_placeholder` call and does not exercise these two
-    /// loops. A granted *trigger* has no such independent scrubber, so this
-    /// synthetic Equipment's granted "Whenever this creature attacks,
-    /// sacrifice <self>" trigger — parsed via `parse_static_line_multi` →
-    /// `classify_quoted_inner`'s `GrantTrigger` branch, never touching
-    /// `parse_quoted_ability` — is the case that actually needs the new
-    /// scrub loops.
+    /// CR 201.5a: proves the two `render_static_descriptions` /
+    /// `render_modification_descriptions` loops at the end of
+    /// `catalog_rules_text_abilities` actually do something, on the granted
+    /// *trigger* route. That route is parsed via `parse_static_line_multi` →
+    /// `classify_quoted_inner`'s `GrantTrigger` branch and never touches
+    /// `parse_quoted_ability` at all, so this entry point's two loops are its
+    /// only display authority.
     ///
-    /// Revert-to-red: commenting out the two scrub loops (while leaving
+    /// (Rock's test above now depends on the same two loops: `parse_quoted_ability`
+    /// no longer sanitizes anything — the old `sanitize_granting_placeholder`
+    /// collapse to `~` is the defect and is deleted.)
+    ///
+    /// Revert-to-red: commenting out the two render loops (while leaving
     /// `normalize_card_name_refs` intact) leaves the raw
     /// `GRANTING_SELF_PLACEHOLDER` char in the granted trigger's
-    /// `description`, flipping the no-leak assertion below to a failure.
+    /// `description` and drops the granter's printed name, flipping BOTH
+    /// assertions below to failures.
     #[test]
-    fn catalog_synthetic_equipment_grant_trigger_scrub_removes_placeholder() {
+    fn catalog_synthetic_equipment_grant_trigger_renders_the_granter_name() {
         let (static_definitions, _modifications, unparsed_lines) = catalog_rules_text_abilities(
             "Equipped creature has \"Whenever this creature attacks, sacrifice Ember Golem.\"",
             "Ember Golem",
@@ -9048,8 +9083,132 @@ mod tests {
         });
         assert!(
             !leaked,
-            "the new scrub loops must remove the raw placeholder char from the \
+            "the render loops must remove the raw placeholder char from the \
              granted trigger's description, got {static_definitions:#?}"
+        );
+
+        // POSITIVE half: removal alone would also be satisfied by the old
+        // collapse to `~`. CR 201.5a requires the GRANTER's printed name.
+        assert!(
+            trigger
+                .description
+                .as_deref()
+                .is_some_and(|d| d.contains("Ember Golem")),
+            "CR 201.5a: the granted trigger's description must name the granting \
+             object, got {:?}",
+            trigger.description
+        );
+    }
+
+    /// CR 201.5a — corpus leak guard for the SECOND parse entry point.
+    ///
+    /// The card-level corpus guard lives in
+    /// `tests/integration/granted_ability_self_binding.rs` and runs over
+    /// `client/public/card-data.json`'s 16 class members. Rock is not in that
+    /// export (it is a predefined token, materialized through
+    /// `catalog_rules_text_abilities`), and that function is a private `fn`, so
+    /// this arm of the corpus property has to live here.
+    ///
+    /// `serde_json` rather than `format!("{:?}")` is deliberate: `Debug` escapes
+    /// the raw private-use char to the literal text `\u{e0002}`, so a `Debug`
+    /// search for the real character is always false and the guard would be
+    /// vacuous. `serde_json` emits it raw, at every depth.
+    ///
+    /// Revert-to-red: delete the two `render_*` loops at the end of
+    /// `catalog_rules_text_abilities` — the raw marker survives into the
+    /// serialized statics and `contains("Sacrifice Rock")` fails.
+    #[test]
+    fn catalog_rules_text_abilities_never_leaks_the_placeholder() {
+        let (static_definitions, modifications, unparsed_lines) = catalog_rules_text_abilities(
+            "Equipped creature has \"{1}, {T}, Sacrifice Rock: This creature deals 2 damage to any target.\"\nEquip {1}",
+            "Rock",
+        );
+        assert!(
+            unparsed_lines.is_empty(),
+            "Rock's rules text must fully parse, got unparsed: {unparsed_lines:?}"
+        );
+        let json = serde_json::to_string(&(&static_definitions, &modifications))
+            .expect("the parsed token abilities serialize");
+        // POSITIVE REACH-GUARD: the typed channel must have consumed the marker,
+        // or the negative below would pass on a parse that never masked at all.
+        assert!(
+            json.contains("GrantingObject"),
+            "reach-guard: the granter self-reference must reach the typed channel: {json}"
+        );
+        assert!(
+            !json.contains(crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER),
+            "no raw CR 201.5a marker may survive the token catalog parse entry point"
+        );
+        assert!(
+            json.contains("Sacrifice Rock"),
+            "CR 201.5a: the granted body must name the granting token: {json}"
+        );
+    }
+
+    /// CR 201.5a — the MEASURED BOUNDARY for this entry point's one un-rendered
+    /// output. `catalog_rules_text_abilities` renders the marker out of the
+    /// parsed statics' and modifications' display descriptions, but the third
+    /// value it returns — `unparsed_lines`, which becomes
+    /// `TokenAbilityMaterialization::unparsed_rules_text_lines` and feeds
+    /// coverage gap text — is taken VERBATIM from the SAME masked text and is
+    /// deliberately not rendered (it is a diagnostic surface, not a player-facing
+    /// one, and rendering it would hide the raw line the gap report is about).
+    ///
+    /// That is only safe if no catalog preset can put a marker there, and this
+    /// test is the MEASUREMENT of that, not a claim about it: it runs the real
+    /// entry point over every preset in `data/known-tokens.toml`. Result at the
+    /// time of writing: of 2,869 presets, exactly ONE ("Rock") plants a marker at
+    /// all — the masker only fires on a quoted granter self-reference in a
+    /// verb-object position — and both of Rock's lines parse, so its unparsed
+    /// vector is empty.
+    ///
+    /// The `masked` reach-guard is what keeps the negative honest: without it a
+    /// green would also be produced by a corpus (or a masker) that stopped
+    /// planting markers entirely, which is the vacuous pass this property is
+    /// most exposed to.
+    ///
+    /// Revert-to-red: add a preset whose rules text both masks and fails to
+    /// parse, or widen `GRANTER_SELF_REF_VERB_PREFIXES` so a preset masks in a
+    /// position no static/quoted-inner parser handles.
+    #[test]
+    fn no_catalog_preset_leaks_the_placeholder_into_unparsed_lines() {
+        use crate::parser::oracle_util::{normalize_card_name_refs, GRANTING_SELF_PLACEHOLDER};
+
+        let mut masked = Vec::new();
+        for preset in crate::game::token_presets::known_token_presets() {
+            let Some(rules_text) = preset.rules_text.as_deref().filter(|t| !t.is_empty()) else {
+                continue;
+            };
+            let name = preset.body.display_name.as_str();
+            // allow-noncombinator: marker presence check on an already-normalized
+            // display string; not parsing dispatch.
+            if normalize_card_name_refs(rules_text, name).contains(GRANTING_SELF_PLACEHOLDER) {
+                masked.push(name);
+            }
+            let (_statics, _modifications, unparsed_lines) =
+                catalog_rules_text_abilities(rules_text, name);
+            for line in &unparsed_lines {
+                assert!(
+                    // allow-noncombinator: marker leak check on a diagnostic
+                    // display line; not parsing dispatch.
+                    !line.contains(GRANTING_SELF_PLACEHOLDER),
+                    "CR 201.5a: preset `{name}` left a raw granter marker in an \
+                     UNPARSED rules-text line ({line:?}), which flows into \
+                     `unparsed_rules_text_lines` un-rendered. This axis is \
+                     documented as measured-unreachable in \
+                     `parser::oracle::render_granting_self_descriptions`' traversal \
+                     contract; that documentation is now false and the axis needs \
+                     a render pass or a scope decision."
+                );
+            }
+        }
+        // POSITIVE REACH-GUARD for the negative above.
+        assert_eq!(
+            masked,
+            vec!["Rock"],
+            "reach-guard: the token catalog's masked-preset set is what makes the \
+             un-rendered `unparsed_lines` axis measurably safe. If this changed, \
+             re-measure that axis rather than editing this expectation."
         );
     }
 
