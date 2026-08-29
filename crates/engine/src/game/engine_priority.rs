@@ -336,7 +336,9 @@ fn run_post_action_pipeline_from_with_policy(
                     events_before,
                     &consumed_trigger_events,
                 );
-                if sba_choice_requires_combined_trigger_batch(&state.waiting_for) {
+                let sba_choice_batch =
+                    sba_choice_requires_combined_trigger_batch(&state.waiting_for);
+                if sba_choice_batch {
                     triggers::collect_sba_choice_triggers_into_deferred(state, &sba_events);
                 } else {
                     triggers::collect_triggers_into_deferred(state, &sba_events);
@@ -344,7 +346,7 @@ fn run_post_action_pipeline_from_with_policy(
                 // Logical zone-change owners collect ordinary observers only.
                 // Delayed triggers remain entitled to the raw occurrences; the
                 // ordinary queued-context witness must not suppress them.
-                if sba_choice_requires_combined_trigger_batch(&state.waiting_for) {
+                if sba_choice_batch {
                     triggers::collect_sba_choice_delayed_triggers_into_deferred(
                         state,
                         &raw_sba_events,
@@ -452,7 +454,13 @@ fn run_post_action_pipeline_from_with_policy(
         && !state.deferred_triggers.is_empty()
     {
         if deferred_trigger_batch_was_sba_choice_parked && !delayed_trigger_events.is_empty() {
-            let pending = std::mem::take(&mut state.deferred_triggers);
+            // This is the one post-answer CR 603.3b ordering attempt owned by
+            // the completed SBA choice. Consuming the marker before dispatch
+            // ensures a trigger that pauses again re-parks as ordinary work.
+            // This branch intentionally combines the answer's delayed events
+            // before ordinary drain-policy routing; changing that order would
+            // split one SBA/answer trigger batch across two ordering windows.
+            let pending = triggers::take_sba_choice_trigger_batch(state);
             let outcome = triggers::process_collected_triggers_with_delayed_events(
                 state,
                 pending,
@@ -538,9 +546,10 @@ fn run_post_action_pipeline_from_with_policy(
     ))
 }
 
-/// CR 903.9a + CR 704.5j + CR 310.11: the complete set of player-choice
-/// pauses the SBA fixpoint itself opens. Only their parked trigger batches must
-/// merge with events emitted by the answer before CR 603.3b ordering.
+/// CR 903.9a + CR 704.5j + CR 310.11: SBA-owned commander, legend, and
+/// battle-protector choices park a trigger batch that must merge with answer
+/// events before CR 603.3b ordering. Replacement choices are instead owned by
+/// `pending_replacement`'s resolution path and must not join this batch.
 fn sba_choice_requires_combined_trigger_batch(waiting_for: &WaitingFor) -> bool {
     matches!(
         waiting_for,

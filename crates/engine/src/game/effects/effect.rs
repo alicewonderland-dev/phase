@@ -449,7 +449,7 @@ fn register_transient_effect(
     // TriggeringSource` (the GenericEffect `target` parameter); a SequentialSibling
     // continuous grant on a non-targeted trigger ("put a +1/+1 counter on it. It
     // gains haste until end of turn" — Surrak and Goreclaw, issue #2378) instead
-    // carries `affected: TriggeringSource` with `target: None`. Both name the
+    // carries `affected: TriggeringSource`. Both name the
     // triggering object directly, so when there is no chosen target to inherit
     // (`ability.targets.is_empty()`), resolve via `resolve_event_context_target`
     // here. We must NOT short-circuit when targets exist: `affected:

@@ -7348,6 +7348,19 @@ pub(crate) fn has_sba_choice_trigger_batch(state: &GameState) -> bool {
     })
 }
 
+/// Take the batch that an SBA-owned choice parked and consume its ownership.
+///
+/// The ownership exists only until the first post-answer CR 603.3b ordering
+/// attempt. If dispatch pauses again, its remainder is an ordinary deferred
+/// queue and must follow the regular drain policy on the next pipeline pass.
+pub(crate) fn take_sba_choice_trigger_batch(state: &mut GameState) -> Vec<PendingTriggerContext> {
+    let mut pending = std::mem::take(&mut state.deferred_triggers);
+    for context in &mut pending {
+        context.batch_origin = DeferredTriggerBatchOrigin::Ordinary;
+    }
+    pending
+}
+
 /// CR 603.2 + CR 603.3b: Park observer triggers emitted during a resolution-time
 /// player choice that pauses on another prompt before the action settles.
 /// Mirrors `batch_or_drain_observer_triggers`' B2 branch: events are queued in
