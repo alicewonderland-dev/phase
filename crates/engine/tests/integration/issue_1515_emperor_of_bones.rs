@@ -8,9 +8,10 @@ use engine::parser::oracle_effect::parse_effect_chain;
 use engine::types::ability::Duration;
 use engine::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, ChoiceType, ChosenAttribute,
-    ContinuousModification, ControllerRef, DelayedTriggerCondition, Effect, FilterProp,
-    QuantityExpr, QuantityRef, ReplacementDefinition, ResolvedAbility, StaticDefinition,
-    SubAbilityLink, TargetChoiceTiming, TargetFilter, TypeFilter, TypedFilter,
+    ContinuousModification, ControllerRef, DelayedTriggerCondition, Effect, EffectScope,
+    FilterProp, QuantityExpr, QuantityRef, ReplacementDefinition, ResolvedAbility,
+    StaticDefinition, SubAbilityLink, TapStateChange, TargetChoiceTiming, TargetFilter, TypeFilter,
+    TypedFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
@@ -527,6 +528,137 @@ fn empty_forward_result_preserves_amassed_army_generic_effect() {
         "the inner AmassedArmy application filter must override the outer SelfRef; \
          without an amassed Army, no transient may bind to the spell source"
     );
+}
+
+/// The `GenericEffect` continuation both positive pairings share: it declares
+/// `target: SelfRef` but binds through an inherited-reference `affected`, which
+/// `generic_effect_application_filter` gives precedence (CR 608.2c).
+fn self_ref_generic_grant(affected: TargetFilter) -> AbilityDefinition {
+    AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::GenericEffect {
+            static_abilities: vec![StaticDefinition::continuous()
+                .affected(affected)
+                .modifications(vec![ContinuousModification::AddKeyword {
+                    keyword: Keyword::Haste,
+                }])],
+            duration: Some(Duration::UntilEndOfTurn),
+            target: Some(TargetFilter::SelfRef),
+            end_cost: None,
+        },
+    )
+}
+
+/// Find the single Army token the `Effect::Amass` parent created (CR 701.47a).
+fn amassed_army_on_battlefield(state: &engine::types::game_state::GameState) -> ObjectId {
+    let armies: Vec<ObjectId> = state
+        .battlefield
+        .iter()
+        .copied()
+        .filter(|id| {
+            state.objects[id]
+                .card_types
+                .subtypes
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case("Army"))
+        })
+        .collect();
+    assert_eq!(armies.len(), 1, "amass must have produced exactly one Army");
+    armies[0]
+}
+
+/// Positive pairing for `empty_forward_result_preserves_parent_target_generic_effect`.
+///
+/// The negative case above only proves nothing bound to the spell. This one
+/// proves the `ParentTarget` binding path actually executes: a targeted parent
+/// (`SetTapState`) propagates its chosen creature into the continuation's
+/// `targets`, and the continuation must bind the transient to THAT creature.
+/// Reverting the shared-classifier fix pins it to the spell's own id instead,
+/// so the `SpecificObject` identity assertion — not just a count — fails.
+#[test]
+fn parent_target_generic_effect_binds_the_chosen_object_under_outer_self_ref() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let chosen = scenario.add_vanilla(P0, 2, 2);
+    let spell = scenario
+        .add_spell_to_hand(P0, "Parent Target Generic", false)
+        .with_ability_definition(
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::SetTapState {
+                    target: TargetFilter::Typed(TypedFilter {
+                        type_filters: vec![TypeFilter::Creature],
+                        controller: None,
+                        properties: vec![],
+                    }),
+                    scope: EffectScope::Single,
+                    state: TapStateChange::Tap,
+                },
+            )
+            .sub_ability(self_ref_generic_grant(TargetFilter::ParentTarget)),
+        )
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+
+    let outcome = runner.cast(spell).target_objects(&[chosen]).resolve();
+    let state = outcome.state();
+
+    assert_eq!(
+        state.transient_continuous_effects.len(),
+        1,
+        "the ParentTarget continuation must install exactly one transient"
+    );
+    assert_eq!(
+        state.transient_continuous_effects[0].affected,
+        TargetFilter::SpecificObject { id: chosen },
+        "the inner ParentTarget must bind the chosen creature, not the spell source \
+         ({chosen:?} expected, spell source is {spell:?})"
+    );
+    assert!(creature_has_haste_from_transient_effects(state, chosen));
+}
+
+/// Positive pairing for `empty_forward_result_preserves_amassed_army_generic_effect`.
+///
+/// CR 701.47c: "the amassed Army" names the creature amass chose. `Effect::Amass`
+/// stamps `amassed_army_object` recursively onto its chain, so the continuation
+/// must bind that Army rather than the spell that amassed it.
+#[test]
+fn amassed_army_generic_effect_binds_the_stamped_army_under_outer_self_ref() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let spell = scenario
+        .add_spell_to_hand(P0, "Amass Generic", false)
+        .with_ability_definition(
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Amass {
+                    subtype: "Zombie".to_string(),
+                    count: QuantityExpr::Fixed { value: 2 },
+                },
+            )
+            .sub_ability(self_ref_generic_grant(TargetFilter::AmassedArmy)),
+        )
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+
+    let outcome = runner.cast(spell).resolve();
+    let state = outcome.state();
+    let army = amassed_army_on_battlefield(state);
+
+    assert_eq!(
+        state.transient_continuous_effects.len(),
+        1,
+        "the AmassedArmy continuation must install exactly one transient"
+    );
+    assert_eq!(
+        state.transient_continuous_effects[0].affected,
+        TargetFilter::SpecificObject { id: army },
+        "the inner AmassedArmy must bind the stamped Army, not the spell source \
+         ({army:?} expected, spell source is {spell:?})"
+    );
+    assert!(creature_has_haste_from_transient_effects(state, army));
 }
 
 /// A mixed GenericEffect is retained after an empty forwarded move, but its
