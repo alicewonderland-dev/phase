@@ -13727,23 +13727,45 @@ fn effect_chain_depends_on_missing_forward_result(effect: &Effect) -> bool {
 /// which filter governs where a static's modifications land — never the outer
 /// `target` slot, because an inherited-reference `affected` overrides that slot.
 ///
-/// Only an effective `SelfRef` is dependent: it is the printed-name anaphor
-/// that, in a forward-result continuation, can only mean the object the
-/// preceding instruction moved. Every other effective filter is independent
-/// here — the resolution-local inherited references (`TriggeringSource`,
-/// `CostPaidObject`, `AmassedArmy`) bind from the ability's own event / cost /
-/// amass context, and a `ParentTarget` that finds no referent binds nothing at
-/// install time rather than falling back to the ability source (see the
-/// dedicated arms in `effect.rs::resolve_generic_static`). Pruning those would
-/// silently drop grants the game still owes.
+/// Dependency is decided by [`filter_requires_missing_forward_result`]. Every
+/// other effective filter is independent here — the resolution-local inherited
+/// references (`TriggeringSource`, `CostPaidObject`, `AmassedArmy`) bind from
+/// the ability's own event / cost / amass context, and a `ParentTarget` that
+/// finds no referent binds nothing at install time rather than falling back to
+/// the ability source (see the dedicated arms in
+/// `effect.rs::resolve_generic_static`). Pruning those would silently drop
+/// grants the game still owes.
 fn generic_static_depends_on_missing_forward_result(
     target: Option<&TargetFilter>,
     static_def: &StaticDefinition,
 ) -> bool {
-    matches!(
-        effect::generic_effect_application_filter(target, static_def.affected.as_ref()),
-        Some(TargetFilter::SelfRef)
-    )
+    effect::generic_effect_application_filter(target, static_def.affected.as_ref())
+        .is_some_and(filter_requires_missing_forward_result)
+}
+
+/// CR 608.2c: Does this application filter *require* the object the preceding
+/// forward-result instruction failed to produce?
+///
+/// `SelfRef` is the printed-name anaphor, which in a forward-result
+/// continuation can only mean that object. A conjunction inherits the
+/// dependency of any member: `And` is satisfied only when EVERY member matches,
+/// so a `SelfRef` member leaves the whole filter unsatisfiable without the
+/// forwarded object. Nesting falls out of the recursion.
+///
+/// Deliberately NOT extended to the other combinators:
+///   * `Or { [SelfRef, X] }` is still satisfiable through `X`, so it does not
+///     require the absent object;
+///   * `Not { SelfRef }` is satisfied by everything the anaphor is *not*, which
+///     is the opposite of requiring it.
+///
+/// Recursing into either would prune grants the game still owes — the same
+/// over-pruning this function's `_ => false` arm exists to prevent.
+fn filter_requires_missing_forward_result(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::SelfRef => true,
+        TargetFilter::And { filters } => filters.iter().any(filter_requires_missing_forward_result),
+        _ => false,
+    }
 }
 
 /// A GenericEffect depends on the forwarded object when ANY static it installs

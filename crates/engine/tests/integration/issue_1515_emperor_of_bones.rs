@@ -531,6 +531,91 @@ fn empty_forward_result_preserves_amassed_army_generic_effect() {
     );
 }
 
+/// Creature filter used as the innocuous second member of the combinator cases
+/// below — present only so the combinator has something to combine `SelfRef`
+/// with.
+fn any_creature_filter() -> TargetFilter {
+    TargetFilter::Typed(TypedFilter {
+        type_filters: vec![TypeFilter::Creature],
+        controller: None,
+        properties: vec![],
+    })
+}
+
+/// CR 608.2c: `And` is satisfied only when EVERY member matches, so an effective
+/// `And { [SelfRef, ...] }` still names the object the preceding instruction
+/// failed to produce. It must prune exactly like a bare `SelfRef`: the grant is
+/// dropped, the dependent continuation is skipped, and only the independent
+/// sequential sibling runs.
+#[test]
+fn empty_forward_result_prunes_conjunctive_self_ref_static() {
+    let state = resolve_empty_forward_result_generic_spell(
+        vec![StaticDefinition::continuous()
+            .affected(TargetFilter::And {
+                filters: vec![TargetFilter::SelfRef, any_creature_filter()],
+            })
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Haste,
+            }])],
+        None,
+    );
+    assert_eq!(
+        state.players[P0.0 as usize].hand.len(),
+        1,
+        "the independent sequential sibling must still run"
+    );
+    assert_eq!(
+        state.players[P0.0 as usize].life, 20,
+        "a conjunctive SelfRef static cannot be satisfied without the forwarded \
+         object, so its dependent continuation must be skipped"
+    );
+    assert!(
+        state.transient_continuous_effects.is_empty(),
+        "no transient may bind for a static that requires the absent object"
+    );
+}
+
+/// The other half of the conjunctive rule: `Or` and `Not` must NOT be pruned.
+/// `Or { [SelfRef, X] }` is still satisfiable through `X`, and `Not { SelfRef }`
+/// is satisfied by everything the anaphor is not — neither requires the absent
+/// object, so pruning either would drop a grant the game still owes.
+///
+/// This guards against a later over-broadening of
+/// `filter_requires_missing_forward_result` into the remaining combinators.
+#[test]
+fn empty_forward_result_keeps_disjunctive_and_negated_self_ref_statics() {
+    let cases = vec![
+        (
+            "or",
+            TargetFilter::Or {
+                filters: vec![TargetFilter::SelfRef, any_creature_filter()],
+            },
+        ),
+        (
+            "not",
+            TargetFilter::Not {
+                filter: Box::new(TargetFilter::SelfRef),
+            },
+        ),
+    ];
+
+    for (label, affected) in cases {
+        let state = resolve_empty_forward_result_generic_spell(
+            vec![StaticDefinition::continuous()
+                .affected(affected)
+                .modifications(vec![ContinuousModification::AddKeyword {
+                    keyword: Keyword::Haste,
+                }])],
+            None,
+        );
+        assert_eq!(
+            state.players[P0.0 as usize].life, 21,
+            "{label} does not require the forwarded object, so the node and its \
+             dependent continuation must survive"
+        );
+    }
+}
+
 /// The arm where the retain pass and the dependency check must agree: an outer
 /// `ParentTarget` node carrying BOTH a dependent `SelfRef` static and an
 /// independent `TriggeringSource` one. The pruner must drop only the first and
