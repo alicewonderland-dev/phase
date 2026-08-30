@@ -15,8 +15,8 @@ use crate::types::ability::{
     EffectKind, EffectOutcomeSignal, EffectResolutionResult, EffectScope, FilterProp,
     ManaProduction, OpponentMayScope, PlayerFilter, PlayerScope, QuantityExpr, QuantityRef,
     RepeatContinuation, ResolvedAbility, RevealUntilDisposition, SacrificeCost,
-    SacrificeRequirement, SharedQuality, SharedQualityRelation, SiblingCondition, SubAbilityLink,
-    TapStateChange, TargetChoiceTiming, TargetFilter, TargetRef, ThisWayCause,
+    SacrificeRequirement, SharedQuality, SharedQualityRelation, SiblingCondition, StaticDefinition,
+    SubAbilityLink, TapStateChange, TargetChoiceTiming, TargetFilter, TargetRef, ThisWayCause,
 };
 #[cfg(test)]
 use crate::types::ability::{AttackScope, AttackSubject};
@@ -13702,8 +13702,19 @@ fn effect_chain_refs_parent_target(effect: &Effect) -> bool {
 }
 
 fn effect_chain_depends_on_missing_forward_result(effect: &Effect) -> bool {
+    // CR 608.2c: A `GenericEffect`'s dependency is decided PER STATIC by
+    // `generic_effect_depends_on_missing_forward_result`, which routes through
+    // `generic_effect_application_filter`. Consulting the raw outer `target`
+    // via `effect_refs_parent_target` here as well would re-introduce the
+    // mismatch this function exists to avoid: an outer `ParentTarget` paired
+    // with an `affected: TriggeringSource` static is independent of the
+    // forwarded move, but the raw check sees only the outer slot and would
+    // discard the whole node — including the static
+    // `without_missing_forward_result_dependencies` just deliberately retained.
+    if matches!(effect, Effect::GenericEffect { .. }) {
+        return generic_effect_depends_on_missing_forward_result(effect);
+    }
     effect_refs_parent_target(effect)
-        || generic_effect_depends_on_missing_forward_result(effect)
         || matches!(
             effect,
             Effect::CreateDelayedTrigger { effect: definition, .. }
@@ -13711,10 +13722,33 @@ fn effect_chain_depends_on_missing_forward_result(effect: &Effect) -> bool {
         )
 }
 
-/// A GenericEffect contains a forwarded-object dependency when any static it
-/// installs is effectively bound to SelfRef. An inner `affected` inherited
-/// reference wins over the outer target descriptor, so use the shared
-/// application-filter classifier instead of examining `target` directly.
+/// CR 608.2c: Does this ONE `GenericEffect` static require the absent forwarded
+/// object? Ask `generic_effect_application_filter` — the shared authority for
+/// which filter governs where a static's modifications land — never the outer
+/// `target` slot, because an inherited-reference `affected` overrides that slot.
+///
+/// Only an effective `SelfRef` is dependent: it is the printed-name anaphor
+/// that, in a forward-result continuation, can only mean the object the
+/// preceding instruction moved. Every other effective filter is independent
+/// here — the resolution-local inherited references (`TriggeringSource`,
+/// `CostPaidObject`, `AmassedArmy`) bind from the ability's own event / cost /
+/// amass context, and a `ParentTarget` that finds no referent binds nothing at
+/// install time rather than falling back to the ability source (see the
+/// dedicated arms in `effect.rs::resolve_generic_static`). Pruning those would
+/// silently drop grants the game still owes.
+fn generic_static_depends_on_missing_forward_result(
+    target: Option<&TargetFilter>,
+    static_def: &StaticDefinition,
+) -> bool {
+    matches!(
+        effect::generic_effect_application_filter(target, static_def.affected.as_ref()),
+        Some(TargetFilter::SelfRef)
+    )
+}
+
+/// A GenericEffect depends on the forwarded object when ANY static it installs
+/// does — that gates entry into `without_missing_forward_result_dependencies`,
+/// which then prunes exactly the dependent statics and keeps the rest.
 fn generic_effect_depends_on_missing_forward_result(effect: &Effect) -> bool {
     let Effect::GenericEffect {
         static_abilities,
@@ -13726,13 +13760,7 @@ fn generic_effect_depends_on_missing_forward_result(effect: &Effect) -> bool {
     };
 
     static_abilities.iter().any(|static_def| {
-        matches!(
-            effect::generic_effect_application_filter(
-                target.as_ref(),
-                static_def.affected.as_ref(),
-            ),
-            Some(TargetFilter::SelfRef)
-        )
+        generic_static_depends_on_missing_forward_result(target.as_ref(), static_def)
     })
 }
 
@@ -13752,13 +13780,7 @@ fn without_missing_forward_result_dependencies(
     } = &mut remaining.effect
     {
         static_abilities.retain(|static_def| {
-            !matches!(
-                effect::generic_effect_application_filter(
-                    target.as_ref(),
-                    static_def.affected.as_ref(),
-                ),
-                Some(TargetFilter::SelfRef)
-            )
+            !generic_static_depends_on_missing_forward_result(target.as_ref(), static_def)
         });
         if static_abilities.is_empty() {
             return first_independent_forward_result_sibling(ability.sub_ability.as_deref());

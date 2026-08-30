@@ -15,6 +15,7 @@ use engine::types::ability::{
 };
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
+use engine::types::events::GameEvent;
 use engine::types::game_state::{CastPaymentMode, ExileLink, ExileLinkKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
@@ -530,6 +531,150 @@ fn empty_forward_result_preserves_amassed_army_generic_effect() {
     );
 }
 
+/// The arm where the retain pass and the dependency check must agree: an outer
+/// `ParentTarget` node carrying BOTH a dependent `SelfRef` static and an
+/// independent `TriggeringSource` one. The pruner must drop only the first and
+/// keep the node alive for the second, which then binds the event-context object.
+///
+/// This is the case that would regress if the two predicates ever stopped
+/// sharing `generic_static_depends_on_missing_forward_result`.
+#[test]
+fn empty_forward_result_prunes_only_the_dependent_static_under_outer_parent_target() {
+    let (state, trigger_source) = resolve_empty_forward_result_with_trigger_source(
+        vec![
+            StaticDefinition::continuous()
+                .affected(TargetFilter::SelfRef)
+                .modifications(vec![ContinuousModification::AddKeyword {
+                    keyword: Keyword::Vigilance,
+                }]),
+            StaticDefinition::continuous()
+                .affected(TargetFilter::TriggeringSource)
+                .modifications(vec![ContinuousModification::AddKeyword {
+                    keyword: Keyword::Haste,
+                }]),
+        ],
+        Some(TargetFilter::ParentTarget),
+    );
+    assert_eq!(
+        state.transient_continuous_effects.len(),
+        1,
+        "exactly the independent TriggeringSource static may survive"
+    );
+    assert_eq!(
+        state.transient_continuous_effects[0].affected,
+        TargetFilter::SpecificObject { id: trigger_source },
+        "the surviving static must bind the triggering source"
+    );
+    assert!(
+        state.transient_continuous_effects[0]
+            .modifications
+            .iter()
+            .any(|m| matches!(
+                m,
+                ContinuousModification::AddKeyword {
+                    keyword: Keyword::Haste
+                }
+            )),
+        "the SelfRef static (vigilance) must have been pruned, not the TriggeringSource one"
+    );
+}
+
+/// Same empty-forward-result spell as `resolve_empty_forward_result_generic_spell`,
+/// but with a real event-context source staged so an `affected: TriggeringSource`
+/// static has a referent to bind. `PermanentUntapped` is the smallest event
+/// `targeting::extract_source_from_event` accepts. Returns the resolved state
+/// and the staged source.
+fn resolve_empty_forward_result_with_trigger_source(
+    static_abilities: Vec<StaticDefinition>,
+    target: Option<TargetFilter>,
+) -> (engine::types::game_state::GameState, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(P0, &["independent sibling draw"]);
+    let trigger_source = scenario.add_vanilla(P0, 2, 2);
+    let spell = scenario
+        .add_spell_to_hand(P0, "Empty Forward Generic", false)
+        .with_ability_definition(empty_forward_result_generic_spell(static_abilities, target))
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    runner.state_mut().current_trigger_event = Some(GameEvent::PermanentUntapped {
+        object_id: trigger_source,
+    });
+    runner
+        .act(GameAction::CastSpell {
+            object_id: spell,
+            card_id: runner.state().objects[&spell].card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("synthetic spell announcement must be accepted");
+    runner.advance_until_stack_empty();
+    (runner.state().clone(), trigger_source)
+}
+
+/// CR 608.2c: an outer `target: ParentTarget` must not condemn a static whose
+/// effective application filter is the resolution-local `TriggeringSource`.
+/// `generic_effect_application_filter` makes the inner `affected` the authority,
+/// so the static is independent of the absent forwarded object and the node —
+/// and its dependent continuation — must survive the pruner.
+///
+/// Pre-fix, `effect_chain_depends_on_missing_forward_result` re-read the raw
+/// outer slot after `without_missing_forward_result_dependencies` had already
+/// retained this static, and discarded the whole node: life stopped at 20.
+#[test]
+fn empty_forward_result_keeps_triggering_source_static_under_outer_parent_target() {
+    let state = resolve_empty_forward_result_generic_spell(
+        vec![StaticDefinition::continuous()
+            .affected(TargetFilter::TriggeringSource)
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Haste,
+            }])],
+        Some(TargetFilter::ParentTarget),
+    );
+    assert_eq!(state.players[P0.0 as usize].hand.len(), 1);
+    assert_eq!(
+        state.players[P0.0 as usize].life, 21,
+        "the retained TriggeringSource static is independent of the missing forward \
+         result, so the node and its dependent continuation must both survive"
+    );
+}
+
+/// The positive half: with a real event context staged, the static the pruner
+/// retained must actually install its transient, bound to the triggering source.
+/// Asserting `SpecificObject` identity means a regression that drops the static
+/// fails on a MISSING transient and one that mis-binds fails on the WRONG object.
+#[test]
+fn empty_forward_result_binds_retained_triggering_source_static_under_outer_parent_target() {
+    let (state, trigger_source) = resolve_empty_forward_result_with_trigger_source(
+        vec![StaticDefinition::continuous()
+            .affected(TargetFilter::TriggeringSource)
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Haste,
+            }])],
+        Some(TargetFilter::ParentTarget),
+    );
+    assert_eq!(
+        state.transient_continuous_effects.len(),
+        1,
+        "the retained TriggeringSource static must install its transient; the pruner \
+         must not have discarded the node that carries it"
+    );
+    assert_eq!(
+        state.transient_continuous_effects[0].affected,
+        TargetFilter::SpecificObject { id: trigger_source },
+        "the event-context transient must bind the triggering source"
+    );
+    assert_eq!(
+        state.players[P0.0 as usize].life, 21,
+        "the node carrying the independent static must survive the pruner"
+    );
+    assert!(creature_has_haste_from_transient_effects(
+        &state,
+        trigger_source
+    ));
+}
+
 /// The `GenericEffect` continuation both positive pairings share: it declares
 /// `target: SelfRef` but binds through an inherited-reference `affected`, which
 /// `generic_effect_application_filter` gives precedence (CR 608.2c).
@@ -720,6 +865,14 @@ fn empty_forward_result_preserves_non_self_ref_generic_effect_forms() {
         ),
         ("empty", vec![], Some(TargetFilter::SelfRef)),
         ("none", vec![StaticDefinition::continuous()], None),
+        // A statics-less node has nothing that can need the forwarded object,
+        // whatever the outer descriptor says, so it stays executable exactly
+        // like the `SelfRef` row above.
+        (
+            "empty-outer-parent-target",
+            vec![],
+            Some(TargetFilter::ParentTarget),
+        ),
     ];
 
     for (label, static_abilities, target) in cases {
