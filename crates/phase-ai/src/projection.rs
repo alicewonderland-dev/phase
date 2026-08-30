@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 
 use engine::ai_support::{
-    classify_payment_continuation, legal_actions, witness_payment_continuation,
-    PaymentContinuationState,
+    classify_payment_continuation, legal_actions, witness_payment_continuations,
+    PaymentContinuationBatchStatus, PaymentContinuationState,
 };
 use engine::game::combat::AttackTarget;
 use engine::game::engine::{apply_for_simulation, EngineError};
@@ -48,6 +48,7 @@ pub enum BailReason {
     MulliganOrSideboardEncountered,
     NoLegalAction { waiting_for: String },
     NoLegalManaPayment,
+    IncompleteManaPaymentWitness,
     EngineRejected(EngineError),
 }
 
@@ -405,11 +406,29 @@ fn resolve_choice(
         PaymentContinuationState::Affiliated(_) => {
             let mut actions = actions;
             actions.sort_by(|left, right| left.cmp_stable(right));
+            let batch = witness_payment_continuations(state, &actions);
+            let status = batch.status;
             let accepted = actions
                 .into_iter()
-                .find_map(|action| witness_payment_continuation(state, &action))
-                .ok_or(BailReason::NoLegalManaPayment)?;
-            return Ok((acting, accepted.action, true, Some(accepted.state)));
+                .zip(batch.successors)
+                .find_map(|(action, successor)| successor.map(|successor| (action, successor)));
+            let accepted = match (status, accepted) {
+                (_, Some(accepted)) => accepted,
+                (PaymentContinuationBatchStatus::Complete, None) => {
+                    return Err(BailReason::NoLegalManaPayment);
+                }
+                (PaymentContinuationBatchStatus::Indeterminate(_), None) => {
+                    return Err(BailReason::IncompleteManaPaymentWitness);
+                }
+                (
+                    PaymentContinuationBatchStatus::NotAffiliated
+                    | PaymentContinuationBatchStatus::UnsupportedAffiliated(_),
+                    None,
+                ) => {
+                    return Err(BailReason::NoLegalManaPayment);
+                }
+            };
+            return Ok((acting, accepted.0, true, Some(accepted.1.state)));
         }
     }
 
@@ -1539,7 +1558,7 @@ mod tests {
                     "an affiliated payment window must return a witnessed successor, got {action:?}"
                 );
             }
-            Err(BailReason::NoLegalManaPayment) => {}
+            Err(BailReason::NoLegalManaPayment | BailReason::IncompleteManaPaymentWitness) => {}
             other => panic!("expected the payment-witness branch, got {other:?}"),
         }
     }
