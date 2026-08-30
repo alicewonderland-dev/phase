@@ -135,6 +135,12 @@ fn run_post_action_pipeline_from_with_policy(
     // triggers.
     let deferred_trigger_batch_was_sba_choice_parked =
         triggers::has_sba_choice_trigger_batch(state);
+    // CR 603.3b: the queue boundary between contexts that predate this pass and
+    // the ones its own collectors are about to append. `take_sba_choice_trigger_batch`
+    // needs it because an answer-generated trigger is collected as `Ordinary`
+    // too — origin alone cannot tell it apart from a construction tail that was
+    // already queued when the choice opened.
+    let deferred_triggers_before_answer = state.deferred_triggers.len();
     let mut consumed_trigger_events =
         std::mem::take(&mut state.consumed_before_priority_trigger_events);
     let mut delayed_trigger_events = Vec::new();
@@ -460,7 +466,13 @@ fn run_post_action_pipeline_from_with_policy(
             // This branch intentionally combines the answer's delayed events
             // before ordinary drain-policy routing; changing that order would
             // split one SBA/answer trigger batch across two ordering windows.
-            let pending = triggers::take_sba_choice_trigger_batch(state);
+            // The converse also has to hold: only the SBA-marked partition may
+            // join those delayed events. `take_sba_choice_trigger_batch` leaves
+            // every ordinary context queued for the drain below, so a
+            // construction tail sitting beside the batch is never merged into
+            // the answer's ordering window.
+            let pending =
+                triggers::take_sba_choice_trigger_batch(state, deferred_triggers_before_answer);
             let outcome = triggers::process_collected_triggers_with_delayed_events(
                 state,
                 pending,
@@ -469,6 +481,21 @@ fn run_post_action_pipeline_from_with_policy(
             );
             if let Some(wf) = outcome.prompt {
                 state.waiting_for = wf;
+            }
+            // CR 603.3b: `take_sba_choice_trigger_batch` partitions, so any
+            // ordinary context queued beside the SBA batch is still here. It
+            // belongs to its own ordering window, not the answer's, but it must
+            // not be stranded either — hand it to the regular drain, which
+            // self-gates on `can_drain_deferred_triggers` and simply declines
+            // when this pass is not an eligible drain point.
+            if matches!(state.waiting_for, WaitingFor::Priority { .. })
+                && !state.deferred_triggers.is_empty()
+            {
+                if let Some(wf) =
+                    triggers::drain_deferred_trigger_queue_with_policy(state, events, drain_policy)
+                {
+                    state.waiting_for = wf;
+                }
             }
         } else if let Some(wf) =
             triggers::drain_deferred_trigger_queue_with_policy(state, events, drain_policy)
