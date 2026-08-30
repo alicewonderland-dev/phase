@@ -182,6 +182,35 @@ impl<'a> TextPair<'a> {
         })
     }
 
+    /// CR 604.1: split around `sep` only when the split point sits OUTSIDE a
+    /// quoted granted ability. An ability written in quotation marks is a
+    /// separate static whose own gate belongs to IT, not to the clause granting
+    /// it (Ancestral Katana: `gets +2/+2 and has "This creature has first strike
+    /// as long as it's attacking."` — the `as long as` gates the granted first
+    /// strike, not the +2/+2). A body with an EVEN number of double quotes ends
+    /// outside any "…", so the split point is safe; an odd count means the
+    /// separator was found inside a quoted region and the split must be refused.
+    ///
+    /// INHERITS [`Self::split_around`]'s FIRST-OCCURRENCE semantics: an
+    /// odd-quote body refuses the split outright rather than scanning on to a
+    /// later separator that may lie outside the quotes
+    /// (`has "X as long as Y" as long as Z`). No corpus line has that shape
+    /// today. Measured over the distinct oracle lines in MTGJSON AtomicCards:
+    /// 7 lines have an odd-quote FIRST `" as long as "` and 24 have an odd-quote
+    /// first `" unless "`, and for BOTH separators ZERO of those lines carry a
+    /// LATER outside-quotes occurrence — which is the claim that actually
+    /// matters, since it is what makes the first-occurrence refusal lossless.
+    /// Both incumbent guards already
+    /// behave this way, so this is a documented property rather than a
+    /// deviation.
+    ///
+    /// SINGLE AUTHORITY for that rule. Callers must not re-derive the quote
+    /// count.
+    pub(crate) fn split_around_outside_quotes(&self, sep: &str) -> Option<(Self, Self)> {
+        self.split_around(sep)
+            .filter(|(body, _)| body.original.chars().filter(|&c| c == '"').count() % 2 == 0)
+    }
+
     /// Find last `needle` in lowered text, return `(before, after)` excluding needle.
     pub fn rsplit_around(&self, needle: &str) -> Option<(Self, Self)> {
         self.lower.rfind(needle).map(|pos| {
@@ -2687,6 +2716,62 @@ mod tests {
     use super::*;
     use crate::types::mana::ManaCostShard;
     use nom::Parser;
+
+    fn tp(text: &str) -> (String, String) {
+        (text.to_string(), text.to_lowercase())
+    }
+
+    /// CR 604.1: the building block, exercised across its documented contract
+    /// rather than through any one card. An EVEN quote count before the
+    /// separator means the split point is outside a quoted granted ability and
+    /// the split is safe; an ODD count means the separator was found inside
+    /// `"…"` and the split must be refused, so the quoted ability keeps its own
+    /// gate instead of the gate being hoisted onto the granting clause.
+    #[test]
+    fn split_around_outside_quotes_refuses_separator_inside_a_quoted_ability() {
+        // Zero quotes before the separator — plain conditional static, splits.
+        let (o, l) = tp("this creature gets +1/+1 as long as you control a Swamp");
+        let (body, cond) = TextPair::new(&o, &l)
+            .split_around_outside_quotes(" as long as ")
+            .expect("an unquoted gate must split");
+        assert_eq!(body.original, "this creature gets +1/+1");
+        assert_eq!(cond.original, "you control a Swamp");
+
+        // ONE quote before the separator — the separator is inside the quoted
+        // granted ability (the Ancestral Katana / Giant's Amulet shape). Refuse:
+        // splitting here would drop the granted ability and hoist its gate onto
+        // the unconditional buff.
+        let (o, l) =
+            tp("gets +2/+2 and has \"this creature has first strike as long as it's attacking.\"");
+        assert!(
+            TextPair::new(&o, &l)
+                .split_around_outside_quotes(" as long as ")
+                .is_none(),
+            "a separator inside a quoted granted ability must not split"
+        );
+
+        // TWO quotes before the separator — the quoted region CLOSED before the
+        // separator, so the gate belongs to the granting clause. Splits.
+        let (o, l) =
+            tp("creatures you control have \"first strike\" as long as you control a Swamp");
+        let (body, cond) = TextPair::new(&o, &l)
+            .split_around_outside_quotes(" as long as ")
+            .expect("a closed quoted region must not block a later outside split");
+        assert_eq!(body.original, "creatures you control have \"first strike\"");
+        assert_eq!(cond.original, "you control a Swamp");
+
+        // Documented FIRST-OCCURRENCE property: an odd-quote body refuses
+        // outright rather than scanning on to a later outside-quotes separator.
+        // No corpus line has this shape; pinning it makes the deviation
+        // deliberate rather than accidental if one ever appears.
+        let (o, l) = tp("has \"x as long as y\" as long as you control a Swamp");
+        assert!(
+            TextPair::new(&o, &l)
+                .split_around_outside_quotes(" as long as ")
+                .is_none(),
+            "first-occurrence semantics: refuse, do not scan on to the later separator"
+        );
+    }
 
     fn parse_every_creature_type_prefix(input: &str) -> OracleResult<'_, ()> {
         let (input, _) = tag("creatures you control are").parse(input)?;

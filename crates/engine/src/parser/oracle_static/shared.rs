@@ -1,5 +1,6 @@
 // CR 604 / CR 613 — shared static parser infrastructure.
 
+use super::anthem::rewrite_self_pronoun_subject;
 #[allow(unused_imports)]
 use super::prelude::*;
 #[allow(unused_imports)]
@@ -3335,11 +3336,94 @@ pub(crate) fn rebind_source_object_quantity_ref_to_recipient(qty: QuantityRef) -
     }
 }
 
+/// CR 604.1 + CR 611.3a: resolve a static ability's gate-condition text against
+/// the static's own affected set.
+///
+/// CR 611.3a — a continuous effect from a static ability isn't "locked in"; it
+/// applies at any moment to whatever its text indicates. WHICH object its gate's
+/// anaphoric "it" indicates is fixed by the static's subject: in a self-modifying
+/// static (`TargetFilter::SelfRef`) "it" names the source permanent, so
+/// `it's <state>` is normalized to `~ is <state>` (CR 301.5a "equipped creature";
+/// CR 303.4b "enchanted"). In an attached-subject static ("Enchanted creature has shroud
+/// as long as it's untapped" — Spectral Cloak) "it" names the enchanted/equipped
+/// RECIPIENT and is left for the recipient grammar; binding it to the
+/// Aura/Equipment would gate on a permanent that is never itself tapped or
+/// attacking.
+///
+/// `affected` is `Option` because `StaticDefinition::affected` is: a static with
+/// no affected set (`MaxUntapPerType`) is categorically not SelfRef and must not
+/// be coerced into a literal it does not carry.
+///
+/// Authority for that binding decision within the three static-gate helpers
+/// `parse_unless_static_condition`, `parse_as_long_as_static_condition` and
+/// `parse_if_static_condition`: those route through here and no call site
+/// re-decides it. Replaces the ternary formerly duplicated in
+/// `parse_continuous_gets_has` (anthem.rs, both the as-long-as and unless arms).
+///
+/// The claim is deliberately NOT "every affected-bearing static gate", and NOT a
+/// complete enumeration of the arms that fall outside it. Review found three
+/// that build a SelfRef static and parse its gate with a bare
+/// `parse_static_condition`, deciding the binding by omission — `evasion.rs`'s
+/// `CanAttackWithDefender` subject arm, and `dispatch.rs`'s
+/// `~ has <kw> as long as <cond>` and self-referential type-removal branches.
+/// A proximity scan (a `SelfRef` assignment within ~45 lines of a
+/// `parse_static_condition` call) flags substantially more than three, but that
+/// instrument over-reports across sibling branches, so neither three nor its own
+/// figure is a defensible count. THE COMPLETE SET IS UNMEASURED, as is whether
+/// any such arm is REACHABLE with a pronoun gate. Named here so the next change
+/// starts from a known-incomplete list it can extend, rather than from a
+/// universal that is false.
+///
+/// PRE-REWRITING CALLERS ARE ENUMERATED, not permitted by predicate.
+/// `parse_max_untap_per_type_static` (dispatch.rs) is the ONLY caller allowed to
+/// call `rewrite_self_pronoun_subject` before/instead of routing through here,
+/// and it always applies the rewrite. That is not an oversight and must not be
+/// "fixed" by routing it through this helper. The two are reconciled by scope,
+/// not precedence: this helper reads binding off `affected`, and
+/// `MaxUntapPerType` never sets `affected` (`StaticDefinition::new` defaults it
+/// to `None`), so the helper correctly declines — while that same structural
+/// fact, not any rule, is why the static has no attached-subject variant and why
+/// its gate is always a state check on the cap's own source.
+/// Adding a second pre-rewriting caller requires re-running the census of
+/// SelfRef-affected statics first. These are the only two production callers of
+/// `rewrite_self_pronoun_subject`.
+///
+/// NORMALIZATION IS PART OF THE CONTRACT, not the caller's job.
+/// `rewrite_self_pronoun_subject` matches an EXACT closed list, so a trailing
+/// sentence period defeats it ("enchanted." is not "enchanted").
+/// `parse_as_long_as_static_condition` does not pre-strip (its two siblings do),
+/// so the period must be removed here, before the rewrite — not left to
+/// `parse_static_condition`, which strips only after the rewrite has already run.
+///
+/// NOTE: the binding MUST stay context-gated here rather than being pushed into
+/// `oracle_nom::condition` as a blanket `it's` subject arm — bare "it's" is
+/// target-anaphoric in spell bodies (Awaken the Sleeper), and a blanket arm would
+/// mis-bind every attached-subject static. See
+/// `parse_contraction_source_state_condition`.
+pub(crate) fn parse_affected_scoped_static_condition(
+    text: &str,
+    affected: Option<&TargetFilter>,
+) -> Option<StaticCondition> {
+    let text = text.trim().trim_end_matches('.');
+    if matches!(affected, Some(TargetFilter::SelfRef)) {
+        parse_static_condition(&rewrite_self_pronoun_subject(text))
+    } else {
+        parse_static_condition(text)
+    }
+}
+
 /// Parse the trailing " unless [condition]" clause of a combat-restriction
 /// static. Delegates `Not`-wrapping (with the `UnlessPay` raw-passthrough
 /// exception) to the shared `parse_unless_condition` combinator so the static
 /// layer and the `parse_condition` "unless " dispatch share one polarity rule.
-pub(crate) fn parse_unless_static_condition(tp: &TextPair<'_>) -> Option<StaticCondition> {
+///
+/// `affected` is the host static's affected set, threaded to
+/// `parse_affected_scoped_static_condition` so the gate's anaphoric "it" binds
+/// to the source only for a SelfRef static (CR 611.3a).
+pub(crate) fn parse_unless_static_condition(
+    tp: &TextPair<'_>,
+    affected: Option<&TargetFilter>,
+) -> Option<StaticCondition> {
     let (_, unless_text) = tp.split_around(" unless ")?;
     let original = unless_text.original.trim().trim_end_matches('.');
     let lower = original.to_lowercase();
@@ -3350,7 +3434,7 @@ pub(crate) fn parse_unless_static_condition(tp: &TextPair<'_>) -> Option<StaticC
     // <condition> is false — fall back to the shared static-condition parser and
     // negate, so a recognized inner condition (e.g. Heroic Defiance's most-common-
     // color check) gates the grant instead of being swallowed as Unrecognized.
-    if let Some(condition) = parse_static_condition(original) {
+    if let Some(condition) = parse_affected_scoped_static_condition(original, affected) {
         return Some(StaticCondition::Not {
             condition: Box::new(condition),
         });
@@ -3618,11 +3702,14 @@ pub(crate) fn split_trailing_gate_condition_with_body<'a>(
 /// combat-restriction static ("~ can't attack if defending player controls an
 /// untapped land"; "~ can't block if you control an untapped land"). Mirrors
 /// `parse_unless_static_condition`; delegates the condition body to
-/// `parse_static_condition` → `parse_inner_condition` (the single authority
-/// for game-state conditions).
-pub(crate) fn parse_if_static_condition(tp: &TextPair<'_>) -> Option<StaticCondition> {
+/// `parse_affected_scoped_static_condition` → `parse_static_condition` →
+/// `parse_inner_condition` (the single authority for game-state conditions).
+pub(crate) fn parse_if_static_condition(
+    tp: &TextPair<'_>,
+    affected: Option<&TargetFilter>,
+) -> Option<StaticCondition> {
     let condition_text = split_trailing_if_condition_tp(tp)?;
-    parse_static_condition(condition_text.trim_end_matches('.'))
+    parse_affected_scoped_static_condition(condition_text, affected)
 }
 
 /// CR 611.3a: Parse the trailing " as long as [condition]" clause of a
@@ -3630,12 +3717,16 @@ pub(crate) fn parse_if_static_condition(tp: &TextPair<'_>) -> Option<StaticCondi
 /// counter on it" — Seer of the Bright Side). "As long as" and "if" both express
 /// a continuous game-state gate on a static ability (CR 611.3a), so this mirrors
 /// [`parse_if_static_condition`] exactly, delegating the condition body to
-/// `parse_static_condition` → `parse_inner_condition` (the single authority for
+/// `parse_affected_scoped_static_condition` → `parse_static_condition` →
+/// `parse_inner_condition` (the single authority for
 /// game-state conditions). Restriction arms peel "unless"/"if" but historically
 /// dropped the "as long as" rider on their SelfRef restriction, enforcing it
 /// unconditionally; this closes that keyword gap without touching the shared
 /// condition grammar.
-pub(crate) fn parse_as_long_as_static_condition(tp: &TextPair<'_>) -> Option<StaticCondition> {
+pub(crate) fn parse_as_long_as_static_condition(
+    tp: &TextPair<'_>,
+    affected: Option<&TargetFilter>,
+) -> Option<StaticCondition> {
     // CR 611.3a vs duration seam: "for as long as" is effect-duration/provenance
     // text (`Duration::ForAsLongAs` — Promise of Loyalty: "... can't attack you
     // or planeswalkers you control for as long as it has a vow counter on it"),
@@ -3647,7 +3738,7 @@ pub(crate) fn parse_as_long_as_static_condition(tp: &TextPair<'_>) -> Option<Sta
         return None;
     }
     let (_, as_long_as_text) = tp.split_around(" as long as ")?;
-    parse_static_condition(as_long_as_text.original)
+    parse_affected_scoped_static_condition(as_long_as_text.original, affected)
 }
 
 /// Result of the combat-tax nom parse.

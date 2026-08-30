@@ -1056,6 +1056,33 @@ pub fn apply_interaction_with_rejection(
 /// it exists now and may reuse only the verified representative's own pass at
 /// later priority windows. It never infers a pass for an unverified
 /// representative and never authorizes a new stack entry.
+/// The priority player for whom `action` is a verified AI stack-continuation
+/// pass, or `None` when it is not one.
+///
+/// **Single authority for that classification.** Both AI dispatch routers
+/// (`phase_ai::auto_play::run_ai_actions_with_limit` and engine-wasm's
+/// `submit_ai_action_proposal`) pick their reducer boundary with this function,
+/// and [`apply_verified_ai_priority_pass`] gates on the very same call — so the
+/// routers and the callee cannot disagree about what this boundary accepts.
+/// Returning the window's `PlayerId` rather than a bool is what lets the callee
+/// consume the classification it is gated by instead of re-deriving it.
+///
+/// CR 601.2a + CR 601.2h: `GameAction::PassPriority` is overloaded by prompt. At
+/// `WaitingFor::Priority` it passes priority; at `WaitingFor::ManaPayment` the
+/// reducer routes the SAME variant to `casting_costs::finalize_mana_payment` —
+/// there it means "pay the total cost" (CR 601.2h). Announcing a spell puts it
+/// on the stack (CR 601.2a), so a nonempty stack is true throughout every cast
+/// and cannot separate the two meanings on its own; the prompt is what does.
+pub fn verified_ai_stack_pass_player(state: &GameState, action: &GameAction) -> Option<PlayerId> {
+    if !matches!(action, GameAction::PassPriority) || state.stack.is_empty() {
+        return None;
+    }
+    match state.waiting_for {
+        WaitingFor::Priority { player } => Some(player),
+        _ => None,
+    }
+}
+
 pub fn apply_verified_ai_priority_pass(
     state: &mut GameState,
     authenticated_actor: PlayerId,
@@ -1070,18 +1097,21 @@ pub fn apply_verified_ai_priority_pass(
             "AI priority pass no longer matches its issued decision contract".to_string(),
         ));
     }
-    let WaitingFor::Priority { player } = &state.waiting_for else {
+    // The routers select this boundary with the same call, so a mismatch here
+    // is impossible by construction rather than by convention.
+    let Some(player) = verified_ai_stack_pass_player(state, &action) else {
         return Err(EngineError::ActionNotAllowed(
-            "AI stack continuation requires a live priority window".to_string(),
+            "AI stack continuation requires a live priority window over a nonempty stack"
+                .to_string(),
         ));
     };
-    if *player != contract.semantic_owner || state.stack.is_empty() {
+    if player != contract.semantic_owner {
         return Err(EngineError::ActionNotAllowed(
             "AI stack continuation requires the issued nonempty priority window".to_string(),
         ));
     }
 
-    let representative = super::topology::priority_pass_representative(state, *player);
+    let representative = super::topology::priority_pass_representative(state, player);
     let inserted_verified_representative = if let Some(session) =
         state.stack_resolution_session.as_ref()
     {
@@ -9251,7 +9281,7 @@ fn respond_resolve_all_consent(
         let run = state.resolve_all_consent_run.as_mut().ok_or_else(|| {
             EngineError::InvalidAction("Resolve All consent is not active".to_string())
         })?;
-        if run.epoch != epoch || run.next_pending_representative() != Some(representative) {
+        if !run.accepts_response_from(epoch, representative) {
             return Err(EngineError::InvalidAction(
                 "Resolve All consent response is no longer pending".to_string(),
             ));
@@ -15824,16 +15854,59 @@ fn is_tappable_creature_for_cost(state: &GameState, id: ObjectId, player: Player
     })
 }
 
-/// CR 602.5b + CR 702.122a: "activate only once each turn" is keyed to the exact
-/// object incarnation, so a Vehicle that leaves and returns (a new object per
-/// CR 400.7) may be crewed again. Single authority for reading the crew-cadence
-/// set — callers never touch `crew_activated_this_turn` directly.
+/// CAVEAT: the set is recorded at crew ANNOUNCEMENT and cleared only at turn
+/// start (CR 602.5b). It is therefore NOT a layer-independent test for "the
+/// crew payoff is in force": a Stifle-class counter (CR 701.6a) removes the
+/// pending crew entry before it resolves, leaving the cadence record stale all
+/// turn while the Vehicle never became a creature. Consumers that must reject
+/// a redundant re-crew should test PAYOFF-IN-FORCE instead — see
+/// [`crew_pending_on_stack`] / [`crew_resolved_this_turn_contains`].
 pub(crate) fn crew_activated_this_turn_contains(state: &GameState, vehicle_id: ObjectId) -> bool {
     state
         .objects
         .get(&vehicle_id)
         .map(crate::types::identifiers::ObjectIncarnationRef::from_object)
         .is_some_and(|r| state.crew_activated_this_turn.contains(&r))
+}
+
+/// CR 702.122a: Has a `KeywordAction::Crew` for this Vehicle RESOLVED this
+/// turn (the resolved-crew marker)? This is the crew-repeat guard's
+/// PAYOFF-IN-FORCE authority: the marker is written only when the Crew stack
+/// entry actually resolves and installs the transient UEOT `AddType(Creature)`
+/// effect, so a countered crew (CR 701.6a) never sets it — and neither does a
+/// generic SelfRef self-animation (Kylox-class), which installs the same
+/// transient shape with no Crew resolution behind it. Only an explicit
+/// successful Crew sets the marker. Incarnation-keyed: a Vehicle that leaves
+/// and returns is a new object (CR 400.7) and is re-crewable.
+pub fn crew_resolved_this_turn_contains(state: &GameState, vehicle_id: ObjectId) -> bool {
+    state
+        .objects
+        .get(&vehicle_id)
+        .map(crate::types::identifiers::ObjectIncarnationRef::from_object)
+        .is_some_and(|r| state.crew_resolved_this_turn.contains(&r))
+}
+
+/// CR 702.122a + CR 113.3b + CR 117.3c: Is a Crew activation for this Vehicle
+/// currently pending on the stack? Crew's payoff — the transient UEOT
+/// `AddType(Creature)` effect — is applied at stack RESOLUTION, not at
+/// announcement (CR 113.3b opens a priority window for counterspell-class
+/// effects between the two; CR 117.3c hands that same player priority again
+/// after the activation — the very re-crew window this guard exists to close).
+/// Between announcement and resolution the pending `KeywordAction::Crew` entry
+/// is the proof that the payoff is owed; the cadence set alone is not (see
+/// [`crew_activated_this_turn_contains`]).
+pub fn crew_pending_on_stack(state: &GameState, vehicle_id: ObjectId) -> bool {
+    state.stack.iter().any(|entry| {
+        matches!(
+            &entry.kind,
+            StackEntryKind::KeywordAction {
+                action: KeywordAction::Crew {
+                    vehicle_id: pending,
+                    ..
+                },
+            } if *pending == vehicle_id
+        )
+    })
 }
 
 /// CR 602.5b + CR 702.122a: record a crew activation against the Vehicle's current
@@ -15845,6 +15918,23 @@ pub(crate) fn record_crew_activation(state: &mut GameState, vehicle_id: ObjectId
         .map(crate::types::identifiers::ObjectIncarnationRef::from_object)
     {
         state.crew_activated_this_turn.insert(r);
+    }
+}
+
+/// CR 702.122a: record a RESOLVED crew against the Vehicle's current
+/// incarnation. Single authority for writing the resolved-crew marker set —
+/// called from the `KeywordAction::Crew` stack-resolution arm (stack.rs) in
+/// the exact block that installs the UEOT `AddType(Creature)` transient, so
+/// the marker and the payoff are written together and cannot drift.
+/// Deliberately NOT written at crew announcement: a countered crew (CR 701.6a)
+/// installs no payoff, and the Vehicle must stay re-crewable.
+pub(crate) fn record_crew_resolution(state: &mut GameState, vehicle_id: ObjectId) {
+    if let Some(r) = state
+        .objects
+        .get(&vehicle_id)
+        .map(crate::types::identifiers::ObjectIncarnationRef::from_object)
+    {
+        state.crew_resolved_this_turn.insert(r);
     }
 }
 
