@@ -1,0 +1,27 @@
+Entry 1 (initial adjudication, Step 1a)
+  Sizing source: plan-7451.md Sizing section
+  T1 unit count: 3 (U1 trigger boundary window, U2 except-for subtype vocabulary gate, U3 dest_remainder exclusion application) -> FIRES
+  T2 scope-path count: 7 (oracle_trigger.rs, oracle_trigger_tests.rs, oracle_target.rs, oracle_effect/imperative.rs,
+      tests/integration/main.rs, tests/integration/oxford_type_list_boundary_7451.rs (new),
+      tests/integration/jeskai_ascendancy_pump_untap_anaphora_6857.rs)
+      Groups used: none needed. Excluded outright: client/public/card-data.json (regenerated pipeline data).
+      7 < 13 -> DOES NOT FIRE
+  T1 AND T2 = false -> VERDICT: SINGLE-PHASE
+  T3: U2->U3 dependency edge noted; irrelevant absent a T1^T2 firing.
+
+Entry 2 (re-adjudication after round-2 revised plan, Step 2 loop)
+  T1 unit count: 3 (unchanged) -> FIRES
+  T2 scope-path count: 7 under the plan's chosen B3 remedy (asserts through the already-pub
+      game::keywords::source_matches_card_type, so no keywords.rs edit); 8 under either remedy
+      the reviewer named. Both < 13 -> DOES NOT FIRE
+  VERDICT: SINGLE-PHASE (unchanged)
+
+Entry 3 (re-adjudication after round-3 revised plan, Step 2 loop)
+  T1 unit count: 3 (unchanged) -> FIRES
+  T2 scope-path count: 7 (U3 applicator relocated into oracle_target.rs, removing the
+      oracle_static/mod.rs re-export dependency; hostile fixture pinned to the new
+      integration file, so no oracle_effect/tests.rs path). 7 < 13 -> DOES NOT FIRE
+  VERDICT: SINGLE-PHASE (unchanged)
+  T4 check: rounds so far -> R1 review 4 blocking/10 gaps, R2 review 4 blocking/7 gaps.
+      Blocking-finding count non-increasing and layer spread is parser+tests (2 of 7 axis
+      layers, < 3). T4 does NOT fire.
