@@ -1,3 +1,4 @@
+use crate::game::targeting;
 use crate::game::targeting::find_legal_targets;
 use crate::types::ability::{
     Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter, TargetRef,
@@ -18,7 +19,9 @@ pub fn resolve(
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
     let Effect::ChangeTargets {
-        scope, forced_to, ..
+        target,
+        scope,
+        forced_to,
     } = &ability.effect
     else {
         return Err(EffectError::MissingParam(
@@ -26,15 +29,25 @@ pub fn resolve(
         ));
     };
 
-    // ability.targets[0] is the TargetRef::Object(id) of the stack entry being retargeted.
-    let stack_entry_id = match ability.targets.first() {
-        Some(TargetRef::Object(id)) => *id,
-        _ => {
-            return Err(EffectError::MissingParam(
-                "ChangeTargets requires a stack entry target".to_string(),
-            ))
-        }
-    };
+    // CR 115.7 + CR 608.2k: the retarget subject may be a DECLARED target
+    // ("target spell") or a CONTEXT REF ("that spell" on a spell-cast trigger —
+    // Perplexing Chimera's `TriggeringSource`), which surfaces no target slot.
+    // Both are bound by the single 4-tier authority `targeting::resolved_targets`,
+    // whose chosen-targets tier preserves the prior declared-target behavior
+    // (ability.targets[0] is still the TargetRef::Object(id) of the stack entry
+    // being retargeted for a declared subject).
+    // CR 115.7 (Class D, OUT OF RUN): a non-`you` chooser ("the spell's
+    // controller may choose new targets") needs a chooser slot on
+    // `Effect::ChangeTargets`; the chooser here is `ability.controller`.
+    let stack_entry_id = targeting::resolved_targets(ability, target, state)
+        .into_iter()
+        .find_map(|t| match t {
+            TargetRef::Object(id) => Some(id),
+            TargetRef::Player(_) => None,
+        })
+        .ok_or_else(|| {
+            EffectError::MissingParam("ChangeTargets requires a stack entry target".into())
+        })?;
 
     // CR 115.7: Find the stack entry by its object ID.
     let stack_entry_index = state

@@ -2054,6 +2054,39 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
         }
         kept.extend(target_iter.cloned());
         kept
+    } else if let Effect::ExchangeControl { target_a, target_b } = &validated.effect {
+        // CR 608.2b + CR 701.12a (Phase 2 scope extension — see U4/U8's
+        // `is_context_ref()` generalization above; this is the SAME bug class
+        // at the re-validation seam instead of the slot-building seam).
+        // ExchangeControl's two declared filters have no single unified
+        // `target_filter()`, so without this arm the generic `None` branch
+        // below (hardcoded to `state.battlefield.contains`) would
+        // fizzle-filter a legal STACK-zone target (Sudden Substitution's
+        // "target noncreature spell") as illegal, even though CR 701.12a +
+        // CR 400.7a make a stack subject legal (`exchange_control.rs`'s
+        // widened zone gate). Mirrors `prevent_damage_source_slot_filter`'s
+        // arm immediately below, which fixes the identical hazard for a
+        // different effect. Context-ref filters (SelfRef, TriggeringSource)
+        // claim no slot and are skipped, mirroring
+        // `collect_target_slots_inner` / `build_target_slot_specs`.
+        let mut kept = Vec::new();
+        let mut target_iter = validated.targets.iter();
+        for filter in [target_a, target_b] {
+            if filter.is_context_ref() {
+                continue;
+            }
+            let Some(target_ref) = target_iter.next() else {
+                continue;
+            };
+            if let Some(legal) =
+                validate_pinned_targets(state, std::slice::from_ref(target_ref), filter, &validated)
+                    .into_iter()
+                    .next()
+            {
+                kept.push(legal);
+            }
+        }
+        kept
     } else if let Some(role) = mana_multi_role(&validated.effect) {
         // CR 608.2b: THREE properties, all required.
         // (1) "Illegal targets won't be affected by parts of the effect for
@@ -2666,13 +2699,21 @@ fn collect_target_slots_inner(
         }
     }
 
-    // CR 701.12a: ExchangeControl carries two distinct per-slot filters. SelfRef
-    // slots (e.g. "this artifact and target …") are filled by the resolver from
-    // ability.source_id and don't require a player choice. Surface one slot per
-    // non-SelfRef filter, in declaration order.
+    // CR 701.12a: ExchangeControl carries two distinct per-slot filters.
+    // Context-ref filters (SelfRef — "this artifact and target …"; TriggeringSource
+    // — "that spell", Perplexing Chimera) are filled by the resolver from chain
+    // context (ability.source_id, or the triggering event) and don't require a
+    // player choice. Surface one slot per non-context-ref filter, in declaration
+    // order. (Keep in sync with `build_target_slot_specs` or the slot-count
+    // invariant fires.)
+    //
+    // CR 608.2k: `is_context_ref()`'s superset also admits `TargetFilter::None`
+    // (no parser path produces it here, but should one appear, `resolved_targets`
+    // binds it to `ability.source_id` via its documented `use_self` fallback
+    // rather than surfacing a target slot for it).
     if let Effect::ExchangeControl { target_a, target_b } = &ability.effect {
         for filter in [target_a, target_b] {
-            if matches!(filter, TargetFilter::SelfRef) {
+            if filter.is_context_ref() {
                 continue;
             }
             let legal_targets =
@@ -2842,18 +2883,42 @@ fn collect_target_slots_inner(
         // Soltari Guerrillas). The resolver reads `recipient_host` from
         // `chosen_target_object(ability, 0)` and the redirect from
         // `chosen_redirect_object` (which skips the recipient slot when present),
-        // so the surfacing order here must match that indexing exactly.
-        for filter in [recipient_object_filter, redirect_object_filter]
-            .into_iter()
-            .flatten()
-        {
-            // CR 614.9: a `SelfRef` original-recipient ("...dealt to ~" — the
-            // en-Kor cycle) is the ability's own source, not a chosen target, so
-            // it surfaces no target slot. The resolver hosts the shield on the
-            // source directly.
-            if matches!(filter, TargetFilter::SelfRef) {
-                continue;
+        // so the surfacing order here must match that indexing exactly. The two
+        // positions are unrolled (not looped) because they use DIFFERENT skip
+        // predicates — see each arm below.
+        if let Some(filter) = recipient_object_filter {
+            // CR 614.9 + CR 608.2k: a context-ref original-recipient (`SelfRef` —
+            // "...dealt to ~", the en-Kor cycle — and any future event anaphor in
+            // this position) is not a chosen target, so it surfaces no target
+            // slot. The resolver hosts the shield on the source directly (or, for
+            // a non-SelfRef context ref, on whatever `targeting::resolved_targets`
+            // binds).
+            if !filter.is_context_ref() {
+                let legal_targets =
+                    legal_targets_for_ability_filter(state, ability, filter, &acc.slots);
+                if legal_targets.is_empty() && !ability.optional_targeting {
+                    return Err(no_legal_target_slots());
+                }
+                acc.push(TargetSelectionSlot {
+                    legal_targets,
+                    optional: ability.optional_targeting,
+                    chooser: None,
+                    effect_kind: acc.current_effect_kind,
+                    effect_detail: acc.current_effect_detail,
+                });
             }
+        }
+        if let Some(filter) = redirect_object_filter {
+            // CR 614.9: the redirect-destination slot is declared UNCONDITIONALLY
+            // — it is never a context ref in the corpus. `redirect_object_filter`
+            // is `Some` exactly when `redirect_to ==
+            // DamageRedirectTarget::ChosenObjectTarget`, the variant that *means*
+            // "an object chosen as a target of the creating ability"; every other
+            // destination (`Controller`, `SourceObject`, `AttachedToSource`) has
+            // its own variant and carries no filter here. A context ref in this
+            // position would drop the slot `chosen_redirect_object` indexes, so
+            // this position does NOT share the recipient's `is_context_ref()`
+            // check.
             let legal_targets =
                 legal_targets_for_ability_filter(state, ability, filter, &acc.slots);
             if legal_targets.is_empty() && !ability.optional_targeting {
@@ -4777,10 +4842,13 @@ fn collect_target_slot_specs(
 
     // CR 701.12a: Mirror the ExchangeControl branch in `collect_target_slots`
     // so per-slot specs match the surfaced TargetSelectionSlots one-for-one
-    // (SelfRef slots are auto-resolved and not surfaced).
+    // (context-ref slots — SelfRef, TriggeringSource — are auto-resolved and not
+    // surfaced; keep in sync with `collect_target_slots_inner` or the slot-count
+    // invariant fires). CR 608.2k: the `None` superset admission is documented
+    // at that mirror.
     if let Effect::ExchangeControl { target_a, target_b } = &ability.effect {
         for filter in [target_a, target_b] {
-            if matches!(filter, TargetFilter::SelfRef) {
+            if filter.is_context_ref() {
                 continue;
             }
             let id = TargetInstanceId(*next_instance);
@@ -4898,16 +4966,28 @@ fn collect_target_slot_specs(
     {
         // CR 115.1 + CR 614.9: Mirror `collect_target_slots` one-for-one — the
         // recipient slot (Jade Monolith) before the redirect slot (Soltari) — so
-        // per-slot specs line up with the surfaced TargetSelectionSlots.
-        for filter in [recipient_object_filter, redirect_object_filter]
-            .into_iter()
-            .flatten()
-        {
-            // CR 614.9: mirror `collect_target_slots` — a `SelfRef` self
-            // recipient (en-Kor) surfaces no slot, so it gets no spec either.
-            if matches!(filter, TargetFilter::SelfRef) {
-                continue;
+        // per-slot specs line up with the surfaced TargetSelectionSlots. Unrolled
+        // exactly as the `collect_target_slots_inner` mirror: the two positions
+        // use DIFFERENT skip predicates, so a single shared loop would apply the
+        // recipient's context-ref skip to the redirect position too.
+        if let Some(filter) = recipient_object_filter {
+            // CR 614.9 + CR 608.2k: mirror `collect_target_slots_inner` — a
+            // context-ref recipient (`SelfRef`, en-Kor) surfaces no slot, so it
+            // gets no spec either.
+            if !filter.is_context_ref() {
+                let id = TargetInstanceId(*next_instance);
+                *next_instance += 1;
+                specs.push(TargetSlotSpec {
+                    filter: filter.clone(),
+                    optional: ability.optional_targeting,
+                    instance: id,
+                });
             }
+        }
+        if let Some(filter) = redirect_object_filter {
+            // CR 614.9: the redirect position is declared unconditionally — see
+            // `collect_target_slots_inner`'s mirror for why it does not share the
+            // recipient's `is_context_ref()` check.
             let id = TargetInstanceId(*next_instance);
             *next_instance += 1;
             specs.push(TargetSlotSpec {
@@ -17044,6 +17124,145 @@ mod tests {
             "production oracle path must surface ally + opponent slots (abilities={}), got {}",
             parsed.abilities.len(),
             slots.len()
+        );
+    }
+
+    /// V13 (Perplexing Chimera Phase 2, plan-r6 Verification Matrix) — slot /
+    /// spec / resolver THREE-WAY agreement for `Effect::ExchangeControl`,
+    /// mirroring the `ManaTargetRole` three-way-agreement test above.
+    ///
+    /// CR 701.12a + CR 608.2k: a context-ref filter (`SelfRef`,
+    /// `TriggeringSource`) surfaces no target slot in either mirror
+    /// (`collect_target_slots_inner` / `collect_target_slot_specs`), and the
+    /// two mirrors must agree on slot count, spec count, AND resolver index
+    /// for every reachable declared/context-ref combination.
+    #[test]
+    fn exchange_control_slot_and_spec_counts_agree() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            crate::types::identifiers::CardId(1),
+            PlayerId(0),
+            "Test Chimera".to_string(),
+            Zone::Battlefield,
+        );
+
+        // Case (i): two DECLARED filters (Switcheroo shape) ⇒ 2 slots / 2 specs.
+        // Needs real creature candidates on the battlefield, or the slot build
+        // fails at announcement with "No legal targets available" before the
+        // count/order claim can even be checked.
+        let creature_a = create_object(
+            &mut state,
+            crate::types::identifiers::CardId(4),
+            PlayerId(0),
+            "Creature A".to_string(),
+            Zone::Battlefield,
+        );
+        let creature_b = create_object(
+            &mut state,
+            crate::types::identifiers::CardId(5),
+            PlayerId(1),
+            "Creature B".to_string(),
+            Zone::Battlefield,
+        );
+        for id in [creature_a, creature_b] {
+            state.objects.get_mut(&id).unwrap().card_types.core_types = vec![CoreType::Creature];
+        }
+        let two_declared = ResolvedAbility::new(
+            Effect::ExchangeControl {
+                target_a: TargetFilter::Typed(TypedFilter::creature()),
+                target_b: TargetFilter::Typed(TypedFilter::creature()),
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        assert_eq!(build_target_slots(&state, &two_declared).unwrap().len(), 2);
+        assert_eq!(target_slot_specs(&state, &two_declared).len(), 2);
+
+        // Case (ii): SelfRef + TriggeringSource (Perplexing Chimera shape) —
+        // BOTH are context refs, so 0 slots / 0 specs.
+        let both_context = ResolvedAbility::new(
+            Effect::ExchangeControl {
+                target_a: TargetFilter::SelfRef,
+                target_b: TargetFilter::TriggeringSource,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        assert_eq!(build_target_slots(&state, &both_context).unwrap().len(), 0);
+        assert_eq!(target_slot_specs(&state, &both_context).len(), 0);
+
+        // Case (iii), HOSTILE — mixed `{Typed(Creature), TriggeringSource}` ⇒
+        // exactly 1 SLOT (for the declared filter), and the resolver must bind
+        // slot A to the declared target while slot B binds via the
+        // triggering-spell authority: the index-discipline proof that
+        // `resolved_targets`' tiers don't disturb the `ability.targets`
+        // iterator position.
+        let declared_target = create_object(
+            &mut state,
+            crate::types::identifiers::CardId(2),
+            PlayerId(0),
+            "Declared Creature".to_string(),
+            Zone::Battlefield,
+        );
+        let triggering_spell = create_object(
+            &mut state,
+            crate::types::identifiers::CardId(3),
+            PlayerId(1),
+            "Triggering Spell".to_string(),
+            Zone::Stack,
+        );
+        state
+            .objects
+            .get_mut(&declared_target)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Creature];
+        let mixed = ResolvedAbility::new(
+            Effect::ExchangeControl {
+                target_a: TargetFilter::Typed(TypedFilter::creature()),
+                target_b: TargetFilter::TriggeringSource,
+            },
+            vec![TargetRef::Object(declared_target)],
+            source,
+            PlayerId(0),
+        );
+        assert_eq!(
+            build_target_slots(&state, &mixed).unwrap().len(),
+            1,
+            "only the declared (target_a) filter surfaces a slot"
+        );
+        assert_eq!(target_slot_specs(&state, &mixed).len(), 1);
+
+        state.current_trigger_event = Some(crate::types::events::GameEvent::SpellCast {
+            card_id: crate::types::identifiers::CardId(3),
+            controller: PlayerId(1),
+            object_id: triggering_spell,
+            cast_mana_value: None,
+        });
+        let mut events = Vec::new();
+        crate::game::effects::exchange_control::resolve(&mut state, &mixed, &mut events).unwrap();
+        assert!(
+            state.transient_continuous_effects.iter().any(|e| {
+                e.affected
+                    == TargetFilter::SpecificObject {
+                        id: declared_target,
+                    }
+                    && e.controller == PlayerId(1)
+            }),
+            "slot A (declared target, controlled by P0) must swap to P1's control"
+        );
+        assert!(
+            state.transient_continuous_effects.iter().any(|e| {
+                e.affected
+                    == TargetFilter::SpecificObject {
+                        id: triggering_spell,
+                    }
+                    && e.controller == PlayerId(0)
+            }),
+            "slot B (the triggering spell, controlled by P1) must swap to P0's control"
         );
     }
 }

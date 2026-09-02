@@ -3605,8 +3605,26 @@ fn filter_inner_for_object(
         | TargetFilter::TriggeringSpellOwner
         | TargetFilter::TriggeringSourceController
         | TargetFilter::TriggeringPlayer
-        | TargetFilter::TriggeringSource
         | TargetFilter::DefendingPlayer => false,
+        // CR 608.2k: `TriggeringSource` IS object-valued (unlike its player-axis
+        // siblings above — types/ability.rs documents it as "the source object
+        // of the triggering event"), but it is still not a population predicate,
+        // so it belongs in its own arm rather than the CR 603.7c group. Its
+        // referent is bound at resolution time by `targeting::resolved_targets`
+        // (delegating to `targeting::resolve_event_context_target` for the event
+        // tier), and `TargetFilter::is_context_ref()` guarantees no target slot
+        // is ever built from it (`ability_utils::collect_target_slots_inner` /
+        // `build_target_slot_specs` skip it). Matching `true` here would make a
+        // resolution-time ref ENUMERABLE — selectable as a population member —
+        // across every `matches_target_filter` consumer, including
+        // `layers::apply_continuous_effect_filtered`, where a `TriggeringSource`
+        // affected-filter would start selecting a population instead of the one
+        // bound referent. It would also fire at trigger DETECTION time through
+        // `quantity::triggering_event_source_object`'s thread-local fallback,
+        // changing trigger-condition and intervening-if evaluation corpus-wide.
+        // Contrast `EventTarget` below: that arm serves a DIFFERENT consumer,
+        // CR 603.4 intervening-if object matching, not population enumeration.
+        TargetFilter::TriggeringSource => false,
         // CR 603.2 + CR 603.4: "that creature"/"that permanent" bound to the
         // object target carried by the current trigger event. Matches only that
         // specific object (including a BecomesTarget object), so an

@@ -1,3 +1,4 @@
+use crate::game::targeting;
 use crate::types::ability::Duration;
 use crate::types::ability::{
     ContinuousModification, Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter,
@@ -8,17 +9,18 @@ use crate::types::game_state::GameState;
 use crate::types::identifiers::ObjectId;
 use crate::types::zones::Zone;
 
-/// CR 701.12a: Exchange control of two permanents.
+/// CR 701.12a: Exchange control of two permanents, or a permanent and a spell
+/// (CR 701.12a + CR 400.7a — see `control_is_exchangeable` below).
 ///
 /// Object resolution for each slot:
-/// - Filter `SelfRef` → resolver substitutes `ability.source_id` (the
-///   ability's source permanent), matching the Fight resolver pattern.
-///   Used by patterns like "exchange control of this artifact and target …"
-///   (Avarice Totem, Eyes Everywhere, Phyrexian Infiltrator).
+/// - A context-ref filter (`SelfRef` — "this artifact and target …", Avarice
+///   Totem / Eyes Everywhere / Phyrexian Infiltrator; `TriggeringSource` —
+///   "that spell", Perplexing Chimera) → resolved through the single 4-tier
+///   authority `targeting::resolved_targets`.
 /// - Any other filter → consumed in order from `ability.targets`.
 ///
 /// CR 701.12a: If the entire exchange can't be completed (missing object,
-/// off-battlefield), no part of the exchange occurs (all-or-nothing).
+/// off-battlefield/off-stack), no part of the exchange occurs (all-or-nothing).
 /// CR 701.12b: If both permanents are controlled by the same player, the
 /// exchange effect does nothing.
 pub fn resolve(
@@ -41,24 +43,41 @@ pub fn resolve(
     if matches!(target_a, TargetFilter::Any) && matches!(target_b, TargetFilter::Any) {
         tracing::warn!(
             source_id = ?ability.source_id,
-            "ExchangeControl resolved with both target filters = Any — likely legacy data or parser gap"
+            "ExchangeControl resolved with both target filters = Any — check for a parser gap"
         );
     }
 
-    // Each non-SelfRef slot consumes one TargetRef::Object from ability.targets,
-    // in declaration order. SelfRef slots are filled with ability.source_id.
+    // Each non-context-ref slot consumes one TargetRef::Object from
+    // ability.targets, in declaration order. Context-ref slots (SelfRef,
+    // TriggeringSource) are resolved through `targeting::resolved_targets`.
     let mut object_targets = ability.targets.iter().filter_map(|t| match t {
         TargetRef::Object(id) => Some(*id),
         TargetRef::Player(_) => None,
     });
-    let resolve_slot =
-        |filter: &TargetFilter, iter: &mut dyn Iterator<Item = ObjectId>| -> Option<ObjectId> {
-            if matches!(filter, TargetFilter::SelfRef) {
-                Some(ability.source_id)
-            } else {
-                iter.next()
-            }
-        };
+    // CR 608.2k + CR 608.2c: a context-ref slot surfaces no target and is bound at
+    // resolution time by the single 4-tier authority `targeting::resolved_targets` —
+    // its tier-1 short-circuit owns the resolution-local anaphors (`SelfRef`, and
+    // with it the CR 400.7 `self_ref_is_current` check), and its pure-event-context
+    // tier owns `TriggeringSource` AHEAD of the `ability.targets` tier, so per-slot
+    // index discipline survives a mixed declared/context-ref pair. It delegates the
+    // event tier to `targeting::resolve_event_context_target`; there is no second
+    // resolver here.
+    // NOTE: `resolve_event_context_target` must NOT be called directly — it has no
+    // `SelfRef` arm, so it would silently break the Avarice Totem / Eyes Everywhere /
+    // Phyrexian Infiltrator class.
+    let resolve_slot = |filter: &TargetFilter, iter: &mut dyn Iterator<Item = ObjectId>| {
+        if !filter.is_context_ref() {
+            return iter.next();
+        }
+        targeting::resolved_targets(ability, filter, state)
+            .into_iter()
+            .find_map(|t| match t {
+                TargetRef::Object(id) => Some(id),
+                // CR 701.12a: a player-valued ref cannot be an exchange subject —
+                // the exchange can't be completed, so no part of it occurs.
+                TargetRef::Player(_) => None,
+            })
+    };
 
     let Some(id_a) = resolve_slot(target_a, &mut object_targets) else {
         // CR 701.12a: Can't complete exchange — do nothing.
@@ -78,7 +97,24 @@ pub fn resolve(
         return Ok(());
     };
 
-    // CR 701.12a: Both objects must exist on the battlefield.
+    // CR 701.12a + CR 400.7a: control of an object can be exchanged wherever
+    // control is a meaningful characteristic — the battlefield (CR 110.2) and
+    // the stack (CR 112.2, CR 109.4: "Only objects on the stack or on the
+    // battlefield have a controller"). A SPELL subject is legal precisely
+    // because CR 400.7a carries the control change through onto the permanent
+    // that spell becomes, and CR 110.2b assigns that permanent's by-default
+    // controller to the player who put the spell onto the stack. Any other zone
+    // (an object that has already left the stack — countered in response)
+    // cannot complete the exchange, so per CR 701.12a no part of it occurs.
+    fn control_is_exchangeable(zone: Zone) -> bool {
+        matches!(zone, Zone::Battlefield | Zone::Stack)
+    }
+
+    // CR 701.12a: Both objects must exist and be in an exchangeable zone. The
+    // controller read below is what makes this depend on the stack seed
+    // (`layers::evaluate_layers`'s CR 112.2 base + CR 613.1b re-derivation): for
+    // a stack subject, `obj.controller` is origin-zone data before that seed and
+    // the live, re-derived controller after.
     let (controller_a, controller_b) = {
         let Some(obj_a) = state.objects.get(&id_a) else {
             events.push(GameEvent::EffectResolved {
@@ -96,7 +132,7 @@ pub fn resolve(
             });
             return Ok(());
         };
-        if obj_a.zone != Zone::Battlefield || obj_b.zone != Zone::Battlefield {
+        if !control_is_exchangeable(obj_a.zone) || !control_is_exchangeable(obj_b.zone) {
             events.push(GameEvent::EffectResolved {
                 kind: EffectKind::ExchangeControl,
                 source_id: ability.source_id,
@@ -107,7 +143,11 @@ pub fn resolve(
         (obj_a.controller, obj_b.controller)
     };
 
-    // CR 701.12b: Same controller → no effect.
+    // CR 701.12b: Same controller → no effect. CR 701.12b is written for two
+    // PERMANENTS; the permanent-and-spell case rests on CR 701.12a's general
+    // all-or-nothing principle plus CR 701.12b's same-controller principle —
+    // there is no separate rule for a spell whose live controller already
+    // matches the permanent's.
     if controller_a == controller_b {
         events.push(GameEvent::EffectResolved {
             kind: EffectKind::ExchangeControl,

@@ -1,6 +1,7 @@
 use crate::game::effects::choose_damage_source;
 use crate::game::effects::prevent_damage::resolve_source_filter;
 use crate::game::game_object::AttachTarget;
+use crate::game::targeting;
 use crate::types::ability::{
     DamageRedirectTarget, Effect, EffectError, EffectKind, PreventionAmount, RedirectionLifetime,
     ReplacementDefinition, ResolvedAbility, TargetFilter, TargetRef,
@@ -165,27 +166,35 @@ pub fn resolve(
         shield = shield.combat_scope(scope);
     }
 
-    // CR 614.9: Decide where to host the shield and whether the original
-    // recipient consumed a declared object target slot. Hosting on an object
-    // with `valid_card: SelfRef` (set below) makes the shield fire only on
+    // CR 614.9 + CR 608.2k: Decide where to host the shield and whether the
+    // original recipient consumed a declared object target slot. Hosting on an
+    // object with `valid_card: SelfRef` (set below) makes the shield fire only on
     // damage to that object (mirrors `prevent_damage::resolve`'s host-on-target
-    // pattern).
-    //   * `Some(SelfRef)` ("...dealt to ~" — the en-Kor cycle): the recipient is
-    //     the ability's own source. Host on the source (`valid_card: SelfRef` is
-    //     set below) so the shield fires only on damage to it; it surfaces NO
-    //     target slot, so a `ChosenObjectTarget` redirect reads the FIRST object
-    //     target.
-    //   * `Some(other)` ("...dealt to target creature" — Jade Monolith): the
-    //     recipient is a chosen target object, consuming the first slot; the
-    //     redirect reads the SECOND.
-    let recipient_is_self = matches!(recipient_object_filter, Some(TargetFilter::SelfRef));
-    let recipient_consumes_slot = recipient_object_filter.is_some() && !recipient_is_self;
-    let recipient_host = if recipient_is_self {
-        Some(ability.source_id)
-    } else if recipient_object_filter.is_some() {
-        chosen_target_object(ability, /*skip*/ 0)
-    } else {
-        None
+    // pattern). Mirror the RECIPIENT-position slot/spec skip predicate in
+    // `ability_utils` EXACTLY. A context-ref recipient (the en-Kor cycle's
+    // `SelfRef`, and any future event anaphor) surfaces NO target slot, so the
+    // redirect reads the FIRST object target; a declared recipient (Jade
+    // Monolith) consumes the first slot and the redirect reads the SECOND. Both
+    // the index arithmetic AND the shield host must come from this one
+    // predicate — deriving only the index here would host the shield on the
+    // redirect destination for any non-`SelfRef` context ref. The REDIRECT
+    // position is declared by construction (`DamageRedirectTarget::
+    // ChosenObjectTarget`), so `chosen_redirect_object` needs no matching
+    // predicate.
+    let recipient_context_ref = recipient_object_filter
+        .as_ref()
+        .filter(|f| f.is_context_ref());
+    let recipient_consumes_slot =
+        recipient_object_filter.is_some() && recipient_context_ref.is_none();
+    let recipient_host = match (recipient_context_ref, recipient_object_filter.is_some()) {
+        (Some(filter), _) => targeting::resolved_targets(ability, filter, state)
+            .into_iter()
+            .find_map(|t| match t {
+                TargetRef::Object(id) => Some(id),
+                TargetRef::Player(_) => None,
+            }),
+        (None, true) => chosen_target_object(ability, /*skip*/ 0),
+        (None, false) => None,
     };
 
     // CR 614.5 + CR 614.9: Tag the shield as the appropriate one-shot kind.
