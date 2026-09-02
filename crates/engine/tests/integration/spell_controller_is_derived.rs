@@ -146,9 +146,10 @@ fn install_steal(state: &mut GameState, source_id: ObjectId, thief: PlayerId, id
 }
 
 /// `GameState::new_two_player` seeds no libraries — a `Draw` effect against an
-/// empty library is a silent no-op (CR 120.3's loss-by-drawing SBA is not
-/// checked by these tests), which would make a hand-growth assertion pass or
-/// fail vacuously regardless of WHO drew. Seed both players so either can draw.
+/// empty library is a silent no-op (CR 121.3 + CR 704.5b's loss-by-drawing SBA
+/// is not checked by these tests), which would make a hand-growth assertion
+/// pass or fail vacuously regardless of WHO drew. Seed both players so either
+/// can draw.
 fn seed_libraries(state: &mut GameState, card_num_base: u64) {
     for (i, player) in [P0, P1].into_iter().enumerate() {
         for j in 0..3u64 {
@@ -296,7 +297,7 @@ fn stack_entry_whose_object_is_still_in_its_origin_zone_is_not_stamped() {
 // V1b — the seed maintains the popped resolving entry too (M2)
 // ---------------------------------------------------------------------------
 
-/// CR 608.2g: `resolving_stack_entry_is_reset_by_the_stack_seed`.
+/// CR 608.2m: `resolving_stack_entry_is_reset_by_the_stack_seed`.
 /// REVERT-FAILING: delete the `.chain(..)` and the object is never visited.
 #[test]
 fn resolving_stack_entry_is_reset_by_the_stack_seed() {
@@ -1827,4 +1828,151 @@ fn two_look_alike_entries_with_different_controllers_each_render_their_own() {
     let views = engine::game::derived_views::derive_views(&state, None);
     assert_eq!(views.stack_entry_details[&a].controller, P0);
     assert_eq!(views.stack_entry_details[&b].controller, P1);
+}
+
+// ---------------------------------------------------------------------------
+// MED-1 (review-impl round 1, charter revision 1) — a paused permanent
+// spell's KEEP-classified riders (warp's CR 702.185a exile trigger, Room's
+// CR 709.5d door designation) must read the BY-DEFAULT cast-time controller,
+// matching the UNPAUSED path (`stack.rs` `entry.controller`), never the live
+// controller the pause snapshot's `controller` field carries for resumption.
+// ---------------------------------------------------------------------------
+
+mod paused_permanent_spell_keeps_the_cast_time_controller_for_keep_riders {
+    use super::*;
+    use engine::game::scenario::GameRunner;
+    use engine::types::ability::{
+        AbilityDefinition, AbilityKind, EffectScope, ReplacementDefinition, ReplacementMode,
+        TapStateChange,
+    };
+    use engine::types::actions::GameAction;
+    use engine::types::mana::ManaCostShard;
+    use engine::types::replacements::ReplacementEvent;
+
+    /// A Warp creature spell on the stack, controlled at cast time by `caster`
+    /// (P1), then STOLEN by `thief` (P0) via an `UntilEndOfTurn`
+    /// `ChangeController` effect while it is still on the stack — so the LIVE
+    /// controller (`stack_object_controller`, read by `resolve_top` before the
+    /// pop) is the thief, while `entry.controller` (the by-default caster)
+    /// stays P1. The creature also carries a single OPTIONAL self-ETB
+    /// `ChangeZone` replacement ("may enter tapped") — CR 614.1a's lone-
+    /// optional-candidate cause alone forces a genuine
+    /// `ReplacementResult::NeedsChoice` pause, with NO `enters_under`
+    /// controller-override anywhere in the fixture (MED-1 part B, the
+    /// KEEP-consistency half).
+    fn stolen_warp_creature_paused_on_its_own_optional_etb(card_num: u64) -> (GameState, ObjectId) {
+        let mut state = new_state();
+        let caster = P1;
+        let thief = P0;
+        let spell = create_object(
+            &mut state,
+            CardId(card_num),
+            caster,
+            "Stolen Warp Creature".to_string(),
+            Zone::Stack,
+        );
+        {
+            let obj = state.objects.get_mut(&spell).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.power = Some(2);
+            obj.toughness = Some(2);
+            obj.base_power = Some(2);
+            obj.base_toughness = Some(2);
+            obj.keywords.push(Keyword::Warp(ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 0,
+            }));
+            obj.base_keywords = obj.keywords.clone();
+            let repl = ReplacementDefinition::new(ReplacementEvent::ChangeZone)
+                .mode(ReplacementMode::Optional { decline: None })
+                .valid_card(TargetFilter::SelfRef)
+                .destination_zone(Zone::Battlefield)
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::SetTapState {
+                        target: TargetFilter::SelfRef,
+                        scope: EffectScope::Single,
+                        state: TapStateChange::Tap,
+                    },
+                ));
+            obj.replacement_definitions.push(repl.clone());
+            std::sync::Arc::make_mut(&mut obj.base_replacement_definitions).push(repl);
+            obj.base_characteristics_initialized = true;
+        }
+        push_spell_entry(&mut state, spell, caster, None, CastingVariant::Warp);
+        let source = creature_on_battlefield(&mut state, thief, "Threaten Source", card_num + 100);
+        install_steal(&mut state, source, thief, spell);
+        evaluate_layers(&mut state);
+        // REACH GUARD: the steal landed before resolution — the LIVE
+        // controller genuinely diverges from the by-default caster.
+        let entry = state.stack.back().unwrap().clone();
+        assert_eq!(
+            stack_object_controller(&state, &entry),
+            thief,
+            "fixture invariant: the steal must have applied before resolve_top runs"
+        );
+        assert_eq!(
+            entry.controller, caster,
+            "fixture invariant: entry.controller is unaffected by the steal (CR 112.2)"
+        );
+        (state, spell)
+    }
+
+    /// CR 702.185a + CR 603.7d + CR 608.2c: `warp_delayed_trigger_keeps_the_by_default_caster_through_a_pause`.
+    /// REVERT-FAILING: reverting `engine_replacement.rs`'s `cast_time_controller`
+    /// back to `ctx.controller` makes the delayed trigger's controller P0 (the
+    /// thief / live controller) instead of P1 — proven below by temporarily
+    /// reverting that exact line and observing this test fail (see the
+    /// executor report; not re-run automatically here).
+    #[test]
+    fn warp_delayed_trigger_keeps_the_by_default_caster_through_a_pause() {
+        let (mut state, spell) = stolen_warp_creature_paused_on_its_own_optional_etb(1);
+
+        let mut events = Vec::new();
+        resolve_top(&mut state, &mut events);
+
+        // REACH GUARD: the spell left the stack (StackResolved fires even
+        // though the replacement choice is pending) and a genuine
+        // replacement-choice pause was raised — not an outright resolution.
+        assert!(state.stack.is_empty(), "the spell must have left the stack");
+        assert!(
+            matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }),
+            "expected a ReplacementChoice pause, got {:?}",
+            state.waiting_for
+        );
+        let ctx = state
+            .active_spell_resolution()
+            .expect("the pause must stash a PendingSpellResolution");
+        assert_eq!(
+            ctx.controller, P0,
+            "REACH GUARD: the stashed LIVE controller is the thief"
+        );
+        assert_eq!(
+            ctx.cast_controller,
+            Some(P1),
+            "REACH GUARD: the stashed by-default cast_controller is the caster"
+        );
+
+        // Resume through the real production dispatcher (GameAction::ChooseReplacement,
+        // routed through GameRunner::act -> apply_as_current -> engine_replacement::
+        // handle_replacement_choice -> apply_pending_spell_resolution).
+        let mut runner = GameRunner::from_state(state);
+        runner
+            .act(GameAction::ChooseReplacement { index: 0 })
+            .expect("accept the optional ETB replacement");
+        let state = runner.state();
+
+        let trigger = state
+            .delayed_triggers
+            .iter()
+            .find(|t| t.source_id == spell)
+            .expect("the warp delayed trigger must have been installed");
+        assert_eq!(
+            trigger.controller, P1,
+            "MED-1: the warp delayed trigger must carry the BY-DEFAULT caster \
+             (matching the unpaused path's entry.controller), not the live \
+             thief controller the spell resolved for"
+        );
+    }
 }

@@ -965,7 +965,10 @@ fn move_prevented_permanent_spell_to_graveyard_if_still_on_stack(
 ///   1. SEEDED-AT-ARRIVAL. `zones::move_to_zone` marks a full pass on every move
 ///      INTO `Zone::Stack` (CR 601.2a: continuous effects "begin as it is put on the
 ///      stack"; CR 611.2f), so a spell that has finished being put onto the stack has
-///      had at least one full pass seed it from its `StackEntry`.
+///      a full pass MARKED that will seed it from its `StackEntry` on the NEXT FLUSH —
+///      not necessarily already applied. A reader that cannot flush (see the
+///      `derived_views` note below) may still observe the pre-flush value for that
+///      spell.
 ///      `a_cast_from_each_origin_zone_seeds_the_stack_objects_controller` is the test
 ///      that pins it, per origin zone, with the Hand cast as positive control.
 ///      DO NOT WEAKEN THAT MARK: before it existed, Exile/Graveyard/Command -> Stack
@@ -995,10 +998,12 @@ fn move_prevented_permanent_spell_to_graveyard_if_still_on_stack(
 /// existing in-repo tests that push straight onto the stack (`move_to_zone` from
 /// `Zone::Hand` marks `LayersDirty::Full` and `stack.rs` has no production
 /// `flush_layers`), so an assert there fails the suite rather than guarding it.
-/// AFTER the CR 601.2a arrival mark above, a stale read degrades to the CR 112.2
-/// `entry.controller` this accessor replaces — i.e. it can lag a live control change by
-/// at most one pass, never fall back to origin-zone data. (Before that mark existed it
-/// degraded to the card's OWNER, which is the defect this design closes.)
+/// The CR 601.2a arrival mark seeds the object controller on the NEXT FLUSH, not
+/// instantaneously; a caller that reads before that flush (e.g. `derive_views`, which
+/// structurally cannot flush) degrades to the CR 112.2 `entry.controller` this accessor
+/// replaces — i.e. it can lag a live control change by at most one pass. (Before that
+/// mark existed it degraded to the card's OWNER, which is the defect this design
+/// closes.)
 pub fn stack_object_controller(state: &GameState, entry: &StackEntry) -> PlayerId {
     state
         .objects
@@ -1010,6 +1015,18 @@ pub fn stack_object_controller(state: &GameState, entry: &StackEntry) -> PlayerI
 /// paused mid-resolution (delivery-tail `NeedsChoice`, replacement-choice
 /// `NeedsChoice`, or CallerEpilogue `CopyTargetChoice`). Single authority so a
 /// new cast-metadata field cannot be threaded into only two of three stash sites.
+///
+/// `live_controller` MUST be the caller's already-computed [`resolve_top`]
+/// value (CR 109.4-safe, read while the object was still on the stack) — never
+/// re-derived here via [`stack_object_controller`]. All three call sites in
+/// `resolve_top` invoke this from inside `zone_pipeline::deliver`'s
+/// `NeedsChoice` / `CopyTargetChoice` continuations, i.e. AFTER
+/// `move_to_zone_with_entry_flags` has already moved the object to the
+/// battlefield and possibly applied an `enters_under` control change; a fresh
+/// `stack_object_controller(state, entry)` read at that point would read the
+/// object's battlefield-scoped controller (CR 109.4: only stack/battlefield
+/// objects have a controller, but that's the WRONG one here) instead of the
+/// controller this spell resolved for.
 fn pending_spell_resolution_snapshot(
     state: &GameState,
     entry: &StackEntry,
@@ -1017,6 +1034,7 @@ fn pending_spell_resolution_snapshot(
     casting_variant: CastingVariant,
     actual_mana_spent: u32,
     spell_targets: &[TargetRef],
+    live_controller: PlayerId,
 ) -> PendingSpellResolution {
     let obj = state.objects.get(&entry.id);
     let cast_from_zone = ability
@@ -1046,7 +1064,11 @@ fn pending_spell_resolution_snapshot(
         object_id: entry.id,
         // CR 608.2c: the mid-resolution pause snapshot must carry the same live-controller
         // answer the resolution path uses, or a paused stolen spell resumes for the caster.
-        controller: stack_object_controller(state, entry),
+        // Passed in by the caller (`resolve_top`'s `live_controller`, read while the object
+        // was still on the stack) rather than re-derived here — a fresh
+        // `stack_object_controller` read at this point in `resolve_top` would be
+        // battlefield-scoped (see the doc comment above).
+        controller: live_controller,
         casting_variant,
         cast_from_zone,
         // CR 601.2a: "that player becomes its controller" — the CASTER, a historical fact
@@ -2260,6 +2282,7 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                                         casting_variant,
                                         actual_mana_spent,
                                         &spell_targets,
+                                        live_controller,
                                     ));
                                     events.push(GameEvent::StackResolved {
                                         object_id: entry.id,
@@ -2412,6 +2435,7 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                         casting_variant,
                         actual_mana_spent,
                         &spell_targets,
+                        live_controller,
                     ));
                     state.waiting_for =
                         super::replacement::replacement_choice_waiting_for(player, state);
@@ -2656,6 +2680,7 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                                 casting_variant,
                                 actual_mana_spent,
                                 &spell_targets,
+                                live_controller,
                             ));
                             state.waiting_for = wf;
                         }

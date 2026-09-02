@@ -2958,10 +2958,21 @@ pub(crate) fn apply_pending_spell_resolution(
         }
     }
 
+    // CR 709.5d / CR 702.185a + CR 603.7d: both of these are KEEP-classified
+    // consumers of the historical cast-time controller (`entry.controller` on
+    // the unpaused `stack.rs` path — the same known limitation noted there),
+    // NOT the live/CR 608.2c re-stamped controller `ctx.controller` carries.
+    // Reading `ctx.controller` here would make a warp/Room rider resolve under
+    // a DIFFERENT controller than the unpaused path resolves it under,
+    // depending only on whether the resolution paused for a choice.
+    // `cast_controller` is always `Some` (set unconditionally in
+    // `pending_spell_resolution_snapshot`); the fallback only guards the type.
+    let cast_time_controller = ctx.cast_controller.unwrap_or(ctx.controller);
+
     super::room::unlock_door_designation(
         state,
         ctx.object_id,
-        ctx.controller,
+        cast_time_controller,
         crate::game::game_object::RoomDoor::Left,
         events,
     );
@@ -2974,7 +2985,12 @@ pub(crate) fn apply_pending_spell_resolution(
                 .any(|k| matches!(k, crate::types::keywords::Keyword::Warp(_)))
         });
         if has_warp {
-            super::stack::create_warp_delayed_trigger(state, ctx.object_id, ctx.controller, events);
+            super::stack::create_warp_delayed_trigger(
+                state,
+                ctx.object_id,
+                cast_time_controller,
+                events,
+            );
         }
     }
 

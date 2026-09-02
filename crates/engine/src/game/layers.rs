@@ -2632,7 +2632,7 @@ pub fn evaluate_layers(state: &mut GameState) {
     // `state.stack.iter().map(|e| e.id)`, so enumerating the entries directly here visits
     // the identical set while also carrying each entry's CR 112.2 default.
     //
-    // CR 608.2g: the POPPED-but-still-Zone::Stack entry exposed through
+    // CR 608.2m: the POPPED-but-still-Zone::Stack entry exposed through
     // `state.resolving_stack_entry` is not in `state.stack`, yet BOTH stack-object
     // enumerators add it back under exactly this guard —
     // `targeting::targetable_stack_spell_entries` and
