@@ -166,6 +166,7 @@ mod crackle_with_power;
 mod craft_tithing_blade_transform;
 mod crime_tracking;
 mod cross_line_instead_override_branch;
+mod cross_slot_target_binding;
 mod crossway_troublemakers_attacking_keywords;
 mod culling_scales_lowest_mana_value_target;
 mod cultivate_split_destination;
