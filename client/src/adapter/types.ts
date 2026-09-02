@@ -1795,6 +1795,10 @@ export interface StackEntryDisplay {
   paid?: StackPaidFactView[];
   trigger_context?: TriggerContextDisplay[];
   provenance?: SyntheticTriggerProvenance;
+  /** The live controller (CR 112.2 + CR 613.1b). `StackEntry.controller` stays the
+   * by-default caster; optional because `PlayerId::default()` is a real seat rather
+   * than a sentinel, so a missing value must fall back to `entry.controller`, not seat 0. */
+  controller?: PlayerId;
 }
 
 // ── Pending Cast (for target selection) ──────────────────────────────────

@@ -943,6 +943,36 @@ fn do_eliminate(
     // one unjournalable mutation; removing by position instead records each
     // entry with the index it occupied at the moment IT was removed, so a replay
     // reproduces both the count and the surviving entries' relative order.
+    //
+    // MEASURED ORDERING: this sweep runs INSIDE `do_eliminate`, while
+    // `end_control_effects_for_leaving_players` (CR 800.4a's later "then, if
+    // that player controlled any objects on the stack not represented by cards,
+    // those objects cease to exist" step and the subsequent control-effect-end
+    // step) runs AFTER every `do_eliminate` call in
+    // `eliminate_players_simultaneously`. So at the moment this predicate runs,
+    // `entry.controller` IS CR 800.4a's post-step-1 "still controlled" answer —
+    // the departing player's own by-default control, before any control effect
+    // they granted or received has been unwound.
+    //
+    // DO NOT SWITCH THIS TO THE LIVE CONTROLLER (`stack::stack_object_controller`).
+    // That breaks in BOTH directions: a departing THIEF (who stole a spell via a
+    // layer-2 control change) would wrongly have the reverted spell removed by
+    // this sweep, when CR 800.4a says the spell should simply revert to its
+    // by-default controller and stay on the stack; and a departing CASTER+OWNER
+    // whose spell was stolen would be MISSED by this sweep (the live controller
+    // is the thief, not `player`), leaving it to fall through to the owned-exile
+    // leg below with a different disposition than CR 800.4a's stack-removal step
+    // gives it.
+    //
+    // KNOWN LIMITATION (CR 800.4a), out of run: a Gonti-class cast (owner !=
+    // caster) + a survivor's steal + the CASTER's elimination is not correctly
+    // handled by either sweep — `end_control_effects_for_leaving_players`'s
+    // battlefield-only reach and this loop's position inside `do_eliminate`
+    // (before the control effect ends) are the seam. Closing it means relocating
+    // this sweep past the control-effect end across the CR 733 `leave_node`
+    // boundary and re-ordering `abandon_pending_spell_casts` — a separate unit
+    // with its own gate run. No behavioral change here; the predicate is
+    // untouched.
     let mut abandoned_spell_ids = Vec::new();
     while let Some(idx) = state
         .stack

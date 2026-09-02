@@ -105,6 +105,13 @@ pub struct StackEntryDisplay {
     /// stack provenance surface consumed by the frontend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<SyntheticTriggerProvenance>,
+    /// CR 112.2 + CR 613.1b: the LIVE controller of this stack object, as
+    /// `stack::stack_object_controller` derives it. The wire `StackEntry.controller`
+    /// stays the CR 112.2 by-default controller (rules state, replay-load-bearing);
+    /// this is the engine's answer to "who controls it right now", so the display layer
+    /// renders one engine-provided value and never picks between two.
+    #[serde(default)]
+    pub controller: PlayerId,
 }
 
 /// A single player-affecting condition the HUD surfaces as a status icon.
@@ -2666,6 +2673,7 @@ fn stack_entry_detail(state: &GameState, entry: &StackEntry) -> StackEntryDispla
             | StackEntryKind::ActivatedAbility { .. }
             | StackEntryKind::KeywordAction { .. } => None,
         },
+        controller: super::stack::stack_object_controller(state, entry),
     }
 }
 
@@ -4977,6 +4985,7 @@ mod tests {
             paid: Vec::new(),
             trigger_context: Vec::new(),
             provenance: None,
+            controller: PlayerId(0),
         };
         let empty_json = serde_json::to_string(&empty).expect("serialize empty display");
         assert!(

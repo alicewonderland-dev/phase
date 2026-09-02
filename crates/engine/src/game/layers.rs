@@ -2612,18 +2612,88 @@ pub fn evaluate_layers(state: &mut GameState) {
     // Toxic) would accumulate one instance per evaluation, and a grant would outlive the
     // transient continuous effect that produced it.
     //
-    // Scoped narrowly to `keywords`: remote type-changing effects use
+    // Scoped narrowly to `{keywords, controller}`: remote type-changing effects use
     // `reset_remote_type_layer_recipients` above, which resets only their prior
     // recipients and therefore preserves independent cast-time state on every
     // other stack object. Extend the relevant reset authority before landing a
     // static that modifies another stack characteristic.
-    let stack_ids = super::targeting::zone_object_ids(state, crate::types::zones::Zone::Stack);
-    for id in stack_ids {
+    //
+    // CR 112.2 + CR 613.1: a spell's controller is, BY DEFAULT, the player who put it on
+    // the stack; every applicable continuous effect is then applied on top, starting from
+    // that base. Stack objects sit outside the battlefield reset loop above, so without
+    // this seed a layer-2 control change (CR 613.1b) applied to a spell is a STICKY
+    // ONE-SHOT — measured: it survives removal of its own effect, so it outlives its own
+    // expiry — and a spell cast from a zone its caster does not own keeps the OWNER as its
+    // controller, contradicting CR 112.2. Scoped to `controller` alongside `keywords` for
+    // the same stated reason: extend this reset set before landing a static that modifies
+    // another stack characteristic.
+    //
+    // `targeting::zone_object_ids(state, Zone::Stack)` is defined as exactly
+    // `state.stack.iter().map(|e| e.id)`, so enumerating the entries directly here visits
+    // the identical set while also carrying each entry's CR 112.2 default.
+    //
+    // CR 608.2g: the POPPED-but-still-Zone::Stack entry exposed through
+    // `state.resolving_stack_entry` is not in `state.stack`, yet BOTH stack-object
+    // enumerators add it back under exactly this guard —
+    // `targeting::targetable_stack_spell_entries` and
+    // `filter::matches_stack_target_filter`. A controller value those two read must be one
+    // this reset maintains, or a mid-resolution exchange's expiry leaves it stale. Mirror
+    // their fallback verbatim rather than arguing the window is unreachable.
+    let stack_bases: Vec<(ObjectId, PlayerId)> = state
+        .stack
+        .iter()
+        .map(|e| (e.id, e.controller))
+        .chain(
+            state
+                .resolving_stack_entry
+                .iter()
+                .filter(|entry| {
+                    state
+                        .objects
+                        .get(&entry.id)
+                        .is_some_and(|obj| obj.zone == Zone::Stack)
+                        && !state.stack.iter().any(|live| live.id == entry.id)
+                })
+                .map(|e| (e.id, e.controller)),
+        )
+        .collect();
+    for (id, base) in stack_bases {
         if let Some(obj) = state.objects.get_mut(&id) {
             obj.sync_missing_base_characteristics();
-            obj.keywords = obj.base_keywords.clone();
+            obj.keywords = obj.base_keywords.clone(); // pre-existing, unchanged
+                                                      // CR 109.4 (r5/§F-1): "Only objects on the stack or on the battlefield
+                                                      // have a controller." This loop enumerates STACK ENTRY ids
+                                                      // (`zone_object_ids(.., Zone::Stack)` is `state.stack.iter().map(|e| e.id)`,
+                                                      // unfiltered), and the CR 601.2a announcement puts the ENTRY on the stack
+                                                      // while the OBJECT is still in its origin zone until cast finalization —
+                                                      // MEASURED: a full pass forced at a real `TargetSelection` pause visits an
+                                                      // object living in `Zone::Exile`. Writing a controller there would stamp the
+                                                      // caster onto an opponent-owned card in Exile, which no rule gives a
+                                                      // controller and which `filter::is_owner_scoped_zone` (Hand | Library |
+                                                      // Graveyard) does NOT shield. Guard verbatim the way the `.chain()` above and
+                                                      // both stack-object enumerators guard — `targeting::targetable_stack_spell_
+                                                      // entries` and `filter::matches_stack_target_filter`'s `or_else` — so the seed
+                                                      // and its consumers agree by construction. Scoped to this write: the keyword
+                                                      // reset above keeps its pre-existing unguarded shape.
+            if obj.zone == Zone::Stack {
+                obj.controller = base; // NEW
+            }
         }
     }
+    // KNOWN LIMITATION (CR 109.4): this seed maintains a stack object's
+    // controller on the way IN. Nothing resets `controller` on the way OUT:
+    // `zones::move_to_zone` calls `reset_for_battlefield_exit` only under
+    // `from == Zone::Battlefield`, and that function writes
+    // `base_controller = Some(owner)`, not `controller`. So a STOLEN SPELL that
+    // exiles on resolution (rebound's CR 702.88a exile, paradigm's "Exile this
+    // spell" per CR 702.192a, an exile rider) reaches Zone::Exile still carrying
+    // the THIEF as `obj.controller` — and Exile takes the controller-scoped
+    // route, because `filter::is_owner_scoped_zone` is Hand | Library |
+    // Graveyard. This is a PRE-EXISTING class extended, not a new one: a stolen
+    // permanent that is exiled already leaves the same stale controller today,
+    // which `effects/change_zone.rs` documents at its own site. Graveyard and
+    // Hand exits are shielded by `is_owner_scoped_zone`. Closing it means giving
+    // the stack exit its own reset, a separate unit with its own gate run.
 
     // CR 611.2 + CR 613.1: Rebuild the static-effect-source index from the
     // just-reset base `static_definitions` so the Copy / main gathers below
@@ -4180,6 +4250,16 @@ fn prepare_incremental_flush(
             &active_effects,
         )
         || any_active_static_condition_perturbed_by_entry(state, entered_ids)
+        // CR 613.1 + CR 613.1b: the incremental arm re-derives only BATTLEFIELD recipients
+        // (`incremental_recipient_ids`), so a continuous effect naming a STACK object as a
+        // recipient would leave that object's controller at whatever the last full pass wrote
+        // — stale the moment the effect's duration expires or a later CR 613.7 timestamp wins.
+        // Escalate to the full pass rather than skip. `continuous_effect_scan_zones` already
+        // resolves `SpecificObject` to the object's LIVE zone, so this is the same authority
+        // the apply step uses, not a second one.
+        || active_effects.iter().any(|effect| {
+            continuous_effect_scan_zones(state, &effect.affected_filter).contains(&Zone::Stack)
+        })
     {
         return None;
     }
@@ -7804,7 +7884,10 @@ fn unstarted_effect_generator_is_suppressed(
 /// * `Battlefield` — `seed_live_characteristics_from_base` resets the full characteristic set.
 /// * `Hand` — CR 702.94a hand-zone keyword grants; keywords-only reset.
 /// * `Stack` — CR 613.1 stack-object keyword grants (Taigam's rebound, Waystone's mobilize, and
-///   `StackSpell`-filtered statics); keywords-only reset.
+///   `StackSpell`-filtered statics); `{keywords, controller}` reset. CR 112.2: this pass also
+///   reseeds each stack object's controller from its `StackEntry` default; this predicate
+///   governs the KEYWORD half only, and is consulted solely by the keyword-materialization
+///   filter below.
 ///
 /// Every OTHER zone (library, graveyard, exile) is owned by `off_zone_characteristics`, which
 /// computes keywords ON DEMAND from base + active effects and never materializes them.

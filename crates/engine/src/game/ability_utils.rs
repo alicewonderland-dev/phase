@@ -24,6 +24,7 @@ use crate::types::zones::Zone;
 use super::engine::EngineError;
 use super::players;
 use super::quantity::resolve_quantity_with_targets;
+use super::stack::stack_object_controller;
 use super::targeting;
 use super::triggers;
 
@@ -711,11 +712,18 @@ pub fn parent_target_controller(ability: &ResolvedAbility, state: &GameState) ->
         // to exist per CR 704.5d before the chained "that player discards"
         // resolves — fall back to last-known information so the player anaphor
         // still resolves.
+        // CR 109.4: "Only objects on the stack or on the battlefield have a
+        // controller." The rung matches by `entry.id == id || entry.source_id
+        // == id` — a spell's `source_id == entry.id` (measured), so
+        // `stack_object_controller` is correct on both arms: it reads the
+        // spell's live controller when the object is on the stack, and falls
+        // back to `entry.controller` (CR 113.8) for an ability entry, which has
+        // no `state.objects` row.
         TargetRef::Object(id) => state
             .stack
             .iter()
             .find(|entry| entry.id == *id || entry.source_id == *id)
-            .map(|entry| entry.controller)
+            .map(|entry| stack_object_controller(state, entry))
             .or_else(|| {
                 let obj_opt = state.objects.get(id);
                 // CR 608.2h: reset_for_battlefield_exit() reverts `controller`

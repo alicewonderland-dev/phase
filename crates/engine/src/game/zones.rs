@@ -1453,9 +1453,34 @@ pub(crate) fn move_to_zone_with_entry_flags(
         || from == Zone::Battlefield
         || to == Zone::Hand
         || from == Zone::Hand
+        || to == Zone::Stack
         || static_dependency_before
         || static_dependency_after
     {
+        //   - CR 601.2a + CR 611.2f: "a player first moves that card ... to the
+        //     stack. ... Any continuous effects that modify the characteristics of
+        //     the spell as you start casting it BEGIN AS IT IS PUT ON THE STACK."
+        //     The stack pass in `evaluate_layers` is what performs that beginning —
+        //     it resets each stack object to its base and re-applies every
+        //     applicable continuous effect (CR 613.1), including the CR 112.2
+        //     controller seed and the pre-existing CR 613.1 keyword grants the loop
+        //     already serves (Taigam's rebound, Waystone's mobilize, StackSpell-
+        //     filtered statics). Before this term, only a HAND origin marked, via
+        //     `from == Zone::Hand`; Exile -> Stack, Graveyard -> Stack and
+        //     Command -> Stack satisfied no disjunct and ran NO pass at all
+        //     (Exile and Graveyard MEASURED; Command follows the same `else if`
+        //     arm by inspection), so a spell cast from a zone its caster does not own kept
+        //     the OWNER as its controller, contradicting CR 112.2, and a live
+        //     keyword grant naming that spell was never applied.
+        //     COST: `ZoneMoveRequest::casting_to_stack` is the one constructor that
+        //     hardcodes `Zone::Stack`; its production callers are
+        //     `casting_costs::finalize_cast_with_phyrexian_choices_inner` (the real
+        //     cast) and `casting::project_evoke_entry_state` (a read-only projection
+        //     over a cloned state, on the AI search path, whose object is hand-origin
+        //     in practice). So the added work is ONE FULL PASS PER CAST WHOSE ORIGIN
+        //     IS Graveyard / Exile / Command / Library — zero passes today, not a
+        //     cheap pass being upgraded. Hand and Battlefield origins already mark
+        //     via `from == Zone::Hand` / `from == Zone::Battlefield`.
         crate::game::layers::mark_layers_full(state);
     }
 
