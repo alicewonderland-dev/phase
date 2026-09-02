@@ -11727,8 +11727,8 @@ fn try_parse_exchange_control_targets(span: &str) -> Option<(TargetFilter, Targe
             .ok()?;
     let target_a = parse_exchange_slot(left.trim())?;
     let mut target_b = parse_exchange_slot(right.trim())?;
-    // CR 601.2c: the relative clause attaches RIGHTWARD, to slot B, and its
-    // antecedent is slot A's declared object target. Guarded on slot A actually
+    // The relative clause attaches RIGHTWARD, to slot B, and its antecedent is
+    // slot A's declared object target. Guarded on slot A actually
     // surfacing one: `collect_target_slots`' ExchangeControl loop skips a
     // `TargetFilter::SelfRef` slot (`ability_utils.rs:2667`), so for "exchange
     // control of this artifact and target X with equal or lesser mana value"
