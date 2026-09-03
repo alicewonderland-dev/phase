@@ -500,19 +500,119 @@ fn whelming_wave_spares_every_exempted_subtype() {
     }
 }
 
-/// U3 hostile fixture — "stays in its destination class": a graveyard-origin
-/// mass return falls to the `ReturnAllToZone` arm, which does not call
-/// `apply_except_for_type_list_exclusion`. Asserts the POSITIVE shape first
-/// (a `ChangeZoneAll` graveyard->hand form over a `Typed` creature-card
-/// population), so this cannot pass vacuously on an `Effect::Unimplemented`,
-/// a `None` parse, or a renamed variant — THEN the negative: no
-/// `Non(Subtype("Zombie"))` anywhere on that target. U3 deliberately does not
-/// extend the applicator to this arm (no attested printing). Note what that
-/// costs: the drop is SILENT, not a decline — `swallow_check` has no "except
-/// for" detector, so such a card still reports supported. Unchanged from before
-/// #7451, but not honest coverage.
+/// CR 205.3a: a REJECTED `except for` tail must not emit a mass return at all.
+///
+/// `parse_except_for_type_list_suffix` declines a card name or designation
+/// ("except for Mageta") rather than emitting a vacuous `Non(Subtype("Mageta"))`.
+/// The applicator used to treat that `None` identically to "no tail present" and
+/// hand back the unchanged population — so this line produced an UNRESTRICTED
+/// mass return that would bounce Mageta itself, while still reporting supported.
+/// `swallow_check` has no "except for" detector, so nothing downstream flagged it.
+/// Raised in review of PR #8336.
+///
+/// The positive control is the sibling row below: the identical grammar with an
+/// ACCEPTED tail does produce `BounceAll`, so a failure here cannot be blamed on
+/// the sentence shape.
 #[test]
-fn graveyard_origin_mass_return_does_not_apply_the_exclusion() {
+fn rejected_except_for_tail_does_not_emit_an_unrestricted_mass_return() {
+    let def = parse_effect_chain(
+        "Return all creatures to their owners' hands except for Mageta.",
+        AbilityKind::Spell,
+    );
+
+    // Assert the HONEST outcome, not merely the absence of `BounceAll`: a bare
+    // negative would also pass if a refactor routed this onto some other wrong
+    // effect. `Unimplemented` is the coverage-honesty marker the blocker is about
+    // — the card must report unsupported, not supported-and-widened.
+    assert!(
+        matches!(&*def.effect, Effect::Unimplemented { .. }),
+        "a rejected exception tail must leave the card unsupported, got {:?}",
+        def.effect
+    );
+
+    // Positive control: the same shape with an ACCEPTED tail still parses.
+    let ok = parse_effect_chain(
+        "Return all creatures to their owners' hands except for Krakens.",
+        AbilityKind::Spell,
+    );
+    let Effect::BounceAll { target, .. } = &*ok.effect else {
+        panic!(
+            "control: an accepted tail must still produce BounceAll, got {:?}",
+            ok.effect
+        );
+    };
+    let TargetFilter::Typed(tf) = target else {
+        panic!("control: expected a Typed population, got {target:?}");
+    };
+    assert!(
+        tf.type_filters.iter().any(|f| matches!(
+            f,
+            TypeFilter::Non(inner) if matches!(**inner, TypeFilter::Subtype(ref s) if s == "Kraken")
+        )),
+        "control: the accepted tail must narrow the population, got {tf:?}"
+    );
+}
+
+/// CR 205.3a + CR 608.2c: the exclusion reaches every leg of a DISJUNCTIVE mass
+/// population, through the real parse pipeline.
+///
+/// "Return all artifacts and enchantments to their owners\' hands" (Reduce to
+/// Dreams) is the attested shape that parses to `BounceAll` over a
+/// `TargetFilter::Or`; this drives the same grammar with an `except for` tail.
+/// Before PR #8336\'s review the helper returned any non-`Typed` population
+/// untouched, so the spell would have bounced the exempted permanents while still
+/// reporting supported. Companion to the helper-level
+/// `except_for_exclusion_reaches_every_leg_of_a_disjunctive_population`; this row
+/// proves the narrowing survives `parse_effect_chain`, not just a direct call.
+///
+/// Asserts the POSITIVE shape first — `BounceAll` over an `Or` with both legs
+/// intact — so the per-leg exclusion assertions cannot pass vacuously on an
+/// `Effect::Unimplemented`, a `None` parse, or a collapsed single-leg filter.
+#[test]
+fn disjunctive_mass_return_applies_the_exclusion_to_every_leg() {
+    let def = parse_effect_chain(
+        "Return all artifacts and enchantments to their owners' hands except for Clues.",
+        AbilityKind::Spell,
+    );
+
+    let Effect::BounceAll { target, .. } = &*def.effect else {
+        panic!("expected BounceAll, got {:?}", def.effect);
+    };
+    let TargetFilter::Or { filters } = target else {
+        panic!("expected a disjunctive population to survive, got {target:?}");
+    };
+    assert_eq!(filters.len(), 2, "both legs must survive: {target:?}");
+
+    for (i, leg) in filters.iter().enumerate() {
+        let TargetFilter::Typed(tf) = leg else {
+            panic!("leg {i} is not Typed: {leg:?}");
+        };
+        assert!(
+            tf.type_filters.iter().any(|f| matches!(
+                f,
+                TypeFilter::Non(inner) if matches!(**inner, TypeFilter::Subtype(ref s) if s == "Clue")
+            )),
+            "leg {i} must carry Non(Subtype(\"Clue\")), got {tf:?}"
+        );
+    }
+}
+
+/// A graveyard-origin mass return carries its `except for` exclusion too.
+///
+/// This arm builds `ReturnAllToZone` rather than `ReturnAll`, and originally did
+/// not apply `apply_except_for_type_list_exclusion` — so the clause was parsed,
+/// reported as supported, and then silently dropped, returning the very cards it
+/// named. Raised in review of PR #8336. The exclusion is a POPULATION filter
+/// (CR 205.3a + CR 608.2c), so it narrows the same set whichever zone the
+/// resolver scans; "no attested printing" was a statement about reach, not
+/// correctness, and reach is the wrong test for a clause the parser already
+/// accepts.
+///
+/// Asserts the POSITIVE shape first — a `ChangeZoneAll` graveyard->hand form over
+/// a `Typed` creature-card population — so the exclusion assertion cannot pass
+/// vacuously on an `Effect::Unimplemented`, a `None` parse, or a renamed variant.
+#[test]
+fn graveyard_origin_mass_return_applies_the_exclusion() {
     let def = parse_effect_chain(
         "Return all creature cards from your graveyard to your hand except for Zombies.",
         AbilityKind::Spell,
@@ -538,13 +638,15 @@ fn graveyard_origin_mass_return_does_not_apply_the_exclusion() {
         "population must be creature cards, got {tf:?}"
     );
 
-    // Negative: the "except for Zombies" clause must NOT have been applied —
-    // this arm does not call the applicator.
+    // The exclusion must be APPLIED here, exactly as on the implicit-origin
+    // sibling. An "except for" clause is a POPULATION filter; it narrows the same
+    // set whichever zone the resolver scans. This arm used to drop it silently and
+    // return the exempted cards anyway (PR review of issue #7451).
     assert!(
-        !tf.type_filters.iter().any(|f| matches!(
+        tf.type_filters.iter().any(|f| matches!(
             f,
             TypeFilter::Non(inner) if matches!(**inner, TypeFilter::Subtype(ref s) if s == "Zombie")
         )),
-        "the graveyard-origin arm must NOT apply the except-for exclusion, got {tf:?}"
+        "the graveyard-origin arm must apply the except-for exclusion, got {tf:?}"
     );
 }

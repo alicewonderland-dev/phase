@@ -9280,16 +9280,20 @@ fn parse_event_phrase<'a>(
 fn parse_event_verb_start(input: &str) -> OracleResult<'_, ()> {
     let combat_or_zone = alt((
         parse_event_word("dies"),
-        parse_event_phrase("die "),
-        parse_event_phrase("deals "),
-        parse_event_phrase("deal "),
+        parse_event_word("die"),
+        parse_event_word("deals"),
+        parse_event_word("deal"),
         parse_event_word("enters"),
-        parse_event_phrase("enter "),
+        parse_event_word("enter"),
         parse_event_word("attacks"),
-        parse_event_phrase("attack "),
+        parse_event_word("attack"),
         parse_event_word("blocks"),
-        parse_event_phrase("block "),
+        parse_event_word("block"),
         parse_event_word("leaves"),
+        // Left as a bare `tag` deliberately: "into" is always followed by a zone
+        // name, so this phrase can never sit at a comma/period/EOF boundary and
+        // needs no peek. (Not a limitation of `parse_event_word` — the passive
+        // forms just below are multi-word and do use it.)
         parse_event_phrase("is put into"),
     ));
     let passive_player_actions = alt((
@@ -9340,6 +9344,12 @@ fn parse_event_verb_start(input: &str) -> OracleResult<'_, ()> {
         // CR 702.100b + CR 701.44b: SimpleEvent verbs that may appear in
         // compound triggers (e.g. "~ evolves or dies").
         parse_event_word("evolves"),
+        // NOT given `parse_event_word` twins in PR #8336: "explore" IS a
+        // `PREDICATE_VERBS` entry, so a bare comma-terminated "explore," would hit
+        // the same defect the combat verbs just had. Deferred deliberately —
+        // zero corpus trigger lines carry either form at a comma, and each
+        // lexicon widening moves cards through the other event-head consumers,
+        // so it wants its own measured change.
         parse_event_phrase("evolve "),
         parse_event_word("explores"),
         parse_event_phrase("explore "),
@@ -9398,7 +9408,7 @@ fn parse_event_verb_start(input: &str) -> OracleResult<'_, ()> {
 /// combinator is CALL-SITE SCOPE: most of the head lexicon's consultation sites must
 /// stay NARROW (`parse_event_head_start` carries the census, its counting unit and the
 /// grep that regenerates it), so the state-change voices are composed only at the WIDE
-/// ones. `parse_event_verb_start` is left byte-identical.
+/// ones.
 ///
 /// TWO productions, one per grammatical voice. The ASYMMETRY IS MEASURED, NOT DERIVED:
 ///   * `is`/`are` consults `parse_non_event_complement` because TWO LIVE CORPUS CARDS
@@ -9983,11 +9993,15 @@ fn parse_combat_damage_to_player(input: &str) -> OracleResult<'_, ()> {
 ///
 /// This bounds WHERE THE SCAN STOPS, never what a parser is handed: pass 2 always
 /// evaluates `parse_event_head_start` on the full, unbounded tail. Handing the
-/// event parser a truncated slice would be unsound — `parse_event_phrase` (this
-/// file) is a bare `tag(phrase)` with no boundary peek, so a slice ending
-/// right after "deals"/"cast"/"draw"/... loses the Event match and the same word
-/// is re-read as a `PREDICATE_VERBS` hit, i.e. a SHRINKING window could flip a
-/// verdict toward `true`. See the monotonicity paragraph on
+/// event parser a truncated slice would be unsound: the event lexicon still
+/// contains bare-`tag` entries with no boundary peek (`parse_event_phrase`, this
+/// file — e.g. the multi-word "is put into", and "evolve "/"explore "), so a
+/// slice ending inside or right after one loses the Event match and the same word
+/// can be re-read as a `PREDICATE_VERBS` hit — a SHRINKING window could flip a
+/// verdict toward `true`. The property is structural and does not depend on which
+/// verbs currently use which form: the single-word combat verbs cited here before
+/// PR #8336 review have since been given boundary-aware `parse_event_word` twins,
+/// which is exactly why the example is stated by form rather than by verb. See the monotonicity paragraph on
 /// [`is_new_sentence_not_type_continuation`].
 fn parse_type_list_postmodifier_start(input: &str) -> OracleResult<'_, ()> {
     value((), alt((tag("that "), tag("which "), tag("with ")))).parse(input)

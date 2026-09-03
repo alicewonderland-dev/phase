@@ -13789,6 +13789,73 @@ fn find_effect_boundary_keeps_a_condition_type_list_intact() {
     }
 }
 
+/// CR 603.1: a bare event verb terminated by a COMMA is still an event head, so
+/// pass 2 must not read it as the effect clause's predicate.
+///
+/// `parse_event_word` peeks a comma/period/EOF boundary; `parse_event_phrase` is a
+/// bare `tag`, so it required a trailing SPACE. Six single-word tags were
+/// space-only and are now boundary-aware: `die`, `deal`, `deals`, `enter`,
+/// `attack`, `block` — so a
+/// plural subject ("...Rats you control attack,") failed the event test at the
+/// comma, `normalize_verb_token` trimmed it to `attack`, a `PREDICATE_VERBS` entry,
+/// and pass 2 moved the boundary to the FIRST list comma — leaving `Whenever Birds`
+/// as the entire trigger subject. Found in review of PR #8336.
+///
+/// SCOPE, stated precisely. This pins that the first list comma is not taken. It
+/// does NOT pin `", draw"`: at the LAST list item the legacy pass-1 window is
+/// `"rats you control attack"`, which contains a `PREDICATE_VERBS` entry, so pass 1
+/// returns `true` there — byte-identically to the pre-#7451 code. Monotonicity
+/// forbids turning a pass-1 `true` into `false` (that is what keeps The
+/// Thanos-Copter's effect clause alive), so that split is pre-existing and out of
+/// scope here. Measured: the corpus boundary census moves ZERO cards between this
+/// fix and the head before it, so no printed card is in either shape.
+#[test]
+fn comma_terminated_bare_event_verb_is_an_event_head_not_a_predicate() {
+    for (line, first_list_comma, expected_suffix) in [
+        (
+            "whenever birds, frogs, otters, and rats you control attack, draw a card.",
+            ", frogs, otters",
+            ", and rats you control attack, draw a card.",
+        ),
+        (
+            "whenever birds, frogs, and rats you control block, draw a card.",
+            ", frogs, and rats",
+            ", and rats you control block, draw a card.",
+        ),
+    ] {
+        let boundary = find_effect_boundary(line).expect("effect boundary");
+        assert!(
+            !line[boundary..].starts_with(first_list_comma),
+            "the boundary must not fall at the FIRST list comma — the bare event \
+             verb is an event head, not a predicate; got {:?} for {line:?}",
+            &line[boundary..]
+        );
+        // Pin the exact landing point too: "not the first comma" would also be
+        // satisfied by the second, which is equally wrong. This is the LAST list
+        // comma — the pre-existing pass-1 split described above.
+        assert_eq!(
+            &line[boundary..],
+            expected_suffix,
+            "boundary must land on the last list comma for {line:?}"
+        );
+    }
+
+    // Control, not a pass-2 reach-guard: this line is claimed earlier by
+    // `type_phrase_continues_to_combat_damage_player_event`, which short-circuits
+    // before `is_new_sentence_not_type_continuation` runs. It pins that the
+    // space-terminated form is unchanged by the lexicon edit. The rows above are
+    // discriminating on their own — under the pre-fix code both land on the first
+    // list comma and both assertions fail.
+    let spaced =
+        "whenever birds, frogs, and rats you control deal combat damage to a player, draw a card.";
+    let b = find_effect_boundary(spaced).expect("effect boundary");
+    assert!(
+        spaced[b..].starts_with(", draw"),
+        "the space-terminated form must keep the whole list in the condition, got {:?}",
+        &spaced[b..]
+    );
+}
+
 /// Issue #7451: a condition-side Oxford type list — the trigger's SUBJECT, not
 /// its effect — must stay exactly where it is today. These cards remain
 /// `TriggerMode::Unknown`; turning them green is out of scope for #7451.
