@@ -2745,11 +2745,13 @@ fn collect_target_slots_inner(
     // invariant fires.)
     //
     // CR 608.2k: `is_context_ref()` is a SUPERSET of what `targeting::
-    // resolved_targets` owns an early tier for. Its tier-owned set here is
-    // `SelfRef` (tier 1) and the `is_pure_event_context_filter` group, which
-    // covers `TriggeringSource` — i.e. every filter the corpus actually
-    // produces in an `ExchangeControl` slot (verified: 30 cards, only
-    // `SelfRef` / `TriggeringSource` / `Typed` / `And` / `Or`). Any OTHER
+    // resolved_targets` owns an early tier for. The tier-owned set is
+    // `SelfRef`, `SourceOrPaired`, `CostPaidObject`, `AmassedArmy`,
+    // `ParentTarget{,Slot}`, and the whole `is_pure_event_context_filter`
+    // group; of those, `SelfRef` and `TriggeringSource` are the only two the
+    // corpus actually produces in an `ExchangeControl` slot (verified: 30
+    // cards, only `SelfRef` / `TriggeringSource` / `Typed` / `And` / `Or`).
+    // Any OTHER
     // member of the superset — `None`, `LastCreated`, `TrackedSet`,
     // `Neighbor`, ... — has no tier here and falls through to
     // `resolved_targets`' terminal `ability.targets.clone()`, which means it

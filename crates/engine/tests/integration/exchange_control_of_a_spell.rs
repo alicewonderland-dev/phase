@@ -575,11 +575,19 @@ fn gilded_drake_sole_target_that_stops_matching_its_filter_stops_the_ability() {
         .card_types
         .core_types = vec![CoreType::Artifact];
 
+    let validated = validate_targets_in_chain(&state, &ability);
     assert!(
-        validate_targets_in_chain(&state, &ability)
-            .targets
-            .is_empty(),
+        validated.targets.is_empty(),
         "CR 608.2b: a target that no longer matches its filter is illegal, so this ability's \
-         only target is illegal and it does not resolve"
+         only target is illegal"
+    );
+    // ...and carry the claim the test's name makes all the way to the
+    // disposition rather than stopping one inference short of it. CR 608.2b:
+    // all targets illegal ⇒ the ability doesn't resolve, so the "otherwise
+    // sacrifice this creature" rider never runs. Asserting it here also fails
+    // loudly if `check_fizzle`'s contract changes underneath this row.
+    assert!(
+        engine::game::targeting::check_fizzle(&[TargetRef::Object(victim)], &validated.targets),
+        "CR 608.2b: with its only target illegal the ability does not resolve"
     );
 }

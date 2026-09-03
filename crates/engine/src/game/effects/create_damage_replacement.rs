@@ -177,7 +177,29 @@ pub fn resolve(
     // Monolith) consumes the first slot and the redirect reads the SECOND. Both
     // the index arithmetic AND the shield host must come from this one
     // predicate — deriving only the index here would host the shield on the
-    // redirect destination for any non-`SelfRef` context ref. The REDIRECT
+    // redirect destination for any non-`SelfRef` context ref.
+    //
+    // SCOPE OF THAT GUARANTEE (mirrors the note in `exchange_control.rs`):
+    // routing through `resolved_targets` avoids that outcome only for the
+    // filters it owns a TIER for — `SelfRef`, `SourceOrPaired`,
+    // `CostPaidObject`, `AmassedArmy`, `ParentTarget{,Slot}`, and the
+    // `is_pure_event_context_filter` group. `is_context_ref()` admits more
+    // than that, and a member without a tier falls through to
+    // `resolved_targets`' terminal `ability.targets.clone()`, whose first
+    // object IS `targets[0]` — the redirect destination. Same wrong host, by
+    // a different route, and `recipient_host.is_none()` does not catch it
+    // because the host is `Some`.
+    //
+    // This is the seam where that is likeliest to become reachable: CR 615.5
+    // gives the damage-replacement domain its own anaphors, and two of them —
+    // `ControllerAndControlledPermanents` ("you and permanents you control", a
+    // natural recipient) and `PostReplacementDamageSource` — have NO tier
+    // today. Note `PostReplacementDamageSource` is the one `PostReplacement*`
+    // filter absent from `is_pure_event_context_filter` while its three
+    // siblings are present. A new context-ref recipient must be given a tier
+    // in `resolved_targets` before it appears in a parse.
+    //
+    // The REDIRECT
     // position is declared by construction (`DamageRedirectTarget::
     // ChosenObjectTarget`), so `chosen_redirect_object` needs no matching
     // predicate.

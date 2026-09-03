@@ -64,8 +64,10 @@ pub fn resolve(
     // resolver here.
     //
     // SCOPE OF THAT GUARANTEE: it holds for the filters `resolved_targets`
-    // owns a tier for — `SelfRef` and the `is_pure_event_context_filter` group
-    // (which covers `TriggeringSource`). Those are the only context refs the
+    // owns a tier for — `SelfRef`, `SourceOrPaired`, `CostPaidObject`,
+    // `AmassedArmy`, `ParentTarget{,Slot}`, and the
+    // `is_pure_event_context_filter` group (which covers `TriggeringSource`).
+    // Of those, `SelfRef` and `TriggeringSource` are the only context refs the
     // corpus produces in an `ExchangeControl` slot. `is_context_ref()` admits
     // more than that, and any filter WITHOUT a tier falls through to
     // `resolved_targets`' terminal `ability.targets.clone()` — so it would
