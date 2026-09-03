@@ -25,6 +25,23 @@ const SUDDEN_SUBSTITUTION_TEXT: &str = "Split second (As long as this spell is o
     control of target noncreature spell and target creature. Then the spell's controller may \
     choose new targets for it.";
 
+/// The unrestricted single-target pump clause. A TARGETED triggering spell is
+/// required for the Chimera rows: `change_targets` takes its
+/// `current_targets.is_empty()` no-op arm for a vanilla creature spell, which
+/// makes the retarget prompt structurally unreachable and the assertion vacuous.
+const PUMP_TEXT: &str = "Target creature gets +1/+1 until end of turn.";
+
+/// Verbatim from `client/public/card-data.json`.
+const GILDED_DRAKE_TEXT: &str = "Flying\nWhen this creature enters, exchange control of this \
+    creature and up to one target creature an opponent controls. If you don't or can't make an \
+    exchange, sacrifice this creature. This ability still resolves if its target becomes illegal.";
+
+/// The generic "steal a creature for the turn" clause, used to stage the CR
+/// 701.12b same-controller collision through a REAL continuous effect. Writing
+/// `state.objects[drake].controller = P1` directly does not work: the layer
+/// flush at the end of resolution reverts it before any assertion can read it.
+const GAIN_CONTROL_TEXT: &str = "Gain control of target creature until end of turn.";
+
 /// Pass priority until the current committed cast's next trigger raises its
 /// own `OptionalEffectChoice`, or panic with a diagnosable message if the
 /// stack empties first.
@@ -426,6 +443,13 @@ fn perplexing_chimera_declined_trigger_changes_nothing() {
 /// trigger — CR 701.12a: no part of the exchange occurs. The SelfRef source
 /// is no longer current (CR 400.7), so `targeting::resolved_targets` binds
 /// it to nothing rather than a stale id.
+///
+/// The triggering spell is a TARGETED one. With the vanilla creature spell
+/// this row used to cast, `change_targets` took its `current_targets.is_empty()`
+/// no-op arm and the retarget prompt was structurally unreachable — so the row
+/// could not observe the "If you do" defect at all. A targeted spell makes the
+/// prompt reachable, which is what turns the added assertion below into a real
+/// discriminator rather than a tautology.
 #[test]
 fn perplexing_chimera_destroyed_in_response_to_its_own_trigger_is_a_total_noop() {
     let mut scenario = GameScenario::new();
@@ -433,8 +457,10 @@ fn perplexing_chimera_destroyed_in_response_to_its_own_trigger_is_a_total_noop()
     let chimera = scenario
         .add_creature_from_oracle(P0, "Perplexing Chimera", 3, 3, PERPLEXING_CHIMERA_TEXT)
         .id();
-    let grizzly_bears = scenario
-        .add_creature_to_hand_from_oracle(P1, "Grizzly Bears", 2, 2, "")
+    let p0_bear = scenario.add_creature(P0, "P0 Bear", 2, 2).id();
+    let p1_bear = scenario.add_creature(P1, "P1 Bear", 2, 2).id();
+    let pump = scenario
+        .add_spell_to_hand_from_oracle(P1, "Giant Growth", true, PUMP_TEXT)
         .with_mana_cost(ManaCost::zero())
         .id();
 
@@ -445,7 +471,7 @@ fn perplexing_chimera_destroyed_in_response_to_its_own_trigger_is_a_total_noop()
         state.priority_player = P1;
         state.waiting_for = WaitingFor::Priority { player: P1 };
     }
-    let mut commit = runner.cast(grizzly_bears).commit();
+    let mut commit = runner.cast(pump).target_objects(&[p1_bear]).commit();
     advance_to_optional_choice(&mut commit);
     match commit.state().waiting_for {
         WaitingFor::OptionalEffectChoice { source_id, .. } => {
@@ -473,9 +499,212 @@ fn perplexing_chimera_destroyed_in_response_to_its_own_trigger_is_a_total_noop()
         "CR 701.12a: no part of the exchange occurs once the SelfRef source is gone"
     );
     assert_eq!(
-        commit.state().objects.get(&grizzly_bears).unwrap().zone,
+        commit.state().objects.get(&pump).unwrap().zone,
         Zone::Stack,
-        "REACH GUARD: Grizzly Bears must still be on the stack (unresolved) at this point"
+        "REACH GUARD: the triggering spell must still be on the stack (unresolved) here"
+    );
+
+    // CR 608.2c: and no retarget offer is EVER raised, all the way to the end
+    // of the resolution. Pre-fix the accept latch left the outcome flag true,
+    // so "If you do, you may choose new targets for the spell" fired after an
+    // exchange CR 701.12a had refused. Drained by hand rather than through a
+    // declining policy, because a policy that auto-declines the second offer
+    // would answer the very prompt this row exists to prove is never raised.
+    for _ in 0..40 {
+        match &commit.state().waiting_for {
+            WaitingFor::RetargetChoice { .. } => {
+                panic!("a retarget offer was raised for an exchange that never happened")
+            }
+            WaitingFor::OptionalEffectChoice { source_id, .. } => panic!(
+                "a second optional offer was raised for an exchange that never happened \
+                 (source {source_id:?})"
+            ),
+            WaitingFor::Priority { .. } => {
+                if commit.state().stack.is_empty() {
+                    break;
+                }
+                commit
+                    .act(GameAction::PassPriority)
+                    .expect("PassPriority should succeed while draining");
+            }
+            other => panic!("unexpected state while draining to the end: {other:?}"),
+        }
+    }
+
+    // REACH GUARD: the spell really did resolve for its own caster, so the
+    // drain above was not short-circuited by a fizzle.
+    assert_eq!(
+        commit.state().objects.get(&pump).unwrap().zone,
+        Zone::Graveyard,
+        "REACH GUARD: the triggering spell must have resolved"
+    );
+    assert_eq!(
+        commit.state().objects.get(&p0_bear).unwrap().controller,
+        P0,
+        "P0's creature was never part of any exchange"
+    );
+    assert_eq!(commit.state().objects.get(&p1_bear).unwrap().controller, P1);
+}
+
+// ---------------------------------------------------------------------------
+// V1 / V2 — an accepted Chimera trigger whose exchange did not occur
+// ---------------------------------------------------------------------------
+
+/// V1 — CR 701.12a + CR 608.2c: accepting the Chimera's "you may exchange
+/// control of this creature and that spell" does NOT entitle you to the
+/// printed "If you do, you may choose new targets for the spell" when the
+/// exchange could not be made.
+///
+/// Production entry chain: `resolve_optional_effect_decision` (accept — which
+/// LOWERS `optional` and LATCHES the performed flag true) → `resolve_ability_chain`
+/// → the resolver-verdict block → the sub descent → `evaluate_condition`'s
+/// `EffectOutcome { OptionalEffectPerformed }` arm.
+///
+/// First production branch reached: `exchange_control.rs`'s
+/// `let Some(id_a) = resolve_slot(target_a, ..) else` arm — `resolved_targets`
+/// binds nothing for `TargetFilter::SelfRef` once CR 400.7's currency check
+/// fails on a Chimera that has left the battlefield.
+///
+/// REVERT-FAILING: pre-fix, nothing downstream of the accept latch ever lowers
+/// the flag, so the gate reads true and the engine raises the "you may choose
+/// new targets" offer (itself optional, hence a SECOND `OptionalEffectChoice`)
+/// and then `RetargetChoice` — handing P0 a free retarget of an opponent's
+/// spell it never gained control of. Post-fix the sub is skipped outright.
+#[test]
+fn an_accepted_chimera_exchange_that_did_not_happen_offers_no_retarget() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let chimera = scenario
+        .add_creature_from_oracle(P0, "Perplexing Chimera", 3, 3, PERPLEXING_CHIMERA_TEXT)
+        .id();
+    let _p0_bear = scenario.add_creature(P0, "P0 Bear", 2, 2).id();
+    let p1_bear = scenario.add_creature(P1, "P1 Bear", 2, 2).id();
+    let pump = scenario
+        .add_spell_to_hand_from_oracle(P1, "Giant Growth", true, PUMP_TEXT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+
+    let mut runner = scenario.build();
+    {
+        let state = runner.state_mut();
+        state.active_player = P1;
+        state.priority_player = P1;
+        state.waiting_for = WaitingFor::Priority { player: P1 };
+    }
+    let mut commit = runner.cast(pump).target_objects(&[p1_bear]).commit();
+    advance_to_optional_choice(&mut commit);
+
+    // Destroy the Chimera in response, so the exchange CANNOT be made
+    // (CR 701.12a all-or-nothing).
+    {
+        let state = commit.state_mut();
+        let mut events = Vec::new();
+        engine::game::zones::move_to_zone(state, chimera, Zone::Graveyard, &mut events);
+    }
+    commit
+        .act(GameAction::DecideOptionalEffect { accept: true })
+        .expect("accepting the exchange must be legal");
+
+    // THE DISCRIMINATOR, read at the prompt boundary: the very next thing the
+    // engine asks for is neither the "you may choose new targets" offer nor the
+    // retarget itself.
+    match commit.state().waiting_for {
+        WaitingFor::OptionalEffectChoice { source_id, .. } => panic!(
+            "a second optional offer was raised for an exchange that never happened \
+             (source {source_id:?}) — the \"If you do\" gate read true"
+        ),
+        WaitingFor::RetargetChoice { .. } => {
+            panic!("a retarget offer was raised for an exchange that never happened")
+        }
+        _ => {}
+    }
+
+    // CO-WITNESS: nothing was exchanged.
+    assert!(
+        commit.state().transient_continuous_effects.is_empty(),
+        "CR 701.12a: no part of the exchange occurs"
+    );
+}
+
+/// V2 — V1's PAIRED POSITIVE REACH GUARD. The same board WITHOUT the destroy
+/// still reaches the retarget offer, so V1's two negatives cannot pass because
+/// the fixture never built a targeted spell or never reached the gate at all.
+#[test]
+fn an_accepted_chimera_exchange_that_happened_still_offers_the_retarget() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let chimera = scenario
+        .add_creature_from_oracle(P0, "Perplexing Chimera", 3, 3, PERPLEXING_CHIMERA_TEXT)
+        .id();
+    let p0_bear = scenario.add_creature(P0, "P0 Bear", 2, 2).id();
+    let p1_bear = scenario.add_creature(P1, "P1 Bear", 2, 2).id();
+    let pump = scenario
+        .add_spell_to_hand_from_oracle(P1, "Giant Growth", true, PUMP_TEXT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+
+    let mut runner = scenario.build();
+    {
+        let state = runner.state_mut();
+        state.active_player = P1;
+        state.priority_player = P1;
+        state.waiting_for = WaitingFor::Priority { player: P1 };
+    }
+    let mut commit = runner.cast(pump).target_objects(&[p1_bear]).commit();
+
+    let mut reached = None;
+    for _ in 0..40 {
+        match &commit.state().waiting_for {
+            WaitingFor::RetargetChoice {
+                player,
+                current_targets,
+                legal_new_targets,
+                ..
+            } => {
+                reached = Some((*player, current_targets.clone(), legal_new_targets.clone()));
+                break;
+            }
+            WaitingFor::OptionalEffectChoice { .. } => {
+                commit
+                    .act(GameAction::DecideOptionalEffect { accept: true })
+                    .expect("accepting must succeed");
+            }
+            WaitingFor::Priority { .. } => {
+                assert!(
+                    !commit.state().stack.is_empty(),
+                    "the stack emptied before the retarget offer was raised"
+                );
+                commit
+                    .act(GameAction::PassPriority)
+                    .expect("PassPriority should succeed while draining");
+            }
+            other => panic!("unexpected state while draining to the retarget offer: {other:?}"),
+        }
+    }
+    let (chooser, current, pool) = reached.expect("REACH GUARD: the retarget offer must be raised");
+
+    // REACH GUARD: the exchange really happened.
+    assert_eq!(
+        commit.state().objects.get(&chimera).unwrap().controller,
+        P1,
+        "REACH GUARD: the Chimera must have swapped to P1"
+    );
+    assert_eq!(
+        commit.state().transient_continuous_effects.len(),
+        2,
+        "CR 613.1b: the exchange installs one ChangeController effect per subject"
+    );
+
+    assert_eq!(chooser, P0, "CR 115.7: the spell's new controller chooses");
+    assert_eq!(
+        current,
+        vec![TargetRef::Object(p1_bear)],
+        "the offer is made against the spell's existing target"
+    );
+    assert!(
+        pool.contains(&TargetRef::Object(p0_bear)),
+        "an unrestricted \"target creature\" pool must offer P0's own creature too \
+         (pool was {pool:?})"
     );
 }
 
@@ -807,4 +1036,607 @@ fn chimera_retarget_pool_is_built_for_the_new_controller() {
         "the Chimera is P1's after the swap, so it must not be in P0's pool \
          (pool was {pool:?})"
     );
+}
+
+// ---------------------------------------------------------------------------
+// V5 — Gilded Drake's "if you don't or can't make an exchange" rider
+// ---------------------------------------------------------------------------
+
+/// Stage Gilded Drake's ETB trigger onto the stack with `bear` chosen as its
+/// declared target, and hand priority to P1 so a response can be cast.
+///
+/// Shared by V5 and its positive control so the two rows differ in exactly one
+/// thing — whether the response is cast — and nothing else.
+fn stage_gilded_drake_trigger(
+    runner: &mut engine::game::scenario::GameRunner,
+    drake: engine::types::identifiers::ObjectId,
+) -> CastCommit<'_> {
+    let mut commit = runner.cast(drake).commit();
+    let mut staged = false;
+    for _ in 0..40 {
+        let on_battlefield =
+            commit.state().objects.get(&drake).map(|obj| obj.zone) == Some(Zone::Battlefield);
+        if on_battlefield && commit.state().stack.len() == 1 {
+            staged = true;
+            break;
+        }
+        match commit.state().waiting_for {
+            WaitingFor::Priority { .. } => {
+                assert!(
+                    !commit.state().stack.is_empty(),
+                    "the stack emptied before the Drake's ETB trigger could be staged"
+                );
+                commit
+                    .act(GameAction::PassPriority)
+                    .expect("PassPriority should succeed while staging the trigger");
+            }
+            ref other => panic!("unexpected waiting state while staging the trigger: {other:?}"),
+        }
+    }
+    // REACH GUARD: the Drake really is on the battlefield and its ETB trigger
+    // really is on the stack, unresolved — the only window in which a response
+    // can change who controls the Drake before the exchange resolves.
+    //
+    // NOTE the trigger raises no `TriggerTargetSelection` here: "up to one
+    // target creature an opponent controls" has exactly one legal choice on
+    // this board, so the engine binds it without prompting. The two rows below
+    // assert on the bound target's disposition instead.
+    assert!(
+        staged,
+        "REACH GUARD: the Drake must be on the battlefield with its ETB trigger on the stack"
+    );
+    {
+        let state = commit.state_mut();
+        state.priority_player = P1;
+        state.waiting_for = WaitingFor::Priority { player: P1 };
+    }
+    commit
+}
+
+fn sacrifice_resolutions(
+    outcome: &engine::game::scenario::CastOutcome,
+    source: engine::types::identifiers::ObjectId,
+) -> usize {
+    use engine::types::ability::EffectKind;
+    use engine::types::events::GameEvent;
+    outcome
+        .events()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                GameEvent::EffectResolved {
+                    kind: EffectKind::Sacrifice,
+                    source_id,
+                    ..
+                } if *source_id == source
+            )
+        })
+        .count()
+}
+
+/// V5 — CR 701.12b + CR 608.2c: "If you don't or can't make an exchange,
+/// sacrifice this creature."
+///
+/// P0 casts Gilded Drake targeting P1's bear. **In response to the ETB
+/// trigger**, P1 casts "Gain control of target creature until end of turn."
+/// on the Drake itself. By the time the trigger resolves, P1 controls BOTH
+/// subjects, so CR 701.12b makes the exchange do nothing — and the printed
+/// rider must fire.
+///
+/// The declared target survives CR 608.2b re-validation because the ability's
+/// controller is still P0: **CR 603.3a** — "a triggered ability is controlled
+/// by the player who controlled its source at the time it triggered" — so a
+/// control change of the SOURCE does not re-seat it, and "target creature an
+/// opponent controls" is still read against P0. Slot A is `SelfRef`, whose
+/// currency check (CR 400.7) is zone/incarnation-based, not controller-based,
+/// so P1 gaining control of the Drake does not unbind it either.
+///
+/// **THE REVERT-FAILING ASSERTION** is the `EffectResolved { Sacrifice }` in
+/// the event trail. It cannot be a board delta: the sacrifice itself is a
+/// legitimate no-op here (CR 701.21a — the Drake's controller is P1, not the
+/// ability's controller P0, so `sacrifice::resolve`'s controller guard skips
+/// it), which makes the board BYTE-IDENTICAL pre- and post-fix. Pre-fix
+/// `mandatory_parent_effect_performed` fell into `_ => true`, the
+/// `Not(IfYouDo)` gate read false, and the sub never ran at all.
+///
+/// NEGATIVE CO-ASSERTION — no `PermanentSacrificed` at all. Once this sub
+/// actually runs, the walker propagates the parent's declared target (the
+/// BEAR) into the `Sacrifice { target: SelfRef }` sub, and only the CR 701.21a
+/// controller guard stops the Drake's rider from eating P1's bear. If that
+/// guard is ever weakened this row fails loudly instead of silently
+/// sacrificing the wrong permanent.
+#[test]
+fn gilded_drake_sacrifice_rider_fires_when_the_exchange_does_nothing() {
+    use engine::types::ability::ContinuousModification;
+    use engine::types::events::GameEvent;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let bear = scenario.add_creature(P1, "Grizzly Bears", 2, 2).id();
+    let drake = scenario
+        .add_creature_to_hand_from_oracle(P0, "Gilded Drake", 3, 3, GILDED_DRAKE_TEXT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let steal = scenario
+        .add_spell_to_hand_from_oracle(P1, "Seize the Drake", true, GAIN_CONTROL_TEXT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+
+    let mut runner = scenario.build();
+    {
+        let state = runner.state_mut();
+        state.active_player = P0;
+        state.priority_player = P0;
+        state.waiting_for = WaitingFor::Priority { player: P0 };
+    }
+
+    let mut commit = stage_gilded_drake_trigger(&mut runner, drake);
+    let outcome = commit
+        .cast(steal)
+        .target_objects(&[drake])
+        .decline_optional()
+        .resolve();
+
+    // REACH GUARD: the response actually landed, so the CR 701.12b collision
+    // this row depends on really was staged.
+    assert_eq!(
+        outcome.state().objects.get(&drake).unwrap().controller,
+        P1,
+        "REACH GUARD: P1 must control the Drake when the exchange resolves"
+    );
+    assert_eq!(
+        outcome.state().objects.get(&bear).unwrap().controller,
+        P1,
+        "REACH GUARD: the bear stays P1's, so both subjects share a controller \
+         (CR 701.12b) and the exchange does nothing"
+    );
+
+    // THE DISCRIMINATOR.
+    assert_eq!(
+        sacrifice_resolutions(&outcome, drake),
+        1,
+        "CR 608.2c: the \"if you don't or can't make an exchange\" rider must RESOLVE \
+         exactly once (events were {:?})",
+        outcome.events()
+    );
+
+    // NEGATIVE CO-ASSERTION.
+    assert!(
+        !outcome
+            .events()
+            .iter()
+            .any(|event| matches!(event, GameEvent::PermanentSacrificed { .. })),
+        "CR 701.21a: nothing may actually be sacrificed — the Drake is P1's, and the bear \
+         was never this rider's subject (events were {:?})",
+        outcome.events()
+    );
+
+    // The exchange installed no Layer-2 control effect of its own; the only
+    // transient effect present is the gain-control spell's.
+    let drake_sourced: Vec<_> = outcome
+        .state()
+        .transient_continuous_effects
+        .iter()
+        .filter(|effect| {
+            effect.source_id == drake
+                && effect
+                    .modifications
+                    .contains(&ContinuousModification::ChangeController)
+        })
+        .collect();
+    assert!(
+        drake_sourced.is_empty(),
+        "CR 701.12a/b: a no-op exchange installs no control effect of its own"
+    );
+}
+
+/// V5's PAIRED POSITIVE CONTROL — the same scenario with P1 declining to
+/// respond. The exchange genuinely happens, so the `Not(IfYouDo)` rider must
+/// NOT fire. Without this row, a fix that over-suppressed (or a fixture that
+/// never reached the trigger at all) would pass V5 silently.
+#[test]
+fn gilded_drake_sacrifice_rider_stays_silent_when_the_exchange_happens() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let bear = scenario.add_creature(P1, "Grizzly Bears", 2, 2).id();
+    let drake = scenario
+        .add_creature_to_hand_from_oracle(P0, "Gilded Drake", 3, 3, GILDED_DRAKE_TEXT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+
+    let mut runner = scenario.build();
+    {
+        let state = runner.state_mut();
+        state.active_player = P0;
+        state.priority_player = P0;
+        state.waiting_for = WaitingFor::Priority { player: P0 };
+    }
+
+    let commit = stage_gilded_drake_trigger(&mut runner, drake);
+    let outcome = commit.resolve();
+
+    // CR 701.12b: different controllers, so the exchange really happens.
+    assert_eq!(
+        outcome.state().objects.get(&drake).unwrap().controller,
+        P1,
+        "the Drake goes to the opponent"
+    );
+    assert_eq!(
+        outcome.state().objects.get(&bear).unwrap().controller,
+        P0,
+        "and their creature comes back"
+    );
+    assert_eq!(
+        sacrifice_resolutions(&outcome, drake),
+        0,
+        "CR 608.2c: an exchange that HAPPENED must not fire the \"if you don't or can't\" \
+         rider (events were {:?})",
+        outcome.events()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// V8 — blast radius of the new `ControllerChanged` event
+// ---------------------------------------------------------------------------
+
+/// Verbatim from `client/public/card-data.json`. The middle clause parses to a
+/// `TriggerMode::ChangesController` trigger with `valid_card: SelfRef` — one of
+/// only four printed producers of that mode, and the reason this row exists.
+const KHARN_TEXT: &str = "Berzerker — Khârn the Betrayer attacks or blocks each combat if \
+    able.\nSigil of Corruption — When you lose control of Khârn the Betrayer, draw two \
+    cards.\nThe Betrayer — If damage would be dealt to Khârn the Betrayer, prevent that damage \
+    and an opponent of your choice gains control of it.";
+
+/// Verbatim from `client/public/card-data.json`.
+const SWITCHEROO_TEXT: &str = "Exchange control of two target creatures.";
+
+/// V8 POSITIVE — CR 603.2 + CR 613.1b: now that `exchange_control::resolve`
+/// publishes `ControllerChanged`, a "When you lose control of ~" trigger fires
+/// on an exchange, exactly once.
+///
+/// Production entry chain: `exchange_control::resolve` → `collect_pending_triggers`
+/// → `trigger_index.rs`'s `ControllerChanged{..} => TriggerEventKey::ChangesController`
+/// (the gate that makes the matcher reachable at all) → `match_changes_controller`.
+///
+/// REVERT-FAILING: without the emission the event never exists, no
+/// `ChangesController` key is ever pushed, and nobody draws.
+#[test]
+fn exchanging_control_fires_a_lose_control_trigger_exactly_once() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(P0, &["Draw A", "Draw B", "Draw C"]);
+    scenario.with_library_top(P1, &["Filler D", "Filler E", "Filler F"]);
+    let kharn = scenario
+        .add_creature_from_oracle(P0, "Khârn the Betrayer", 4, 4, KHARN_TEXT)
+        .id();
+    let bear = scenario.add_creature(P1, "Grizzly Bears", 2, 2).id();
+    let switcheroo = scenario
+        .add_spell_to_hand_from_oracle(P0, "Switcheroo", false, SWITCHEROO_TEXT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+
+    let mut runner = scenario.build();
+    {
+        let state = runner.state_mut();
+        state.active_player = P0;
+        state.priority_player = P0;
+        state.waiting_for = WaitingFor::Priority { player: P0 };
+    }
+    let outcome = runner
+        .cast(switcheroo)
+        .target_objects(&[kharn, bear])
+        .resolve();
+
+    // REACH GUARD: the exchange really happened (CR 701.12b needed two
+    // different controllers, which this board supplies).
+    assert_eq!(
+        outcome.state().objects.get(&kharn).unwrap().controller,
+        P1,
+        "REACH GUARD: Khârn must have changed hands"
+    );
+    assert_eq!(
+        outcome.state().objects.get(&bear).unwrap().controller,
+        P0,
+        "REACH GUARD: and the bear must have come the other way"
+    );
+
+    // THE DISCRIMINATOR: exactly one lose-control trigger resolved. Two draws,
+    // not zero (no event published) and not four (double-fired).
+    let drawn = outcome.hand_drawn(P0) + outcome.hand_drawn(P1);
+    assert_eq!(
+        drawn,
+        2,
+        "CR 603.2: the exchange must fire \"When you lose control of ~\" exactly once \
+         (P0 drew {}, P1 drew {})",
+        outcome.hand_drawn(P0),
+        outcome.hand_drawn(P1)
+    );
+}
+
+/// V8 NEGATIVE — the Portent trap. A `ChangesController` trigger is scoped to
+/// its OWN tracked object by `valid_card_matches`, so a bystander carrying the
+/// same trigger must NOT fire when two unrelated objects exchange control.
+///
+/// This row also covers the STACK HALF: Perplexing Chimera's exchange publishes
+/// a `ControllerChanged` whose `object_id` is a SPELL (CR 109.4 — objects on the
+/// stack have a controller). That event is a legitimate verdict signal and must
+/// stay inert to triggers; no printed `ChangesController` trigger has
+/// `valid_card: None`, so none can match it.
+#[test]
+fn an_unrelated_lose_control_trigger_does_not_fire_on_someone_elses_exchange() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(P0, &["Draw A", "Draw B", "Draw C"]);
+    scenario.with_library_top(P1, &["Filler D", "Filler E", "Filler F"]);
+    let chimera = scenario
+        .add_creature_from_oracle(P0, "Perplexing Chimera", 3, 3, PERPLEXING_CHIMERA_TEXT)
+        .id();
+    // The BYSTANDER: it carries the ChangesController trigger, it is on the
+    // battlefield throughout, and its controller never changes.
+    let bystander = scenario
+        .add_creature_from_oracle(P0, "Khârn the Betrayer", 4, 4, KHARN_TEXT)
+        .id();
+    let grizzly_bears = scenario
+        .add_creature_to_hand_from_oracle(P1, "Grizzly Bears", 2, 2, "")
+        .with_mana_cost(ManaCost::zero())
+        .id();
+
+    let mut runner = scenario.build();
+    {
+        let state = runner.state_mut();
+        state.active_player = P1;
+        state.priority_player = P1;
+        state.waiting_for = WaitingFor::Priority { player: P1 };
+    }
+    let outcome = runner.cast(grizzly_bears).accept_optional().resolve();
+
+    // REACH GUARD: the exchange really happened — the Chimera swapped and the
+    // spell resolved for its new controller. Without this the row could pass
+    // because nothing exchanged at all.
+    assert_eq!(
+        outcome.state().objects.get(&chimera).unwrap().controller,
+        P1,
+        "REACH GUARD: the Chimera must have swapped to P1"
+    );
+    assert_eq!(
+        outcome
+            .state()
+            .objects
+            .get(&grizzly_bears)
+            .unwrap()
+            .controller,
+        P0,
+        "REACH GUARD: CR 400.7a — the exchanged spell's permanent enters under P0's control"
+    );
+    assert_eq!(
+        outcome.state().objects.get(&bystander).unwrap().controller,
+        P0,
+        "REACH GUARD: the bystander's controller never changed"
+    );
+
+    assert_eq!(
+        outcome.hand_drawn(P0),
+        0,
+        "the bystander's \"When you lose control of ~\" must not fire for an exchange it \
+         was not part of, on the battlefield half OR the stack half"
+    );
+    assert_eq!(outcome.hand_drawn(P1), 0);
+}
+
+// ---------------------------------------------------------------------------
+// V6c — Arteeoh's reflexive "When you do", end to end
+// ---------------------------------------------------------------------------
+
+/// Verbatim from `client/public/card-data.json`.
+const ARTEEOH_TEXT: &str = "Flying, deathtouch\nWhenever Arteeoh deals combat damage to a \
+    player, you may exchange control of two other target artifacts. When you do, create a token \
+    that's a copy of target artifact you don't control, except it's a 1/1 green Squirrel \
+    creature token in addition to its other colors and types.";
+
+/// Stage Arteeoh's trigger with its two declared exchange slots pre-wired, then
+/// accept the "you may" through the real action pipeline.
+///
+/// The declared targets are pre-wired rather than submitted through
+/// `GameAction::SelectTargets` because a two-declared-slot `ExchangeControl`
+/// CANNOT be targeted that way today: `collect_target_slots` and the per-slot
+/// spec builder both surface two slots, but `assign_targets_recursive` has no
+/// `Effect::ExchangeControl` arm, so `assign_targets_in_chain` consumes one of
+/// the two and rejects the submission with `InvalidAction("Unused selected
+/// targets")` — measured for the same-controller AND the cross-controller pick,
+/// so it is not fixture-specific. That is a pre-existing targeting-assignment
+/// defect in `ability_utils.rs`, filed separately and NOT this change's to fix;
+/// the CAST path is unaffected, which is why the Switcheroo / Sudden
+/// Substitution rows above are green.
+///
+/// **DO NOT "upgrade" this row to `advance_to_combat` / `declare_attackers` /
+/// `combat_damage` staging.** The combat half works (the trigger fires and
+/// surfaces both slots), but the `SelectTargets` that must follow it cannot be
+/// satisfied, so the row would be permanently red.
+///
+/// Everything downstream of the accept — the reflexive trigger, its target
+/// prompt, and the token — flows through the production `WaitingFor` /
+/// `GameAction` path, which is what this row measures.
+fn accept_arteeoh_exchange(
+    runner: &mut engine::game::scenario::GameRunner,
+    arteeoh: engine::types::identifiers::ObjectId,
+    slot_a: engine::types::identifiers::ObjectId,
+    slot_b: engine::types::identifiers::ObjectId,
+) {
+    use engine::game::ability_utils::build_resolved_from_def_with_targets;
+    use engine::game::effects::resolve_ability_chain;
+    use engine::parser::oracle::parse_oracle_text;
+
+    let parsed = parse_oracle_text(ARTEEOH_TEXT, "Arteeoh, Dread Scavenger", &[], &[], &[]);
+    let def = *parsed
+        .triggers
+        .first()
+        .expect("Arteeoh has a combat-damage trigger")
+        .execute
+        .clone()
+        .expect("that trigger has an execute");
+
+    let resolved = build_resolved_from_def_with_targets(
+        &def,
+        arteeoh,
+        P0,
+        vec![TargetRef::Object(slot_a), TargetRef::Object(slot_b)],
+    );
+    let mut events = Vec::new();
+    resolve_ability_chain(runner.state_mut(), &resolved, &mut events, 0)
+        .expect("the chain must resolve up to its optional prompt");
+
+    // REACH GUARD: the chain really parked on Arteeoh's own "you may" offer.
+    match runner.state().waiting_for {
+        WaitingFor::OptionalEffectChoice { source_id, .. } => assert_eq!(
+            source_id, arteeoh,
+            "REACH GUARD: the offer must be Arteeoh's own"
+        ),
+        ref other => panic!("expected Arteeoh's OptionalEffectChoice, got {other:?}"),
+    }
+
+    assert!(
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: true })
+            .is_ok(),
+        "accepting the exchange must be accepted by the reducer"
+    );
+}
+
+fn squirrel_tokens(runner: &engine::game::scenario::GameRunner) -> Vec<String> {
+    runner
+        .state()
+        .battlefield
+        .iter()
+        .filter(|id| runner.state().objects[id].is_token)
+        .map(|id| runner.state().objects[id].name.clone())
+        .collect()
+}
+
+/// V6c — CR 701.12b + CR 603.12: Arteeoh's reflexive "When you do, create a
+/// token …" must NOT fire when the accepted exchange exchanged nothing.
+///
+/// Both declared artifacts are P0's, so CR 701.12b makes the exchange a no-op
+/// even though the controller accepted the offer. Suppression happens at
+/// `resolve_ability_chain`'s `if !condition_met` early exit, which is strictly
+/// BEFORE `try_materialize_reflexive_trigger` — a suppressed `WhenYouDo` sub
+/// can never materialise a reflexive trigger at all.
+///
+/// This consumer's path is DISJOINT from the `IfYouDo` one: `evaluate_condition`'s
+/// `WhenYouDo` arm reads `ability.optional && !performed`, and the accept has
+/// already lowered `optional`, so that arm returns true regardless.
+/// `when_you_do_mandatory_parent_did_nothing` is the only thing that can
+/// suppress it, and all four of its conjuncts must hold — two of which this
+/// change supplies (the resolver-verdict block lowers the latched flag; the new
+/// `mandatory_parent_effect_performed` arm answers no).
+///
+/// REVERT-FAILING (both measured PRESENT pre-fix): the reflexive
+/// `TriggerTargetSelection` carrying a `CopyTokenOf` slot, and the token itself.
+#[test]
+fn arteeoh_reflexive_token_does_not_fire_when_the_exchange_did_nothing() {
+    use engine::types::ability::EffectKind;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let arteeoh = scenario
+        .add_creature_from_oracle(P0, "Arteeoh, Dread Scavenger", 3, 3, ARTEEOH_TEXT)
+        .id();
+    // BOTH exchange subjects under P0. Legal: both slots are
+    // `Typed(Artifact, Another)` with no controller restriction.
+    let a1 = scenario.add_artifact_from_oracle(P0, "Bauble A", "").id();
+    let a2 = scenario.add_artifact_from_oracle(P0, "Bauble B", "").id();
+    // The reflexive body's own target — "target artifact you don't control".
+    let foreign = scenario
+        .add_artifact_from_oracle(P1, "Foreign Relic", "")
+        .id();
+
+    let mut runner = scenario.build();
+    accept_arteeoh_exchange(&mut runner, arteeoh, a1, a2);
+
+    // SECOND REACH GUARD: the exchange genuinely did nothing (CR 701.12b). A
+    // row where the exchange SUCCEEDED would prove nothing about the gate.
+    assert_eq!(runner.state().objects[&a1].controller, P0);
+    assert_eq!(runner.state().objects[&a2].controller, P0);
+
+    // THE DISCRIMINATOR (1): no reflexive trigger was materialised.
+    if let WaitingFor::TriggerTargetSelection { target_slots, .. } = &runner.state().waiting_for {
+        assert!(
+            !target_slots
+                .iter()
+                .any(|slot| slot.effect_kind == EffectKind::CopyTokenOf),
+            "the reflexive \"When you do\" must not raise its target prompt for an exchange \
+             that exchanged nothing (slots were {target_slots:?})"
+        );
+    }
+
+    // THE DISCRIMINATOR (2): and no token exists, at the prompt boundary or
+    // after draining whatever else is pending.
+    runner.advance_until_stack_empty();
+    assert!(
+        squirrel_tokens(&runner).is_empty(),
+        "no token may be created for an exchange that exchanged nothing (tokens were {:?})",
+        squirrel_tokens(&runner)
+    );
+    // The reflexive body's would-be target is untouched and still P1's.
+    assert_eq!(runner.state().objects[&foreign].controller, P1);
+}
+
+/// V6c's PAIRED POSITIVE REACH GUARD (mandatory — it is what makes the two
+/// negatives above non-vacuous). The same staging with a CROSS-controller pair,
+/// so CR 701.12b does not no-op: the reflexive trigger must still be raised and
+/// the token must still be created.
+#[test]
+fn arteeoh_reflexive_token_still_fires_when_the_exchange_happens() {
+    use engine::types::ability::EffectKind;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let arteeoh = scenario
+        .add_creature_from_oracle(P0, "Arteeoh, Dread Scavenger", 3, 3, ARTEEOH_TEXT)
+        .id();
+    let a1 = scenario.add_artifact_from_oracle(P0, "Bauble A", "").id();
+    let foreign = scenario
+        .add_artifact_from_oracle(P1, "Foreign Relic", "")
+        .id();
+
+    let mut runner = scenario.build();
+    accept_arteeoh_exchange(&mut runner, arteeoh, a1, foreign);
+
+    // CR 701.12b: different controllers, so the exchange really happens.
+    assert_eq!(
+        runner.state().objects[&a1].controller,
+        P1,
+        "REACH GUARD: a real exchange must move control"
+    );
+
+    // The reflexive trigger IS materialised, with its own `CopyTokenOf` slot.
+    let slot_reached = match &runner.state().waiting_for {
+        WaitingFor::TriggerTargetSelection { target_slots, .. } => target_slots
+            .iter()
+            .any(|slot| slot.effect_kind == EffectKind::CopyTokenOf),
+        _ => false,
+    };
+    assert!(
+        slot_reached,
+        "REACH GUARD: a completed exchange must raise the reflexive \"When you do\" target \
+         prompt (state was {:?})",
+        runner.state().waiting_for
+    );
+
+    // "target artifact you don't control" is read AFTER the exchange, so the
+    // artifact P0 no longer controls is `a1` — the one it just handed over.
+    runner
+        .act(GameAction::SelectTargets {
+            targets: vec![TargetRef::Object(a1)],
+        })
+        .expect("the reflexive body's slot accepts the artifact P0 no longer controls");
+    runner.advance_until_stack_empty();
+
+    assert_eq!(
+        squirrel_tokens(&runner),
+        vec!["Bauble A".to_string()],
+        "a completed exchange must still create the copy token"
+    );
+    // The artifact P0 gained stays P0's — this row is not measuring a revert.
+    assert_eq!(runner.state().objects[&foreign].controller, P0);
 }

@@ -193,6 +193,45 @@ pub fn resolve(
         None,
     );
 
+    // CR 613.1b + CR 603.2: publish the control change so the event exists for the
+    // rules that key off it. Every OTHER Layer-2 control-change path already does
+    // (`gain_control::resolve`, `::resolve_all`, `::resolve_give`,
+    // `apply_permanent_control_change`, and the until-EOT control reversion in
+    // `turns.rs`) — `match_changes_controller`'s doc enumerates that set as
+    // complete, and this resolver was the missing member.
+    //
+    // Emitted on the SUCCESS path only, which is what makes it the authoritative
+    // "the exchange happened" witness for the CR 608.2c "if you do" / "if you
+    // don't or can't" riders on Perplexing Chimera, Gilded Drake, Volatile
+    // Stormdrake and Arteeoh. The SIX REACHABLE no-op returns above each emit
+    // `EffectResolved` and no `ControllerChanged`, so the two are distinguishable.
+    // (A seventh `return Ok(())` guards the `Effect::ExchangeControl` destructure
+    // at the top of this function; it emits nothing and is unreachable — the only
+    // caller is `resolve_effect`'s `Effect::ExchangeControl` arm, which matches the
+    // same variant.)
+    //
+    // The `controller_a != controller_b` inequality is guaranteed HERE BY CODE —
+    // the early return above at the `controller_a == controller_b` check — not by
+    // a rule. CR 701.12b is why that return exists ("if those permanents are
+    // controlled by the same player, the exchange effect does nothing"), and the
+    // return is what makes neither event a no-op self-handoff; unlike the sibling
+    // resolvers, no `old != new` guard is needed at this point.
+    //
+    // CR 109.4: a stack subject legitimately has a controller, so a spell half
+    // emits too; it is inert to `match_changes_controller` because that matcher is
+    // scoped by `valid_card_matches` to the trigger's own tracked object, and every
+    // printed `ChangesController` trigger carries a non-`None` `valid_card`.
+    events.push(GameEvent::ControllerChanged {
+        object_id: id_a,
+        old_controller: controller_a,
+        new_controller: controller_b,
+    });
+    events.push(GameEvent::ControllerChanged {
+        object_id: id_b,
+        old_controller: controller_b,
+        new_controller: controller_a,
+    });
+
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::ExchangeControl,
         source_id: ability.source_id,
@@ -220,6 +259,70 @@ mod tests {
             ObjectId(100),
             PlayerId(0),
         )
+    }
+
+    /// CR 613.1b: the directed control handoffs this resolution published.
+    fn controller_changes(events: &[GameEvent]) -> Vec<(ObjectId, PlayerId, PlayerId)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                GameEvent::ControllerChanged {
+                    object_id,
+                    old_controller,
+                    new_controller,
+                } => Some((*object_id, *old_controller, *new_controller)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every no-op return still reports the effect as resolved (CR 608.2c) —
+    /// what distinguishes them from success is the ABSENCE of
+    /// `ControllerChanged`, which is exactly what
+    /// `mandatory_parent_effect_performed`'s `Effect::ExchangeControl` arm reads.
+    fn exchange_resolved_count(events: &[GameEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    GameEvent::EffectResolved {
+                        kind: EffectKind::ExchangeControl,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    /// Asserts the shared shape of every REACHABLE no-op return: the effect
+    /// resolved exactly once, published no control change, and installed no
+    /// Layer-2 effect.
+    ///
+    /// There are SIX such returns (CR 701.12a slot A unresolvable, slot B
+    /// unresolvable, object A missing, object B missing, a subject in a zone
+    /// where control is not a characteristic; CR 701.12b same controller), and
+    /// this module covers one row per branch. A SEVENTH `return Ok(())` guards
+    /// the `Effect::ExchangeControl` destructure at the top of `resolve`; it is
+    /// deliberately uncovered because it is unreachable by dispatcher contract —
+    /// `resolve_effect`'s `Effect::ExchangeControl` arm is its only caller and
+    /// matches the same variant — and it pushes no event at all, so it is not a
+    /// member of the "every no-op return emits `EffectResolved`" claim.
+    fn assert_noop(state: &GameState, events: &[GameEvent]) {
+        assert!(
+            state.transient_continuous_effects.is_empty(),
+            "a no-op exchange installs no Layer-2 control effect"
+        );
+        assert_eq!(
+            exchange_resolved_count(events),
+            1,
+            "a no-op exchange still reports EffectResolved (CR 608.2c)"
+        );
+        assert!(
+            controller_changes(events).is_empty(),
+            "a no-op exchange must publish NO ControllerChanged — that absence is the \
+             signal `mandatory_parent_effect_performed` reads (events were {events:?})"
+        );
     }
 
     #[test]
@@ -267,6 +370,20 @@ mod tests {
             .find(|e| e.affected == TargetFilter::SpecificObject { id: obj_b })
             .expect("Should have effect for obj_b");
         assert_eq!(tce_b.controller, PlayerId(0));
+
+        // CR 613.1b + CR 603.2: the success path publishes exactly two DIRECTED
+        // control handoffs. Asserting the directions (not just the count) is what
+        // catches a both-to-one regression — the same class of bug the layer
+        // pipeline row below pins on the state side.
+        assert_eq!(
+            controller_changes(&events),
+            vec![
+                (obj_a, PlayerId(0), PlayerId(1)),
+                (obj_b, PlayerId(1), PlayerId(0)),
+            ],
+            "each subject hands off to the OTHER subject's controller (events were {events:?})"
+        );
+        assert_eq!(exchange_resolved_count(&events), 1);
     }
 
     #[test]
@@ -296,6 +413,7 @@ mod tests {
             state.transient_continuous_effects.is_empty(),
             "Should create no transient effects for same-controller exchange"
         );
+        assert_noop(&state, &events);
     }
 
     #[test]
@@ -310,11 +428,71 @@ mod tests {
         );
 
         // CR 701.12a: One target missing → all-or-nothing, do nothing.
+        // This is the `state.objects.get(&id_b)` branch.
         let ability = make_exchange_ability(obj_a, ObjectId(999));
         let mut events = Vec::new();
 
         resolve(&mut state, &ability, &mut events).unwrap();
         assert!(state.transient_continuous_effects.is_empty());
+        assert_noop(&state, &events);
+    }
+
+    /// CR 701.12a: the mirror branch — `state.objects.get(&id_a)` is the one
+    /// that misses. Covered separately so a regression that reorders the two
+    /// existence checks cannot hide behind the other row.
+    #[test]
+    fn exchange_control_missing_first_target_is_noop() {
+        let mut state = GameState::new_two_player(42);
+        let obj_b = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Wolf".to_string(),
+            Zone::Battlefield,
+        );
+
+        let ability = make_exchange_ability(ObjectId(999), obj_b);
+        let mut events = Vec::new();
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+        assert_noop(&state, &events);
+    }
+
+    /// CR 701.12a + CR 109.4: a subject that is neither on the stack nor on the
+    /// battlefield has no controller, so the exchange can't be completed and no
+    /// part of it occurs. This is the `control_is_exchangeable` branch — the one
+    /// no-op return no other row in this module reaches.
+    #[test]
+    fn exchange_control_unexchangeable_zone_is_noop() {
+        let mut state = GameState::new_two_player(42);
+        let obj_a = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Bear".to_string(),
+            Zone::Battlefield,
+        );
+        let obj_b = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Wolf".to_string(),
+            Zone::Graveyard,
+        );
+
+        // REACH GUARD: the two subjects have DIFFERENT controllers, so this row
+        // is stopped by the zone gate and not by CR 701.12b's same-controller
+        // return further down.
+        assert_ne!(
+            state.objects.get(&obj_a).unwrap().controller,
+            state.objects.get(&obj_b).unwrap().controller
+        );
+
+        let ability = make_exchange_ability(obj_a, obj_b);
+        let mut events = Vec::new();
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+        assert_noop(&state, &events);
     }
 
     #[test]
@@ -341,6 +519,26 @@ mod tests {
         let mut events = Vec::new();
         resolve(&mut state, &ability, &mut events).unwrap();
         assert!(state.transient_continuous_effects.is_empty());
+        assert_noop(&state, &events);
+    }
+
+    /// CR 701.12a: no targets at all — the FIRST `resolve_slot` runs dry. The
+    /// row above covers the second slot; this one covers the first.
+    #[test]
+    fn exchange_control_no_targets_is_noop() {
+        let mut state = GameState::new_two_player(42);
+        let ability = ResolvedAbility::new(
+            Effect::ExchangeControl {
+                target_a: TargetFilter::Any,
+                target_b: TargetFilter::Any,
+            },
+            Vec::new(),
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+        assert_noop(&state, &events);
     }
 
     /// CR 613.1b + CR 701.12a: End-to-end layer pipeline test. Resolves an
@@ -401,6 +599,16 @@ mod tests {
             state.objects.get(&obj_b).unwrap().controller,
             PlayerId(0),
             "obj_b should now be controlled by PlayerId(0) after swap"
+        );
+        // CR 603.2: and the swap the layer pipeline just performed was PUBLISHED,
+        // in both directions, so `ChangesController` triggers and the CR 608.2c
+        // "if you do" riders can key off it.
+        assert_eq!(
+            controller_changes(&events),
+            vec![
+                (obj_a, PlayerId(0), PlayerId(1)),
+                (obj_b, PlayerId(1), PlayerId(0)),
+            ]
         );
     }
 }
