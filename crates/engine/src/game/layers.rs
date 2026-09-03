@@ -7885,9 +7885,15 @@ fn unstarted_effect_generator_is_suppressed(
 /// * `Hand` — CR 702.94a hand-zone keyword grants; keywords-only reset.
 /// * `Stack` — CR 613.1 stack-object keyword grants (Taigam's rebound, Waystone's mobilize, and
 ///   `StackSpell`-filtered statics); `{keywords, controller}` reset. CR 112.2: this pass also
-///   reseeds each stack object's controller from its `StackEntry` default; this predicate
-///   governs the KEYWORD half only, and is consulted solely by the keyword-materialization
-///   filter below.
+///   reseeds each stack object's controller from its `StackEntry` default.
+///
+/// SCOPE OF THIS PREDICATE — it does NOT govern the keyword half only. Its single call site
+/// is `collect_scan_zones`' `TargetFilter::SpecificObject` arm, which picks the scan zone for
+/// EVERY identity-filtered continuous effect regardless of modification kind. That includes
+/// the `ContinuousModification::ChangeController` that `exchange_control::resolve` installs on
+/// a stolen spell, so `Zone::Stack`'s membership here is load-bearing for the CR 613.1b
+/// controller derivation and not merely for keyword grants. Narrowing this predicate would
+/// silently stop a stolen spell's control change from reaching its object.
 ///
 /// Every OTHER zone (library, graveyard, exile) is owned by `off_zone_characteristics`, which
 /// computes keywords ON DEMAND from base + active effects and never materializes them.

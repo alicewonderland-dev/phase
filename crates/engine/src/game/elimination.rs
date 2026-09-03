@@ -1281,9 +1281,23 @@ fn do_eliminate(
     // guard — cleared only for the LEAVING player's own resolution (mirroring the
     // cast-abandonment controller key above) so a living player's paused resolution
     // survives an opponent's departure.
+    //
+    // KEYED ON `cast_controller`, NOT `controller`. `PendingSpellResolution.
+    // controller` became the LIVE controller when a spell's controller became a
+    // derived value (CR 608.2c re-stamp in `stack::resolve_top`), so for a spell
+    // stolen mid-resolution — Perplexing Chimera pausing on an as-enters choice —
+    // it names the thief, not the caster. The cast-abandonment sweep this comment
+    // says it mirrors keys on `entry.controller`, the by-default/caster answer, so
+    // reading the live value here would break the mirror in both directions:
+    // the THIEF conceding would tear down a frame that CR 800.4a says merely
+    // reverts to the caster and keeps resolving, and the CASTER conceding would
+    // leave a dangling frame keyed to the surviving thief while
+    // `exile_owned_objects_on_player_left_game` removes the object underneath it.
+    // `cast_controller` is `Some` at every production construction; the
+    // `unwrap_or` preserves the prior reading for hand-built fixtures.
     if state
         .active_spell_resolution()
-        .is_some_and(|psr| psr.controller == player)
+        .is_some_and(|psr| psr.cast_controller.unwrap_or(psr.controller) == player)
     {
         let _ = state.take_active_spell_resolution();
     }
@@ -3430,6 +3444,64 @@ mod tests {
         assert!(
             state.active_spell_resolution().is_none(),
             "the leaving controller's active spell frame must be torn down"
+        );
+    }
+
+    /// CR 800.4a (final review) — the active-spell-resolution teardown must key
+    /// on the CASTER, not on the live controller.
+    ///
+    /// `PendingSpellResolution.controller` became the LIVE controller once a
+    /// spell's controller became a derived value, so for a spell stolen
+    /// mid-resolution (Perplexing Chimera pausing on an as-enters choice) it
+    /// names the thief. The sibling row above cannot catch the difference: its
+    /// fixture leaves `cast_controller: None`, so both readings coincide. This
+    /// row sets them to DIFFERENT players, which is the only shape that
+    /// discriminates.
+    ///
+    /// REVERT-FAILING: keying on `psr.controller` tears the frame down when the
+    /// THIEF leaves (CR 800.4a says the control effect merely ends and the
+    /// spell reverts to its caster and keeps resolving) and leaves it dangling
+    /// when the CASTER leaves.
+    #[test]
+    fn elimination_keys_the_active_spell_frame_on_the_caster_not_the_thief() {
+        let mut state = setup_three_player();
+        let caster = PlayerId(0);
+        let thief = PlayerId(1);
+        let spell = create_object(
+            &mut state,
+            CardId(8),
+            caster,
+            "Stolen paused permanent".into(),
+            Zone::Stack,
+        );
+        state.push_spell_resolution(PendingSpellResolution {
+            object_id: spell,
+            // Stolen: the live controller is the thief...
+            controller: thief,
+            casting_variant: CastingVariant::Normal,
+            cast_from_zone: None,
+            // ...but the caster is who the CR 800.4a teardown is keyed to.
+            cast_controller: Some(caster),
+            cast_timing_permission: None,
+            spell_targets: vec![],
+            actual_mana_spent: 0,
+            kickers_paid: vec![],
+            additional_cost_payment_count: 0,
+            additional_cost_payments: vec![],
+            convoked_creatures: vec![],
+        });
+
+        eliminate_player(&mut state, thief, &mut Vec::new());
+        assert!(
+            state.active_spell_resolution().is_some(),
+            "the THIEF leaving must not tear down the frame — CR 800.4a ends the control \
+             effect and the spell reverts to its caster and keeps resolving"
+        );
+
+        eliminate_player(&mut state, caster, &mut Vec::new());
+        assert!(
+            state.active_spell_resolution().is_none(),
+            "the CASTER leaving must tear the frame down, or it dangles past the object"
         );
     }
 

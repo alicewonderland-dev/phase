@@ -2085,7 +2085,9 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
         // THE INVARIANT THAT MAKES PRUNING SAFE: dropping a leading entry
         // shifts the survivor into the earlier slot's position, so with
         // `target_a` illegal and `target_b` legal the resolver reads B's
-        // object into slot A. That is harmless ONLY because `resolve_slot`
+        // object into slot A. This holds ONLY because nothing else is left in
+        // the list for slot B to pick up — see the no-pass-through note at the
+        // end of this arm, which is load-bearing for exactly this reason. That is harmless ONLY because `resolve_slot`
         // then finds nothing for slot B and returns before writing any
         // continuous effect — CR 701.12a is what converts the mis-binding
         // into the correct total no-op. `exchange_control_of_a_spell.rs::
@@ -2117,12 +2119,32 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
                 kept.push(legal);
             }
         }
-        // CR 608.2b (phase#4767 review, same hazard the `Attach` arm above
-        // documents): `validated.targets` may carry entries this node's own
-        // two filters never claimed, propagated through for a downstream
-        // sibling in the chain. They must pass through UNCHANGED rather than
-        // be silently dropped, or the sibling loses its target.
-        kept.extend(target_iter.cloned());
+        // CR 608.2b: this arm deliberately does NOT pass unclaimed propagated
+        // entries through, which is where it diverges from the `Attach` arm
+        // above. `Attach` can afford the pass-through; `ExchangeControl`
+        // cannot, because `exchange_control::resolve` builds its
+        // `object_targets` iterator over the WHOLE list and takes the first
+        // two objects with no per-slot recheck. Any entry left in the list is
+        // therefore bindable into one of the two exchange slots.
+        //
+        // Measured: with `[A_illegal, B_legal, C_propagated]`, appending the
+        // unclaimed tail yields `[B, C]`, and the resolver then exchanges
+        // control of B and C — a pair the spell never targeted together, and a
+        // direct CR 608.2b violation ("illegal targets won't be affected", and
+        // nothing licenses affecting an object that was never a target).
+        // Dropping the tail yields `[B]`, the second `resolve_slot` runs dry,
+        // and CR 701.12a's all-or-nothing early return makes it a total no-op
+        // — the correct outcome. `exchange_control_of_a_spell.rs::
+        // exchange_control_ignores_unclaimed_propagated_targets` pins it.
+        //
+        // The cost of dropping is that a downstream chain sibling relying on a
+        // propagated entry would lose it. No `ExchangeControl` parse in the
+        // corpus has such a sibling (Perplexing Chimera's `ChangeTargets`
+        // sibling binds a context ref and claims no slot; Sudden
+        // Substitution's is `Effect::Unimplemented`), and losing a sibling's
+        // target is a strictly milder failure than exchanging the wrong pair.
+        // If a card ever needs both, the fix is to stop having the resolver
+        // consume positionally from a flat list — not to re-add this tail.
         kept
     } else if let Some(role) = mana_multi_role(&validated.effect) {
         // CR 608.2b: THREE properties, all required.

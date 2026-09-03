@@ -591,3 +591,105 @@ fn gilded_drake_sole_target_that_stops_matching_its_filter_stops_the_ability() {
         "CR 608.2b: with its only target illegal the ability does not resolve"
     );
 }
+
+/// REGRESSION (final review) — an `ExchangeControl` node must never bind an
+/// object that was not one of its own two claimed targets.
+///
+/// `validate_targets_in_chain`'s `ExchangeControl` arm prunes illegal targets,
+/// which shifts survivors toward index 0. `exchange_control::resolve` consumes
+/// `ability.targets` positionally with no per-slot recheck, so ANY entry left
+/// in the list is bindable into one of the two exchange slots. An earlier
+/// revision of this arm appended unclaimed propagated entries after the
+/// survivors (mirroring the `Attach` arm); with `[A_illegal, B_legal,
+/// C_propagated]` that produced `[B, C]` and the resolver exchanged control of
+/// B and C — a pair the spell never targeted together.
+///
+/// Correct outcome: only `B` survives, the second `resolve_slot` runs dry, and
+/// CR 701.12a's all-or-nothing rule makes the whole thing a no-op.
+///
+/// REVERT-FAILING: re-adding `kept.extend(target_iter.cloned())` to that arm
+/// makes this row exchange B and C and fail on the emptiness assertion.
+#[test]
+fn exchange_control_ignores_unclaimed_propagated_targets() {
+    use engine::game::ability_utils::validate_targets_in_chain;
+    use engine::game::effects::exchange_control;
+    use engine::game::zones::create_object;
+    use engine::types::ability::{Effect, ResolvedAbility, TargetFilter, TargetRef, TypedFilter};
+    use engine::types::card_type::CoreType;
+    use engine::types::game_state::GameState;
+    use engine::types::identifiers::CardId;
+
+    let mut state = GameState::new_two_player(42);
+    let source = create_object(
+        &mut state,
+        CardId(1),
+        P0,
+        "Source".into(),
+        Zone::Battlefield,
+    );
+    let illegal = create_object(
+        &mut state,
+        CardId(2),
+        P0,
+        "Illegal A".into(),
+        Zone::Battlefield,
+    );
+    let legal = create_object(
+        &mut state,
+        CardId(3),
+        P1,
+        "Legal B".into(),
+        Zone::Battlefield,
+    );
+    let propagated = create_object(
+        &mut state,
+        CardId(4),
+        P0,
+        "Propagated C".into(),
+        Zone::Battlefield,
+    );
+
+    // A is on the battlefield but is NOT a creature, so it fails the declared
+    // filter at CR 608.2b re-validation. B and C both satisfy it.
+    state
+        .objects
+        .get_mut(&illegal)
+        .unwrap()
+        .card_types
+        .core_types = vec![CoreType::Artifact];
+    for id in [legal, propagated] {
+        state.objects.get_mut(&id).unwrap().card_types.core_types = vec![CoreType::Creature];
+    }
+
+    let ability = ResolvedAbility::new(
+        Effect::ExchangeControl {
+            target_a: TargetFilter::Typed(TypedFilter::creature()),
+            target_b: TargetFilter::Typed(TypedFilter::creature()),
+        },
+        vec![
+            TargetRef::Object(illegal),
+            TargetRef::Object(legal),
+            TargetRef::Object(propagated),
+        ],
+        source,
+        P0,
+    );
+
+    let validated = validate_targets_in_chain(&state, &ability);
+    // REACH GUARD: the illegal target really was dropped, and the unclaimed
+    // third entry really was not carried forward — without this the row could
+    // pass for the wrong reason (e.g. nothing was pruned at all).
+    assert_eq!(
+        validated.targets,
+        vec![TargetRef::Object(legal)],
+        "only the surviving claimed target is kept; the unclaimed third entry is not appended"
+    );
+
+    let mut events = Vec::new();
+    exchange_control::resolve(&mut state, &validated, &mut events).unwrap();
+    assert!(
+        state.transient_continuous_effects.is_empty(),
+        "CR 701.12a: with only one subject bindable the exchange can't complete, so no part of \
+         it occurs — and in particular C, which was never a target of this effect, is untouched"
+    );
+}
