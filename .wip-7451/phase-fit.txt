@@ -25,3 +25,13 @@ Entry 3 (re-adjudication after round-3 revised plan, Step 2 loop)
   T4 check: rounds so far -> R1 review 4 blocking/10 gaps, R2 review 4 blocking/7 gaps.
       Blocking-finding count non-increasing and layer spread is parser+tests (2 of 7 axis
       layers, < 3). T4 does NOT fire.
+
+Entry 4 (re-adjudication after round-4 revised plan, Step 2 loop)
+  T1 unit count: 3 (unchanged) -> FIRES
+  T2 scope-path count: 7 (unchanged; independently re-walked by the round-3 reviewer,
+      who confirmed no eighth path). 7 < 13 -> DOES NOT FIRE
+  VERDICT: SINGLE-PHASE (unchanged)
+  T4 check: review findings R1=14, R2=11, R3=9 (strictly decreasing). Blocking findings
+      span 2 axis layers (parser, tests) < 3. T4 does NOT fire.
+  Note: round 4 was interrupted mid-edit by an operator stop and restarted from a
+      reconciliation pass; the restart is not a separate round.

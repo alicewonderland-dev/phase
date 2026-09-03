@@ -1,0 +1,151 @@
+Entry 1 — ENTER surgical-fix mode, after the round-6 plan review.
+  Measurement 1 (design unchanged >= 2 consecutive rounds): YES. Comparing NAMED ENTRIES
+    (units, steps, sub-steps, call sites, enum variants) across the r4 -> r5 -> r6 plans:
+    algorithm, the three theorems, the Containment lemma, unit boundaries U1/U2/U3, Sizing
+    (3 units / 7 scope paths), the CR table, the fixture set and the commit shape are
+    identical in all three. r5 changed only the pre-flight instrument and prose. r6's one
+    structural addition (splitting token_is_effect_predicate out of
+    clause_has_effect_predicate) was ADJUDICATED TEXT supplied verbatim by the r5 reviewer
+    to make an already-asserted property true -- an application, not a design move.
+  Measurement 2 (last round's findings all spot): YES. r6 review returned NO BLOCKING
+    findings. Both items are SPOT: (1) an exhaustiveness sentence contradicted by its own
+    preceding clause, (2) an off-by-one read-only anchor in a function the plan forbids
+    editing. Neither changes any edit the implementer makes. The reviewer marked the one
+    optional design-ish change ("mirror comma_short_self_name in the harvest") as
+    explicitly NOT required: "do not spend a round on it" -- so nothing requires deciding.
+  Measurement 3 (each finding names a coordinate AND its replacement text): YES. Both
+    findings quote the exact old text, name the line, and supply replacement prose.
+  Corroborating signal (not the trigger): the fraction of r6-review findings whose defect
+    originated in r6's own repairs is 1/2 -- finding 1 is a sentence r6 itself rewrote.
+    Consistent with a loop starting to feed on itself; treated as evidence for the switch.
+  Rationale: dispatching a fresh planner to absorb two wording fixes would rewrite prose,
+    and prose is where spot findings live -- the exact mechanism the mode exists to stop.
+  Spot-vs-design classification of r6-review findings: finding 1 SPOT (wording/scoping),
+    finding 2 SPOT (anchor). Zero design findings.
+  Deviation from the adjudicated text, with reason: the reviewer's replacement quotes
+    "1434 of the 16862 emitted lines". Independently re-measured: 1435 under the
+    production-faithful rule (comma_short_self_name resolves through alchemy_effective_name,
+    which strips MTGJSON's "A-" prefix); 1434 is the figure WITHOUT that strip. The
+    one-line delta is exactly that prefix. Writing 1435 with the method stated, rather
+    than copying an unverified number into the plan.
+
+Entry 2 — round 7, surgical application (orchestrator-applied, no planner dispatched).
+  Applied both r6-review findings as check-and-replace edits, two-sided verified
+  (old string present exactly once at the named coordinate before; replacement present
+  exactly once and old string absent after; counted occurrences, not matching lines):
+    F1 sites: the §5.5 fidelity sentence; the "outside 5.5" intro at :1157; the residue
+      table (fifth row retitled "over-normalisation" + sixth row added); the step-6
+      backstop sentence; the r6 header note.
+    F2 sites: :352 and :402, ":9792" -> ":9793". Verified against source: at BASE_SHA
+      oracle_trigger.rs:9792 is `let comma_pos = search_start + before.len();` and :9793
+      is `if !continues_player_action_list(after)`. The reviewer's correction is right.
+  Neighbour sweep, boundary stated: population = the whole plan file; predicate = any
+    surviving reference to the superseded scoping (single residue / "fifth row" as the
+    only one / ":9792" / a bare 1434); scan = full-file grep, matched lines counted.
+    Three stale neighbours found and fixed: the r5/r6 revision marker, the "the fifth row
+    is not a line shape at all -- it is the one place" sentence, and the r6 disposition
+    row (given a "superseded in part at r7" pointer rather than being rewritten, matching
+    the plan's own convention for historical rows). One deliberate non-match: line 1891's
+    "1435" is CR 205.3i's line number in docs/MagicCompRules.txt, not the residue figure.
+  Deviation from adjudicated text: 1435 written, not the reviewer's 1434 -- see Entry 1.
+  Next: whole-artifact re-review in a fresh context (surgical mode replaces the planner
+    rewrite, never the final independent check).
+
+Entry 3 — EXIT surgical-fix mode after the round-7 whole-artifact re-review.
+  Reason: the re-review returned a finding that requires DECIDING something, which the
+    mode's own rule says ends it and returns to the unbounded loop. Finding 3 asks the
+    plan to settle the COUNTING UNIT for the event-head call-site census (gates vs
+    functions vs consumers) and then make two in-file censuses agree; the reviewer
+    offered two mutually exclusive remedies ("four of eleven" relabel, or keep the old
+    denominator and exclude :8971 explicitly) and stated the current relabel "cannot
+    stand with 3/10". Choosing between them is a design decision, not an application.
+  Orchestrator verification of the re-review's two new claims (both real):
+    - Stale twin census CONFIRMED at oracle_trigger.rs:9126-:9129 ("2 of the 9
+      `parse_event_verb_start` call sites are widened ... 7 stay narrow"). U1 adds a
+      widened consumer, so this comment goes false the moment U1 lands, and the plan
+      never mentions it.
+    - :8971 CONFIRMED to already call the WIDE parse_event_head_start, with its own
+      comment at :8965 saying it does so on purpose.
+  Orchestrator's own measurement, sharpening the finding for the planner:
+    grep 'parse_event_verb_start(|parse_event_head_start(' over oracle_trigger.rs gives
+    9 direct call sites excluding the two fn definitions (:9277, :9553):
+      NARROW (7): :8939 :9051 :9073 :9080 :9844 :9850 :9851
+      WIDE   (2): :8971 :9131
+    So "2 of the 9 ... 7 stay narrow" is arithmetically self-consistent on DIRECT calls.
+    The defect is the NARROW LIST'S NAMING, not the arithmetic: it names
+    `split_cross_subject_event_compound` as a narrow site, but that function owns BOTH
+    :8939 (narrow, trailing half) and :8971 (wide, leading half). Separately,
+    `extract_subject_text` reaches the wide lexicon through the `is_event_head_start`
+    helper rather than a direct call, which is why the census's "call site" count and a
+    raw grep do not line up. The reviewer's "3 of 10 -> 4 of 11" arithmetic assumes a
+    different counting unit than the existing comment uses; the planner must pick one
+    unit, state it, and make both censuses agree under it.
+  Rounds recorded in this mode: 1 (round 7). Whole-artifact re-review was run and is
+    what surfaced the exit condition -- the mode's final independent check did its job.
+
+Entry 4 — RE-ENTER surgical-fix mode, round 10, after the round-9 plan review.
+  Measurement 1 (design unchanged >= 2 consecutive rounds): YES. r7, r8 and r9 all left
+    the algorithm, theorems, unit boundaries U1/U2/U3, the helper set, the call sites and
+    Sizing identical. r8 changed only a doc-comment census figure and its counting unit.
+  Measurement 2 (last round's findings all spot): YES. r9 review returned ONE material
+    finding, explicitly SPOT (a misattributed consumer name), plus one non-blocking CR
+    scoping observation. No design decision is required.
+  Measurement 3 (coordinate + replacement text): YES. Three exact coordinates with exact
+    replacement text; the observation names both acceptable resolutions.
+  Orchestrator verification of the finding BEFORE applying (all confirmed at BASE_SHA):
+    - is_event_head_start: nested fn :9130, body :9131, EXACTLY ONE call at :9214, inside
+      split_or_event_compound's " or " scan loop.
+    - suppresses_duplicate_event_arm: a DIFFERENT nested fn at :9187-:9189 whose whole
+      body is scan_contains(cond_lower, "fight or become blocked"). It consults no
+      event-head lexicon.
+    - The file's CURRENT doc at :9524 already says "(is_event_head_start, inside
+      split_or_event_compound)" and is TRUE; the plan's rewrite would have replaced a
+      true shipping sentence with a false one. Same class as the r7 F1 / r8 F2 findings.
+  CR observation resolved by NARROWING, not by adding a table row: the annotation at
+    plan :1832 cited "CR 205.3", which is real (docs/MagicCompRules.txt:1414) but is a
+    bare SECTION HEADER ("205.3. Subtypes") and is not a row in the plan's citation
+    table, whose closing line forbids un-tabled annotations. Narrowed to CR 205.3a,
+    already tabled at :1416 ("A card can have one or more subtypes printed on its type
+    line"), which is what the annotation's sentence actually relies on. This keeps the
+    table closed and avoids citing a section header as if it stated a rule.
+  Round-10 edits applied (4 + 1), each two-sided verified (old string present exactly
+    once at the named coordinate before; replacement present exactly once, old absent
+    after; occurrences counted, not matching lines):
+      1. §U1.4 site table WIDE :9131 row  -> named the real caller and its scan loop
+      2. §U1.4(a) shipping doc text        -> ditto (this is the sentence that would ship)
+      3. §Anchors census-TWIN row :440     -> ditto, plus an explicit note that
+         suppresses_duplicate_event_arm is a different fn consulting scan_contains
+      4. §U2.1 shipping annotation :1832   -> CR 205.3 narrowed to CR 205.3a
+      5. §U2 shipping doc-comment :1810    -> same narrowing (found by the sweep, NOT
+         named by the reviewer -- the "one fix, one stale twin" pattern again)
+  Neighbour sweep, boundary stated: population = whole plan file; predicate = (a) any
+    surviving "suppresses_duplicate_event_arm" attribution, (b) any "CR 205.3" not
+    followed by a/i/m INSIDE a shipping code comment (leading //); scan = full-file
+    grep, matched lines counted. Result: (a) one remaining occurrence, which is the
+    corrected row's own explanatory clause naming it as the DIFFERENT function --
+    intended, not stale. (b) none. Plan prose at :313 mentions "CR 205.3" descriptively
+    but is not an annotation entering the codebase, so the table rule does not reach it.
+
+Entry 5 — EXIT surgical-fix mode after the round-10 whole-artifact re-review.
+  Reason: the re-review returned a BLOCKING finding that ADDS STRUCTURE to the plan
+    (two new sub-steps U1.4(b2)/(b3), two site-table rows, two anchor rows, a new
+    durable guard grep, and widening "BOTH" wording at four dependent sites). That is
+    authoring content, not applying adjudicated replacement text, so it goes to a fresh
+    planner. It also changes what the implementation does (two additional file edits in
+    commit 1), which the mode's own spot-finding definition excludes.
+  Orchestrator verification of the finding (CONFIRMED at BASE_SHA):
+    grep -inE '(nine|(^|[^0-9])9)[ -].{0,30}(consumer|call site)' over oracle_trigger.rs
+    returns FOUR shipping comments carrying the stale census figure:
+      :9126  "2 of the 9 `parse_event_verb_start` call sites are widened"   <- planned
+      :9182  "the nine-consumer accounting this change preserves"           <- MISSED
+      :9395  "the head lexicon has nine consumers and seven must stay narrow
+              (see `parse_event_head_start`) ... composed at exactly the two" <- MISSED
+      :9523  "Composed at exactly TWO of the nine ... call sites"            <- planned
+    :9395 is the serious one: it sits inside parse_state_change_event_start's doc and
+    CROSS-REFERENCES the very census U1.4(a) rewrites, so after U1 the file would say
+    "FOUR of the ELEVEN" at :9523 and "nine consumers ... exactly the two" at :9395.
+    It is also already wrong TODAY by exactly the :8971 omission U1.4 exists to repair.
+    U1.4(c)'s agreement greps key on the NEW phrasing and structurally cannot catch
+    either missed site -- hence the reviewer's proposed stale-figure guard grep.
+  This is the "one fix, one stale twin" pattern for the seventh time in ten rounds,
+    now one copy further out than the sweep that was looking for it.
