@@ -14,16 +14,24 @@
 //! Oracle text is verbatim, fetched from `client/public/card-data.json` at the
 //! branch base.
 
+use engine::game::ability_utils::build_resolved_from_def;
 use engine::game::combat::AttackTarget;
+use engine::game::effects::resolve_ability_chain;
 use engine::game::keywords::source_matches_card_type;
 use engine::game::layers::evaluate_layers;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+use engine::game::zones::create_object;
 use engine::parser::oracle::parse_oracle_text;
-use engine::types::ability::ContinuousModification;
-use engine::types::identifiers::ObjectId;
+use engine::parser::oracle_effect::parse_effect_chain;
+use engine::types::ability::{
+    AbilityKind, ContinuousModification, Effect, TargetFilter, TypeFilter,
+};
+use engine::types::card_type::CoreType;
+use engine::types::identifiers::{CardId, ObjectId};
 use engine::types::keywords::{Keyword, ProtectionTarget};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
+use engine::types::zones::Zone;
 
 const VALLEY_FLOODCALLER: &str = "Flash\nYou may cast noncreature spells as though they had flash.\nWhenever you cast a noncreature spell, Birds, Frogs, Otters, and Rats you control get +1/+1 until end of turn. Untap them.";
 
@@ -264,4 +272,134 @@ fn rotcaller_counts_exactly_one_when_only_one_listed_subtype_present() {
 
     assert_eq!(life(&runner, P1) - p1_before, -1, "X must be 1, not 4");
     assert_eq!(life(&runner, P0) - p0_before, 1, "X must be 1, not 4");
+}
+
+/// V3b — issue #7451 U2 ALONE (no U3): The Argent Etchings chapter III,
+/// verbatim substring from its `card-data.json` back-face `oracle_text`
+/// (`Elesh Norn // The Argent Etchings` is a transforming DFC; The Argent
+/// Etchings is the BACK face, keyed under its own `"the argent etchings"`
+/// entry): "Destroy all other permanents except for artifacts, lands, and
+/// Phyrexians." This is the ADJACENT surface order — the except-for clause
+/// immediately follows the type list, with no intervening destination
+/// clause — so it exercises the pure U2 vocabulary-gate fix, isolated from
+/// U3's post-destination remainder handling. Chapter-driving recipe follows
+/// `issue_2425_fable_chapter_iii_transform.rs::fable_chapter_three_returns_transformed_not_as_saga`:
+/// the Saga source is built directly via `create_object` (no saga/lore
+/// helper exists on `GameScenario`), and the chapter's own sentence is fed to
+/// `parse_effect_chain` -> `build_resolved_from_def` -> `resolve_ability_chain`
+/// rather than through a cast pipeline.
+///
+/// Revert-failing: today the whole exclusion clause declines the moment the
+/// unrecognised "Phyrexians" item is reached (the mixed core-type + subtype
+/// list makes `parse_except_for_type_list_suffix` reject wholesale), so the
+/// artifact, the lands and the Phyrexian creature are destroyed alongside the
+/// Bears instead of being spared. Positive reach-guard: the parsed effect is
+/// asserted to be `Effect::DestroyAll` over a `Typed` filter carrying all
+/// three exclusions BEFORE the board is checked, so this cannot pass on a
+/// `None` parse, an `Effect::Unimplemented`, or a renamed variant.
+#[test]
+fn argent_etchings_iii_spares_artifacts_lands_and_phyrexians() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let artifact = scenario
+        .add_artifact_from_oracle(P0, "Argent Etchings Artifact", "")
+        .id();
+    let land = scenario
+        .add_land_from_oracle(P0, "Argent Etchings Land", "")
+        .id();
+    let phyrexian = scenario
+        .add_creature(P0, "Phyrexian Test Creature", 2, 2)
+        .with_subtypes(vec!["Phyrexian"])
+        .id();
+    let p0_bear = scenario.add_creature(P0, "P0 Beary", 2, 2).id();
+
+    let p1_bear = scenario.add_creature(P1, "P1 Beary", 2, 2).id();
+    let p1_land = scenario.add_land_from_oracle(P1, "P1 Land", "").id();
+
+    let mut runner: GameRunner = scenario.build();
+
+    let saga_id = {
+        let state = runner.state_mut();
+        let id = create_object(
+            state,
+            CardId(1000),
+            P0,
+            "The Argent Etchings".to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Enchantment);
+        obj.card_types.subtypes.push("Saga".to_string());
+        obj.base_card_types = obj.card_types.clone();
+        id
+    };
+
+    let execute = parse_effect_chain(
+        "Destroy all other permanents except for artifacts, lands, and Phyrexians.",
+        AbilityKind::Spell,
+    );
+
+    // Positive reach-guard: confirm this text actually reaches the
+    // except-for vocabulary gate — and keeps all three exclusions — rather
+    // than declining or landing on a different effect shape, before touching
+    // the board at all.
+    match &*execute.effect {
+        Effect::DestroyAll { target, .. } => {
+            match target {
+                TargetFilter::Typed(tf) => {
+                    assert!(tf.type_filters.contains(&TypeFilter::Permanent));
+                    assert!(tf
+                        .type_filters
+                        .contains(&TypeFilter::Non(Box::new(TypeFilter::Artifact))));
+                    assert!(tf
+                        .type_filters
+                        .contains(&TypeFilter::Non(Box::new(TypeFilter::Land))));
+                    assert!(tf.type_filters.contains(&TypeFilter::Non(Box::new(
+                        TypeFilter::Subtype("Phyrexian".to_string())
+                    ))));
+                }
+                other => panic!("expected a Typed target filter, got {other:?}"),
+            }
+        }
+        other => panic!("expected Effect::DestroyAll, got {other:?}"),
+    }
+
+    let resolved = build_resolved_from_def(&execute, saga_id, P0);
+    let mut events = Vec::new();
+    resolve_ability_chain(runner.state_mut(), &resolved, &mut events, 0)
+        .expect("chapter III's destroy clause resolves");
+
+    let zone_of = |id: ObjectId, runner: &GameRunner| runner.state().objects[&id].zone;
+
+    assert_eq!(
+        zone_of(p0_bear, &runner),
+        Zone::Graveyard,
+        "P0's plain Bear must be destroyed"
+    );
+    assert_eq!(
+        zone_of(p1_bear, &runner),
+        Zone::Graveyard,
+        "P1's plain Bear must be destroyed"
+    );
+    assert_eq!(
+        zone_of(artifact, &runner),
+        Zone::Battlefield,
+        "the artifact must be spared"
+    );
+    assert_eq!(
+        zone_of(land, &runner),
+        Zone::Battlefield,
+        "P0's land must be spared"
+    );
+    assert_eq!(
+        zone_of(p1_land, &runner),
+        Zone::Battlefield,
+        "P1's land must be spared"
+    );
+    assert_eq!(
+        zone_of(phyrexian, &runner),
+        Zone::Battlefield,
+        "the Phyrexian creature must be spared"
+    );
 }

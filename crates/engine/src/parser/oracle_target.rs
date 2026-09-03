@@ -8411,15 +8411,31 @@ fn preceded_color_separator(input: &str) -> super::oracle_nom::error::OracleResu
 /// `neg_type_filters`/`properties`. List items are Oxford-comma-tolerant via
 /// the existing `match_mass_union_separator`, reused rather than duplicated.
 ///
-/// Guard: `classify_negation`'s catch-all treats any unrecognized word as a
-/// negated Subtype (correct for its "non-<word>" prefix context — CR 205.3
-/// subtype negation like "nonZombie" is a real pattern). That fallback is
-/// UNSAFE here: "except for Mageta" or "except for commanders" would silently
-/// classify as `Non(Subtype("Mageta"))`, which no permanent has, making the
-/// exclusion a silent no-op that looks fixed but isn't. This function rejects
-/// the whole clause (returns `None`) if any item resolves to a negated
-/// Subtype, leaving those cards' existing (unhandled, honestly silent)
-/// behavior unchanged rather than mis-firing on a named/designation exception.
+/// The exclusion vocabulary gate: each list item's singular form is resolved
+/// through the CR 205.3 subtype vocabulary (`parse_subtype`) before being
+/// classified by `classify_negation`. That vocabulary is the single authority
+/// on two questions at once — what an item's singular is, and whether the
+/// item is a genuine subtype at all. `classify_negation`'s catch-all still
+/// treats any unrecognized word as a negated Subtype (correct for its
+/// "non-<word>" prefix context — CR 205.3 subtype negation like "nonZombie"
+/// is a real pattern), so this function still verifies every catch-all hit
+/// against the vocabulary before accepting it. Two promises hold: (a) a
+/// **name/designation** exception ("except for Mageta") still declines the
+/// whole clause, exactly as before — pinned by
+/// `except_for_named_exception_does_not_misfire_as_subtype_negation` — rather
+/// than silently classifying as `Non(Subtype("Mageta"))`, which no permanent
+/// has; (b) a **mixed** list containing one unrecognised word still declines
+/// wholesale rather than partially applying.
+///
+/// The gate newly ACCEPTS what it used to decline: CR 205.3m creature-type
+/// exclusions ("except for Krakens, Leviathans, Octopuses, and Serpents";
+/// "except for artifacts, lands, and Phyrexians") and CR 205.3i basic
+/// land-type exclusions ("except for Islands"). Before this gate, a wholesale
+/// decline on a MIXED list — as on The Argent Etchings' "except for
+/// artifacts, lands, and Phyrexians" — silently dropped two correctly
+/// classified card-type exclusions (artifact, land) along with the one
+/// subtype exclusion (Phyrexian), because the whole clause was rejected the
+/// moment any single item resolved to an unrecognised negated Subtype.
 fn parse_except_for_type_list_suffix(
     text: &str,
 ) -> Option<(Vec<TypeFilter>, Vec<FilterProp>, usize)> {
@@ -8439,14 +8455,47 @@ fn parse_except_for_type_list_suffix(
             take_till1::<_, _, OracleError<'_>>(|c: char| !c.is_ascii_alphabetic())
                 .parse(rest)
                 .ok()?;
-        let singular = word.trim_end_matches('s');
-        match classify_negation(singular) {
+        // CR 205.3a + CR 205.3i + CR 205.3m: the SUBTYPE VOCABULARY is the single
+        // authority for both questions this item raises — "what is its singular?" and
+        // "is it a real subtype at all?". `parse_subtype` normalizes -s / -es / -ies
+        // and the irregulars (Octopuses -> Octopus, Elves -> Elf, Merfolk -> Merfolk);
+        // the legacy `trim_end_matches('s')` produced "Octopuse"/"Elve", which no
+        // lookup recognizes, so every genuine subtype exclusion declined. `word` is a
+        // whole alphabetic token from this function's own `take_till1`, and
+        // `parse_subtype_entry` (oracle_util.rs:1258) word-bounds every arm via
+        // `starts_with_word_ci`, so a match here always consumes the whole word —
+        // "Serpentine" cannot match "Serpent".
+        //
+        // PRECEDENCE IS UNCHANGED: `classify_negation` still classifies, and still
+        // first. `parse_subtype` supplies the singular it classifies, and is consulted
+        // a second time only inside the catch-all arm, to tell a real CR 205.3a subtype
+        // ("Kraken", "Phyrexian", "Island") from a card name or designation ("Mageta",
+        // "commanders"). A vocabulary word whose singular IS a card type
+        // ("sorceries" -> "Sorcery") therefore reaches `classify_negation` as
+        // "sorcery" and is classified as CR 205.2a `TypeFilter::Sorcery`, not as a
+        // subtype.
+        let canonical_subtype = parse_subtype(word).map(|(canonical, _)| canonical);
+        let lowered_canonical = canonical_subtype.as_deref().map(str::to_lowercase);
+        // Byte-identical legacy fallback: every item that classifies today keeps
+        // classifying exactly as it does today.
+        let normalized: &str = lowered_canonical
+            .as_deref()
+            .unwrap_or_else(|| word.trim_end_matches('s'));
+        match classify_negation(normalized) {
             NegationResult::Type(TypeFilter::Non(inner))
                 if matches!(*inner, TypeFilter::Subtype(_)) =>
             {
-                // Unrecognized word (name, designation, etc.) — decline the
-                // whole clause rather than emit a silently-vacuous exclusion.
-                return None;
+                match &canonical_subtype {
+                    // CR 205.3a: a genuine subtype exclusion — emit it.
+                    Some(canonical) => neg_types.push(TypeFilter::Non(Box::new(
+                        TypeFilter::Subtype(canonical.clone()),
+                    ))),
+                    // CR 205.3a: an unrecognized word (a card NAME, a designation) still
+                    // falls through `classify_negation`'s catch-all (:4013) to a negated
+                    // Subtype that no permanent has — a silently vacuous exclusion.
+                    // Decline the whole clause, as before ("except for Mageta").
+                    None => return None,
+                }
             }
             NegationResult::Type(tf) => neg_types.push(tf),
             NegationResult::Prop(prop) => props.push(prop),
@@ -9668,6 +9717,125 @@ mod tests {
         );
     }
 
+    /// V3u — issue #7451 U2: "creatures except for Krakens, Leviathans,
+    /// Octopuses, and Serpents" (Slinn Voda class) must exclude the FULL
+    /// four-subtype list. Before the vocabulary gate, `trim_end_matches('s')`
+    /// singularised "Octopuses" to "Octopuse", which no subtype lookup
+    /// recognizes, so the whole clause declined and the exclusion was lost —
+    /// `Octopuses` is the revert-failing item; the other three singularise
+    /// correctly under the legacy fallback and would still pass on their own.
+    /// Sibling case (Slinn Voda's actual printed list): "Merfolk" has no
+    /// "-s" plural, pinning that the irregular-plural table is consulted for
+    /// every item in a list, not just the first.
+    #[test]
+    fn parse_type_phrase_except_for_subtype_list() {
+        let (filter, rest) =
+            parse_type_phrase("creatures except for Krakens, Leviathans, Octopuses, and Serpents");
+        assert_eq!(rest.trim(), "");
+        let tf = typed_leg(&filter).expect("expected typed filter");
+        assert!(tf.type_filters.contains(&TypeFilter::Creature));
+        for subtype in ["Kraken", "Leviathan", "Octopus", "Serpent"] {
+            assert!(
+                tf.type_filters
+                    .contains(&TypeFilter::Non(Box::new(TypeFilter::Subtype(
+                        subtype.to_string()
+                    )))),
+                "missing Non(Subtype({subtype:?})) in {:?}",
+                tf.type_filters
+            );
+        }
+
+        let (filter, rest) = parse_type_phrase(
+            "creatures except for Merfolk, Krakens, Leviathans, Octopuses, and Serpents",
+        );
+        assert_eq!(rest.trim(), "");
+        let tf = typed_leg(&filter).expect("expected typed filter");
+        for subtype in ["Merfolk", "Kraken", "Leviathan", "Octopus", "Serpent"] {
+            assert!(
+                tf.type_filters
+                    .contains(&TypeFilter::Non(Box::new(TypeFilter::Subtype(
+                        subtype.to_string()
+                    )))),
+                "missing Non(Subtype({subtype:?})) in {:?}",
+                tf.type_filters
+            );
+        }
+    }
+
+    /// V3u-mixed — issue #7451 U2: The Argent Etchings' grammar, isolated
+    /// from its board (see `argent_etchings_iii_spares_artifacts_lands_and_phyrexians`
+    /// in the integration suite for the cast-pipeline form). A list mixing
+    /// two CR 205.2a core types with one CR 205.3m subtype must classify
+    /// each item through its own vocabulary and keep all three exclusions.
+    /// Revert-failing: today the whole clause declines the moment
+    /// "Phyrexians" resolves to an unrecognised negated Subtype, losing the
+    /// two correctly-classified core-type exclusions along with it.
+    #[test]
+    fn parse_type_phrase_except_for_mixed_core_types_and_subtype() {
+        let (filter, rest) =
+            parse_type_phrase("permanents except for artifacts, lands, and Phyrexians");
+        assert_eq!(rest.trim(), "");
+        let tf = typed_leg(&filter).expect("expected typed filter");
+        assert!(tf.type_filters.contains(&TypeFilter::Permanent));
+        assert!(tf
+            .type_filters
+            .contains(&TypeFilter::Non(Box::new(TypeFilter::Artifact))));
+        assert!(tf
+            .type_filters
+            .contains(&TypeFilter::Non(Box::new(TypeFilter::Land))));
+        assert!(tf
+            .type_filters
+            .contains(&TypeFilter::Non(Box::new(TypeFilter::Subtype(
+                "Phyrexian".to_string()
+            )))));
+    }
+
+    /// V3u-land — CR 205.3i basic land-type exclusion. BUILDING-BLOCK
+    /// coverage only: no printed card reads "except for Islands" ("except
+    /// for basic lands" is a different phrase — a supertype negation that
+    /// declines on the trailing-text guard both before and after this
+    /// change, and is unaffected by it). Documents a deliberate
+    /// decline -> accept change: before the vocabulary gate, "Islands"
+    /// singularised to "Island" under the legacy fallback but "island" is
+    /// not one of `classify_negation`'s known words, so it fell through to
+    /// a negated Subtype that the old guard declined outright.
+    #[test]
+    fn parse_type_phrase_except_for_basic_land_type() {
+        let (filter, rest) = parse_type_phrase("permanents except for Islands");
+        assert_eq!(rest.trim(), "");
+        let tf = typed_leg(&filter).expect("expected typed filter");
+        assert!(tf.type_filters.contains(&TypeFilter::Permanent));
+        assert!(tf
+            .type_filters
+            .contains(&TypeFilter::Non(Box::new(TypeFilter::Subtype(
+                "Island".to_string()
+            )))));
+    }
+
+    /// V3u-sorc — the single measured collision between the CR 205.3 subtype
+    /// vocabulary and `classify_negation`'s keyword set: "sorceries"
+    /// singularises to "Sorcery" via the irregular-plural table, but Sorcery
+    /// is a CR 205.2a CORE type, not a subtype. Pins that precedence was not
+    /// reordered: `classify_negation` still classifies "sorcery" through its
+    /// own core-type arm, never falling into the catch-all that would emit a
+    /// vacuous `Non(Subtype("Sorcery"))`.
+    #[test]
+    fn parse_type_phrase_except_for_card_type_plural() {
+        let (filter, rest) = parse_type_phrase("permanents except for sorceries");
+        assert_eq!(rest.trim(), "");
+        let tf = typed_leg(&filter).expect("expected typed filter");
+        assert!(tf
+            .type_filters
+            .contains(&TypeFilter::Non(Box::new(TypeFilter::Sorcery))));
+        assert!(
+            !tf.type_filters.iter().any(
+                |t| matches!(t, TypeFilter::Non(inner) if matches!(**inner, TypeFilter::Subtype(_)))
+            ),
+            "must not misclassify 'sorceries' as a negated Subtype, got {:?}",
+            tf.type_filters
+        );
+    }
+
     /// GitHub #4710 hostile fixture (Mageta the Lion class): "except for
     /// Mageta" names a specific permanent, not a type. `classify_negation`'s
     /// catch-all treats any unrecognized word as a negated Subtype, which
@@ -9675,6 +9843,19 @@ mod tests {
     /// (no permanent has that subtype) that looks fixed but isn't. The suffix
     /// parser must decline the whole clause instead, leaving the base filter
     /// unchanged rather than mis-firing on a named exception it can't model.
+    /// V3u-neg (added): a MIXED list combining a genuine CR 205.3m subtype
+    /// ("Krakens") with a card-name exception ("Mageta") must still decline
+    /// wholesale, not partially apply the subtype exclusion while dropping
+    /// the name. The vocabulary gate resolves "Krakens" but "Mageta" is not
+    /// in the CR 205.3 vocabulary at all, so the whole clause is rejected via
+    /// the same `None` catch-all arm as the pure-name case above.
+    /// Word-boundary row: a word that merely CONTAINS a vocabulary subtype as a
+    /// prefix ("Serpentine" over "Serpent") must also decline. This is a
+    /// different risk from the two above — they exercise a word absent from the
+    /// vocabulary, this one exercises `parse_subtype_entry`'s `starts_with_word_ci`
+    /// guard, which requires a non-alphanumeric follower so the match consumes
+    /// the whole token. Without that guard the clause would silently exclude
+    /// Serpents from a spell that never mentioned them.
     #[test]
     fn except_for_named_exception_does_not_misfire_as_subtype_negation() {
         let (filter, rest) = parse_type_phrase("creatures except for Mageta");
@@ -9685,6 +9866,26 @@ mod tests {
                 .parse(rest.trim_start())
                 .is_ok(),
             "the unrecognized exception clause must be left unconsumed, got rest={rest:?}"
+        );
+
+        let (filter, rest) = parse_type_phrase("creatures except for Krakens and Mageta");
+        let tf = typed_leg(&filter).expect("expected typed filter");
+        assert_eq!(tf.type_filters, vec![TypeFilter::Creature]);
+        assert!(
+            tag::<_, _, OracleError<'_>>("except for")
+                .parse(rest.trim_start())
+                .is_ok(),
+            "a mixed real-subtype + name list must be left unconsumed, got rest={rest:?}"
+        );
+
+        let (filter, rest) = parse_type_phrase("permanents except for Serpentine");
+        let tf = typed_leg(&filter).expect("expected typed filter");
+        assert_eq!(tf.type_filters, vec![TypeFilter::Permanent]);
+        assert!(
+            tag::<_, _, OracleError<'_>>("except for")
+                .parse(rest.trim_start())
+                .is_ok(),
+            "a word merely PREFIXED by a subtype must be left unconsumed, got rest={rest:?}"
         );
     }
 
