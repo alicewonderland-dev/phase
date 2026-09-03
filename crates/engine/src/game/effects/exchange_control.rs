@@ -62,6 +62,18 @@ pub fn resolve(
     // index discipline survives a mixed declared/context-ref pair. It delegates the
     // event tier to `targeting::resolve_event_context_target`; there is no second
     // resolver here.
+    //
+    // SCOPE OF THAT GUARANTEE: it holds for the filters `resolved_targets`
+    // owns a tier for — `SelfRef` and the `is_pure_event_context_filter` group
+    // (which covers `TriggeringSource`). Those are the only context refs the
+    // corpus produces in an `ExchangeControl` slot. `is_context_ref()` admits
+    // more than that, and any filter WITHOUT a tier falls through to
+    // `resolved_targets`' terminal `ability.targets.clone()` — so it would
+    // return the sibling slot's declared target and both slots would resolve
+    // to the same object (CR 701.12b no-op). That is a latent shape, not a
+    // reachable one; see the matching note in `ability_utils.rs`'s slot
+    // builder. Adding a new context-ref filter to an ExchangeControl parse
+    // means giving it a tier in `resolved_targets` first.
     // NOTE: `resolve_event_context_target` must NOT be called directly — it has no
     // `SelfRef` arm, so it would silently break the Avarice Totem / Eyes Everywhere /
     // Phyrexian Infiltrator class.

@@ -216,13 +216,21 @@ fn switcheroo_still_surfaces_two_slots_and_swaps_two_permanents() {
 }
 
 /// HOSTILE (V12): `TargetFilter::None` is in `is_context_ref()`'s superset
-/// admission (§Q1) — no parser path produces it in an `ExchangeControl` slot,
-/// but the widening must not panic. `None` binds to `ability.source_id`
-/// (CR 608.2c `use_self` fallback via `targeting::resolved_targets`), so
-/// pairing it with a same-controller declared target reaches the ordinary
-/// CR 701.12b same-controller no-op cleanly.
+/// admission — no parser path produces it in an `ExchangeControl` slot, but
+/// the widening must not panic.
+///
+/// WHICH BINDING ACTUALLY HAPPENS: with a DECLARED sibling slot, `None` does
+/// NOT reach `resolved_targets`' `use_self` fallback — that fallback is gated
+/// on `ability.targets.is_empty()`. It falls through every tier to the
+/// terminal `ability.targets.clone()` and binds THE SIBLING'S declared target,
+/// so both slots resolve to the same object and CR 701.12b no-ops. This row
+/// pins that (the object identity, not just "nothing happened"); the
+/// `..._binds_the_source_when_no_sibling_target_exists` row below pins the
+/// `use_self` path it is often mistaken for. Together they are the reason
+/// `ability_utils.rs`'s slot-builder comment says a NEW context-ref filter
+/// must be given a tier in `resolved_targets` before it appears in a parse.
 #[test]
-fn exchange_control_none_filter_reaches_the_use_self_fallback_without_panicking() {
+fn exchange_control_none_filter_with_a_declared_sibling_binds_that_sibling() {
     let mut state = GameState::new_two_player(42);
     let source = create_object(
         &mut state,
@@ -254,12 +262,56 @@ fn exchange_control_none_filter_reaches_the_use_self_fallback_without_panicking(
         source,
         P0,
     );
+    // REACH GUARD on the actual mechanism: `None` must bind the DECLARED
+    // sibling target, not `ability.source_id`. Without this the row would pass
+    // under either binding and prove nothing about which one happened.
+    assert_eq!(
+        engine::game::targeting::resolved_targets(&ability, &TargetFilter::None, &state),
+        vec![TargetRef::Object(same_controller_target)],
+        "with a declared sibling, None falls through to the declared-targets tier"
+    );
+
     let mut events = Vec::new();
     exchange_control::resolve(&mut state, &ability, &mut events).expect("must not panic");
     assert!(
         state.transient_continuous_effects.is_empty(),
-        "CR 701.12b: None resolves to the source (P0-controlled), matching the declared \
-         target's controller (P0) ⇒ same-controller no-op"
+        "CR 701.12b: both slots resolved to the same object ⇒ same-controller no-op"
+    );
+}
+
+/// SIBLING: the `use_self` path the row above is commonly mistaken for.
+/// `resolved_targets` binds `TargetFilter::None` to `ability.source_id` ONLY
+/// when `ability.targets` is empty (CR 608.2c) — which, in an
+/// `ExchangeControl`, means only when the other slot is also a context ref.
+#[test]
+fn exchange_control_none_filter_binds_the_source_when_no_sibling_target_exists() {
+    let mut state = GameState::new_two_player(42);
+    let source = create_object(
+        &mut state,
+        CardId(1),
+        P0,
+        "Source".to_string(),
+        Zone::Battlefield,
+    );
+    let ability = ResolvedAbility::new(
+        Effect::ExchangeControl {
+            target_a: TargetFilter::None,
+            target_b: TargetFilter::SelfRef,
+        },
+        vec![],
+        source,
+        P0,
+    );
+    assert_eq!(
+        engine::game::targeting::resolved_targets(&ability, &TargetFilter::None, &state),
+        vec![TargetRef::Object(source)],
+        "with no declared targets, None reaches the use_self fallback"
+    );
+    let mut events = Vec::new();
+    exchange_control::resolve(&mut state, &ability, &mut events).expect("must not panic");
+    assert!(
+        state.transient_continuous_effects.is_empty(),
+        "CR 701.12b: both slots are the source ⇒ same-controller no-op"
     );
 }
 

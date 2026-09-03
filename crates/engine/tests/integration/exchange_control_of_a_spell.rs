@@ -477,3 +477,109 @@ fn perplexing_chimera_destroyed_in_response_to_its_own_trigger_is_a_total_noop()
         "REACH GUARD: Grizzly Bears must still be on the stack (unresolved) at this point"
     );
 }
+
+/// BLAST-RADIUS PIN (review round 2) — Gilded Drake's disposition when its
+/// sole declared target becomes illegal while staying on the battlefield.
+///
+/// `validate_targets_in_chain`'s `ExchangeControl` arm re-validates against
+/// each declared filter, where the generic branch it replaced checked only
+/// `state.battlefield.contains`. For Gilded Drake ("exchange control of this
+/// creature and up to one target creature an opponent controls. If you don't
+/// or can't make an exchange, sacrifice this creature.") that flips the
+/// outcome when the target stops being a creature in response:
+///
+///   * BEFORE — the target survived re-validation, so the ability resolved
+///     and the exchange RAN against an illegal target. Plainly wrong.
+///   * AFTER  — the target is illegal, it is this ability's only instance of
+///     the word "target", so per CR 608.2b the ability doesn't resolve. This
+///     is the correct DEFAULT, and it is what this row pins.
+///
+/// KNOWN GAP, deliberately not fixed here: Gilded Drake's printed "This
+/// ability still resolves if its target becomes illegal" is an explicit CR
+/// 608.2b exception that the parser does not model at all — the clause is
+/// dropped, and `optional_targeting` is `false` despite "up to one target".
+/// With it modelled, the ability would resolve, the exchange would not
+/// happen, and the Drake would be sacrificed. Representing that exception is
+/// a parser + AST change well outside this run; this row exists so the
+/// current disposition is a recorded decision rather than an unnoticed side
+/// effect, and so it fails loudly when the exception is implemented.
+#[test]
+fn gilded_drake_sole_target_that_stops_matching_its_filter_stops_the_ability() {
+    use engine::game::ability_utils::validate_targets_in_chain;
+    use engine::game::zones::create_object;
+    use engine::types::ability::{
+        ControllerRef, Effect, QuantityExpr, ResolvedAbility, TargetFilter, TargetRef, TypedFilter,
+    };
+    use engine::types::card_type::CoreType;
+    use engine::types::game_state::GameState;
+    use engine::types::identifiers::CardId;
+
+    let mut state = GameState::new_two_player(42);
+    let drake = create_object(
+        &mut state,
+        CardId(1),
+        P0,
+        "Gilded Drake".to_string(),
+        Zone::Battlefield,
+    );
+    let victim = create_object(
+        &mut state,
+        CardId(2),
+        P1,
+        "Victim".to_string(),
+        Zone::Battlefield,
+    );
+
+    let mut ability = ResolvedAbility::new(
+        Effect::ExchangeControl {
+            target_a: TargetFilter::SelfRef,
+            target_b: TargetFilter::Typed(
+                TypedFilter::creature().controller(ControllerRef::Opponent),
+            ),
+        },
+        vec![TargetRef::Object(victim)],
+        drake,
+        P0,
+    );
+    ability.sub_ability = Some(Box::new(ResolvedAbility::new(
+        Effect::Sacrifice {
+            target: TargetFilter::SelfRef,
+            count: QuantityExpr::Fixed { value: 1 },
+            min_count: 0,
+        },
+        vec![],
+        drake,
+        P0,
+    )));
+
+    // REACH GUARD: while the victim IS a creature the target is kept, so this
+    // row is exercising the re-validation seam and not an unrelated drop.
+    state
+        .objects
+        .get_mut(&victim)
+        .unwrap()
+        .card_types
+        .core_types = vec![CoreType::Creature];
+    assert_eq!(
+        validate_targets_in_chain(&state, &ability).targets,
+        vec![TargetRef::Object(victim)],
+        "REACH GUARD: a legal creature target must survive re-validation"
+    );
+
+    // The victim stays on the battlefield but stops being a creature — the
+    // exact case the old battlefield-presence-only check let through.
+    state
+        .objects
+        .get_mut(&victim)
+        .unwrap()
+        .card_types
+        .core_types = vec![CoreType::Artifact];
+
+    assert!(
+        validate_targets_in_chain(&state, &ability)
+            .targets
+            .is_empty(),
+        "CR 608.2b: a target that no longer matches its filter is illegal, so this ability's \
+         only target is illegal and it does not resolve"
+    );
+}

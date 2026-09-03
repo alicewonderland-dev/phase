@@ -2744,10 +2744,25 @@ fn collect_target_slots_inner(
     // order. (Keep in sync with `build_target_slot_specs` or the slot-count
     // invariant fires.)
     //
-    // CR 608.2k: `is_context_ref()`'s superset also admits `TargetFilter::None`
-    // (no parser path produces it here, but should one appear, `resolved_targets`
-    // binds it to `ability.source_id` via its documented `use_self` fallback
-    // rather than surfacing a target slot for it).
+    // CR 608.2k: `is_context_ref()` is a SUPERSET of what `targeting::
+    // resolved_targets` owns an early tier for. Its tier-owned set here is
+    // `SelfRef` (tier 1) and the `is_pure_event_context_filter` group, which
+    // covers `TriggeringSource` — i.e. every filter the corpus actually
+    // produces in an `ExchangeControl` slot (verified: 30 cards, only
+    // `SelfRef` / `TriggeringSource` / `Typed` / `And` / `Or`). Any OTHER
+    // member of the superset — `None`, `LastCreated`, `TrackedSet`,
+    // `Neighbor`, ... — has no tier here and falls through to
+    // `resolved_targets`' terminal `ability.targets.clone()`, which means it
+    // would bind THE SIBLING SLOT'S DECLARED TARGET, not the source.
+    //
+    // Do NOT read `None` as "resolves to `ability.source_id`": that
+    // (`use_self`) only fires when `ability.targets.is_empty()`, i.e. only
+    // when the sibling slot is also a context ref. With a declared sibling,
+    // `None` binds that sibling's target and both slots resolve to the same
+    // object, which CR 701.12b then no-ops. `context_ref_slot_hygiene.rs`
+    // pins both halves of that split. No parser path produces any of these
+    // here; if one ever does, give it a tier in `resolved_targets` rather
+    // than assuming this predicate already covers it.
     if let Effect::ExchangeControl { target_a, target_b } = &ability.effect {
         for filter in [target_a, target_b] {
             if filter.is_context_ref() {
