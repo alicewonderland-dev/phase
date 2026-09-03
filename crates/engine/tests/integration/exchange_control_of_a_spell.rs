@@ -9,6 +9,7 @@
 
 use engine::game::scenario::{CastCommit, GameScenario, P0, P1};
 use engine::types::actions::GameAction;
+use engine::types::card_type::CoreType;
 use engine::types::game_state::WaitingFor;
 use engine::types::mana::ManaCost;
 use engine::types::phase::Phase;
@@ -225,6 +226,99 @@ fn sudden_substitution_hostile_target_spell_countered_in_response() {
             .controller,
         P1,
         "CR 701.12a all-or-nothing: with the spell subject gone, the creature must NOT swap either"
+    );
+    // CR 608.2b + CR 701.12a — INDEX-DISCIPLINE PIN for
+    // `ability_utils::validate_targets_in_chain`'s ExchangeControl arm. That
+    // arm PRUNES the illegal slot-A target, which slides the surviving slot-B
+    // target into slot A's position; `exchange_control::resolve_slot` then
+    // reads the creature into slot A and finds nothing for slot B. Pruning is
+    // safe only because that second lookup runs dry and takes CR 701.12a's
+    // all-or-nothing early return BEFORE any continuous effect is written.
+    // Asserting "no continuous effect at all" (not merely "the creature kept
+    // its controller") is what makes a future partially-completable
+    // ExchangeControl fail here instead of silently exchanging the wrong
+    // object.
+    assert!(
+        outcome.state().transient_continuous_effects.is_empty(),
+        "no partial or mis-bound exchange may be written when one subject is illegal"
+    );
+}
+
+/// SIBLING (V17) — CR 608.2b re-validation is now filter-aware for the
+/// ORDINARY two-permanent path, not just the stack-subject one.
+///
+/// Before this change `ExchangeControl` fell to `validate_targets_in_chain`'s
+/// generic `None` branch, which re-checked only `state.battlefield.contains`.
+/// A target that stayed on the battlefield but stopped satisfying the
+/// ability's own filter therefore survived re-validation and got exchanged.
+/// The dedicated arm re-validates against each declared filter, so a creature
+/// that is no longer a creature when Switcheroo resolves is illegal
+/// (CR 608.2b: "its characteristics may have changed"), and with one subject
+/// illegal the exchange can't be completed (CR 701.12a).
+///
+/// This row exists because the arm changes re-validation for EVERY card that
+/// parses to `ExchangeControl`, not only the two cards in this run's scope.
+///
+/// REVERT-FAILING: restoring the generic battlefield-only check makes the
+/// de-typed permanent a legal target again and both controllers swap.
+#[test]
+fn exchange_control_target_that_stops_matching_its_filter_is_illegal_on_resolution() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let creature_a = scenario.add_creature(P0, "Creature A", 2, 2).id();
+    let creature_b = scenario.add_creature(P1, "Creature B", 3, 3).id();
+    let switcheroo = scenario
+        .add_spell_to_hand_from_oracle(
+            P0,
+            "Switcheroo",
+            false,
+            "Exchange control of two target creatures.",
+        )
+        .with_mana_cost(ManaCost::zero())
+        .id();
+
+    let mut runner = scenario.build();
+    let mut commit = runner
+        .cast(switcheroo)
+        .target_objects(&[creature_a, creature_b])
+        .commit();
+
+    // REACH GUARD: both targets must have been accepted at announcement, or
+    // this row would prove nothing about RESOLUTION-time re-validation.
+    assert_eq!(
+        commit.state().stack.len(),
+        1,
+        "REACH GUARD: Switcheroo must be on the stack with its two targets"
+    );
+
+    // "In response", creature B stops being a creature (it stays on the
+    // battlefield, so the old battlefield-only check would still accept it).
+    {
+        let state = commit.state_mut();
+        state
+            .objects
+            .get_mut(&creature_b)
+            .expect("creature B exists")
+            .card_types
+            .core_types = vec![CoreType::Artifact];
+    }
+
+    let outcome = commit.resolve();
+
+    assert!(
+        outcome.state().transient_continuous_effects.is_empty(),
+        "CR 608.2b + CR 701.12a: with one subject no longer matching its filter, no part of \
+         the exchange occurs"
+    );
+    assert_eq!(
+        outcome.state().objects.get(&creature_a).unwrap().controller,
+        P0,
+        "creature A must keep its controller"
+    );
+    assert_eq!(
+        outcome.state().objects.get(&creature_b).unwrap().controller,
+        P1,
+        "creature B must keep its controller"
     );
 }
 

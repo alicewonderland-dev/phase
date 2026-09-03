@@ -2069,6 +2069,37 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
         // different effect. Context-ref filters (SelfRef, TriggeringSource)
         // claim no slot and are skipped, mirroring
         // `collect_target_slots_inner` / `build_target_slot_specs`.
+        //
+        // PRUNING IS DELIBERATE, and it is the opposite choice from the
+        // `mana_multi_role` arm immediately below — read both together. That
+        // arm keeps illegal targets in position because its consumption site
+        // (`ability_scoped_to_slot`) re-validates each role against that
+        // role's OWN filter, so a retained illegal entry can never be acted
+        // on. `exchange_control::resolve` has NO such per-slot recheck: it
+        // consumes `ability.targets` positionally through `resolve_slot`, so
+        // a retained illegal target would be bound and exchanged, violating
+        // CR 608.2b's "illegal targets won't be affected". Dropping it is
+        // what makes the second `resolve_slot` call run dry and take
+        // CR 701.12a's all-or-nothing early return.
+        //
+        // THE INVARIANT THAT MAKES PRUNING SAFE: dropping a leading entry
+        // shifts the survivor into the earlier slot's position, so with
+        // `target_a` illegal and `target_b` legal the resolver reads B's
+        // object into slot A. That is harmless ONLY because `resolve_slot`
+        // then finds nothing for slot B and returns before writing any
+        // continuous effect — CR 701.12a is what converts the mis-binding
+        // into the correct total no-op. `exchange_control_of_a_spell.rs::
+        // sudden_substitution_hostile_target_spell_countered_in_response` is
+        // exactly that shape (slot A illegal, slot B legal) and asserts NO
+        // continuous effect is written at all, so making `ExchangeControl`
+        // partially completable breaks a test rather than silently
+        // exchanging the wrong object.
+        //
+        // Emitting nothing when only ONE side is illegal would be wrong for a
+        // different reason: `check_fizzle` would then see an empty legal list
+        // against a non-empty original and fizzle the spell, but CR 608.2b
+        // fizzles only when EVERY target is illegal. One surviving legal
+        // target means the spell resolves and does nothing.
         let mut kept = Vec::new();
         let mut target_iter = validated.targets.iter();
         for filter in [target_a, target_b] {
@@ -2086,6 +2117,12 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
                 kept.push(legal);
             }
         }
+        // CR 608.2b (phase#4767 review, same hazard the `Attach` arm above
+        // documents): `validated.targets` may carry entries this node's own
+        // two filters never claimed, propagated through for a downstream
+        // sibling in the chain. They must pass through UNCHANGED rather than
+        // be silently dropped, or the sibling loses its target.
+        kept.extend(target_iter.cloned());
         kept
     } else if let Some(role) = mana_multi_role(&validated.effect) {
         // CR 608.2b: THREE properties, all required.

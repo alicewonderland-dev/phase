@@ -440,6 +440,105 @@ fn damage_redirect_selfref_recipient_hosts_on_source_redirect_reads_the_only_slo
     );
 }
 
+/// HOSTILE (V15) — CR 614.9 + CR 400.7: a context-ref recipient whose
+/// referent is GONE must install no shield at all.
+///
+/// Routing the recipient host through `targeting::resolved_targets` added a
+/// way for `recipient_host` to be `None` that did not exist before (the old
+/// code returned `ability.source_id` unconditionally for `SelfRef`). The
+/// `None` fallback pushes the shield into `state.pending_damage_replacements`
+/// WITHOUT stamping `valid_card: SelfRef`, and the en-Kor class carries no
+/// `target_filter` either — so an unguarded fallback would install a shield
+/// that redirects the next damage dealt to ANY object this turn.
+///
+/// `SelfRef` currency is only re-checked when the ability carries a
+/// `trigger_source` context (`ResolvedAbility::self_ref_is_current`), which an
+/// activated en-Kor ability does not — so this fixture stamps one explicitly
+/// to reach the seam rather than relying on that incidental guard to keep it
+/// unreachable.
+///
+/// REVERT-FAILING: without the `recipient_context_ref.is_some() &&
+/// recipient_host.is_none()` guard, `pending_damage_replacements` gains one
+/// unconstrained shield.
+#[test]
+fn damage_redirect_context_ref_recipient_with_a_dead_source_installs_no_shield() {
+    let mut state = GameState::new_two_player(42);
+    let en_kor = create_object(
+        &mut state,
+        CardId(1),
+        P0,
+        "Nomads en-Kor".to_string(),
+        Zone::Battlefield,
+    );
+    let chosen = create_object(
+        &mut state,
+        CardId(2),
+        P0,
+        "Chosen Creature".to_string(),
+        Zone::Battlefield,
+    );
+    state
+        .objects
+        .get_mut(&chosen)
+        .unwrap()
+        .card_types
+        .core_types = vec![CoreType::Creature];
+
+    let mut ability = ResolvedAbility::new(
+        Effect::CreateDamageReplacement {
+            source_filter: None,
+            combat_scope: None,
+            target_filter: None,
+            modification: None,
+            redirect_to: Some(DamageRedirectTarget::ChosenObjectTarget),
+            redirect_amount: Some(PreventionAmount::Next(1)),
+            redirect_object_filter: Some(TargetFilter::Typed(TypedFilter::creature())),
+            recipient_object_filter: Some(TargetFilter::SelfRef),
+            redirect_lifetime: RedirectionLifetime::OneOpportunity,
+        },
+        vec![TargetRef::Object(chosen)],
+        en_kor,
+        P0,
+    );
+    let source_context = engine::game::triggers::trigger_source_context_for_latch(
+        &state,
+        state.objects.get(&en_kor).expect("fixture source"),
+    );
+    ability.set_trigger_source_recursive(source_context);
+
+    // The recipient (the source itself) is destroyed before the ability
+    // resolves, so CR 400.7 currency fails and the context ref binds nothing.
+    let mut move_events = Vec::new();
+    engine::game::zones::move_to_zone(&mut state, en_kor, Zone::Graveyard, &mut move_events);
+
+    let mut events = Vec::new();
+    create_damage_replacement::resolve(&mut state, &ability, &mut events).unwrap();
+
+    assert!(
+        state.pending_damage_replacements.is_empty(),
+        "CR 614.9: a redirection whose original recipient is gone installs NO shield — an \
+         unconstrained pending shield would redirect damage dealt to any object"
+    );
+    assert!(
+        state
+            .objects
+            .get(&en_kor)
+            .unwrap()
+            .replacement_definitions
+            .is_empty(),
+        "nothing is hosted on the dead source either"
+    );
+    assert!(
+        state
+            .objects
+            .get(&chosen)
+            .unwrap()
+            .replacement_definitions
+            .is_empty(),
+        "and nothing leaks onto the redirect destination"
+    );
+}
+
 /// HOSTILE (V15 / M4): a synthetic fixture with BOTH a declared recipient AND
 /// a declared redirect filter (no printed card carries both, but the
 /// contract — recipient consumes slot 0, redirect reads slot 1 — must hold

@@ -197,6 +197,30 @@ pub fn resolve(
         (None, false) => None,
     };
 
+    // CR 614.9 + CR 400.7: a DECLARED context-ref recipient whose referent is
+    // gone ("...dealt to ~" after the source left the battlefield, so
+    // `resolved_targets`' CR 400.7 currency check binds nothing) must install
+    // NO shield. Without this guard the `recipient_host.is_none()` fallback
+    // below would push an unconstrained shield into
+    // `state.pending_damage_replacements`: the en-Kor class carries no
+    // `target_filter`, and `valid_card: SelfRef` is only stamped on the hosted
+    // branch, so that shield would redirect the next damage dealt to ANY
+    // object this turn instead of doing nothing.
+    //
+    // Gated on `recipient_context_ref` — NOT on `recipient_object_filter` —
+    // so this restores exactly the pre-`is_context_ref()` behavior and leaves
+    // the declared-recipient path (`chosen_target_object` returning `None`)
+    // on its existing fallback. That path has the same latent hazard, but it
+    // predates this change and is deliberately left alone here.
+    if recipient_context_ref.is_some() && recipient_host.is_none() {
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::CreateDamageReplacement,
+            source_id: ability.source_id,
+            subject: None,
+        });
+        return Ok(());
+    }
+
     // CR 614.5 + CR 614.9: Tag the shield as the appropriate one-shot kind.
     // Exactly one of `modification` / `redirect_to` is `Some` (parser invariant).
     match (modification, redirect_to) {
