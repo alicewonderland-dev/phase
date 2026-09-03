@@ -13616,6 +13616,228 @@ fn find_effect_boundary_skips_spell_quality_comma() {
     );
 }
 
+/// Issue #7451: the trigger condition/effect boundary must span the WHOLE
+/// Oxford-comma type list in the effect's subject, not stop at the list's
+/// first item. Revert-failing for all three rows: before the fix, the boundary
+/// walks to the LAST comma in the list, so the effect handed downstream keeps
+/// only the final list item.
+#[test]
+fn find_effect_boundary_splits_before_an_effect_subject_type_list() {
+    let subtype_list =
+        "whenever ~ attacks, birds, frogs, otters, and rats you control get +1/+1 until end of turn.";
+    let lower = subtype_list.to_lowercase();
+    let boundary = find_effect_boundary(&lower).expect("effect boundary");
+    let suffix = &lower[boundary..];
+    let expected = ", birds";
+    assert_eq!(
+        &suffix[..expected.len()],
+        expected,
+        "boundary should precede the whole subtype list, got {suffix:?}"
+    );
+
+    let core_type_list = "whenever you cast a noncreature spell, artifacts, creatures, and lands you control get +1/+1 until end of turn.";
+    let lower = core_type_list.to_lowercase();
+    let boundary = find_effect_boundary(&lower).expect("effect boundary");
+    let suffix = &lower[boundary..];
+    let expected = ", artifacts";
+    assert_eq!(
+        &suffix[..expected.len()],
+        expected,
+        "boundary should precede the whole core-type list, got {suffix:?}"
+    );
+
+    let two_item_list =
+        "whenever ~ attacks, birds, and rats you control get +1/+1 until end of turn.";
+    let lower = two_item_list.to_lowercase();
+    let boundary = find_effect_boundary(&lower).expect("effect boundary");
+    let suffix = &lower[boundary..];
+    let expected = ", birds";
+    assert_eq!(
+        &suffix[..expected.len()],
+        expected,
+        "boundary should precede the 2-item Oxford list, got {suffix:?}"
+    );
+}
+
+/// Monotonicity: pass 2 is a disjunct over pass 1, so a card decided `true` in
+/// pass 1 must never lose its boundary. Both rows are revert-failing against
+/// `naive-A` (issue #7451 round 1's single-pass `widened window AND NOT an
+/// event head` design): under `naive-A`, the only word in the narrow window is
+/// an event-head-lexicon word ("become"/"cast"), so the whole clause is
+/// excluded and `find_effect_boundary` returns `None`, losing the effect
+/// entirely. Assert `is_some()` explicitly rather than `unwrap()`, so a
+/// regression reports rather than panics.
+#[test]
+fn widened_boundary_window_is_monotone_over_effect_verbs() {
+    let thanos_copter =
+        "when ~ enters, vehicles you control become artifact creatures until end of turn.";
+    let lower = thanos_copter.to_lowercase();
+    let boundary = find_effect_boundary(&lower);
+    assert!(
+        boundary.is_some(),
+        "The Thanos-Copter must keep its effect clause (revert-failing against naive-A)"
+    );
+    let suffix = &lower[boundary.unwrap()..];
+    let expected = ", vehicles";
+    assert_eq!(&suffix[..expected.len()], expected);
+
+    let spellbinding_soprano =
+        "whenever ~ attacks, instant and sorcery spells you cast this turn cost {1} less to cast.";
+    let lower = spellbinding_soprano.to_lowercase();
+    let boundary = find_effect_boundary(&lower);
+    assert!(
+        boundary.is_some(),
+        "Spellbinding Soprano must keep its effect clause (revert-failing against naive-A)"
+    );
+    let suffix = &lower[boundary.unwrap()..];
+    let expected = ", instant";
+    assert_eq!(&suffix[..expected.len()], expected);
+}
+
+/// Issue #7451: the pass-2 scan must stop at a restrictive postmodifier
+/// (`that `/`which `/`with `) rather than reading into it. Without this bound,
+/// **Immolation Shaman**'s "an ability of an artifact, creature, or land THAT
+/// ISN'T a mana ability" would let the widened window reach "isn't", which
+/// `is_negated_auxiliary_predicate_token` classifies as an effect predicate,
+/// moving the boundary from the card's second comma to its first and
+/// narrowing `valid_card` from `AnyOf[Artifact, Creature]` to `Artifact`.
+/// Revert-failing against the round-2 variant (sentence bound only), under
+/// which row 1 moves to the first comma and row 3 returns
+/// `"creature, or land that isn't a mana ability"`.
+#[test]
+fn widened_window_stops_at_a_restrictive_postmodifier() {
+    let immolation_shaman = "whenever an opponent activates an ability of an artifact, creature, or land that isn't a mana ability, this creature deals 1 damage to that player.";
+    let lower = immolation_shaman.to_lowercase();
+    let boundary = find_effect_boundary(&lower).expect("effect boundary");
+    let suffix = &lower[boundary..];
+    let expected = ", or land that isn't";
+    assert_eq!(
+        &suffix[..expected.len()],
+        expected,
+        "boundary must stay at the card's second comma, got {suffix:?}"
+    );
+
+    let harsh_mentor = "whenever an opponent activates an ability of an artifact, creature, or land on the battlefield, if it isn't a mana ability, this creature deals 2 damage to that player.";
+    let lower = harsh_mentor.to_lowercase();
+    let boundary = find_effect_boundary(&lower).expect("effect boundary");
+    let suffix = &lower[boundary..];
+    let expected = ", if it isn't";
+    assert_eq!(
+        &suffix[..expected.len()],
+        expected,
+        "boundary must stay at the card's third comma, got {suffix:?}"
+    );
+
+    assert_eq!(
+        type_list_clause_window(
+            "creature, or land that isn't a mana ability, this creature deals 1 damage to that player."
+        ),
+        "creature, or land"
+    );
+}
+
+/// Issue #7451: the two-pass design keeps `find_effect_boundary` exactly where
+/// it is today for a mix of Event-classified and unclassified condition-side
+/// type lists — including the ones where `parse_event_head_start` must win
+/// over a same-word `PREDICATE_VERBS` entry ("is put into" vs. "put") and the
+/// ones where neither lexicon claims the next word at all.
+#[test]
+fn find_effect_boundary_keeps_a_condition_type_list_intact() {
+    let cases = [
+        (
+            "whenever a creature, planeswalker, or battle enters, draw a card",
+            ", draw",
+        ),
+        (
+            "whenever a bird, frog, or otter you control dies, draw a card",
+            ", draw",
+        ),
+        (
+            // Verbatim (post `strip_reminder_text`) April O'Neil, Live on the
+            // Scene text, trailing period included: `continues_player_action_list`'s
+            // FIRST check is a bare, pre-existing (unrelated to #7451)
+            // `all_consuming(parse_player_action_phrase_nom)` match, and a
+            // period-less `"investigate"` fragment fully satisfies it as a
+            // false "player action list" continuation — a shape no real
+            // corpus trigger line has, since `strip_reminder_text` always
+            // leaves the sentence-terminating period in place.
+            "whenever a mutant, ninja, or turtle you control enters, investigate.",
+            ", investigate",
+        ),
+        (
+            "whenever one or more other rabbits, bats, birds, and/or mice you control enter, scry 1",
+            ", scry",
+        ),
+        (
+            "whenever ~ deals combat damage to a player, planeswalker, or battle, surveil 1",
+            ", surveil",
+        ),
+        (
+            "whenever one or more mutants, ninjas, and/or turtles you control deal combat damage to a player, draw a card",
+            ", draw",
+        ),
+    ];
+    for (text, expected) in cases {
+        let lower = text.to_lowercase();
+        let boundary = find_effect_boundary(&lower).expect("effect boundary");
+        let suffix = &lower[boundary..];
+        assert_eq!(
+            &suffix[..expected.len()],
+            expected,
+            "for {text:?}, got {suffix:?}"
+        );
+    }
+}
+
+/// Issue #7451: a condition-side Oxford type list — the trigger's SUBJECT, not
+/// its effect — must stay exactly where it is today. These cards remain
+/// `TriggerMode::Unknown`; turning them green is out of scope for #7451.
+/// Revert-failing against `naive-B` (the two-pass design with the widened
+/// window but WITHOUT the event-head exclusion): under `naive-B` the boundary
+/// jumps to the FIRST comma. **Not** revert-failing against `naive-A` — under
+/// `naive-A` the widened window still contains the event head ("attacks" /
+/// "becomes"), so `naive-A`'s whole-window veto also leaves the boundary at
+/// comma 2.
+#[test]
+fn condition_side_type_list_boundary_is_unchanged() {
+    let bird_frog_otter = "whenever a bird, frog, or otter you control attacks, draw a card";
+    let lower = bird_frog_otter.to_lowercase();
+    let boundary = find_effect_boundary(&lower).expect("effect boundary");
+    let suffix = &lower[boundary..];
+    let expected = ", or otter";
+    assert_eq!(&suffix[..expected.len()], expected, "got {suffix:?}");
+
+    let forest_island_swamp =
+        "whenever a forest, island, or swamp you control becomes tapped, draw a card";
+    let lower = forest_island_swamp.to_lowercase();
+    let boundary = find_effect_boundary(&lower).expect("effect boundary");
+    let suffix = &lower[boundary..];
+    let expected = ", or swamp";
+    assert_eq!(&suffix[..expected.len()], expected, "got {suffix:?}");
+}
+
+/// `type_list_clause_window` bounds: extended across every list comma when
+/// nothing stops it; truncated to the Oxford list when a following clause
+/// isn't a list continuation; and stopped at the SENTENCE boundary so a
+/// trailing instruction sentence's verbs never leak into the window.
+#[test]
+fn type_list_clause_window_spans_the_whole_list() {
+    let whole = "birds, frogs, otters, and rats you control get +1/+1 until end of turn.";
+    assert_eq!(type_list_clause_window(whole), whole);
+
+    assert_eq!(
+        type_list_clause_window("planeswalker, or battle, surveil 1."),
+        "planeswalker, or battle"
+    );
+
+    let sentence_bounded = "birds, frogs and rats you control get +1/+1. untap them.";
+    let window = type_list_clause_window(sentence_bounded);
+    assert!(
+        !window.contains("untap"),
+        "the window must stop at the sentence boundary, got {window:?}"
+    );
+}
+
 #[test]
 fn parse_spell_chosen_number_quality_talion_suffix() {
     let tf = parse_spell_chosen_number_quality(
@@ -29694,7 +29916,9 @@ fn bare_you_attack_trigger_stays_you_attack_without_defender_scope() {
 // Entailment-gated plural-antecedent derivation — direct unit tests over the
 // private `trigger_plural_object_pronoun_ref_for_intervening_if` helper
 // (directly callable here via `use super::*`, since this file is mounted as
-// a child module of `oracle_trigger` at `oracle_trigger.rs:17850`). CR 603.4
+// a child module of `oracle_trigger` by the
+// `#[path = "oracle_trigger_tests.rs"] mod tests;` declaration at the end of
+// `oracle_trigger.rs`). CR 603.4
 // + CR 406.6 + CR 607.2a + CR 608.2k. U1-U11 exercise the fix's comparator ×
 // polarity × orientation entailment table; U5 (EQ 0), U6 (Not{GE 1}), and the
 // mixed-Or case inside U11 are REVERT-FAILING against the shipped

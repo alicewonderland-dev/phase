@@ -9123,10 +9123,13 @@ fn split_or_event_compound(cond_lower: &str, condition: &str) -> Option<Vec<Stri
     // handlers via the per-half re-parse loop.
     // Renamed from `is_event_verb_start`: it now answers "does an event HEAD start
     // here", covering the active-voice verbs AND the state-change/passive voices.
-    // 2 of the 9 `parse_event_verb_start` call sites are widened (this one and
-    // `extract_subject_text`); 7 stay narrow (`split_cross_subject_event_compound`;
-    // the three trailing-leg gates in `split_serial_event_compound`; the three in
-    // `continues_serial_event_condition`).
+    // 4 of the 11 event-head lexicon CONSULTATION SITES are WIDE: this one; the LEADING-half gate in
+    // split_cross_subject_event_compound; extract_subject_text (a fn-value handoff to
+    // scan_split_at_phrase); and the pass-2 scan in is_new_sentence_not_type_continuation (issue #7451).
+    // 7 stay narrow: split_cross_subject_event_compound's TRAILING-half gate — that function owns one
+    // gate of EACH width — the three trailing-leg gates in split_serial_event_compound, and the three in
+    // continues_serial_event_condition. Counting unit + regeneration command: see
+    // parse_event_head_start's doc.
     fn is_event_head_start(text: &str) -> bool {
         parse_event_head_start(text).is_ok()
     }
@@ -9136,8 +9139,7 @@ fn split_or_event_compound(cond_lower: &str, condition: &str) -> Option<Vec<Stri
     //
     // CR 509.1h: "blocks or becomes blocked" is the fused `BlocksOrBecomesBlocked`
     // mode. Its surface form is the `tag("blocks or becomes blocked")` inside
-    // `try_parse_event` (this file, at `oracle_trigger.rs:10225`; the tag itself is at
-    // :10622). This entry is LOAD-BEARING under the OPEN head
+    // `try_parse_event` (this file). This entry is LOAD-BEARING under the OPEN head
     // (`parse_state_change_event_start`), which admits `becomes blocked` like any
     // other complement. It was provably dead under the closed allow-list, which is
     // why the base commit had it in neither place; ablation now measures real
@@ -9179,7 +9181,8 @@ fn split_or_event_compound(cond_lower: &str, condition: &str) -> Option<Vec<Stri
     //
     // The general fix that would delete this predicate is admitting `fight`/`fights`
     // to an event-head lexicon so the subject span can terminate at it; that touches
-    // the nine-consumer accounting this change preserves and is out of scope here.
+    // the event-head consultation-site accounting censused on `parse_event_head_start`,
+    // which this change preserves, and is out of scope here.
     //
     // Deliberately NOT added: `fights or becomes blocked` (the singular of Neyith's
     // plural). Zero printed cards carry it, so it would ablate to zero breakage and
@@ -9392,9 +9395,10 @@ fn parse_event_verb_start(input: &str) -> OracleResult<'_, ()> {
 /// (`passive_player_actions`' "is/are sacrificed" and "is/are exiled";
 /// `simple_event_verbs`' "becomes the target of …"), so "active voice lives there,
 /// passive voice lives here" would be a false rule. The reason this is a separate
-/// combinator is CALL-SITE SCOPE: the head lexicon has nine consumers and seven must
-/// stay narrow (see `parse_event_head_start`), so the state-change voices are composed
-/// at exactly the two that need them. `parse_event_verb_start` is left byte-identical.
+/// combinator is CALL-SITE SCOPE: most of the head lexicon's consultation sites must
+/// stay NARROW (`parse_event_head_start` carries the census, its counting unit and the
+/// grep that regenerates it), so the state-change voices are composed only at the WIDE
+/// ones. `parse_event_verb_start` is left byte-identical.
 ///
 /// TWO productions, one per grammatical voice. The ASYMMETRY IS MEASURED, NOT DERIVED:
 ///   * `is`/`are` consults `parse_non_event_complement` because TWO LIVE CORPUS CARDS
@@ -9520,13 +9524,38 @@ fn parse_non_event_complement(input: &str) -> OracleResult<'_, ()> {
 /// CR 603.2e: the FULL trigger-event head lexicon — active-voice
 /// verbs plus the state-change/passive voices.
 ///
-/// Composed at exactly TWO of the nine `parse_event_verb_start` call sites: the
-/// 2-way or-split gate (`is_event_head_start`, inside `split_or_event_compound`) and
-/// the subject-span terminator (`extract_subject_text`). The other SEVEN stay
-/// NARROW — `split_cross_subject_event_compound`'s gate, the three serial
-/// TRAILING-leg gates in `split_serial_event_compound`, and the three in
-/// `continues_serial_event_condition` — each with a named counterexample or a
-/// measured zero-demand justification at its own site.
+/// COUNTING UNIT for the census below: an event-head lexicon **consultation site** is any position in
+/// this file that consults `parse_event_verb_start` (NARROW) or `parse_event_head_start` (WIDE) at run
+/// time — a direct call, a closure wrapping one, or a fn-value handoff (`extract_subject_text` passes
+/// this fn to `scan_split_at_phrase`, so a "direct call" count would miss it). NOT sites: the two `fn`
+/// definitions, this fn's own `alt((..))` body (the composition, not a consumer), and prose mentions.
+/// Regenerate the list — do not trust the figure, re-derive it:
+/// ```text
+///   grep -nE 'parse_event_(verb|head)_start' crates/engine/src/parser/oracle_trigger.rs \
+///     | grep -vE '^[0-9]+:[[:space:]]*//' \
+///     | grep -vE '^[0-9]+:fn parse_event_(verb|head)_start' \
+///     | grep -v 'alt((parse_event_verb_start'
+/// ```
+/// One line per site; the WIDE ones are exactly the lines naming `parse_event_head_start`.
+///
+/// Composed at exactly **FOUR of the ELEVEN** consultation sites: the **LEADING**-half gate in
+/// `split_cross_subject_event_compound` (deliberately wide — see its own comment there), the 2-way
+/// or-split gate (`is_event_head_start`, defined inside `split_or_event_compound` and consulted by
+/// that function's `" or "` scan loop), the subject-span terminator (`extract_subject_text`), and the
+/// widened-window pass-2 scan in `is_new_sentence_not_type_continuation` (issue #7451). The other
+/// **SEVEN** stay NARROW — `split_cross_subject_event_compound`'s **TRAILING**-half gate (that function
+/// owns one gate of EACH width; do not read it as a narrow-only consumer), the three serial TRAILING-leg
+/// gates in `split_serial_event_compound`, and the three in `continues_serial_event_condition` — each
+/// with a named counterexample or a measured zero-demand justification at its own site.
+///
+/// The #7451 site is the only composition whose consumer can move a condition/effect boundary, and it is
+/// safe there for a structural reason rather than a measured one: it is consulted **only** inside a
+/// DISJUNCT that runs when the legacy narrow-window verdict is already `false`, so a false positive here
+/// can only decline a NEW `true` — it can never turn a today-`true` into `false`, and therefore can never
+/// move a boundary later or delete an effect clause. It is also not the only guard at that site: its
+/// **scan is stopped** at a restrictive postmodifier — every parser it consults, this one included, is
+/// still handed the unbounded tail — because an event head cannot suppress a negated auxiliary
+/// ("isn't"). See that function's monotonicity paragraph.
 ///
 /// This file hosts FOUR hand-maintained event-head lexicons —
 /// `parse_event_verb_start`, `parse_bare_shared_event_verb`,
@@ -9932,39 +9961,262 @@ fn parse_combat_damage_to_player(input: &str) -> OracleResult<'_, ()> {
     .parse(input)
 }
 
-/// Check if the text starting at a type word is a new subject-predicate sentence
-/// rather than a type-list continuation.
+/// The lead of a RESTRICTIVE POSTMODIFIER — a relative clause ("that isn't a
+/// mana ability", "which has flying") or a "with ..." phrase. A postmodifier
+/// attaches to the noun phrase it follows, so every verb inside it belongs to
+/// THAT noun phrase and can never be the main verb of a following clause.
+/// Bounds [`type_list_clause_window`].
 ///
-/// A type-list continuation: "planeswalker, or battle enters" — just a type word
-/// optionally followed by more type words and a trigger event verb.
-/// A new effect sentence: "creatures you control get +1/+1" — a type word followed
-/// by a controller clause and a predicate verb before the next comma.
+/// This is a rule of ENGLISH applied at parse time, adopted BY ANALOGY with
+/// CR 608.2c's "read the whole text and apply the rules of English to the text"
+/// instruction. CR 608.2c is itself a RESOLUTION-time instruction-ordering rule
+/// and states nothing about noun-phrase attachment; do not read the citation as
+/// rules authority for the attachment itself.
 ///
-/// The heuristic: check only the words before the next ", " boundary. If a
-/// predicate verb appears there, it's a new sentence.
-fn is_new_sentence_not_type_continuation(text: &str) -> bool {
+/// Measured (issue #7451): without this bound, Immolation Shaman's "an ability
+/// of an artifact, creature, or land THAT ISN'T a mana ability" lets the widened
+/// window reach "isn't", which `is_negated_auxiliary_predicate_token` classifies
+/// as an effect predicate and `parse_event_head_start` cannot suppress (its
+/// passive arm requires "is "/"are "). The boundary would move from the card's
+/// second comma to its first and narrow `valid_card` from
+/// AnyOf[Artifact, Creature] to Artifact.
+///
+/// This bounds WHERE THE SCAN STOPS, never what a parser is handed: pass 2 always
+/// evaluates `parse_event_head_start` on the full, unbounded tail. Handing the
+/// event parser a truncated slice would be unsound — `parse_event_phrase` (this
+/// file) is a bare `tag(phrase)` with no boundary peek, so a slice ending
+/// right after "deals"/"cast"/"draw"/... loses the Event match and the same word
+/// is re-read as a `PREDICATE_VERBS` hit, i.e. a SHRINKING window could flip a
+/// verdict toward `true`. See the monotonicity paragraph on
+/// [`is_new_sentence_not_type_continuation`].
+fn parse_type_list_postmodifier_start(input: &str) -> OracleResult<'_, ()> {
+    value((), alt((tag("that "), tag("which "), tag("with ")))).parse(input)
+}
+
+/// The span of ONE Oxford-comma type list, starting at `text`'s head type word.
+///
+/// Returns a PREFIX SLICE of `text`, so `.len()` is a byte offset into `text` —
+/// that offset is the ONLY thing the caller uses (see
+/// [`is_new_sentence_not_type_continuation`]'s pass 2, which stops its word scan
+/// there while still handing every parser the unbounded tail).
+///
+/// `text` is always lowercase: the sole consumer chain is
+/// `split_trigger` -> `find_effect_boundary(tp.lower)` ->
+/// `continues_player_action_list` -> `is_new_sentence_not_type_continuation`.
+///
+/// THREE BOUNDS, IN THIS ORDER. Bounds 1 and 2 SHORTEN the span; bound 3
+/// EXTENDS it. (Where this plan and [`is_new_sentence_not_type_continuation`]
+/// say "two bounds", they mean the two SHORTENING bounds — the ones that
+/// protect a trigger condition. Bound 3 is the widening that fixes Valley
+/// Floodcaller. One function, two counts, one reconciling sentence.)
+///
+/// 1. CR 603.1 — a triggered ability is ONE sentence ("[When/Whenever/At]
+///    [trigger condition or event], [effect]. [Instructions (if any).]"), so the
+///    span is bounded at the sentence FIRST. Without it, a trailing instruction
+///    sentence's verbs could decide this sentence's boundary (Valley
+///    Floodcaller's "... until end of turn. Untap them.").
+/// 2. English grammar, by analogy with CR 608.2c — then at the first
+///    restrictive postmodifier ([`parse_type_list_postmodifier_start`]). See
+///    that fn's doc for the measured card and for why the CR is an analogy
+///    here rather than an authority.
+/// 3. CR 205.2a + CR 205.3a — then extended across every `", "` whose remainder
+///    `starts_with_type_list_continuation` accepts, i.e. the same authority the
+///    SpellCast payload truncation already uses (issue #5324, Sram), stopping at
+///    the first comma that is not a list continuation. Reading a comma inside a
+///    type list as a set-union separator rather than a clause boundary is an
+///    ENGLISH reading adopted at parse time by analogy with CR 608.2c's "apply
+///    the rules of English to the text" instruction — CR 608.2c does not itself
+///    state anything about comma grammar. CR 205.2a/205.3a supply only the
+///    vocabularies ("these words are card types / subtypes").
+fn type_list_clause_window(text: &str) -> &str {
+    let sentence = match nom_primitives::split_once_on(text, ". ") {
+        Ok((_, (before, _))) => before,
+        Err(_) => text,
+    };
+    let bounded =
+        match nom_primitives::scan_split_at_phrase(sentence, parse_type_list_postmodifier_start) {
+            Some((before, _)) => before.trim_end(),
+            None => sentence,
+        };
+    let mut consumed = 0usize;
+    let mut tail = bounded;
+    loop {
+        let Ok((_, (before, rest))) = nom_primitives::split_once_on(tail, ", ") else {
+            return bounded;
+        };
+        if !starts_with_type_list_continuation(rest) {
+            return &bounded[..consumed + before.len()];
+        }
+        consumed += before.len() + ", ".len();
+        tail = rest;
+    }
+}
+
+/// The LEGACY effect-predicate test AT ONE WORD — the single authority both
+/// passes consult, so the monotonicity argument in
+/// [`is_new_sentence_not_type_continuation`]'s doc-comment is mechanically
+/// checkable: pass 1 reaches it through [`clause_has_effect_predicate`] and
+/// pass 2 calls it directly, so the two cannot drift apart.
+///
+/// Negated modal verbs ("can't", "doesn't", "isn't") head a restriction
+/// predicate and count as a predicate, via
+/// [`is_negated_auxiliary_predicate_token`]. That is a rule of ENGLISH applied
+/// at parse time, adopted BY ANALOGY with CR 608.2c's "read the whole text and
+/// apply the rules of English to the text" instruction; CR 608.2c is itself a
+/// RESOLUTION-time instruction-ordering rule and states nothing about modal
+/// verbs, negation, or what heads a predicate — do not read the citation as
+/// rules authority for the classification itself. They are only trustworthy as
+/// an EFFECT signal inside a main clause, which is why the pass-2 scan is
+/// stopped at a restrictive postmodifier before this is applied there.
+fn token_is_effect_predicate(word: &str) -> bool {
     use crate::parser::oracle_effect::normalize_verb_token;
     use crate::parser::oracle_effect::subject::PREDICATE_VERBS;
-    // Only examine up to the next ", " (or end of text) to avoid looking through
-    // subsequent clauses that legitimately contain predicate verbs.
-    let clause = text.split(", ").next().unwrap_or(text);
+    PREDICATE_VERBS.contains(&normalize_verb_token(word).as_str())
+        || is_negated_auxiliary_predicate_token(word)
+}
+
+/// The LEGACY clause-level verdict, lifted out of
+/// [`is_new_sentence_not_type_continuation`]; behaviour-identical to the
+/// pre-#7451 test (same operands, same order, same short-circuit).
+fn clause_has_effect_predicate(clause: &str) -> bool {
     let lower = clause.to_lowercase();
-    // Skip the first word (the type word itself) and check remaining words.
-    lower.split_whitespace().skip(1).any(|w| {
-        let normalized = normalize_verb_token(w);
-        if PREDICATE_VERBS.contains(&normalized.as_str()) {
-            return true;
+    // Skip the head type word itself and check the remaining words.
+    lower
+        .split_whitespace()
+        .skip(1)
+        .any(token_is_effect_predicate)
+}
+
+/// Check whether the text starting at a type word is a new subject-predicate
+/// sentence (the trigger's EFFECT) rather than a continuation of the trigger
+/// CONDITION's own type list.
+///
+/// TWO PASSES, AND THE ORDER IS THE CONTRACT.
+///
+/// Pass 1 is [`clause_has_effect_predicate`] over TODAY'S one-item window and is
+/// behaviorally identical to the pre-#7451 test. Pass 2 only runs when pass 1
+/// says "continuation".
+///
+/// MONOTONICITY (load-bearing, do not restructure into a single pass). This
+/// predicate feeds `continues_player_action_list`, hence `find_effect_boundary`,
+/// hence the condition/effect split of EVERY trigger line containing ", ".
+/// The population is the INPUT side: every corpus `oracle_text` trigger line
+/// containing ", " — on the order of 17k lines over ~15k cards, and it drifts
+/// with each MTGJSON refresh, so regenerate rather than trust a number here
+/// (issue #7451 verification step 5.5(a) is the harvest). Each such line reaches
+/// `split_trigger` after `strip_reminder_text` + `normalize_self_refs`, which is
+/// why that harvest applies both. The parsed-trigger `description` count is a
+/// different, OUTPUT-side population and is not the figure to quote here.
+/// Returning `true` more often moves the boundary EARLIER; returning `false`
+/// more often moves it LATER or removes it, swallowing effect text into the
+/// condition. Because pass 2 is a DISJUNCT, no verdict that is `true` today can
+/// become `false`: The Thanos-Copter's "Vehicles you control become artifact
+/// creatures" and Spellbinding Soprano's "instant and sorcery spells you cast
+/// this turn cost {1} less" are both decided in pass 1 and never reach the
+/// event-head test — which would otherwise classify their "become"/"cast" as
+/// trigger events and DELETE their effect clauses outright. The single-pass
+/// "widened window AND not an event head" form (call it NAIVE-A) does exactly
+/// that; it was measured and rejected (#7451 round 1). The two-pass form with
+/// the widened window but NO event-head exclusion (NAIVE-B) is monotone and so
+/// keeps both cards, but it moves condition-side boundaries EARLIER — see the
+/// paragraph below and Theorem 3a.
+///
+/// MOVING A BOUNDARY EARLIER IS ALSO UNSAFE, and monotonicity does NOT cover it:
+/// it truncates the CONDITION. That is what [`type_list_clause_window`]'s two
+/// bounds exist for. Measured (#7451 round 2): with only the sentence bound,
+/// Immolation Shaman's "an ability of an artifact, creature, or land that isn't
+/// a mana ability" moved from its second comma to its first and narrowed
+/// `valid_card` from AnyOf[Artifact, Creature] to Artifact. Tens of printed
+/// cards carry a condition-side comma type list, so this side is not empty —
+/// that count is corpus-derived too (issue #7451 census C3 regenerates it).
+///
+/// WINDOW — the comma-as-set-union reading is ENGLISH GRAMMAR applied at parse
+/// time, adopted BY ANALOGY with CR 608.2c's "read the whole text and apply the
+/// rules of English" instruction. CR 608.2c is a resolution-time instruction-
+/// ordering rule and states nothing about comma grammar or noun-phrase
+/// attachment; CR 205.2a / CR 205.3a supply only the vocabularies. Pass 2's
+/// window is the whole Oxford-comma type list
+/// ([`type_list_clause_window`]), not its first item. The one-item window saw
+/// only "birds" in "Birds, Frogs, Otters, and Rats you control get +1/+1", so
+/// `find_effect_boundary` walked to the LAST list comma and the effect kept only
+/// the final item (issue #7451, Valley Floodcaller). Core-type lists collapsed
+/// identically ("artifacts, creatures, and lands" -> Land), which is why the
+/// WINDOW — not the subtype vocabulary — is the fix.
+///
+/// EVENT HEADS WIN TIES — an ENGINEERING HEURISTIC derived from CR 603.1, not
+/// a rule the CR states. CR 603.1 supplies only the sentence template
+/// ("[When/Whenever/At] [trigger condition or event], [effect]"), i.e. that the
+/// condition/event precedes the effect; CR 603.2e supplies the "becomes" voice.
+/// Neither states a first-token tie-break. The tie-break below is DERIVED from
+/// that ordering and validated by the #7451 fixture set (April O'Neil,
+/// Questcaller, Sram, Farseeing Flockmate, the two condition-side rows), not
+/// asserted as CR text. `PREDICATE_VERBS` and the
+/// trigger-event lexicon overlap on TWELVE roots that are the SAME WORD in both:
+/// attack(s), block(s), become(s), deal(s), sacrifice(s), discard(s), cast(s),
+/// create(s), draw(s), transform(s), explore(s), phase(s in/out). (Enumerated by
+/// intersecting the 47-entry `PREDICATE_VERBS` with `parse_event_verb_start` +
+/// `parse_state_change_event_start`. "mill" is in `PREDICATE_VERBS`
+/// only; "play", "enters", "dies", "leaves" and "cycle" are in the event lexicon
+/// only.) Pass 2 therefore scans left to right and asks `parse_event_head_start`
+/// BEFORE the predicate test at each word: because the template puts the event
+/// before the effect, the first classifying token after a condition-side type
+/// list is far more often the event's verb than the effect's, so where both
+/// lexicons claim the same word the event lexicon wins. Heuristic, measured —
+/// see the fixture rows above.
+///
+/// A THIRTEENTH overlap is NOT same-word and is why the scan must be ORDERED
+/// rather than a whole-window veto: "put" is a predicate verb, but the event
+/// lexicon's entry is the phrase "is put into", carried by
+/// `parse_event_verb_start` (this file), whose head "is" is reached one word
+/// EARLIER. The
+/// ordered scan classifies "is put into" as an Event before "put" can be read as
+/// a predicate.
+///
+/// Both authorities are consulted as PARSERS, never restated as a local verb
+/// list, so this stays in lockstep as either table grows.
+fn is_new_sentence_not_type_continuation(text: &str) -> bool {
+    // Pass 1 — legacy verdict over the one-item window. PATTERNS.md section 6:
+    // `split_once_on` is the combinator form of the former `str::split` call on `", "`.
+    let narrow = match nom_primitives::split_once_on(text, ", ") {
+        Ok((_, (before, _))) => before,
+        Err(_) => text,
+    };
+    if clause_has_effect_predicate(narrow) {
+        return true;
+    }
+
+    // Pass 2 — event-head-priority word scan over the UNBOUNDED tail
+    // (PATTERNS.md section 5), stopped at the end of the type list. Reached
+    // only when pass 1 found no predicate at all, so every classification
+    // below lies strictly beyond the one-item window.
+
+    // The scan STOP, as a byte offset into `text`: `type_list_clause_window`
+    // returns a PREFIX SLICE of `text`, so its length is that offset. `text` is
+    // already lowercase (`find_effect_boundary(tp.lower)`), so no re-casing.
+    let stop = type_list_clause_window(text).len();
+    // Skip the head type word. Split `text` ITSELF, not the window, so every
+    // tail the scan yields below is a suffix of the FULL line.
+    let after_head = match nom_primitives::split_once_on(text, " ") {
+        Ok((_, (_, rest))) => rest,
+        Err(_) => return false,
+    };
+    nom_primitives::scan_at_word_boundaries(after_head, |tail: &str| {
+        // Past the end of the type list: stop the scan, verdict `false`. Only
+        // the SCAN is bounded — the parsers below always see the full tail.
+        if text.len() - tail.len() >= stop {
+            return Ok((tail, false));
         }
-        // CR 608.2c: Negated modal verbs ("can't", "don't", "doesn't", "won't")
-        // indicate a restriction predicate — recognize the base verb before the
-        // negation contraction so "creatures you control can't be the targets ..."
-        // is correctly classified as a new subject-predicate sentence rather than
-        // a type-list continuation.
-        if is_negated_auxiliary_predicate_token(w) {
-            return true;
+        // CR 603.1: an event head belongs to the trigger CONDITION.
+        if parse_event_head_start(tail).is_ok() {
+            return Ok((tail, false));
         }
-        false
+        let word = tail.split_whitespace().next().unwrap_or(tail);
+        if token_is_effect_predicate(word) {
+            return Ok((tail, true));
+        }
+        Err(oracle_err(tail))
     })
+    .unwrap_or(false)
 }
 
 fn is_negated_auxiliary_predicate_token(token: &str) -> bool {
