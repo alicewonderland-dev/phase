@@ -8,6 +8,7 @@
 //! the card (Perplexing Chimera, end to end through the real cast pipeline).
 
 use engine::game::scenario::{CastCommit, GameScenario, P0, P1};
+use engine::types::ability::TargetRef;
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::WaitingFor;
@@ -691,5 +692,119 @@ fn exchange_control_ignores_unclaimed_propagated_targets() {
         state.transient_continuous_effects.is_empty(),
         "CR 701.12a: with only one subject bindable the exchange can't complete, so no part of \
          it occurs — and in particular C, which was never a target of this effect, is untouched"
+    );
+}
+
+/// V18 SIBLING (final review) — Perplexing Chimera's SECOND clause. After the
+/// exchange, "you may choose new targets for the spell" must enumerate the
+/// replacement pool against the spell's NEW controller.
+///
+/// The card's printed ruling is explicit: "The change of control happens before
+/// new targets are chosen, so any targeting restrictions such as 'target
+/// opponent' or 'target creature you control' are now made in reference to you,
+/// not the spell's original controller."
+///
+/// This was wrong until the `pool_controller` binding in
+/// `change_targets::legal_new_targets_for_entry`: the exchange installs a
+/// layer-2 `ChangeController` on the OBJECT, while `ResolvedAbility.controller`
+/// stays the caster until `stack::resolve_top` re-stamps it — which happens
+/// after the retarget window has already closed. The pool was therefore built
+/// for P1 while the chooser was P0.
+///
+/// MEASURED before the fix: `legal_new_targets == [chimera, p1_creature]` — the
+/// creatures P1 controls, with P0's own creature absent, so P0 could not make
+/// the one choice the ruling entitles them to.
+///
+/// The other Chimera rows cannot catch this: `perplexing_chimera_steals_the_
+/// spell_end_to_end` deliberately uses vanilla Grizzly Bears so the retarget
+/// offer is a guaranteed no-op, and `chimera_retarget_subject_binds_to_the_
+/// triggering_spell` uses a filter with no `ControllerRef`. A controller-
+/// relative filter is required to distinguish the two controllers at all.
+#[test]
+fn chimera_retarget_pool_is_built_for_the_new_controller() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let chimera = scenario
+        .add_creature_from_oracle(P0, "Perplexing Chimera", 3, 3, PERPLEXING_CHIMERA_TEXT)
+        .id();
+    let p0_creature = scenario.add_creature(P0, "P0 Bear", 2, 2).id();
+    let p1_creature = scenario.add_creature(P1, "P1 Bear", 2, 2).id();
+    let guile = scenario
+        .add_spell_to_hand_from_oracle(
+            P1,
+            "Ranger's Guile",
+            true,
+            "Target creature you control gets +1/+1 until end of turn.",
+        )
+        .with_mana_cost(ManaCost::zero())
+        .id();
+
+    let mut runner = scenario.build();
+    {
+        let state = runner.state_mut();
+        state.active_player = P1;
+        state.priority_player = P1;
+        state.waiting_for = WaitingFor::Priority { player: P1 };
+    }
+    let mut commit = runner
+        .cast(guile)
+        .target_objects(&[p1_creature])
+        .accept_optional()
+        .commit();
+
+    // Drain to the retarget prompt, accepting the Chimera trigger on the way.
+    let mut reached = None;
+    for _ in 0..40 {
+        match &commit.state().waiting_for {
+            WaitingFor::RetargetChoice {
+                player,
+                legal_new_targets,
+                ..
+            } => {
+                reached = Some((*player, legal_new_targets.clone()));
+                break;
+            }
+            WaitingFor::OptionalEffectChoice { .. } => {
+                commit
+                    .act(GameAction::DecideOptionalEffect { accept: true })
+                    .expect("accepting the Chimera trigger must succeed");
+            }
+            WaitingFor::Priority { .. } => {
+                assert!(
+                    !commit.state().stack.is_empty(),
+                    "the stack emptied before the retarget prompt was raised"
+                );
+                commit
+                    .act(GameAction::PassPriority)
+                    .expect("PassPriority should succeed while draining");
+            }
+            other => panic!("unexpected state while draining to the retarget prompt: {other:?}"),
+        }
+    }
+    let (chooser, pool) = reached.expect("REACH GUARD: the retarget prompt must be raised");
+
+    // REACH GUARD: the exchange really happened, so this row is measuring the
+    // post-steal pool and not a pre-steal one.
+    assert_eq!(
+        commit.state().objects.get(&chimera).unwrap().controller,
+        P1,
+        "REACH GUARD: the Chimera must have swapped to P1"
+    );
+    assert_eq!(chooser, P0, "the new controller chooses the new targets");
+
+    assert!(
+        pool.contains(&TargetRef::Object(p0_creature)),
+        "\"target creature you control\" must now mean P0's creatures — P0's own creature \
+         must be offered (pool was {pool:?})"
+    );
+    assert!(
+        !pool.contains(&TargetRef::Object(p1_creature)),
+        "P1's creature must NOT be offered — the restriction is read against P0 now \
+         (pool was {pool:?})"
+    );
+    assert!(
+        !pool.contains(&TargetRef::Object(chimera)),
+        "the Chimera is P1's after the swap, so it must not be in P0's pool \
+         (pool was {pool:?})"
     );
 }

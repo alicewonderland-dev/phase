@@ -2673,7 +2673,28 @@ fn stack_entry_detail(state: &GameState, entry: &StackEntry) -> StackEntryDispla
             | StackEntryKind::ActivatedAbility { .. }
             | StackEntryKind::KeywordAction { .. } => None,
         },
-        controller: super::stack::stack_object_controller(state, entry),
+        // CR 109.4 + CR 601.2a: the live controller, EXCEPT during the
+        // announcement window. Between `announce_spell_on_stack` and cast
+        // finalization the `StackEntry` is already on the stack while the
+        // object is still in its ORIGIN zone, and an off-stack, off-battlefield
+        // object's `controller` is its OWNER — so for a cast from a zone the
+        // caster does not own (Gonti / Etali / Memory Plunder), reading the
+        // object there renders the row under the opponent's seat and inverts
+        // the You/Opp label for both players until finalization.
+        //
+        // `stack_object_controller`'s own doc records this window but argues it
+        // is unobservable because only the caster holds priority; that argument
+        // covers LEGALITY reads, and this is a display projection, which is
+        // exactly the non-legality observer that does see it. Guarded here
+        // rather than inside the accessor so the legality readers keep the
+        // semantics they were reasoned about with — `derive_views` takes
+        // `&GameState` and structurally cannot flush, so the projection is the
+        // one caller that needs the narrower answer.
+        controller: state
+            .objects
+            .get(&entry.id)
+            .filter(|obj| obj.zone == crate::types::zones::Zone::Stack)
+            .map_or(entry.controller, |obj| obj.controller),
     }
 }
 

@@ -261,6 +261,30 @@ fn legal_new_targets_for_entry(state: &GameState, entry: &StackEntry) -> Vec<Tar
         return Vec::new();
     };
 
+    // CR 115.7 + CR 608.2c: enumerate the replacement pool against the spell's
+    // CURRENT controller, not the caster. Perplexing Chimera's printed ruling is
+    // explicit: "The change of control happens before new targets are chosen, so
+    // any targeting restrictions such as 'target opponent' or 'target creature
+    // you control' are now made in reference to you, not the spell's original
+    // controller." `ResolvedAbility.controller` is still the caster at this
+    // point — the exchange installs a layer-2 `ChangeController` on the OBJECT,
+    // and the stack entry's ability is only re-stamped later, in
+    // `stack::resolve_top`, by which time the retarget window has closed. So the
+    // pool must come from the object, exactly as the other stack-time
+    // controller readers this branch introduced already do
+    // (`derived_views`, `casting::targets_commit_crime`,
+    // `ability_utils::parent_target_controller`).
+    //
+    // Falls back to `stack_ability.controller` rather than
+    // `stack::stack_object_controller`'s `entry.controller`: a triggered or
+    // activated ability entry has a freshly-allocated id with no `state.objects`
+    // row (CR 113.7a), and the ability's own controller is the authority there.
+    // For a spell entry the object row always exists, so the live value wins.
+    let pool_controller = state
+        .objects
+        .get(&entry.id)
+        .map_or(stack_ability.controller, |obj| obj.controller);
+
     // CR 303.4a: "An Aura spell requires a target, which is defined by its
     // enchant ability." That is a statement about the Aura SPELL — the object on
     // the stack whose resolution puts the Aura onto the battlefield — and it is
@@ -282,12 +306,7 @@ fn legal_new_targets_for_entry(state: &GameState, entry: &StackEntry) -> Vec<Tar
     // rejected and no actor could discharge the prompt.
     if matches!(entry.kind, StackEntryKind::Spell { .. }) {
         if let Some(filter) = aura_enchant_filter(state, stack_ability.source_id) {
-            return find_legal_targets(
-                state,
-                &filter,
-                stack_ability.controller,
-                stack_ability.source_id,
-            );
+            return find_legal_targets(state, &filter, pool_controller, stack_ability.source_id);
         }
     }
 
@@ -313,12 +332,7 @@ fn legal_new_targets_for_entry(state: &GameState, entry: &StackEntry) -> Vec<Tar
         let options: Vec<TargetRef> = role
             .surfaced_filters()
             .flat_map(|(_slot, filter)| {
-                find_legal_targets(
-                    state,
-                    filter,
-                    stack_ability.controller,
-                    stack_ability.source_id,
-                )
+                find_legal_targets(state, filter, pool_controller, stack_ability.source_id)
             })
             .collect();
         if !options.is_empty() {
@@ -329,12 +343,7 @@ fn legal_new_targets_for_entry(state: &GameState, entry: &StackEntry) -> Vec<Tar
     // CR 115.7: Standard targeted spell/ability — re-evaluate its own declared
     // target filter against current game state.
     if let Some(filter) = extract_target_filter(&stack_ability.effect) {
-        return find_legal_targets(
-            state,
-            filter,
-            stack_ability.controller,
-            stack_ability.source_id,
-        );
+        return find_legal_targets(state, filter, pool_controller, stack_ability.source_id);
     }
 
     // CR 109.4: A mass effect that targets a player via a population filter
