@@ -9993,7 +9993,17 @@ fn parse_type_list_postmodifier_start(input: &str) -> OracleResult<'_, ()> {
     value((), alt((tag("that "), tag("which "), tag("with ")))).parse(input)
 }
 
-/// The span of ONE Oxford-comma type list, starting at `text`'s head type word.
+/// The SCAN WINDOW for the effect-predicate test: an Oxford-comma type list's own
+/// commas PLUS everything after the last one, bounded at the sentence and at the
+/// first restrictive postmodifier.
+///
+/// It is deliberately NOT just the type list. When the list is the sentence's final
+/// comma-run the walk exhausts its commas and returns the whole postmodifier-bounded
+/// sentence — predicate included — and that overrun is what makes the fix work:
+/// for "birds, frogs, otters, and rats you control get +1/+1 until end of turn" the
+/// window must reach `get`, which lies past the last list comma. Pinned by
+/// `type_list_clause_window_spans_the_whole_list`. The bounds below constrain how
+/// far the overrun may go; they do not make the result a type list.
 ///
 /// Returns a PREFIX SLICE of `text`, so `.len()` is a byte offset into `text` —
 /// that offset is the ONLY thing the caller uses (see
@@ -10164,17 +10174,27 @@ fn clause_has_effect_predicate(clause: &str) -> bool {
 /// lexicons claim the same word the event lexicon wins. Heuristic, measured —
 /// see the fixture rows above.
 ///
-/// A THIRTEENTH overlap is NOT same-word and is why the scan must be ORDERED
-/// rather than a whole-window veto: "put" is a predicate verb, but the event
-/// lexicon's entry is the phrase "is put into", carried by
-/// `parse_event_verb_start` (this file), whose head "is" is reached one word
-/// EARLIER. The
-/// ordered scan classifies "is put into" as an Event before "put" can be read as
-/// a predicate.
+/// AT LEAST TWO further overlaps are NOT same-word, and they are why the scan must
+/// be ORDERED rather than a whole-window veto. "put" is a predicate verb, but the
+/// event lexicon's entry is the phrase "is put into"; "exile" is a predicate verb,
+/// but the lexicon's entries are "is exiled" / "are exiled". Both are carried by
+/// `parse_event_verb_start` (this file), and in both the head "is"/"are" is reached
+/// one word EARLIER, so the ordered scan classifies the Event before the bare verb
+/// can be read as a predicate. This pair is not claimed to be exhaustive — the
+/// ordering is what makes the class safe, not the enumeration.
 ///
 /// Both authorities are consulted as PARSERS, never restated as a local verb
 /// list, so this stays in lockstep as either table grows.
 fn is_new_sentence_not_type_continuation(text: &str) -> bool {
+    // Pass 1 lowercases its own clause; pass 2 consults `token_is_effect_predicate`
+    // on raw tail words, so it is the pass that DEPENDS on this precondition. The
+    // sole consumer chain (`split_trigger` -> `find_effect_boundary(tp.lower)`)
+    // guarantees it; assert it so a future caller cannot silently degrade pass 2
+    // back to the legacy verdict.
+    debug_assert!(
+        !text.chars().any(char::is_uppercase),
+        "requires lowercase input; got {text:?}"
+    );
     // Pass 1 — legacy verdict over the one-item window. PATTERNS.md section 6:
     // `split_once_on` is the combinator form of the former `str::split` call on `", "`.
     let narrow = match nom_primitives::split_once_on(text, ", ") {
@@ -10206,7 +10226,9 @@ fn is_new_sentence_not_type_continuation(text: &str) -> bool {
         if text.len() - tail.len() >= stop {
             return Ok((tail, false));
         }
-        // CR 603.1: an event head belongs to the trigger CONDITION.
+        // An event head belongs to the trigger CONDITION. HEURISTIC derived from
+        // CR 603.1's sentence template, not a rule the CR states — see this
+        // function's doc-comment, which carries the full caveat.
         if parse_event_head_start(tail).is_ok() {
             return Ok((tail, false));
         }

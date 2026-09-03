@@ -8413,15 +8413,23 @@ fn preceded_color_separator(input: &str) -> super::oracle_nom::error::OracleResu
 ///
 /// The exclusion vocabulary gate: each list item's singular form is resolved
 /// through the CR 205.3 subtype vocabulary (`parse_subtype`) before being
-/// classified by `classify_negation`. That vocabulary is the single authority
-/// on two questions at once — what an item's singular is, and whether the
-/// item is a genuine subtype at all. `classify_negation`'s catch-all still
+/// classified by `classify_negation`. `parse_subtype` answers two questions at
+/// once — what an item's singular is, and whether the item is in the CR 205.3
+/// vocabulary. One caveat, stated because the gate's value depends on it: the
+/// irregular `SUBTYPE_PLURALS` table is consulted FIRST and its singular is
+/// returned unvalidated, so an entry whose singular is absent from the
+/// vocabulary (e.g. "halves" -> "Half") would still be accepted here. No such
+/// exclusion is printed; widening the gate to re-validate that table's output
+/// is a separate change. `classify_negation`'s catch-all still
 /// treats any unrecognized word as a negated Subtype (correct for its
 /// "non-<word>" prefix context — CR 205.3 subtype negation like "nonZombie"
 /// is a real pattern), so this function still verifies every catch-all hit
 /// against the vocabulary before accepting it. Two promises hold: (a) a
 /// **name/designation** exception ("except for Mageta") still declines the
-/// whole clause, exactly as before — pinned by
+/// whole clause — more precisely, any name OUTSIDE the CR 205.3 vocabulary
+/// does. CR 205.3j planeswalker types are themselves proper names ("Ajani",
+/// "Urza", "Bolas"), so an exclusion naming one is now accepted as a subtype
+/// where it previously declined; Mageta is not a planeswalker type. Pinned by
 /// `except_for_named_exception_does_not_misfire_as_subtype_negation` — rather
 /// than silently classifying as `Non(Subtype("Mageta"))`, which no permanent
 /// has; (b) a **mixed** list containing one unrecognised word still declines
@@ -8462,9 +8470,11 @@ fn parse_except_for_type_list_suffix(
         // the legacy `trim_end_matches('s')` produced "Octopuse"/"Elve", which no
         // lookup recognizes, so every genuine subtype exclusion declined. `word` is a
         // whole alphabetic token from this function's own `take_till1`, and
-        // `parse_subtype_entry` (oracle_util.rs:1258) word-bounds every arm via
-        // `starts_with_word_ci`, so a match here always consumes the whole word —
-        // "Serpentine" cannot match "Serpent".
+        // `parse_subtype_entry` (oracle_util.rs:1258) word-bounds every arm —
+        // `starts_with_word_ci` on the singular, an equivalent
+        // non-alphanumeric-follower guard on the `-s`/`-es`/`-ies` plurals — so a
+        // match here always consumes the whole word: "Serpentine" cannot match
+        // "Serpent".
         //
         // PRECEDENCE IS UNCHANGED: `classify_negation` still classifies, and still
         // first. `parse_subtype` supplies the singular it classifies, and is consulted
@@ -8485,17 +8495,17 @@ fn parse_except_for_type_list_suffix(
             NegationResult::Type(TypeFilter::Non(inner))
                 if matches!(*inner, TypeFilter::Subtype(_)) =>
             {
-                match &canonical_subtype {
-                    // CR 205.3a: a genuine subtype exclusion — emit it.
-                    Some(canonical) => neg_types.push(TypeFilter::Non(Box::new(
-                        TypeFilter::Subtype(canonical.clone()),
-                    ))),
-                    // CR 205.3a: an unrecognized word (a card NAME, a designation) still
-                    // falls through `classify_negation`'s catch-all (:4013) to a negated
-                    // Subtype that no permanent has — a silently vacuous exclusion.
-                    // Decline the whole clause, as before ("except for Mageta").
-                    None => return None,
-                }
+                // CR 205.3a: an unrecognized word (a card NAME, a designation) still
+                // falls through `classify_negation`'s catch-all (:4013) to a negated
+                // Subtype that no permanent has — a silently vacuous exclusion.
+                // Decline the whole clause, as before ("except for Mageta").
+                let Some(canonical) = &canonical_subtype else {
+                    return None;
+                };
+                // CR 205.3a: a genuine subtype exclusion — emit it.
+                neg_types.push(TypeFilter::Non(Box::new(TypeFilter::Subtype(
+                    canonical.clone(),
+                ))));
             }
             NegationResult::Type(tf) => neg_types.push(tf),
             NegationResult::Prop(prop) => props.push(prop),
@@ -8530,6 +8540,92 @@ fn parse_except_for_type_list_suffix(
     }
 
     Some((neg_types, props, consumed))
+}
+
+/// CR 205.3a + CR 608.2c: AND an "except for `<type-list>`" exclusion
+/// onto an already-parsed mass population, for callers whose exclusion is
+/// separated from the type phrase by an intervening destination clause ("return
+/// all creatures TO THEIR OWNERS' HANDS except for Krakens, Leviathans,
+/// Octopuses, and Serpents" — Whelming Wave, Slinn Voda, Cyclone Summoner).
+/// CR 608.2c is what licenses reading the trailing clause as a modifier of the
+/// earlier population phrase across the intervening destination clause.
+///
+/// Same grammar and the same decline rules as the adjacent surface order:
+/// [`parse_except_for_type_list_suffix`] stays the single authority, so a named
+/// exception ("except for Mageta") and a mixed list containing an unrecognised
+/// word still decline rather than emitting a vacuous `Non(Subtype("Mageta"))`.
+/// A mixed list whose words are ALL in the vocabulary — "artifacts, lands, and
+/// Phyrexians" — parses; that is the same function's job, not an exception to
+/// it. NOTE the decline is SILENT:
+/// `swallow_check` has no "except for" detector, so a declined clause leaves
+/// `parse_warnings` empty and the card still reports supported (measured:
+/// "mageta the lion", "flame sweep"). Declining is strictly better than a
+/// vacuous exclusion, but it is not honest coverage; making it red is a
+/// separate issue and is NOT claimed here.
+///
+/// The application is the `TargetFilter`-level form of the two lines the
+/// suffix-position call site in `parse_type_phrase_with_ctx` already runs
+/// (`neg_type_filters.extend(excl_types); properties.extend(excl_props);`).
+/// That site cannot call this function — it accumulates into local vectors
+/// *before* its `TypedFilter` exists — so what is shared is the grammar, and
+/// what is repeated is two `Vec::extend` calls, not logic.
+///
+/// `type_filters` are conjunctive in `game::filter`, so each `TypeFilter::Non`
+/// narrows the population by one exempted type — the De Morgan form of "except
+/// for A, B, or C" (evaluated at game/filter.rs:2378).
+///
+/// (CR 400.7 is deliberately NOT cited here: this function performs no zone
+/// change and says nothing about one — it only narrows a population filter. The
+/// zone change belongs to the `ReturnAll` construction in `imperative.rs`,
+/// which is where CR 400.7 is annotated.)
+///
+/// Returns a non-`Typed` population UNTOUCHED. An `Or`/`And` filter has no single
+/// `type_filters` vector to narrow, and applying the exclusion to only one leg
+/// would be worse than not applying it at all.
+///
+/// Be precise about what that costs, because the wording here was wrong once: this
+/// is NOT "failing closed", and the card does NOT become unsupported. The caller
+/// still builds its effect, with a population that is WIDER than the card says —
+/// the same silent-drop shape described above for a declined clause, and the same
+/// class of defect issue #7451 exists to remove.
+///
+/// Be precise about WHY it is unreached, because the obvious reason is wrong: the
+/// mass-return grammar DOES produce disjunctive populations, and they DO reach this
+/// function. "Return all artifacts and enchantments to their owners' hands" (Reduce
+/// to Dreams) parses to `BounceAll` over a `TargetFilter::Or`, and it reaches this
+/// call site. What keeps the branch cold is narrower: no printed card
+/// pairs a disjunctive population WITH an "except for" clause, so the exclusion parse
+/// declines first and this function returns at the `None` arm above, never reaching
+/// the type match. One printing of that combination would widen the spell silently.
+/// It is no worse than the pre-#7451 behavior, which dropped the exclusion
+/// unconditionally — but narrowing each leg is the real fix, and is a separate
+/// change.
+pub(crate) fn apply_except_for_type_list_exclusion(
+    filter: TargetFilter,
+    text: &str,
+) -> TargetFilter {
+    // Both callers of `parse_except_for_type_list_suffix` must hand it the same
+    // shape. The suffix-position site in `parse_type_phrase_with_ctx` passes a
+    // slice of the already-lowercased text; this one is handed the original-case
+    // `dest_remainder`. `classify_negation` matches lowercase literals only, so a
+    // capitalized core-type item ("except for Artifacts") would otherwise miss
+    // every arm, fall to the catch-all, fail the subtype vocabulary gate, and
+    // decline the whole clause — silently dropping the exclusion and WIDENING the
+    // spell, which is the defect class issue #7451 exists to remove. Normalizing
+    // here needs no offset remapping because this function discards the parser's
+    // `consumed` length; `parse_subtype` is case-insensitive and still yields the
+    // canonical capitalization ("krakens" -> "Kraken").
+    let lowered = text.trim_start().to_lowercase();
+    let Some((neg_types, props, _consumed)) = parse_except_for_type_list_suffix(&lowered) else {
+        return filter;
+    };
+    let mut typed = match filter {
+        TargetFilter::Typed(typed) => typed,
+        other => return other,
+    };
+    typed.type_filters.extend(neg_types);
+    typed.properties.extend(props);
+    TargetFilter::Typed(typed)
 }
 
 /// CR 302.6 + CR 508.1a: a trailing continuity exemption on a target filter —
@@ -9852,9 +9948,10 @@ mod tests {
     /// Word-boundary row: a word that merely CONTAINS a vocabulary subtype as a
     /// prefix ("Serpentine" over "Serpent") must also decline. This is a
     /// different risk from the two above — they exercise a word absent from the
-    /// vocabulary, this one exercises `parse_subtype_entry`'s `starts_with_word_ci`
-    /// guard, which requires a non-alphanumeric follower so the match consumes
-    /// the whole token. Without that guard the clause would silently exclude
+    /// vocabulary, this one exercises `parse_subtype_entry`'s word-boundary guard
+    /// (`starts_with_word_ci` on the singular arm, an equivalent
+    /// non-alphanumeric-follower check on the plural arms), which makes a match
+    /// consume the whole token. Without that guard the clause would silently exclude
     /// Serpents from a spell that never mentioned them.
     #[test]
     fn except_for_named_exception_does_not_misfire_as_subtype_negation() {
@@ -9886,6 +9983,67 @@ mod tests {
                 .parse(rest.trim_start())
                 .is_ok(),
             "a word merely PREFIXED by a subtype must be left unconsumed, got rest={rest:?}"
+        );
+    }
+
+    /// CR 205.3a: `apply_except_for_type_list_exclusion` returns a population it
+    /// cannot narrow UNTOUCHED. An `Or`/`And` filter has no single `type_filters`
+    /// vector to extend, and narrowing one leg would be worse than narrowing none.
+    ///
+    /// This is NOT "failing closed", and the card does NOT become unsupported —
+    /// see the function's own doc-comment. The caller still builds its effect with
+    /// a population WIDER than the card says, silently. That is no worse than the
+    /// pre-#7451 behavior (which dropped the exclusion unconditionally) and is
+    /// unreached today, but it is a real gap, not a guard. Narrowing each leg is
+    /// the fix, and is a separate change.
+    ///
+    /// BUILDING-BLOCK coverage. The arm is unreached today, but NOT because the
+    /// grammar cannot build a disjunctive population — it can, and does: Reduce to
+    /// Dreams ("Return all artifacts and enchantments to their owners' hands")
+    /// parses to `BounceAll` over a `TargetFilter::Or` and reaches this same call
+    /// site. What keeps this branch cold is only that no printed card pairs such a
+    /// population with an "except for" clause, so the exclusion parse declines
+    /// first. That is one printing away from mattering, which is why the behavior
+    /// is pinned here rather than left to inspection.
+    #[test]
+    fn except_for_exclusion_returns_a_non_typed_population_untouched() {
+        let exclusion = " except for Krakens, Leviathans, Octopuses, and Serpents.";
+
+        // Positive reach-guard: on a `Typed` population the SAME call does apply
+        // the exclusion, so the negative below cannot pass vacuously on a parse
+        // failure or a mis-typed exclusion string.
+        let typed = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Creature],
+            ..Default::default()
+        });
+        let applied = apply_except_for_type_list_exclusion(typed, exclusion);
+        let tf = typed_leg(&applied).expect("expected the typed population to survive");
+        assert!(
+            tf.type_filters
+                .iter()
+                .any(|f| matches!(f, TypeFilter::Non(inner) if matches!(**inner, TypeFilter::Subtype(ref s) if s == "Kraken"))),
+            "reach-guard: the Typed population must gain Non(Subtype(\"Kraken\")), got {tf:?}"
+        );
+
+        // The negative: an Or population comes back byte-identical.
+        let or = TargetFilter::Or {
+            filters: vec![
+                TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Creature],
+                    ..Default::default()
+                }),
+                TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Artifact],
+                    ..Default::default()
+                }),
+            ],
+        };
+        let before = format!("{or:?}");
+        let after = apply_except_for_type_list_exclusion(or, exclusion);
+        assert_eq!(
+            format!("{after:?}"),
+            before,
+            "a non-Typed population must be returned untouched, not partially narrowed"
         );
     }
 

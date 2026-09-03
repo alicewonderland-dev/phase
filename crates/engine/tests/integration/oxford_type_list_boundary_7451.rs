@@ -37,6 +37,8 @@ const VALLEY_FLOODCALLER: &str = "Flash\nYou may cast noncreature spells as thou
 
 const VALLEY_ROTCALLER: &str = "Menace\nWhenever this creature attacks, each opponent loses X life and you gain X life, where X is the number of other Squirrels, Bats, Lizards, and Rats you control.";
 
+const WHELMING_WAVE: &str = "Return all creatures to their owners' hands except for Krakens, Leviathans, Octopuses, and Serpents.";
+
 fn effective_pt(runner: &mut GameRunner, id: ObjectId) -> (i32, i32) {
     runner.state_mut().layers_dirty.mark_full();
     evaluate_layers(runner.state_mut());
@@ -108,7 +110,7 @@ fn valley_floodcaller_pumps_every_listed_subtype() {
         effective_pt(&mut runner, floodcaller),
         (3, 3),
         "Valley Floodcaller is itself an Otter (CR 205.3m) and the filter carries \
-         no FilterProp::Another, so CR 109.5 puts the source in its own pumped \
+         no FilterProp::Another, so the source is inside its own pumped \
          population"
     );
     // Paired positive reach-guard: at least one creature's P/T actually changed
@@ -401,5 +403,148 @@ fn argent_etchings_iii_spares_artifacts_lands_and_phyrexians() {
         zone_of(phyrexian, &runner),
         Zone::Battlefield,
         "the Phyrexian creature must be spared"
+    );
+}
+
+/// V3a — issue #7451 U3: the POST-DESTINATION `except for` exclusion
+/// (Whelming Wave, Slinn Voda, Cyclone Summoner class). Whelming Wave's
+/// destination phrase ("to their owners' hands") sits BETWEEN the type list
+/// and the exclusion clause, so `dest_remainder` — not `target_text` — carries
+/// "except for Krakens, Leviathans, Octopuses, and Serpents." Before U3,
+/// nothing but the battlefield attach-host probe ever read `dest_remainder`,
+/// so the exclusion was silently dropped and every creature was bounced,
+/// including the four exempted subtypes.
+///
+/// Owner-vs-controller hostile fixture: `Effect::BounceAll`'s population
+/// carries no controller restriction (`controller: None`), so `P1`'s
+/// exempted Kraken must ALSO survive, not just `P0`'s.
+///
+/// Revert-failing: before the fix every creature (both Bears AND all five
+/// exempted creatures) is bounced to its owner's hand.
+#[test]
+fn whelming_wave_spares_every_exempted_subtype() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let p0_kraken = scenario
+        .add_creature(P0, "P0 Test Kraken", 4, 4)
+        .with_subtypes(vec!["Kraken"])
+        .id();
+    let p0_leviathan = scenario
+        .add_creature(P0, "P0 Test Leviathan", 4, 4)
+        .with_subtypes(vec!["Leviathan"])
+        .id();
+    let p0_octopus = scenario
+        .add_creature(P0, "P0 Test Octopus", 4, 4)
+        .with_subtypes(vec!["Octopus"])
+        .id();
+    let p0_serpent = scenario
+        .add_creature(P0, "P0 Test Serpent", 4, 4)
+        .with_subtypes(vec!["Serpent"])
+        .id();
+    let p0_bear = scenario.add_creature(P0, "P0 Beary", 2, 2).id();
+
+    let p1_kraken = scenario
+        .add_creature(P1, "P1 Test Kraken", 4, 4)
+        .with_subtypes(vec!["Kraken"])
+        .id();
+    let p1_bear = scenario.add_creature(P1, "P1 Beary", 2, 2).id();
+
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Whelming Wave", false, WHELMING_WAVE)
+        .id();
+
+    let mut runner: GameRunner = scenario.build();
+    let outcome = runner.cast(spell).resolve();
+
+    // Positive reach-guard: the hand count actually increased by 2 (one Bear
+    // per owner), so the exemption negatives below cannot pass vacuously on a
+    // spell that failed to resolve, or resolved as a no-op.
+    assert_eq!(
+        outcome.hand_drawn(P0),
+        1,
+        "P0's Bear must return to P0's hand"
+    );
+    assert_eq!(
+        outcome.hand_drawn(P1),
+        1,
+        "P1's Bear must return to P1's hand"
+    );
+
+    assert_eq!(
+        outcome.zone_of(p0_bear),
+        Zone::Hand,
+        "P0's Bear must be bounced"
+    );
+    assert_eq!(
+        outcome.zone_of(p1_bear),
+        Zone::Hand,
+        "P1's Bear must be bounced"
+    );
+
+    for (id, label) in [
+        (p0_kraken, "P0's Kraken"),
+        (p0_leviathan, "P0's Leviathan"),
+        (p0_octopus, "P0's Octopus"),
+        (p0_serpent, "P0's Serpent"),
+        (
+            p1_kraken,
+            "P1's Kraken (owner vs controller: the population is uncontrolled)",
+        ),
+    ] {
+        assert_eq!(
+            outcome.zone_of(id),
+            Zone::Battlefield,
+            "{label} must be exempted from the bounce"
+        );
+    }
+}
+
+/// U3 hostile fixture — "stays in its destination class": a graveyard-origin
+/// mass return falls to the `ReturnAllToZone` arm, which does not call
+/// `apply_except_for_type_list_exclusion`. Asserts the POSITIVE shape first
+/// (a `ChangeZoneAll` graveyard->hand form over a `Typed` creature-card
+/// population), so this cannot pass vacuously on an `Effect::Unimplemented`,
+/// a `None` parse, or a renamed variant — THEN the negative: no
+/// `Non(Subtype("Zombie"))` anywhere on that target. U3 deliberately does not
+/// extend the applicator to this arm (no attested printing). Note what that
+/// costs: the drop is SILENT, not a decline — `swallow_check` has no "except
+/// for" detector, so such a card still reports supported. Unchanged from before
+/// #7451, but not honest coverage.
+#[test]
+fn graveyard_origin_mass_return_does_not_apply_the_exclusion() {
+    let def = parse_effect_chain(
+        "Return all creature cards from your graveyard to your hand except for Zombies.",
+        AbilityKind::Spell,
+    );
+
+    let Effect::ChangeZoneAll {
+        origin: Some(Zone::Graveyard),
+        destination: Zone::Hand,
+        target,
+        ..
+    } = &*def.effect
+    else {
+        panic!(
+            "expected a graveyard-to-hand ChangeZoneAll, got {:?}",
+            def.effect
+        );
+    };
+    let TargetFilter::Typed(tf) = target else {
+        panic!("expected a Typed creature-card population, got {target:?}");
+    };
+    assert!(
+        tf.type_filters.contains(&TypeFilter::Creature),
+        "population must be creature cards, got {tf:?}"
+    );
+
+    // Negative: the "except for Zombies" clause must NOT have been applied —
+    // this arm does not call the applicator.
+    assert!(
+        !tf.type_filters.iter().any(|f| matches!(
+            f,
+            TypeFilter::Non(inner) if matches!(**inner, TypeFilter::Subtype(ref s) if s == "Zombie")
+        )),
+        "the graveyard-origin arm must NOT apply the except-for exclusion, got {tf:?}"
     );
 }

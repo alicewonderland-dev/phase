@@ -917,7 +917,7 @@ fn essence_of_antiquity_untaps_the_creatures_it_granted_hexproof() {
 /// Otters, and Rats") now parses in full, so the pumped population is the
 /// whole printed list PLUS Valley Floodcaller itself — it is an Otter (CR
 /// 205.3m: the printed type line) and the filter carries no
-/// `FilterProp::Another`, so CR 109.5 puts the source inside its own
+/// `FilterProp::Another`, so the source is inside its own
 /// population. This row asserts the INVARIANT #6857 owns — **the untapped set
 /// is exactly the pumped set is exactly the published set** — over that full
 /// population; the identity, not the population, is what #6857 is

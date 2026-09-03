@@ -2116,7 +2116,35 @@ pub(super) fn parse_targeted_action_ast(
                 // remain `ChangeZone { origin: Graveyard, destination: Hand }`,
                 // not `BounceAll` (whose resolver only scans the battlefield).
                 if is_mass && origin.is_none() {
-                    Some(TargetedImperativeAst::ReturnAll { target, count })
+                    // CR 205.3a + CR 608.2c: a mass bounce may carry its
+                    // exclusion AFTER the destination phrase — Whelming Wave's "return
+                    // all creatures to their owners' hands except for Krakens,
+                    // Leviathans, Octopuses, and Serpents". Slinn Voda prints the same
+                    // shape with Merfolk leading the list, and Cyclone Summoner returns
+                    // all PERMANENTS "except for Giants, Wizards, and lands" — so this
+                    // arm sees mixed core-type/subtype exclusions, not only creatures.
+                    // `strip_return_destination_ext_with_remainder` leaves that clause
+                    // in `dest_remainder`, where nothing but the battlefield
+                    // attach-host probe used to look, so the whole exclusion was
+                    // silently dropped and the spell bounced the exempted creatures
+                    // too (issue #7451). Fold it onto the population with the SAME
+                    // grammar the adjacent form uses (Scourglass, The Argent
+                    // Etchings), so both surface orders reach one authority.
+                    //
+                    // SCOPE: this arm only. A graveyard-origin mass return
+                    // ("return all creature cards from your graveyard to your hand")
+                    // falls to the `ReturnAllToZone` arm below and is deliberately NOT
+                    // given the exclusion — its resolver scans a different zone and the
+                    // shape has no attested printing. Note the drop there is SILENT, not
+                    // a decline: `swallow_check` has no "except for" detector, so such a
+                    // card would still report supported. Unchanged from before #7451.
+                    Some(TargetedImperativeAst::ReturnAll {
+                        target: crate::parser::oracle_target::apply_except_for_type_list_exclusion(
+                            target,
+                            dest_remainder,
+                        ),
+                        count,
+                    })
                 } else if is_mass {
                     Some(TargetedImperativeAst::ReturnAllToZone {
                         target,

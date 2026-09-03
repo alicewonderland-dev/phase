@@ -13832,9 +13832,9 @@ fn type_list_clause_window_spans_the_whole_list() {
 
     let sentence_bounded = "birds, frogs and rats you control get +1/+1. untap them.";
     let window = type_list_clause_window(sentence_bounded);
-    assert!(
-        !window.contains("untap"),
-        "the window must stop at the sentence boundary, got {window:?}"
+    assert_eq!(
+        window, "birds, frogs and rats you control get +1/+1",
+        "the window must stop at the sentence boundary, excluding the trailing instruction"
     );
 }
 
