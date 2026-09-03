@@ -218,9 +218,28 @@ pub fn resolve(
     // resolvers, no `old != new` guard is needed at this point.
     //
     // CR 109.4: a stack subject legitimately has a controller, so a spell half
-    // emits too; it is inert to `match_changes_controller` because that matcher is
-    // scoped by `valid_card_matches` to the trigger's own tracked object, and every
-    // printed `ChangesController` trigger carries a non-`None` `valid_card`.
+    // emits too. It is inert to `match_changes_controller` NOT primarily because
+    // of `valid_card_matches`: when the exchanged spell is itself the tracked
+    // object (Perplexing Chimera exchanging control with a cast Khârn the
+    // Betrayer), `valid_card: SelfRef` MATCHES the spell, and the
+    // `source_id == *object_id` branch in `match_changes_controller`
+    // (trigger_matchers.rs) short-circuits straight to `true` — `valid_card`
+    // does not gate that case.
+    //
+    // The guard that actually holds is CR 113.6 ("Abilities of all other
+    // objects usually function only while that object is on the battlefield"):
+    // the collection loop's zone gate (triggers.rs, keyed on `trigger_zones`)
+    // enforces it, and every printed `ChangesController` producer (Khârn the
+    // Betrayer, Duplicity, Gustha's Scepter, Stolen Uniform) declares
+    // `trigger_zones: ["Battlefield"]`, so none of them ever scan this
+    // spell-half event on the stack. `valid_card` remains a real, secondary
+    // scope for the in-zone case — it is just not what protects the
+    // self-tracked-spell case above.
+    //
+    // WARNING for a future `ChangesController` producer written to function
+    // from the stack (an explicit non-battlefield `trigger_zones` per CR
+    // 113.6b): neither guard here protects it. Check any such trigger by hand
+    // against this spell-half emission before shipping it.
     events.push(GameEvent::ControllerChanged {
         object_id: id_a,
         old_controller: controller_a,
