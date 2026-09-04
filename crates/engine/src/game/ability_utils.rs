@@ -602,14 +602,14 @@ pub fn additional_cost_instead_spell_has_legal_targets(
 /// The resulting slots are slot-for-slot identical (order and count) to the
 /// whole-chain `build_target_slots(&build_chained_resolved(...))` pass for every
 /// current card, which the resolver relies on because it consumes the COMBINED
-/// chain and maps selected targets back by slot index. There are two
-/// unreachable-today divergences:
-///   1. `Effect::ExchangeControl` head modes: `collect_target_slots` returns
-///      unconditionally after an ExchangeControl effect without descending into
-///      the sub-chain, so the whole-chain pass silently truncates any later
-///      modes appended after such a mode. Collecting each mode from its own
-///      resolved ability is strictly more correct there — every chosen mode
-///      contributes its slots regardless of position. (0 cards.)
+/// chain and maps selected targets back by slot index. There is one fixed and
+/// one remaining unreachable-today divergence:
+///   1. FIXED: `Effect::ExchangeControl` / `Effect::ExchangeLifeTotals` head
+///      modes used to return unconditionally without descending into the
+///      sub-chain, silently truncating any later mode's slots from the
+///      whole-chain pass (Shifting Grift). The paired-subject collect arm now
+///      descends (`collect_sub_chain_slots`), so this divergence no longer
+///      exists.
 ///   2. A deferred-effect-head mode (Scry/Dig/Surveil/Choose/ChooseCard/
 ///      SearchLibrary/RevealHand) immediately followed in sorted order by a
 ///      targeting skip-stack mode (ChangeZone/Shuffle/PutAtLibraryPosition): the
@@ -618,9 +618,17 @@ pub fn additional_cost_instead_spell_has_legal_targets(
 ///      `skips_stack_targets_after_deferred_effect`), but this per-mode build
 ///      collects it via plain `collect_target_slots`, so it may surface one
 ///      extra slot. (0 cards.)
+///   3. `Effect::Fight` head modes: `collect_target_slots_inner`'s `Fight` arm
+///      returns unconditionally without descending, so the whole-chain pass
+///      truncates any later mode. REACHABLE TODAY — measured on Clash of the
+///      Eikons with modes `[0,1]`: per-mode build 3 slots, whole-chain 2, and
+///      this assert fires. Deliberately out of scope for the paired-subject
+///      target-ownership change; `Fight` already has a `chain_has_target_sink`
+///      arm and descending assign blocks in BOTH assigners, so only the
+///      collect side is wrong. TRACKED: phase-rs/phase#8354.
 ///
-/// A `debug_assert_eq!` below catches either case loudly should a future card
-/// ever reach it.
+/// A `debug_assert_eq!` below catches divergence #2 or #3 loudly should a
+/// mode combination reach them.
 ///
 /// Indices are sorted (printed order, CR 608.2c) to match
 /// `build_chained_resolved`; duplicate indices (CR 700.2d) repeat the mode.
@@ -669,13 +677,15 @@ pub fn build_target_slots_labelled(
     // CR 700.2c: The resolver consumes the COMBINED chain and maps selected
     // targets back by slot index, so this per-mode slot count MUST equal the
     // whole-chain `build_target_slots(&build_chained_resolved(...))` count. The
-    // two documented divergences (ExchangeControl head; deferred-effect head
-    // followed by a skip-stack mode) are unreachable today; this detection-only
-    // assert makes any future card that reaches them fail loudly in test/debug
-    // builds rather than surfacing an extra slot at runtime. Confined to
-    // debug_assertions so release builds don't pay the double-build cost, and
-    // any Err from the comparison build is swallowed so it can never change
-    // release-observable behavior (the returned slots/labels are unaffected).
+    // remaining documented divergences (deferred-effect head followed by a
+    // skip-stack mode; `Effect::Fight` head modes, TRACKED:
+    // phase-rs/phase#8354) are either unreachable today or already filed; this
+    // detection-only assert makes any future card that reaches them fail
+    // loudly in test/debug builds rather than surfacing an extra slot at
+    // runtime. Confined to debug_assertions so release builds don't pay the
+    // double-build cost, and any Err from the comparison build is swallowed so
+    // it can never change release-observable behavior (the returned
+    // slots/labels are unaffected).
     #[cfg(debug_assertions)]
     {
         if let Ok(mut combined) = build_chained_resolved(abilities, indices, source_id, controller)
@@ -688,7 +698,7 @@ pub fn build_target_slots_labelled(
                 debug_assert_eq!(
                     acc.slots.len(),
                     combined_slots.len(),
-                    "build_target_slots_labelled slot count diverged from whole-chain build — a modal mode combination (ExchangeControl, or deferred-effect + skip-stack) is now reachable; see CR 700.2 slot-mapping invariant"
+                    "build_target_slots_labelled slot count diverged from whole-chain build — a modal mode combination (Effect::Fight head mode truncation, tracked phase-rs/phase#8354, or deferred-effect + skip-stack) is now reachable; see CR 700.2 slot-mapping invariant"
                 );
             }
         }
@@ -2054,7 +2064,16 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
         }
         kept.extend(target_iter.cloned());
         kept
-    } else if let Effect::ExchangeControl { target_a, target_b } = &validated.effect {
+    } else if paired_subject_filters(&validated.effect).is_some() {
+        // MEASURED borrow shape: collect owned filters BEFORE the assignment,
+        // so the `&validated.effect` borrow ends ahead of
+        // `validated.targets = …`. `paired_subject_slot_filters` has already
+        // applied the `is_context_ref` projection, so this is exactly the
+        // node's claimed slots in declaration order.
+        let paired: Vec<TargetFilter> = paired_subject_slot_filters(&validated.effect)
+            .cloned()
+            .collect();
+
         // CR 608.2b + CR 701.12a (Phase 2 scope extension — see U4/U8's
         // `is_context_ref()` generalization above; this is the SAME bug class
         // at the re-validation seam instead of the slot-building seam).
@@ -2069,6 +2088,15 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
         // different effect. Context-ref filters (SelfRef, TriggeringSource)
         // claim no slot and are skipped, mirroring
         // `collect_target_slots_inner` / `build_target_slot_specs`.
+        //
+        // GENERALISED (round 6 of the plan this arm implements): this guard now
+        // reads `paired_subject_filters`/`paired_subject_slot_filters` instead
+        // of matching `Effect::ExchangeControl` directly, so the SAME arm
+        // applies identically to `Effect::ExchangeLifeTotals` (CR 701.12c). Its
+        // context-ref member (`Controller` — Mister Negative's "exchange life
+        // totals with target opponent", Cliffside Market's "exchange life
+        // totals with target player") likewise claims no slot and is skipped
+        // by `paired_subject_slot_filters`'s own `!is_context_ref()` filter.
         //
         // PRUNING IS DELIBERATE, and it is the opposite choice from the
         // `mana_multi_role` arm immediately below — read both together. That
@@ -2102,9 +2130,28 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
         // against a non-empty original and fizzle the spell, but CR 608.2b
         // fizzles only when EVERY target is illegal. One surviving legal
         // target means the spell resolves and does nothing.
+        //
+        // CR 608.2b + CR 701.12a — BEHAVIOUR DELTA, DELIBERATE. Widening this
+        // guard to the paired authority routes `Effect::ExchangeLifeTotals`
+        // here for the first time. It previously fell through to this
+        // function's terminal generic `None` arm, whose
+        // `TargetRef::Player(_) => true` kept every player target
+        // unconditionally with no filter consulted. Declared slots are now
+        // re-validated per filter and CAN be pruned — MEASURED on Soul
+        // Conduit with an eliminated target: `[Player(0), Player(1)]` before,
+        // `[Player(0)]` after. That is CR 608.2b-correct. The survivor shift
+        // is harmless because `exchange_life_totals::resolve_slot` pulls
+        // declared players with `declared_players.next()` and a short list
+        // yields `None`, taking the `emit_noop` exit — CR 701.12a,
+        // all-or-nothing. All SEVEN `ExchangeLifeTotals` cards carry at least
+        // one non-context-ref member and are therefore affected:
+        // `(Player, Player)` — Axis of Mortality, Profane Transfusion, Soul
+        // Conduit; `(Controller, Player)` — Cliffside Market (×2), reserving
+        // exactly one slot; `(Controller, Typed{Opponent})` — Magus of the
+        // Mirror, Mirror Universe, Mister Negative.
         let mut kept = Vec::new();
         let mut target_iter = validated.targets.iter();
-        for filter in [target_a, target_b] {
+        for filter in &paired {
             if filter.is_context_ref() {
                 continue;
             }
@@ -2137,12 +2184,16 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
         // — the correct outcome. `exchange_control_of_a_spell.rs::
         // exchange_control_ignores_unclaimed_propagated_targets` pins it.
         //
-        // The cost of dropping is that a downstream chain sibling relying on a
-        // propagated entry would lose it. No `ExchangeControl` parse in the
-        // corpus has such a sibling (Perplexing Chimera's `ChangeTargets`
-        // sibling binds a context ref and claims no slot; Sudden
-        // Substitution's is `Effect::Unimplemented`), and losing a sibling's
-        // target is a strictly milder failure than exchanging the wrong pair.
+        // CR 601.2c: this arm sees only THIS node's own claimed entries,
+        // because `assign_targets_recursive` / `assign_selected_slots_recursive`
+        // consume exactly `paired_subject_slot_filters(effect).count()` targets
+        // into each paired-subject node. An unclaimed propagated tail
+        // therefore cannot legitimately exist here, which is what makes the
+        // no-pass-through choice safe STRUCTURALLY rather than by corpus
+        // survey — the earlier corpus claim was wrong (`build_chained_resolved`
+        // produces a multi-node `ExchangeControl` chain for Shifting Grift).
+        // `exchange_control_ignores_unclaimed_propagated_targets` hand-builds
+        // the now-unreachable shape and pins that the arm still refuses it.
         // If a card ever needs both, the fix is to stop having the resolver
         // consume positionally from a flat list — not to re-add this tail.
         kept
@@ -2758,11 +2809,13 @@ fn collect_target_slots_inner(
         }
     }
 
-    // CR 701.12a: ExchangeControl carries two distinct per-slot filters.
-    // Context-ref filters (SelfRef — "this artifact and target …"; TriggeringSource
-    // — "that spell", Perplexing Chimera) are filled by the resolver from chain
-    // context (ability.source_id, or the triggering event) and don't require a
-    // player choice. Surface one slot per non-context-ref filter, in declaration
+    // CR 701.12a: a paired-subject node (`ExchangeControl` / `ExchangeLifeTotals`)
+    // carries two distinct per-slot filters. Context-ref filters (SelfRef —
+    // "this artifact and target …"; TriggeringSource — "that spell", Perplexing
+    // Chimera; Controller — "you", Mister Negative / Cliffside Market) are
+    // filled by the resolver from chain context (ability.source_id, the
+    // triggering event, or ability.controller) and don't require a player
+    // choice. Surface one slot per non-context-ref filter, in declaration
     // order. (Keep in sync with `build_target_slot_specs` or the slot-count
     // invariant fires.)
     //
@@ -2772,8 +2825,8 @@ fn collect_target_slots_inner(
     // `ParentTarget{,Slot}`, and the whole `is_pure_event_context_filter`
     // group; of those, `SelfRef` and `TriggeringSource` are the only two the
     // corpus actually produces in an `ExchangeControl` slot (verified: 30
-    // cards, only `SelfRef` / `TriggeringSource` / `Typed` / `And` / `Or`).
-    // Any OTHER
+    // cards, only `SelfRef` / `TriggeringSource` / `Typed` / `And` / `Or`), and
+    // `Controller` is the one `ExchangeLifeTotals` produces. Any OTHER
     // member of the superset — `None`, `LastCreated`, `TrackedSet`,
     // `Neighbor`, ... — has no tier here and falls through to
     // `resolved_targets`' terminal `ability.targets.clone()`, which means it
@@ -2787,11 +2840,26 @@ fn collect_target_slots_inner(
     // pins both halves of that split. No parser path produces any of these
     // here; if one ever does, give it a tier in `resolved_targets` rather
     // than assuming this predicate already covers it.
-    if let Effect::ExchangeControl { target_a, target_b } = &ability.effect {
-        for filter in [target_a, target_b] {
-            if filter.is_context_ref() {
-                continue;
-            }
+    //
+    // CR 700.2 + CR 700.2c + CR 700.2f: the descent at the end is LOAD-BEARING
+    // and is the half that used to be missing. `build_chained_resolved` links
+    // every chosen mode into one sub_ability chain, so a paired-subject HEAD
+    // mode followed by further modes must still contribute those modes' slots.
+    // Returning unconditionally here truncated them: MEASURED on Shifting
+    // Grift with modes [0,1] — whole-chain build produced 2 slots against
+    // `build_target_slots_labelled`'s 4, tripping that function's own
+    // CR 700.2c slot-mapping `debug_assert_eq!` and making the card uncastable
+    // in any debug build.
+    //
+    // CR 700.2a: the `no_legal_target_slots()` exit below is now REACHABLE for
+    // a later mode. Before the descent, a later mode with no legal target was
+    // silently truncated here and this builder returned `Ok` with a short slot
+    // list while `build_target_slots_labelled` returned `Err` — a second,
+    // count-invisible divergence the `debug_assert_eq!` cannot see, because it
+    // only compares counts when BOTH builds succeed. Both builders now reject,
+    // which is what CR 700.2a requires.
+    if paired_subject_filters(&ability.effect).is_some() {
+        for filter in paired_subject_slot_filters(&ability.effect) {
             let legal_targets =
                 legal_targets_for_ability_filter(state, ability, filter, &acc.slots);
             if legal_targets.is_empty() && !ability.optional_targeting {
@@ -2805,33 +2873,7 @@ fn collect_target_slots_inner(
                 effect_detail: acc.current_effect_detail,
             });
         }
-        return Ok(());
-    }
-
-    // CR 701.12a: ExchangeLifeTotals carries two distinct per-slot player filters.
-    // Context-ref filters (Controller / "you") are filled by the resolver from
-    // ability.controller and don't require a player choice. Surface one slot per
-    // non-context-ref filter, in declaration order. (Keep in sync with
-    // `build_target_slot_specs` or the slot-count invariant at ~408 fires.)
-    if let Effect::ExchangeLifeTotals { player_a, player_b } = &ability.effect {
-        for filter in [player_a, player_b] {
-            if filter.is_context_ref() {
-                continue;
-            }
-            let legal_targets =
-                legal_targets_for_ability_filter(state, ability, filter, &acc.slots);
-            if legal_targets.is_empty() && !ability.optional_targeting {
-                return Err(no_legal_target_slots());
-            }
-            acc.push(TargetSelectionSlot {
-                legal_targets,
-                optional: ability.optional_targeting,
-                chooser: None,
-                effect_kind: acc.current_effect_kind,
-                effect_detail: acc.current_effect_detail,
-            });
-        }
-        return Ok(());
+        return collect_sub_chain_slots(state, ability, acc);
     }
 
     // CR 701.14a + CR 115.1: "Target creature you control fights another target
@@ -3205,6 +3247,35 @@ fn collect_target_slots_inner(
             }
         }
     }
+    collect_sub_chain_slots(state, ability, acc)
+}
+
+/// CR 608.2c + CR 700.2c: descend into this node's sub-chain to collect the
+/// slots of the instructions that follow it. Extracted so an effect arm that
+/// must `return` early (paired-subject nodes) runs the SAME descent instead of
+/// either skipping it — which truncates every later mode's slots — or falling
+/// through the generic recipient ladder above, which would surface companion
+/// slots the node never claims.
+///
+/// BOTH tail statements moved here, in order: the
+/// `defers_sub_ability_target_selection` branch that hands the sub-chain to
+/// `collect_target_slots_after_deferred_effect` (Scry / Dig / Surveil /
+/// ChooseCard / SearchLibrary / RevealHand / Choose), and the ordinary
+/// `sub_ability` descent. Moving only the second would delete the first for
+/// every generic caller.
+///
+/// The gate inside is unchanged and load-bearing: a sub whose targets are
+/// chosen at resolution (`defers_conditional_target_selection`, e.g. Arteeoh's
+/// "When you do…" reflexive body) surfaces NO slot here, and one that inherits
+/// the parent's creature target (`sub_ability_inherits_parent_creature_target_only`)
+/// surfaces none either. See the plan's §Newly Reachable Descent: all nine
+/// paired-with-sub_ability corpus chains were MEASURED to surface the same
+/// slot set before and after this extraction.
+fn collect_sub_chain_slots(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    acc: &mut SlotAccumulator,
+) -> Result<(), TargetSlotBuildError> {
     if defers_sub_ability_target_selection(&ability.effect) {
         collect_target_slots_after_deferred_effect(state, ability.sub_ability.as_deref(), acc)?;
         return Ok(());
@@ -4916,17 +4987,14 @@ fn collect_target_slot_specs(
         }
     }
 
-    // CR 701.12a: Mirror the ExchangeControl branch in `collect_target_slots`
+    // CR 701.12a: Mirror the paired-subject branch in `collect_target_slots`
     // so per-slot specs match the surfaced TargetSelectionSlots one-for-one
-    // (context-ref slots — SelfRef, TriggeringSource — are auto-resolved and not
-    // surfaced; keep in sync with `collect_target_slots_inner` or the slot-count
-    // invariant fires). CR 608.2k: the `None` superset admission is documented
-    // at that mirror.
-    if let Effect::ExchangeControl { target_a, target_b } = &ability.effect {
-        for filter in [target_a, target_b] {
-            if filter.is_context_ref() {
-                continue;
-            }
+    // (context-ref slots — SelfRef, TriggeringSource, Controller — are
+    // auto-resolved and not surfaced; keep in sync with
+    // `collect_target_slots_inner` or the slot-count invariant fires).
+    // CR 608.2k: the `None` superset admission is documented at that mirror.
+    if paired_subject_filters(&ability.effect).is_some() {
+        for filter in paired_subject_slot_filters(&ability.effect) {
             let id = TargetInstanceId(*next_instance);
             *next_instance += 1;
             specs.push(TargetSlotSpec {
@@ -4935,25 +5003,7 @@ fn collect_target_slot_specs(
                 instance: id,
             });
         }
-        return;
-    }
-
-    // CR 701.12a: Mirror the ExchangeLifeTotals branch in `collect_target_slots`
-    // so per-slot specs match the surfaced TargetSelectionSlots one-for-one
-    // (context-ref slots like Controller are auto-resolved and not surfaced).
-    if let Effect::ExchangeLifeTotals { player_a, player_b } = &ability.effect {
-        for filter in [player_a, player_b] {
-            if filter.is_context_ref() {
-                continue;
-            }
-            let id = TargetInstanceId(*next_instance);
-            *next_instance += 1;
-            specs.push(TargetSlotSpec {
-                filter: filter.clone(),
-                optional: ability.optional_targeting,
-                instance: id,
-            });
-        }
+        collect_sub_chain_slot_specs(state, ability, specs, next_instance);
         return;
     }
 
@@ -5211,6 +5261,19 @@ fn collect_target_slot_specs(
             }
         }
     }
+    collect_sub_chain_slot_specs(state, ability, specs, next_instance);
+}
+
+/// Mirror of `collect_sub_chain_slots`, for per-slot specs. Extracted for the
+/// same reason: an effect arm that must `return` early (paired-subject nodes)
+/// runs the SAME descent instead of skipping it — keep in sync or the
+/// slot-count invariant fires.
+fn collect_sub_chain_slot_specs(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    specs: &mut Vec<TargetSlotSpec>,
+    next_instance: &mut usize,
+) {
     if defers_sub_ability_target_selection(&ability.effect) {
         collect_target_slot_specs_after_deferred_effect(
             state,
@@ -7037,6 +7100,80 @@ fn assign_targets_recursive(
         }
     }
 
+    // CR 601.2c + CR 700.2f: consume one selected target per surfaced paired
+    // subject slot onto THIS node's own base-0 `targets`, in
+    // `collect_target_slots` declaration order, then descend. (CR 700.2f, not
+    // CR 700.2d: this card sets `allow_repeat_modes: false`, so the
+    // repeated-mode rule is unreachable here; what licenses per-mode slot
+    // ownership is "Modal spells and abilities may have different targeting
+    // requirements for each mode.")
+    //
+    // PLACEMENT IS LOAD-BEARING for the same reason the `mana_multi_role`
+    // block documents: a companion slot pushed ahead of these would land a
+    // non-subject target at index 0, and `exchange_control::resolve_slot` /
+    // `exchange_life_totals::resolve_slot` — which consume positionally —
+    // would bind it as subject A. `minimum_targets_in_chain` gates all three
+    // companion terms off for a paired node for exactly this reason (§5.8).
+    //
+    // PRODUCER-AGNOSTIC BY CONSTRUCTION. `assign_targets_in_chain` has 18
+    // production call sites and `targets` arrives from three different
+    // producers: a player's `GameAction::SelectTargets`
+    // (`casting_targets.rs:387`, `engine_stack.rs:182`),
+    // `auto_select_targets_for_ability` / `auto_select_targets` when EXACTLY
+    // ONE legal assignment exists, and `random_select_targets_for_ability`
+    // under `TargetSelectionMode::Random`. (CR 115.1d: a triggered ability's
+    // targets are chosen as it is put on the stack — that is the timing all
+    // three share. The RANDOMNESS itself is a card-specific instruction, e.g.
+    // Karona, False God Avatar's "chosen at random"; NO CR licenses random
+    // target selection generally, so none is cited for it.) All three deliver
+    // a flat slice in the COLLECT PASS's slot order, and this block consumes a
+    // prefix of it by ordinal — so it must NOT discriminate on the producer.
+    // Making this node a sink additionally exposes the chain-level leftover
+    // check (`next_target != targets.len()`) to paired nodes for the first
+    // time at every one of those sites; on the trigger route
+    // (`triggers.rs:8347`) an error there is turned into
+    // `PreparedTriggerTargets::NeedsFallbackPush` and the trigger is DROPPED
+    // SILENTLY.
+    //
+    // This is what makes the resolvers' positional consumption sound: after
+    // this block a paired-subject node holds exactly its own claimed entries
+    // and nothing else, so `effects/mod.rs::should_propagate_parent_targets`
+    // cannot fire for a later node either — and `retarget_slot_violation`'s
+    // per-slot zip (§5.11) lines up with the node's own filters instead of a
+    // flat multi-node pool.
+    //
+    // CR 115.7 / CR 115.7d (tracked: phase-rs/phase#8355):
+    // `engine.rs::apply_retarget` writes `ability.targets` on the ROOT stack
+    // node only, so a paired-subject node in a SUB position is not
+    // retargetable once its targets live here rather than on the root. That is
+    // a pre-existing root-only limitation of the retarget seam, made
+    // observable by per-node ownership; it removes no legal CR 115.7d
+    // capability (the pre-change pool was `stack_ability.targets.clone()`,
+    // i.e. degenerate) and it CLOSES the cross-mode half of a CR 115.7d hole,
+    // since a later mode's target — illegal for an earlier mode's slot under
+    // CR 700.2f's differing per-mode targeting requirements — can no longer be
+    // permuted into it. The intra-node half is closed by §5.11.
+    if paired_subject_filters(&ability.effect).is_some() {
+        let claimed = paired_subject_slot_filters(&ability.effect).count();
+        for _ in 0..claimed {
+            if let Some(chosen) = targets.get(*next_target) {
+                ability.targets.push(chosen.clone());
+                *next_target += 1;
+            } else if !ability.optional_targeting {
+                return Err(EngineError::InvalidAction(
+                    "Missing required target".to_string(),
+                ));
+            }
+        }
+        if let Some(sub_ability) = ability.sub_ability.as_mut() {
+            if defers_conditional_target_selection(sub_ability) {
+                return Ok(());
+            }
+            assign_targets_recursive(state, sub_ability, targets, next_target)?;
+        }
+        return Ok(());
+    }
+
     if let Effect::Fight { subject, target } = &ability.effect {
         let mut filters: Vec<&TargetFilter> = Vec::new();
         if fight_subject_needs_target_slot(subject) {
@@ -7408,6 +7545,52 @@ fn assign_selected_slots_recursive(
             }
             return Ok(());
         }
+    }
+
+    // CR 601.2c + CR 700.2f: mirror of the paired-subject block in
+    // `assign_targets_recursive`, for the ONE-SLOT-AT-A-TIME walk. The bulk
+    // `GameAction::SelectTargets` path reaches that function
+    // (`casting_targets.rs:387`, `engine_stack.rs:182`); the step-by-step
+    // `GameAction::ChooseTarget` walk reaches THIS one
+    // (`casting_targets.rs:498`, `engine_stack.rs:345`) — and
+    // `ai_support::candidates::target_step_actions` emits ONLY `ChooseTarget`,
+    // so this is the block every AI game goes through.
+    //
+    // The two blocks are NOT interchangeable: this one is fed
+    // `Option<TargetRef>` slots, so a DECLINED slot is representable and must
+    // be honoured (`None if ability.optional_targeting`), and a short list is
+    // a different error (`"Missing target selection"`) from a missing
+    // required choice (`"Missing required target"`). MEASURED at BASE on
+    // Arteeoh's live combat-damage trigger prompt: the second `ChooseTarget`
+    // returned `Err(InvalidAction("Unused selected target slots"))` — this
+    // function's chain entry point's own message
+    // (`assign_selected_slots_in_chain`), not `assign_targets_in_chain`'s.
+    if paired_subject_filters(&ability.effect).is_some() {
+        let claimed = paired_subject_slot_filters(&ability.effect).count();
+        for _ in 0..claimed {
+            let Some(selected_slot) = selected_slots.get(*next_slot) else {
+                return Err(EngineError::InvalidAction(
+                    "Missing target selection".to_string(),
+                ));
+            };
+            match selected_slot {
+                Some(chosen) => ability.targets.push(chosen.clone()),
+                None if ability.optional_targeting => {}
+                None => {
+                    return Err(EngineError::InvalidAction(
+                        "Missing required target".to_string(),
+                    ));
+                }
+            }
+            *next_slot += 1;
+        }
+        if let Some(sub_ability) = ability.sub_ability.as_mut() {
+            if defers_conditional_target_selection(sub_ability) {
+                return Ok(());
+            }
+            assign_selected_slots_recursive(state, sub_ability, selected_slots, next_slot)?;
+        }
+        return Ok(());
     }
 
     if let Effect::Fight { subject, target } = &ability.effect {
@@ -7813,7 +7996,109 @@ fn validate_target_constraints(
     Ok(())
 }
 
+/// CR 601.2c + CR 115.1: The effects whose two subjects are declared as two
+/// INDEPENDENT per-slot filters rather than one unified filter. Because there
+/// is no single filter to return, `Effect::target_filter()` answers `None` for
+/// both of them (see its `=> None` arm) — which is correct, and is exactly why
+/// every seam that reasons about "does this node claim a target slot", "how
+/// many", or "which filter governs slot i" must ask THIS function instead.
+///
+/// CR 701.12a: both members are exchanges, and an exchange names two subjects.
+/// `ExchangeControl` names two permanents (or a permanent and a stack spell,
+/// CR 400.7a); `ExchangeLifeTotals` names two players (CR 701.12c).
+///
+/// SINGLE AUTHORITY. Consulted by `collect_target_slots_inner`,
+/// `collect_target_slot_specs`, `chain_has_target_sink`,
+/// `assign_targets_recursive`, `assign_selected_slots_recursive`,
+/// `minimum_targets_in_chain` (its own term, the generic-term zeroing, and all
+/// THREE companion-term gates), `validate_targets_in_chain`, and
+/// `retarget_slot_violation`. Mirrors `mana_multi_role`
+/// (`crate::types::ability`, `pub fn`) at every one of those sites. Adding a
+/// third paired-subject effect means adding one arm HERE — never a second
+/// `if let Effect::… { .. }` at a call site.
+///
+/// NOT mirrored at `chain_has_target_sink`'s own three
+/// `mana_multi_role(..).is_none()` companion conjuncts: the paired arm added to
+/// that function returns `true` before they are reached whenever ≥1 slot is
+/// claimed, and for a zero-claim paired node (both filters context refs) the
+/// generic companion verdict is the correct one, unchanged.
+fn paired_subject_filters(effect: &Effect) -> Option<[&TargetFilter; 2]> {
+    match effect {
+        Effect::ExchangeControl { target_a, target_b } => Some([target_a, target_b]),
+        Effect::ExchangeLifeTotals { player_a, player_b } => Some([player_a, player_b]),
+        _ => None,
+    }
+}
+
+/// CR 608.2k + CR 601.2c: the subset of `paired_subject_filters` that actually
+/// claims a declared target slot, in declaration order. A context-ref filter
+/// (`SelfRef` — Avarice Totem; `TriggeringSource` — Perplexing Chimera;
+/// `Controller` — Mister Negative's "with target opponent" and Cliffside
+/// Market's "exchange life totals with target player") is bound at resolution by
+/// `targeting::resolved_targets` (objects) or `resolve_effect_player_ref`
+/// (players), so it is no instance of the word "target" and reserves nothing.
+///
+/// Exact analogue of `ManaTargetRole::surfaced_filters`
+/// (`crate::types::ability`), which is likewise `declared_filters()` filtered by
+/// `!is_context_ref()`. Writing the rule once here keeps the slot builders, both
+/// assigners, the minimum-reservation term, the re-validation arm and the
+/// retarget gate from disagreeing.
+fn paired_subject_slot_filters(effect: &Effect) -> impl Iterator<Item = &TargetFilter> {
+    paired_subject_filters(effect)
+        .into_iter()
+        .flatten()
+        .filter(|filter| !filter.is_context_ref())
+}
+
 fn chain_has_target_sink(ability: &ResolvedAbility) -> bool {
+    // CR 601.2c: a paired-subject node IS a target sink whenever it claims at
+    // least one declared slot. This cannot be left to the generic
+    // `extract_target_filter_from_effect` test below: that reads
+    // `Effect::target_filter()`, which is `None` for both members by design.
+    //
+    // WITHOUT THIS ARM, a chain whose ONLY candidate sink is a paired-subject
+    // node answers `false`, and BOTH chain assigners take their blanket early
+    // return (`assign_targets_in_chain` :1850-1854; `assign_selected_slots_in_chain`
+    // :1877-1881), which flattens every chained mode's target onto the root —
+    // MEASURED on Shifting Grift, whose chain has no other sink. Those blanket
+    // returns also SKIP the leftover checks below them ("Unused selected
+    // targets" :1859 / "Unused selected target slots" :1886), so for such a
+    // chain the mis-binding is SILENT, not an error: landing the collect-side
+    // paired arm without this arm produces a fully green suite that still
+    // writes the wrong pair.
+    //
+    // NOT EVERY paired chain is in that state at BASE. Arteeoh, Dread
+    // Scavenger's trigger already answers `true` today via its `CopyTokenOf`
+    // sub, so it reaches the leftover check instead of the blanket return —
+    // which is exactly why its BASE failure is the observable
+    // `Err(InvalidAction("Unused selected target slots"))` (:1886) rather than
+    // a silent `Ok`. MEASURED on both sides.
+    //
+    // PLACED FIRST DELIBERATELY. It must precede the three
+    // `mana_multi_role(..).is_none()` companion conjuncts further down, so a
+    // slot-claiming paired node never reaches them; a paired node claiming ZERO
+    // slots (both filters context refs — Perplexing Chimera) falls through to
+    // them and keeps BASE's generic companion verdict, which is correct.
+    //
+    // KNOCK-ON, DELIBERATE: making this true for a paired parent turns
+    // `sub_ability_inherits_parent_creature_target_only`'s opening
+    // `if !chain_has_target_sink(parent) { return false; }` (:4430-4432) from a
+    // short-circuit into a real evaluation, at its two consumption sites (the
+    // sub-chain descent gate in `collect_target_slots_inner`, and
+    // `minimum_targets_in_chain`'s `rest` term). MEASURED INERT: every
+    // paired-with-sub_ability chain in the corpus surfaces the same slot set
+    // before and after (plan §Newly Reachable Descent).
+    //
+    // UNGATED by `target_choice_timing`, matching `collect_target_slots_inner`,
+    // `collect_target_slot_specs` and both assign blocks. Same footing as the
+    // `mana_multi_role` sink arm below.
+    if paired_subject_slot_filters(&ability.effect)
+        .next()
+        .is_some()
+    {
+        return true;
+    }
+
     if let Effect::Fight { subject, target } = &ability.effect {
         if fight_subject_needs_target_slot(subject) {
             return true;
@@ -7922,8 +8207,18 @@ fn chain_has_target_sink_after_deferred_effect(sub_ability: Option<&ResolvedAbil
     chain_has_target_sink(sub_ability)
 }
 
-/// CR 115.7a: "each target can be changed only to another legal target." A
-/// multi-slot node's replacement targets are submitted positionally, but
+/// CR 115.7a + CR 115.7d: "each target can be changed only to another legal
+/// target" (115.7a) / "the player may leave any number of the targets
+/// unchanged, even if those targets would be illegal… If the player chooses to
+/// change some or all of the targets, the new targets must be legal" (115.7d).
+/// This function is scope-agnostic: it is reached both by the mana case
+/// (115.7a's "change the target(s)") and by a paired-subject node reached
+/// through Perplexing Chimera's "choose new targets" clause (115.7d) — the
+/// unchanged-position exemption below is licensed under 115.7d and simply
+/// non-applicable under 115.7a, which is why one function serves both scopes
+/// with no scope parameter (see the exemption paragraph below).
+///
+/// A multi-slot node's replacement targets are submitted positionally, but
 /// `legal_new_targets_for_stack_entry` can only return a FLAT union pool
 /// (one `Vec<TargetRef>`, no slot structure), so the union alone would let a
 /// count-source-legal player be assigned into the recipient slot. This is the
@@ -7957,24 +8252,57 @@ fn chain_has_target_sink_after_deferred_effect(sub_ability: Option<&ResolvedAbil
 /// left unchanged, or this node declares no per-slot structure this function
 /// knows about.
 ///
-/// SCOPE: today this recognizes any node `mana_multi_role` admits — both the
+/// SCOPE: this recognizes any node `mana_multi_role` admits — both the
 /// two-surfaced-slot `Both` and the one-surfaced-slot context-ref recipient
-/// `Both` (surfaced == 1, generic == 0), which is parser-reachable. `Attach`,
-/// `MoveCounters`, and `Fight` are multi-slot too and share the same
-/// pre-existing flat-pool gap; they are deliberately left on today's behavior
-/// so this change's blast radius stays zero for shipping cards. This function is
-/// the seam they extend into when that gap is fixed on its own merits.
+/// `Both` — AND any paired-subject node `paired_subject_filters` admits
+/// (`ExchangeControl` / `ExchangeLifeTotals`), whose claimed slots come from
+/// `paired_subject_slot_filters` in the same surfaced order the collect pass
+/// used. `Attach`, `MoveCounters`, and `Fight` are multi-slot too and still
+/// share the pre-existing flat-pool gap; they are deliberately left on today's
+/// behavior. This function is the seam they extend into when that gap is
+/// fixed on its own merits — the paired variants are the worked example of
+/// that extension.
 pub fn retarget_slot_violation(
     state: &GameState,
     ability: &ResolvedAbility,
     current_targets: &[TargetRef],
     new_targets: &[TargetRef],
 ) -> Option<usize> {
-    let role = mana_multi_role(&ability.effect)?;
-    role.surfaced_filters()
+    // CR 115.7d + CR 601.2c: the per-slot filters this node declares, in
+    // surfaced order. Two implementors today: a multi-role mana
+    // (`ManaTargetRole::surfaced_filters`) and a paired-subject exchange
+    // (`paired_subject_slot_filters`). Both already apply the
+    // `!is_context_ref()` projection, so both yield exactly the slots the
+    // collect pass surfaced and the assign pass consumed — which is what
+    // makes the positional zip below sound.
+    //
+    // The empty case reproduces the previous `mana_multi_role(..)?` early-out
+    // EXACTLY: a node outside both classes, and a paired node whose two
+    // filters are both context refs (Perplexing Chimera), declare no per-slot
+    // structure this function knows about and are passed through unfiltered,
+    // as before.
+    //
+    // SOUND ONLY BECAUSE OF §5.6/§5.7: `new_targets` is a permutation of the
+    // ROOT stack node's `ability.targets`. Before per-node ownership a chained
+    // Grift root held ALL FOUR flat targets, so this zip would have validated
+    // a 2-long prefix and ignored the rest. With per-node ownership the root
+    // holds exactly its own claimed pair, so the zip is total. This is why
+    // §5.11 may not land without §5.6/§5.7.
+    let filters: Vec<&TargetFilter> = match mana_multi_role(&ability.effect) {
+        Some(role) => role
+            .surfaced_filters()
+            .map(|(_slot, filter)| filter)
+            .collect(),
+        None => paired_subject_slot_filters(&ability.effect).collect(),
+    };
+    if filters.is_empty() {
+        return None;
+    }
+    filters
+        .into_iter()
         .zip(new_targets.iter())
         .enumerate()
-        .find_map(|(slot, ((_slot, filter), submitted))| {
+        .find_map(|(slot, (filter, submitted))| {
             // CR 115.7d: "the player may leave any number of the targets
             // unchanged, even if those targets would be illegal." CR 115.7a says
             // the same thing for the other scope from the other direction: a
@@ -8048,6 +8376,16 @@ fn minimum_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -> usi
         0
     };
 
+    // CR 601.2c: a paired-subject node reserves one slot per non-context-ref
+    // filter. Mirrors the `move_counter_targets` term above; zero when
+    // targeting is optional. Note the `(Controller, Player)` shape (Cliffside
+    // Market) reserves exactly ONE — the context-ref half claims nothing.
+    let paired_subject_targets = if ability.optional_targeting {
+        0
+    } else {
+        paired_subject_slot_filters(&ability.effect).count()
+    };
+
     // CR 601.2c: A multi-role mana surfaces a DIFFERENT number of slots than the
     // generic `extract_target_filter_from_effect` term below reserves. Add only
     // the excess, so the two terms sum to the true surfaced count. This feeds
@@ -8099,9 +8437,29 @@ fn minimum_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -> usi
     // collect surfaces nor assign consumes, so `remaining_minimum`
     // over-reserves and an upstream `multi_target` sibling is starved of a
     // target it is entitled to.
+    //
+    // CR 601.2c: the same gate applies to a paired-subject node, for the same
+    // reason. `collect_target_slots_inner`'s paired arm returns before the
+    // generic companion ladder and both assigners' paired blocks return before
+    // the generic companion consumption, so a companion term here would
+    // reserve a slot that neither collect surfaces nor assign consumes — the
+    // exact over-reservation this comment already warns about for multi-role
+    // mana.
+    //
+    // MEASURED INERT TODAY: `effect_bound_filter_matches` reaches its
+    // predicates only through `Attach`/`UnattachAll` operands, a non-targeted
+    // `GenericEffect`'s `static_abilities[].affected`, `Effect::target_filter()`
+    // and `mass_all_target_filter` — and both paired variants answer `None` at
+    // the last two, so a `ControllerRef` living INSIDE a paired filter is
+    // invisible here. Karona, False God Avatar's `target_b: Typed{Permanent,
+    // controller: TargetOpponent}` is the only such filter in the corpus and is
+    // missed for exactly that reason. This conjunct is therefore a no-op today
+    // and a correctness guarantee the moment those detectors learn to see
+    // paired filters.
     let player_companion = if ability.target_choice_timing == TargetChoiceTiming::Stack
         && ability_needs_companion_target_player_slot(ability)
         && mana_multi_role(&ability.effect).is_none()
+        && paired_subject_filters(&ability.effect).is_none()
         && !ability.optional_targeting
     {
         1
@@ -8113,6 +8471,7 @@ fn minimum_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -> usi
         && effect_needs_target_creature_quantity_slot(&ability.effect)
         && !one_sided_fight_source_supplies_quantity_creature(&ability.effect)
         && mana_multi_role(&ability.effect).is_none()
+        && paired_subject_filters(&ability.effect).is_none()
         && !ability.optional_targeting
     {
         1
@@ -8123,6 +8482,7 @@ fn minimum_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -> usi
         == TargetChoiceTiming::Stack
         && effect_needs_parent_target_combat_relation_slot(&ability.effect)
         && mana_multi_role(&ability.effect).is_none()
+        && paired_subject_filters(&ability.effect).is_none()
         && !ability.optional_targeting
     {
         1
@@ -8132,7 +8492,8 @@ fn minimum_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -> usi
     let current = if matches!(
         &ability.effect,
         Effect::Attach { .. } | Effect::MoveCounters { .. }
-    ) {
+    ) || paired_subject_filters(&ability.effect).is_some()
+    {
         0
     } else if ability.target_choice_timing == TargetChoiceTiming::Stack
         && triggers::extract_target_filter_from_effect(&ability.effect).is_some()
@@ -8153,6 +8514,7 @@ fn minimum_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -> usi
     };
     let current = attach_targets
         + move_counter_targets
+        + paired_subject_targets
         + mana_extra_roles
         + player_companion
         + target_creature_quantity_companion
@@ -9204,6 +9566,451 @@ mod tests {
             None,
             "CR 115.7d: an unchanged position is exempt from slot legality even \
              though P0 is illegal in slot 1"
+        );
+    }
+
+    /// V17 (round-6 plan §5.11, M2a) — a retarget submission that is legal
+    /// for the FLAT POOL but illegal for the SLOT IT LANDS IN is rejected on
+    /// a paired-subject node (`Effect::ExchangeLifeTotals`), not just a
+    /// multi-role mana. Modelled on
+    /// `retarget_slot_violation_rejects_slot_legal_only_for_the_other_slot`
+    /// above, with the SAME asymmetric filter shape (`TargetFilter::Player`
+    /// vs. an opponent-only `Typed`), so the instrument is known to
+    /// discriminate.
+    ///
+    /// REVERT-FAILING: at BASE, `retarget_slot_violation` bails immediately
+    /// at `mana_multi_role(&ability.effect)?` for a paired-subject node —
+    /// `None` unconditionally, regardless of per-slot legality.
+    #[test]
+    fn paired_subject_retarget_rejects_a_submission_illegal_for_its_own_slot() {
+        let mut state = GameState::new_two_player(31);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Paired Retarget Source".to_string(),
+            Zone::Battlefield,
+        );
+
+        // player_a: any player. player_b: an OPPONENT of P0 (i.e. P1 only).
+        // P0 is therefore legal for slot 0 and ILLEGAL for slot 1 — the SAME
+        // asymmetric shape the mana rows above use.
+        let ability = ResolvedAbility::new(
+            Effect::ExchangeLifeTotals {
+                player_a: TargetFilter::Player,
+                player_b: TargetFilter::Typed(
+                    TypedFilter::default().controller(ControllerRef::Opponent),
+                ),
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+
+        // Reach guards: this is the PAIRED path (mana_multi_role is None), and
+        // it claims two discriminable slots.
+        assert!(
+            mana_multi_role(&ability.effect).is_none(),
+            "reach guard: this is the PAIRED path, not mana"
+        );
+        assert!(paired_subject_filters(&ability.effect).is_some());
+        assert_eq!(paired_subject_slot_filters(&ability.effect).count(), 2);
+
+        // POSITIVE (paired positive, MANDATORY): a slot-legal submission where
+        // BOTH positions genuinely change is accepted — MEASURED `None` on
+        // both sides, proving legality rather than the CR 115.7d
+        // unchanged-position exemption.
+        assert_eq!(
+            retarget_slot_violation(
+                &state,
+                &ability,
+                &[
+                    TargetRef::Player(PlayerId(1)),
+                    TargetRef::Player(PlayerId(0)),
+                ],
+                &[
+                    TargetRef::Player(PlayerId(0)),
+                    TargetRef::Player(PlayerId(1)),
+                ],
+            ),
+            None,
+            "P0 is a legal player_a and P1 a legal (opponent) player_b"
+        );
+
+        // NEGATIVE / REVERT-FAILING: P0 is in the flat union pool (legal for
+        // player_a) but illegal in the player_b (opponent-only) slot it lands
+        // in. Slot 1 genuinely changes (P1 -> P0), so the unchanged-position
+        // exemption does not apply.
+        assert_eq!(
+            retarget_slot_violation(
+                &state,
+                &ability,
+                &[
+                    TargetRef::Player(PlayerId(1)),
+                    TargetRef::Player(PlayerId(1)),
+                ],
+                &[
+                    TargetRef::Player(PlayerId(1)),
+                    TargetRef::Player(PlayerId(0)),
+                ],
+            ),
+            Some(1),
+            "BASE: None (mana_multi_role(..)? bails unconditionally) — CR 115.7d: P0 is \
+             not an opponent, so it is illegal in slot 1 even though the flat pool \
+             contains it"
+        );
+
+        // HOSTILE 1 (the unchanged-position exemption still holds under the
+        // generalised arm): every position unchanged must remain exempt, even
+        // though P0 is illegal in slot 1.
+        assert_eq!(
+            retarget_slot_violation(
+                &state,
+                &ability,
+                &[
+                    TargetRef::Player(PlayerId(1)),
+                    TargetRef::Player(PlayerId(0)),
+                ],
+                &[
+                    TargetRef::Player(PlayerId(1)),
+                    TargetRef::Player(PlayerId(0)),
+                ],
+            ),
+            None,
+            "CR 115.7d: an unchanged position is exempt even though P0 is illegal in \
+             slot 1"
+        );
+
+        // HOSTILE 2 (the zero-claim paired node — Perplexing Chimera's
+        // shape): must still return `None` via the `filters.is_empty()`
+        // guard, reproducing BASE's `?` early-out exactly — the generalised
+        // arm must not start reporting violations for a node claiming no slot.
+        let zero_claim = ResolvedAbility::new(
+            Effect::ExchangeControl {
+                target_a: TargetFilter::SelfRef,
+                target_b: TargetFilter::TriggeringSource,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        assert!(paired_subject_slot_filters(&zero_claim.effect)
+            .next()
+            .is_none());
+        assert_eq!(
+            retarget_slot_violation(
+                &state,
+                &zero_claim,
+                &[TargetRef::Player(PlayerId(0))],
+                &[TargetRef::Player(PlayerId(1))],
+            ),
+            None,
+            "a zero-claim paired node (both filters context refs) must reproduce BASE's \
+             unconditional None"
+        );
+    }
+
+    /// V14 (round-6 plan §Building Blocks, m4) — the sub-side creature-quantity
+    /// inheritance deny-list entry is DEAD for BOTH paired-subject variants,
+    /// by two DIFFERENT routes: `ExchangeControl` is refused by the explicit
+    /// deny-list `matches!` arm (returns `false` first); `ExchangeLifeTotals`
+    /// is refused because `effect_target_slot_filter` (and therefore
+    /// `effect_needs_target_creature_quantity_slot`) is `None`/`false` for
+    /// both paired variants — `Effect::target_filter()`'s `=> None` arm.
+    #[test]
+    fn paired_subject_effects_never_reach_the_creature_quantity_inheritance_denylist() {
+        assert!(
+            !effect_needs_target_creature_quantity_slot(&Effect::ExchangeControl {
+                target_a: TargetFilter::Typed(TypedFilter::creature()),
+                target_b: TargetFilter::Typed(TypedFilter::creature()),
+            }),
+            "ExchangeControl must never need a creature-quantity companion slot"
+        );
+        assert!(
+            !effect_needs_target_creature_quantity_slot(&Effect::ExchangeLifeTotals {
+                player_a: TargetFilter::Player,
+                player_b: TargetFilter::Player,
+            }),
+            "ExchangeLifeTotals must never need a creature-quantity companion slot"
+        );
+
+        // REACH GUARD (paired positive, MANDATORY): the predicate is not
+        // vacuously false for every effect — a Draw whose count references
+        // target power DOES need one, so the double negative above is not
+        // trivially satisfied.
+        assert!(
+            effect_needs_target_creature_quantity_slot(&Effect::Draw {
+                count: QuantityExpr::Ref {
+                    qty: QuantityRef::Power {
+                        scope: ObjectScope::Target,
+                    },
+                },
+                target: TargetFilter::Controller,
+            }),
+            "reach guard: a Draw whose count is Power{{Target}} DOES need a \
+             creature-quantity slot"
+        );
+    }
+
+    /// V14b (round-6 plan §Building Blocks) — §5.5 makes a slot-claiming
+    /// paired-subject node a `chain_has_target_sink`. That turns
+    /// `sub_ability_inherits_parent_creature_target_only`'s opening
+    /// `if !chain_has_target_sink(parent) { return false; }` from an
+    /// unconditional short-circuit into a REAL evaluation. Checked
+    /// assumption: it must still answer `false` for the corpus's sub shapes.
+    #[test]
+    fn paired_parent_that_is_now_a_sink_still_does_not_inherit_creature_target_only() {
+        let source = ObjectId(500);
+        let paired_parent = ResolvedAbility::new(
+            Effect::ExchangeControl {
+                target_a: TargetFilter::Typed(TypedFilter::creature()),
+                target_b: TargetFilter::Typed(TypedFilter::creature()),
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+
+        // REACH GUARD (paired positive, MANDATORY): the short-circuit this
+        // row exists to prove is gone must genuinely be gone — the parent IS
+        // now a sink, so the `false` results below are not satisfied
+        // vacuously by the very short-circuit under test.
+        assert!(
+            chain_has_target_sink(&paired_parent),
+            "reach guard: §5.5 must make a slot-claiming paired parent a sink"
+        );
+
+        // Mister Negative's sub shape: Draw{Ref{EventContextAmount}, Controller}.
+        let draw_sub = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                },
+                target: TargetFilter::Controller,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        assert!(
+            !sub_ability_inherits_parent_creature_target_only(&paired_parent, &draw_sub),
+            "a Draw{{EventContextAmount, Controller}} sub must not inherit the parent's \
+             (nonexistent) creature target"
+        );
+
+        // Volatile Stormdrake's sub shape: GainEnergy{Fixed 4} — targetless.
+        let gain_energy_sub = ResolvedAbility::new(
+            Effect::GainEnergy {
+                amount: QuantityExpr::Fixed { value: 4 },
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        assert!(!sub_ability_inherits_parent_creature_target_only(
+            &paired_parent,
+            &gain_energy_sub
+        ));
+
+        // Gilded Drake's sub shape: Sacrifice{SelfRef} — a context-ref subject.
+        let sacrifice_sub = ResolvedAbility::new(
+            Effect::Sacrifice {
+                target: TargetFilter::SelfRef,
+                count: QuantityExpr::Fixed { value: 1 },
+                min_count: 0,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        assert!(!sub_ability_inherits_parent_creature_target_only(
+            &paired_parent,
+            &sacrifice_sub
+        ));
+    }
+
+    /// V16 (round-6 plan §Building Blocks) — the three `minimum_targets_in_chain`
+    /// companion terms reserve NOTHING beyond a paired-subject node's own
+    /// claimed slots. Checked assumption (the terms are already 0 for these
+    /// shapes today — round-3's P5 — so there is no revert-red form
+    /// available; this pins the invariant going forward).
+    #[test]
+    fn paired_subject_nodes_reserve_exactly_their_claimed_slots_and_no_companion() {
+        let mut state = GameState::new_two_player(41);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Paired Reservation Source".to_string(),
+            Zone::Battlefield,
+        );
+
+        for effect in [
+            // (Typed, Typed)
+            Effect::ExchangeControl {
+                target_a: TargetFilter::Typed(TypedFilter::creature()),
+                target_b: TargetFilter::Typed(TypedFilter::creature()),
+            },
+            // (SelfRef, Typed)
+            Effect::ExchangeControl {
+                target_a: TargetFilter::SelfRef,
+                target_b: TargetFilter::Typed(TypedFilter::creature()),
+            },
+            // (SelfRef, TriggeringSource) — the zero-claim shape.
+            Effect::ExchangeControl {
+                target_a: TargetFilter::SelfRef,
+                target_b: TargetFilter::TriggeringSource,
+            },
+            // (Player, Player)
+            Effect::ExchangeLifeTotals {
+                player_a: TargetFilter::Player,
+                player_b: TargetFilter::Player,
+            },
+            // (Controller, Player)
+            Effect::ExchangeLifeTotals {
+                player_a: TargetFilter::Controller,
+                player_b: TargetFilter::Player,
+            },
+            // Karona, False God Avatar's shape — the one corpus filter
+            // carrying a `ControllerRef` a companion detector would react to.
+            Effect::ExchangeControl {
+                target_a: TargetFilter::Typed(
+                    TypedFilter::default().controller(ControllerRef::You),
+                ),
+                target_b: TargetFilter::Typed(
+                    TypedFilter::default().controller(ControllerRef::TargetOpponent),
+                ),
+            },
+        ] {
+            let node = ResolvedAbility::new(effect.clone(), vec![], source, PlayerId(0));
+            let claimed = paired_subject_slot_filters(&node.effect).count();
+            assert_eq!(
+                minimum_targets_in_chain(&state, &node),
+                claimed,
+                "paired-subject node {effect:?} must reserve exactly its claimed slot \
+                 count, no companion"
+            );
+        }
+
+        // REACH GUARD (paired positive, MANDATORY): a NON-paired effect that
+        // DOES need a companion player slot reserves claimed + 1 on the SAME
+        // state — proving the companion machinery is genuinely live, not
+        // globally disabled.
+        let mut companion_node = ResolvedAbility::new(
+            Effect::GainEnergy {
+                amount: QuantityExpr::Fixed { value: 1 },
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        companion_node.unless_pay = Some(declared_target_payer(TargetFilter::Typed(
+            TypedFilter::default(),
+        )));
+        assert!(
+            ability_needs_companion_target_player_slot(&companion_node),
+            "reach guard: a targeted unless-payer must surface a companion player slot"
+        );
+        assert!(paired_subject_filters(&companion_node.effect).is_none());
+        assert_eq!(
+            minimum_targets_in_chain(&state, &companion_node),
+            1,
+            "reach guard: the companion machinery reserves 1 slot when it applies"
+        );
+    }
+
+    /// V6c-i (round-6 plan) — Cliffside Market's `(Controller, Player)` shape
+    /// reserves exactly ONE slot: the context-ref half (`Controller`) claims
+    /// nothing.
+    #[test]
+    fn cliffside_market_controller_and_target_player_reserves_exactly_one_slot() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Cliffside Market".to_string(),
+            Zone::Battlefield,
+        );
+        let cliffside = ResolvedAbility::new(
+            Effect::ExchangeLifeTotals {
+                player_a: TargetFilter::Controller,
+                player_b: TargetFilter::Player,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        assert_eq!(
+            minimum_targets_in_chain(&state, &cliffside),
+            1,
+            "the context-ref half (Controller) must claim nothing"
+        );
+        assert_eq!(
+            build_target_slots(&state, &cliffside).unwrap().len(),
+            1,
+            "the collect pass must surface exactly one slot"
+        );
+
+        // REACH GUARD (paired positive): the same assertion on a
+        // (Player, Player) node (Soul Conduit's shape) yields TWO — proving
+        // the term is counted per non-context-ref filter, not hard-wired.
+        let soul_conduit = ResolvedAbility::new(
+            Effect::ExchangeLifeTotals {
+                player_a: TargetFilter::Player,
+                player_b: TargetFilter::Player,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        assert_eq!(minimum_targets_in_chain(&state, &soul_conduit), 2);
+        assert_eq!(build_target_slots(&state, &soul_conduit).unwrap().len(), 2);
+    }
+
+    /// §5.13 tracker row (round-6 plan Gap 9): `Effect::Fight` head modes
+    /// truncate later modes' target slots (Clash of the Eikons). NOT this
+    /// change's to fix — TRACKED: phase-rs/phase#8354. Pins the CORRECT
+    /// 3-slot count and is quarantined until that issue lands.
+    #[test]
+    #[ignore = "tracked: phase-rs/phase#8354 — Effect::Fight head-mode slot truncation"]
+    fn fight_head_mode_truncates_later_modes_slots_clash_of_the_eikons() {
+        use crate::parser::oracle::parse_oracle_text;
+
+        const CLASH_OF_THE_EIKONS_TEXT: &str = "Choose one or more —\n\
+            • Target creature you control fights target creature an opponent controls.\n\
+            • Remove a lore counter from target Saga you control. (Removing lore counters \
+            doesn't cause chapter abilities to trigger.)\n\
+            • Put a lore counter on target Saga you control.";
+
+        let mut state = GameState::new_two_player(43);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Clash of the Eikons".to_string(),
+            Zone::Battlefield,
+        );
+        let parsed = parse_oracle_text(
+            CLASH_OF_THE_EIKONS_TEXT,
+            "Clash of the Eikons",
+            &[],
+            &[],
+            &[],
+        );
+        let chained =
+            build_chained_resolved(&parsed.abilities, &[0, 1], source, PlayerId(0)).unwrap();
+        let whole_chain = build_target_slots(&state, &chained).unwrap();
+        assert_eq!(
+            whole_chain.len(),
+            3,
+            "the whole-chain build must surface all 3 slots — mode 0's fighter pair \
+             (subject + target, both declared \"target creature\") plus mode 1's Saga \
+             target — matching the per-mode `build_target_slots_labelled` count. \
+             CORRECT behaviour, pinned here and quarantined until \
+             phase-rs/phase#8354 lands (today's whole-chain build truncates to 2, \
+             because collect_target_slots_inner's Fight arm returns without \
+             descending into the sub-chain)"
         );
     }
 

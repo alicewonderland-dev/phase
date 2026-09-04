@@ -11,10 +11,42 @@ use engine::game::scenario::{CastCommit, GameScenario, P0, P1};
 use engine::types::ability::TargetRef;
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
-use engine::types::game_state::WaitingFor;
-use engine::types::mana::ManaCost;
+use engine::types::game_state::{CastPaymentMode, WaitingFor};
+use engine::types::mana::{ManaCost, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
+
+/// Verbatim from `client/public/card-data.json`.
+const SHIFTING_GRIFT_TEXT: &str = "Spree (Choose one or more additional costs.)\n+ {2} — \
+    Exchange control of two target creatures.\n+ {1} — Exchange control of two target \
+    artifacts.\n+ {1} — Exchange control of two target enchantments.";
+
+/// Verbatim from `client/public/card-data.json`.
+const KARONA_FALSE_GOD_AVATAR_TEXT: &str = "At the beginning of your upkeep, exchange control \
+    of a permanent you control chosen at random and a permanent target opponent controls \
+    chosen at random.";
+
+/// Verbatim from `client/public/card-data.json`.
+const MISTER_NEGATIVE_TEXT: &str = "Vigilance, lifelink\nDarkforce Inversion — When Mister \
+    Negative enters, you may exchange life totals with target opponent. If you lost life this \
+    way, draw that many cards.";
+
+/// A generous colorless mana pool — enough to cover any combination of
+/// Shifting Grift's Spree additional costs (max `{2}+{1}+{1} = {4}`, with the
+/// printed `{U}{U}` zeroed by `.with_mana_cost(ManaCost::zero())` at each call
+/// site) without needing specific colors.
+fn generic_mana_pool() -> Vec<ManaUnit> {
+    std::iter::repeat_with(|| {
+        ManaUnit::new(
+            ManaType::Colorless,
+            engine::types::identifiers::ObjectId(0),
+            false,
+            vec![],
+        )
+    })
+    .take(8)
+    .collect()
+}
 
 const PERPLEXING_CHIMERA_TEXT: &str = "Whenever an opponent casts a spell, you may exchange \
     control of this creature and that spell. If you do, you may choose new targets for the \
@@ -1436,28 +1468,22 @@ const ARTEEOH_TEXT: &str = "Flying, deathtouch\nWhenever Arteeoh deals combat da
     that's a copy of target artifact you don't control, except it's a 1/1 green Squirrel \
     creature token in addition to its other colors and types.";
 
-/// Stage Arteeoh's trigger with its two declared exchange slots pre-wired, then
-/// accept the "you may" through the real action pipeline.
+/// V3b (round-6 plan, per-node target ownership) — stage Arteeoh's trigger
+/// through REAL COMBAT DAMAGE, submit its two declared exchange slots through
+/// the production BULK `GameAction::SelectTargets` seam
+/// (`engine_stack.rs::handle_trigger_target_selection_select_targets`, which
+/// reaches `assign_targets_in_chain`), and accept the "you may" through the
+/// real action pipeline.
 ///
-/// The declared targets are pre-wired rather than submitted through
-/// `GameAction::SelectTargets` because a two-declared-slot `ExchangeControl`
-/// CANNOT be targeted that way today: `collect_target_slots` and the per-slot
-/// spec builder both surface two slots, but `assign_targets_recursive` has no
-/// `Effect::ExchangeControl` arm, so `assign_targets_in_chain` consumes one of
-/// the two and rejects the submission with `InvalidAction("Unused selected
-/// targets")` — measured for the same-controller AND the cross-controller pick,
-/// so it is not fixture-specific. That is a pre-existing targeting-assignment
-/// defect in `ability_utils.rs`, filed separately and NOT this change's to fix;
-/// the CAST path is unaffected, which is why the Switcheroo / Sudden
-/// Substitution rows above are green.
+/// This is exactly what makes the upgrade buildable: per-node target
+/// ownership (§5.5/§5.6) is what lets `assign_targets_in_chain` accept BOTH
+/// declared slots for a two-declared-slot `ExchangeControl` node instead of
+/// rejecting the submission with `InvalidAction("Unused selected targets")`
+/// after consuming only one of them (BASE, MEASURED both same-controller and
+/// cross-controller).
 ///
-/// **DO NOT "upgrade" this row to `advance_to_combat` / `declare_attackers` /
-/// `combat_damage` staging.** The combat half works (the trigger fires and
-/// surfaces both slots), but the `SelectTargets` that must follow it cannot be
-/// satisfied, so the row would be permanently red.
-///
-/// Everything downstream of the accept — the reflexive trigger, its target
-/// prompt, and the token — flows through the production `WaitingFor` /
+/// Everything downstream — the trigger prompt, the reflexive trigger, its
+/// target prompt, and the token — flows through the production `WaitingFor` /
 /// `GameAction` path, which is what this row measures.
 fn accept_arteeoh_exchange(
     runner: &mut engine::game::scenario::GameRunner,
@@ -1465,30 +1491,44 @@ fn accept_arteeoh_exchange(
     slot_a: engine::types::identifiers::ObjectId,
     slot_b: engine::types::identifiers::ObjectId,
 ) {
-    use engine::game::ability_utils::build_resolved_from_def_with_targets;
-    use engine::game::effects::resolve_ability_chain;
-    use engine::parser::oracle::parse_oracle_text;
+    use engine::game::combat::AttackTarget;
+    use engine::types::ability::EffectKind;
 
-    let parsed = parse_oracle_text(ARTEEOH_TEXT, "Arteeoh, Dread Scavenger", &[], &[], &[]);
-    let def = *parsed
-        .triggers
-        .first()
-        .expect("Arteeoh has a combat-damage trigger")
-        .execute
-        .clone()
-        .expect("that trigger has an execute");
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[(arteeoh, AttackTarget::Player(P1))])
+        .expect("Arteeoh attacks");
+    let _ = runner.combat_damage(); // parks on TriggerTargetSelection; does NOT drain it
 
-    let resolved = build_resolved_from_def_with_targets(
-        &def,
-        arteeoh,
-        P0,
-        vec![TargetRef::Object(slot_a), TargetRef::Object(slot_b)],
-    );
-    let mut events = Vec::new();
-    resolve_ability_chain(runner.state_mut(), &resolved, &mut events, 0)
-        .expect("the chain must resolve up to its optional prompt");
+    // REACH GUARD 1 (the production trigger seam):
+    match &runner.state().waiting_for {
+        WaitingFor::TriggerTargetSelection {
+            source_id,
+            target_slots,
+            ..
+        } => {
+            assert_eq!(*source_id, Some(arteeoh));
+            assert_eq!(target_slots.len(), 2);
+            assert!(target_slots
+                .iter()
+                .all(|s| s.effect_kind == EffectKind::ExchangeControl));
+        }
+        other => panic!("expected Arteeoh's TriggerTargetSelection, got {other:?}"),
+    }
+    runner
+        .act(GameAction::SelectTargets {
+            targets: vec![TargetRef::Object(slot_a), TargetRef::Object(slot_b)],
+        })
+        .expect("both declared exchange slots accept their targets"); // <- BASE Errs HERE
+                                                                      // two PassPriority put the trigger through resolution to its "you may" offer
+    runner
+        .act(GameAction::PassPriority)
+        .expect("priority passes");
+    runner
+        .act(GameAction::PassPriority)
+        .expect("priority passes");
 
-    // REACH GUARD: the chain really parked on Arteeoh's own "you may" offer.
+    // REACH GUARD 2: the chain really parked on Arteeoh's own "you may" offer.
     match runner.state().waiting_for {
         WaitingFor::OptionalEffectChoice { source_id, .. } => assert_eq!(
             source_id, arteeoh,
@@ -1641,4 +1681,1420 @@ fn arteeoh_reflexive_token_still_fires_when_the_exchange_happens() {
     );
     // The artifact P0 gained stays P0's — this row is not measuring a revert.
     assert_eq!(runner.state().objects[&foreign].controller, P0);
+}
+
+// ---------------------------------------------------------------------------
+// Round-6 plan — per-node target ownership for paired-subject effects
+// (Effect::ExchangeControl / Effect::ExchangeLifeTotals). Rows V1, V2
+// (MANDATORY — the maintainer's Shifting Grift two-mode blocker fixture),
+// V3a, V3c, V3d, V8, V9, V11, V18.
+// ---------------------------------------------------------------------------
+
+/// V1 — a 2-mode Shifting Grift exchanges BOTH pairs, each against its own
+/// declared targets — not the head mode's pair twice (the BASE bug: M6
+/// measured 4 `ChangeController` transients all on `{c1,c2}`, with `a1`/`a2`
+/// never touched, because the whole-chain collect pass returned before
+/// descending into the artifact mode).
+///
+/// REACH GUARD (paired positive, MANDATORY): the finalized stack ability
+/// holds EXACTLY the creature pair on the root node and EXACTLY the artifact
+/// pair on its sub-ability — the direct, structural proof of per-node
+/// ownership, not just an end-state coincidence.
+///
+/// REVERT-FAILING: at BASE (debug) `SelectModes{[0,1]}` panics inside
+/// `build_target_slots_labelled`'s `debug_assert_eq!` (measured, M5); at BASE
+/// (release) all four transients land on `{c1,c2}` and `a1`/`a2` never move
+/// (measured, M6), so the artifact-pair assertions below fail.
+#[test]
+fn shifting_grift_two_modes_exchange_their_own_pairs() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(P0, generic_mana_pool());
+    let c1 = scenario.add_creature(P0, "Creature C1", 2, 2).id();
+    let c2 = scenario.add_creature(P1, "Creature C2", 2, 2).id();
+    let a1 = scenario
+        .add_artifact_from_oracle(P0, "Artifact A1", "")
+        .id();
+    let a2 = scenario
+        .add_artifact_from_oracle(P1, "Artifact A2", "")
+        .id();
+    let grift = scenario
+        .add_spell_to_hand_from_oracle(P0, "Shifting Grift", false, SHIFTING_GRIFT_TEXT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+
+    let mut runner = scenario.build();
+    let commit = runner
+        .cast(grift)
+        .modes(&[0, 1])
+        .target_objects(&[c1, c2, a1, a2])
+        .commit();
+
+    // REACH GUARD: per-node ownership at announcement, structurally — the
+    // root (creature mode) claims ONLY [c1, c2]; the sub-ability (artifact
+    // mode) claims ONLY [a1, a2]. At BASE (release) the root would instead
+    // hold all four flat targets and there would be no sub-ability slot.
+    {
+        use engine::types::game_state::StackEntryKind;
+        let StackEntryKind::Spell {
+            ability: Some(ability),
+            ..
+        } = &commit.state().stack.back().unwrap().kind
+        else {
+            panic!("Shifting Grift must finalize its ability at commit");
+        };
+        assert_eq!(
+            ability.targets,
+            vec![TargetRef::Object(c1), TargetRef::Object(c2)],
+            "REACH GUARD: the creature mode (root) must claim exactly its OWN pair"
+        );
+        let sub = ability
+            .sub_ability
+            .as_ref()
+            .expect("REACH GUARD: the artifact mode must be chained as a sub-ability");
+        assert_eq!(
+            sub.targets,
+            vec![TargetRef::Object(a1), TargetRef::Object(a2)],
+            "REACH GUARD: the artifact mode (sub node) must claim exactly its OWN pair"
+        );
+    }
+
+    let outcome = commit.resolve();
+
+    assert_eq!(
+        outcome.state().objects[&c1].controller,
+        P1,
+        "creature pair must exchange"
+    );
+    assert_eq!(
+        outcome.state().objects[&c2].controller,
+        P0,
+        "creature pair must exchange"
+    );
+    assert_eq!(
+        outcome.state().objects[&a1].controller,
+        P1,
+        "artifact pair must exchange against ITS OWN targets, not be left untouched"
+    );
+    assert_eq!(
+        outcome.state().objects[&a2].controller,
+        P0,
+        "artifact pair must exchange against ITS OWN targets, not be left untouched"
+    );
+}
+
+/// V1's SIBLING: a 1-mode Shifting Grift cast (mode 0 only) still exchanges
+/// exactly the creature pair — proves the paired arm's descent is not
+/// accidentally required for the single-node case to keep working.
+#[test]
+fn shifting_grift_single_mode_still_exchanges_exactly_its_pair() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(P0, generic_mana_pool());
+    let c1 = scenario.add_creature(P0, "Creature C1", 2, 2).id();
+    let c2 = scenario.add_creature(P1, "Creature C2", 2, 2).id();
+    let grift = scenario
+        .add_spell_to_hand_from_oracle(P0, "Shifting Grift", false, SHIFTING_GRIFT_TEXT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+
+    let mut runner = scenario.build();
+    let outcome = runner
+        .cast(grift)
+        .modes(&[0])
+        .target_objects(&[c1, c2])
+        .resolve();
+
+    assert_eq!(outcome.state().objects[&c1].controller, P1);
+    assert_eq!(outcome.state().objects[&c2].controller, P0);
+}
+
+/// V2 (U1's DISCRIMINATING TEST — the maintainer's mandatory blocker
+/// fixture). A 2-mode Shifting Grift where mode 1's (creature) targets go
+/// illegal in response, and mode 2's (artifact) targets stay legal: the spell
+/// must RESOLVE — not fizzle — with the artifact exchange happening and the
+/// creature exchange skipped (CR 608.2b: only the illegal instance is
+/// unaffected; the spell as a whole resolves because a legal target
+/// remains).
+///
+/// REVERT-FAILING: at BASE this exact shape either panics (debug,
+/// `build_target_slots_labelled`'s `debug_assert_eq!`) or, once ALL FOUR
+/// targets are flattened onto ONE node (M6), a partial illegal-target set
+/// mis-evaluates CR 608.2b across the wrong node boundary — this is precisely
+/// the maintainer's HIGH blocker: "with two or more modes chosen, when mode
+/// 1's targets go illegal and mode 2's stay legal, the spell now fizzles
+/// instead of resolving."
+#[test]
+fn shifting_grift_second_mode_resolves_when_the_first_modes_targets_go_illegal() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(P0, generic_mana_pool());
+    let c1 = scenario.add_creature(P0, "Creature C1", 2, 2).id();
+    let c2 = scenario.add_creature(P1, "Creature C2", 2, 2).id();
+    let a1 = scenario
+        .add_artifact_from_oracle(P0, "Artifact A1", "")
+        .id();
+    let a2 = scenario
+        .add_artifact_from_oracle(P1, "Artifact A2", "")
+        .id();
+    let grift = scenario
+        .add_spell_to_hand_from_oracle(P0, "Shifting Grift", false, SHIFTING_GRIFT_TEXT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+
+    let mut runner = scenario.build();
+    let mut commit = runner
+        .cast(grift)
+        .modes(&[0, 1])
+        .target_objects(&[c1, c2, a1, a2])
+        .commit();
+
+    // REACH GUARD: the spell is really on the stack with both modes' targets
+    // declared before we strip anything.
+    assert_eq!(
+        commit.state().stack.len(),
+        1,
+        "REACH GUARD: Shifting Grift must be on the stack with all four targets"
+    );
+
+    // "In response", BOTH creature targets stop being creatures — mode 1's
+    // node loses every legal target. Mode 2's artifact targets are untouched.
+    {
+        let state = commit.state_mut();
+        for id in [c1, c2] {
+            state
+                .objects
+                .get_mut(&id)
+                .expect("creature target exists")
+                .card_types
+                .core_types = vec![CoreType::Artifact];
+        }
+    }
+
+    let outcome = commit.resolve();
+
+    // (a) a1/a2 controllers exchanged.
+    assert_eq!(
+        outcome.state().objects[&a1].controller,
+        P1,
+        "the artifact mode's own targets are unaffected by the OTHER mode's illegal targets"
+    );
+    assert_eq!(outcome.state().objects[&a2].controller, P0);
+    // (b) c1/c2 controllers UNCHANGED — the illegal instance is simply
+    // unaffected (CR 608.2b), not swapped anyway.
+    assert_eq!(
+        outcome.state().objects[&c1].controller,
+        P0,
+        "an illegal target must not be affected by the part of the effect for which it's illegal"
+    );
+    assert_eq!(outcome.state().objects[&c2].controller, P1);
+    // (c) Shifting Grift is in its owner's graveyard WITH the artifact
+    // exchange having happened — not countered/fizzled.
+    assert_eq!(
+        outcome.zone_of(grift),
+        Zone::Graveyard,
+        "the spell must RESOLVE (not fizzle) because one node still has a legal target"
+    );
+
+    // HOSTILE (the CR 608.2b "all its targets are now illegal" half): if
+    // instead every one of the four targets goes illegal, the spell truly
+    // fizzles and NO exchange happens at all.
+    let mut hostile_scenario = GameScenario::new();
+    hostile_scenario.at_phase(Phase::PreCombatMain);
+    hostile_scenario.with_mana_pool(P0, generic_mana_pool());
+    let hc1 = hostile_scenario.add_creature(P0, "Creature HC1", 2, 2).id();
+    let hc2 = hostile_scenario.add_creature(P1, "Creature HC2", 2, 2).id();
+    let ha1 = hostile_scenario
+        .add_artifact_from_oracle(P0, "Artifact HA1", "")
+        .id();
+    let ha2 = hostile_scenario
+        .add_artifact_from_oracle(P1, "Artifact HA2", "")
+        .id();
+    let hostile_grift = hostile_scenario
+        .add_spell_to_hand_from_oracle(P0, "Shifting Grift", false, SHIFTING_GRIFT_TEXT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut hostile_runner = hostile_scenario.build();
+    let mut hostile_commit = hostile_runner
+        .cast(hostile_grift)
+        .modes(&[0, 1])
+        .target_objects(&[hc1, hc2, ha1, ha2])
+        .commit();
+    {
+        let state = hostile_commit.state_mut();
+        for id in [hc1, hc2] {
+            state.objects.get_mut(&id).unwrap().card_types.core_types = vec![CoreType::Artifact];
+        }
+        for id in [ha1, ha2] {
+            state.objects.get_mut(&id).unwrap().card_types.core_types = vec![CoreType::Creature];
+        }
+    }
+    let hostile_outcome = hostile_commit.resolve();
+    assert_eq!(
+        hostile_outcome.state().objects[&hc1].controller,
+        P0,
+        "HOSTILE: with every target illegal for every node, the whole spell fizzles"
+    );
+    assert_eq!(hostile_outcome.state().objects[&hc2].controller, P1);
+    assert_eq!(hostile_outcome.state().objects[&ha1].controller, P0);
+    assert_eq!(hostile_outcome.state().objects[&ha2].controller, P1);
+    assert_eq!(hostile_outcome.zone_of(hostile_grift), Zone::Graveyard);
+}
+
+/// V3a — a two-declared-slot `ExchangeControl` node can have targets ASSIGNED
+/// AT ALL, directly against the `pub` seam `assign_targets_in_chain`, on
+/// Arteeoh's parsed trigger.
+///
+/// REVERT-FAILING: at BASE, `assign_targets_in_chain` consumes only ONE of
+/// the two declared slots and rejects the rest with
+/// `Err(InvalidAction("Unused selected targets"))` — measured for both the
+/// same-controller and cross-controller submission — because
+/// `chain_has_target_sink` answers `false` for a chain whose only sink is a
+/// paired-subject node.
+#[test]
+fn arteeoh_two_declared_exchange_slots_assign_to_their_own_node() {
+    use engine::game::ability_utils::{
+        assign_targets_in_chain, build_resolved_from_def, build_target_slots,
+    };
+    use engine::parser::oracle::parse_oracle_text;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let arteeoh = scenario
+        .add_creature_from_oracle(P0, "Arteeoh, Dread Scavenger", 3, 3, ARTEEOH_TEXT)
+        .id();
+    let a1 = scenario.add_artifact_from_oracle(P0, "Bauble A", "").id();
+    let a2 = scenario.add_artifact_from_oracle(P1, "Bauble B", "").id();
+
+    let runner = scenario.build();
+    let parsed = parse_oracle_text(ARTEEOH_TEXT, "Arteeoh, Dread Scavenger", &[], &[], &[]);
+    let def = *parsed
+        .triggers
+        .first()
+        .expect("Arteeoh has a combat-damage trigger")
+        .execute
+        .clone()
+        .expect("that trigger has an execute");
+    let mut resolved = build_resolved_from_def(&def, arteeoh, P0);
+
+    // REACH GUARD: exactly 2 slots surfaced.
+    let slots =
+        build_target_slots(runner.state(), &resolved).expect("Arteeoh's two slots must build");
+    assert_eq!(
+        slots.len(),
+        2,
+        "REACH GUARD: Arteeoh's trigger must surface exactly 2 slots"
+    );
+
+    let result = assign_targets_in_chain(
+        runner.state(),
+        &mut resolved,
+        &[TargetRef::Object(a1), TargetRef::Object(a2)],
+    );
+    assert!(
+        result.is_ok(),
+        "both declared exchange slots must be accepted, got {result:?}"
+    );
+    assert_eq!(
+        resolved.targets,
+        vec![TargetRef::Object(a1), TargetRef::Object(a2)]
+    );
+    assert!(
+        resolved
+            .sub_ability
+            .as_ref()
+            .is_none_or(|sub| sub.targets.is_empty()),
+        "the CopyTokenOf sub must claim no targets at declaration time — its target is chosen \
+         at resolution (defers_conditional_target_selection on \"When you do\")"
+    );
+
+    // HOSTILE: submitting only ONE target must be rejected.
+    let mut resolved_short = build_resolved_from_def(&def, arteeoh, P0);
+    let short_result = assign_targets_in_chain(
+        runner.state(),
+        &mut resolved_short,
+        &[TargetRef::Object(a1)],
+    );
+    assert!(
+        short_result.is_err(),
+        "a short submission must be rejected (Missing required target), got {short_result:?}"
+    );
+}
+
+/// V3c (BLOCKER FIX). §5.7 IS EXERCISED: Arteeoh's SAME production trigger
+/// prompt walked ONE SLOT AT A TIME with `GameAction::ChooseTarget`, hitting
+/// the trigger `ChooseTarget` walk → `assign_selected_slots_in_chain`. This
+/// is the ONLY path the AI takes through a target prompt
+/// (`ai_support::candidates::target_step_actions` emits ONLY `ChooseTarget`).
+///
+/// REVERT-FAILING (MEASURED both sides): at BASE the SECOND `ChooseTarget`
+/// returns `Err(InvalidAction("Unused selected target slots"))` —
+/// `assign_selected_slots_in_chain`'s own message, not
+/// `assign_targets_in_chain`'s — and the state stays parked on
+/// `TriggerTargetSelection`.
+#[test]
+fn arteeoh_exchange_slots_are_walked_one_at_a_time_by_choose_target() {
+    use engine::game::combat::AttackTarget;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let arteeoh = scenario
+        .add_creature_from_oracle(P0, "Arteeoh, Dread Scavenger", 3, 3, ARTEEOH_TEXT)
+        .id();
+    let a1 = scenario.add_artifact_from_oracle(P0, "Bauble A", "").id();
+    let foreign = scenario
+        .add_artifact_from_oracle(P1, "Foreign Relic", "")
+        .id();
+
+    let mut runner = scenario.build();
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[(arteeoh, AttackTarget::Player(P1))])
+        .expect("Arteeoh attacks");
+    let _ = runner.combat_damage();
+
+    // REACH GUARD 1 — the production trigger prompt, and the walk's starting cursor.
+    match &runner.state().waiting_for {
+        WaitingFor::TriggerTargetSelection {
+            source_id,
+            target_slots,
+            selection,
+            ..
+        } => {
+            assert_eq!(*source_id, Some(arteeoh));
+            assert_eq!(target_slots.len(), 2);
+            assert_eq!(selection.current_slot, 0);
+            assert!(selection.selected_slots.is_empty());
+        }
+        other => panic!("expected Arteeoh's TriggerTargetSelection, got {other:?}"),
+    }
+
+    runner
+        .act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(a1)),
+        })
+        .expect("first exchange slot accepts its target");
+
+    // REACH GUARD 2 (paired positive, MANDATORY): the walk advanced rather
+    // than completing early.
+    match &runner.state().waiting_for {
+        WaitingFor::TriggerTargetSelection { selection, .. } => {
+            assert_eq!(selection.current_slot, 1);
+            assert_eq!(selection.selected_slots, vec![Some(TargetRef::Object(a1))]);
+            assert_eq!(
+                selection.current_legal_targets,
+                vec![TargetRef::Object(foreign)]
+            );
+        }
+        other => panic!("expected the walk to advance to slot 1, got {other:?}"),
+    }
+
+    runner
+        .act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(foreign)),
+        })
+        .expect("second exchange slot accepts its target"); // <- BASE Errs HERE
+    runner
+        .act(GameAction::PassPriority)
+        .expect("priority passes");
+    runner
+        .act(GameAction::PassPriority)
+        .expect("priority passes");
+
+    // REACH GUARD 3
+    match runner.state().waiting_for {
+        WaitingFor::OptionalEffectChoice { source_id, .. } => assert_eq!(source_id, arteeoh),
+        ref other => panic!("expected Arteeoh's OptionalEffectChoice, got {other:?}"),
+    }
+    runner
+        .act(GameAction::DecideOptionalEffect { accept: true })
+        .expect("accept the exchange");
+
+    assert_eq!(runner.state().objects[&a1].controller, P1);
+    assert_eq!(runner.state().objects[&foreign].controller, P0);
+}
+
+/// V3c's HOSTILE: both of Arteeoh's declared exchange slots are `optional:
+/// false` (MEASURED at the live prompt) — this is the arm §5.6 has no
+/// analogue for, and the reason V3c exists at all.
+#[test]
+fn arteeoh_choose_target_walk_rejects_a_declined_required_slot() {
+    use engine::game::combat::AttackTarget;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let arteeoh = scenario
+        .add_creature_from_oracle(P0, "Arteeoh, Dread Scavenger", 3, 3, ARTEEOH_TEXT)
+        .id();
+    let a1 = scenario.add_artifact_from_oracle(P0, "Bauble A", "").id();
+    let _foreign = scenario
+        .add_artifact_from_oracle(P1, "Foreign Relic", "")
+        .id();
+
+    let mut runner = scenario.build();
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[(arteeoh, AttackTarget::Player(P1))])
+        .expect("Arteeoh attacks");
+    let _ = runner.combat_damage();
+    runner
+        .act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(a1)),
+        })
+        .expect("first slot accepts");
+
+    let result = runner.act(GameAction::ChooseTarget { target: None });
+    assert!(
+        result.is_err(),
+        "both exchange slots are non-optional, so declining slot 1 must be rejected, \
+         got {result:?}"
+    );
+}
+
+/// Stage a 2-mode Shifting Grift cast through the CAST-TIME slot walk (bulk
+/// `SelectTargets` is NOT submitted), returning the runner parked on
+/// `WaitingFor::TargetSelection` with all 4 slots surfaced.
+fn stage_grift_cast_time_target_selection(
+    scenario: GameScenario,
+    grift: engine::types::identifiers::ObjectId,
+) -> engine::game::scenario::GameRunner {
+    let mut runner = scenario.build();
+    let card_id = runner.state().objects[&grift].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: grift,
+            card_id,
+            targets: Vec::new(),
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("cast Shifting Grift");
+
+    for _ in 0..10 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::ModeChoice { .. } => {
+                runner
+                    .act(GameAction::SelectModes {
+                        indices: vec![0, 1],
+                    })
+                    .expect("select both Grift modes");
+            }
+            WaitingFor::ManaPayment { .. } => {
+                runner
+                    .act(GameAction::PassPriority)
+                    .expect("auto-pay the announced Spree cost");
+            }
+            WaitingFor::TargetSelection { .. } => break,
+            other => panic!("unexpected waiting state while driving to TargetSelection: {other:?}"),
+        }
+    }
+    match &runner.state().waiting_for {
+        WaitingFor::TargetSelection { target_slots, .. } => {
+            assert_eq!(
+                target_slots.len(),
+                4,
+                "REACH GUARD: 2 modes x 2 slots each = 4"
+            );
+        }
+        other => panic!("expected TargetSelection, got {other:?}"),
+    }
+    runner
+}
+
+/// V3d — §5.7 at the OTHER production entry point: a 2-mode Shifting Grift's
+/// CAST-TIME slot walk, hitting `casting_targets.rs`'s `ChooseTarget`
+/// `TargetSelectionAdvance::Complete` arm → `assign_selected_slots_in_chain`.
+///
+/// REVERT-FAILING BY OUTCOME (release-safe): at BASE, `chain_has_target_sink`
+/// is false, so `assign_selected_slots_in_chain` takes its blanket early
+/// return and ALL FOUR selected slots land on the root (creature) node — the
+/// artifact pair is never exchanged even though all four targets were
+/// legally submitted.
+#[test]
+fn shifting_grift_two_modes_walked_slot_by_slot_bind_their_own_pairs() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(P0, generic_mana_pool());
+    let c1 = scenario.add_creature(P0, "Creature C1", 2, 2).id();
+    let c2 = scenario.add_creature(P1, "Creature C2", 2, 2).id();
+    let a1 = scenario
+        .add_artifact_from_oracle(P0, "Artifact A1", "")
+        .id();
+    let a2 = scenario
+        .add_artifact_from_oracle(P1, "Artifact A2", "")
+        .id();
+    let grift = scenario
+        .add_spell_to_hand_from_oracle(P0, "Shifting Grift", false, SHIFTING_GRIFT_TEXT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+
+    let mut runner = stage_grift_cast_time_target_selection(scenario, grift);
+
+    // REACH GUARDS (paired positives, MANDATORY): the cursor advances by one
+    // after each `ChooseTarget`.
+    for (i, target) in [c1, c2, a1, a2].into_iter().enumerate() {
+        match &runner.state().waiting_for {
+            WaitingFor::TargetSelection { selection, .. } => {
+                assert_eq!(selection.current_slot, i);
+            }
+            other => panic!("expected TargetSelection at slot {i}, got {other:?}"),
+        }
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(target)),
+            })
+            .unwrap_or_else(|e| {
+                panic!("ChooseTarget({target:?}) at slot {i} must be accepted: {e:?}")
+            });
+    }
+
+    runner.advance_until_stack_empty();
+
+    assert_eq!(runner.state().objects[&c1].controller, P1);
+    assert_eq!(runner.state().objects[&c2].controller, P0);
+    assert_eq!(
+        runner.state().objects[&a1].controller,
+        P1,
+        "the artifact pair must exchange against ITS OWN targets"
+    );
+    assert_eq!(runner.state().objects[&a2].controller, P0);
+}
+
+/// V3d's HOSTILE: `GameAction::ChooseTarget { target: None }` on any of the
+/// four non-optional slots must be rejected.
+#[test]
+fn shifting_grift_choose_target_walk_rejects_a_declined_required_slot() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(P0, generic_mana_pool());
+    let _c1 = scenario.add_creature(P0, "Creature C1", 2, 2).id();
+    let _c2 = scenario.add_creature(P1, "Creature C2", 2, 2).id();
+    let _a1 = scenario
+        .add_artifact_from_oracle(P0, "Artifact A1", "")
+        .id();
+    let _a2 = scenario
+        .add_artifact_from_oracle(P1, "Artifact A2", "")
+        .id();
+    let grift = scenario
+        .add_spell_to_hand_from_oracle(P0, "Shifting Grift", false, SHIFTING_GRIFT_TEXT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+
+    let mut runner = stage_grift_cast_time_target_selection(scenario, grift);
+    let result = runner.act(GameAction::ChooseTarget { target: None });
+    assert!(
+        result.is_err(),
+        "the creature mode's first slot is non-optional, so declining it must be rejected, \
+         got {result:?}"
+    );
+}
+
+/// V18 — the TRIGGER AUTO-ASSIGN route (`triggers.rs`'s
+/// `prepare_trigger_targets`, the branch taken when exactly one legal
+/// assignment exists) stays `AutoAssigned`, with each node holding its own
+/// list. This is the ONE production route with a SILENT failure mode: a §5.6
+/// defect here does not surface as an `Err` anywhere — it becomes
+/// `PreparedTriggerTargets::NeedsFallbackPush` →
+/// `TriggerDispatchDisposition::DroppedTargetUnresolved`, and the trigger
+/// simply vanishes. It is also Karona, False God Avatar's ONLY production
+/// route (one Phase/Upkeep trigger, no `sub_ability`, no activated ability).
+///
+/// Table-driven over TWO carriers, both through the real pipeline with
+/// VERBATIM Oracle text.
+#[test]
+fn paired_trigger_targets_auto_assign_without_a_prompt_and_bind_per_node() {
+    // CARRIER A — Karona, False God Avatar: `ExchangeControl(Typed{You},
+    // Typed{TargetOpponent})`, 2 claimed slots, no `sub_ability`. The staged
+    // permanent must be P0's ONLY permanent — that (and only that) is what
+    // makes exactly one legal assignment exist and forces the auto-select
+    // branch. P1's board is cosmetic: `Typed{controller: TargetOpponent}`
+    // resolves to the CONTROLLER (CR 603.2's triggering-event-player
+    // fallback), so both slots read P0's permanents regardless of P1's
+    // board.
+    {
+        let mut scenario = GameScenario::new();
+        let _karona = scenario
+            .add_enchantment_from_oracle(
+                P0,
+                "Karona, False God Avatar",
+                KARONA_FALSE_GOD_AVATAR_TEXT,
+            )
+            .id();
+        let _p1_creature = scenario.add_creature(P1, "P1 Creature", 2, 2).id();
+
+        let mut runner = scenario.build();
+        runner.advance_to_upkeep();
+
+        // ASSERTED / REVERT-FAILING: never parks on TriggerTargetSelection.
+        assert!(
+            !matches!(
+                runner.state().waiting_for,
+                WaitingFor::TriggerTargetSelection { .. }
+            ),
+            "the trigger must auto-assign, not prompt — got {:?}",
+            runner.state().waiting_for
+        );
+        // It reaches the stack (a NeedsFallbackPush regression would instead
+        // make stack.len() == 0 immediately).
+        assert_eq!(
+            runner.state().stack.len(),
+            1,
+            "the auto-assigned trigger must reach the stack"
+        );
+        // REACH GUARD (paired positive, MANDATORY), folded into the same
+        // check: the dispatched stack entry carries exactly 2 REAL targets
+        // and no sub-ability — this is what rules out "never parked on
+        // TriggerTargetSelection" being satisfied vacuously by the
+        // zero-slot `PreparedTriggerTargets::NoTargets` branch instead of a
+        // genuine 2-slot auto-assignment (a standalone `build_target_slots`
+        // probe outside a live trigger context cannot resolve
+        // `ControllerRef::TargetOpponent`, which needs `triggering_event_player`
+        // — CR 603.2 — so this in-pipeline check is the correct instrument).
+        {
+            use engine::types::game_state::StackEntryKind;
+            let StackEntryKind::TriggeredAbility { ability, .. } =
+                &runner.state().stack.back().unwrap().kind
+            else {
+                panic!("Karona's stack entry must be a TriggeredAbility");
+            };
+            assert_eq!(
+                ability.targets.len(),
+                2,
+                "per-node ownership: this node's own claimed pair"
+            );
+            assert!(ability.sub_ability.is_none());
+        }
+
+        // DO NOT assert "the exchange happened" for Karona: the single legal
+        // assignment is the same permanent in both slots
+        // (`[Object(karona), Object(karona)]`), a disclosed, pre-existing
+        // under-declaration (the parse surfaces two object slots and no
+        // player slot for "target opponent"), so CR 701.12b makes it a no-op
+        // — unaffected by this change either way.
+        runner
+            .act(GameAction::PassPriority)
+            .expect("priority passes");
+        runner
+            .act(GameAction::PassPriority)
+            .expect("priority resolves the trigger");
+        assert_eq!(
+            runner.state().stack.len(),
+            0,
+            "two PassPriority must drain the auto-assigned trigger"
+        );
+    }
+
+    // CARRIER B — Mister Negative: `ExchangeLifeTotals(Controller,
+    // Typed{Opponent})`, 1 claimed slot, WITH a real `sub_ability`
+    // (`Draw{EventContextAmount, Controller}`). Staged as a real cast from
+    // hand so its ETB trigger fires through production dispatch; on a
+    // two-player board there is exactly one opponent, forcing the
+    // auto-select branch again. `at_phase(Phase::PreCombatMain)` is
+    // MANDATORY (MEASURED): at the scenario default phase the cast is
+    // rejected as sorcery-speed-only and the harness would panic before any
+    // assertion ran.
+    {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.with_life(P0, 20);
+        scenario.with_life(P1, 7);
+        let mn = scenario
+            .add_creature_to_hand_from_oracle(P0, "Mister Negative", 5, 5, MISTER_NEGATIVE_TEXT)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+
+        let mut runner = scenario.build();
+        let outcome = runner.cast(mn).accept_optional().resolve();
+
+        // REVERT-FAILING / ASSERTED: the paired node's own targets, and the
+        // life-total exchange (per-node ownership, not a flat list).
+        outcome.assert_life_delta(P0, -13);
+        outcome.assert_life_delta(P1, 13);
+    }
+}
+
+/// V18's REPLACEMENT HOSTILE — a carrier whose declared slots genuinely go
+/// empty, on the SAME `prepare_trigger_targets` route: Arteeoh, Dread
+/// Scavenger on a board with NO artifacts at all. Both declared
+/// `ExchangeControl` slots have an EMPTY legal set, `build_target_slots`
+/// `Err`s, and `prepare_trigger_targets` never reaches the stack (CR 603.3d —
+/// "If a choice is required when the triggered ability goes on the stack but
+/// no legal choices can be made for it… the ability is simply removed from
+/// the stack").
+///
+/// This is what pins that §5.5/§5.6 did not turn a no-legal-target trigger
+/// into an assignment error, or vice versa.
+#[test]
+fn arteeoh_combat_damage_trigger_with_no_legal_artifact_targets_is_dropped_not_errored() {
+    use engine::game::combat::AttackTarget;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let arteeoh = scenario
+        .add_creature_from_oracle(P0, "Arteeoh, Dread Scavenger", 3, 3, ARTEEOH_TEXT)
+        .id();
+    // No artifacts anywhere.
+
+    let mut runner = scenario.build();
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[(arteeoh, AttackTarget::Player(P1))])
+        .expect("Arteeoh attacks");
+    let outcome = runner.combat_damage();
+
+    // PAIRED POSITIVE REACH GUARD, MANDATORY: combat damage genuinely
+    // landed, so the trigger event genuinely occurred and `stack.len() == 0`
+    // below is a DROPPED trigger, not a trigger that never fired.
+    assert_eq!(
+        outcome.state().players[P1.0 as usize].life,
+        17,
+        "REACH GUARD: combat damage must have landed (20 -> 17)"
+    );
+    assert_eq!(
+        outcome.state().stack.len(),
+        0,
+        "with no legal artifact targets anywhere, the trigger must be dropped, not raise a \
+         prompt and not error"
+    );
+}
+
+/// CONTROL for the hostile above: the same staging WITH one artifact per
+/// player must raise the prompt (`stack.len() == 1`) — proving the
+/// instrument fires when targets ARE available.
+#[test]
+fn arteeoh_combat_damage_trigger_with_legal_artifact_targets_raises_the_prompt() {
+    use engine::game::combat::AttackTarget;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let arteeoh = scenario
+        .add_creature_from_oracle(P0, "Arteeoh, Dread Scavenger", 3, 3, ARTEEOH_TEXT)
+        .id();
+    let _a1 = scenario.add_artifact_from_oracle(P0, "Bauble A", "").id();
+    let _foreign = scenario
+        .add_artifact_from_oracle(P1, "Foreign Relic", "")
+        .id();
+
+    let mut runner = scenario.build();
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[(arteeoh, AttackTarget::Player(P1))])
+        .expect("Arteeoh attacks");
+    let _ = runner.combat_damage();
+
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::TriggerTargetSelection { .. }
+        ),
+        "with legal artifact targets available, the trigger must raise the prompt, got {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(runner.state().stack.len(), 1);
+}
+
+/// V8 — announced mode order does not disturb the mapping. Modes are
+/// declared to the reducer in ANNOUNCEMENT order (`[1, 0]` — artifact mode
+/// first, creature mode second), but slots are still bound in CR 608.2c
+/// PRINTED order (creature-pair-then-artifact-pair), because
+/// `build_chained_resolved`/`ordered_selected_mode_indices` sort the chosen
+/// indices before chaining — a fact this change's collect/assign arms do not
+/// alter.
+///
+/// REACH GUARD: `selected_mode_labels` names the creature mode first and the
+/// artifact mode second, regardless of announcement order.
+#[test]
+fn shifting_grift_modes_announced_out_of_order_still_bind_printed_order() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(P0, generic_mana_pool());
+    let c1 = scenario.add_creature(P0, "Creature C1", 2, 2).id();
+    let c2 = scenario.add_creature(P1, "Creature C2", 2, 2).id();
+    let a1 = scenario
+        .add_artifact_from_oracle(P0, "Artifact A1", "")
+        .id();
+    let a2 = scenario
+        .add_artifact_from_oracle(P1, "Artifact A2", "")
+        .id();
+    let grift = scenario
+        .add_spell_to_hand_from_oracle(P0, "Shifting Grift", false, SHIFTING_GRIFT_TEXT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+
+    let mut runner = scenario.build();
+    // Announce mode 1 (artifacts) BEFORE mode 0 (creatures) — the reverse of
+    // printed order.
+    let commit = runner
+        .cast(grift)
+        .modes(&[1, 0])
+        .target_objects(&[c1, c2, a1, a2])
+        .commit();
+
+    {
+        use engine::types::game_state::StackEntryKind;
+        let StackEntryKind::Spell {
+            ability: Some(ability),
+            ..
+        } = &commit.state().stack.back().unwrap().kind
+        else {
+            panic!("Shifting Grift must finalize its ability at commit");
+        };
+        assert_eq!(
+            ability.selected_mode_labels.len(),
+            2,
+            "both announced modes must have a label"
+        );
+        assert!(
+            ability.selected_mode_labels[0]
+                .to_lowercase()
+                .contains("creature"),
+            "REACH GUARD: PRINTED order (creature mode first), not announcement order \
+             (artifact mode was announced first) — labels were {:?}",
+            ability.selected_mode_labels
+        );
+        assert!(
+            ability.selected_mode_labels[1]
+                .to_lowercase()
+                .contains("artifact"),
+            "labels were {:?}",
+            ability.selected_mode_labels
+        );
+        // Per-node target ownership itself is unaffected by announcement
+        // order — the SAME structural check V1 makes.
+        assert_eq!(
+            ability.targets,
+            vec![TargetRef::Object(c1), TargetRef::Object(c2)],
+            "the creature mode (root) must still claim exactly its own pair"
+        );
+        let sub = ability
+            .sub_ability
+            .as_ref()
+            .expect("the artifact mode must be chained as a sub-ability");
+        assert_eq!(
+            sub.targets,
+            vec![TargetRef::Object(a1), TargetRef::Object(a2)],
+            "the artifact mode (sub node) must still claim exactly its own pair"
+        );
+    }
+
+    let outcome = commit.resolve();
+    assert_eq!(outcome.state().objects[&c1].controller, P1);
+    assert_eq!(outcome.state().objects[&c2].controller, P0);
+    assert_eq!(outcome.state().objects[&a1].controller, P1);
+    assert_eq!(outcome.state().objects[&a2].controller, P0);
+}
+
+/// V9 — the fix generalises past N = 2. A 3-mode Shifting Grift exchanges
+/// THREE disjoint pairs, each node holding exactly its own targets: 6 slots,
+/// 6 transients over 6 distinct objects. This is the row that exercises the
+/// recursive descent at chain depth 3 (root + 2 sub-abilities), not just
+/// depth 2, and doubles as the residual-risk (3-mode Grift combinatorics)
+/// smoke signal — the whole cast must complete well inside the default test
+/// timeout.
+///
+/// REACH GUARD: `target_slots.len() == 6` at announcement.
+/// `allow_repeat_modes: false` makes CR 700.2d's duplicate-mode case
+/// UNREACHABLE here — recorded, not tested.
+#[test]
+fn shifting_grift_all_three_modes_exchange_three_disjoint_pairs() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(P0, generic_mana_pool());
+    let c1 = scenario.add_creature(P0, "Creature C1", 2, 2).id();
+    let c2 = scenario.add_creature(P1, "Creature C2", 2, 2).id();
+    let a1 = scenario
+        .add_artifact_from_oracle(P0, "Artifact A1", "")
+        .id();
+    let a2 = scenario
+        .add_artifact_from_oracle(P1, "Artifact A2", "")
+        .id();
+    let e1 = scenario
+        .add_enchantment_from_oracle(P0, "Enchantment E1", "")
+        .id();
+    let e2 = scenario
+        .add_enchantment_from_oracle(P1, "Enchantment E2", "")
+        .id();
+    let grift = scenario
+        .add_spell_to_hand_from_oracle(P0, "Shifting Grift", false, SHIFTING_GRIFT_TEXT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+
+    let mut runner = scenario.build();
+    let commit = runner
+        .cast(grift)
+        .modes(&[0, 1, 2])
+        .target_objects(&[c1, c2, a1, a2, e1, e2])
+        .commit();
+
+    // REACH GUARD: per-node ownership at announcement, structurally, at
+    // chain depth 3 — root (creatures), sub (artifacts), sub-of-sub
+    // (enchantments).
+    {
+        use engine::types::game_state::StackEntryKind;
+        let StackEntryKind::Spell {
+            ability: Some(ability),
+            ..
+        } = &commit.state().stack.back().unwrap().kind
+        else {
+            panic!("Shifting Grift must finalize its ability at commit");
+        };
+        assert_eq!(
+            ability.targets,
+            vec![TargetRef::Object(c1), TargetRef::Object(c2)]
+        );
+        let sub_artifacts = ability
+            .sub_ability
+            .as_ref()
+            .expect("the artifact mode must be chained as a sub-ability");
+        assert_eq!(
+            sub_artifacts.targets,
+            vec![TargetRef::Object(a1), TargetRef::Object(a2)]
+        );
+        let sub_enchantments = sub_artifacts
+            .sub_ability
+            .as_ref()
+            .expect("the enchantment mode must be chained two levels deep");
+        assert_eq!(
+            sub_enchantments.targets,
+            vec![TargetRef::Object(e1), TargetRef::Object(e2)]
+        );
+    }
+
+    let outcome = commit.resolve();
+    assert_eq!(outcome.state().objects[&c1].controller, P1);
+    assert_eq!(outcome.state().objects[&c2].controller, P0);
+    assert_eq!(outcome.state().objects[&a1].controller, P1);
+    assert_eq!(outcome.state().objects[&a2].controller, P0);
+    assert_eq!(outcome.state().objects[&e1].controller, P1);
+    assert_eq!(outcome.state().objects[&e2].controller, P0);
+}
+
+/// V11 — the no-legal-target rejection is the STABLE outcome across BOTH
+/// slot builders, on a board with creatures but NO artifacts.
+///
+/// (b) DISCRIMINATING HALF: `build_target_slots(&build_chained_resolved(..))`
+/// (whole-chain) must `Err` — BASE returns `Ok` with 2 slots (the artifact
+/// mode's `no_legal_target_slots()` exit was never reached because the
+/// whole-chain collect pass returned before descending into it). Asserts on
+/// a `Result`, so revert-red in `--release` too.
+/// (a) NON-DISCRIMINATING STABILITY HALF, labelled as such: `SelectModes`
+/// itself still `Err`s at BASE and after (the per-mode `build_target_slots_labelled`
+/// builder was never broken) — a no-regression sibling, not evidence.
+#[test]
+fn shifting_grift_artifactless_second_mode_is_rejected_by_both_slot_builders() {
+    use engine::game::ability_utils::{build_chained_resolved, build_target_slots};
+    use engine::parser::oracle::parse_oracle_text;
+
+    // ---- (b) THE DISCRIMINATING HALF — direct against the two `pub` builders, on a
+    // board with creatures but NO artifacts. ----
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let _c1 = scenario.add_creature(P0, "Creature C1", 2, 2).id();
+    let _c2 = scenario.add_creature(P1, "Creature C2", 2, 2).id();
+    let grift = scenario
+        .add_spell_to_hand_from_oracle(P0, "Shifting Grift", false, SHIFTING_GRIFT_TEXT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let runner = scenario.build();
+
+    let parsed = parse_oracle_text(SHIFTING_GRIFT_TEXT, "Shifting Grift", &[], &[], &[]);
+    let chained = build_chained_resolved(&parsed.abilities, &[0, 1], grift, P0).unwrap();
+    let whole_chain = build_target_slots(runner.state(), &chained);
+    assert!(
+        whole_chain.is_err(),
+        "REVERT-FAILING: with no legal artifact targets anywhere, the whole-chain build \
+         must Err (BASE: Ok with 2 truncated slots), got {whole_chain:?}"
+    );
+
+    // REACH GUARD: the same shape WITH an artifact on each side yields `Ok`
+    // with 4 slots — a fresh board so the artifactless board above is not
+    // itself mutated (MEASURED, plan round-3 P4).
+    let mut artifact_scenario = GameScenario::new();
+    artifact_scenario.at_phase(Phase::PreCombatMain);
+    let ac1 = artifact_scenario.add_creature(P0, "Creature C1", 2, 2).id();
+    let ac2 = artifact_scenario.add_creature(P1, "Creature C2", 2, 2).id();
+    let _aa1 = artifact_scenario
+        .add_artifact_from_oracle(P0, "Artifact A1", "")
+        .id();
+    let _aa2 = artifact_scenario
+        .add_artifact_from_oracle(P1, "Artifact A2", "")
+        .id();
+    let artifact_grift = artifact_scenario
+        .add_spell_to_hand_from_oracle(P0, "Shifting Grift", false, SHIFTING_GRIFT_TEXT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let artifact_runner = artifact_scenario.build();
+    let chained_with_artifacts =
+        build_chained_resolved(&parsed.abilities, &[0, 1], artifact_grift, P0).unwrap();
+    let slots_with_artifacts = build_target_slots(artifact_runner.state(), &chained_with_artifacts)
+        .expect("REACH GUARD: the same shape with an artifact on each side must build");
+    assert_eq!(
+        slots_with_artifacts.len(),
+        4,
+        "REACH GUARD: the same shape with an artifact on each side yields 4 slots"
+    );
+    let _ = (ac1, ac2);
+
+    // ---- (a) THE NON-DISCRIMINATING STABILITY HALF, labelled as such: the real
+    // `SelectModes` outcome is unchanged — still `Err` — because the per-mode
+    // `build_target_slots_labelled` builder was never broken (CR 700.2a). Reuses
+    // the SAME artifactless `runner` from (b), driven through the real cast
+    // pipeline. ----
+    let mut runner = runner;
+    let card_id = runner.state().objects[&grift].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: grift,
+            card_id,
+            targets: Vec::new(),
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("cast Shifting Grift");
+    let select_modes_result = loop {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::ModeChoice { .. } => {
+                break runner.act(GameAction::SelectModes {
+                    indices: vec![0, 1],
+                });
+            }
+            WaitingFor::ManaPayment { .. } => {
+                runner
+                    .act(GameAction::PassPriority)
+                    .expect("auto-pay Grift's base cost");
+            }
+            other => panic!("unexpected waiting state before ModeChoice: {other:?}"),
+        }
+    };
+    assert!(
+        select_modes_result.is_err(),
+        "non-discriminating stability sibling: SelectModes must still Err on both sides \
+         (ActionNotAllowed(\"No legal targets available\")), got {select_modes_result:?}"
+    );
+
+    // HOSTILE: mode 0 ALONE on the same (artifactless) board must still
+    // succeed — the artifactless mode is what's rejected, not the whole cast.
+    let mode0_only = build_chained_resolved(&parsed.abilities, &[0], grift, P0).unwrap();
+    assert!(
+        build_target_slots(runner.state(), &mode0_only).is_ok(),
+        "HOSTILE: mode 0 alone must still succeed on the artifactless board"
+    );
+}
+
+/// V12 — retargeting a chained paired-subject spell sees the ROOT node's own
+/// pair only, and leaves the sub-node's (artifact mode's) targets intact.
+/// Seam: `engine.rs::apply_retarget` + `change_targets::legal_new_targets_for_entry`'s
+/// fallback (`stack_ability.targets.clone()`) — untouched by this change, but
+/// now sound BECAUSE the root holds only its own claimed pair (§5.6/§5.7).
+///
+/// P1 casts a 2-mode Shifting Grift (creatures + artifacts). Perplexing
+/// Chimera's "whenever an opponent casts a spell" trigger fires for P0; P0
+/// accepts the exchange (steals the Grift spell) and is offered "you may
+/// choose new targets for the spell".
+///
+/// REVERT-FAILING: at BASE the cast PANICS at `SelectModes` before the
+/// Chimera trigger can even fire (M5, `debug_assert_eq!`); in `--release`
+/// the retarget pool would instead contain all 4 flat targets (both
+/// artifacts included) because the root held everything.
+#[test]
+fn chimera_retarget_of_a_two_mode_grift_offers_only_the_root_nodes_pair() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(P1, generic_mana_pool());
+    let chimera = scenario
+        .add_creature_from_oracle(P0, "Perplexing Chimera", 3, 3, PERPLEXING_CHIMERA_TEXT)
+        .id();
+    let c1 = scenario.add_creature(P0, "Creature C1", 2, 2).id();
+    let c2 = scenario.add_creature(P1, "Creature C2", 2, 2).id();
+    let a1 = scenario
+        .add_artifact_from_oracle(P0, "Artifact A1", "")
+        .id();
+    let a2 = scenario
+        .add_artifact_from_oracle(P1, "Artifact A2", "")
+        .id();
+    let grift = scenario
+        .add_spell_to_hand_from_oracle(P1, "Shifting Grift", false, SHIFTING_GRIFT_TEXT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+
+    let mut runner = scenario.build();
+    {
+        let state = runner.state_mut();
+        state.active_player = P1;
+        state.priority_player = P1;
+        state.waiting_for = WaitingFor::Priority { player: P1 };
+    }
+    let mut commit = runner
+        .cast(grift)
+        .modes(&[0, 1])
+        .target_objects(&[c1, c2, a1, a2])
+        .commit();
+
+    // Drain to the retarget prompt, accepting the Chimera trigger on the way.
+    let mut reached = None;
+    for _ in 0..40 {
+        match &commit.state().waiting_for {
+            WaitingFor::RetargetChoice {
+                current_targets,
+                legal_new_targets,
+                ..
+            } => {
+                reached = Some((current_targets.clone(), legal_new_targets.clone()));
+                break;
+            }
+            WaitingFor::OptionalEffectChoice { .. } => {
+                commit
+                    .act(GameAction::DecideOptionalEffect { accept: true })
+                    .expect("accepting the Chimera trigger must succeed");
+            }
+            WaitingFor::Priority { .. } => {
+                assert!(
+                    !commit.state().stack.is_empty(),
+                    "the stack emptied before the retarget prompt was raised"
+                );
+                commit
+                    .act(GameAction::PassPriority)
+                    .expect("PassPriority should succeed while draining");
+            }
+            other => panic!("unexpected state while draining to the retarget prompt: {other:?}"),
+        }
+    }
+    let (current_targets, legal_new_targets) =
+        reached.expect("REACH GUARD: the retarget prompt must be raised");
+
+    // REACH GUARD: the Chimera exchange really happened.
+    assert_eq!(
+        commit.state().objects.get(&chimera).unwrap().controller,
+        P1,
+        "REACH GUARD: the Chimera must have swapped to P1"
+    );
+
+    // THE DISCRIMINATOR: the pool is the ROOT node's own pair ONLY —
+    // [c1, c2] — and contains NEITHER artifact.
+    assert_eq!(
+        current_targets.len(),
+        2,
+        "the retarget prompt's current_targets must be the root's own pair, got \
+         {current_targets:?}"
+    );
+    assert_eq!(
+        legal_new_targets.len(),
+        2,
+        "the legal pool must be exactly 2 (the root's own claimed pair), got \
+         {legal_new_targets:?}"
+    );
+    for artifact in [a1, a2] {
+        assert!(
+            !legal_new_targets.contains(&TargetRef::Object(artifact)),
+            "an artifact must never be offered for the creature mode's retarget — \
+             pool was {legal_new_targets:?}"
+        );
+    }
+
+    // Submit a permutation WITHIN the (symmetric-filter) creature pair — §5.11
+    // must accept it (the NEGATIVE control: this changes nothing about the
+    // actual outcome, since both slots share the same filter).
+    let mut swapped = current_targets.clone();
+    swapped.reverse();
+    commit
+        .act(GameAction::RetargetSpell {
+            new_targets: swapped,
+        })
+        .expect("a within-pair permutation of a symmetric-filter pair must be accepted");
+
+    // Resolve fully: BOTH exchanges still happen on their own pairs — the
+    // creature pair (c1, c2), and the artifact pair (a1, a2), UNTOUCHED by
+    // the retarget.
+    for _ in 0..40 {
+        match commit.state().waiting_for {
+            WaitingFor::Priority { .. } => {
+                if commit.state().stack.is_empty() {
+                    break;
+                }
+                let _ = commit.act(GameAction::PassPriority);
+            }
+            WaitingFor::OptionalEffectChoice { .. } => {
+                let _ = commit.act(GameAction::DecideOptionalEffect { accept: true });
+            }
+            _ => break,
+        }
+    }
+
+    assert_eq!(
+        commit.state().objects[&c1].controller,
+        P1,
+        "the creature pair must still exchange, regardless of the retarget permutation"
+    );
+    assert_eq!(commit.state().objects[&c2].controller, P0);
+    assert_eq!(
+        commit.state().objects[&a1].controller,
+        P1,
+        "the artifact mode's pair must be UNTOUCHED by the creature mode's retarget"
+    );
+    assert_eq!(commit.state().objects[&a2].controller, P0);
+}
+
+/// V15 — the newly reachable sub-chain descent (§5.2/§5.3) surfaces NO
+/// additional slot anywhere in the corpus. Table-driven over the six
+/// measurable carriers of the nine paired-with-`sub_ability` corpus chains
+/// (Modify Memory, Profane Transfusion and Sudden Substitution are omitted:
+/// their spell bodies parse to `Effect::Unimplemented` on this route; their
+/// sub shapes — `Draw{Fixed, Controller}`, `Effect::Unimplemented` — are each
+/// covered by another carrier in this table).
+///
+/// PINNED EXPECTATIONS (MEASURED, plan round-3 P3): `Ok(2)`, `Ok(2)`,
+/// `Ok(1)`, `Ok(1)`, `Ok(0)`, `Ok(1)` respectively, with `effect_kind` per
+/// slot restricted to `{ExchangeControl, ExchangeLifeTotals}` and NEVER
+/// `CopyTokenOf` / `ChangeTargets` / `Draw` — the HOSTILE half, asserted
+/// explicitly per carrier.
+///
+/// REACH GUARD (paired positive): a non-zero slot count for at least four of
+/// the six, and Arteeoh's `CopyTokenOf` slot IS observable at its own LATER
+/// prompt (V3c's post-accept assertion, on the same Oracle text) — so "no
+/// extra slot here" is a real negative, not a dead instrument.
+#[test]
+fn paired_sub_ability_chains_surface_no_additional_slots() {
+    use engine::game::ability_utils::{build_resolved_from_def, build_target_slots};
+    use engine::parser::oracle::parse_oracle_text;
+    use engine::types::ability::{Effect, EffectKind};
+    use engine::types::identifiers::ObjectId;
+
+    const DJINN_OF_INFINITE_DECEITS_TEXT: &str = "Flying\n{T}: Exchange control of two target \
+        nonlegendary creatures. You can't activate this ability during combat.";
+    // GILDED_DRAKE_TEXT is the module-level const (identical text) shared
+    // with the other Gilded Drake rows.
+    const VOLATILE_STORMDRAKE_TEXT: &str = "Flying, hexproof from activated and triggered \
+        abilities\nWhen this creature enters, exchange control of this creature and target \
+        creature an opponent controls. If you do, you get {E}{E}{E}{E}, then sacrifice that \
+        creature unless you pay an amount of {E} equal to its mana value.";
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let arteeoh = scenario
+        .add_creature_from_oracle(P0, "Arteeoh, Dread Scavenger", 3, 3, ARTEEOH_TEXT)
+        .id();
+    let djinn = scenario
+        .add_creature_from_oracle(
+            P0,
+            "Djinn of Infinite Deceits",
+            2,
+            7,
+            DJINN_OF_INFINITE_DECEITS_TEXT,
+        )
+        .id();
+    let drake = scenario
+        .add_creature_from_oracle(P0, "Gilded Drake", 3, 3, GILDED_DRAKE_TEXT)
+        .id();
+    let chimera = scenario
+        .add_creature_from_oracle(P0, "Perplexing Chimera", 3, 3, PERPLEXING_CHIMERA_TEXT)
+        .id();
+    let stormdrake = scenario
+        .add_creature_from_oracle(P0, "Volatile Stormdrake", 3, 2, VOLATILE_STORMDRAKE_TEXT)
+        .id();
+    let mister_negative = scenario
+        .add_creature_from_oracle(P0, "Mister Negative", 5, 5, MISTER_NEGATIVE_TEXT)
+        .id();
+    // Legal-target scaffolding: two nonlegendary P1 creatures (Djinn — "two
+    // target nonlegendary creatures", no controller restriction), an
+    // opponent's creature (Gilded Drake / Volatile Stormdrake), and two
+    // artifacts (Arteeoh's "two other target artifacts").
+    let _p1_creature_a = scenario.add_creature(P1, "P1 Creature A", 2, 2).id();
+    let _p1_creature_b = scenario.add_creature(P1, "P1 Creature B", 2, 2).id();
+    let _a1 = scenario.add_artifact_from_oracle(P0, "Bauble A", "").id();
+    let _a2 = scenario.add_artifact_from_oracle(P1, "Bauble B", "").id();
+
+    let runner = scenario.build();
+
+    let expect_slots = |name: &str,
+                        text: &str,
+                        source: ObjectId,
+                        expected: usize,
+                        expected_kinds: &[EffectKind]| {
+        let parsed = parse_oracle_text(text, name, &[], &[], &[]);
+        let def = if let Some(trigger) = parsed.triggers.first() {
+            *trigger
+                .execute
+                .clone()
+                .expect("the trigger must have an execute")
+        } else {
+            // Some cards' `abilities` list carries a leading keyword-line
+            // entry (e.g. "Flying" parses to its own `Unimplemented` ability)
+            // ahead of the real paired-subject ability — find the one whose
+            // effect is actually ExchangeControl/ExchangeLifeTotals rather
+            // than assuming index 0.
+            parsed
+                .abilities
+                .iter()
+                .find(|a| {
+                    matches!(
+                        *a.effect,
+                        Effect::ExchangeControl { .. } | Effect::ExchangeLifeTotals { .. }
+                    )
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name}: no paired-subject ability found in {:?}",
+                        parsed.abilities
+                    )
+                })
+                .clone()
+        };
+        let resolved = build_resolved_from_def(&def, source, P0);
+        let slots = build_target_slots(runner.state(), &resolved)
+            .unwrap_or_else(|e| panic!("{name}: build_target_slots failed: {e:?}"));
+        assert_eq!(
+            slots.len(),
+            expected,
+            "{name}: expected {expected} slots, got {slots:?}"
+        );
+        for slot in &slots {
+            assert!(
+                expected_kinds.contains(&slot.effect_kind),
+                "{name}: HOSTILE — slot effect_kind {:?} must be in {expected_kinds:?}, never \
+                 CopyTokenOf / ChangeTargets / Draw (no extra slot from the sub-chain descent)",
+                slot.effect_kind
+            );
+        }
+    };
+
+    expect_slots(
+        "Arteeoh, Dread Scavenger",
+        ARTEEOH_TEXT,
+        arteeoh,
+        2,
+        &[EffectKind::ExchangeControl],
+    );
+    expect_slots(
+        "Djinn of Infinite Deceits",
+        DJINN_OF_INFINITE_DECEITS_TEXT,
+        djinn,
+        2,
+        &[EffectKind::ExchangeControl],
+    );
+    expect_slots(
+        "Gilded Drake",
+        GILDED_DRAKE_TEXT,
+        drake,
+        1,
+        &[EffectKind::ExchangeControl],
+    );
+    expect_slots(
+        "Mister Negative",
+        MISTER_NEGATIVE_TEXT,
+        mister_negative,
+        1,
+        &[EffectKind::ExchangeLifeTotals],
+    );
+    expect_slots(
+        "Perplexing Chimera",
+        PERPLEXING_CHIMERA_TEXT,
+        chimera,
+        0,
+        &[],
+    );
+    expect_slots(
+        "Volatile Stormdrake",
+        VOLATILE_STORMDRAKE_TEXT,
+        stormdrake,
+        1,
+        &[EffectKind::ExchangeControl],
+    );
 }
