@@ -204,10 +204,22 @@ pub(crate) fn apply_zone_exit_cleanup(
         .activated_abilities_this_game
         .retain(|(id, _), _| *id != object_id);
 
-    // CR 400.7: Snapshot LKI before zone change from battlefield or exile.
-    // Power/toughness reflect layer modifications on battlefield (Layer 7);
-    // from exile they will be None (no layer computation), which is correct.
-    if from == Zone::Battlefield || from == Zone::Exile {
+    // CR 400.7: Snapshot LKI before a zone change out of any zone whose
+    // characteristics are not recomputed on demand. Power/toughness reflect
+    // layer modifications on battlefield (Layer 7); from exile they will be
+    // None (no layer computation), which is correct.
+    //
+    // CR 608.2h + CR 109.4: `Zone::Stack` is included because the CR 109.4
+    // reset below erases `obj.controller` on the way out, and a look-back
+    // effect that needs the at-exit controller of a stack object has nowhere
+    // else to read it. Render Silent ("Counter target spell. Its controller
+    // can't cast spells this turn") is the measured consumer:
+    // `ability_utils::parent_target_controller` already prefers this snapshot
+    // for any off-battlefield object and only falls through to `obj.controller`
+    // when there is none, so widening the capture is the whole fix — no
+    // consumer changes. The stack seed (`layers.rs`) owns a stack object's
+    // controller on the way IN; this owns the record of it on the way OUT.
+    if from == Zone::Battlefield || from == Zone::Exile || from == Zone::Stack {
         let lki_copiable_values =
             crate::game::layers::compute_current_copiable_values(state, object_id);
         if let Some(obj) = state.objects.get(&object_id) {
@@ -427,6 +439,29 @@ pub(crate) fn apply_zone_exit_cleanup(
 
         if from == Zone::Battlefield {
             obj_mut.reset_for_battlefield_exit();
+        }
+
+        // CR 109.4: "Only objects on the stack or on the battlefield have a
+        // controller. Objects that are neither on the stack nor on the
+        // battlefield aren't controlled by any player." CR 108.4a: "If anything
+        // asks for the controller of a card that doesn't have one … use its
+        // owner instead." So an object arriving in any OTHER zone must carry the
+        // owner fallback, not whatever CR 613.1b layer-2 control change was last
+        // applied to it.
+        //
+        // Keyed on the DESTINATION, which is the CR 109.4 partition itself —
+        // not on `from == Zone::Stack`. The battlefield leg already reached this
+        // answer via `revert_layered_characteristics_to_base` (called below for
+        // `from == Zone::Battlefield`), which writes the same
+        // `base_controller.unwrap_or(owner)` expression, so this write is
+        // idempotent there and the two sites agree by construction. The STACK
+        // exit had no such reset: MEASURED, a stolen spell that Dissipate
+        // counters-and-exiles reached `Zone::Exile` carrying the THIEF, and
+        // `filter::is_owner_scoped_zone` (Hand | Library | Graveyard) does not
+        // shield Exile. The at-exit controller is not lost — the LKI capture
+        // above snapshots it for CR 608.2h consumers.
+        if !matches!(to, Zone::Battlefield | Zone::Stack) {
+            obj_mut.controller = obj_mut.base_controller.unwrap_or(obj_mut.owner);
         }
 
         // CR 702.103b: A bestowed Aura's type-changing effect lasts until the

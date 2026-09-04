@@ -1237,62 +1237,83 @@ fn mutate_recheck_stays_anchored_to_entry_controller_after_a_steal() {
     }
 }
 
-/// HOSTILE (V5c, r6/M-3): the STACK-EXIT residual — a stolen spell that
-/// exiles on resolution (rebound) carries the THIEF as `obj.controller` into
-/// `Zone::Exile`, because nothing resets a stack object's controller on the
-/// way out. This row asserts the LIMITATION, not a fix — it is the pre-
-/// existing class named in `layers.rs`'s `// KNOWN LIMITATION (CR 109.4)`.
+/// V5 — CR 109.4 + CR 108.4a + CR 608.2h: `stack_exit_resets_the_controller_and_snapshots_the_thief_into_lki`.
+///
+/// REPLACES the prior `stack_exit_residual_a_rebound_spell_carries_the_thiefs_controller_into_exile`
+/// row, which drove `resolve_top` directly against a hand-built Rebound spell.
+/// That direct call skips the mid-resolution layer flush the FULL pipeline
+/// performs (`stack::resolve_top`'s own re-seed from `resolving_stack_entry.controller`),
+/// which is why it manufactured a residual a real rebound spell never shows
+/// (MEASURED: Probe D2/F — the full pipeline already reads `controller ==
+/// caster` for a resolving/rebounding steal, unpatched). The REAL reproducing
+/// class is the NON-RESOLVING stack exit — a stolen spell countered and
+/// exiled instead of hitting the graveyard (Dissipate: "Counter target spell.
+/// If that spell is countered this way, exile it instead of putting it into
+/// its owner's graveyard."), which never runs `resolve_top`'s mid-resolution
+/// flush at all (MEASURED: Probe G — `controller` stayed the THIEF at
+/// baseline). This row drives that exact seam: `effects::counter::resolve`
+/// removes the stack entry via `stack::remove_nonresolving_stack_entry_at`
+/// and then routes the Stack→Exile move through
+/// `zone_pipeline::move_object` → `zones::move_to_zone` →
+/// `zones::apply_zone_exit_cleanup` — the same `move_to_zone` primitive
+/// called directly here, consistent with this file's own stated convention
+/// (see the file header) of exercising the exact zone-transition production
+/// function rather than reconstructing the full alternative-cost cast UI.
+///
+/// REVERT-FAILING: delete either half of U2 (the LKI-capture widening or the
+/// CR 109.4 reset) and this fails — the reset alone reds this row's LKI
+/// assertion (LKI never captured for a stack exit), and the reset without the
+/// LKI capture leaves `obj.controller` correct but `lki_cache` empty.
 #[test]
-fn stack_exit_residual_a_rebound_spell_carries_the_thiefs_controller_into_exile() {
+fn stack_exit_resets_the_controller_and_snapshots_the_thief_into_lki() {
     let mut state = new_state();
     let caster = P1;
     let thief = P0;
-    let spell = spell_object(&mut state, caster, "Stolen Rebound Spell", 1, Zone::Stack);
-    state
-        .objects
-        .get_mut(&spell)
-        .unwrap()
-        .keywords
-        .push(Keyword::Rebound);
-    state
-        .objects
-        .get_mut(&spell)
-        .unwrap()
-        .base_keywords
-        .push(Keyword::Rebound);
-    let mut ability = ResolvedAbility::new(
-        Effect::unimplemented("test", "rebound exit fixture"),
-        vec![],
-        spell,
-        caster,
-    );
-    ability.context = engine::types::ability::SpellContext {
-        cast_from_zone: Some(Zone::Hand),
-        ..Default::default()
-    };
-    push_spell_entry(
-        &mut state,
-        spell,
-        caster,
-        Some(ability),
-        CastingVariant::Normal,
-    );
+    let spell = spell_object(&mut state, caster, "Stolen Countered Spell", 1, Zone::Stack);
+    push_spell_entry(&mut state, spell, caster, None, CastingVariant::Normal);
     let source = creature_on_battlefield(&mut state, thief, "Threaten Source", 2);
     install_steal(&mut state, source, thief, spell);
     evaluate_layers(&mut state);
 
+    // REACH GUARD: the steal landed and the spell is still mid-flight on the
+    // stack before the (simulated) Dissipate-class counter-and-exile.
+    let entry = state.stack.back().unwrap().clone();
+    assert_eq!(stack_object_controller(&state, &entry), thief);
+    assert_eq!(state.objects[&spell].zone, Zone::Stack);
+
+    // CR 701.6a: the removal from the stack IS the counter — mirrors
+    // `effects::counter::resolve`'s own `remove_nonresolving_stack_entry_at`
+    // call (not reachable from an external integration test; `retain`
+    // reproduces the same "gone from state.stack" postcondition for this
+    // row's purposes, since the claim under test is entirely inside the
+    // subsequent zone move, not the stack-removal bookkeeping itself).
+    state.stack.retain(|e| e.id != spell);
+
+    // CR 614.1a (Dissipate's exile-instead rider): the countered spell's
+    // destination move, driven through the exact zone-exit authority
+    // (`zones::move_to_zone` → `zones::apply_zone_exit_cleanup`) that
+    // `zone_pipeline::move_object` calls in production.
     let mut events = Vec::new();
-    resolve_top(&mut state, &mut events);
+    move_to_zone(&mut state, spell, Zone::Exile, &mut events);
 
     assert_eq!(
         state.objects[&spell].zone,
         Zone::Exile,
-        "rebound must exile the resolved spell"
+        "REACH GUARD: the countered spell actually reached Exile"
     );
     assert_eq!(
-        state.objects[&spell].controller, thief,
-        "KNOWN LIMITATION (CR 109.4): nothing resets a stack object's controller \
-         on the way OUT, so the exiled card still carries the thief's controller"
+        state.objects[&spell].controller, caster,
+        "CR 109.4 + CR 108.4a: an object arriving in a zone with no controller carries the \
+         owner fallback, not the thief's stale layer-2 control change"
+    );
+    assert_eq!(
+        state
+            .lki_cache
+            .get(&spell)
+            .expect("the stack exit must capture LKI")
+            .controller,
+        thief,
+        "CR 608.2h: the at-exit (thief) controller must survive in LKI for a later look-back"
     );
 }
 
@@ -1530,6 +1551,14 @@ fn cr800_4a_thief_leaving_reverts_the_stolen_spell_and_leaves_it_on_the_stack() 
     );
 }
 
+/// V3b — CR 800.4a step 4: the spell reaches `Zone::Exile`, not merely off
+/// the stack. Previously this row (under its same name) pinned a
+/// reviewer-adjudicated DOWNGRADE, where the spell left the stack but was
+/// stranded (`obj.zone` stayed `Stack`, never exiled) because the sweep ran
+/// INSIDE `do_eliminate`, before `end_control_effects_for_leaving_players`.
+/// Relocating the sweep past that step (U1/U1b) closes the downgrade: the
+/// spell is now correctly exiled per CR 800.4a's own fourth step, so this
+/// row asserts the CORRECT disposition rather than pinning the prior gap.
 #[test]
 fn cr800_4a_caster_leaving_removes_the_stolen_spell() {
     let mut state = new_state();
@@ -1557,17 +1586,15 @@ fn cr800_4a_caster_leaving_removes_the_stolen_spell() {
         !state.stack.iter().any(|e| e.id == spell),
         "the spell must leave the stack when its CR 112.2 by-default caster leaves"
     );
-    // GUARD AGAINST THE REJECTED ALTERNATIVE (not a route-observability
-    // assertion on obj.zone, which is not updated by the sweep — a known,
-    // documented downgrade; see P1.8's comment): the spell must NOT have
-    // taken the owned-object-exile route, which emits its own ZoneChanged
-    // to Exile. This is the reviewer-adjudicated downgrade this row records.
+    assert_eq!(
+        state.objects[&spell].zone,
+        Zone::Exile,
+        "CR 800.4a step 4: a card-represented stack object still controlled by a leaver \
+         is exiled, not merely un-stacked"
+    );
     assert!(
-        !events.iter().any(|event| matches!(
-            event,
-            GameEvent::ZoneChanged { object_id, to: Zone::Exile, .. } if *object_id == spell
-        )),
-        "the spell must leave via the CR 800.4a stack sweep, not the owned-object exile leg"
+        state.exile.contains(&spell),
+        "the exiled spell must also be present in state.exile"
     );
 }
 
@@ -1603,6 +1630,487 @@ fn cr800_4a_thief_leaving_reverts_a_stolen_permanent_to_its_by_default_controlle
         state.objects[&permanent].controller, caster,
         "CR 800.4a: ending the thief's control effect reverts the permanent to its \
          by-default controller"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PR #8332 round 1, U1/U1b — plan-round1 V1/V3/V4: the relocated CR 800.4a
+// stack sweep (past control-effect end) and its CR 733 journal attribution.
+// (Distinct from this file's own pre-existing "V8" CR 800.4a section above,
+// which predates this round's plan and its own V-numbering.)
+// ---------------------------------------------------------------------------
+
+/// plan-round1 V1 — a survivor-owned spell controlled by a SURVIVOR is not
+/// removed when its eliminated CASTER leaves. Probe A's discriminator:
+/// `entry.controller == caster`, `obj.owner == third_player`, `obj.controller
+/// == thief` — all three players distinct, the only shape that discriminates
+/// the relocated sweep's live-controller predicate
+/// (`stack::stack_object_controller`) from the old `entry.controller`
+/// predicate.
+/// REVERT-FAILING: revert U1 (key the sweep back on `entry.controller`, or
+/// leave it running before `end_control_effects_for_leaving_players`) and the
+/// spell is wrongly removed when the CASTER leaves, even though its
+/// surviving THIEF still controls it.
+#[test]
+fn cr800_4a_caster_leaving_leaves_a_stolen_spell_under_its_surviving_thief() {
+    let mut runner = GameScenario::new_n_player(3, 7).build();
+    let state = runner.state_mut();
+    let owner = PlayerId(2); // survivor, owns the card (Gonti class)
+    let caster = P0; // eliminated
+    let thief = P1; // survivor, steals the spell
+    let spell = spell_object(state, owner, "Gonti Class Stolen Spell", 1, Zone::Stack);
+    push_spell_entry(state, spell, caster, None, CastingVariant::Normal);
+    let source = creature_on_battlefield(state, thief, "Threaten Source", 2);
+    install_steal(state, source, thief, spell);
+    evaluate_layers(state);
+
+    // REACH GUARD: all three players distinct before elimination — the only
+    // shape that discriminates this row.
+    let entry = state.stack.back().unwrap().clone();
+    assert_eq!(entry.controller, caster);
+    assert_eq!(state.objects[&spell].owner, owner);
+    assert_eq!(stack_object_controller(state, &entry), thief);
+
+    let mut events = Vec::new();
+    eliminate_player(state, caster, &mut events);
+
+    assert!(
+        state.stack.iter().any(|e| e.id == spell),
+        "the spell must remain on the stack — its surviving thief still controls it"
+    );
+    let entry_after = state.stack.iter().find(|e| e.id == spell).unwrap().clone();
+    assert_eq!(
+        stack_object_controller(state, &entry_after),
+        thief,
+        "the surviving thief's control effect did not end (only the CASTER left), so the \
+         spell keeps resolving for them"
+    );
+}
+
+/// plan-round1 V3 — CR 800.4a step 4: a survivor-owned spell STILL controlled
+/// by the leaver (no theft) is EXILED, not merely un-stacked. Probe I's
+/// shape: same board as V1 but no steal — the leaving CASTER is also the
+/// spell's by-default controller when they leave.
+/// REVERT-FAILING: before U1b's relocation, the sweep ran inside
+/// `do_eliminate` and had no exile step at all — the entry left the stack but
+/// `obj.zone` stayed `Stack`, never reaching Exile (measured Probe I/C).
+#[test]
+fn cr800_4a_a_leavers_spell_on_a_survivors_card_is_exiled() {
+    let mut runner = GameScenario::new_n_player(3, 8).build();
+    let state = runner.state_mut();
+    let owner = PlayerId(2); // survivor, owns the card
+    let caster = P0; // eliminated; also the by-default (and live) controller
+    let spell = spell_object(
+        state,
+        owner,
+        "Gonti Class Uncontested Spell",
+        1,
+        Zone::Stack,
+    );
+    push_spell_entry(state, spell, caster, None, CastingVariant::Normal);
+    evaluate_layers(state);
+
+    // REACH GUARD: entry present, owner is the survivor, no theft in play.
+    let entry = state.stack.back().unwrap().clone();
+    assert_eq!(entry.controller, caster);
+    assert_eq!(state.objects[&spell].owner, owner);
+    assert_eq!(stack_object_controller(state, &entry), caster);
+
+    let mut events = Vec::new();
+    eliminate_player(state, caster, &mut events);
+
+    assert!(
+        !state.stack.iter().any(|e| e.id == spell),
+        "the spell must leave the stack when its by-default caster leaves"
+    );
+    assert_eq!(
+        state.objects[&spell].zone,
+        Zone::Exile,
+        "CR 800.4a step 4: a card-represented stack object still controlled by a leaver \
+         is exiled, not merely un-stacked"
+    );
+    assert_eq!(
+        state.objects[&spell].controller, owner,
+        "CR 109.4 + CR 108.4a: the exile exit resets the controller to the owner fallback"
+    );
+    assert!(state.exile.contains(&spell));
+}
+
+/// plan-round1 V4 — the relocated sweep preserves per-player CR 733 journal
+/// attribution: two players eliminated SIMULTANEOUSLY, each holding a stack
+/// object, must journal their removals under DIFFERENT leave nodes, not one
+/// shared node.
+/// REVERT-FAILING: if the relocated sweep reused a single
+/// `active_rules_execution_node` across the whole `leave_nodes` batch instead
+/// of re-installing each player's own node per iteration, both removals would
+/// carry the SAME `cause`.
+#[test]
+fn cr800_4a_simultaneous_leavers_journal_their_own_stack_removals() {
+    let mut state = new_state();
+    let p0_spell = spell_object(&mut state, P0, "P0 Stack Object", 1, Zone::Stack);
+    push_spell_entry(&mut state, p0_spell, P0, None, CastingVariant::Normal);
+    let p1_spell = spell_object(&mut state, P1, "P1 Stack Object", 2, Zone::Stack);
+    push_spell_entry(&mut state, p1_spell, P1, None, CastingVariant::Normal);
+    evaluate_layers(&mut state);
+
+    // REACH GUARD: both entries present before the simultaneous elimination.
+    assert_eq!(state.stack.len(), 2);
+
+    let mut events = Vec::new();
+    engine::game::elimination::eliminate_players_simultaneously(&mut state, &[P0, P1], &mut events);
+
+    assert!(
+        state.stack.is_empty(),
+        "both players' own stack objects must be removed"
+    );
+
+    let removal_causes: Vec<_> = state
+        .resolved_rules_journal
+        .entries()
+        .iter()
+        .filter_map(|e| match &e.command {
+            Some(engine::types::resolved_commands::ResolvedRulesCommand::StackRemoval(cmd)) => {
+                Some(cmd.cause)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        removal_causes.len(),
+        2,
+        "each player's own stack removal must be journaled"
+    );
+    assert_ne!(
+        removal_causes[0], removal_causes[1],
+        "CR 733: each removal must be journaled under its OWN player's leave node, not a \
+         shared one"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PR #8332 round 1, U3 — plan-round1 V8/V8b: CR 603.10d + CR 603.3a lose-
+// control trigger controller derivation
+// ---------------------------------------------------------------------------
+
+/// Verbatim from `client/public/card-data.json`.
+const KHARN_TEXT_R1: &str = "Berzerker — Khârn the Betrayer attacks or blocks each combat if \
+    able.\nSigil of Corruption — When you lose control of Khârn the Betrayer, draw two \
+    cards.\nThe Betrayer — If damage would be dealt to Khârn the Betrayer, prevent that damage \
+    and an opponent of your choice gains control of it.";
+
+/// Verbatim from `client/public/card-data.json`.
+const ACT_OF_TREASON_TEXT: &str = "Gain control of target creature until end of turn.";
+
+/// plan-round1 V8 — Probe K's shape: NO stack subject, NO exchange — Khârn
+/// sits on P0's battlefield and P1 casts Act of Treason on it. CR 603.10d:
+/// "when you lose control of ~" looks back in time; CR 603.3a / CR 113.8: a
+/// triggered ability is controlled by whoever controlled its source AT THE
+/// TIME IT TRIGGERED, i.e. the PRE-change controller — P0, who just lost
+/// control — not P1, the gainer.
+/// REVERT-FAILING (measured, Probe K): before U3 the engine gives both cards
+/// to P1 (the gainer), zero to P0. This defect is pre-existing and has
+/// nothing to do with any stack object or exchange — reproducible with a
+/// plain battlefield steal.
+#[test]
+fn cr603_10d_lose_control_trigger_is_controlled_by_the_player_who_lost_control() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(P0, &["P0 Draw A", "P0 Draw B", "P0 Draw C"]);
+    scenario.with_library_top(P1, &["P1 Draw A", "P1 Draw B", "P1 Draw C"]);
+    let kharn = scenario
+        .add_creature_from_oracle(P0, "Khârn the Betrayer", 4, 4, KHARN_TEXT_R1)
+        .id();
+    let act_of_treason = scenario
+        .add_spell_to_hand_from_oracle(P1, "Act of Treason", false, ACT_OF_TREASON_TEXT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+
+    let mut runner = scenario.build();
+    {
+        let state = runner.state_mut();
+        state.active_player = P1;
+        state.priority_player = P1;
+        state.waiting_for = WaitingFor::Priority { player: P1 };
+    }
+    let outcome = runner
+        .cast(act_of_treason)
+        .target_objects(&[kharn])
+        .resolve();
+
+    // REACH GUARD: the steal actually landed.
+    assert_eq!(
+        outcome.state().objects.get(&kharn).unwrap().controller,
+        P1,
+        "REACH GUARD: Act of Treason must have taken control of Khârn"
+    );
+    assert_eq!(
+        outcome.hand_drawn(P0),
+        2,
+        "CR 603.10d: the player who LOST control (P0) controls the trigger and must draw"
+    );
+    assert_eq!(
+        outcome.hand_drawn(P1),
+        0,
+        "the gainer (P1) must not draw — reversing the recipient is the pre-existing bug"
+    );
+}
+
+/// plan-round1 V8b — the delayed/`SpecificObject` shape (Stolen Uniform's
+/// reflexive "when you lose control of the enchanted creature this turn,
+/// draw a card") is sourced from a DIFFERENT object than the one whose
+/// control changed (`source_id != object_id`). Its controller comes from a
+/// wholly separate authority — `DelayedTrigger.controller`, bound once at
+/// installation and read directly by `triggers::delayed_trigger_to_context`
+/// — never from `collect_matching_triggers_inner`'s CR 603.10d override
+/// above (which is gated on `trig_def.mode == ChangesController && *object_id
+/// == obj_id`, false here by construction). This row pins that the class
+/// still resolves for the correct player (P0, the temp holder who created
+/// the delayed trigger) after U3, confirming the two authorities do not
+/// collide — the "must NOT be re-keyed" half of V8b.
+#[test]
+fn cr603_10d_delayed_specific_object_shape_still_attributes_to_its_own_source() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(P0, &["P0 Card A", "P0 Card B"]);
+    scenario.with_library_top(P1, &["P1 Card A", "P1 Card B"]);
+    let source = scenario
+        .add_creature(P0, "Stolen Uniform Source", 0, 0)
+        .id();
+    let sword = scenario.add_creature(P1, "Sword", 2, 2).id();
+    let mut runner = scenario.build();
+
+    {
+        let obj = runner.state_mut().objects.get_mut(&sword).unwrap();
+        obj.card_types = engine::types::card_type::CardType::default();
+        obj.card_types.core_types.push(CoreType::Artifact);
+        obj.base_card_types = obj.card_types.clone();
+        obj.power = None;
+        obj.toughness = None;
+    }
+    {
+        let st = runner.state_mut();
+        st.objects.get_mut(&source).unwrap().zone = Zone::Graveyard;
+        st.battlefield.retain(|&x| x != source);
+        st.players
+            .iter_mut()
+            .find(|p| p.id == P0)
+            .unwrap()
+            .graveyard
+            .push_back(source);
+    }
+
+    // P0 gains control of the Sword until EOT (the "Stolen Uniform" temp control).
+    runner.state_mut().add_transient_continuous_effect(
+        source,
+        P0,
+        Duration::UntilEndOfTurn,
+        TargetFilter::SpecificObject { id: sword },
+        vec![ContinuousModification::ChangeController],
+        None,
+    );
+    flush_layers(runner.state_mut());
+    assert_eq!(
+        runner.state().objects[&sword].controller,
+        P0,
+        "REACH GUARD: P0 temporarily controls the Sword"
+    );
+
+    // The delayed "when you lose control of the enchanted creature this
+    // turn, draw a card" reflexive, sourced from the graveyard Stolen-
+    // Uniform-class card — source_id (source) != object_id (sword).
+    let draw_def = engine::types::ability::AbilityDefinition::new(
+        engine::types::ability::AbilityKind::Spell,
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        },
+    );
+    let mut ability = engine::game::ability_utils::build_resolved_from_def(&draw_def, source, P0);
+    ability.set_trigger_source_recursive(engine::game::triggers::trigger_source_context_for_latch(
+        runner.state(),
+        runner.state().objects.get(&source).unwrap(),
+    ));
+    let mut trig = engine::types::ability::TriggerDefinition::new(
+        engine::types::triggers::TriggerMode::ChangesController,
+    );
+    trig.valid_card = Some(TargetFilter::SpecificObject { id: sword });
+    trig.execute = None;
+    runner
+        .state_mut()
+        .delayed_triggers
+        .push(engine::types::game_state::DelayedTrigger::new(
+            engine::types::ability::DelayedTriggerCondition::WhenNextEvent {
+                trigger: Box::new(trig),
+                or_trigger: None,
+                lifetime: engine::types::ability::DelayedTriggerLifetime::ThisTurn,
+            },
+            Box::new(ability),
+            P0,
+            source,
+            true,
+        ));
+
+    let p0_before = runner
+        .state()
+        .players
+        .iter()
+        .find(|p| p.id == P0)
+        .unwrap()
+        .hand
+        .len();
+    let p1_before = runner
+        .state()
+        .players
+        .iter()
+        .find(|p| p.id == P1)
+        .unwrap()
+        .hand
+        .len();
+    runner.advance_to_phase(Phase::Upkeep);
+    runner.advance_until_stack_empty();
+
+    assert_eq!(
+        runner.state().objects[&sword].controller,
+        P1,
+        "REACH GUARD: control reverts to owner P1 at cleanup"
+    );
+    let p0_after = runner
+        .state()
+        .players
+        .iter()
+        .find(|p| p.id == P0)
+        .unwrap()
+        .hand
+        .len();
+    let p1_after = runner
+        .state()
+        .players
+        .iter()
+        .find(|p| p.id == P1)
+        .unwrap()
+        .hand
+        .len();
+    assert_eq!(
+        p0_after,
+        p0_before + 1,
+        "the delayed trigger's OWN authority (DelayedTrigger.controller = P0, bound at \
+         install) must attribute the draw to P0, unaffected by U3's override"
+    );
+    assert_eq!(
+        p1_after, p1_before,
+        "P1 (the object's owner, regaining control) must not draw"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PR #8332 round 1, LOW regression — plan-round1 V9: the CR 601.2a
+// announcement window falls back to StackEntry.controller
+// ---------------------------------------------------------------------------
+
+/// plan-round1 V9 — during the CR 601.2a announcement window (before a
+/// paused target-selection cast finalizes), `derive_views`'s stack-entry
+/// controller projection must fall back to `StackEntry.controller` rather
+/// than reading the object's own (still-in-origin-zone) controller. Probe J's
+/// shape: a P2-owned card in exile carrying `PlayFromExile{granted_to: P0}`,
+/// P0 casts it, and the fixture supplies >= 2 legal targets so the cast
+/// genuinely pauses at `TargetSelection` (mandatory reach guard — with only
+/// one legal target the cast auto-selects and the window is never entered,
+/// measured Probe J v1).
+#[test]
+fn announcement_window_display_uses_the_stack_entry_controller() {
+    let mut runner = GameScenario::new_n_player(3, 9).build();
+    {
+        let state = runner.state_mut();
+        state.active_player = P0;
+        state.priority_player = P0;
+        state.waiting_for = WaitingFor::Priority { player: P0 };
+    }
+    let owner = PlayerId(2);
+    let caster = P0;
+    let (spell, target_a, target_b, card_id) = {
+        let state = runner.state_mut();
+        let spell = spell_object(state, owner, "Two-Target Exile Grant Spell", 1, Zone::Exile);
+        {
+            let obj = state.objects.get_mut(&spell).unwrap();
+            obj.card_types.core_types.push(CoreType::Instant);
+            // A real targeted ability, so the cast genuinely pauses at
+            // TargetSelection instead of resolving straight through — with
+            // >= 2 legal creature targets on the board (mandatory reach
+            // guard: with exactly one legal target the cast auto-selects and
+            // the announcement window is never entered, measured Probe J v1).
+            let pump = engine::types::ability::AbilityDefinition::new(
+                engine::types::ability::AbilityKind::Spell,
+                Effect::Pump {
+                    power: engine::types::ability::PtValue::Fixed(1),
+                    toughness: engine::types::ability::PtValue::Fixed(1),
+                    target: TargetFilter::Typed(TypedFilter::creature()),
+                },
+            );
+            std::sync::Arc::make_mut(&mut obj.abilities).push(pump.clone());
+            std::sync::Arc::make_mut(&mut obj.base_abilities).push(pump);
+            obj.casting_permissions.push(
+                engine::types::ability::CastingPermission::PlayFromExile {
+                    provenance: engine::types::ability::PlayFromExileProvenance::Impulse,
+                    duration: Duration::UntilEndOfTurn,
+                    granted_to: caster,
+                    mode: engine::types::ability::CardPlayMode::Play,
+                    frequency: engine::types::statics::CastFrequency::Unlimited,
+                    source_id: None,
+                    invalidation: None,
+                    exiled_by_ability_controller: None,
+                    mana_spend_permission: None,
+                    card_filter: None,
+                    single_use_group: None,
+                    single_use: false,
+                    cast_cost_raise: None,
+                    alt_ability_cost: None,
+                    land_enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+                },
+            );
+            obj.mana_cost = ManaCost::zero();
+        }
+        let target_a = creature_on_battlefield(state, owner, "Legal Target A", 2);
+        let target_b = creature_on_battlefield(state, owner, "Legal Target B", 3);
+        let card_id = state.objects[&spell].card_id;
+        (spell, target_a, target_b, card_id)
+    };
+
+    let action = engine::types::actions::GameAction::CastSpell {
+        object_id: spell,
+        card_id,
+        targets: vec![],
+        payment_mode: engine::types::game_state::CastPaymentMode::Auto,
+    };
+    engine::game::engine::apply(runner.state_mut(), caster, action)
+        .expect("cast announcement must succeed");
+
+    // REACH GUARD: the cast genuinely paused at TargetSelection with >= 2
+    // legal targets, the spell still physically in Exile, and the stack
+    // carrying exactly the one announced entry.
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::TargetSelection { .. }
+        ),
+        "REACH GUARD: the cast must pause at TargetSelection (got {:?})",
+        runner.state().waiting_for
+    );
+    assert_eq!(runner.state().stack.len(), 1);
+    assert_eq!(runner.state().objects[&spell].zone, Zone::Exile);
+    assert_eq!(
+        runner.state().objects[&spell].controller,
+        owner,
+        "REACH GUARD: the object itself, still in its origin zone, carries no meaningful \
+         controller (CR 109.4) — it reads the OWNER, the wrong answer the guard exists to avoid"
+    );
+    let _ = (target_a, target_b);
+
+    let views = engine::game::derived_views::derive_views(runner.state(), Some(P1));
+    let entry_id = runner.state().stack.back().unwrap().id;
+    assert_eq!(
+        views.stack_entry_details[&entry_id].controller, caster,
+        "the announcement-window display must fall back to StackEntry.controller (the caster), \
+         not the exiled object's own controller"
     );
 }
 

@@ -1293,14 +1293,21 @@ const SWITCHEROO_TEXT: &str = "Exchange control of two target creatures.";
 
 /// V8 POSITIVE — CR 603.2 + CR 613.1b: now that `exchange_control::resolve`
 /// publishes `ControllerChanged`, a "When you lose control of ~" trigger fires
-/// on an exchange, exactly once.
+/// on an exchange, exactly once — and, per PR #8332 round 1 (U3), for the
+/// correct player.
 ///
 /// Production entry chain: `exchange_control::resolve` → `collect_pending_triggers`
 /// → `trigger_index.rs`'s `ControllerChanged{..} => TriggerEventKey::ChangesController`
-/// (the gate that makes the matcher reachable at all) → `match_changes_controller`.
+/// (the gate that makes the matcher reachable at all) → `match_changes_controller`
+/// → `collect_matching_triggers_inner`'s CR 603.10d + CR 603.3a controller
+/// derivation (`triggers.rs`).
 ///
-/// REVERT-FAILING: without the emission the event never exists, no
-/// `ChangesController` key is ever pushed, and nobody draws.
+/// REVERT-FAILING (two independent legs): without the `ControllerChanged`
+/// emission the event never exists, no `ChangesController` key is ever
+/// pushed, and nobody draws (0/0). Without U3's controller derivation, the
+/// trigger still fires exactly once but for the WRONG player — the gainer
+/// (P1) instead of the loser (P0) — so a reversed-recipient assertion is
+/// needed to catch that leg; a summed total cannot.
 #[test]
 fn exchanging_control_fires_a_lose_control_trigger_exactly_once() {
     let mut scenario = GameScenario::new();
@@ -1341,17 +1348,12 @@ fn exchanging_control_fires_a_lose_control_trigger_exactly_once() {
         "REACH GUARD: and the bear must have come the other way"
     );
 
-    // THE DISCRIMINATOR: exactly one lose-control trigger resolved. Two draws,
-    // not zero (no event published) and not four (double-fired).
-    let drawn = outcome.hand_drawn(P0) + outcome.hand_drawn(P1);
-    assert_eq!(
-        drawn,
-        2,
-        "CR 603.2: the exchange must fire \"When you lose control of ~\" exactly once \
-         (P0 drew {}, P1 drew {})",
-        outcome.hand_drawn(P0),
-        outcome.hand_drawn(P1)
-    );
+    // THE DISCRIMINATOR: exactly one lose-control trigger resolved, controlled
+    // by the player who LOST control of Khârn (P0, CR 603.10d + CR 603.3a) —
+    // not the gainer (P1), and not a double-fire (which would read 4/0 or 2/2
+    // depending on attribution).
+    outcome.assert_hand_drawn(P0, 2);
+    outcome.assert_hand_drawn(P1, 0);
 }
 
 /// V8 NEGATIVE — the Portent trap. A `ChangesController` trigger is scoped to

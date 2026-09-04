@@ -2680,20 +2680,19 @@ pub fn evaluate_layers(state: &mut GameState) {
             }
         }
     }
-    // KNOWN LIMITATION (CR 109.4): this seed maintains a stack object's
-    // controller on the way IN. Nothing resets `controller` on the way OUT:
-    // `zones::move_to_zone` calls `reset_for_battlefield_exit` only under
-    // `from == Zone::Battlefield`, and that function writes
-    // `base_controller = Some(owner)`, not `controller`. So a STOLEN SPELL that
-    // exiles on resolution (rebound's CR 702.88a exile, paradigm's "Exile this
-    // spell" per CR 702.192a, an exile rider) reaches Zone::Exile still carrying
-    // the THIEF as `obj.controller` — and Exile takes the controller-scoped
-    // route, because `filter::is_owner_scoped_zone` is Hand | Library |
-    // Graveyard. This is a PRE-EXISTING class extended, not a new one: a stolen
-    // permanent that is exiled already leaves the same stale controller today,
-    // which `effects/change_zone.rs` documents at its own site. Graveyard and
-    // Hand exits are shielded by `is_owner_scoped_zone`. Closing it means giving
-    // the stack exit its own reset, a separate unit with its own gate run.
+    // CR 109.4 + CR 108.4a: this seed maintains a stack object's controller on
+    // the way IN. The way OUT is owned by `zones::apply_zone_exit_cleanup`,
+    // which resets `controller` to the owner fallback for every destination
+    // that is neither Battlefield nor Stack and snapshots the at-exit
+    // controller into `state.lki_cache` first (CR 608.2h). The class that
+    // needed it is the NON-RESOLVING stack exit — a stolen spell countered and
+    // exiled (Dissipate), the CR 724.1b "end the turn" / CR 724.2b "end the
+    // combat phase" stack exiles, and stack-exile riders. A stolen spell that
+    // exiles ON RESOLUTION (rebound, CR 702.88a) is NOT that class: MEASURED,
+    // the mid-resolution flush re-seeds the object from
+    // `resolving_stack_entry.controller` while the layer-2 scan can no longer
+    // reach it (`zone_object_ids(Stack)` no longer lists the popped entry), so
+    // the caster is already restored before the move.
 
     // CR 611.2 + CR 613.1: Rebuild the static-effect-source index from the
     // just-reset base `static_definitions` so the Copy / main gathers below

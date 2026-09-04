@@ -2474,9 +2474,12 @@ pub fn is_owner_scoped_zone(zone: Zone) -> bool {
 /// In an owner-scoped zone (see [`is_owner_scoped_zone`]) this delegates to
 /// [`matches_target_filter_in_owner_zone`], so a stale `obj.controller` left behind
 /// by a control-change effect cannot exclude the object from its own owner's
-/// player-scoped query — the state `effects::change_zone` documents for a stolen
-/// creature that dies into its owner's graveyard, where `reset_for_battlefield_exit`
-/// leaves `controller = thief`. Everywhere else it delegates to the ordinary
+/// player-scoped query. `zones::apply_zone_exit_cleanup`'s
+/// `revert_layered_characteristics_to_base` call already resets `controller` back
+/// to the owner fallback for a stolen creature that dies into its owner's
+/// graveyard, but this filter is defence-in-depth for a hand-built or serialized
+/// state where the two have diverged — the state `effects::change_zone` documents
+/// at its own site. Everywhere else it delegates to the ordinary
 /// controller-scoped [`matches_target_filter`].
 pub fn matches_target_filter_for_zone(
     state: &GameState,
