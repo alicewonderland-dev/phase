@@ -8699,7 +8699,61 @@ fn narrow_population_for_exclusion(
             .map(|leg| narrow_population_for_exclusion(leg, neg_types, props))
             .collect::<Option<Vec<_>>>()
             .map(|filters| TargetFilter::And { filters }),
-        _ => None,
+        // `¬A \ Z` is not `¬(A \ Z)`, so distributing the exclusion into a
+        // negation would invert the clause rather than narrowing it.
+        TargetFilter::Not { .. } => None,
+        TargetFilter::None
+        | TargetFilter::Any
+        | TargetFilter::Player
+        | TargetFilter::Controller
+        | TargetFilter::SourceController
+        | TargetFilter::ControllerAndControlledPermanents { .. }
+        | TargetFilter::Opponent
+        | TargetFilter::SelfRef
+        | TargetFilter::GrantingObject
+        | TargetFilter::SourceOrPaired
+        | TargetFilter::StackAbility { .. }
+        | TargetFilter::StackSpell
+        | TargetFilter::SpecificObject { .. }
+        | TargetFilter::SpecificPlayer { .. }
+        | TargetFilter::PlayerWhoChoseLabel { .. }
+        | TargetFilter::PlayerMatching { .. }
+        | TargetFilter::Neighbor { .. }
+        | TargetFilter::ScopedPlayer
+        | TargetFilter::AttachedTo
+        | TargetFilter::LastCreated
+        | TargetFilter::LastRevealed
+        | TargetFilter::LastZoneChanged
+        | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
+        | TargetFilter::ChosenCard
+        | TargetFilter::TrackedSet { .. }
+        | TargetFilter::TrackedSetFiltered { .. }
+        | TargetFilter::ExiledBySource
+        | TargetFilter::ExiledCardByIndex { .. }
+        | TargetFilter::TriggeringSpellController
+        | TargetFilter::TriggeringSpellOwner
+        | TargetFilter::TriggeringPlayer
+        | TargetFilter::TriggeringSource
+        | TargetFilter::EventTarget
+        | TargetFilter::TriggeringSourceController
+        | TargetFilter::ParentTarget
+        | TargetFilter::ParentTargetSlot { .. }
+        | TargetFilter::ParentTargetController
+        | TargetFilter::ParentTargetOwner
+        | TargetFilter::SourceChosenPlayer
+        | TargetFilter::OriginalController
+        | TargetFilter::OriginalSource
+        | TargetFilter::PostReplacementSourceController
+        | TargetFilter::PostReplacementDamageSource
+        | TargetFilter::PostReplacementDamageTarget
+        | TargetFilter::PostReplacementDamageTargetOwner
+        | TargetFilter::DefendingPlayer
+        | TargetFilter::HasChosenName
+        | TargetFilter::ChosenDamageSource { .. }
+        | TargetFilter::Named { .. }
+        | TargetFilter::Owner
+        | TargetFilter::AllPlayers => None,
     }
 }
 
