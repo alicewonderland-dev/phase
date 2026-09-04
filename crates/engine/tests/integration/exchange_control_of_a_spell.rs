@@ -11,7 +11,7 @@ use engine::game::scenario::{CastCommit, GameScenario, P0, P1};
 use engine::types::ability::TargetRef;
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
-use engine::types::game_state::{CastPaymentMode, WaitingFor};
+use engine::types::game_state::{CastPaymentMode, ChainStep, WaitingFor};
 use engine::types::mana::{ManaCost, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
@@ -2779,23 +2779,26 @@ fn shifting_grift_artifactless_second_mode_is_rejected_by_both_slot_builders() {
     );
 }
 
-/// V12 — retargeting a chained paired-subject spell sees the ROOT node's own
-/// pair only, and leaves the sub-node's (artifact mode's) targets intact.
-/// Seam: `engine.rs::apply_retarget` + `change_targets::legal_new_targets_for_entry`'s
-/// fallback (`stack_ability.targets.clone()`) — untouched by this change, but
-/// now sound BECAUSE the root holds only its own claimed pair (§5.6/§5.7).
+/// V12 — retargeting a chained paired-subject spell (CR 115.7d) spans the
+/// resolved chain: EVERY mode's targets are addressed, each at the node that
+/// owns it. Seam: `engine.rs::apply_retarget` -> `RetargetSlotAddress` ->
+/// `ability_utils::chain_retarget_slots`.
 ///
 /// P1 casts a 2-mode Shifting Grift (creatures + artifacts). Perplexing
 /// Chimera's "whenever an opponent casts a spell" trigger fires for P0; P0
 /// accepts the exchange (steals the Grift spell) and is offered "you may
 /// choose new targets for the spell".
 ///
-/// REVERT-FAILING: at BASE the cast PANICS at `SelectModes` before the
-/// Chimera trigger can even fire (M5, `debug_assert_eq!`); in `--release`
-/// the retarget pool would instead contain all 4 flat targets (both
-/// artifacts included) because the root held everything.
+/// REVERT-FAILING (two directions):
+/// 1. At `bb28b0e8b` this row's first assertion fails — `current_targets.len()`
+///    is 2, not 4 — because `change_targets::resolve` read `stack_ability.targets`
+///    on the root only.
+/// 2. At BASE, before `bb28b0e8b`, this cast PANICS at `SelectModes` — the
+///    per-node target ownership that commit introduced is the precondition an
+///    address `(node, slot)` depends on, and this note is what guards it from
+///    being quietly undone.
 #[test]
-fn chimera_retarget_of_a_two_mode_grift_offers_only_the_root_nodes_pair() {
+fn chimera_retarget_of_a_two_mode_grift_offers_every_modes_targets() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     scenario.with_mana_pool(P1, generic_mana_pool());
@@ -2809,6 +2812,9 @@ fn chimera_retarget_of_a_two_mode_grift_offers_only_the_root_nodes_pair() {
         .id();
     let a2 = scenario
         .add_artifact_from_oracle(P1, "Artifact A2", "")
+        .id();
+    let a3 = scenario
+        .add_artifact_from_oracle(P0, "Artifact A3", "")
         .id();
     let grift = scenario
         .add_spell_to_hand_from_oracle(P1, "Shifting Grift", false, SHIFTING_GRIFT_TEXT)
@@ -2834,10 +2840,17 @@ fn chimera_retarget_of_a_two_mode_grift_offers_only_the_root_nodes_pair() {
         match &commit.state().waiting_for {
             WaitingFor::RetargetChoice {
                 current_targets,
+                slots,
+                slot_pools,
                 legal_new_targets,
                 ..
             } => {
-                reached = Some((current_targets.clone(), legal_new_targets.clone()));
+                reached = Some((
+                    current_targets.clone(),
+                    slots.clone(),
+                    slot_pools.clone(),
+                    legal_new_targets.clone(),
+                ));
                 break;
             }
             WaitingFor::OptionalEffectChoice { .. } => {
@@ -2857,7 +2870,7 @@ fn chimera_retarget_of_a_two_mode_grift_offers_only_the_root_nodes_pair() {
             other => panic!("unexpected state while draining to the retarget prompt: {other:?}"),
         }
     }
-    let (current_targets, legal_new_targets) =
+    let (current_targets, slots, slot_pools, legal_new_targets) =
         reached.expect("REACH GUARD: the retarget prompt must be raised");
 
     // REACH GUARD: the Chimera exchange really happened.
@@ -2867,42 +2880,89 @@ fn chimera_retarget_of_a_two_mode_grift_offers_only_the_root_nodes_pair() {
         "REACH GUARD: the Chimera must have swapped to P1"
     );
 
-    // THE DISCRIMINATOR: the pool is the ROOT node's own pair ONLY —
-    // [c1, c2] — and contains NEITHER artifact.
+    // Assertion 1: EVERY mode's targets are exposed, in order — the ordering
+    // is load-bearing because the submission shares its index space, and
+    // because the first two positions are exactly BASE's `current_targets`
+    // (Invariant B).
     assert_eq!(
-        current_targets.len(),
-        2,
-        "the retarget prompt's current_targets must be the root's own pair, got \
-         {current_targets:?}"
+        current_targets,
+        vec![
+            TargetRef::Object(c1),
+            TargetRef::Object(c2),
+            TargetRef::Object(a1),
+            TargetRef::Object(a2),
+        ],
+        "every mode's targets must be exposed, in order, got {current_targets:?}"
     );
-    assert_eq!(
-        legal_new_targets.len(),
-        2,
-        "the legal pool must be exactly 2 (the root's own claimed pair), got \
-         {legal_new_targets:?}"
-    );
-    for artifact in [a1, a2] {
-        assert!(
-            !legal_new_targets.contains(&TargetRef::Object(artifact)),
-            "an artifact must never be offered for the creature mode's retarget — \
-             pool was {legal_new_targets:?}"
-        );
-    }
 
-    // Submit a permutation WITHIN the (symmetric-filter) creature pair — §5.11
-    // must accept it (the NEGATIVE control: this changes nothing about the
-    // actual outcome, since both slots share the same filter).
-    let mut swapped = current_targets.clone();
-    swapped.reverse();
+    // Assertion 2: the addresses pin the code owner's mechanism itself — the
+    // creature mode's pair lives at the root, the artifact mode's pair lives
+    // at the sub.
+    assert_eq!(slots.len(), 4);
+    assert!(slots[0].path.is_empty() && slots[1].path.is_empty());
+    assert_eq!(slots[2].path, vec![ChainStep::SubAbility]);
+    assert_eq!(slots[3].path, vec![ChainStep::SubAbility]);
+    assert_eq!(slots[0].slot, 0);
+    assert_eq!(slots[1].slot, 1);
+    assert_eq!(slots[2].slot, 0);
+    assert_eq!(slots[3].slot, 1);
+
+    // Assertion 3 (Invariant SC): the two paired-subject root positions share
+    // one authority; every offered candidate at every position is admitted
+    // there (asserted end-to-end via the reducer itself below, positions 0/2
+    // via direct submission).
+    assert_eq!(
+        slot_pools[0], slot_pools[1],
+        "the two root positions share one authority"
+    );
+
+    // Assertion 4: THE DISCRIMINATOR — the union still offers the artifact
+    // A3, and position 2 (the artifact-mode slot) may take it.
+    assert!(
+        legal_new_targets.contains(&TargetRef::Object(a3)),
+        "the union must still offer every position's pool, got {legal_new_targets:?}"
+    );
+    assert!(
+        slot_pools[2].contains(&TargetRef::Object(a3)),
+        "the artifact-mode position must admit A3, got {:?}",
+        slot_pools[2]
+    );
+
+    // Assertion 5: the creature mode's own pool survives the union rather
+    // than being replaced (Invariant B, literal): the union is BASE's cascade
+    // verbatim as a prefix.
+    assert!(legal_new_targets.contains(&TargetRef::Object(c1)));
+
+    // Assertion 7 (hostile, checked BEFORE the accepted submission so the
+    // parked state is untouched): the sub-only artifact into position 0 (a
+    // `Filtered(creature)` position) must be refused.
+    let hostile = commit.act(GameAction::RetargetSpell {
+        new_targets: vec![
+            TargetRef::Object(a3),
+            TargetRef::Object(c2),
+            TargetRef::Object(a1),
+            TargetRef::Object(a2),
+        ],
+    });
+    assert!(
+        hostile.is_err(),
+        "a sub-only object must not be admitted at the creature mode's own position"
+    );
+
+    // Assertion 6: the maintainer's literal requirement — submit a full,
+    // legal cross-mode reassignment.
     commit
         .act(GameAction::RetargetSpell {
-            new_targets: swapped,
+            new_targets: vec![
+                TargetRef::Object(c1),
+                TargetRef::Object(c2),
+                TargetRef::Object(a3),
+                TargetRef::Object(a2),
+            ],
         })
-        .expect("a within-pair permutation of a symmetric-filter pair must be accepted");
+        .expect("a full cross-mode reassignment offered by the union must be accepted");
 
-    // Resolve fully: BOTH exchanges still happen on their own pairs — the
-    // creature pair (c1, c2), and the artifact pair (a1, a2), UNTOUCHED by
-    // the retarget.
+    // Resolve fully.
     for _ in 0..40 {
         match commit.state().waiting_for {
             WaitingFor::Priority { .. } => {
@@ -2918,18 +2978,14 @@ fn chimera_retarget_of_a_two_mode_grift_offers_only_the_root_nodes_pair() {
         }
     }
 
-    assert_eq!(
-        commit.state().objects[&c1].controller,
-        P1,
-        "the creature pair must still exchange, regardless of the retarget permutation"
-    );
-    assert_eq!(commit.state().objects[&c2].controller, P0);
-    assert_eq!(
-        commit.state().objects[&a1].controller,
-        P1,
-        "the artifact mode's pair must be UNTOUCHED by the creature mode's retarget"
-    );
+    // Assertion 8: the exchange resolved against the RETARGETED pair (a3, a2)
+    // for the artifact mode, and the untouched creature pair for the creature
+    // mode.
+    assert_eq!(commit.state().objects[&a3].controller, P1);
     assert_eq!(commit.state().objects[&a2].controller, P0);
+    assert_eq!(commit.state().objects[&a1].controller, P0);
+    assert_eq!(commit.state().objects[&c1].controller, P1);
+    assert_eq!(commit.state().objects[&c2].controller, P0);
 }
 
 /// V15 — the newly reachable sub-chain descent (§5.2/§5.3) surfaces NO

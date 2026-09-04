@@ -2187,7 +2187,7 @@ export type WaitingFor =
       track_exiled_by_source?: boolean;
     } }
   | { type: "DrawnThisTurnTopdeckChoice"; data: { player: PlayerId; cards: ObjectId[]; count: number; min_count: number; life_payment: number; source_id: ObjectId } }
-  | { type: "RetargetChoice"; data: { player: PlayerId; stack_entry_index: number; scope: RetargetScope; current_targets: TargetRef[]; legal_new_targets: TargetRef[] } }
+  | { type: "RetargetChoice"; data: { player: PlayerId; stack_entry_index: number; scope: RetargetScope; current_targets: TargetRef[]; slots: RetargetSlotAddress[]; slot_pools: TargetRef[][]; legal_new_targets: TargetRef[] } }
   | { type: "ProliferateChoice"; data: { player: PlayerId; eligible: TargetRef[] } }
   | { type: "TimeTravelChoice"; data: { player: PlayerId; eligible: TargetRef[]; phase: "Remove" | "Add" } }
   | { type: "AssistChoosePlayer"; data: { player: PlayerId; candidates: PlayerId[]; max_generic: number; convoke_mode?: ConvokeMode } }
@@ -2383,6 +2383,19 @@ export type RetargetScope =
   | { type: "Single" }
   | { type: "All" }
   | { type: "ForcedTo"; data: TargetRef };
+
+// CR 601.2c: one descent step from a stack entry's root ResolvedAbility
+// toward a node that owns declared targets. Mirrors `ChainStep`
+// (crates/engine/src/types/game_state.rs).
+export type ChainStep = "SubAbility" | "ElseAbility";
+
+// CR 115.7d: the address of ONE declared-target slot inside a resolved
+// chain. Mirrors `RetargetSlotAddress`
+// (crates/engine/src/types/game_state.rs).
+export interface RetargetSlotAddress {
+  path: ChainStep[];
+  slot: number;
+}
 
 // ── Log Types ────────────────────────────────────────────────────────────
 

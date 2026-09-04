@@ -14,8 +14,8 @@ use crate::types::ability::mana_multi_role;
 #[cfg(test)]
 use crate::types::counter::CounterType;
 use crate::types::game_state::{
-    GameState, PtDirection, TargetEffectDetail, TargetSelectionConstraint, TargetSelectionProgress,
-    TargetSelectionSlot,
+    ChainStep, GameState, PtDirection, RetargetSlotAddress, TargetEffectDetail,
+    TargetSelectionConstraint, TargetSelectionProgress, TargetSelectionSlot,
 };
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use crate::types::player::PlayerId;
@@ -7142,17 +7142,20 @@ fn assign_targets_recursive(
     // per-slot zip (§5.11) lines up with the node's own filters instead of a
     // flat multi-node pool.
     //
-    // CR 115.7 / CR 115.7d (tracked: phase-rs/phase#8355):
-    // `engine.rs::apply_retarget` writes `ability.targets` on the ROOT stack
-    // node only, so a paired-subject node in a SUB position is not
-    // retargetable once its targets live here rather than on the root. That is
-    // a pre-existing root-only limitation of the retarget seam, made
-    // observable by per-node ownership; it removes no legal CR 115.7d
-    // capability (the pre-change pool was `stack_ability.targets.clone()`,
-    // i.e. degenerate) and it CLOSES the cross-mode half of a CR 115.7d hole,
-    // since a later mode's target — illegal for an earlier mode's slot under
-    // CR 700.2f's differing per-mode targeting requirements — can no longer be
-    // permuted into it. The intra-node half is closed by §5.11.
+    // CR 115.7 / CR 115.7d (phase-rs/phase#8355, FIXED): a paired-subject node
+    // in a SUB position IS retargetable. `engine::apply_retarget` writes the
+    // node named by the prompt's `RetargetSlotAddress`, so a node's targets
+    // living here rather than on the root no longer places them outside the
+    // CR 115.7d operation. The cross-mode half of the hole stays closed, but by
+    // a stronger mechanism than target placement:
+    // `ability_utils::chain_retarget_slots` carries each slot's own AUTHORITY
+    // with its address, `retarget_slot_violation` validates every CHANGED
+    // submission against the pool of the slot it is written into (CR 115.7a +
+    // CR 700.2f), and each position is admitted from the pool that same
+    // authority produces (`WaitingFor::RetargetChoice::slot_pools`, Invariant
+    // SC). Per-node ownership remains the PRECONDITION — an address
+    // `(node, slot)` is only meaningful because this block makes each node
+    // hold exactly its own claimed entries.
     if paired_subject_filters(&ability.effect).is_some() {
         let claimed = paired_subject_slot_filters(&ability.effect).count();
         for _ in 0..claimed {
@@ -8207,136 +8210,658 @@ fn chain_has_target_sink_after_deferred_effect(sub_ability: Option<&ResolvedAbil
     chain_has_target_sink(sub_ability)
 }
 
-/// CR 115.7a + CR 115.7d: "each target can be changed only to another legal
-/// target" (115.7a) / "the player may leave any number of the targets
-/// unchanged, even if those targets would be illegal… If the player chooses to
-/// change some or all of the targets, the new targets must be legal" (115.7d).
-/// This function is scope-agnostic: it is reached both by the mana case
-/// (115.7a's "change the target(s)") and by a paired-subject node reached
-/// through Perplexing Chimera's "choose new targets" clause (115.7d) — the
-/// unchanged-position exemption below is licensed under 115.7d and simply
-/// non-applicable under 115.7a, which is why one function serves both scopes
-/// with no scope parameter (see the exemption paragraph below).
+// ============================================================================
+// phase-rs/phase#8355 (CR 115.7d): the addressable-slot authority.
+//
+// The mechanism is the code owner's: `RetargetSlotAddress` identifies the
+// resolved-chain node and target slot(s) a "choose new targets" operation
+// addresses; legality validation and target-incarnation pin refresh apply
+// per addressed node. `chain_retarget_slots` is the single enumerator; every
+// consumer downstream (the prompt payload, validation, the write-back, the AI
+// generator) reads its output rather than re-deriving addressing.
+// ============================================================================
+
+/// CR 115.7a + CR 601.2c: the per-slot AUTHORITIES one chain node declares, in
+/// the same order `collect_target_slot_specs` emits that node's specs.
 ///
-/// A multi-slot node's replacement targets are submitted positionally, but
-/// `legal_new_targets_for_stack_entry` can only return a FLAT union pool
-/// (one `Vec<TargetRef>`, no slot structure), so the union alone would let a
-/// count-source-legal player be assigned into the recipient slot. This is the
-/// seam where slot identity IS available: re-validate each submitted target
-/// against the filter of the slot it actually lands in.
+/// FAITHFUL MIRROR, not an approximation. This function reproduces
+/// `collect_target_slot_specs`' per-node arms with the same guards and the SAME
+/// generic authority (`triggers::extract_target_filter_from_effect`, NOT
+/// `Effect::target_filter` — the two differ by that function's carve-outs and by
+/// its `!is_context_ref()` projection). Divergence here is not a missing
+/// feature, it is a WRONG FILTER on a real slot: before this mirror,
+/// `PreventDamage`'s declared SOURCE slot (an instant or sorcery on the stack)
+/// was given the RECIPIENT's `TargetFilter::Any`.
 ///
-/// Takes the prompt's `current_targets` and **exempts positions whose submission
-/// is unchanged**: CR 115.7d ("the player may leave any number of the targets
-/// unchanged, even if those targets would be illegal") licenses this outright for
-/// the "choose new targets" scope. CR 115.7a does not grant an equivalent licence
-/// — its unchanged-target allowance is conditional ("if a target can't be changed
-/// to another legal target") — but it does not need to: it constrains only targets
-/// that ARE changed, so a slot already holding its own submission was never
-/// changed and "changed only to another legal target" has nothing to bite on.
-/// The exemption is therefore correct without a scope parameter, by licence under
-/// 115.7d and by non-application under 115.7a.
+/// THE AUTHORITY-PAIR RULE (CR 115.7d, phase-rs/phase#8355 round-4 defect B7).
+/// A `TargetFilter` may be returned here ONLY when it is the WHOLE authority for
+/// its slot — i.e. the cast path both VALIDATES the slot with it and ENUMERATES
+/// the slot with it. Where the cast path pairs a deliberately LOOSE spec filter
+/// with a NARROW dedicated pool, returning the loose filter would enforce a
+/// weaker rule than the cast path does. The measured instance is the companion
+/// target-player slot: `collect_target_slot_specs` declares `TargetFilter::Player`,
+/// but the cast path enumerates it with `companion_target_player_legal_targets`
+/// and overrides the spec filter with that same function. That arm is
+/// therefore `NotDerivable`, which routes the position to `Legacy`, whose pool
+/// IS `companion_target_player_retarget_options` — the cast path's own
+/// authority.
 ///
-/// CR 115.7d's SECOND sentence — new targets "must not cause any unchanged targets
-/// to become illegal" — is vacuous under today's model and is deliberately not
-/// enforced here: `validate_targets_for_ability` evaluates each slot's filter
-/// against the state and the ability, never against a sibling slot's choice, so no
-/// submission can invalidate a neighbour. A future filter that reads sibling slots
-/// must revisit this.
+/// Deliberately a TYPED verdict, not a `Vec`. `None` ("declares no slots") and
+/// `NotDerivable` ("declares slots whose whole authority this function cannot
+/// supply") both yield no FILTERED binding, but they are different facts and the
+/// caller treats a BASE-exposed node differently from a chain-new one.
 ///
-/// Consumed by `engine::apply_retarget` AND by
-/// `ai_support::candidates::retarget_actions`, so the reducer and the AI
-/// generator cannot disagree about which submissions are legal.
+/// SCOPE. Derivable today — every arm whose filter is also its own enumerator:
+///   * CR 609.7: the source-scoped `PreventDamage` slot, declared FIRST
+///   * paired-subject nodes -> `paired_subject_slot_filters` (the filters BASE's
+///     `retarget_slot_violation` already enforces at that position)
+///   * `mana_multi_role` nodes -> `surfaced_filters()` (the same filters the
+///     entry cascade's mana-role branch unions)
+///   * the target-creature-quantity slot and the parent-target-combat-relation
+///     slot (both enumerated by `legal_targets_for_ability_filter` over the same
+///     filter)
+///   * the generic slot -> `triggers::extract_target_filter_from_effect`, which
+///     bottoms out in an EXHAUSTIVE `Effect::target_filter` match (no top-level
+///     `_ =>` arm), so a new `Effect` cannot silently become unaddressable
+///     without a compile error
 ///
-/// Returns `Some(slot_index)` for the first positionally-illegal CHANGED
-/// submission. `None` = the submission is slot-legal, every illegal position was
-/// left unchanged, or this node declares no per-slot structure this function
-/// knows about.
+/// NOT derivable today, and therefore fail-closed (`NotDerivable`):
+///   * the companion target-player slot — a filter/POOL PAIR, see above
+///   * `Fight`, `MoveCounters`, `Attach`, `CreateDamageReplacement`,
+///     `EachDealsDamageEqualToPower`, and per-opponent target fanout.
+///     DELIBERATE CONSERVATISM, not an inability — widening them is
+///     `TRACKED(pending-approval)` #2.
 ///
-/// SCOPE: this recognizes any node `mana_multi_role` admits — both the
-/// two-surfaced-slot `Both` and the one-surfaced-slot context-ref recipient
-/// `Both` — AND any paired-subject node `paired_subject_filters` admits
-/// (`ExchangeControl` / `ExchangeLifeTotals`), whose claimed slots come from
-/// `paired_subject_slot_filters` in the same surfaced order the collect pass
-/// used. `Attach`, `MoveCounters`, and `Fight` are multi-slot too and still
-/// share the pre-existing flat-pool gap; they are deliberately left on today's
-/// behavior. This function is the seam they extend into when that gap is
-/// fixed on its own merits — the paired variants are the worked example of
-/// that extension.
-pub fn retarget_slot_violation(
-    state: &GameState,
+/// A fail-closed CHAIN-NEW node contributes nothing (BASE exposes no such slot).
+/// A fail-closed BASE-EXPOSED node contributes `SlotEnforcement::Legacy`
+/// bindings, because BASE exposes that node's slots unconditionally
+/// (`change_targets.rs`'s `current_targets = stack_ability.targets.clone()`) —
+/// see `chain_retarget_slots`.
+enum NodeSlotFilters {
+    PerSlot(Vec<TargetFilter>),
+    UniformRun(TargetFilter),
+    None,
+    NotDerivable,
+}
+
+fn node_slot_filters(ability: &ResolvedAbility) -> NodeSlotFilters {
+    let stack_timing = ability.target_choice_timing == TargetChoiceTiming::Stack;
+    let mut lead: Vec<TargetFilter> = Vec::new();
+
+    // Arm 1 — `PreventDamage` source slot (declared FIRST, not returned early,
+    // exactly mirroring `collect_target_slot_specs`).
+    if stack_timing {
+        if let Some(src) = prevent_damage_source_slot_filter(&ability.effect) {
+            lead.push(src.clone());
+        }
+    }
+
+    // Arm 2 — paired-subject. Returns here, exactly as the cast path does.
+    let paired: Vec<TargetFilter> = paired_subject_slot_filters(&ability.effect)
+        .cloned()
+        .collect();
+    if !paired.is_empty() {
+        lead.extend(paired);
+        return NodeSlotFilters::PerSlot(lead);
+    }
+
+    // Arm 3 — `Fight`: fail-closed, also a `return` in the cast path.
+    if matches!(ability.effect, Effect::Fight { .. }) {
+        return NodeSlotFilters::NotDerivable;
+    }
+
+    // Arm 4 — `MoveCounters` fail-closed; `mana_multi_role`; the remaining
+    // multi-slot-but-underivable effects. One if/else-if chain, mirroring the
+    // cast path's own chain.
+    if matches!(ability.effect, Effect::MoveCounters { .. }) {
+        return NodeSlotFilters::NotDerivable;
+    } else if let Some(role) = mana_multi_role(&ability.effect) {
+        lead.extend(
+            role.surfaced_filters()
+                .map(|(_slot, filter)| filter.clone()),
+        );
+        return NodeSlotFilters::PerSlot(lead);
+    } else if matches!(
+        ability.effect,
+        Effect::Attach { .. }
+            | Effect::CreateDamageReplacement { .. }
+            | Effect::EachDealsDamageEqualToPower { .. }
+    ) {
+        return NodeSlotFilters::NotDerivable;
+    }
+
+    // Arm 5 — per-opponent target fanout: fail-closed.
+    if is_per_opponent_target_fanout(ability) {
+        return NodeSlotFilters::NotDerivable;
+    }
+
+    // Arm 6 (B7) — the companion target-player slot is a filter/POOL PAIR;
+    // `TargetFilter::Player` alone is not the whole authority. See doc above.
+    if stack_timing && ability_needs_companion_target_player_slot(ability) {
+        return NodeSlotFilters::NotDerivable;
+    }
+
+    // Arm 7 — the two remaining companion slots, in the cast path's order.
+    if stack_timing
+        && effect_needs_target_creature_quantity_slot(&ability.effect)
+        && !one_sided_fight_source_supplies_quantity_creature(&ability.effect)
+    {
+        match effect_target_slot_filter(&ability.effect) {
+            Some(f) => lead.push(f),
+            // The cast path `expect`s here; the retarget path must never panic
+            // on a shape the cast path tolerated differently, so it fails
+            // closed instead.
+            None => return NodeSlotFilters::NotDerivable,
+        }
+    }
+    if stack_timing && effect_needs_parent_target_combat_relation_slot(&ability.effect) {
+        lead.push(parent_target_combat_relation_slot_filter());
+    }
+
+    // Arm 8 — the `TargetChoiceTiming` guard: the cast path declares no
+    // generic slot for a non-`Stack` node, so neither does this.
+    if !stack_timing {
+        return if lead.is_empty() {
+            NodeSlotFilters::None
+        } else {
+            NodeSlotFilters::PerSlot(lead)
+        };
+    }
+
+    // Arm 9 — the generic arm, on the cast path's own authority.
+    match triggers::extract_target_filter_from_effect(&ability.effect) {
+        Some(f) if ability.multi_target.is_some() && lead.is_empty() => {
+            NodeSlotFilters::UniformRun(f.clone())
+        }
+        Some(_) if ability.multi_target.is_some() => NodeSlotFilters::NotDerivable,
+        Some(f) => {
+            lead.push(f.clone());
+            NodeSlotFilters::PerSlot(lead)
+        }
+        None => {
+            if lead.is_empty() {
+                NodeSlotFilters::None
+            } else {
+                NodeSlotFilters::PerSlot(lead)
+            }
+        }
+    }
+}
+
+/// CR 115.7d: WHICH AUTHORITY builds this slot's candidate set.
+///
+/// This enum selects an authority. It does NOT pair two computations — there
+/// is only one (INVARIANT SC, `chain_retarget_slots`' doc). `change_targets::
+/// slot_pool` matches on this value exactly once, produces the position's
+/// candidate set, and stores it in `WaitingFor::RetargetChoice::slot_pools[i]`.
+/// Every later consumer — `engine::apply_retarget`,
+/// `ability_utils::retarget_slot_violation`,
+/// `change_targets::forced_retarget_target_position`,
+/// `ai_support::candidates::retarget_actions` — READS that stored vector. None
+/// of them derives a candidate set; `retarget_slot_violation` cannot, because
+/// it does not take `&GameState` (phase-rs/phase#8355 round-5 defects B8/B9:
+/// two derivations of "the same" set disagreed on the controller and on the
+/// scope).
+///
+///   * `Filtered(f)` — `f` is the WHOLE authority for this slot: the cast path
+///     both validates and enumerates the slot with `f` (the authority-pair
+///     rule). The pool is
+///     `find_legal_targets_for_ability_with_controller(state, f, THIS NODE,
+///     pool_controller)` — the node, because a controller- or source-relative
+///     filter must be read against the node that declares it; and
+///     `pool_controller`, because CR 109.5's "you" is the spell's CURRENT
+///     controller and CR 400.7a keeps an exchange's controller change in force
+///     during the window (`ResolvedAbility.controller` is still the caster
+///     until `stack::resolve_top` re-stamps, after the window closes). A slot
+///     whose cast-path authority is a filter/POOL PAIR that `f` alone cannot
+///     express must NOT be emitted here — see `node_slot_filters`' companion
+///     target-player arm.
+///   * `Legacy` — this authority could not derive the slot's filter. It is
+///     exposed anyway, because BASE exposes it: `change_targets::resolve` sets
+///     `current_targets = stack_ability.targets` unconditionally, with no
+///     derivability gate. The pool is `legal_new_targets_for_entry`'s cascade,
+///     CLONED VERBATIM (review-round3's Invariant C; round-3 defect B6).
+///     Emitted ONLY for a BASE-EXPOSED node — the stack entry's root, or,
+///     under `AdditionalCostPaidInstead` delegation, the delegated sub whose
+///     `targets` the root merely mirrors (`assign_targets_recursive`). NOT
+///     emitting it would silently delete a prompt the engine raises today
+///     (measured on Prey Upon, a printed `Fight` card, whose root is
+///     fail-closed).
+///
+///     BYTE-IDENTITY TO `bb28b0e8b` AT SUCH A POSITION IS CONDITIONAL, and the
+///     condition is a DIFFERENT authority from the one that produced `Legacy`.
+///     BASE's `retarget_slot_violation` is a no-op at a position exactly when
+///
+///         mana_multi_role(&ability.effect).is_none()
+///             && paired_subject_slot_filters(&ability.effect).next().is_none()
+///
+///     (its `filters.is_empty()` early-out). `Legacy` is produced by
+///     `node_slot_filters`' `NotDerivable` verdict or by its arity gate
+///     (`PerSlot(f) if f.len() == owned`). A node that is non-empty on the
+///     first predicate but fails the arity gate would fall to `Legacy` while
+///     BASE still enforces its filters — the collapse would then admit the
+///     whole cascade where BASE filtered (round-3 defect B2's class). No such
+///     node is currently constructible, but the alignment `debug_assert!`
+///     exists because arity mismatch is real, so row P-LEGACY-ROOT ASSERTS the
+///     predicate at every `Legacy` position rather than assuming it. If it ever
+///     fails, the correct fix is to emit `Filtered` there, not to widen the
+///     pool (phase-rs/phase#8355 round-6 review, m10).
+pub(crate) enum SlotEnforcement {
+    Filtered(TargetFilter),
+    Legacy,
+}
+
+/// CR 115.7d + CR 601.2c + CR 700.2c: every declared-target slot of this
+/// resolved chain that the "choose new targets" operation addresses, each bound
+/// to the node it lives on, the authority that governs it, and the target it
+/// currently holds.
+///
+/// SINGLE AUTHORITY. Four consumers read this ONE vector — the prompt payload
+/// and the per-position pools (`change_targets::resolve`), validation
+/// (`retarget_slot_violation`), the write-back (`engine::apply_retarget`), and
+/// the AI's proposal enumeration (`ai_support::candidates::retarget_actions`,
+/// via the payload).
+///
+/// THE BASE-EXPOSED NODE. `change_targets::resolve` shows the player
+/// `stack_ability.targets` unconditionally. Under `AdditionalCostPaidInstead`
+/// delegation those values are a MIRROR of the delegated sub's
+/// (`assign_targets_recursive` sets `ability.targets = sub_ability.targets.clone()`
+/// and copies `context.attach_target_bindings`, then returns), and
+/// `collect_target_slot_specs` likewise recurses into the sub and returns
+/// without emitting anything for the parent. So the BASE-exposed node — the
+/// one whose slots must always be emitted, and the only one that may carry
+/// `Legacy` — is the ROOT, or, when `ability.context.additional_cost_paid` and
+/// the sub carries that condition, the DELEGATED SUB. Emitting both would give
+/// 2N positions for N values, and `restamp_derived_chain_targets` re-mirrors the
+/// parent from the sub after the write, so a change written to a parent
+/// position would be silently discarded and the submission would return `Ok`
+/// with no effect. MEASURED reachable on 56 printed cards (Bloodchief's
+/// Thirst, Fight with Fire, Torch the Tower, Urza's Rage, Rite of Replication).
+///
+/// THREE INVARIANTS, all load-bearing:
+///   (A) Nothing exposed that is not enforced. Every binding on a node that is
+///       NOT the BASE-exposed one is `Filtered`, so a chain-new slot is never
+///       offered without a per-slot check.
+///   (B) Nothing enforced today becomes unreachable. The BASE-exposed node's
+///       slots are emitted 1:1 with its `targets`, ALWAYS — `Filtered` when the
+///       whole authority is derivable, `Legacy` otherwise.
+///   (SC) ONE COMPUTATION PER POSITION. Exactly one expression in the engine
+///        produces a candidate set for an addressed position:
+///        `change_targets::slot_pool`. It has exactly two call sites, both
+///        inside `change_targets.rs` — the interactive prompt-construction site
+///        in `resolve`, and the forced-retarget site in `resolve`'s
+///        `forced_to` branch. Both derive their arguments from the same stack
+///        entry by the same route, so the two sites compute the same value on
+///        the same board (row V-TWO-SITES).
+///        `apply_retarget`'s admission test, `retarget_slot_violation`, and
+///        `retarget_actions`' enumeration read the stored vector. None of them
+///        derives a candidate set. `retarget_slot_violation` is re-signatured
+///        to take `slot_pools` and to NOT take `&GameState`, so a second
+///        derivation THERE is not expressible; `slot_pool` is module-private,
+///        so THAT expression cannot be called from outside this file. Note
+///        that this bounds `slot_pool`, NOT derivation in general —
+///        `targeting::find_legal_targets_for_ability_with_controller` is
+///        `pub(crate)`, and `apply_retarget`'s CR 115.7d-second-clause pass
+///        calls it deliberately (a legality re-check of an unchanged target,
+///        not a candidate set). The single-producer property is held for the
+///        addressed positions by the enumeration in row V-CTRL, not by the
+///        compiler.
+///
+/// CR 700.2c: the walk is over the RESOLVED chain (the chosen modes), never the
+/// printed card. CR 115.8 + CR 700.2f: the mode cannot change while the prompt
+/// is parked, so the slot set is fixed for the window.
+///
+/// SCOPE NOTE: `context.attach_target_bindings` and `Effect::Attach`'s host
+/// binding are not rebound on retarget. `Attach` is `NotDerivable`, so its
+/// slots are exposed only as `Legacy` bindings drawing BASE's cascade — the
+/// omission is structural, not latent. TRACKED(pending-approval) #1.
+pub struct RetargetSlotBinding {
+    pub address: RetargetSlotAddress,
+    pub(crate) enforcement: SlotEnforcement,
+    pub current: TargetRef,
+    /// CR 115.3: slots sharing a run id are ONE instance of "target" and may not
+    /// receive the same object twice. MIRRORS `collect_target_slot_specs`'
+    /// `TargetInstanceId` allocation exactly — one shared id per `multi_target`
+    /// run, a distinct id per paired-subject slot. `None` = its own instance.
+    pub run: Option<usize>,
+}
+
+/// Alignment-gate emission for one chain node: pushes zero or more
+/// `RetargetSlotBinding`s for `node`'s own `targets`, following the rule
+/// `chain_retarget_slots`' doc states as invariant (A)/(B).
+fn emit_node(
+    node: &ResolvedAbility,
+    path: &[ChainStep],
+    base_exposed: bool,
+    bindings: &mut Vec<RetargetSlotBinding>,
+    next_run: &mut usize,
+) {
+    if node.targets.is_empty() {
+        return;
+    }
+    match node_slot_filters(node) {
+        NodeSlotFilters::PerSlot(filters) if filters.len() == node.targets.len() => {
+            for (slot, (filter, target)) in filters.into_iter().zip(node.targets.iter()).enumerate()
+            {
+                bindings.push(RetargetSlotBinding {
+                    address: RetargetSlotAddress {
+                        path: path.to_vec(),
+                        slot,
+                    },
+                    enforcement: SlotEnforcement::Filtered(filter),
+                    current: target.clone(),
+                    run: None,
+                });
+            }
+        }
+        NodeSlotFilters::UniformRun(filter) => {
+            let run = *next_run;
+            *next_run += 1;
+            for (slot, target) in node.targets.iter().enumerate() {
+                bindings.push(RetargetSlotBinding {
+                    address: RetargetSlotAddress {
+                        path: path.to_vec(),
+                        slot,
+                    },
+                    enforcement: SlotEnforcement::Filtered(filter.clone()),
+                    current: target.clone(),
+                    run: Some(run),
+                });
+            }
+        }
+        other => {
+            // Diagnostic for the coverage boundary, not a correctness-critical
+            // guard — deliberately NOT attached to `None`/`NotDerivable`, which
+            // printed cards reach every game.
+            if let NodeSlotFilters::PerSlot(filters) = &other {
+                debug_assert!(
+                    false,
+                    "node_slot_filters PerSlot length {} disagrees with {} declared targets for {:?}",
+                    filters.len(),
+                    node.targets.len(),
+                    node.effect,
+                );
+            }
+            if base_exposed {
+                for (slot, target) in node.targets.iter().enumerate() {
+                    bindings.push(RetargetSlotBinding {
+                        address: RetargetSlotAddress {
+                            path: path.to_vec(),
+                            slot,
+                        },
+                        enforcement: SlotEnforcement::Legacy,
+                        current: target.clone(),
+                        run: None,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Descent shape mirrors `collect_sub_chain_slot_specs` exactly: deferred
+/// effects (Scry/Dig/…) route through the deferred-descent helper below; every
+/// other node descends via `sub_ability`, skipping a sub that defers its own
+/// selection (`defers_conditional_target_selection`) or that only inherits the
+/// parent's creature target (`sub_ability_inherits_parent_creature_target_only`).
+fn descend_retarget_slots(
     ability: &ResolvedAbility,
+    path: &[ChainStep],
+    bindings: &mut Vec<RetargetSlotBinding>,
+    next_run: &mut usize,
+) {
+    if defers_sub_ability_target_selection(&ability.effect) {
+        descend_retarget_slots_after_deferred_effect(
+            ability.sub_ability.as_deref(),
+            path,
+            bindings,
+            next_run,
+        );
+        return;
+    }
+    if let Some(sub) = ability.sub_ability.as_deref() {
+        if !defers_conditional_target_selection(sub)
+            && !sub_ability_inherits_parent_creature_target_only(ability, sub)
+        {
+            let mut sub_path = path.to_vec();
+            sub_path.push(ChainStep::SubAbility);
+            emit_node(sub, &sub_path, false, bindings, next_run);
+            descend_retarget_slots(sub, &sub_path, bindings, next_run);
+        }
+    }
+}
+
+/// Mirror of `collect_target_slot_specs_after_deferred_effect`: a deferred
+/// effect's immediate sub may itself have no target slot of its own
+/// (`skips_stack_targets_after_deferred_effect` — `ChangeZone`/`Shuffle`/
+/// `PutAtLibraryPosition`), in which case the walk continues one level deeper
+/// WITHOUT emitting a binding for the skipped node, until it lands on a node
+/// whose own slots (if any) are emitted and whose further chain is descended
+/// through the ordinary path above.
+fn descend_retarget_slots_after_deferred_effect(
+    sub_ability: Option<&ResolvedAbility>,
+    path: &[ChainStep],
+    bindings: &mut Vec<RetargetSlotBinding>,
+    next_run: &mut usize,
+) {
+    let Some(sub) = sub_ability else {
+        return;
+    };
+    if defers_conditional_target_selection(sub) {
+        return;
+    }
+    let mut sub_path = path.to_vec();
+    sub_path.push(ChainStep::SubAbility);
+    if skips_stack_targets_after_deferred_effect(&sub.effect) {
+        descend_retarget_slots_after_deferred_effect(
+            sub.sub_ability.as_deref(),
+            &sub_path,
+            bindings,
+            next_run,
+        );
+        return;
+    }
+    emit_node(sub, &sub_path, false, bindings, next_run);
+    descend_retarget_slots(sub, &sub_path, bindings, next_run);
+}
+
+pub fn chain_retarget_slots(ability: &ResolvedAbility) -> Vec<RetargetSlotBinding> {
+    // Step 1 (M14): resolve the BASE-exposed node, re-rooting through a PAID
+    // `AdditionalCostPaidInstead` delegation exactly as `assign_targets_recursive`
+    // does — read from the PARENT's context, recursing because the sub may
+    // itself delegate further.
+    fn resolve_base_exposed(
+        ability: &ResolvedAbility,
+        path: Vec<ChainStep>,
+    ) -> (&ResolvedAbility, Vec<ChainStep>) {
+        if let Some(sub) = ability.sub_ability.as_deref() {
+            if matches!(
+                sub.condition,
+                Some(AbilityCondition::AdditionalCostPaidInstead)
+            ) && ability.context.additional_cost_paid
+            {
+                let mut new_path = path;
+                new_path.push(ChainStep::SubAbility);
+                return resolve_base_exposed(sub, new_path);
+            }
+        }
+        (ability, path)
+    }
+    let (base_node, base_path) = resolve_base_exposed(ability, Vec::new());
+
+    let mut bindings = Vec::new();
+    let mut next_run = 0usize;
+    // Step 2: emit the BASE-exposed node, unconditionally.
+    emit_node(base_node, &base_path, true, &mut bindings, &mut next_run);
+
+    // Step 3: blanket early-outs — the faithful mirror of
+    // `assign_targets_in_chain`'s own early-outs, which assign the node's
+    // targets and stop without gating on derivability.
+    if is_per_opponent_target_fanout(base_node) || !chain_has_target_sink(base_node) {
+        return bindings;
+    }
+
+    // Step 4: descend.
+    descend_retarget_slots(base_node, &base_path, &mut bindings, &mut next_run);
+    bindings
+}
+
+/// Exhaustive over `ChainStep`; `None` when the path does not resolve, which
+/// `apply_retarget` turns into `InvalidAction` rather than writing elsewhere.
+pub(crate) fn node_at<'a>(
+    root: &'a ResolvedAbility,
+    path: &[ChainStep],
+) -> Option<&'a ResolvedAbility> {
+    let mut node = root;
+    for step in path {
+        node = match step {
+            ChainStep::SubAbility => node.sub_ability.as_deref()?,
+            ChainStep::ElseAbility => node.else_ability.as_deref()?,
+        };
+    }
+    Some(node)
+}
+
+pub(crate) fn node_at_mut<'a>(
+    root: &'a mut ResolvedAbility,
+    path: &[ChainStep],
+) -> Option<&'a mut ResolvedAbility> {
+    let mut node = root;
+    for step in path {
+        node = match step {
+            ChainStep::SubAbility => node.sub_ability.as_deref_mut()?,
+            ChainStep::ElseAbility => node.else_ability.as_deref_mut()?,
+        };
+    }
+    Some(node)
+}
+
+/// CR 601.2c: re-derive the chain's NON-DECLARED targets after a write to its
+/// declared ones. Two kinds exist, and `assign_targets_in_chain` re-derives both
+/// after an assignment; a retarget write must do the same or a synthesized node
+/// keeps targets computed from the OLD declaration:
+///   * an `AdditionalCostPaidInstead` parent whose `targets` mirror its sub's,
+///     AND whose `context.attach_target_bindings` mirror the sub's — BOTH are
+///     copied by `assign_targets_recursive`, so both are re-mirrored here.
+///   * `EachSourceDealsDamage { sources: ParentTarget, recipient:
+///     OtherBatchSource, .. }` nodes (`stamp_other_batch_source_targets`)
+///
+/// Extracted so `apply_retarget` and `assign_targets_in_chain` cannot disagree
+/// about what a chain write implies. Because `chain_retarget_slots` addresses
+/// the DELEGATED SUB and never the mirroring parent, this function only ever
+/// pushes values downstream-to-upstream — it can never overwrite a write.
+pub(crate) fn restamp_derived_chain_targets(ability: &mut ResolvedAbility) {
+    fn remirror(ability: &mut ResolvedAbility) {
+        if let Some(sub) = ability.sub_ability.as_deref_mut() {
+            remirror(sub);
+            if matches!(
+                sub.condition,
+                Some(AbilityCondition::AdditionalCostPaidInstead)
+            ) && ability.context.additional_cost_paid
+            {
+                ability.targets = sub.targets.clone();
+                ability.context.attach_target_bindings = sub.context.attach_target_bindings.clone();
+            }
+        }
+        if let Some(other) = ability.else_ability.as_deref_mut() {
+            remirror(other);
+        }
+    }
+    remirror(ability);
+    stamp_other_batch_source_targets(ability);
+}
+
+/// CR 601.2c + CR 115.8 + CR 700.2f: the prompt's addresses must still describe
+/// the stack entry they were derived from. THE single alignment authority; both
+/// the reducer and the AI generator consult it, so the two cannot disagree
+/// about whether a payload is still applicable.
+pub fn retarget_slots_aligned(
+    derived: &[RetargetSlotBinding],
+    slots: &[RetargetSlotAddress],
+) -> bool {
+    derived.len() >= slots.len()
+        && derived
+            .iter()
+            .map(|b| &b.address)
+            .take(slots.len())
+            .eq(slots.iter())
+}
+
+// ============================================================================
+// End addressable-slot authority infrastructure.
+// ============================================================================
+
+/// CR 115.7a + CR 115.7d + CR 115.3: is any CHANGED submission illegal for the
+/// position it is written into?
+///
+/// INVARIANT SC — THIS FUNCTION DOES NOT DERIVE A CANDIDATE SET, AND CANNOT.
+/// It does not take `&GameState`. Every legal-set producer in this engine
+/// (`find_legal_targets*`, `validate_targets*`, `has_legal_target*`,
+/// `legal_targets_for_*`) requires it, so a second derivation here is not
+/// expressible. `binding.enforcement`'s filter travels with the binding and is
+/// INERT here: a filter with no state to evaluate against is data.
+///
+/// The candidate set for position `i` was computed ONCE, at prompt
+/// construction (or forced-path evaluation), by `change_targets::slot_pool`,
+/// and is `slot_pools[i]`. Enforcement is membership in THAT VECTOR. This is
+/// not a weakening of BASE: BASE's check was
+/// `validate_targets_for_ability(..).is_empty()`, which is DEFINITIONALLY
+/// `!find_legal_targets_for_ability(..).contains(t)` (`targeting.rs:506` ->
+/// `:516`) — already a membership test, differing only in that it recomputed
+/// the set through a second call with a different `FilterContext` and a
+/// different controller. That second call is what produced round-5 defects B8
+/// and B9; deleting it deletes them.
+///
+/// The snapshot is the authority. BASE re-checked against the LIVE board here;
+/// that recheck is vacuous under N21 (no priority, no resolution, no SBA check
+/// between prompt construction and submission for the addressed positions'
+/// legal sets not shrinking).
+///
+/// An empty OUTER `slot_pools` means a payload predating the field, and ONLY
+/// that; the fallback is `legal_new_targets`, which for such a payload IS the
+/// cascade. An empty INNER pool is a positive statement ("this position has no
+/// legal alternative", CR 115.7a) and admits nothing — `get(i)` yields
+/// `Some(&[])`, so the OUTER fallback correctly does not fire. That is
+/// answerable only because `change_targets::retarget_prompt_is_dischargeable`
+/// refuses to park a `Single` prompt whose ADDRESSED position is in that state
+/// (phase-rs/phase#8355 round-6 defect B10).
+///
+/// SCOPE: this function does not know what is legal; it knows what was
+/// offered. `chain_retarget_slots` decides which positions exist, `slot_pool`
+/// decides what each may hold, and this function decides whether a submission
+/// respected that.
+pub fn retarget_slot_violation(
+    bindings: &[RetargetSlotBinding],
+    slot_pools: &[Vec<TargetRef>],
+    legal_new_targets: &[TargetRef],
     current_targets: &[TargetRef],
     new_targets: &[TargetRef],
 ) -> Option<usize> {
-    // CR 115.7d + CR 601.2c: the per-slot filters this node declares, in
-    // surfaced order. Two implementors today: a multi-role mana
-    // (`ManaTargetRole::surfaced_filters`) and a paired-subject exchange
-    // (`paired_subject_slot_filters`). Both already apply the
-    // `!is_context_ref()` projection, so both yield exactly the slots the
-    // collect pass surfaced and the assign pass consumed — which is what
-    // makes the positional zip below sound.
-    //
-    // The empty case reproduces the previous `mana_multi_role(..)?` early-out
-    // EXACTLY: a node outside both classes, and a paired node whose two
-    // filters are both context refs (Perplexing Chimera), declare no per-slot
-    // structure this function knows about and are passed through unfiltered,
-    // as before.
-    //
-    // SOUND ONLY BECAUSE OF §5.6/§5.7: `new_targets` is a permutation of the
-    // ROOT stack node's `ability.targets`. Before per-node ownership a chained
-    // Grift root held ALL FOUR flat targets, so this zip would have validated
-    // a 2-long prefix and ignored the rest. With per-node ownership the root
-    // holds exactly its own claimed pair, so the zip is total. This is why
-    // §5.11 may not land without §5.6/§5.7.
-    let filters: Vec<&TargetFilter> = match mana_multi_role(&ability.effect) {
-        Some(role) => role
-            .surfaced_filters()
-            .map(|(_slot, filter)| filter)
-            .collect(),
-        None => paired_subject_slot_filters(&ability.effect).collect(),
-    };
-    if filters.is_empty() {
-        return None;
+    for (i, (binding, submitted)) in bindings.iter().zip(new_targets.iter()).enumerate() {
+        // CR 115.7d's unchanged-position exemption, preserved word for word,
+        // including its existing rationale about INDEXING `current_targets`
+        // rather than zipping it.
+        if current_targets.get(i) == Some(submitted) {
+            continue;
+        }
+        // INVARIANT SC: the one computation's stored value, read.
+        let pool = slot_pools.get(i).map_or(legal_new_targets, Vec::as_slice);
+        if !pool.contains(submitted) {
+            return Some(i);
+        }
+        // CR 115.3: two positions sharing a `run` are ONE instance of "target".
+        if let Some(run) = binding.run {
+            if bindings
+                .iter()
+                .zip(new_targets)
+                .take(i)
+                .any(|(b, other)| b.run == Some(run) && other == submitted)
+            {
+                return Some(i);
+            }
+        }
     }
-    filters
-        .into_iter()
-        .zip(new_targets.iter())
-        .enumerate()
-        .find_map(|(slot, (filter, submitted))| {
-            // CR 115.7d: "the player may leave any number of the targets
-            // unchanged, even if those targets would be illegal." CR 115.7a says
-            // the same thing for the other scope from the other direction: a
-            // target is "changed only to another legal target", and a slot
-            // already holding its own submission was not changed at all. So a
-            // position whose submission equals its current target is exempt
-            // under BOTH retarget scopes, which is why this authority needs no
-            // scope parameter.
-            //
-            // `apply_retarget`'s pool-membership stage already exempts exactly
-            // these positions (its `All` arm's `continue` on
-            // `current_targets.get(idx) == Some(target)`); before this, the
-            // per-slot stage re-rejected them, so the one submission CR 115.7d
-            // guarantees — leave everything unchanged — was refused for every
-            // node `mana_multi_role` admits whose current target had become
-            // slot-illegal. The forced seam
-            // (`change_targets::forced_retarget_targets`) has always conjoined
-            // "changes" with "legal", and its doc already claims parity with
-            // this function; this is that same conjunction, here.
-            //
-            // Index `current_targets` rather than zipping it: a third `.zip`
-            // would truncate the scan and silently skip validation for any
-            // position beyond `current_targets.len()`, where `get` correctly
-            // yields `None` (no current target cannot be "unchanged").
-            let changes = current_targets.get(slot) != Some(submitted);
-            let illegal = targeting::validate_targets_for_ability(
-                state,
-                std::slice::from_ref(submitted),
-                filter,
-                ability,
-            )
-            .is_empty();
-            (changes && illegal).then_some(slot)
-        })
+    None
 }
 
 fn minimum_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -> usize {
@@ -8746,6 +9271,111 @@ mod tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::types::ability::{CombatRelation, CombatRelationSubject};
+
+    fn addr(slot: usize) -> RetargetSlotAddress {
+        RetargetSlotAddress { path: vec![], slot }
+    }
+
+    fn binding_at(slot: usize) -> RetargetSlotBinding {
+        RetargetSlotBinding {
+            address: addr(slot),
+            enforcement: SlotEnforcement::Legacy,
+            current: TargetRef::Player(PlayerId(0)),
+            run: None,
+        }
+    }
+
+    /// Row P-LEGACY-ROOT (ii) (phase-rs/phase#8355 round-8 review; m10's
+    /// stated predicate, `ability_utils.rs:8291-8299`) — cheap, and the only
+    /// guard between a `node_slot_filters`/`emit_node` arm-order drift and a
+    /// silent whole-cascade admission in release. `SlotEnforcement::Legacy`
+    /// (`node_slot_filters`' `NotDerivable` verdict) is BASE-equivalent ONLY
+    /// where BASE's own per-slot validator was ALSO a no-op there:
+    /// `mana_multi_role(&node.effect).is_none() && paired_subject_slot_
+    /// filters(&node.effect).next().is_none()`. `node_slot_filters` already
+    /// checks paired-subject filters (arm 2) and `mana_multi_role` (arm 4)
+    /// BEFORE any `NotDerivable` arm can be reached, so this predicate holds
+    /// by construction today — this row pins that ORDERING so a future arm
+    /// inserted ahead of them cannot silently break it without a test noticing.
+    #[test]
+    fn every_legacy_position_is_outside_the_mana_and_paired_subject_classes() {
+        let source = ObjectId(1);
+        let creature = ObjectId(2);
+
+        // `Effect::Fight` — `node_slot_filters` arm 3, unconditionally
+        // `NotDerivable`.
+        let fight = ResolvedAbility::new(
+            Effect::Fight {
+                target: TargetFilter::Typed(TypedFilter::creature()),
+                subject: TargetFilter::SelfRef,
+            },
+            vec![TargetRef::Object(creature)],
+            source,
+            PlayerId(0),
+        );
+
+        // `Effect::Attach` — arm 4's `NotDerivable` branch.
+        let attach = ResolvedAbility::new(
+            Effect::Attach {
+                attachment: TargetFilter::SelfRef,
+                target: TargetFilter::Typed(TypedFilter::creature()),
+            },
+            vec![TargetRef::Object(creature)],
+            source,
+            PlayerId(0),
+        );
+
+        let mut saw_legacy = false;
+        for ability in [&fight, &attach] {
+            let bindings = chain_retarget_slots(ability);
+            assert!(
+                !bindings.is_empty(),
+                "reach guard: the fixture must produce at least one binding"
+            );
+            for binding in &bindings {
+                if matches!(binding.enforcement, SlotEnforcement::Legacy) {
+                    saw_legacy = true;
+                    let node = node_at(ability, &binding.address.path).unwrap_or(ability);
+                    assert!(
+                        mana_multi_role(&node.effect).is_none()
+                            && paired_subject_slot_filters(&node.effect).next().is_none(),
+                        "P-LEGACY-ROOT (ii): a Legacy position's node must be outside \
+                         BOTH the mana-multi-role and paired-subject classes, or BASE's \
+                         own per-slot validator was not actually a no-op there"
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_legacy,
+            "reach guard: the fixture must produce >=1 Legacy binding"
+        );
+    }
+
+    /// U15 — `retarget_slots_aligned` is a prefix test: equal prefixes and a
+    /// strict-prefix payload (the derivation grew since prompt construction)
+    /// both align; a SHORTER derivation, a LONGER payload, or a DIFFERING
+    /// address at any shared position all fail to align.
+    #[test]
+    fn retarget_slots_aligned_is_a_prefix_test() {
+        let derived = vec![binding_at(0), binding_at(1)];
+
+        // Equal prefixes.
+        assert!(retarget_slots_aligned(&derived, &[addr(0), addr(1)]));
+        // Strict prefix: the derivation grew (e.g. a sub-node became
+        // reachable) but the payload's own addresses still match.
+        assert!(retarget_slots_aligned(&derived, &[addr(0)]));
+        // Empty payload: trivially aligned (a payload predating `slots`).
+        assert!(retarget_slots_aligned(&derived, &[]));
+
+        // Shorter derivation than the payload.
+        assert!(!retarget_slots_aligned(
+            &[binding_at(0)],
+            &[addr(0), addr(1)]
+        ));
+        // Differing address at a shared position.
+        assert!(!retarget_slots_aligned(&derived, &[addr(0), addr(2)]));
+    }
 
     fn typed_with(props: Vec<FilterProp>) -> TargetFilter {
         TargetFilter::Typed(TypedFilter {
@@ -9417,25 +10047,33 @@ mod tests {
         );
     }
 
+    /// INVARIANT SC (round 6+): `retarget_slot_violation` is re-signatured to
+    /// take `slot_pools` rather than deriving legality from `&GameState`; a
+    /// binding's `run` is the only field it reads besides pool membership. A
+    /// `Legacy` placeholder enforcement is fine everywhere below — the value is
+    /// never consulted.
+    fn plain_binding(slot: usize) -> RetargetSlotBinding {
+        RetargetSlotBinding {
+            address: RetargetSlotAddress { path: vec![], slot },
+            enforcement: SlotEnforcement::Legacy,
+            current: TargetRef::Player(PlayerId(0)),
+            run: None,
+        }
+    }
+
     /// Matrix row 8b — CR 115.7a: "each target can be changed only to another
     /// legal target." A flat `legal_new_targets_for_stack_entry` union pool
     /// cannot express per-slot legality, so `retarget_slot_violation` re-checks
-    /// each submission against the filter of the slot it actually lands in.
+    /// each submission against the STORED POOL of the slot it actually lands
+    /// in (INVARIANT SC).
     #[test]
     fn retarget_slot_violation_rejects_slot_legal_only_for_the_other_slot() {
         use crate::types::ability::ManaTargetRole;
 
-        let mut state = GameState::new_two_player(23);
-        let source = create_object(
-            &mut state,
-            CardId(1),
-            PlayerId(0),
-            "Retarget Mana Source".to_string(),
-            Zone::Battlefield,
-        );
+        let source = ObjectId(1);
 
-        // Recipient: any player. Count source: an OPPONENT of P0 (i.e. P1 only).
-        // P0 is therefore legal for slot 0 and ILLEGAL for slot 1.
+        // Recipient: any player. Count source: an OPPONENT of P0 (i.e. P1 only)
+        // — the SAME asymmetric shape `slot_pool` would have produced.
         let role = ManaTargetRole::Both {
             recipient: TargetFilter::Player,
             count_source: TargetFilter::Typed(
@@ -9443,11 +10081,17 @@ mod tests {
             ),
         };
         let ability = mana_ability_with_role(role.clone(), source);
-
-        // Reach guard: two surfaced slots with DIFFERENT filters, so the two
-        // positions are genuinely discriminable.
         assert!(mana_multi_role(&ability.effect).is_some());
         assert_eq!(role.surfaced_filters().count(), 2);
+
+        let bindings = vec![plain_binding(0), plain_binding(1)];
+        let slot_pools = vec![
+            vec![
+                TargetRef::Player(PlayerId(0)),
+                TargetRef::Player(PlayerId(1)),
+            ],
+            vec![TargetRef::Player(PlayerId(1))],
+        ];
 
         // Positive: a slot-legal submission is accepted. Without this the
         // negative below could pass because EVERYTHING is rejected. Both slots
@@ -9455,8 +10099,9 @@ mod tests {
         // proves legality rather than the CR 115.7d unchanged-position exemption.
         assert_eq!(
             retarget_slot_violation(
-                &state,
-                &ability,
+                &bindings,
+                &slot_pools,
+                &[],
                 &[
                     TargetRef::Player(PlayerId(1)),
                     TargetRef::Player(PlayerId(0)),
@@ -9470,14 +10115,15 @@ mod tests {
             "P0 is a legal recipient and P1 a legal count source"
         );
 
-        // Negative: P0 is in the flat union pool (legal for the recipient slot)
-        // but illegal in the COUNT SOURCE slot it was submitted into. Slot 1
+        // Negative: P0 is in slot 0's pool (legal for the recipient slot) but
+        // illegal in the COUNT SOURCE slot it was submitted into. Slot 1
         // genuinely changes (P1 -> P0) against the current targets, so the
         // exemption does not apply and the violation must be reported.
         assert_eq!(
             retarget_slot_violation(
-                &state,
-                &ability,
+                &bindings,
+                &slot_pools,
+                &[],
                 &[
                     TargetRef::Player(PlayerId(1)),
                     TargetRef::Player(PlayerId(1)),
@@ -9488,8 +10134,8 @@ mod tests {
                 ],
             ),
             Some(1),
-            "CR 115.7a: P0 is not an opponent, so it is illegal in slot 1 even though \
-             the flat union pool contains it"
+            "CR 115.7a: P0 is not an opponent, so it is illegal in slot 1's OWN pool \
+             even though slot 0's pool contains it"
         );
     }
 
@@ -9503,17 +10149,8 @@ mod tests {
     fn retarget_slot_violation_exempts_an_unchanged_illegal_target() {
         use crate::types::ability::ManaTargetRole;
 
-        let mut state = GameState::new_two_player(24);
-        let source = create_object(
-            &mut state,
-            CardId(1),
-            PlayerId(0),
-            "Retarget Mana Source".to_string(),
-            Zone::Battlefield,
-        );
+        let source = ObjectId(1);
 
-        // Recipient: any player. Count source: an OPPONENT of P0 (i.e. P1 only).
-        // P0 is therefore legal for slot 0 and ILLEGAL for slot 1.
         let role = ManaTargetRole::Both {
             recipient: TargetFilter::Player,
             count_source: TargetFilter::Typed(
@@ -9521,10 +10158,17 @@ mod tests {
             ),
         };
         let ability = mana_ability_with_role(role.clone(), source);
-
-        // Reach guard: the node is admitted and has two discriminable slots.
         assert!(mana_multi_role(&ability.effect).is_some());
         assert_eq!(role.surfaced_filters().count(), 2);
+
+        let bindings = vec![plain_binding(0), plain_binding(1)];
+        let slot_pools = vec![
+            vec![
+                TargetRef::Player(PlayerId(0)),
+                TargetRef::Player(PlayerId(1)),
+            ],
+            vec![TargetRef::Player(PlayerId(1))],
+        ];
 
         // Reach guard: the function still DISCRIMINATES. Slot 1 genuinely
         // changes P1 -> P0 and is illegal there, so a violation is still
@@ -9532,8 +10176,9 @@ mod tests {
         // world where this authority stopped rejecting anything at all.
         assert_eq!(
             retarget_slot_violation(
-                &state,
-                &ability,
+                &bindings,
+                &slot_pools,
+                &[],
                 &[
                     TargetRef::Player(PlayerId(1)),
                     TargetRef::Player(PlayerId(1)),
@@ -9552,8 +10197,9 @@ mod tests {
         // is no violation to report.
         assert_eq!(
             retarget_slot_violation(
-                &state,
-                &ability,
+                &bindings,
+                &slot_pools,
+                &[],
                 &[
                     TargetRef::Player(PlayerId(1)),
                     TargetRef::Player(PlayerId(0)),
@@ -9583,14 +10229,7 @@ mod tests {
     /// `None` unconditionally, regardless of per-slot legality.
     #[test]
     fn paired_subject_retarget_rejects_a_submission_illegal_for_its_own_slot() {
-        let mut state = GameState::new_two_player(31);
-        let source = create_object(
-            &mut state,
-            CardId(1),
-            PlayerId(0),
-            "Paired Retarget Source".to_string(),
-            Zone::Battlefield,
-        );
+        let source = ObjectId(1);
 
         // player_a: any player. player_b: an OPPONENT of P0 (i.e. P1 only).
         // P0 is therefore legal for slot 0 and ILLEGAL for slot 1 — the SAME
@@ -9616,14 +10255,24 @@ mod tests {
         assert!(paired_subject_filters(&ability.effect).is_some());
         assert_eq!(paired_subject_slot_filters(&ability.effect).count(), 2);
 
+        let bindings = vec![plain_binding(0), plain_binding(1)];
+        let slot_pools = vec![
+            vec![
+                TargetRef::Player(PlayerId(0)),
+                TargetRef::Player(PlayerId(1)),
+            ],
+            vec![TargetRef::Player(PlayerId(1))],
+        ];
+
         // POSITIVE (paired positive, MANDATORY): a slot-legal submission where
         // BOTH positions genuinely change is accepted — MEASURED `None` on
         // both sides, proving legality rather than the CR 115.7d
         // unchanged-position exemption.
         assert_eq!(
             retarget_slot_violation(
-                &state,
-                &ability,
+                &bindings,
+                &slot_pools,
+                &[],
                 &[
                     TargetRef::Player(PlayerId(1)),
                     TargetRef::Player(PlayerId(0)),
@@ -9637,14 +10286,15 @@ mod tests {
             "P0 is a legal player_a and P1 a legal (opponent) player_b"
         );
 
-        // NEGATIVE / REVERT-FAILING: P0 is in the flat union pool (legal for
+        // NEGATIVE / REVERT-FAILING: P0 is in slot 0's pool (legal for
         // player_a) but illegal in the player_b (opponent-only) slot it lands
         // in. Slot 1 genuinely changes (P1 -> P0), so the unchanged-position
         // exemption does not apply.
         assert_eq!(
             retarget_slot_violation(
-                &state,
-                &ability,
+                &bindings,
+                &slot_pools,
+                &[],
                 &[
                     TargetRef::Player(PlayerId(1)),
                     TargetRef::Player(PlayerId(1)),
@@ -9656,8 +10306,8 @@ mod tests {
             ),
             Some(1),
             "BASE: None (mana_multi_role(..)? bails unconditionally) — CR 115.7d: P0 is \
-             not an opponent, so it is illegal in slot 1 even though the flat pool \
-             contains it"
+             not an opponent, so it is illegal in slot 1's own pool even though slot 0's \
+             pool contains it"
         );
 
         // HOSTILE 1 (the unchanged-position exemption still holds under the
@@ -9665,8 +10315,9 @@ mod tests {
         // though P0 is illegal in slot 1.
         assert_eq!(
             retarget_slot_violation(
-                &state,
-                &ability,
+                &bindings,
+                &slot_pools,
+                &[],
                 &[
                     TargetRef::Player(PlayerId(1)),
                     TargetRef::Player(PlayerId(0)),
@@ -9682,9 +10333,10 @@ mod tests {
         );
 
         // HOSTILE 2 (the zero-claim paired node — Perplexing Chimera's
-        // shape): must still return `None` via the `filters.is_empty()`
-        // guard, reproducing BASE's `?` early-out exactly — the generalised
-        // arm must not start reporting violations for a node claiming no slot.
+        // shape): must still return `None` — no bindings for this position, so
+        // the `zip` over `bindings` is empty, reproducing BASE's `?` early-out
+        // exactly. The generalised arm must not start reporting violations for
+        // a node claiming no slot.
         let zero_claim = ResolvedAbility::new(
             Effect::ExchangeControl {
                 target_a: TargetFilter::SelfRef,
@@ -9699,8 +10351,9 @@ mod tests {
             .is_none());
         assert_eq!(
             retarget_slot_violation(
-                &state,
-                &zero_claim,
+                &[],
+                &[],
+                &[],
                 &[TargetRef::Player(PlayerId(0))],
                 &[TargetRef::Player(PlayerId(1))],
             ),
