@@ -78,6 +78,11 @@ class AudioManager {
    * `ctx.resume()`). A new method in any of those categories must join the
    * set. Pure parameter automation on nodes that already exist — gain ramps,
    * `dispose()`'s teardown — is inert on a dead context and stays unguarded.
+   *
+   * Asynchronous continuations RECHECK rather than inheriting their caller's
+   * guard: an entry check is stale by the time a callback runs, so
+   * `playTrack()`'s `ended` handler and its `play()`-rejection path each latch
+   * on `disabled` and the generation before touching the context again.
    */
   disable(): void {
     this.disabled = true;
@@ -610,18 +615,26 @@ class AudioManager {
 
     this.currentAudio = audio;
 
-    // Capture generation so the ended handler becomes a no-op if a context
+    // Capture generation so the continuations below become no-ops if a context
     // change or stopMusic has occurred since this track started.
     const gen = this.generation;
     audio.addEventListener("ended", () => {
-      if (this.generation !== gen) return;
+      if (this.disabled || this.generation !== gen) return;
       this.crossfadeTo(this.nextTrackIndex());
     });
 
+    // The guard at the top of this method is synchronous and stale by the time
+    // a rejection arrives: `disabled` can latch, and the generation can move,
+    // between initiating playback and hearing back. Neither `resume()` nor the
+    // retry reaches a guarded entry point, so each async step rechecks both.
     audio.play().catch((err) => {
       console.warn("[music] play() rejected:", err);
+      if (this.disabled || this.generation !== gen) return;
       if (this.ctx?.state === "suspended") {
-        this.ctx.resume().then(() => audio.play().catch(() => {}));
+        this.ctx.resume().then(() => {
+          if (this.disabled || this.generation !== gen) return;
+          audio.play().catch(() => {});
+        });
       }
     });
   }

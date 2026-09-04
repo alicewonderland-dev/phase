@@ -10,6 +10,24 @@ const resumeSpy = vi.fn().mockResolvedValue(undefined);
 // Per-test so a fixture can put the LIVE context into the one state that
 // reaches ensurePlayback's resume branch.
 let contextState: AudioContextState = "running";
+
+// `playTrack` hangs a continuation off `audio.play()`'s rejection. Holding the
+// rejection lets a test latch `disable()` in the window between initiating
+// playback and hearing back — the window the entry guard cannot see.
+let rejectPlay: ((err: unknown) => void) | null = null;
+const playSpy = vi.fn();
+
+class StubAudio {
+  crossOrigin = "";
+  play = playSpy;
+  pause = vi.fn();
+  addEventListener = vi.fn();
+  removeEventListener = vi.fn();
+}
+vi.stubGlobal("Audio", StubAudio);
+
+/** Let queued microtasks (the catch, then its resume().then) run. */
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 const createBufferSourceSpy = vi.fn().mockImplementation(() => ({
   buffer: null,
   connect: vi.fn(),
@@ -64,6 +82,13 @@ describe("AudioManager.disable", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     contextState = "running";
+    rejectPlay = null;
+    playSpy.mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectPlay = reject;
+        }),
+    );
   });
 
   // Disabled tests arm device-open first so they discriminate the disable()
@@ -214,6 +239,71 @@ describe("AudioManager.disable", () => {
     audioManager.ensurePlayback();
 
     expect(resumeSpy).toHaveBeenCalledOnce();
+  });
+
+  // The `ensurePlayback` guard is synchronous and cannot see this: `playTrack`
+  // initiates playback while enabled, and the rejection arrives later. If the
+  // boot deadline latches in that window, the continuation would resume a media
+  // stack that was deliberately declared dead.
+  it("a play() rejection arriving after disable resumes nothing", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const audioManager = await freshAudioManager();
+    audioManager.armDeviceOpen();
+    audioManager.warmUp();
+    audioManager.setContext("menu", true);
+
+    // Reach guard: playback really was initiated, so there is a live
+    // continuation for the latch to have to stop.
+    expect(playSpy).toHaveBeenCalled();
+    expect(rejectPlay).not.toBeNull();
+
+    audioManager.disable();
+    contextState = "suspended";
+    rejectPlay!(new Error("autoplay blocked"));
+    await flush();
+
+    expect(resumeSpy).not.toHaveBeenCalled();
+    // The retry rides behind resume(); neither may fire.
+    expect(playSpy).toHaveBeenCalledOnce();
+    warn.mockRestore();
+  });
+
+  // Control arm: identical deferred rejection on an identical suspended
+  // context, latch never set. Without it the assertion above would pass on a
+  // fixture whose continuation never ran at all.
+  it("the same deferred rejection does resume while enabled", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const audioManager = await freshAudioManager();
+    audioManager.armDeviceOpen();
+    audioManager.warmUp();
+    audioManager.setContext("menu", true);
+
+    contextState = "suspended";
+    rejectPlay!(new Error("autoplay blocked"));
+    await flush();
+
+    expect(resumeSpy).toHaveBeenCalledOnce();
+    warn.mockRestore();
+  });
+
+  // Same window, different invalidation: a context change between initiating
+  // playback and the rejection makes this continuation stale, so it must not
+  // resume on behalf of a track that is no longer current.
+  it("a play() rejection from a superseded generation resumes nothing", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const audioManager = await freshAudioManager();
+    audioManager.armDeviceOpen();
+    audioManager.warmUp();
+    audioManager.setContext("menu", true);
+    const staleReject = rejectPlay!;
+
+    audioManager.setContext("battlefield", true);
+    contextState = "suspended";
+    staleReject(new Error("autoplay blocked"));
+    await flush();
+
+    expect(resumeSpy).not.toHaveBeenCalled();
+    warn.mockRestore();
   });
 
   it("diagnostics reports the disabled state", async () => {
