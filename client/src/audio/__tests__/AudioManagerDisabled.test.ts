@@ -6,6 +6,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // singleton and leaking the flag into its assertions.
 
 const decodeAudioDataSpy = vi.fn().mockResolvedValue({});
+const resumeSpy = vi.fn().mockResolvedValue(undefined);
+// Per-test so a fixture can put the LIVE context into the one state that
+// reaches ensurePlayback's resume branch.
+let contextState: AudioContextState = "running";
 const createBufferSourceSpy = vi.fn().mockImplementation(() => ({
   buffer: null,
   connect: vi.fn(),
@@ -24,6 +28,11 @@ const audioContextSpy = vi.fn().mockImplementation(function () {
       connect: vi.fn(),
     })),
     createBufferSource: createBufferSourceSpy,
+    createMediaElementSource: vi.fn().mockImplementation(() => ({ connect: vi.fn() })),
+    resume: resumeSpy,
+    get state() {
+      return contextState;
+    },
     decodeAudioData: decodeAudioDataSpy,
     close: vi.fn(),
     destination: {},
@@ -54,6 +63,7 @@ async function freshAudioManager() {
 describe("AudioManager.disable", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    contextState = "running";
   });
 
   // Disabled tests arm device-open first so they discriminate the disable()
@@ -171,6 +181,39 @@ describe("AudioManager.disable", () => {
     audioManager.warmUp();
     await audioManager.preloadSfx();
     expect(decodeAudioDataSpy).toHaveBeenCalled();
+  });
+
+  // The existing "ensurePlayback stays device-free while disabled" case above
+  // disables BEFORE warm-up, so `ctx` is null and the resume branch is never
+  // reached — it cannot see this. The boot deadline latches with the context
+  // still live, and `ctx.resume()` acts on it directly rather than through a
+  // guarded callee, so a gesture handler could walk back into the media path
+  // boot just declared dead.
+  it("ensurePlayback resumes nothing once disabled, even on a live suspended context", async () => {
+    const audioManager = await freshAudioManager();
+    audioManager.armDeviceOpen();
+    audioManager.warmUp();
+    audioManager.disable();
+    contextState = "suspended";
+
+    audioManager.ensurePlayback();
+
+    expect(audioContextSpy).toHaveBeenCalledOnce();
+    expect(resumeSpy).not.toHaveBeenCalled();
+  });
+
+  // Control arm: identical live, suspended context with the latch never set.
+  // Without it the assertion above would pass on a fixture that never reached
+  // the resume branch at all.
+  it("ensurePlayback does resume the same live suspended context while enabled", async () => {
+    const audioManager = await freshAudioManager();
+    audioManager.armDeviceOpen();
+    audioManager.warmUp();
+    contextState = "suspended";
+
+    audioManager.ensurePlayback();
+
+    expect(resumeSpy).toHaveBeenCalledOnce();
   });
 
   it("diagnostics reports the disabled state", async () => {

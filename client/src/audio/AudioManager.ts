@@ -72,9 +72,12 @@ class AudioManager {
    *
    * Because the context can outlive the latch — and can outlive it with
    * buffers already decoded — the flag guards every method that OPENS a media
-   * pipeline or FEEDS one: `warmUp()` (the device), `preloadSfx()` (a decode),
-   * `playTrack()`/`playStinger()` (a media element source), and `playSfx()`
-   * (a buffer source). A new method in either category must join that set.
+   * pipeline, FEEDS one, or RESUMES one: `warmUp()` (the device),
+   * `preloadSfx()` (a decode), `playTrack()`/`playStinger()` (a media element
+   * source), `playSfx()` (a buffer source), and `ensurePlayback()` (a direct
+   * `ctx.resume()`). A new method in any of those categories must join the
+   * set. Pure parameter automation on nodes that already exist — gain ramps,
+   * `dispose()`'s teardown — is inert on a dead context and stays unguarded.
    */
   disable(): void {
     this.disabled = true;
@@ -450,8 +453,14 @@ class AudioManager {
    * Resume audio playback after a user gesture (e.g. unmute button click).
    * Warms up the AudioContext if needed, resumes it if suspended,
    * and ensures music is playing for the current context.
+   *
+   * Returns early while disabled rather than relying on its callees' guards:
+   * `resume()` below acts on `ctx` directly, and the boot deadline can latch
+   * with that context still live, so a gesture handler would otherwise walk
+   * straight back into the media path boot just declared dead.
    */
   ensurePlayback(): void {
+    if (this.disabled) return;
     this.warmUp();
     this.preloadSfx();
 
