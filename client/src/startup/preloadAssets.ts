@@ -72,7 +72,16 @@ function awaitSfxPreload(
   ]).finally(() => clearTimeout(timer));
 }
 
-/** Actionable line for the terminal, per outcome. Never called for "ready". */
+/**
+ * Actionable line for the terminal, per outcome. Only called once boot has
+ * concluded the host cannot play sound at all.
+ *
+ * Not routed through `t()` on purpose: `i18n/README.md` puts console output on
+ * the never-translate list, and this line's counterpart is the shell's English
+ * stderr from `src-tauri/src/media_stack.rs` — the two are read together in one
+ * terminal. The user-facing half of this state is localized, in the volume
+ * control's `volume.mediaUnavailable`.
+ */
 function sfxFailureDiagnostic(outcome: Exclude<SfxPreloadOutcome, "ready">): string {
   const cause =
     outcome === "timed-out"
@@ -118,10 +127,23 @@ export function ensurePreload(): Promise<void> {
     emit({ phase: "audio", percent: 20 });
     audioManager.warmUp();
     const outcome = await awaitSfxPreload(audioManager.preloadSfx(), SFX_PRELOAD_DEADLINE_MS);
-    if (outcome !== "ready") {
-      // Latch audio off: on this host every later pipeline — theme loads,
-      // music tracks, a gesture handler's ensurePlayback() — would hang or
-      // fail the same way, so stop opening them.
+    if (outcome === "ready") {
+      // Nothing to do — every file settled and at least one decoded.
+    } else if (outcome === "timed-out" && audioManager.sfxAvailability() !== "none") {
+      // A fired deadline is not a verdict on its own. `preloadSfx` cannot
+      // resolve while a single file hangs, but its siblings' buffers are
+      // already in the map and playable — so ask what landed before switching
+      // anything off. Losing every sound to one bad file would be a worse bug
+      // than the one this deadline exists to fix.
+      console.warn(
+        `[audio] Some sounds did not decode within ${SFX_PRELOAD_DEADLINE_MS}ms. ` +
+          "Continuing with the ones that did.",
+      );
+    } else {
+      // Nothing decoded, or the preload failed outright: this host cannot play
+      // sound. Latch audio off so no later pipeline — theme loads, music
+      // tracks, a gesture handler's ensurePlayback() — hangs or fails the same
+      // way.
       audioManager.disable();
       useAudioHealthStore.getState().setUnavailable("media-unavailable");
       console.error(sfxFailureDiagnostic(outcome));

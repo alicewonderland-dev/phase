@@ -14,6 +14,12 @@ vi.mock("../../services/audioHealth", () => ({ audioDeviceSafe: audioDeviceSafeM
 // needs was never fully built.
 let decodeAudioData: () => Promise<unknown> = () => Promise.resolve({});
 
+const createBufferSourceSpy = vi.fn().mockImplementation(() => ({
+  buffer: null,
+  connect: vi.fn(),
+  start: vi.fn(),
+}));
+
 const audioContextSpy = vi.fn().mockImplementation(function () {
   return {
     createGain: vi.fn().mockImplementation(() => ({
@@ -26,6 +32,7 @@ const audioContextSpy = vi.fn().mockImplementation(function () {
       connect: vi.fn(),
     })),
     decodeAudioData: vi.fn().mockImplementation(() => decodeAudioData()),
+    createBufferSource: createBufferSourceSpy,
     close: vi.fn(),
     destination: {},
     currentTime: 0,
@@ -45,6 +52,9 @@ vi.mock("../../audio/audioCache", () => ({
   cacheThemeManifest: vi.fn().mockResolvedValue(undefined),
   clearThemeCache: vi.fn().mockResolvedValue(undefined),
 }));
+
+// The boot default theme, read only for its event-type list.
+import { PLANESWALKER_THEME } from "../../audio/planeswalkerTheme";
 
 // preloadAssets caches its promise and audioManager latches isWarmedUp, both
 // at module scope — fresh module graph per test (changelog.test.ts idiom).
@@ -262,6 +272,77 @@ describe("ensurePreload SFX deadline", () => {
     expect(diagnostic).not.toHaveBeenCalled();
     diagnostic.mockRestore();
     warn.mockRestore();
+  });
+
+  // A hanging file and a working file are not the same host. `preloadSfx`
+  // cannot resolve while one decode is pending, so the deadline fires — but the
+  // siblings that already decoded are in the buffer map and playable, and
+  // switching audio off would cost the user every sound to save one.
+  it("one never-settling decode among many keeps the decoded sounds playable", async () => {
+    let call = 0;
+    decodeAudioData = () => {
+      call += 1;
+      return call === 1 ? new Promise(() => {}) : Promise.resolve({});
+    };
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const {
+      ensurePreload,
+      subscribePreload,
+      audioManager,
+      useAudioHealthStore,
+      SFX_PRELOAD_DEADLINE_MS,
+    } = await freshBoot();
+
+    const percents: number[] = [];
+    const unsub = subscribePreload((p) => percents.push(p.percent));
+    const done = ensurePreload();
+    await vi.advanceTimersByTimeAsync(SFX_PRELOAD_DEADLINE_MS);
+    await done;
+    unsub();
+
+    // Reach guard: the deadline really is what ended this boot — one decode is
+    // still pending, so preloadSfx cannot have resolved on its own.
+    expect(call).toBeGreaterThan(1);
+    expect(percents).toContain(100);
+
+    // Audio survives, and not just as a flag: a decoded buffer still plays.
+    expect(useAudioHealthStore.getState().unavailable).toBeNull();
+    expect(audioManager.isDisabled).toBe(false);
+    expect(audioManager.sfxAvailability()).toBe("partial");
+    for (const { eventType } of PLANESWALKER_THEME.sfx) {
+      audioManager.playSfx(eventType);
+    }
+    expect(createBufferSourceSpy).toHaveBeenCalled();
+
+    // Degraded-audio wiring stays untriggered; the partial load is a warning.
+    expect(diagnostic).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalled();
+    diagnostic.mockRestore();
+    warn.mockRestore();
+  });
+
+  // Control arm for the test above: same never-settling decode, but now it is
+  // every file. Only the count of hanging decodes differs, so the assertion
+  // that audio survives above is about partial availability and nothing else.
+  it("every decode never settling is still the all-fail degraded path", async () => {
+    decodeAudioData = () => new Promise(() => {});
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+    const {
+      ensurePreload,
+      audioManager,
+      useAudioHealthStore,
+      SFX_PRELOAD_DEADLINE_MS,
+    } = await freshBoot();
+
+    const done = ensurePreload();
+    await vi.advanceTimersByTimeAsync(SFX_PRELOAD_DEADLINE_MS);
+    await done;
+
+    expect(useAudioHealthStore.getState().unavailable).toBe("media-unavailable");
+    expect(audioManager.isDisabled).toBe(true);
+    expect(diagnostic).toHaveBeenCalledOnce();
+    diagnostic.mockRestore();
   });
 
   // The wedged-device verdict already named the fault and left ctx null, so

@@ -24,13 +24,14 @@ function shuffle<T>(arr: T[]): T[] {
 const DEFAULT_PHASE_BREAKPOINTS = { mid: 5, late: 10 };
 
 /**
- * What one `preloadSfx()` pass put into the buffer map.
+ * How much of the active theme's SFX is playable — what the buffer map holds,
+ * which is the same thing `playSfx` reads.
  *
- * - `skipped` — nothing to do: audio is off, there is no context, or the theme
- *   declares no SFX. Says nothing about whether the host can play sound.
- * - `none` — every file failed. On a host with a working media pipeline this
- *   does not happen, so it is the pipeline reporting itself broken.
- * - `partial` / `loaded` — some or all decoded; audio works either way.
+ * - `skipped` — nothing to say: audio is off, there is no context, or the theme
+ *   declares no SFX. Not a statement about whether the host can play sound.
+ * - `none` — nothing decoded. On a host with a working media pipeline that does
+ *   not happen, so it is the pipeline reporting itself broken.
+ * - `partial` / `loaded` — some or all decoded; sound works either way.
  */
 export type SfxPreloadResult = "skipped" | "none" | "partial" | "loaded";
 
@@ -132,21 +133,47 @@ class AudioManager {
   // ---------------------------------------------------------------------------
 
   /**
+   * How much of the active theme is playable right now.
+   *
+   * Reads the buffer map rather than the outcome of a preload pass, because
+   * the map is what `playSfx` reads and because a caller may need an answer
+   * while a pass is still in flight: `preloadSfx` cannot resolve until every
+   * file settles, but the files that already decoded are playable the moment
+   * they land. The boot deadline depends on that distinction — one file that
+   * never settles must not cost the user every other sound (issue #6744).
+   *
+   * Sharing one classifier with `preloadSfx` is what keeps "what boot decided"
+   * and "what is actually playable" from drifting apart.
+   */
+  sfxAvailability(): SfxPreloadResult {
+    if (this.disabled || !this.ctx) return "skipped";
+    const entries = Object.entries(this.activeTheme.sfxMap);
+    const urls = [...new Set(entries.map(([, url]) => url))];
+    if (urls.length === 0) return "skipped";
+
+    const loaded = urls.filter((url) =>
+      entries.some(([eventType, u]) => u === url && this.sfxBuffers.has(eventType)),
+    ).length;
+    if (loaded === 0) return "none";
+    return loaded === urls.length ? "loaded" : "partial";
+  }
+
+  /**
    * Preload all unique SFX files into AudioBuffers (background, non-blocking).
    *
-   * Reports what actually landed. `loadBuffer` swallows per-file failures on
-   * purpose — one unreachable sound must not take the rest down — but a pass
-   * where *nothing* decoded is not a partial failure, it is the platform
-   * telling us it cannot play sound at all, and the boot gate has to be able
-   * to tell those apart (issue #6744).
+   * `loadBuffer` swallows per-file failures on purpose — one unreachable sound
+   * must not take the rest down — so the result is read off the buffer map
+   * afterwards. A pass where *nothing* decoded is not a partial failure; it is
+   * the platform telling us it cannot play sound at all, and the boot gate has
+   * to be able to tell those apart.
    */
   async preloadSfx(): Promise<SfxPreloadResult> {
     if (this.disabled || !this.ctx) return "skipped";
-    const urls = [...new Set(Object.values(this.activeTheme.sfxMap))];
-    if (urls.length === 0) return "skipped";
     const entries = Object.entries(this.activeTheme.sfxMap);
+    const urls = [...new Set(entries.map(([, url]) => url))];
+    if (urls.length === 0) return "skipped";
 
-    const buffers = await Promise.all(
+    await Promise.all(
       urls.map((url) => {
         // Find the eventType(s) that map to this URL
         const eventTypes = entries
@@ -156,9 +183,7 @@ class AudioManager {
       }),
     );
 
-    const loaded = buffers.filter((buffer) => buffer !== null).length;
-    if (loaded === 0) return "none";
-    return loaded === buffers.length ? "loaded" : "partial";
+    return this.sfxAvailability();
   }
 
   /** Play a single SFX by GameEvent type. */
@@ -530,12 +555,10 @@ class AudioManager {
     return event.type;
   }
 
-  /** The decoded buffer, or `null` when this one file could not be loaded. */
-  private async loadBuffer(
-    url: string,
-    eventTypes: string[],
-  ): Promise<AudioBuffer | null> {
-    if (!this.ctx) return null;
+  /** Decode one file into the buffer map. Failures are logged, not thrown —
+   *  `sfxAvailability()` reads the map to find out what survived. */
+  private async loadBuffer(url: string, eventTypes: string[]): Promise<void> {
+    if (!this.ctx) return;
     try {
       const isLocal = url.startsWith("/");
       let arrayBuffer: ArrayBuffer;
@@ -560,10 +583,8 @@ class AudioManager {
         this.sfxBuffers.set(et, audioBuffer);
       }
       console.debug(`[SFX] Loaded ${url} → [${eventTypes.join(", ")}]`);
-      return audioBuffer;
     } catch (err) {
       console.warn(`[SFX] Failed to load: ${url}`, err);
-      return null;
     }
   }
 
