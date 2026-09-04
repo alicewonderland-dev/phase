@@ -146,6 +146,11 @@ the bundled `.m4a` tracks decode through. Without them the app starts and plays
 normally but stays silent, and prints the missing plugins and their packages to
 the terminal on launch.
 
+Release-time verification that the shipped AppImage's bundled plugin set really
+resolves those elements is tracked separately, in
+[#8357](https://github.com/phase-rs/phase/issues/8357) — it lives in the release
+workflow, which is maintainer-owned.
+
 ### Android APKs
 
 Android builds require Node.js 22, pnpm 9.15.9, JDK 17, Android SDK platform
