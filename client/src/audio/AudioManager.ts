@@ -74,10 +74,17 @@ class AudioManager {
    * buffers already decoded — the flag guards every method that OPENS a media
    * pipeline, FEEDS one, or RESUMES one: `warmUp()` (the device),
    * `preloadSfx()` (a decode), `playTrack()`/`playStinger()` (a media element
-   * source), `playSfx()` (a buffer source), and `ensurePlayback()` (a direct
-   * `ctx.resume()`). A new method in any of those categories must join the
+   * source), `playSfx()` (a buffer source), `startMusic()` (the rotation entry
+   * point), and `ensurePlayback()` (a direct `ctx.resume()`). A new method in any of those categories must join the
    * set. Pure parameter automation on nodes that already exist — gain ramps,
    * `dispose()`'s teardown — is inert on a dead context and stays unguarded.
+   *
+   * `setContext()` is deliberately NOT guarded: it is the teardown path as well
+   * as the start path, so an early return would strand music that was already
+   * playing when the latch fired, leaving a "disabled" manager audible. It
+   * reaches playback only through `startMusic()`/`playTrack()`, both of which
+   * check, so the pipeline stays shut while its `stopMusic()` half keeps
+   * working.
    *
    * Asynchronous continuations RECHECK rather than inheriting their caller's
    * guard: an entry check is stale by the time a callback runs, so
@@ -396,7 +403,7 @@ class AudioManager {
 
   /** Start music playback with shuffled track rotation for the active context. */
   startMusic(): void {
-    if (!this.ctx || !this.musicGain) return;
+    if (this.disabled || !this.ctx || !this.musicGain) return;
 
     const prefs = usePreferencesStore.getState();
     if (prefs.musicMuted || prefs.masterMuted) return;

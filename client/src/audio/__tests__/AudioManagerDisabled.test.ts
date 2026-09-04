@@ -7,6 +7,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const decodeAudioDataSpy = vi.fn().mockResolvedValue({});
 const resumeSpy = vi.fn().mockResolvedValue(undefined);
+const createMediaElementSourceSpy = vi
+  .fn()
+  .mockImplementation(() => ({ connect: vi.fn() }));
 // Per-test so a fixture can put the LIVE context into the one state that
 // reaches ensurePlayback's resume branch.
 let contextState: AudioContextState = "running";
@@ -46,7 +49,7 @@ const audioContextSpy = vi.fn().mockImplementation(function () {
       connect: vi.fn(),
     })),
     createBufferSource: createBufferSourceSpy,
-    createMediaElementSource: vi.fn().mockImplementation(() => ({ connect: vi.fn() })),
+    createMediaElementSource: createMediaElementSourceSpy,
     resume: resumeSpy,
     get state() {
       return contextState;
@@ -385,6 +388,53 @@ describe("AudioManager.disable", () => {
     // way production does: a stale entry would give playSfx something to start.
     audioManager.playSfx("GameStarted");
     expect(createBufferSourceSpy).not.toHaveBeenCalled();
+  });
+
+  // Page navigation reaches setContext directly (useAudioContext on mount,
+  // GameProvider on game transitions), so a route change after a degraded boot
+  // must not start music. The guard lives at startMusic/playTrack rather than
+  // at setContext — see the control arm below for why.
+  it("setContext after disable starts no music source", async () => {
+    const audioManager = await freshAudioManager();
+    audioManager.armDeviceOpen();
+    audioManager.warmUp();
+    audioManager.disable();
+
+    audioManager.setContext("battlefield", true);
+
+    expect(createMediaElementSourceSpy).not.toHaveBeenCalled();
+    expect(playSpy).not.toHaveBeenCalled();
+  });
+
+  // Control arm: same live context and the same navigation call, latch unset.
+  // Proves the negative above is about `disabled` and not about a fixture that
+  // could never have started music.
+  it("the same setContext does start music while enabled", async () => {
+    const audioManager = await freshAudioManager();
+    audioManager.armDeviceOpen();
+    audioManager.warmUp();
+
+    audioManager.setContext("battlefield", true);
+
+    expect(createMediaElementSourceSpy).toHaveBeenCalledOnce();
+  });
+
+  // Why setContext itself must NOT early-return on the latch: it is the
+  // teardown path too. If the deadline latches while music is already playing,
+  // a later navigation still has to stop it — an early return would leave a
+  // "disabled" manager audible forever.
+  it("setContext still stops music that was playing when the latch fired", async () => {
+    const audioManager = await freshAudioManager();
+    audioManager.armDeviceOpen();
+    audioManager.warmUp();
+    audioManager.setContext("menu", true);
+    // Reach guard: music really is playing before the latch.
+    expect(audioManager.diagnostics()).toContain("music=playing");
+
+    audioManager.disable();
+    audioManager.setContext("battlefield", true);
+
+    expect(audioManager.diagnostics()).toContain("music=stopped");
   });
 
   it("diagnostics reports the disabled state", async () => {
