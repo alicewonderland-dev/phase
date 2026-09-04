@@ -12,6 +12,22 @@ type ProgressListener = (progress: PreloadProgress) => void;
 const listeners = new Set<ProgressListener>();
 let preloadPromise: Promise<void> | null = null;
 
+/**
+ * How long the splash waits for SFX buffers before booting without them.
+ *
+ * Decoding the handful of short local files the default theme ships is
+ * milliseconds of work on a healthy system, so this only ever fires on a
+ * broken one — where it must fire, because `decodeAudioData` is not
+ * guaranteed to settle at all. WebKitGTK assembles every decode as a
+ * GStreamer pipeline; when the plugins it needs are missing it logs the
+ * missing elements, wires up a partial pipeline, and leaves the promise
+ * pending forever (issue #6744). Audio is optional, boot is not.
+ */
+export const SFX_PRELOAD_DEADLINE_MS = 8000;
+
+/** How the bounded audio phase ended. */
+type SfxPreloadOutcome = "ready" | "failed" | "timed-out";
+
 function emit(progress: PreloadProgress): void {
   for (const listener of listeners) {
     listener(progress);
@@ -25,12 +41,53 @@ export function subscribePreload(listener: ProgressListener): () => void {
 }
 
 /**
+ * Await the SFX preload without letting it own the boot.
+ *
+ * Mirrors the verdict race in `services/audioHealth.ts`: the deadline resolves
+ * a sentinel rather than rejecting, because a deadline that fires is an
+ * expected boot outcome on a broken host, not an error to handle. A rejection
+ * from the preload itself is the same kind of outcome and is reported as one.
+ *
+ * `work` is left running on a timeout — its buffers are still welcome if they
+ * ever land, and a pending `decodeAudioData` cannot be cancelled.
+ */
+function awaitSfxPreload(work: Promise<unknown>, limitMs: number): Promise<SfxPreloadOutcome> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race<SfxPreloadOutcome>([
+    work.then(
+      () => "ready",
+      () => "failed",
+    ),
+    new Promise<SfxPreloadOutcome>((resolve) => {
+      timer = setTimeout(() => resolve("timed-out"), limitMs);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+/** Actionable line for the terminal, per outcome. Never called for "ready". */
+function sfxFailureDiagnostic(outcome: Exclude<SfxPreloadOutcome, "ready">): string {
+  const cause =
+    outcome === "timed-out"
+      ? `no sound finished decoding within ${SFX_PRELOAD_DEADLINE_MS}ms`
+      : "sound decoding failed";
+  return (
+    `[audio] Starting without audio: ${cause}. This platform's media pipeline cannot ` +
+    "play sound. On Linux that means WebKit found no usable GStreamer plugins — run " +
+    "the app from a terminal, where the shell lists exactly which plugins are missing " +
+    "and the packages that provide them."
+  );
+}
+
+/**
  * Run the startup preload sequence:
  * 1. Register music interaction listeners
  * 2. Preload SFX audio buffers
  *
  * Also registers audio interaction listeners for music playback.
  * Idempotent — safe to call multiple times.
+ *
+ * Every audio step is bounded or skippable. The splash this drives covers the
+ * whole app, so no audio fault may leave this promise unresolved.
  */
 export function ensurePreload(): Promise<void> {
   if (preloadPromise) return preloadPromise;
@@ -45,14 +102,22 @@ export function ensurePreload(): Promise<void> {
     // the verdict so a click cannot reach warmUp() early.
     if (!(await audioDeviceSafe())) {
       audioManager.disable();
-      useAudioHealthStore.getState().setDeviceBlocked(true);
+      useAudioHealthStore.getState().setUnavailable("device-wedged");
     }
     audioManager.armDeviceOpen();
     initAudioOnInteraction();
 
     emit({ phase: "audio", percent: 20 });
     audioManager.warmUp();
-    await audioManager.preloadSfx();
+    const outcome = await awaitSfxPreload(audioManager.preloadSfx(), SFX_PRELOAD_DEADLINE_MS);
+    if (outcome !== "ready") {
+      // Latch audio off: on this host every later pipeline — theme loads,
+      // music tracks, a gesture handler's ensurePlayback() — would hang or
+      // fail the same way, so stop opening them.
+      audioManager.disable();
+      useAudioHealthStore.getState().setUnavailable("media-unavailable");
+      console.error(sfxFailureDiagnostic(outcome));
+    }
     emit({ phase: "complete", percent: 100 });
   })();
 

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Claim boundary: `audioDeviceSafe` is mocked here, so this file proves the
 // DISABLE WIRING (verdict → disable → silent, completed boot) and its
@@ -8,6 +8,11 @@ const { audioDeviceSafeMock } = vi.hoisted(() => ({
   audioDeviceSafeMock: vi.fn(),
 }));
 vi.mock("../../services/audioHealth", () => ({ audioDeviceSafe: audioDeviceSafeMock }));
+
+// Swappable so a test can reproduce the WebKitGTK failure mode from issue
+// #6744: a decode that neither resolves nor rejects because the pipeline it
+// needs was never fully built.
+let decodeAudioData: () => Promise<unknown> = () => Promise.resolve({});
 
 const audioContextSpy = vi.fn().mockImplementation(function () {
   return {
@@ -20,7 +25,7 @@ const audioContextSpy = vi.fn().mockImplementation(function () {
       },
       connect: vi.fn(),
     })),
-    decodeAudioData: vi.fn().mockResolvedValue({}),
+    decodeAudioData: vi.fn().mockImplementation(() => decodeAudioData()),
     close: vi.fn(),
     destination: {},
     currentTime: 0,
@@ -54,6 +59,7 @@ async function freshBoot() {
 describe("ensurePreload audio gate", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    decodeAudioData = () => Promise.resolve({});
   });
 
   it("wedged verdict: boot completes silent, disable precedes gesture listeners", async () => {
@@ -72,7 +78,7 @@ describe("ensurePreload audio gate", () => {
     expect(audioContextSpy).not.toHaveBeenCalled();
     // …but the boot still completed and the splash can dismiss.
     expect(percents).toContain(100);
-    expect(useAudioHealthStore.getState().deviceBlocked).toBe(true);
+    expect(useAudioHealthStore.getState().unavailable).toBe("device-wedged");
 
     // Ordering, not mere co-occurrence: disable() must run before ANY gesture
     // listener exists, else a click during boot could still reach warmUp().
@@ -99,7 +105,7 @@ describe("ensurePreload audio gate", () => {
 
     expect(audioContextSpy).toHaveBeenCalledOnce();
     expect(percents).toContain(100);
-    expect(useAudioHealthStore.getState().deviceBlocked).toBe(false);
+    expect(useAudioHealthStore.getState().unavailable).toBeNull();
   });
 
   it("progress starts moving before the verdict resolves (splash is never 0%-frozen)", async () => {
@@ -122,5 +128,101 @@ describe("ensurePreload audio gate", () => {
     await done;
     unsub();
     expect(percents).toContain(100);
+  });
+});
+
+// Issue #6744. WebKitGTK builds every decode as a GStreamer pipeline; with no
+// usable plugin set it logs the missing elements, wires a partial pipeline and
+// leaves the promise pending forever. The device opened fine, so the wedged-
+// device gate above cannot see this — only a deadline on the preload can.
+// Every test here fails by TIMING OUT if the deadline is removed, which is
+// exactly the user-visible bug: a splash that never dismisses.
+describe("ensurePreload SFX deadline", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    audioDeviceSafeMock.mockResolvedValue(true);
+    decodeAudioData = () => Promise.resolve({});
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("a decode that never settles still boots the app, degraded and diagnosed", async () => {
+    decodeAudioData = () => new Promise(() => {});
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+    const {
+      ensurePreload,
+      subscribePreload,
+      audioManager,
+      useAudioHealthStore,
+      SFX_PRELOAD_DEADLINE_MS,
+    } = await freshBoot();
+
+    const percents: number[] = [];
+    const unsub = subscribePreload((p) => percents.push(p.percent));
+    const done = ensurePreload();
+
+    // The deadline is the only thing that can complete this boot.
+    await vi.advanceTimersByTimeAsync(SFX_PRELOAD_DEADLINE_MS);
+    await done;
+    unsub();
+
+    expect(percents).toContain(100);
+    expect(useAudioHealthStore.getState().unavailable).toBe("media-unavailable");
+    // Latched off so no later pipeline (theme load, music, ensurePlayback)
+    // opens another decode that will hang the same way.
+    expect(audioManager.isDisabled).toBe(true);
+    // Actionable, not just "audio failed": names the missing plugin set and
+    // where to see which plugins (§ acceptance criterion 4).
+    expect(diagnostic).toHaveBeenCalledOnce();
+    expect(diagnostic.mock.calls[0][0]).toMatch(/GStreamer/);
+    diagnostic.mockRestore();
+  });
+
+  // Control arm: same clock, same fake timers, decode resolves — so the test
+  // above is discriminating about the hang and not about fake timers.
+  it("a decode that settles boots with audio intact and no diagnostic", async () => {
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+    const {
+      ensurePreload,
+      subscribePreload,
+      audioManager,
+      useAudioHealthStore,
+      SFX_PRELOAD_DEADLINE_MS,
+    } = await freshBoot();
+
+    const percents: number[] = [];
+    const unsub = subscribePreload((p) => percents.push(p.percent));
+    const done = ensurePreload();
+    await vi.advanceTimersByTimeAsync(SFX_PRELOAD_DEADLINE_MS);
+    await done;
+    unsub();
+
+    expect(percents).toContain(100);
+    expect(useAudioHealthStore.getState().unavailable).toBeNull();
+    expect(audioManager.isDisabled).toBe(false);
+    expect(diagnostic).not.toHaveBeenCalled();
+    diagnostic.mockRestore();
+  });
+
+  it("a rejected preload degrades the same way instead of throwing out of boot", async () => {
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { ensurePreload, subscribePreload, audioManager, useAudioHealthStore } =
+      await freshBoot();
+    vi.spyOn(audioManager, "preloadSfx").mockRejectedValue(new Error("no decoder"));
+
+    const percents: number[] = [];
+    const unsub = subscribePreload((p) => percents.push(p.percent));
+    // Resolves without the clock moving: a rejection is known immediately.
+    await expect(ensurePreload()).resolves.toBeUndefined();
+    unsub();
+
+    expect(percents).toContain(100);
+    expect(useAudioHealthStore.getState().unavailable).toBe("media-unavailable");
+    expect(audioManager.isDisabled).toBe(true);
+    expect(diagnostic).toHaveBeenCalledOnce();
+    diagnostic.mockRestore();
   });
 });

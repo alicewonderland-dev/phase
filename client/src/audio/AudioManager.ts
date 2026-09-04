@@ -48,11 +48,20 @@ class AudioManager {
   /**
    * Permanently skip audio for this session: `warmUp()` becomes a no-op so no
    * device-open path can run (every other device touch already guards on a
-   * null `ctx`). Set at boot when the shell reports the OS audio server
-   * wedged — WebKitGTK opens the device synchronously on the page main
-   * thread, so opening it then would freeze the page. Invariant: while
-   * disabled, `ctx` stays null across `dispose()`/`restart()` cycles; an
+   * null `ctx`). Boot sets this for either fault it can detect — the shell
+   * reporting the OS audio server wedged (WebKitGTK opens the device
+   * synchronously on the page main thread, so opening it then would freeze
+   * the page), or the platform's media pipeline failing to decode any sound
+   * within the boot deadline, which leaves every later pipeline just as dead.
+   * The second case latches after `warmUp()` has already built a context, so
+   * `disable()` does not itself imply a null `ctx`; the invariant is that once
+   * disabled, `ctx` stays null after any `dispose()`/`restart()` cycle, and an
    * `isWarmedUp`-based fast path must never bypass the `disabled` check.
+   *
+   * Because the context can outlive the latch, the flag guards every method
+   * that OPENS a media pipeline, not just the device: `warmUp()` (the device),
+   * `preloadSfx()` (a decode), and `playTrack()`/`playStinger()` (a media
+   * element source). A new pipeline-opening method must join that set.
    */
   disable(): void {
     this.disabled = true;
@@ -112,7 +121,7 @@ class AudioManager {
 
   /** Preload all unique SFX files into AudioBuffers (background, non-blocking). */
   async preloadSfx(): Promise<void> {
-    if (!this.ctx) return;
+    if (this.disabled || !this.ctx) return;
     const urls = [...new Set(Object.values(this.activeTheme.sfxMap))];
     const entries = Object.entries(this.activeTheme.sfxMap);
 
@@ -283,7 +292,7 @@ class AudioManager {
     // Stop current music immediately
     this.stopMusic(0);
 
-    if (!this.ctx || !this.musicGain) return;
+    if (this.disabled || !this.ctx || !this.musicGain) return;
 
     // Reset music gain — cancelScheduledValues first so .value assignment
     // takes effect (WebAudio spec: automation overrides direct .value writes)
@@ -525,7 +534,7 @@ class AudioManager {
   }
 
   private playTrack(): void {
-    if (!this.ctx || !this.musicGain) return;
+    if (this.disabled || !this.ctx || !this.musicGain) return;
 
     const track = this.trackOrder[this.trackIndex];
     if (!track) return;

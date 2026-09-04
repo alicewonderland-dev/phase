@@ -3,6 +3,8 @@ use tauri::{Manager, WebviewWindowBuilder};
 
 mod audio_probe;
 mod host_platform;
+#[cfg(target_os = "linux")]
+mod media_stack;
 mod migration;
 mod mobile_compat;
 #[cfg(desktop)]
@@ -22,6 +24,16 @@ pub fn run() {
     if std::env::var_os("WEBKIT_DMABUF_RENDERER_FORCE_SHM").is_none() {
         std::env::set_var("WEBKIT_DMABUF_RENDERER_FORCE_SHM", "1");
     }
+
+    // WebKitGTK has no audio stack of its own — every AudioContext and every
+    // decodeAudioData is a GStreamer pipeline it assembles from plugin
+    // libraries. A missing plugin set leaves the decode promise the page
+    // awaits unsettled rather than rejected, so the user sees a frozen
+    // loading screen with no explanation. Say why here, before the webview
+    // exists, so the reason is the first thing in the terminal. Diagnostic
+    // only: the page's own audio phase is deadline-bounded and boots anyway.
+    #[cfg(target_os = "linux")]
+    media_stack::report_to_stderr();
 
     let builder = tauri::Builder::default().plugin(
         tauri_plugin_opener::Builder::new()

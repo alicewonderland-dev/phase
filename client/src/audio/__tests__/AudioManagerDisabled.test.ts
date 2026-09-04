@@ -5,6 +5,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // module per test (changelog.test.ts idiom) instead of sharing the suite's
 // singleton and leaking the flag into its assertions.
 
+const decodeAudioDataSpy = vi.fn().mockResolvedValue({});
+
 const audioContextSpy = vi.fn().mockImplementation(function () {
   return {
     createGain: vi.fn().mockImplementation(() => ({
@@ -17,7 +19,7 @@ const audioContextSpy = vi.fn().mockImplementation(function () {
       connect: vi.fn(),
     })),
     createBufferSource: vi.fn(),
-    decodeAudioData: vi.fn().mockResolvedValue({}),
+    decodeAudioData: decodeAudioDataSpy,
     close: vi.fn(),
     destination: {},
     currentTime: 0,
@@ -100,6 +102,30 @@ describe("AudioManager.disable", () => {
     const audioManager = await freshAudioManager();
     audioManager.disable();
     await expect(audioManager.preloadSfx()).resolves.toBeUndefined();
+  });
+
+  // Issue #6744 latches disable() AFTER warmUp() built a context, so the
+  // null-ctx guard the test above rides on is gone. Without a `disabled` check
+  // of its own, preloadSfx would keep opening decodes on a media stack that
+  // never settles them.
+  it("preloadSfx opens no decode once disabled, even with a live context", async () => {
+    const audioManager = await freshAudioManager();
+    audioManager.armDeviceOpen();
+    audioManager.warmUp();
+    audioManager.disable();
+    await audioManager.preloadSfx();
+    expect(audioContextSpy).toHaveBeenCalledOnce();
+    expect(decodeAudioDataSpy).not.toHaveBeenCalled();
+  });
+
+  // Control arm for the test above: same live context, latch never set, so the
+  // not-called assertion is about `disabled` and not about the fixture.
+  it("preloadSfx does decode on a live context while enabled", async () => {
+    const audioManager = await freshAudioManager();
+    audioManager.armDeviceOpen();
+    audioManager.warmUp();
+    await audioManager.preloadSfx();
+    expect(decodeAudioDataSpy).toHaveBeenCalled();
   });
 
   it("diagnostics reports the disabled state", async () => {
