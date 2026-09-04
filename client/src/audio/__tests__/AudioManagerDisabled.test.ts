@@ -59,10 +59,14 @@ const audioContextSpy = vi.fn().mockImplementation(function () {
 });
 vi.stubGlobal("AudioContext", audioContextSpy);
 
-vi.stubGlobal(
-  "fetch",
-  vi.fn().mockResolvedValue({ arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)) }),
-);
+// A gate the tests can hold open, so a load can be caught mid-fetch — the
+// window in which `disable()` can latch under a slow network or cache read.
+let fetchGate: Promise<void> | null = null;
+const fetchSpy = vi.fn().mockImplementation(async () => {
+  if (fetchGate) await fetchGate;
+  return { arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)) };
+});
+vi.stubGlobal("fetch", fetchSpy);
 
 // Avoid IndexedDB in happy-dom.
 vi.mock("../audioCache", () => ({
@@ -82,6 +86,7 @@ describe("AudioManager.disable", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     contextState = "running";
+    fetchGate = null;
     rejectPlay = null;
     playSpy.mockImplementation(
       () =>
@@ -304,6 +309,82 @@ describe("AudioManager.disable", () => {
 
     expect(resumeSpy).not.toHaveBeenCalled();
     warn.mockRestore();
+  });
+
+  // `loadBuffer` checks the context before its fetch and then has to wait. If
+  // the boot deadline latches while bytes are in flight, the continuation would
+  // open the very decode pipeline boot declared unusable — the hang path again,
+  // after a degraded start.
+  it("a fetch landing after disable never opens a decode", async () => {
+    let openGate!: () => void;
+    fetchGate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    const audioManager = await freshAudioManager();
+    audioManager.armDeviceOpen();
+    audioManager.warmUp();
+
+    const preload = audioManager.preloadSfx();
+    await flush();
+    // Reach guard: loads really are in flight and parked on the gate.
+    expect(fetchSpy).toHaveBeenCalled();
+    expect(decodeAudioDataSpy).not.toHaveBeenCalled();
+
+    audioManager.disable();
+    openGate();
+    await preload;
+
+    expect(decodeAudioDataSpy).not.toHaveBeenCalled();
+  });
+
+  // Control arm: the same held fetch released on the same schedule, latch never
+  // set. Proves the continuation does reach decode, so the negative above is
+  // about `disabled` and not about a gate that never opened.
+  it("the same held fetch does reach decode while enabled", async () => {
+    let openGate!: () => void;
+    fetchGate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    const audioManager = await freshAudioManager();
+    audioManager.armDeviceOpen();
+    audioManager.warmUp();
+
+    const preload = audioManager.preloadSfx();
+    await flush();
+    expect(decodeAudioDataSpy).not.toHaveBeenCalled();
+
+    openGate();
+    await preload;
+
+    expect(decodeAudioDataSpy).toHaveBeenCalled();
+  });
+
+  // Same window, SFX-side invalidation: a theme switch clears the buffer map,
+  // so a load started for the old theme must not repopulate it afterwards.
+  it("a fetch landing after a theme switch does not repopulate the cleared map", async () => {
+    let openGate!: () => void;
+    fetchGate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    const audioManager = await freshAudioManager();
+    const { PLANESWALKER_THEME } = await import("../planeswalkerTheme");
+    audioManager.armDeviceOpen();
+    audioManager.warmUp();
+
+    const preload = audioManager.preloadSfx();
+    await flush();
+    expect(fetchSpy).toHaveBeenCalled();
+
+    // Swap to a theme with no SFX at all; loadTheme clears the map.
+    await audioManager.loadTheme({ ...PLANESWALKER_THEME, id: "other", sfx: [] });
+    openGate();
+    await preload;
+
+    // `sfxAvailability()` cannot see this — it reports "skipped" for a theme
+    // with no SFX whether or not stale buffers landed. Ask the buffer map the
+    // way production does: a stale entry would give playSfx something to start.
+    audioManager.playSfx("GameStarted");
+    expect(createBufferSourceSpy).not.toHaveBeenCalled();
   });
 
   it("diagnostics reports the disabled state", async () => {

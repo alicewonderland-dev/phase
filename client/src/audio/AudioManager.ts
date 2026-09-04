@@ -82,7 +82,12 @@ class AudioManager {
    * Asynchronous continuations RECHECK rather than inheriting their caller's
    * guard: an entry check is stale by the time a callback runs, so
    * `playTrack()`'s `ended` handler and its `play()`-rejection path each latch
-   * on `disabled` and the generation before touching the context again.
+   * on `disabled` and the generation before touching the context again, and
+   * `loadBuffer()` rechecks `disabled` plus the captured context and theme
+   * across both of its awaits. Every `await` and every callback in this file
+   * that afterwards touches the context is covered by that rule; a new one
+   * must recheck too, choosing the invalidation signal that matches what it
+   * produces (generation for music rotation, theme identity for SFX buffers).
    */
   disable(): void {
     this.disabled = true;
@@ -570,9 +575,30 @@ class AudioManager {
   }
 
   /** Decode one file into the buffer map. Failures are logged, not thrown —
-   *  `sfxAvailability()` reads the map to find out what survived. */
+   *  `sfxAvailability()` reads the map to find out what survived.
+   *
+   *  Bytes are in flight across two awaits, so the entry guard is stale twice
+   *  over: `disable()` can latch, `dispose()`/`restart()` can swap the context,
+   *  and `loadTheme()` can clear the buffer map for a different theme, all
+   *  while this load is waiting. The context and theme are captured up front
+   *  and rechecked before opening the decode and again before committing, so a
+   *  slow fetch cannot reopen a pipeline boot declared unusable, decode against
+   *  a replaced context, or repopulate a map that was cleared for another
+   *  theme.
+   *
+   *  Deliberately NOT gated on `generation`: that tracks music-rotation
+   *  identity and is bumped by `setContext`/`playStinger`/`setBattlefieldPhase`,
+   *  so gating SFX on it would throw away good buffers every time the player
+   *  moves between menu and battlefield. `loadTheme()` conversely may not bump
+   *  it at all, so it does not even capture the invalidation that matters here.
+   */
   private async loadBuffer(url: string, eventTypes: string[]): Promise<void> {
-    if (!this.ctx) return;
+    const ctx = this.ctx;
+    const theme = this.activeTheme;
+    if (this.disabled || !ctx) return;
+    /** Whether this load still belongs to the audio stack it started on. */
+    const stillCurrent = () =>
+      !this.disabled && this.ctx === ctx && this.activeTheme === theme;
     try {
       const isLocal = url.startsWith("/");
       let arrayBuffer: ArrayBuffer;
@@ -591,7 +617,10 @@ class AudioManager {
         );
       }
 
-      const audioBuffer = await this.ctx.decodeAudioData(arrayBuffer);
+      if (!stillCurrent()) return;
+      const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+      // The decode is itself a wait, so recheck before publishing the buffer.
+      if (!stillCurrent()) return;
       // Key by every eventType that maps to this URL
       for (const et of eventTypes) {
         this.sfxBuffers.set(et, audioBuffer);
