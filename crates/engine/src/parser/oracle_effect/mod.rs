@@ -145,7 +145,7 @@ pub(crate) use self::conditions::{
 };
 use self::imperative::{
     lower_imperative_family_ast, lower_shuffle_ast, lower_targeted_action_ast,
-    lower_zone_counter_ast, parse_imperative_family_ast, parse_shuffle_ast,
+    lower_zone_counter_ast, parse_imperative_family_ast, parse_shuffle_ast, try_parse_amass,
 };
 use self::search::parse_search_filter;
 use self::search::{
@@ -8188,6 +8188,8 @@ fn try_parse_choose_and_pay_per_object(
         filter,
         min,
         max,
+        cardinality: None,
+        eligibility: None,
     });
     clause.sub_ability = Some(Box::new(pay_ability));
     // CR 603.4: The "that player may" modal makes the whole clause optional —
@@ -14987,6 +14989,8 @@ fn parse_choose_survivors_destroy_rest_ir(
                 filter,
                 min: 0,
                 max: Some(max),
+                cardinality: None,
+                eligibility: None,
             }),
             Some(match connector {
                 DestroyRestConnector::Then => ClauseBoundary::Then,
@@ -22077,6 +22081,37 @@ fn lower_subject_predicate_ast(
                     enters_under: None,
                 });
             }
+            // CR 701.47a + CR 109.4 + CR 608.2c: "<player> amasses [subtype] N"
+            // — third-person form. Azog, Moria's Ruin's "Its controller amasses
+            // Goblins X, where X is that creature's power" binds the acting
+            // player to the anaphoric subject (`affected` = `ParentTargetController`
+            // — the destroyed creature's controller, per `parse_subject_application`'s
+            // bare "its controller" arm) instead of the imperative form's default
+            // `Controller`. Delegates to the same `try_parse_amass` keyword-body
+            // parser the plain "Amass Zombies 2" imperative uses, so subtype
+            // canonicalization and "where X is …" binding stay a single authority.
+            if let Some(effect) = try_parse_amass(&text, &pred_lower, affected.clone()) {
+                let mut clause = parsed_clause(effect);
+                // CR 601.2c + CR 608.2c (ruling: "If no target is chosen for
+                // Azog's ability, 'its controller' is undefined and no player
+                // amasses Goblins"): when the acting player anaphors the
+                // parent's chosen OBJECT target (`ParentTargetController` /
+                // `ParentTargetOwner`), a declined "up to one" antecedent
+                // leaves that anaphor undefined. Gate on `HasObjectTarget` so
+                // no player amasses — mirroring
+                // `gate_reflexive_rider_on_declined_optional_target`, which
+                // only wraps a rider's OWN pre-existing condition and so
+                // cannot reach this condition-less Amass clause itself. A
+                // plain "you"/"they" subject (`affected == Controller`, no
+                // target dependency) is left ungated.
+                if matches!(
+                    affected,
+                    TargetFilter::ParentTargetController | TargetFilter::ParentTargetOwner
+                ) {
+                    clause.condition = Some(AbilityCondition::HasObjectTarget);
+                }
+                return clause;
+            }
             // CR 701.40a + CR 101.4 + CR 608.2c: "<target players> [each]
             // manifest[s] <N> card[s] from their hand[s]" (Kozilek, the Broken
             // Reality). Each targeted player picks the cards from their OWN
@@ -28377,6 +28412,28 @@ fn publishes_tracked_set_from_resolution(effect: &Effect) -> bool {
         )
 }
 
+/// CR 608.2c + CR 400.7j: a singular battlefield recall after a self-move
+/// antecedent — the nearest prior publishing clause is a ChangeZone whose
+/// target is the source itself ("Exile ~ / Exile this Saga / Exile <name>"),
+/// so "it" names the source object, not the chain tracked set. Nearest-first
+/// scan mirrors the `draw_object_count_filter` precedent; using the same
+/// publisher set as the tracked-set rewrite keeps both branches consistent
+/// about what "affected objects" means.
+fn nearest_publisher_is_self_move(defs: &[AbilityDefinition]) -> bool {
+    defs.iter()
+        .rev()
+        .find(|d| publishes_tracked_set_from_resolution(&d.effect))
+        .is_some_and(|d| {
+            matches!(
+                &*d.effect,
+                Effect::ChangeZone {
+                    target: TargetFilter::SelfRef,
+                    ..
+                }
+            )
+        })
+}
+
 /// CR 603.7 + CR 400.7: A return/put onto the battlefield publishes the moved
 /// objects as the chain tracked set (Storm Herald "those Auras", Returned cause).
 fn is_battlefield_return_effect(effect: &Effect) -> bool {
@@ -28863,6 +28920,18 @@ fn contains_implicit_tracked_set_pronoun(lower: &str) -> bool {
         || free_cast_that_card_grant
 }
 
+/// CR 608.2c: the SINGULAR battlefield-recall anaphor — "return it " at a
+/// clause start with a battlefield mention. Splitting the plural axis out of
+/// [`contains_implicit_tracked_set_pronoun`] lets the assembly gate bind the
+/// singular pronoun to its named antecedent (CR 400.7j) while plural riders
+/// keep the chain-set binding.
+pub(crate) fn singular_battlefield_recall(lower: &str) -> bool {
+    tag::<_, _, OracleError<'_>>("return it ")
+        .parse(lower)
+        .is_ok()
+        && scan_contains_phrase(lower, "battlefield")
+}
+
 fn mark_uses_tracked_set(def: &mut AbilityDefinition) {
     if let Effect::CreateDelayedTrigger {
         uses_tracked_set, ..
@@ -29180,6 +29249,26 @@ fn rewrite_parent_targets_to_tracked_set(effect: &mut Effect, cast_anaphor_is_ex
             *target = tracked_set_filter();
         }
         _ => {}
+    }
+}
+
+/// CR 608.2c + CR 400.7j: singular battlefield recall after a self-move —
+/// "Exile ~, then return it to the battlefield" binds "it" to the source
+/// object itself (the thing the prior clause moved), not to the chain tracked
+/// set, whose membership may include unrelated riders (Cold Snap's tap leg).
+/// Non-recursive over CreateDelayedTrigger, mirroring
+/// [`rewrite_parent_targets_to_tracked_set`]: a delayed payload keeps its own
+/// CR 603.7c referent machinery (Aetherling, Otherworldly Journey).
+fn rewrite_singular_battlefield_recall_to_self(effect: &mut Effect) {
+    if let Effect::ChangeZone {
+        target,
+        destination: Zone::Battlefield,
+        ..
+    } = effect
+    {
+        if matches!(target, TargetFilter::ParentTarget) {
+            *target = TargetFilter::SelfRef;
+        }
     }
 }
 
@@ -30995,6 +31084,8 @@ fn maybe_convert_choose_head_into_tracked_set(def: &mut AbilityDefinition) {
         filter,
         min,
         max,
+        cardinality: None,
+        eligibility: None,
     };
     def.multi_target = None;
 }
@@ -31607,6 +31698,8 @@ fn parse_exile_pile_shuffle_cloak_ir(
                 filter,
                 min: 0,
                 max: None,
+                cardinality: None,
+                eligibility: None,
             }),
             Some(ClauseBoundary::Comma),
             ClauseDisposition::Emit {

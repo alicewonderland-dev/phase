@@ -57,6 +57,22 @@ pub enum Chooser {
     OwningPlayer,
 }
 
+/// CR 608.2d: Resolution-time choice cardinality.
+///
+/// Unlike the legacy `min`/`max` range, an exact selection is infeasible when
+/// fewer eligible objects exist and is therefore suitable for optional actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ObjectSelectionCardinality {
+    Exactly { count: u32 },
+}
+
+/// CR 608.2d + CR 101.2: Additional eligibility required before an object may
+/// be selected for a counter-removal instruction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ObjectSelectionEligibility {
+    RemovableCounter { counter_type: Option<CounterType> },
+}
+
 #[cfg(test)]
 mod trigger_occurrence_tests {
     use super::*;
@@ -16219,6 +16235,14 @@ pub enum Effect {
         min: u32,
         /// Maximum number of objects selectable (`None` = "any number").
         max: Option<u32>,
+        /// An exact-cardinality selection. `None` preserves legacy min/max
+        /// semantics and its serialized shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cardinality: Option<ObjectSelectionCardinality>,
+        /// Extra resolution-time eligibility beyond the printed object filter.
+        /// `None` preserves legacy selection behavior and wire format.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        eligibility: Option<ObjectSelectionEligibility>,
     },
     /// CR 101.4 + CR 701.21a: Each player chooses one permanent per type category
     /// from among the permanents they control, then sacrifices the rest.
@@ -16810,6 +16834,21 @@ pub enum Effect {
         /// Number of +1/+1 counters to place.
         #[serde(default = "default_quantity_one")]
         count: QuantityExpr,
+        /// CR 109.4 + CR 701.47a: which player performs this amass instruction
+        /// (puts the counters, chooses/creates the Army). Every printed
+        /// imperative "amass [subtype] N" card (Awaken the Erstwhile, Saruman,
+        /// the White Hand, …) has the ability's own controller amass, so the
+        /// default is `TargetFilter::Controller` and existing JSON (which omits
+        /// the field) keeps that reading. Azog, Moria's Ruin's "Its controller
+        /// amasses Goblins X" binds this to `TargetFilter::ParentTargetController`
+        /// — the controller of the creature Azog just destroyed, not Azog's own
+        /// controller — resolved through `resolve_player_for_context_ref`, the
+        /// same path `Discover.player` / `Manifest.target` already use.
+        #[serde(
+            default = "default_target_filter_controller",
+            skip_serializing_if = "is_target_filter_controller"
+        )]
+        player: TargetFilter,
     },
     /// CR 701.37a: Monstrosity N — if not monstrous, put N +1/+1 counters and become monstrous.
     Monstrosity {
@@ -18664,7 +18703,11 @@ impl Effect {
             // target via the same `is_context_ref()` filter the other player-axis
             // effects use.
             | Effect::Discover { player, .. }
-            | Effect::BlightEffect { player, .. } => Some(player),
+            | Effect::BlightEffect { player, .. }
+            // CR 701.47a: Amass's performer. The default `Controller` is a
+            // context ref, but a subject-targeted form ("target player amasses
+            // Goblins 2") must surface its chosen player like `Discover`.
+            | Effect::Amass { player, .. } => Some(player),
 
             // Digital-only Alchemy: `ApplyPerpetual.target` selects the modified
             // object (`~` → Any/source fallback; "that creature"/"the duplicate"
@@ -18940,7 +18983,6 @@ impl Effect {
             | Effect::AssembleContraptionOnSprocket { .. }
             | Effect::ProcessRadCounters
             | Effect::Incubate { .. }
-            | Effect::Amass { .. }
             | Effect::Monstrosity { .. }
             | Effect::Specialize
             | Effect::Renown { .. }

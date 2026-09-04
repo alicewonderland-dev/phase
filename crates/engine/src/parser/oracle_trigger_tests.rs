@@ -5,6 +5,7 @@ use crate::parser::oracle_ir::context::ParseContext;
 use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
 use crate::parser::oracle_ir::doc::PrintedTriggerIndex;
 use crate::parser::oracle_ir::effect_chain::PlayerScopeRewrite;
+use crate::parser::test_support::assert_no_unimplemented;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction, AttackScope,
     AttackSubject, BounceSelection, CardSelectionMode, CardTypeSetSource, CastingPermission,
@@ -24,6 +25,78 @@ use crate::types::keywords::Keyword;
 use crate::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use crate::types::replacements::ReplacementEvent;
 use crate::types::statics::{CastFrequency, StaticMode};
+
+/// CR 603.4 + CR 601.2f: Liberator's intervening "if" survives the whole
+/// pipeline. Its printed wording predates the Increment keyword (CR 702.191a)
+/// and spells the same sentence out; before the mana-spent subject was widened
+/// the clause was dropped and `condition` came out `None`, so every spell cast
+/// added a +1/+1 counter no matter what was actually paid — a face-down
+/// creature spell reduced to {0} by Kadena, Slinking Sorcerer included.
+#[test]
+fn liberator_mana_spent_intervening_if_survives_the_pipeline() {
+    let parsed = parse_oracle_text(
+        "Flash\nFlying\nYou may cast colorless spells and artifact spells as though they had \
+         flash.\nWhenever you cast a spell, if the amount of mana spent to cast that spell is \
+         greater than Liberator's power, put a +1/+1 counter on Liberator.",
+        "Liberator, Urza's Battlethopter",
+        &["Flash".to_string(), "Flying".to_string()],
+        &[
+            "Legendary".to_string(),
+            "Artifact".to_string(),
+            "Creature".to_string(),
+        ],
+        &["Thopter".to_string()],
+    );
+
+    let trigger = parsed
+        .triggers
+        .iter()
+        .find(|t| t.mode == TriggerMode::SpellCast)
+        .expect("spell-cast trigger");
+    let condition = trigger
+        .condition
+        .as_ref()
+        .expect("the intervening 'if' must reach the trigger, not just its description");
+
+    // The gate is "mana spent on the triggering spell > this object's power",
+    // and NOTHING else. Two things are pinned by insisting on a bare
+    // comparison rather than digging one out of a conjunction:
+    //   * nothing reads the spell's mana VALUE — Kadena's reduction is exactly
+    //     the case where spent and value differ (CR 601.2f);
+    //   * no source-is-creature conjunct is bolted on. Liberator prints none.
+    //     CR 702.191a's clause belongs to the Increment keyword, and its rules
+    //     text words the subject exactly as Liberator does. What separates them
+    //     is what reaches the parser: no oracle face gives that keyword any
+    //     subject but its REMINDER's ("the amount of mana you spent"), which
+    //     this sentence's subject is not. The object phrase normalizes to the
+    //     same `~'s` either way and cannot decide it.
+    let TriggerCondition::QuantityComparison {
+        lhs,
+        comparator,
+        rhs,
+    } = condition
+    else {
+        panic!("expected a bare QuantityComparison, got {condition:?}");
+    };
+    assert_eq!(
+        *lhs,
+        QuantityExpr::Ref {
+            qty: QuantityRef::ManaSpentToCast {
+                scope: crate::types::ability::CastManaObjectScope::TriggeringSpell,
+                metric: crate::types::ability::CastManaSpentMetric::Total,
+            },
+        }
+    );
+    assert_eq!(*comparator, Comparator::GT);
+    assert_eq!(
+        *rhs,
+        QuantityExpr::Ref {
+            qty: QuantityRef::Power {
+                scope: crate::types::ability::ObjectScope::Source,
+            },
+        }
+    );
+}
 
 /// CR 608.2c + CR 119.3: Palantir's final life loss reduces the exact cards
 /// milled by its preceding clause and applies to the opponent targeted when the
@@ -10152,6 +10225,7 @@ fn dreadhorde_invasion_upkeep_lose_life_and_amass() {
         Effect::Amass {
             ref subtype,
             ref count,
+            ..
         } => {
             assert_eq!(subtype, "Zombie");
             assert!(
@@ -10161,6 +10235,120 @@ fn dreadhorde_invasion_upkeep_lose_life_and_amass() {
         }
         other => panic!("expected Amass{{Zombie, 1}}, got {other:?}"),
     }
+}
+
+/// Azog, Moria's Ruin: "When Azog enters, destroy up to one other target
+/// creature. Its controller amasses Goblins X, where X is that creature's
+/// power. If you controlled that creature, draw a card."
+///
+/// Three composed clauses, each a distinct authority:
+/// - CR 115.1d: "destroy up to one other target creature" — optional (0-or-1)
+///   targeted `Destroy`.
+/// - CR 701.47a + CR 109.4 + CR 608.2h: "Its controller amasses
+///   Goblins X, where X is that creature's power" — the amass PERFORMER is
+///   the destroyed creature's controller (`TargetFilter::ParentTargetController`,
+///   not `Controller`, unlike every other printed "amass [subtype] N" card),
+///   and X reads that creature's power (`QuantityRef::Power { scope:
+///   ObjectScope::Target }`, bound via the chain's inherited `ability.targets`
+///   — the same referent `ParentTargetController` resolves against). `Target`
+///   reads the object LIVE while it remains on the battlefield (indestructible,
+///   regenerated, or otherwise-prevented destruction) and falls back to its
+///   LKI once it has actually left — unlike `ObjectScope::CostPaidObject`
+///   (Consuming Vapors's "that creature's toughness" class), which only reads
+///   a cost/trigger-condition snapshot that a non-destroyed target never
+///   populates.
+/// - CR 608.2c: "If you controlled that creature, draw a card" — conditional
+///   on AZOG'S controller (not the amass performer) having controlled the
+///   destroyed creature; this is pre-existing coverage (`TargetMatchesFilter`
+///   with `use_lki: true`), asserted here only as a regression guard against
+///   the "amass" `PREDICATE_VERBS` addition breaking the surrounding chain.
+///
+/// Zero `Effect::Unimplemented` nodes anywhere in the chain is the coverage
+/// gate: pre-fix, the middle clause parsed to
+/// `Effect::unimplemented("its", "Its controller amasses Goblins X, ...")`.
+#[test]
+fn azog_morias_ruin_destroy_amass_by_destroyed_controller_conditional_draw() {
+    let def = parse_trigger_line(
+        "When Azog enters, destroy up to one other target creature. Its controller amasses \
+         Goblins X, where X is that creature's power. If you controlled that creature, draw a \
+         card. (To amass Goblins X, that player puts X +1/+1 counters on an Army they control. \
+         It's also a Goblin. If they don't control an Army, they create a 0/0 black Goblin Army \
+         creature token first.)",
+        "Azog, Moria's Ruin",
+    );
+    assert_eq!(def.mode, TriggerMode::ChangesZone);
+    assert_eq!(def.destination, Some(Zone::Battlefield));
+    assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+
+    let destroy = def.execute.expect("execute");
+    assert_no_unimplemented(destroy.as_ref());
+
+    assert!(
+        matches!(*destroy.effect, Effect::Destroy { .. }),
+        "expected Destroy head, got {:?}",
+        destroy.effect
+    );
+    let multi_target = destroy
+        .multi_target
+        .as_ref()
+        .expect("\"up to one\" must carry a multi_target spec");
+    assert!(
+        multi_target.min_is_fixed_zero(),
+        "\"up to one\" allows zero targets: {multi_target:?}"
+    );
+    assert_eq!(
+        multi_target.max.clone(),
+        Some(QuantityExpr::Fixed { value: 1 }),
+        "\"up to one\" caps at a single target: {multi_target:?}"
+    );
+
+    let amass = destroy
+        .sub_ability
+        .expect("amass conjunct must survive as a sub_ability");
+    match *amass.effect {
+        Effect::Amass {
+            ref subtype,
+            ref count,
+            ref player,
+        } => {
+            assert_eq!(subtype, "Goblin");
+            assert_eq!(
+                *count,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::Power {
+                        scope: ObjectScope::Target,
+                    }
+                },
+                "X must bind to the destroyed creature's power, read live while present and via LKI once it has left"
+            );
+            assert_eq!(
+                *player,
+                TargetFilter::ParentTargetController,
+                "the amass performer must be the destroyed creature's controller, not Azog's own controller"
+            );
+        }
+        ref other => panic!(
+            "expected Amass{{Goblin, Power{{Target}}, ParentTargetController}}, got {other:?}"
+        ),
+    }
+    assert_eq!(
+        amass.condition,
+        Some(AbilityCondition::HasObjectTarget),
+        "the amass must be gated on HasObjectTarget so declining the \"up to one\" destroy target leaves \"its controller\" undefined"
+    );
+
+    let draw = amass
+        .sub_ability
+        .expect("draw conjunct must survive as a sub_ability");
+    assert!(
+        matches!(*draw.effect, Effect::Draw { .. }),
+        "expected Draw head, got {:?}",
+        draw.effect
+    );
+    assert!(
+        draw.condition.is_some(),
+        "the draw must stay conditional on \"if you controlled that creature\""
+    );
 }
 
 /// CR 701.47a + CR 701.47c + CR 301.5a (Goblin Plate Mail, HOB): "When this
@@ -10186,6 +10374,7 @@ fn goblin_plate_mail_amass_then_attach_to_amassed_army() {
         Effect::Amass {
             ref subtype,
             ref count,
+            ..
         } => {
             assert_eq!(subtype, "Goblin");
             assert!(
@@ -18513,6 +18702,52 @@ fn trigger_one_or_more_players_discard() {
     assert_eq!(def.valid_target, None); // any player
 }
 
+/// CR 603.2c: Tinybones, Pocket Nuisance's second ability — "a player" is the
+/// singular-subject spelling of the same any-player actor as "one or more
+/// players" above (both resolve to `valid_target: None`), and must pick up
+/// the same "one or more <cards>" batching so the damage ability fires once
+/// per discard event rather than once per discarded card.
+#[test]
+fn trigger_a_player_discards_one_or_more_cards() {
+    let def = parse_trigger_line(
+        "Whenever a player discards one or more cards, ~ deals 1 damage to each opponent.",
+        "Tinybones, Pocket Nuisance",
+    );
+    assert_eq!(def.mode, TriggerMode::DiscardedAll);
+    assert!(def.batched);
+    assert_eq!(def.valid_target, None); // any player, not just an opponent
+}
+
+/// The same batching axis composed onto the "an opponent"/"each player"
+/// actors, proving the fix is a general composition over the actor dispatch
+/// rather than a Tinybones-specific literal match.
+#[test]
+fn trigger_opponent_discards_one_or_more_cards() {
+    let def = parse_trigger_line(
+        "Whenever an opponent discards one or more cards, draw a card.",
+        "Opponent Batch Discard Test",
+    );
+    assert_eq!(def.mode, TriggerMode::DiscardedAll);
+    assert!(def.batched);
+    assert_eq!(
+        def.valid_target,
+        Some(TargetFilter::Typed(
+            TypedFilter::default().controller(ControllerRef::Opponent)
+        ))
+    );
+}
+
+#[test]
+fn trigger_each_player_discards_one_or_more_cards() {
+    let def = parse_trigger_line(
+        "Whenever each player discards one or more cards, draw a card.",
+        "Each Player Batch Discard Test",
+    );
+    assert_eq!(def.mode, TriggerMode::DiscardedAll);
+    assert!(def.batched);
+    assert_eq!(def.valid_target, None);
+}
+
 // ── Work Item 3: Noncombat Damage to Opponent ─────────────────
 
 #[test]
@@ -23558,6 +23793,16 @@ fn extract_mana_spent_comparison_condition_greater_than() {
             },
         })
     );
+}
+
+/// CR 603.4: a mana-spent condition after an effect is not an intervening-if;
+/// it remains part of the resolving effect rather than suppressing the trigger.
+#[test]
+fn trailing_mana_spent_comparison_is_not_hoisted_to_the_trigger() {
+    let text = "put a +1/+1 counter on ~ if the amount of mana spent to cast that spell was greater than its mana value";
+    let (cleaned, condition) = extract_if_condition(text);
+    assert_eq!(cleaned, text);
+    assert_eq!(condition, None);
 }
 
 // The extractor uses `scan_split_at_phrase`, so the clause doesn't have to

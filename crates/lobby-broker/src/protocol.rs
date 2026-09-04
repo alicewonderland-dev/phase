@@ -38,6 +38,11 @@ pub enum ServerErrorCode {
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
+/// 57 — `GameAction::BeginResolveAll` gained `scope: ResolveAllScope` (`Own`
+///      binds only the requester and resolves immediately; `Shared` opens the
+///      table-wide consent protocol), and `PriorityPassingMode` gained
+///      `FullControl`, which is now engine-authoritative rather than a
+///      frontend-only toggle.
 /// 56 — Host-only authoritative-state export request/response variants. Native
 ///      P2P host diagnostics must use a trusted server envelope rather than a
 ///      redacted player view. Lobby messages are unchanged.
@@ -263,7 +268,7 @@ pub enum ServerErrorCode {
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 56;
+pub const PROTOCOL_VERSION: u32 = 57;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -1009,12 +1014,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 56);
+        assert_eq!(PROTOCOL_VERSION, 57);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which is what refuses an older full-game peer whose GameState cannot
         // understand a success acknowledgment the submitting client awaits.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 55);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 56);
     }
 
     #[test]
