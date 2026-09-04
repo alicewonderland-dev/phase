@@ -304,12 +304,68 @@ jobs:
         with:
           projectPath: client
 
+      - name: Stage shell artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          find client/src-tauri/target/release/bundle \
+            -maxdepth 2 \
+            \( -name '*.deb' -o -name '*.AppImage' -o -name '*.AppImage.sig' \
+               -o -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.app.tar.gz.sig' \
+               -o -name '*.exe' -o -name '*.exe.sig' \) \
+            -exec cp {} staging/ \;
+
+          rename_artifact() {
+            local pattern="$1"
+            local destination="$2"
+            local source
+            source=$(find staging -maxdepth 1 -type f -name "$pattern" -print -quit)
+            [ -n "$source" ] || return 0
+            mv "$source" "staging/$destination"
+            if [ -f "$source.sig" ]; then
+              mv "$source.sig" "staging/$destination.sig"
+            fi
+          }
+
+          rename_artifact '*-setup.exe' 'Phase-Desktop-Windows-x64-Setup.exe'
+          rename_artifact '*.dmg' 'Phase-Desktop-macOS-Apple-Silicon.dmg'
+          rename_artifact '*.app.tar.gz' 'Phase-Desktop-macOS-Apple-Silicon.app.tar.gz'
+          rename_artifact '*.AppImage' 'Phase-Desktop-Linux-x86_64.AppImage'
+          rename_artifact '*.deb' 'Phase-Desktop-Linux-x86_64.deb'
+          ls -la staging/
+
+      - name: Upload shell artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: staging/*
+          retention-days: 90
+
       # Release smoke coverage for issue #6744: prove the Linux artifacts can
       # actually play audio on a machine that has nothing installed. The
       # AppImage must carry the plugins WebKit resolves its audio elements
       # from, and the .deb must declare them so apt pulls them in. Both are
       # checked against one list so a plugin can never be required by the
       # app and missing from a shipped artifact.
+      #
+      # Verifying that an element REGISTERS means loading the plugin that
+      # provides it -- gst-inspect-1.0 dlopen()s the .so, so build-output code
+      # runs on the runner. There is no metadata-only way to ask GStreamer
+      # whether an element resolves, so the exposure is contained rather than
+      # avoided:
+      #   * this step runs LAST, after the artifacts are staged and uploaded,
+      #     so nothing it executes can alter what ships; a failure here still
+      #     reds the job, and `release-shell` needs build-shell to succeed, so
+      #     the gate keeps gating;
+      #   * every probe runs under `env -i` with only the GStreamer variables
+      #     it needs, so no ambient runner credential (GITHUB_TOKEN,
+      #     ACTIONS_RUNTIME_TOKEN, ...) is visible to plugin init code;
+      #   * release secrets are step-scoped to `Build shell` and the macOS
+      #     signing step, neither of which is this one.
+      # The plugins themselves come from the runner's own apt packages, and
+      # this workflow has no pull_request trigger -- it runs only on a
+      # `shell-v*` tag push or maintainer dispatch.
       - name: Verify Linux media framework (smoke)
         if: matrix.os == 'linux'
         shell: bash
@@ -381,15 +437,25 @@ jobs:
             exit 1
           }
 
-          export LD_LIBRARY_PATH="$appdir/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          export GST_PLUGIN_SYSTEM_PATH_1_0="$plugin_dir"
-          export GST_PLUGIN_PATH_1_0="$plugin_dir"
-          export GST_PLUGIN_SCANNER_1_0="$appdir/usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner"
-          export GST_REGISTRY="$workdir/registry.bin"
+          # Empty environment plus exactly the GStreamer variables the probe
+          # needs. Loading a plugin runs its init code, so it is handed no
+          # ambient runner credentials and no writable HOME outside $workdir.
+          GST_INSPECT=$(command -v gst-inspect-1.0)
+          probe() {
+            env -i \
+              PATH="$PATH" \
+              HOME="$workdir" \
+              LD_LIBRARY_PATH="$appdir/usr/lib" \
+              GST_PLUGIN_SYSTEM_PATH_1_0="$plugin_dir" \
+              GST_PLUGIN_PATH_1_0="$plugin_dir" \
+              GST_PLUGIN_SCANNER_1_0="$appdir/usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner" \
+              GST_REGISTRY="$workdir/registry.bin" \
+              "$@"
+          }
 
           # Prove the loader actually took the bundled core before believing a
           # single element result.
-          resolved_core=$(ldd "$(command -v gst-inspect-1.0)" \
+          resolved_core=$(probe ldd "$GST_INSPECT" \
             | awk '/libgstreamer-1\.0\.so/ { print $3 }')
           echo "gst-inspect-1.0 resolves libgstreamer-1.0 from: ${resolved_core:-<unresolved>}"
           case "$resolved_core" in
@@ -411,7 +477,7 @@ jobs:
               status=1
               continue
             fi
-            if ! gst-inspect-1.0 "$element" >/dev/null 2>&1; then
+            if ! probe "$GST_INSPECT" "$element" >/dev/null 2>&1; then
               echo "::error::AppImage's bundled plugins do not provide the $element element"
               status=1
             fi
@@ -440,44 +506,6 @@ jobs:
 
           rm -rf "$workdir"
           exit "$status"
-
-      - name: Stage shell artifacts
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p staging
-          find client/src-tauri/target/release/bundle \
-            -maxdepth 2 \
-            \( -name '*.deb' -o -name '*.AppImage' -o -name '*.AppImage.sig' \
-               -o -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.app.tar.gz.sig' \
-               -o -name '*.exe' -o -name '*.exe.sig' \) \
-            -exec cp {} staging/ \;
-
-          rename_artifact() {
-            local pattern="$1"
-            local destination="$2"
-            local source
-            source=$(find staging -maxdepth 1 -type f -name "$pattern" -print -quit)
-            [ -n "$source" ] || return 0
-            mv "$source" "staging/$destination"
-            if [ -f "$source.sig" ]; then
-              mv "$source.sig" "staging/$destination.sig"
-            fi
-          }
-
-          rename_artifact '*-setup.exe' 'Phase-Desktop-Windows-x64-Setup.exe'
-          rename_artifact '*.dmg' 'Phase-Desktop-macOS-Apple-Silicon.dmg'
-          rename_artifact '*.app.tar.gz' 'Phase-Desktop-macOS-Apple-Silicon.app.tar.gz'
-          rename_artifact '*.AppImage' 'Phase-Desktop-Linux-x86_64.AppImage'
-          rename_artifact '*.deb' 'Phase-Desktop-Linux-x86_64.deb'
-          ls -la staging/
-
-      - name: Upload shell artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: staging/*
-          retention-days: 90
 
   build-android:
     name: Build Signed Android APKs
