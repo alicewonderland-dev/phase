@@ -23,6 +23,17 @@ function shuffle<T>(arr: T[]): T[] {
 
 const DEFAULT_PHASE_BREAKPOINTS = { mid: 5, late: 10 };
 
+/**
+ * What one `preloadSfx()` pass put into the buffer map.
+ *
+ * - `skipped` — nothing to do: audio is off, there is no context, or the theme
+ *   declares no SFX. Says nothing about whether the host can play sound.
+ * - `none` — every file failed. On a host with a working media pipeline this
+ *   does not happen, so it is the pipeline reporting itself broken.
+ * - `partial` / `loaded` — some or all decoded; audio works either way.
+ */
+export type SfxPreloadResult = "skipped" | "none" | "partial" | "loaded";
+
 class AudioManager {
   private ctx: AudioContext | null = null;
   private sfxBuffers = new Map<string, AudioBuffer>();
@@ -58,10 +69,11 @@ class AudioManager {
    * disabled, `ctx` stays null after any `dispose()`/`restart()` cycle, and an
    * `isWarmedUp`-based fast path must never bypass the `disabled` check.
    *
-   * Because the context can outlive the latch, the flag guards every method
-   * that OPENS a media pipeline, not just the device: `warmUp()` (the device),
-   * `preloadSfx()` (a decode), and `playTrack()`/`playStinger()` (a media
-   * element source). A new pipeline-opening method must join that set.
+   * Because the context can outlive the latch — and can outlive it with
+   * buffers already decoded — the flag guards every method that OPENS a media
+   * pipeline or FEEDS one: `warmUp()` (the device), `preloadSfx()` (a decode),
+   * `playTrack()`/`playStinger()` (a media element source), and `playSfx()`
+   * (a buffer source). A new method in either category must join that set.
    */
   disable(): void {
     this.disabled = true;
@@ -119,26 +131,42 @@ class AudioManager {
   // SFX
   // ---------------------------------------------------------------------------
 
-  /** Preload all unique SFX files into AudioBuffers (background, non-blocking). */
-  async preloadSfx(): Promise<void> {
-    if (this.disabled || !this.ctx) return;
+  /**
+   * Preload all unique SFX files into AudioBuffers (background, non-blocking).
+   *
+   * Reports what actually landed. `loadBuffer` swallows per-file failures on
+   * purpose — one unreachable sound must not take the rest down — but a pass
+   * where *nothing* decoded is not a partial failure, it is the platform
+   * telling us it cannot play sound at all, and the boot gate has to be able
+   * to tell those apart (issue #6744).
+   */
+  async preloadSfx(): Promise<SfxPreloadResult> {
+    if (this.disabled || !this.ctx) return "skipped";
     const urls = [...new Set(Object.values(this.activeTheme.sfxMap))];
+    if (urls.length === 0) return "skipped";
     const entries = Object.entries(this.activeTheme.sfxMap);
 
-    await Promise.all(
-      urls.map(async (url) => {
+    const buffers = await Promise.all(
+      urls.map((url) => {
         // Find the eventType(s) that map to this URL
         const eventTypes = entries
           .filter(([_, u]) => u === url)
           .map(([et]) => et);
-        await this.loadBuffer(url, eventTypes);
+        return this.loadBuffer(url, eventTypes);
       }),
     );
+
+    const loaded = buffers.filter((buffer) => buffer !== null).length;
+    if (loaded === 0) return "none";
+    return loaded === buffers.length ? "loaded" : "partial";
   }
 
   /** Play a single SFX by GameEvent type. */
   playSfx(eventType: string, volume = 1.0): void {
-    if (!this.ctx || !this.sfxGain) return;
+    // `disabled` can latch after warm-up with buffers already decoded, so the
+    // ctx/gain guards below do not cover it: starting a source node on a
+    // latched-off host would push audio at a stack we just declared dead.
+    if (this.disabled || !this.ctx || !this.sfxGain) return;
 
     const buffer = this.sfxBuffers.get(eventType);
     if (!buffer) {
@@ -502,8 +530,12 @@ class AudioManager {
     return event.type;
   }
 
-  private async loadBuffer(url: string, eventTypes: string[]): Promise<void> {
-    if (!this.ctx) return;
+  /** The decoded buffer, or `null` when this one file could not be loaded. */
+  private async loadBuffer(
+    url: string,
+    eventTypes: string[],
+  ): Promise<AudioBuffer | null> {
+    if (!this.ctx) return null;
     try {
       const isLocal = url.startsWith("/");
       let arrayBuffer: ArrayBuffer;
@@ -528,8 +560,10 @@ class AudioManager {
         this.sfxBuffers.set(et, audioBuffer);
       }
       console.debug(`[SFX] Loaded ${url} → [${eventTypes.join(", ")}]`);
+      return audioBuffer;
     } catch (err) {
       console.warn(`[SFX] Failed to load: ${url}`, err);
+      return null;
     }
   }
 

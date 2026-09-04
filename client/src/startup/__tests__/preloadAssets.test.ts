@@ -207,15 +207,22 @@ describe("ensurePreload SFX deadline", () => {
     diagnostic.mockRestore();
   });
 
-  it("a rejected preload degrades the same way instead of throwing out of boot", async () => {
+  // The decoder rejecting is the OTHER way a broken media stack shows up, and
+  // it never reaches the deadline: `loadBuffer` catches per-file failures, so
+  // `preloadSfx` fulfils promptly with nothing loaded. Driven through the real
+  // preloadSfx → loadBuffer → decodeAudioData path — stubbing `preloadSfx`
+  // itself would prove only that a rejected promise is caught, not that a
+  // fulfilled-but-empty preload is recognised as failure.
+  it("a decoder that rejects every file degrades boot without waiting for the deadline", async () => {
+    decodeAudioData = () => Promise.reject(new Error("no decoder"));
     const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { ensurePreload, subscribePreload, audioManager, useAudioHealthStore } =
       await freshBoot();
-    vi.spyOn(audioManager, "preloadSfx").mockRejectedValue(new Error("no decoder"));
 
     const percents: number[] = [];
     const unsub = subscribePreload((p) => percents.push(p.percent));
-    // Resolves without the clock moving: a rejection is known immediately.
+    // No timer advance: every decode settles, so the deadline never fires.
     await expect(ensurePreload()).resolves.toBeUndefined();
     unsub();
 
@@ -223,6 +230,52 @@ describe("ensurePreload SFX deadline", () => {
     expect(useAudioHealthStore.getState().unavailable).toBe("media-unavailable");
     expect(audioManager.isDisabled).toBe(true);
     expect(diagnostic).toHaveBeenCalledOnce();
+    diagnostic.mockRestore();
+    warn.mockRestore();
+  });
+
+  // Partial failure is not platform failure: one unreachable sound must leave
+  // audio on. This is the arm that stops "report failure when a decode fails"
+  // from being over-applied.
+  it("one failed file among many keeps audio enabled", async () => {
+    let call = 0;
+    decodeAudioData = () => {
+      call += 1;
+      return call === 1 ? Promise.reject(new Error("one bad file")) : Promise.resolve({});
+    };
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { ensurePreload, subscribePreload, audioManager, useAudioHealthStore } =
+      await freshBoot();
+
+    const percents: number[] = [];
+    const unsub = subscribePreload((p) => percents.push(p.percent));
+    await expect(ensurePreload()).resolves.toBeUndefined();
+    unsub();
+
+    // Reach guard: the failing file really was decoded, so this is a partial
+    // failure and not a run where nothing was attempted.
+    expect(call).toBeGreaterThan(1);
+    expect(percents).toContain(100);
+    expect(useAudioHealthStore.getState().unavailable).toBeNull();
+    expect(audioManager.isDisabled).toBe(false);
+    expect(diagnostic).not.toHaveBeenCalled();
+    diagnostic.mockRestore();
+    warn.mockRestore();
+  });
+
+  // The wedged-device verdict already named the fault and left ctx null, so
+  // preloadSfx has nothing to do. It must not relabel that boot as a media
+  // failure — "skipped" is not "none".
+  it("a wedged device keeps its own reason and is not relabelled media-unavailable", async () => {
+    audioDeviceSafeMock.mockResolvedValue(false);
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { ensurePreload, useAudioHealthStore } = await freshBoot();
+
+    await ensurePreload();
+
+    expect(useAudioHealthStore.getState().unavailable).toBe("device-wedged");
+    expect(diagnostic).not.toHaveBeenCalled();
     diagnostic.mockRestore();
   });
 });

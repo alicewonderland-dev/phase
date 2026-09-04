@@ -108,6 +108,8 @@ pub struct MediaStackEnv {
     /// *replace* the distro directories rather than adding to them.
     pub system_path: Option<Vec<PathBuf>>,
     /// `GST_PLUGIN_PATH_1_0` / `GST_PLUGIN_PATH` — always searched as well.
+    /// Unset and set-but-empty both mean "no extra directories" here, because
+    /// this list only ever adds to the search path.
     pub extra_path: Vec<PathBuf>,
     /// The distro's own plugin directories, searched when `system_path` is unset.
     pub default_dirs: Vec<PathBuf>,
@@ -187,20 +189,37 @@ fn split_path_var(value: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// First of `names` that is set to a non-empty value, split into directories.
-fn path_var(names: &[&str]) -> Option<Vec<PathBuf>> {
-    names.iter().find_map(|name| {
-        let dirs = split_path_var(&std::env::var(name).ok()?);
-        (!dirs.is_empty()).then_some(dirs)
-    })
+/// The first of `names` that is *set*, split into directories.
+///
+/// Set-but-empty is a real answer, not a missing one: GStreamer picks the
+/// variable by presence (`g_getenv` returning non-NULL) and only then splits
+/// it, so `GST_PLUGIN_SYSTEM_PATH_1_0=""` means "no system plugin directories"
+/// and must neither fall through to the unversioned variable nor restore the
+/// distro defaults. Matching that exactly is what keeps the verdict a
+/// prediction of what GStreamer will do rather than a guess.
+///
+/// Takes `lookup` instead of reading the environment so the precedence rule
+/// has an env-independent seam to test against — mutating process env in a
+/// shared-process test harness is unsound (see
+/// `crates/engine/tests/integration/issue_4365_msh_legality.rs`).
+fn path_var_from(names: &[&str], lookup: impl Fn(&str) -> Option<String>) -> Option<Vec<PathBuf>> {
+    names
+        .iter()
+        .find_map(|name| lookup(name))
+        .map(|value| split_path_var(&value))
 }
 
 /// Read the process environment into [`MediaStackEnv`].
 fn process_env() -> MediaStackEnv {
+    let env = |name: &str| std::env::var(name).ok();
     MediaStackEnv {
         appdir: std::env::var_os("APPDIR").map(PathBuf::from),
-        system_path: path_var(&["GST_PLUGIN_SYSTEM_PATH_1_0", "GST_PLUGIN_SYSTEM_PATH"]),
-        extra_path: path_var(&["GST_PLUGIN_PATH_1_0", "GST_PLUGIN_PATH"]).unwrap_or_default(),
+        system_path: path_var_from(
+            &["GST_PLUGIN_SYSTEM_PATH_1_0", "GST_PLUGIN_SYSTEM_PATH"],
+            env,
+        ),
+        extra_path: path_var_from(&["GST_PLUGIN_PATH_1_0", "GST_PLUGIN_PATH"], env)
+            .unwrap_or_default(),
         default_dirs: default_plugin_dirs(),
     }
 }
@@ -333,6 +352,58 @@ mod tests {
             MediaStackVerdict::MissingPlugins(_)
         ));
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// An explicitly empty `GST_PLUGIN_SYSTEM_PATH_1_0` means "no system plugin
+    /// directories at all". Treating it as unset would restore the distro
+    /// defaults and report a host as usable that GStreamer will find bare.
+    #[test]
+    fn an_empty_system_path_override_is_not_an_unset_one() {
+        let root = temp_root("empty-override");
+        let complete = plugin_dir(&root, "default", &all_libraries());
+        let env = MediaStackEnv {
+            system_path: Some(Vec::new()),
+            default_dirs: vec![complete],
+            ..MediaStackEnv::default()
+        };
+        match verdict(&env) {
+            MediaStackVerdict::MissingPlugins(missing) => {
+                assert_eq!(missing.len(), REQUIRED_PLUGINS.len());
+            }
+            other => panic!("expected every plugin missing, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The env reader itself must preserve set-versus-unset, not just the
+    /// verdict: precedence is by EXISTENCE, so an empty versioned variable
+    /// wins over a populated unversioned one instead of falling through to it.
+    /// Driven through the env-independent seam — no process env is mutated.
+    #[test]
+    fn path_var_stops_at_the_first_variable_that_exists() {
+        let names = ["VERSIONED", "UNVERSIONED"];
+        let lookup = |set: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                set.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_string())
+            }
+        };
+
+        assert_eq!(
+            path_var_from(
+                &names,
+                lookup(&[("VERSIONED", ""), ("UNVERSIONED", "/host")])
+            ),
+            Some(Vec::new()),
+            "an empty versioned variable is an answer, not a fall-through"
+        );
+        assert_eq!(
+            path_var_from(&names, lookup(&[("UNVERSIONED", "/host")])),
+            Some(vec![PathBuf::from("/host")]),
+            "with the versioned variable absent, the unversioned one applies"
+        );
+        assert_eq!(path_var_from(&names, lookup(&[])), None);
     }
 
     /// Issue #6744: an AppImage carrying `libgstreamer-1.0.so` but pointed at the

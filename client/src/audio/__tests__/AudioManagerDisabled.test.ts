@@ -6,6 +6,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // singleton and leaking the flag into its assertions.
 
 const decodeAudioDataSpy = vi.fn().mockResolvedValue({});
+const createBufferSourceSpy = vi.fn().mockImplementation(() => ({
+  buffer: null,
+  connect: vi.fn(),
+  start: vi.fn(),
+}));
 
 const audioContextSpy = vi.fn().mockImplementation(function () {
   return {
@@ -18,7 +23,7 @@ const audioContextSpy = vi.fn().mockImplementation(function () {
       },
       connect: vi.fn(),
     })),
-    createBufferSource: vi.fn(),
+    createBufferSource: createBufferSourceSpy,
     decodeAudioData: decodeAudioDataSpy,
     close: vi.fn(),
     destination: {},
@@ -98,10 +103,50 @@ describe("AudioManager.disable", () => {
     expect(audioContextSpy).not.toHaveBeenCalled();
   });
 
-  it("preloadSfx resolves without a context while disabled", async () => {
+  it("preloadSfx skips without a context while disabled", async () => {
     const audioManager = await freshAudioManager();
     audioManager.disable();
-    await expect(audioManager.preloadSfx()).resolves.toBeUndefined();
+    await expect(audioManager.preloadSfx()).resolves.toBe("skipped");
+  });
+
+  // "skipped" must stay distinct from "none": boot maps only "none" to a media
+  // failure, so collapsing them would relabel a wedged-device boot.
+  it("a preload with nothing to do is skipped, not a decode failure", async () => {
+    const audioManager = await freshAudioManager();
+    audioManager.armDeviceOpen();
+    audioManager.warmUp();
+    await expect(audioManager.preloadSfx()).resolves.toBe("loaded");
+    audioManager.disable();
+    await expect(audioManager.preloadSfx()).resolves.toBe("skipped");
+  });
+
+  // Issue #6744's timeout latches `disabled` after warm-up, and buffers decoded
+  // before the latch stay in the map — so the ctx/gain guards playSfx already
+  // had cannot stop a later game event from starting a source on a stack we
+  // just declared dead.
+  it("playSfx starts no source once disabled, even with a buffer already loaded", async () => {
+    const audioManager = await freshAudioManager();
+    audioManager.armDeviceOpen();
+    audioManager.warmUp();
+    await audioManager.preloadSfx();
+    audioManager.disable();
+
+    audioManager.playSfx("GameStarted");
+
+    expect(createBufferSourceSpy).not.toHaveBeenCalled();
+  });
+
+  // Control arm: identical fixture, latch never set, so the assertion above is
+  // about `disabled` and not about an empty buffer map.
+  it("playSfx does start a source on the same loaded buffer while enabled", async () => {
+    const audioManager = await freshAudioManager();
+    audioManager.armDeviceOpen();
+    audioManager.warmUp();
+    await audioManager.preloadSfx();
+
+    audioManager.playSfx("GameStarted");
+
+    expect(createBufferSourceSpy).toHaveBeenCalledOnce();
   });
 
   // Issue #6744 latches disable() AFTER warmUp() built a context, so the

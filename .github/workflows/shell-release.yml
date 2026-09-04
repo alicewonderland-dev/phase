@@ -369,11 +369,38 @@ jobs:
 
           # Resolve each element from the BUNDLED plugin set only, exactly as
           # the shipped AppImage will. Presence of the file is not enough — the
-          # element has to register.
+          # element has to register, and it has to register against the CORE
+          # THIS APPIMAGE SHIPS. Pointing plugin paths at the AppDir while
+          # gst-inspect-1.0 still loads the runner's libgstreamer would test a
+          # core/plugin pair that is never shipped together, and would go green
+          # on exactly the ABI mismatch issue #6744 was: a bundled core that
+          # rejects the plugins it is pointed at.
+          test -n "$(find "$appdir/usr/lib" -maxdepth 1 -name 'libgstreamer-1.0.so*' -print -quit)" || {
+            echo "::error::AppImage bundles no libgstreamer-1.0; the element probe" \
+                 "below would be testing the runner's core, not the shipped one"
+            exit 1
+          }
+
+          export LD_LIBRARY_PATH="$appdir/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           export GST_PLUGIN_SYSTEM_PATH_1_0="$plugin_dir"
           export GST_PLUGIN_PATH_1_0="$plugin_dir"
           export GST_PLUGIN_SCANNER_1_0="$appdir/usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner"
           export GST_REGISTRY="$workdir/registry.bin"
+
+          # Prove the loader actually took the bundled core before believing a
+          # single element result.
+          resolved_core=$(ldd "$(command -v gst-inspect-1.0)" \
+            | awk '/libgstreamer-1\.0\.so/ { print $3 }')
+          echo "gst-inspect-1.0 resolves libgstreamer-1.0 from: ${resolved_core:-<unresolved>}"
+          case "$resolved_core" in
+            "$appdir"/*) ;;
+            *)
+              echo "::error::the element probe loaded $resolved_core, which is not from" \
+                   "the AppImage — it would pass on the runner's GStreamer instead of" \
+                   "the shipped core/plugin pair"
+              exit 1
+              ;;
+          esac
 
           status=0
           for entry in "${REQUIRED_ELEMENTS[@]}"; do

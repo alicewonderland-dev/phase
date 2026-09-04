@@ -1,4 +1,4 @@
-import { audioManager, initAudioOnInteraction } from "../audio/AudioManager";
+import { audioManager, initAudioOnInteraction, type SfxPreloadResult } from "../audio/AudioManager";
 import { audioDeviceSafe } from "../services/audioHealth";
 import { useAudioHealthStore } from "../stores/audioHealthStore";
 
@@ -48,14 +48,22 @@ export function subscribePreload(listener: ProgressListener): () => void {
  * expected boot outcome on a broken host, not an error to handle. A rejection
  * from the preload itself is the same kind of outcome and is reported as one.
  *
+ * Fulfilment alone is not success. `loadBuffer` swallows per-file failures, so
+ * a host whose decoder rejects every file still fulfils here — which is why
+ * the preload reports what it loaded and `"none"` is classified as a failure
+ * rather than read as readiness.
+ *
  * `work` is left running on a timeout — its buffers are still welcome if they
  * ever land, and a pending `decodeAudioData` cannot be cancelled.
  */
-function awaitSfxPreload(work: Promise<unknown>, limitMs: number): Promise<SfxPreloadOutcome> {
+function awaitSfxPreload(
+  work: Promise<SfxPreloadResult>,
+  limitMs: number,
+): Promise<SfxPreloadOutcome> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   return Promise.race<SfxPreloadOutcome>([
     work.then(
-      () => "ready",
+      (result) => (result === "none" ? "failed" : "ready"),
       () => "failed",
     ),
     new Promise<SfxPreloadOutcome>((resolve) => {
@@ -69,7 +77,7 @@ function sfxFailureDiagnostic(outcome: Exclude<SfxPreloadOutcome, "ready">): str
   const cause =
     outcome === "timed-out"
       ? `no sound finished decoding within ${SFX_PRELOAD_DEADLINE_MS}ms`
-      : "sound decoding failed";
+      : "no sound could be decoded";
   return (
     `[audio] Starting without audio: ${cause}. This platform's media pipeline cannot ` +
     "play sound. On Linux that means WebKit found no usable GStreamer plugins — run " +
