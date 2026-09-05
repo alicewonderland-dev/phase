@@ -18217,6 +18217,26 @@ pub struct PostReplacementDrain {
     /// CR 615.5: target of the prevented event itself, for
     /// `TargetFilter::PostReplacementDamageTarget`.
     pub event_target: Option<crate::types::ability::TargetRef>,
+
+    /// CR 109.5: the player "you" names inside this continuation — the
+    /// controller of the object whose ability is doing the replacing.
+    ///
+    /// Distinct from [`Self::source`] and deliberately a `PlayerId` rather than
+    /// an `ObjectId`: `source` is the object a `SelfRef` post-effect resolves
+    /// against (rebound to the *affected* object on every zone-change path, and
+    /// cleared outright by [`GameState::clear_post_replacement_source`]), while
+    /// this is the ability's controller, fixed when the replacement applied.
+    /// CR 614.6 makes that snapshot load-bearing: the modified event and its
+    /// continuation are one step, and the replacing object may already be gone
+    /// by drain time (Head of the Hunt dying in the same state-based-action
+    /// batch as the creature it exiles), so a drain-time object lookup would
+    /// answer `None` exactly when the rider still has to name its controller.
+    ///
+    /// `None` on every install path that has no replacing object to speak of —
+    /// combat-prevention riders, the ready-continuation helpers, test fixtures —
+    /// where the affected object's controller remains the fallback.
+    #[serde(default)]
+    pub controller: Option<crate::types::player::PlayerId>,
 }
 
 /// CR 616.1g: what an install does when a continuation is already resident.
@@ -18326,6 +18346,7 @@ impl PostReplacementDrain {
             applied: HashSet::new(),
             event_source: None,
             event_target: None,
+            controller: None,
         }
     }
 
@@ -22572,6 +22593,18 @@ impl GameState {
         self.active_post_replacement_drains()?
             .resident()
             .and_then(|drain| drain.source)
+    }
+
+    /// CR 109.5: the resident drain's replacing ability's controller — the
+    /// player "you" refers to in the continuation. See
+    /// [`PostReplacementDrain::controller`]; unlike
+    /// [`Self::post_replacement_source`] this survives
+    /// [`Self::clear_post_replacement_source`], because clearing the `SelfRef`
+    /// referent says nothing about whose ability produced the continuation.
+    pub fn post_replacement_controller(&self) -> Option<crate::types::player::PlayerId> {
+        self.active_post_replacement_drains()?
+            .resident()
+            .and_then(|drain| drain.controller)
     }
 
     /// CR 615.5 + CR 609.7: the resident drain's *prevented-event* source — the
