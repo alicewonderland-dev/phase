@@ -3574,89 +3574,416 @@ fn target_filter_contains_chosen_x_ref(filter: &TargetFilter) -> bool {
     }
 }
 
-fn target_filter_contains_amassed_army_ref(filter: &TargetFilter) -> bool {
-    match filter {
+/// CR 202.3 + CR 608.2: does any quantity threshold inside `filter` reference
+/// `scope`? Structural traversal delegates to `filter::filter_contains` (the
+/// exhaustive containment authority); the quantity leaf delegates to
+/// `quantity::quantity_expr_contains_scope` (the parameterized quantity
+/// authority). Only the prop → `QuantityExpr` projection is local, and it is
+/// exactly the set of props `filter_prop_contains` documents as
+/// quantity-carrying leaves.
+///
+/// Replaces the former `target_filter_contains_amassed_army_ref` /
+/// `filter_prop_contains_amassed_army_ref` / `quantity_expr_contains_amassed_army_ref`
+/// hand-rolled triple, parameterized by `ObjectScope` instead of hard-coding
+/// `ObjectScope::AmassedArmy`.
+fn target_filter_contains_quantity_scope(filter: &TargetFilter, scope: ObjectScope) -> bool {
+    crate::game::filter::filter_contains(filter, &|inner| match inner {
         TargetFilter::Typed(typed) => typed
             .properties
             .iter()
-            .any(filter_prop_contains_amassed_army_ref),
-        TargetFilter::Not { filter } | TargetFilter::TrackedSetFiltered { filter, .. } => {
-            target_filter_contains_amassed_army_ref(filter)
-        }
-        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
-            filters.iter().any(target_filter_contains_amassed_army_ref)
-        }
+            .any(|prop| filter_prop_contains_quantity_scope(prop, scope)),
         _ => false,
-    }
+    })
 }
 
-fn filter_prop_contains_amassed_army_ref(prop: &FilterProp) -> bool {
+/// EXHAUSTIVE over `FilterProp` with NO wildcard, mirroring
+/// `layers::filter_prop_reads_life` — a future quantity-carrying prop must be
+/// classified here rather than silently defaulting to "carries no threshold".
+fn filter_prop_contains_quantity_scope(prop: &FilterProp, scope: ObjectScope) -> bool {
     match prop {
         FilterProp::Cmc { value, .. }
         | FilterProp::Counters { count: value, .. }
-        | FilterProp::PtComparison { value, .. } => quantity_expr_contains_amassed_army_ref(value),
-        FilterProp::CanEnchant { target } => target_filter_contains_amassed_army_ref(target),
-        FilterProp::DifferentNameFrom { filter }
-        | FilterProp::TargetsOnly { filter }
-        | FilterProp::Targets { filter } => target_filter_contains_amassed_army_ref(filter),
-        FilterProp::SharesQuality { reference, .. } => reference
-            .as_deref()
-            .is_some_and(target_filter_contains_amassed_army_ref),
-        FilterProp::AnyOf { props } => props.iter().any(filter_prop_contains_amassed_army_ref),
-        FilterProp::Not { prop } => filter_prop_contains_amassed_army_ref(prop),
-        _ => false,
+        | FilterProp::PtComparison { value, .. } => {
+            crate::game::quantity::quantity_expr_contains_scope(value, scope)
+        }
+        FilterProp::AnyOf { props } => props
+            .iter()
+            .any(|p| filter_prop_contains_quantity_scope(p, scope)),
+        FilterProp::Not { prop } => filter_prop_contains_quantity_scope(prop, scope),
+        // Every remaining prop enumerated explicitly (no `_ =>`): none carries a
+        // `QuantityExpr` threshold. Props that box a nested `TargetFilter`
+        // (`CanEnchant`, `DifferentNameFrom`, `DistinctFrom`, `SharesQuality`,
+        // `Targets`, `TargetsOnly`, `ControllerMatches`) are handled by the
+        // OUTER `filter_contains` traversal, which independently visits every
+        // nested `TargetFilter` and re-invokes the leaf closure there — this
+        // classifier only answers for props attached directly to the `Typed`
+        // node it is called on.
+        FilterProp::Token
+        | FilterProp::NonToken
+        | FilterProp::RepresentedByCard
+        | FilterProp::ControllerChoseLabel { .. }
+        | FilterProp::ControllerMatches { .. }
+        | FilterProp::WasPlayed
+        | FilterProp::Attacking { .. }
+        | FilterProp::Blocking
+        | FilterProp::BlockingSource
+        | FilterProp::CombatRelation { .. }
+        | FilterProp::Unblocked
+        | FilterProp::AttackingAlone
+        | FilterProp::BlockingAlone
+        | FilterProp::Tapped
+        | FilterProp::Untapped
+        | FilterProp::IsSaddled
+        | FilterProp::SaddledSource
+        | FilterProp::ConvokedSource
+        | FilterProp::ProtectorMatches { .. }
+        | FilterProp::HasHasteOrControlledSinceTurnBegan
+        | FilterProp::WithKeyword { .. }
+        | FilterProp::HasKeywordKind { .. }
+        | FilterProp::WithoutKeyword { .. }
+        | FilterProp::WithoutKeywordKind { .. }
+        | FilterProp::CanEnchant { .. }
+        | FilterProp::ManaValueParity { .. }
+        | FilterProp::ManaCostIn { .. }
+        | FilterProp::InZone { .. }
+        | FilterProp::Owned { .. }
+        | FilterProp::Foretold
+        | FilterProp::HasAdventure
+        | FilterProp::EnchantedBy
+        | FilterProp::EquippedBy
+        | FilterProp::AttachedToSource
+        | FilterProp::AttachedToRecipient
+        | FilterProp::HasAttachment { .. }
+        | FilterProp::HasAnyAttachmentOf { .. }
+        | FilterProp::Another
+        | FilterProp::Unpaired
+        | FilterProp::OtherThanTriggerObject
+        | FilterProp::HasColor { .. }
+        | FilterProp::PowerGTSource
+        | FilterProp::ColorCount { .. }
+        | FilterProp::ManaSymbolCount { .. }
+        | FilterProp::HasSupertype { .. }
+        | FilterProp::IsChosenCreatureType
+        | FilterProp::MostPrevalentCreatureTypeIn { .. }
+        | FilterProp::IsChosenColor
+        | FilterProp::IsChosenCardType
+        | FilterProp::MatchesLastChosenCardPredicate
+        | FilterProp::HasSingleTarget
+        | FilterProp::Modal
+        | FilterProp::NotColor { .. }
+        | FilterProp::NotSupertype { .. }
+        | FilterProp::Suspected
+        | FilterProp::Renowned
+        | FilterProp::Goaded
+        | FilterProp::ToughnessGTPower
+        | FilterProp::PowerExceedsBase
+        | FilterProp::InTrackedSet { .. }
+        | FilterProp::Modified
+        | FilterProp::Historic
+        | FilterProp::NotHistoric
+        | FilterProp::DifferentNameFrom { .. }
+        | FilterProp::DistinctFrom { .. }
+        | FilterProp::InAnyZone { .. }
+        | FilterProp::SharesQuality { .. }
+        | FilterProp::WasDealtDamageThisTurn
+        | FilterProp::DealtDamageThisTurn
+        | FilterProp::EnteredThisTurn
+        | FilterProp::ControlledContinuouslySinceTurnBegan
+        | FilterProp::ZoneChangedThisTurn { .. }
+        | FilterProp::AttackedThisTurn { .. }
+        | FilterProp::BlockedThisTurn
+        | FilterProp::AttackedOrBlockedThisTurn
+        | FilterProp::CountersPutOnThisTurn { .. }
+        | FilterProp::FaceDown
+        | FilterProp::Transformed
+        | FilterProp::TargetsOnly { .. }
+        | FilterProp::Targets { .. }
+        | FilterProp::CouldBeTargetedByTriggeringSpell
+        | FilterProp::HasXInManaCost
+        | FilterProp::HasXInActivationCost
+        | FilterProp::WasKicked
+        | FilterProp::HasManaAbility
+        | FilterProp::HasNoAbilities
+        | FilterProp::Named { .. }
+        | FilterProp::SameName
+        | FilterProp::SameNameAsParentTarget
+        | FilterProp::SameNameAsExiledBySource
+        | FilterProp::NameMatchesAnyPermanent { .. }
+        | FilterProp::IsCommander
+        | FilterProp::SharesCreatureTypeWithCommander
+        | FilterProp::Other { .. } => false,
     }
 }
 
-fn quantity_expr_contains_amassed_army_ref(expr: &QuantityExpr) -> bool {
-    match expr {
-        QuantityExpr::Ref {
-            qty:
-                QuantityRef::Power {
-                    scope: ObjectScope::AmassedArmy,
-                }
-                | QuantityRef::Toughness {
-                    scope: ObjectScope::AmassedArmy,
-                }
-                | QuantityRef::ObjectManaValue {
-                    scope: ObjectScope::AmassedArmy,
-                }
-                | QuantityRef::ObjectColorCount {
-                    scope: ObjectScope::AmassedArmy,
-                }
-                | QuantityRef::ObjectNameWordCount {
-                    scope: ObjectScope::AmassedArmy,
-                }
-                | QuantityRef::ObjectTypelineComponentCount {
-                    scope: ObjectScope::AmassedArmy,
-                }
-                | QuantityRef::ManaSymbolsInManaCost {
-                    scope: ObjectScope::AmassedArmy,
-                    ..
-                },
-        } => true,
-        QuantityExpr::Ref { .. } | QuantityExpr::Fixed { .. } => false,
-        QuantityExpr::Offset { inner, .. }
-        | QuantityExpr::ClampMin { inner, .. }
-        | QuantityExpr::Multiply { inner, .. }
-        | QuantityExpr::DivideRounded { inner, .. }
-        | QuantityExpr::UpTo { max: inner }
-        | QuantityExpr::Power {
-            exponent: inner, ..
-        } => quantity_expr_contains_amassed_army_ref(inner),
-        QuantityExpr::Sum { exprs } | QuantityExpr::Max { exprs } => {
-            exprs.iter().any(quantity_expr_contains_amassed_army_ref)
+/// CR 601.2c: does this slot filter reference an object chosen in an EARLIER
+/// slot of the same ability, in a form a `.targets`-prefilled ability actually
+/// resolves? Exactly two encodings, both measured in the corpus:
+///
+///   * `ObjectScope::Target` inside a quantity threshold (Puca's Mischief `Cmc`,
+///     Spawnbroker `PtComparison`) — resolved by `quantity::object_id_for_scope`.
+///   * `FilterProp::SharesQuality { reference: Some(ParentTarget) }` (Daring
+///     Thief) — resolved by `filter::parent_target_shared_quality_values`.
+///
+/// Both read `ability.targets` with `.find_map(first Object)` and NEITHER
+/// consults `target_incarnations`.
+///
+/// DELIBERATELY EXCLUDED — the object-IDENTITY arm (`filter.rs:3620` for
+/// `TargetFilter::ParentTarget`, `:3628` for `ParentTargetSlot { index }`) and
+/// the positional read at `filter.rs:5331`/`:5333`. That arm additionally
+/// requires `!ability.target_incarnations.is_empty()` and
+/// `target_pin_is_current`, and `target_incarnations` means "pinned at
+/// DELAYED-TRIGGER creation" (`set_target_incarnations_recursive`, CR 400.7 +
+/// CR 603.7c) — announcement-time targets are pinned in the separate
+/// `selected_target_incarnations`. Forging a pin here would lie to
+/// `live_object_targets` and `pinned_object_targets_all_stale`. Measured: a
+/// clone with `.targets` prefilled and pins empty returns the SAME empty set
+/// the ability-free door already returns, so excluding this arm changes no
+/// behaviour and avoids rerouting 30 corpus slots. See deferral D1.
+fn target_filter_binds_prior_target(filter: &TargetFilter) -> bool {
+    crate::game::filter::filter_contains(filter, &|inner| match inner {
+        TargetFilter::Typed(typed) => typed.properties.iter().any(filter_prop_binds_prior_target),
+        _ => false,
+    })
+}
+
+/// EXHAUSTIVE over `FilterProp` with NO wildcard.
+fn filter_prop_binds_prior_target(prop: &FilterProp) -> bool {
+    match prop {
+        FilterProp::Cmc { value, .. }
+        | FilterProp::Counters { count: value, .. }
+        | FilterProp::PtComparison { value, .. } => {
+            crate::game::quantity::quantity_expr_contains_scope(value, ObjectScope::Target)
         }
-        QuantityExpr::Difference { left, right } => {
-            quantity_expr_contains_amassed_army_ref(left)
-                || quantity_expr_contains_amassed_army_ref(right)
+        FilterProp::SharesQuality { reference, .. } => {
+            matches!(reference.as_deref(), Some(TargetFilter::ParentTarget))
+        }
+        FilterProp::AnyOf { props } => props.iter().any(filter_prop_binds_prior_target),
+        FilterProp::Not { prop } => filter_prop_binds_prior_target(prop),
+        // Every remaining prop enumerated explicitly (no `_ =>`) — see
+        // `filter_prop_contains_quantity_scope`'s doc for why props that box a
+        // nested `TargetFilter` (other than `SharesQuality`, handled above) need
+        // no arm here: the OUTER `filter_contains` traversal visits their nested
+        // filters independently.
+        FilterProp::Token
+        | FilterProp::NonToken
+        | FilterProp::RepresentedByCard
+        | FilterProp::ControllerChoseLabel { .. }
+        | FilterProp::ControllerMatches { .. }
+        | FilterProp::WasPlayed
+        | FilterProp::Attacking { .. }
+        | FilterProp::Blocking
+        | FilterProp::BlockingSource
+        | FilterProp::CombatRelation { .. }
+        | FilterProp::Unblocked
+        | FilterProp::AttackingAlone
+        | FilterProp::BlockingAlone
+        | FilterProp::Tapped
+        | FilterProp::Untapped
+        | FilterProp::IsSaddled
+        | FilterProp::SaddledSource
+        | FilterProp::ConvokedSource
+        | FilterProp::ProtectorMatches { .. }
+        | FilterProp::HasHasteOrControlledSinceTurnBegan
+        | FilterProp::WithKeyword { .. }
+        | FilterProp::HasKeywordKind { .. }
+        | FilterProp::WithoutKeyword { .. }
+        | FilterProp::WithoutKeywordKind { .. }
+        | FilterProp::CanEnchant { .. }
+        | FilterProp::ManaValueParity { .. }
+        | FilterProp::ManaCostIn { .. }
+        | FilterProp::InZone { .. }
+        | FilterProp::Owned { .. }
+        | FilterProp::Foretold
+        | FilterProp::HasAdventure
+        | FilterProp::EnchantedBy
+        | FilterProp::EquippedBy
+        | FilterProp::AttachedToSource
+        | FilterProp::AttachedToRecipient
+        | FilterProp::HasAttachment { .. }
+        | FilterProp::HasAnyAttachmentOf { .. }
+        | FilterProp::Another
+        | FilterProp::Unpaired
+        | FilterProp::OtherThanTriggerObject
+        | FilterProp::HasColor { .. }
+        | FilterProp::PowerGTSource
+        | FilterProp::ColorCount { .. }
+        | FilterProp::ManaSymbolCount { .. }
+        | FilterProp::HasSupertype { .. }
+        | FilterProp::IsChosenCreatureType
+        | FilterProp::MostPrevalentCreatureTypeIn { .. }
+        | FilterProp::IsChosenColor
+        | FilterProp::IsChosenCardType
+        | FilterProp::MatchesLastChosenCardPredicate
+        | FilterProp::HasSingleTarget
+        | FilterProp::Modal
+        | FilterProp::NotColor { .. }
+        | FilterProp::NotSupertype { .. }
+        | FilterProp::Suspected
+        | FilterProp::Renowned
+        | FilterProp::Goaded
+        | FilterProp::ToughnessGTPower
+        | FilterProp::PowerExceedsBase
+        | FilterProp::InTrackedSet { .. }
+        | FilterProp::Modified
+        | FilterProp::Historic
+        | FilterProp::NotHistoric
+        | FilterProp::DifferentNameFrom { .. }
+        | FilterProp::DistinctFrom { .. }
+        | FilterProp::InAnyZone { .. }
+        | FilterProp::WasDealtDamageThisTurn
+        | FilterProp::DealtDamageThisTurn
+        | FilterProp::EnteredThisTurn
+        | FilterProp::ControlledContinuouslySinceTurnBegan
+        | FilterProp::ZoneChangedThisTurn { .. }
+        | FilterProp::AttackedThisTurn { .. }
+        | FilterProp::BlockedThisTurn
+        | FilterProp::AttackedOrBlockedThisTurn
+        | FilterProp::CountersPutOnThisTurn { .. }
+        | FilterProp::FaceDown
+        | FilterProp::Transformed
+        | FilterProp::TargetsOnly { .. }
+        | FilterProp::Targets { .. }
+        | FilterProp::CouldBeTargetedByTriggeringSpell
+        | FilterProp::HasXInManaCost
+        | FilterProp::HasXInActivationCost
+        | FilterProp::WasKicked
+        | FilterProp::HasManaAbility
+        | FilterProp::HasNoAbilities
+        | FilterProp::Named { .. }
+        | FilterProp::SameName
+        | FilterProp::SameNameAsParentTarget
+        | FilterProp::SameNameAsExiledBySource
+        | FilterProp::NameMatchesAnyPermanent { .. }
+        | FilterProp::IsCommander
+        | FilterProp::SharesCreatureTypeWithCommander
+        | FilterProp::Other { .. } => false,
+    }
+}
+
+/// Clone `ability` with `targets` replaced by exactly the single object
+/// `object_id`, so `ObjectScope::Target` / `SharesQuality{ParentTarget}`
+/// referents resolve against it during interactive enumeration.
+///
+/// CR 400.7 + CR 603.7c: `target_incarnations` is CLEARED, not merely assumed
+/// empty. The object-IDENTITY arms (`filter::filter_inner`'s
+/// `TargetFilter::ParentTarget` / `ParentTargetSlot`) are excluded from
+/// `target_filter_binds_prior_target` precisely because they additionally gate
+/// on `!target_incarnations.is_empty()`, and that exclusion is only sound while
+/// the clone actually carries no pins. Relying on the field being empty mid-walk
+/// is not enough: a delayed trigger is created with both `targets` and pins
+/// already populated (`effects::delayed_trigger` calls
+/// `set_target_incarnations_recursive` alongside a `targets` snapshot), and such
+/// an ability can still reach target selection. Inheriting those pins would let
+/// the synthetic single-object fill satisfy the identity arms — `is_none_or` in
+/// `target_pin_is_current` returns `true` for any id absent from the pin list —
+/// and would also discard the creation-time snapshot a `ParentTarget` referent
+/// is supposed to read. Clearing keeps the clone's referent surface to exactly
+/// the two encodings the predicate admits.
+fn resolved_ability_with_bound_object_target(
+    ability: &ResolvedAbility,
+    object_id: ObjectId,
+) -> ResolvedAbility {
+    let mut bound = ability.clone();
+    bound.targets = vec![TargetRef::Object(object_id)];
+    bound.target_incarnations.clear();
+    bound
+}
+
+/// Clone `ability` with `targets` prefilled from the FIRST object selected in a
+/// prior slot, so `ObjectScope::Target` and `SharesQuality{ParentTarget}`
+/// referents resolve during the interactive walk. CR 603.3d is why this matters:
+/// mid-walk the real `ability.targets` is still empty, so both referents fail
+/// closed and the dependent slot collapses, removing the ability from the stack.
+///
+/// FILL SHAPE: exactly one element, the first prior object. NOT index-aligned,
+/// not padded — the two admitted consumers both read
+/// `targets.iter().find_map(first Object)`, and `ParentTargetSlot { index }` is
+/// excluded from `target_filter_binds_prior_target`, so no positional consumer
+/// is reachable. No `TargetRef::Player` is written, so every player-axis reader
+/// (`filter::target_player_from_ability_or_root`) sees exactly what it sees
+/// today. `target_incarnations` is CLEARED on the clone, which is what makes the
+/// predicate's exclusion of the object-identity arms sound — see
+/// `resolved_ability_with_bound_object_target`.
+///
+/// `.find_map` (FIRST), not `.rev().find_map()`: an ENGINE CONVENTION (not
+/// CR 115.1), implemented at `quantity::object_id_for_scope`,
+/// `quantity::resolve_object_mana_value`,
+/// `filter::parent_target_shared_quality_values` and
+/// `attach_host_enchant_filter`. A deliberate divergence from
+/// `relative_filter_controller` directly below, which scans backward on the
+/// PLAYER axis; scanning backward here would disagree with the resolution-time
+/// referent for any ability with three or more object slots.
+fn bind_prior_object_targets(
+    ability: &ResolvedAbility,
+    selected_slots: &[Option<TargetRef>],
+) -> Option<ResolvedAbility> {
+    let prior_object = selected_slots
+        .iter()
+        .flatten()
+        .find_map(|target| match target {
+            TargetRef::Object(id) => Some(*id),
+            TargetRef::Player(_) => None,
+        })?;
+    Some(resolved_ability_with_bound_object_target(
+        ability,
+        prior_object,
+    ))
+}
+
+/// The object-axis sibling of the prior-PLAYER-slot lookup at
+/// `legal_targets_for_ability_filter_uncapped:5152-5160`. `.find` (FIRST), not
+/// `.rev()` — same convention, same reason.
+fn first_prior_object_slot(existing_slots: &[TargetSelectionSlot]) -> Option<&TargetSelectionSlot> {
+    existing_slots.iter().find(|slot| {
+        !slot.legal_targets.is_empty()
+            && slot
+                .legal_targets
+                .iter()
+                .all(|target| matches!(target, TargetRef::Object(_)))
+    })
+}
+
+/// CR 601.2c + CR 603.3d: at slot-build time NO selection has been made, and
+/// `TargetSelectionSlot` carries only `legal_targets` — candidate SETS, never a
+/// choice. Union the enumerations obtained by binding each candidate of the
+/// first prior OBJECT slot in turn. Dedup with the same
+/// `if !legal_targets.contains(&target)` idiom the player loop at :5196 uses.
+///
+/// The union is EXACT for this class (a narrowed slot's legality depends only
+/// on the single prior object), so "union non-empty <=> some assignment
+/// exists" holds — the CR 603.3d removal decision at the `collect_target_slots`
+/// call site stays correct. Narrower per-assignment legality is enforced
+/// separately at `legal_targets_for_selected_slot` (exact binding, not union).
+fn union_over_prior_object_candidates(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    filter: &TargetFilter,
+    prior: &TargetSelectionSlot,
+) -> Vec<TargetRef> {
+    let mut legal_targets = Vec::new();
+    for candidate in prior
+        .legal_targets
+        .iter()
+        .filter_map(|target| match target {
+            TargetRef::Object(id) => Some(*id),
+            TargetRef::Player(_) => None,
+        })
+    {
+        #[cfg(feature = "test-support")]
+        crate::game::perf_counters::record_prior_target_binding_static_union_enumeration();
+        let bound = resolved_ability_with_bound_object_target(ability, candidate);
+        for target in targeting::find_legal_targets_for_ability(state, filter, &bound) {
+            if !legal_targets.contains(&target) {
+                legal_targets.push(target);
+            }
         }
     }
+    legal_targets
 }
 
 fn target_filter_needs_ability_context(filter: &TargetFilter) -> bool {
     target_filter_contains_chosen_x_ref(filter)
-        || target_filter_contains_amassed_army_ref(filter)
+        || target_filter_contains_quantity_scope(filter, ObjectScope::AmassedArmy)
         || target_filter_contains_scoped_player_ref(filter)
         || filter_needs_trigger_source(filter)
 }
@@ -5368,6 +5695,16 @@ fn legal_targets_for_ability_filter_uncapped(
     let needs_ability_context = target_filter_needs_ability_context(filter);
     let relative_kind = relative_controller_kind(filter);
     if relative_kind.is_none() {
+        // CR 601.2c + CR 603.3d: at slot-build time no selection has been made
+        // yet, so a prior-target-relative filter must be unioned over every
+        // candidate of the first prior OBJECT slot rather than enumerated once.
+        // See `union_over_prior_object_candidates`'s doc for why a union (not
+        // exact narrowing) is correct here.
+        if target_filter_binds_prior_target(filter) {
+            if let Some(prior) = first_prior_object_slot(existing_slots) {
+                return union_over_prior_object_candidates(state, ability, filter, prior);
+            }
+        }
         if needs_ability_context {
             return targeting::find_legal_targets_for_ability(state, filter, ability);
         }
@@ -6077,14 +6414,33 @@ fn legal_targets_for_selected_slot(
             _ => spec.filter.clone(),
         };
 
-        if target_filter_needs_ability_context(&enumeration_filter) {
+        // CR 601.2c + CR 603.3d: a filter qualified relative to an object chosen
+        // in an EARLIER slot is re-enumerated against that exact object. The
+        // object-valued mirror of the `relative_filter_controller` player
+        // rebind directly above — same seam, same reason (`ability.targets` is
+        // still empty mid-walk), different axis. The door widens ONLY when a
+        // prior object selection existed and was bound, so
+        // `target_filter_needs_ability_context` stays untouched.
+        let bound = target_filter_binds_prior_target(&enumeration_filter)
+            .then(|| bind_prior_object_targets(ability, selected_slots))
+            .flatten();
+        #[cfg(feature = "test-support")]
+        if bound.is_some() {
+            crate::game::perf_counters::record_prior_target_binding_selection();
+        }
+        let enumeration_ability = bound.as_ref().unwrap_or(ability);
+        if bound.is_some() || target_filter_needs_ability_context(&enumeration_filter) {
             if controller == ability.controller {
-                targeting::find_legal_targets_for_ability(state, &enumeration_filter, ability)
+                targeting::find_legal_targets_for_ability(
+                    state,
+                    &enumeration_filter,
+                    enumeration_ability,
+                )
             } else {
                 targeting::find_legal_targets_for_ability_with_controller(
                     state,
                     &enumeration_filter,
-                    ability,
+                    enumeration_ability,
                     controller,
                 )
             }
@@ -6638,6 +6994,13 @@ fn homogeneous_required_target_walk_spec<'a>(
                 || target_filter_has_another_target_marker(&spec.filter)
                 || relative_controller_kind(&spec.filter).is_some()
                 || target_filter_needs_ability_context(&spec.filter)
+                // MG-C: the fast path below calls
+                // `legal_targets_for_selected_slot` with an EMPTY
+                // `selected_slots`, so a homogeneous run of prior-target-binding
+                // filters would silently bypass B4's binding and collapse the
+                // dependent slot. Reject the cache for those runs; T15 is the
+                // tripwire.
+                || target_filter_binds_prior_target(&spec.filter)
         })
         || ability_needs_companion_target_player_slot(ability)
         || is_per_opponent_target_fanout(ability)
