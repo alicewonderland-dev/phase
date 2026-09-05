@@ -25,16 +25,19 @@ import init, {
   get_legal_actions_for_viewer_js,
   get_viewer_snapshot_js,
   restore_game_state,
+  resume_restored_game_state,
   resume_multiplayer_host_state,
   load_card_database,
   build_ai_card_subset,
   evaluate_deck_compatibility_js,
+  evaluateDeckFormatGate,
+  customFormatFromLobbyConfig,
+  formatConfigForCustomRules,
   apply_seat_mutation,
   project_seat_view,
   export_game_state_json,
   clear_game_state,
   set_multiplayer_mode,
-  resolve_all,
   estimate_bracket_for_deck,
   has_replay_recording,
   export_replay_log,
@@ -44,13 +47,17 @@ import init, {
   replay_seek_js,
   clear_replay_playback,
   preview_mana_payment_js,
+  preview_interaction_js,
   get_card_face_data,
   get_card_parse_details,
   get_card_rulings,
 } from "@wasm/engine";
 
-import type { AiActionProposal, GameAction } from "./types";
-import type { InteractionSubmission } from "./generated/interaction";
+import { isActionOutcome, type ActionRejection, type AiActionProposal, type GameAction } from "./types";
+import type {
+  InteractionPreviewRequest,
+  InteractionSubmission,
+} from "./generated/interaction";
 import type { BracketDeckRequest } from "../types/bracketEstimate";
 import { classifyInitFailure, type InitFailure } from "./init-envelope";
 
@@ -82,6 +89,7 @@ type EngineRequest =
   | { type: "submitAction"; id: number; actor: number; action: GameAction }
   | { type: "submitInteraction"; id: number; actor: number; submission: InteractionSubmission }
   | { type: "previewManaPayment"; id: number; actor: number; action: GameAction }
+  | { type: "previewInteraction"; id: number; actor: number; request: InteractionPreviewRequest }
   | { type: "getState"; id: number }
   | { type: "getFilteredState"; id: number; viewerId: number }
   | { type: "getLegalActions"; id: number }
@@ -97,11 +105,15 @@ type EngineRequest =
   | { type: "getAiActionProposalFromScoresWithDiagnostics"; id: number; scoresJson: string; difficulty: string; playerId: number; seed: number }
   | { type: "submitAiActionProposal"; id: number; proposal: AiActionProposal }
   | { type: "restoreState"; id: number; stateJson: string }
+  | { type: "resumeRestoredGameState"; id: number }
   | { type: "resumeMultiplayerHostState"; id: number; stateJson: string }
   | { type: "exportState"; id: number }
   | { type: "loadCardDbFromUrl"; id: number }
   | { type: "buildAiCardSubset"; id: number }
   | { type: "evaluateDeckCompatibility"; id: number; request: unknown }
+  | { type: "evaluateDeckFormatGate"; id: number; request: unknown }
+  | { type: "customFormatFromLobbyConfig"; id: number; name: string; formatConfig: unknown }
+  | { type: "formatConfigForCustomRules"; id: number; customRules: unknown }
   | { type: "getCardFaceData"; id: number; cardName: string }
   | { type: "getCardParseDetails"; id: number; cardName: string }
   | { type: "getCardRulings"; id: number; cardName: string }
@@ -111,7 +123,6 @@ type EngineRequest =
   | { type: "takeLastPanic"; id: number }
   | { type: "applySeatMutation"; id: number; stateJson: string; mutationJson: string }
   | { type: "projectSeatView"; id: number; stateJson: string }
-  | { type: "resolveAll"; id: number; requester: number; aiSeatsJson: string; maxResolutions: number }
   | { type: "estimateBracketForDeck"; id: number; deck: BracketDeckRequest }
   | { type: "hasReplayRecording"; id: number }
   | { type: "exportReplayLog"; id: number }
@@ -129,6 +140,7 @@ type EngineResponse =
       message: string;
       bracketViolation?: true;
       engineOccupied?: true;
+      actionRejection?: ActionRejection;
     };
 
 // ── State ────────────────────────────────────────────────────────────────
@@ -145,6 +157,19 @@ function result(id: number, data: unknown): void {
 
 function error(id: number, message: string): void {
   respond({ type: "error", id, message });
+}
+
+function rejectionError(id: number, rejection: ActionRejection): void {
+  respond({ type: "error", id, message: rejection.message, actionRejection: rejection });
+}
+
+function malformedOutcomeError(id: number): void {
+  respond({
+    type: "error",
+    id,
+    message: "The engine rejected that action.",
+    actionRejection: undefined,
+  });
 }
 
 /**
@@ -225,6 +250,34 @@ self.onmessage = async (e: MessageEvent<EngineRequest>) => {
         break;
       }
 
+      // The ENFORCING sibling of `evaluateDeckCompatibility`: always returns a
+      // definite `{ compatible, reasons }`, never a tri-state. Used by the P2P
+      // host's per-guest deck-kick gate, which must not inherit the UI-hint
+      // path's "no opinion" answer for Custom formats.
+      case "evaluateDeckFormatGate": {
+        if (!cardDbLoaded) {
+          error(
+            msg.id,
+            "Card database not loaded. Call loadCardDb or loadCardDbFromUrl first.",
+          );
+          break;
+        }
+        result(msg.id, evaluateDeckFormatGate(msg.request));
+        break;
+      }
+
+      // Custom-format save/select. Neither call touches the card database —
+      // they are pure format-schema conversions — so neither gates on it.
+      case "customFormatFromLobbyConfig": {
+        result(msg.id, customFormatFromLobbyConfig(msg.name, msg.formatConfig));
+        break;
+      }
+
+      case "formatConfigForCustomRules": {
+        result(msg.id, formatConfigForCustomRules(msg.customRules));
+        break;
+      }
+
       case "getCardFaceData": {
         result(msg.id, get_card_face_data(msg.cardName));
         break;
@@ -300,14 +353,23 @@ self.onmessage = async (e: MessageEvent<EngineRequest>) => {
       }
 
       case "submitAction": {
-        const actionResult = submit_action(msg.actor, msg.action);
-        if (typeof actionResult === "string") {
+        const outcome = submit_action(msg.actor, msg.action);
+        if (typeof outcome === "string") {
           // Rust's submit_action error contract: returns the error string
           // on failure. `NOT_INITIALIZED:` prefix signals state-loss —
           // forward verbatim so the adapter can classify it as STATE_LOST.
-          error(msg.id, actionResult);
+          error(msg.id, outcome);
           break;
         }
+        if (!isActionOutcome(outcome)) {
+          malformedOutcomeError(msg.id);
+          break;
+        }
+        if (outcome.status === "rejected") {
+          rejectionError(msg.id, outcome.rejection);
+          break;
+        }
+        const actionResult = outcome.result as { events?: unknown[]; log_entries?: unknown[] };
         result(msg.id, {
           events: actionResult.events ?? [],
           log_entries: actionResult.log_entries ?? [],
@@ -316,11 +378,20 @@ self.onmessage = async (e: MessageEvent<EngineRequest>) => {
       }
 
       case "submitInteraction": {
-        const actionResult = submit_interaction_js(msg.actor, msg.submission);
-        if (typeof actionResult === "string") {
-          error(msg.id, actionResult);
+        const outcome = submit_interaction_js(msg.actor, msg.submission);
+        if (typeof outcome === "string") {
+          error(msg.id, outcome);
           break;
         }
+        if (!isActionOutcome(outcome)) {
+          malformedOutcomeError(msg.id);
+          break;
+        }
+        if (outcome.status === "rejected") {
+          rejectionError(msg.id, outcome.rejection);
+          break;
+        }
+        const actionResult = outcome.result as { events?: unknown[]; log_entries?: unknown[] };
         result(msg.id, {
           events: actionResult.events ?? [],
           log_entries: actionResult.log_entries ?? [],
@@ -329,12 +400,38 @@ self.onmessage = async (e: MessageEvent<EngineRequest>) => {
       }
 
       case "previewManaPayment": {
-        const sources = preview_mana_payment_js(msg.actor, msg.action);
-        if (typeof sources === "string") {
-          error(msg.id, sources);
+        const outcome = preview_mana_payment_js(msg.actor, msg.action);
+        if (typeof outcome === "string") {
+          error(msg.id, outcome);
           break;
         }
-        result(msg.id, sources);
+        if (!isActionOutcome(outcome)) {
+          malformedOutcomeError(msg.id);
+          break;
+        }
+        if (outcome.status === "rejected") {
+          rejectionError(msg.id, outcome.rejection);
+          break;
+        }
+        result(msg.id, outcome.result);
+        break;
+      }
+
+      case "previewInteraction": {
+        const outcome = preview_interaction_js(msg.actor, msg.request);
+        if (typeof outcome === "string") {
+          error(msg.id, outcome);
+          break;
+        }
+        if (!isActionOutcome(outcome)) {
+          malformedOutcomeError(msg.id);
+          break;
+        }
+        if (outcome.status === "rejected") {
+          rejectionError(msg.id, outcome.rejection);
+          break;
+        }
+        result(msg.id, outcome.result);
         break;
       }
 
@@ -472,9 +569,27 @@ self.onmessage = async (e: MessageEvent<EngineRequest>) => {
         break;
       }
 
+      case "resumeRestoredGameState": {
+        const presentation = resume_restored_game_state();
+        result(msg.id, {
+          presentation,
+          snapshot: {
+            state: get_game_state(),
+            legalResult: get_legal_actions_js(),
+          },
+        });
+        break;
+      }
+
       case "resumeMultiplayerHostState": {
-        resume_multiplayer_host_state(msg.stateJson);
-        result(msg.id, null);
+        const presentation = resume_multiplayer_host_state(msg.stateJson);
+        result(msg.id, {
+          presentation,
+          snapshot: {
+            state: get_game_state(),
+            legalResult: get_legal_actions_js(),
+          },
+        });
         break;
       }
 
@@ -520,16 +635,6 @@ self.onmessage = async (e: MessageEvent<EngineRequest>) => {
       case "projectSeatView": {
         const view = project_seat_view(msg.stateJson);
         result(msg.id, view ?? null);
-        break;
-      }
-
-      case "resolveAll": {
-        const r = resolve_all(msg.requester, msg.aiSeatsJson, msg.maxResolutions);
-        if (typeof r === "string") {
-          error(msg.id, r);
-          break;
-        }
-        result(msg.id, r);
         break;
       }
 

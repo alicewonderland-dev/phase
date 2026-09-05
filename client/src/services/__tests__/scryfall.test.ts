@@ -70,6 +70,128 @@ async function loadScryfallModule() {
   return import("../scryfall.ts");
 }
 
+function jsonResponse(value: unknown, status = 200): Response {
+  return new Response(JSON.stringify(value), { status });
+}
+
+function rejectedJsonResponse(): Response {
+  return Object.assign(new Response("", { status: 200 }), {
+    json: vi.fn().mockRejectedValue(new Error("invalid JSON")),
+  });
+}
+
+function validCardEntry() {
+  return {
+    oracle_id: "lightning-bolt",
+    name: "Lightning Bolt",
+    face_names: ["lightning bolt"],
+    mana_cost: "{R}",
+    cmc: 1,
+    type_line: "Instant",
+    colors: ["R"],
+    color_identity: ["R"],
+    keywords: [],
+    faces: [{ small: null, normal: null, art_crop: null }],
+  };
+}
+
+function validPrintingEntry() {
+  return {
+    id: "lightning-bolt-printing",
+    set: "lea",
+    set_name: "Limited Edition Alpha",
+    collector_number: "161",
+    released_at: "1993-08-05",
+    border_color: "black",
+    frame_effects: [],
+    full_art: false,
+    faces: [{ small: null, normal: null, art_crop: null }],
+  };
+}
+
+describe("local Scryfall data authorities", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("rejects malformed primary payloads, coalesces a valid retry, and preserves text fallback without URLs", async () => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValueOnce(rejectedJsonResponse())
+      .mockResolvedValueOnce(jsonResponse({}, 503))
+      .mockResolvedValueOnce(jsonResponse(null))
+      .mockResolvedValueOnce(jsonResponse([]))
+      .mockResolvedValueOnce(jsonResponse({}))
+      .mockResolvedValueOnce(jsonResponse({ bolt: { ...validCardEntry(), cmc: "1" } }))
+      .mockResolvedValueOnce(jsonResponse({ "lightning bolt": validCardEntry() }));
+    global.fetch = fetchMock;
+    const { buildLocalSearchCard, loadScryfallData, resolveOracleIdSync } = await loadScryfallModule();
+
+    for (let attempt = 0; attempt < 7; attempt++) {
+      await expect(loadScryfallData()).resolves.toBeNull();
+    }
+    expect(resolveOracleIdSync("Lightning Bolt")).toBeNull();
+
+    const first = loadScryfallData();
+    const second = loadScryfallData();
+    expect(second).toBe(first);
+    await expect(first).resolves.toEqual({ "lightning bolt": validCardEntry() });
+    await expect(loadScryfallData()).resolves.toEqual({ "lightning bolt": validCardEntry() });
+    expect(resolveOracleIdSync("Lightning Bolt")).toBe("lightning-bolt");
+    expect(buildLocalSearchCard({
+      name: "Lightning Bolt",
+      cmc: 1,
+      colorIdentity: ["R"],
+      legalities: {},
+    }).image_uris).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(8);
+  });
+
+  it("accepts omitted primary image URLs without publishing image data", async () => {
+    global.fetch = vi.fn().mockResolvedValue(jsonResponse({
+      "lightning bolt": { ...validCardEntry(), faces: [{}] },
+    }));
+    const { buildLocalSearchCard, loadScryfallData } = await loadScryfallModule();
+
+    await expect(loadScryfallData()).resolves.not.toBeNull();
+    expect(buildLocalSearchCard({
+      name: "Lightning Bolt",
+      cmc: 1,
+      colorIdentity: ["R"],
+      legalities: {},
+    }).image_uris).toBeUndefined();
+  });
+
+  it("rejects malformed printings payloads and keeps a valid retry cached", async () => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValueOnce(rejectedJsonResponse())
+      .mockResolvedValueOnce(jsonResponse({}, 503))
+      .mockResolvedValueOnce(jsonResponse(null))
+      .mockResolvedValueOnce(jsonResponse([]))
+      .mockResolvedValueOnce(jsonResponse({}))
+      .mockResolvedValueOnce(jsonResponse({ "lightning-bolt": [] }))
+      .mockResolvedValueOnce(jsonResponse({
+        "lightning-bolt": [{ ...validPrintingEntry(), full_art: "false" }],
+      }))
+      .mockResolvedValueOnce(jsonResponse({ "lightning-bolt": [validPrintingEntry()] }));
+    global.fetch = fetchMock;
+    const { loadPrintingsData, resolvePrintingImageUrl } = await loadScryfallModule();
+
+    for (let attempt = 0; attempt < 8; attempt++) {
+      await expect(loadPrintingsData()).resolves.toBeNull();
+    }
+
+    const first = loadPrintingsData();
+    const second = loadPrintingsData();
+    expect(second).toBe(first);
+    await expect(first).resolves.toEqual({ "lightning-bolt": [validPrintingEntry()] });
+    expect(resolvePrintingImageUrl(validPrintingEntry(), 0, "normal")).toBeNull();
+    await expect(loadPrintingsData()).resolves.toEqual({ "lightning-bolt": [validPrintingEntry()] });
+    expect(fetchMock).toHaveBeenCalledTimes(9);
+  });
+});
+
 describe("normalizeCardName", () => {
   it("strips set code brackets", async () => {
     const { normalizeCardName } = await loadScryfallModule();
@@ -277,6 +399,22 @@ describe("fetchCardData — combined multi-face names", () => {
         color_identity: ["W", "U"],
         keywords: [],
       },
+      "bonecrusher giant": {
+        oracle_id: "bonecrusher-oracle",
+        face_names: ["bonecrusher giant", "stomp"],
+        faces: [
+          { normal: "https://img.example/bonecrusher.jpg", art_crop: "https://img.example/bonecrusher-art.jpg" },
+          { normal: "https://img.example/bonecrusher.jpg", art_crop: "https://img.example/bonecrusher-art.jpg" },
+        ],
+        layout: "adventure",
+        name: "Bonecrusher Giant // Stomp",
+        mana_cost: "{2}{R}",
+        cmc: 3,
+        type_line: "Creature — Giant",
+        colors: ["R"],
+        color_identity: ["R"],
+        keywords: [],
+      },
     };
     return new Response(JSON.stringify(map), {
       status: 200,
@@ -303,15 +441,56 @@ describe("fetchCardData — combined multi-face names", () => {
     expect(card.name).toBe("Peter Parker // The Amazing Spider-Man");
   });
 
+  it("resolves_an_alternate_face_from_a_cube_front_face_name", async () => {
+    global.fetch = vi.fn().mockResolvedValueOnce(makeDfcDataMap());
+
+    const { loadScryfallData, resolveAlternateCardFaceSync } = await loadScryfallModule();
+    expect(resolveAlternateCardFaceSync("Peter Parker")).toBeUndefined();
+    await loadScryfallData();
+
+    expect(resolveAlternateCardFaceSync("Peter Parker")).toEqual({
+      name: "The Amazing Spider-Man",
+      faceIndex: 1,
+      side: "back",
+    });
+  });
+
   it("does not mis-split a single-faced card whose name contains \"//\" (issue #4790)", async () => {
     global.fetch = vi.fn().mockResolvedValueOnce(makeDfcDataMap());
 
-    const { fetchCardData } = await loadScryfallModule();
+    const { fetchCardData, resolveAlternateCardFaceSync } = await loadScryfallModule();
     const card = await fetchCardData("SP//dr, Piloted by Peni");
 
     // Its own name is a primary key, so the exact match wins before any split.
     expect(card.name).toBe("SP//dr, Piloted by Peni");
     expect(card.type_line).toContain("Spider Hero");
+    expect(resolveAlternateCardFaceSync("SP//dr, Piloted by Peni")).toBeNull();
+  });
+
+  it("does_not_treat_adventure_components_as_physical_card_faces", async () => {
+    global.fetch = vi.fn().mockResolvedValueOnce(makeDfcDataMap());
+
+    const { loadScryfallData, resolveAlternateCardFaceSync } = await loadScryfallModule();
+    await loadScryfallData();
+
+    expect(resolveAlternateCardFaceSync("Bonecrusher Giant")).toBeNull();
+  });
+});
+
+describe("manaSymbolSourceUrl", () => {
+  it.each([
+    ["W/U", "WU"],
+    ["W/U/P", "WUP"],
+    ["2/G", "2G"],
+    ["∞", "INFINITY"],
+    ["½", "HALF"],
+    ["1000000", "1000000"],
+  ])("maps %s to the exact Scryfall filename %s", async (shard, filename) => {
+    const { manaSymbolSourceUrl } = await loadScryfallModule();
+
+    expect(manaSymbolSourceUrl(shard)).toBe(
+      `https://svgs.scryfall.io/card-symbols/${filename}.svg`,
+    );
   });
 });
 
@@ -1357,12 +1536,38 @@ describe("localized card art", () => {
     frame_effects: [],
     full_art: false,
     faces: [
-      { normal: cardUrl(id, "normal", "front", query), art_crop: cardUrl(id, "art_crop") },
-      { normal: cardUrl(id, "normal", "back", query), art_crop: cardUrl(id, "art_crop", "back") },
+      {
+        small: cardUrl(id, "small", "front", query),
+        normal: cardUrl(id, "normal", "front", query),
+        art_crop: cardUrl(id, "art_crop"),
+      },
+      {
+        small: cardUrl(id, "small", "back", query),
+        normal: cardUrl(id, "normal", "back", query),
+        art_crop: cardUrl(id, "art_crop", "back"),
+      },
     ],
   });
 
-  function stubLocaleArt(map: Record<string, string>) {
+  function localizedArt(id: string) {
+    return {
+      id,
+      faces: [
+        {
+          small: cardUrl(id, "small", "front", "?exact-small"),
+          normal: cardUrl(id),
+          art_crop: cardUrl(id, "art_crop"),
+        },
+        {
+          small: cardUrl(id, "small", "back", "?exact-small"),
+          normal: cardUrl(id, "normal", "back"),
+          art_crop: cardUrl(id, "art_crop", "back"),
+        },
+      ],
+    };
+  }
+
+  function stubLocaleArt(map: Record<string, ReturnType<typeof localizedArt>>) {
     global.fetch = vi.fn().mockResolvedValue(
       new Response(JSON.stringify(map), {
         status: 200,
@@ -1377,7 +1582,7 @@ describe("localized card art", () => {
 
   it("swaps the image to the localized printing, keeping the chosen printing", async () => {
     const mod = await loadScryfallModule();
-    stubLocaleArt({ [EN_ID]: DE_ID });
+    stubLocaleArt({ [EN_ID]: localizedArt(DE_ID) });
     await mod.loadLocaleArt("de");
 
     const resolved = mod.resolvePrintingImageUrl(printing(EN_ID), 0, "normal");
@@ -1387,9 +1592,22 @@ describe("localized card art", () => {
     expect(resolved).not.toBe(cardUrl(EN_ID));
   });
 
+  it("falls back to English art when a v2 locale entry is invalid", async () => {
+    const mod = await loadScryfallModule();
+    global.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ [EN_ID]: DE_ID }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    await mod.loadLocaleArt("de");
+
+    expect(mod.resolvePrintingImageUrl(printing(EN_ID), 0, "normal")).toBe(cardUrl(EN_ID));
+  });
+
   it("keeps English art when the printing has no localized sibling", async () => {
     const mod = await loadScryfallModule();
-    stubLocaleArt({ [EN_ID]: DE_ID });
+    stubLocaleArt({ [EN_ID]: localizedArt(DE_ID) });
     await mod.loadLocaleArt("de");
 
     // Reach guard FIRST: prove the map actually loaded and the lookup runs.
@@ -1404,7 +1622,7 @@ describe("localized card art", () => {
 
   it("localizes the back face and the art crop", async () => {
     const mod = await loadScryfallModule();
-    stubLocaleArt({ [EN_ID]: DE_ID });
+    stubLocaleArt({ [EN_ID]: localizedArt(DE_ID) });
     await mod.loadLocaleArt("de");
 
     // A localized Scryfall id addresses the whole printing; front/back is a path
@@ -1415,11 +1633,14 @@ describe("localized card art", () => {
     expect(mod.resolvePrintingImageUrl(printing(EN_ID), 0, "art_crop")).toBe(
       cardUrl(DE_ID, "art_crop"),
     );
+    expect(mod.resolvePrintingImageUrl(printing(EN_ID), 0, "small")).toBe(
+      cardUrl(DE_ID, "small", "front", "?exact-small"),
+    );
   });
 
   it("is a no-op for English", async () => {
     const mod = await loadScryfallModule();
-    stubLocaleArt({ [EN_ID]: DE_ID });
+    stubLocaleArt({ [EN_ID]: localizedArt(DE_ID) });
     await mod.loadLocaleArt("de");
     expect(mod.resolvePrintingImageUrl(printing(EN_ID), 0, "normal")).toBe(cardUrl(DE_ID));
 
@@ -1439,7 +1660,11 @@ describe("localized card art", () => {
     const mod = await loadScryfallModule();
     // Map the placeholder's and card back's own ids too, so the guard is doing
     // the work rather than a lookup simply missing.
-    stubLocaleArt({ [EN_ID]: DE_ID, soon: DE_ID, "0aeebaf5-8c7d-4636-9e82-8c27447861f7": DE_ID });
+    stubLocaleArt({
+      [EN_ID]: localizedArt(DE_ID),
+      soon: localizedArt(DE_ID),
+      "0aeebaf5-8c7d-4636-9e82-8c27447861f7": localizedArt(DE_ID),
+    });
     await mod.loadLocaleArt("de");
     expect(mod.resolvePrintingImageUrl(printing(EN_ID), 0, "normal")).toBe(cardUrl(DE_ID));
 
@@ -1485,7 +1710,7 @@ describe("localized card art", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
     settle!(
-      new Response(JSON.stringify({ [EN_ID]: DE_ID }), {
+      new Response(JSON.stringify({ [EN_ID]: localizedArt(DE_ID) }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       }),
@@ -1495,7 +1720,7 @@ describe("localized card art", () => {
     // Same Map instance, so the body was parsed once and both callers observe
     // one shared map rather than two equal copies.
     expect(mapA).toBe(mapB);
-    expect(mapA.get(EN_ID)).toBe(DE_ID);
+    expect(mapA.get(EN_ID)).toEqual(localizedArt(DE_ID));
     expect(fetchMock).toHaveBeenCalledTimes(1);
     // Reach guard: the deduped map is the one that actually got installed, so
     // the identity assertions above are not describing a map nobody uses.

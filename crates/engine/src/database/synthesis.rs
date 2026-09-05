@@ -1623,11 +1623,63 @@ pub fn compute_deck_copy_limit(face: &CardFace) -> Option<DeckCopyLimit> {
         .and_then(compute_deck_copy_limit_from_text)
 }
 
-/// CR 903.3 type-line analysis (excludes MTGJSON skill data). Public for use by
-/// the deck-validation predicate, which reads the precomputed `face.is_commander`
-/// at runtime but exposes this helper for callers that only have a `CardFace`.
-pub fn type_line_commander_eligible(face: &CardFace) -> bool {
+/// CR 903.3 / CR 702.124k: how a card qualifies to be designated a commander.
+///
+/// This is the decomposition of [`type_line_commander_eligible`], not a sibling
+/// of it: the general predicate is *defined in terms of* this one, so every
+/// existing caller of the general predicate is unaffected. The distinction
+/// exists because CR 903.13f(3) grants the partner ability only to a card that
+/// "can be a player's commander **by itself**" — a condition no predicate in
+/// the tree previously drew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommanderQualification {
+    /// CR 903.3 (a)–(c) + CR 903.3a: designatable as the sole commander.
+    ByItself,
+    /// CR 702.124k: a legendary Background enchantment card, which "can't be
+    /// your commander unless you have also designated a commander with 'choose
+    /// a Background'".
+    OnlyAlongsideChooseABackground,
+    /// Not commander-eligible by type line.
+    No,
+}
+
+/// CR 903.3 type-line analysis, resolved to the "by itself" distinction
+/// CR 903.13f(3) needs. Excludes MTGJSON skill data.
+///
+/// LABELLED LIMITATION, stated rather than hidden: this reads the TYPE LINE
+/// only. `is_commander_eligible` prefers the pre-computed `face.is_commander`,
+/// which is the *union* of MTGJSON `leadershipSkills.commander` and this
+/// analysis — so a card MTGJSON marks a commander but whose type line does not
+/// would not receive the CR 903.13f(3) grant. The alternative, treating the
+/// MTGJSON union as "by itself", would grant partner to Backgrounds, which
+/// CR 702.124k forbids. The type-line reading is the conservative and
+/// rules-correct one.
+pub fn commander_qualification(face: &CardFace) -> CommanderQualification {
+    // CR 903.3a: explicit "can be your commander" override.
+    //
+    // BRANCH ORDER IS LOAD-BEARING and must not be "tidied" into type-line
+    // order. A card could in principle match both this override and the
+    // CR 702.124k Background branch below. CR 101.1: "Whenever a card's text
+    // directly contradicts these rules, the card takes precedence. The card
+    // overrides only the rule that applies to that specific situation."
+    // CR 702.124k's restriction is a RULE, so a printed ability saying the card
+    // can be your commander overrides it for that card, and such a card is
+    // `ByItself`. (CR 101.2's "'can't' takes precedence" does NOT govern here:
+    // it resolves a rule or effect against another EFFECT, and CR 702.124k is
+    // neither.) No printed card matches both today, so this specifies a
+    // currently-empty case rather than changing a live verdict.
+    let explicitly_allowed = face
+        .oracle_text
+        .as_ref()
+        .is_some_and(|text| oracle_text_allows_commander(text, &face.name));
+    if explicitly_allowed {
+        return CommanderQualification::ByItself;
+    }
+
     let is_legendary = face.card_type.supertypes.contains(&Supertype::Legendary);
+    if !is_legendary {
+        return CommanderQualification::No;
+    }
     let subtypes = &face.card_type.subtypes;
 
     // CR 903.3(a): legendary creature.
@@ -1642,18 +1694,30 @@ pub fn type_line_commander_eligible(face: &CardFace) -> bool {
         .any(|s| s.eq_ignore_ascii_case("Spacecraft"))
         && face.power.is_some()
         && face.toughness.is_some();
-    // CR 702.124: legendary Background enchantment (paired with a partner).
-    let is_background = subtypes
-        .iter()
-        .any(|s| s.eq_ignore_ascii_case("Background"));
-    // CR 903.3a: explicit "can be your commander" override.
-    let explicitly_allowed = face
-        .oracle_text
-        .as_ref()
-        .is_some_and(|text| oracle_text_allows_commander(text, &face.name));
+    if is_creature || is_vehicle || is_spacecraft_with_pt {
+        return CommanderQualification::ByItself;
+    }
 
-    (is_legendary && (is_creature || is_vehicle || is_spacecraft_with_pt || is_background))
-        || explicitly_allowed
+    // CR 702.124k: a legendary Background enchantment is commander-eligible,
+    // but never on its own.
+    if subtypes
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case("Background"))
+    {
+        return CommanderQualification::OnlyAlongsideChooseABackground;
+    }
+
+    CommanderQualification::No
+}
+
+/// CR 903.3 type-line analysis (excludes MTGJSON skill data). Public for use by
+/// the deck-validation predicate, which reads the precomputed `face.is_commander`
+/// at runtime but exposes this helper for callers that only have a `CardFace`.
+///
+/// Defined in terms of [`commander_qualification`], so the two can never
+/// disagree about who is eligible.
+pub fn type_line_commander_eligible(face: &CardFace) -> bool {
+    !matches!(commander_qualification(face), CommanderQualification::No)
 }
 
 /// Brawl variant of CR 903.3: determine if a card can be a Brawl commander.
@@ -7528,6 +7592,29 @@ fn oracle_corroborated_keywords(raw_oracle_text: &str) -> Vec<Keyword> {
     keywords
 }
 
+/// Lowercased alphanumeric words of one reminder-stripped Oracle line.
+fn counter_scan_words(line: &str) -> Vec<String> {
+    strip_reminder_text(line)
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Does `words` contain `phrase`'s words as one contiguous run?
+fn words_contain_phrase(words: &[String], phrase: &str) -> bool {
+    let phrase_words: Vec<&str> = phrase.split_whitespace().collect();
+    if phrase_words.is_empty() {
+        return false;
+    }
+    words.windows(phrase_words.len()).any(|run| {
+        run.iter()
+            .map(String::as_str)
+            .eq(phrase_words.iter().copied())
+    })
+}
+
 fn backup_keyword_modifications(granted_text: &str) -> Vec<ContinuousModification> {
     let mut modifications = Vec::new();
     for line in granted_text.lines() {
@@ -10122,6 +10209,33 @@ fn build_oracle_face_inner(
         !name_words.contains(&token) || oracle_corroborated.iter().any(|e| e == kw)
     });
 
+    // CR 122.1b: a keyword counter grants its keyword only while the counter sits
+    // on the object — the card itself does not HAVE the ability. MTGJSON still
+    // stamps such cards' `keywords` with the counter's name (Reluctant Role Model
+    // gets "Lifelink" from "put a flying, lifelink, or +1/+1 counter on it";
+    // Grimdancer and Aragorn, Company Leader get their choose-a-counter options).
+    // Drop a counter-capable keyword (the closed CR 122.1b list mirrored in
+    // `KEYWORD_COUNTERS`) that no Oracle keyword line corroborates when its word
+    // appears in a line that also says "counter"/"counters"; a real keyword line
+    // beside counter text stays corroborated and is kept.
+    keywords.retain(|kw| {
+        let counter_token = crate::types::counter::KEYWORD_COUNTERS
+            .iter()
+            .find(|(_, kind)| Keyword::promote_keyword_kind(*kind).as_ref() == Some(kw))
+            .map(|(name, _)| *name);
+        let Some(token) = counter_token else {
+            return true;
+        };
+        if oracle_corroborated.iter().any(|entry| entry == kw) {
+            return true;
+        }
+        !raw_oracle_text.lines().any(|line| {
+            let words = counter_scan_words(line);
+            words_contain_phrase(&words, token)
+                && words.iter().any(|w| w == "counter" || w == "counters")
+        })
+    });
+
     // Merge keywords extracted from Oracle text with MTGJSON keywords via the
     // shared `merge_extracted_keywords` authority (also used by the scenario test
     // harness so the two pipelines cannot diverge). It reconciles parameterized
@@ -11074,6 +11188,102 @@ mod cycling_synthesis_tests {
             // allow-raw-authority: test asserts build-time CardFace intrinsic keywords; no GameState/live object at synthesis time
             face.keywords.contains(&Keyword::Flying),
             "name-colliding Flying corroborated by a standalone Oracle line must be kept"
+        );
+    }
+
+    fn counter_phrase_card(name: &str, oracle: &str, mtgjson_keywords: &[&str]) -> AtomicCard {
+        use crate::database::mtgjson::AtomicIdentifiers;
+        AtomicCard {
+            name: name.to_string(),
+            mana_cost: Some("{1}{W}".to_string()),
+            colors: vec!["W".to_string()],
+            color_identity: vec!["W".to_string()],
+            text: Some(oracle.to_string()),
+            power: Some("2".to_string()),
+            toughness: Some("2".to_string()),
+            loyalty: None,
+            defense: None,
+            layout: "normal".to_string(),
+            type_line: Some("Creature — Human".to_string()),
+            types: vec!["Creature".to_string()],
+            subtypes: vec!["Human".to_string()],
+            supertypes: vec![],
+            keywords: Some(mtgjson_keywords.iter().map(|s| s.to_string()).collect()),
+            side: None,
+            face_name: None,
+            mana_value: 2.0,
+            legalities: Default::default(),
+            leadership_skills: None,
+            printings: Vec::new(),
+            rulings: Vec::new(),
+            is_game_changer: false,
+            identifiers: AtomicIdentifiers {
+                scryfall_oracle_id: Some(format!("{name}-test")),
+                scryfall_id: Some(format!("{name}-test-face")),
+            },
+            foreign_data: Vec::new(),
+            related_cards: crate::database::mtgjson::SetRelatedCards::default(),
+        }
+    }
+
+    /// CR 122.1b: a keyword counter grants its keyword only while the counter is
+    /// on the object — the card itself does not have the ability. MTGJSON still
+    /// phantom-tags Reluctant Role Model with "Lifelink" because its Survival
+    /// trigger names a lifelink counter ("put a flying, lifelink, or +1/+1
+    /// counter on it"). The counter-phrase guard must drop it.
+    #[test]
+    fn synthesis_drops_counter_phrase_only_mtgjson_keyword() {
+        let card = counter_phrase_card(
+            "Reluctant Role Model",
+            "Survival — At the beginning of your second main phase, if this creature is tapped, put a flying, lifelink, or +1/+1 counter on it.\nWhenever this creature or another creature you control dies, if it had counters on it, put those counters on up to one target creature.",
+            &["Lifelink", "Survival"],
+        );
+        let face = build_oracle_face(&card, None);
+        assert!(
+            // allow-raw-authority: test asserts build-time CardFace intrinsic keywords; no GameState/live object at synthesis time
+            !face.keywords.iter().any(|k| matches!(k, Keyword::Lifelink)),
+            "counter-phrase-only Lifelink must be dropped, got {:?}",
+            face.keywords
+        );
+    }
+
+    /// CR 122.1b list form AFTER the word "counter" (Aragorn, Company Leader /
+    /// Grimdancer): "a counter from among first strike, vigilance, deathtouch,
+    /// and lifelink" — the stamped choices must all be dropped.
+    #[test]
+    fn synthesis_drops_choose_a_counter_from_among_keywords() {
+        let card = counter_phrase_card(
+            "Aragorn, Company Leader",
+            "This creature enters with your choice of a counter from among first strike, vigilance, deathtouch, and lifelink on it.",
+            &["Deathtouch", "Vigilance"],
+        );
+        let face = build_oracle_face(&card, None);
+        assert!(
+            // allow-raw-authority: test asserts build-time CardFace intrinsic keywords; no GameState/live object at synthesis time
+            !face
+                .keywords
+                .iter()
+                .any(|k| matches!(k, Keyword::Deathtouch | Keyword::Vigilance)),
+            "choose-a-counter keywords must be dropped, got {:?}",
+            face.keywords
+        );
+    }
+
+    /// Negative control — a PIN, green with and without the counter-phrase guard:
+    /// a real standalone "Lifelink" line beside lifelink-counter text is
+    /// corroborated and must survive.
+    #[test]
+    fn synthesis_keeps_corroborated_keyword_beside_counter_phrase() {
+        let card = counter_phrase_card(
+            "Gilraen Test",
+            "Lifelink\nWhen this creature enters, put a lifelink counter on another target creature you control.",
+            &["Lifelink"],
+        );
+        let face = build_oracle_face(&card, None);
+        assert!(
+            // allow-raw-authority: test asserts build-time CardFace intrinsic keywords; no GameState/live object at synthesis time
+            face.keywords.contains(&Keyword::Lifelink),
+            "corroborated Lifelink beside counter text must be kept"
         );
     }
 }
@@ -18227,6 +18437,62 @@ mod idempotency_tests {
             );
             assert!(!state.battlefield.contains(&token_id));
         }
+    }
+
+    /// CR 609.3 + CR 111.7 (#8147): one mobilized token trades in combat before
+    /// the end step, so it has ceased to exist by the time the delayed
+    /// "sacrifice them" fires. The delayed trigger snapshots BOTH token ids at
+    /// creation and carries no incarnation pins, so `live_object_targets` still
+    /// hands the resolver the dead id; `sacrifice::resolve` used to `?` out with
+    /// `EffectError::ObjectNotFound` on it and abandon the whole effect, leaving
+    /// the survivor on the battlefield forever.
+    ///
+    /// Discriminating (fail-on-revert): restore the `ok_or(...)?` in
+    /// `effects/sacrifice.rs` and the survivor stays on the battlefield.
+    /// `synthesize_mobilize_runtime_sacrifices_tokens_at_next_end_step` cannot
+    /// see this — nothing dies in it, so every snapshotted id is still live.
+    #[test]
+    fn mobilize_end_step_sacrifice_still_takes_the_survivor_of_a_combat_trade() {
+        let mut face = CardFace::default();
+        face.keywords
+            .push(Keyword::Mobilize(QuantityExpr::Fixed { value: 2 }));
+        synthesize_mobilize(&mut face);
+
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Mobilizer".to_string(),
+            Zone::Battlefield,
+        );
+        let execute = face
+            .triggers
+            .first()
+            .and_then(|trigger| trigger.execute.as_deref())
+            .expect("mobilize trigger must have an execute body");
+        let ability = build_resolved_from_def(execute, source_id, PlayerId(0));
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+
+        let tokens = state.last_created_token_ids.clone();
+        assert_eq!(tokens.len(), 2);
+        let (died, survivor) = (tokens[0], tokens[1]);
+
+        // CR 111.7: a token that dies in combat ceases to exist.
+        state.battlefield.retain(|id| *id != died);
+        state.objects.remove(&died);
+
+        let stacked =
+            check_delayed_triggers(&mut state, &[GameEvent::PhaseChanged { phase: Phase::End }]);
+        assert_eq!(stacked.len(), 1, "end-step cleanup must still stack");
+        resolve_top(&mut state, &mut events);
+
+        assert_eq!(
+            state.objects[&survivor].zone,
+            Zone::Graveyard,
+            "surviving mobilized token must still be sacrificed"
+        );
     }
 
     #[test]

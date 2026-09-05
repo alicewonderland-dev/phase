@@ -116,8 +116,8 @@ impl DraftSession {
         {
             return Err("persisted draft player tokens must be unique".to_string());
         }
-        core.validate_sealed_snapshot()
-            .map_err(|error| format!("invalid persisted sealed snapshot: {error}"))?;
+        core.validate_persisted_snapshot()
+            .map_err(|error| format!("invalid persisted draft snapshot: {error}"))?;
         Ok(Self::from_persisted(ps))
     }
 
@@ -498,12 +498,37 @@ impl DraftSessionManager {
             return Err(format!("seat {seat} pack is empty"));
         }
 
-        let idx = rand::rng().random_range(0..pack.len());
-        let card_instance_id = pack[idx].instance_id.clone();
+        // CR 903.13b: a seat's pick step takes its kind's whole card count —
+        // one for the four CR 905.1a kinds, two for CommanderDraft — dropping
+        // to the remainder on an odd final pick. Reading the count from the
+        // procedure is what keeps the disconnected-seat auto-pick and the
+        // reducer's `expected` in agreement by construction rather than by
+        // coincidence. Was a hardcoded single id, which stalled a Commander pod
+        // at `WrongPickCardCount`.
+        //
+        // The other half of the discharged marker, decided here so it is not
+        // re-asked: `guard_create_draft_with_settings` does NOT gain a kind
+        // allowlist. `DraftKind`'s deserialization already refuses every
+        // non-variant, so an allowlist would re-express the type system as a
+        // runtime string check; the guard's job is bounding client-supplied
+        // strings and sizes before clone-heavy work, not policy; every kind is
+        // now genuinely creatable server-side, so there is nothing to deny; and
+        // an allowlist would become a second authority over which kinds exist,
+        // competing with `DraftKind::ALL`.
+        let cards_per_pick =
+            usize::from(session.session.config.kind.procedure().cards_per_pick).min(pack.len());
+        let mut rng = rand::rng();
+        // `swap_remove` off a scratch Vec draws DISTINCT ids; drawing twice by
+        // index into the pack could pick the same card twice, which the reducer
+        // rejects.
+        let mut remaining: Vec<String> = pack.iter().map(|c| c.instance_id.clone()).collect();
+        let card_instance_ids: Vec<String> = (0..cards_per_pick)
+            .map(|_| remaining.swap_remove(rng.random_range(0..remaining.len())))
+            .collect();
 
         let action = DraftAction::Pick {
             seat,
-            card_instance_id,
+            card_instance_ids,
         };
         draft_core::session::apply(&mut session.session, action, pack_source)
             .map_err(|e| format!("auto-pick failed: {e}"))?;
@@ -521,13 +546,10 @@ impl DraftSessionManager {
         if session.session.status != DraftStatus::Pairing {
             return Ok(());
         }
-        let round = session.session.current_round.max(1);
-        draft_core::session::apply(
-            &mut session.session,
-            DraftAction::GeneratePairings { round },
-            None,
-        )
-        .map_err(|e| format!("GeneratePairings failed: {e}"))?;
+        // The reducer derives the round (`DraftSession::next_pairing_round`);
+        // deriving it here is what made round 2 unreachable.
+        draft_core::session::apply(&mut session.session, DraftAction::GeneratePairings, None)
+            .map_err(|e| format!("GeneratePairings failed: {e}"))?;
         Ok(())
     }
 
@@ -701,6 +723,25 @@ fn deck_payload_from_submission(
     let deck = DeckData {
         main_deck: submission.main_deck.clone(),
         sideboard: Vec::new(),
+        // DEFERRED(out of scope -- the server-hosted draft launches 1v1
+        // pairings only). Two independent reasons this slot stays empty rather
+        // than being filled from `submission.commanders`.
+        //
+        // (1) No Commander session reaches this code:
+        // `PostDraftPlay::CompleteImmediately` maps CommanderDraft to
+        // `DraftStatus::Complete`, `apply_generate_pairings` is the only writer
+        // of `session.pairings`, and `ensure_pairings_generated` refuses to run
+        // outside `DraftStatus::Pairing` -- so the pairing loop that calls this
+        // function never has a pairing to iterate.
+        //
+        // (2) Filling it unconditionally would change the four existing kinds:
+        // `apply_submit_deck` has no per-kind gate on the designation list and
+        // `load_and_hydrate_decks` places commanders unconditionally, so a
+        // Premier/Traditional/Sealed submission carrying designations would
+        // start a `FormatConfig::limited()` game with cards in the command
+        // zone.
+        //
+        // A Commander pod launches client-side; see the pod launch path.
         commander: Vec::new(),
         attraction_deck: Vec::new(),
         signature_spell: Vec::new(),
@@ -763,10 +804,10 @@ fn authorize_client_draft_action(seat: usize, action: DraftAction) -> Result<Dra
         // Seat-scoped: overwrite the client-supplied seat with the authenticated
         // seat so a player cannot pick from or submit a deck for another seat.
         DraftAction::Pick {
-            card_instance_id, ..
+            card_instance_ids, ..
         } => Ok(DraftAction::Pick {
             seat: seat as u8,
-            card_instance_id,
+            card_instance_ids,
         }),
         DraftAction::PickWithDraftEffect {
             effect_card_instance_id,
@@ -777,15 +818,22 @@ fn authorize_client_draft_action(seat: usize, action: DraftAction) -> Result<Dra
             effect_card_instance_id,
             card_instance_ids,
         }),
-        DraftAction::SubmitDeck { main_deck, .. } => Ok(DraftAction::SubmitDeck {
+        // The seat is table authority and is overwritten with the authenticated
+        // one; the designation is player data and is carried through untouched.
+        DraftAction::SubmitDeck {
+            main_deck,
+            commanders,
+            ..
+        } => Ok(DraftAction::SubmitDeck {
             seat: seat as u8,
             main_deck,
+            commanders,
         }),
         // Table authority: only the host may start the draft, advance rounds,
         // generate pairings, report results, or replace a seat with a bot.
         DraftAction::StartDraft
         | DraftAction::AdvanceRound
-        | DraftAction::GeneratePairings { .. }
+        | DraftAction::GeneratePairings
         | DraftAction::ReportMatchResult { .. }
         | DraftAction::ReplaceSeatWithBot { .. } => {
             if seat == DRAFT_HOST_SEAT {
@@ -811,9 +859,7 @@ mod tests {
 
     fn test_config() -> DraftConfig {
         DraftConfig {
-            source: DraftSource::Set {
-                code: "TST".to_string(),
-            },
+            source: DraftSource::single_set("TST".to_string()),
             set_code: "TST".to_string(),
             kind: DraftKind::Premier,
             pod_size: 8,
@@ -826,6 +872,70 @@ mod tests {
             pod_policy: PodPolicy::Competitive,
             spectator_visibility: SpectatorVisibility::default(),
         }
+    }
+
+    /// A four-seat Commander pod (CR 903.13a; the 4-player pod is the product
+    /// default, and `min_pod_size` 3 is the CR 800.1 floor below it).
+    fn commander_test_config() -> DraftConfig {
+        let procedure = DraftKind::CommanderDraft.procedure();
+        DraftConfig {
+            kind: DraftKind::CommanderDraft,
+            pod_size: procedure.pod_size,
+            pack_count: procedure.packs_per_player,
+            min_deck_size: procedure.min_deck_size,
+            ..test_config()
+        }
+    }
+
+    fn start_pod(mgr: &mut DraftSessionManager, config: DraftConfig) -> String {
+        let pod_size = config.pod_size;
+        let (code, _host_token, _) = mgr.create_draft(config, "Alice".to_string());
+        for i in 1..pod_size {
+            mgr.join_draft(&code, format!("Player {i}"), None).unwrap();
+        }
+        let source = draft_core::pack_source::FixturePackSource {
+            set_code: "TST".to_string(),
+            cards_per_pack: 14,
+        };
+        mgr.apply_system_action(&code, DraftAction::StartDraft, Some(&source))
+            .unwrap();
+        code
+    }
+
+    /// CR 903.13b: the disconnected-seat auto-pick takes the kind's WHOLE pick
+    /// step — two cards for a Commander pod.
+    ///
+    /// REVERT-PROBE: restore the hardcoded `vec![card_instance_id]` and
+    /// `pick_random_for_seat` returns `Err` (the reducer's `WrongPickCardCount`),
+    /// so the `unwrap` below panics AND the pool-length assertion fails.
+    #[test]
+    fn commander_auto_pick_takes_two_cards() {
+        let mut mgr = DraftSessionManager::new();
+        let code = start_pod(&mut mgr, commander_test_config());
+
+        mgr.pick_random_for_seat(&code, 1, None).unwrap();
+
+        let view = draft_core::view::filter_for_player(&mgr.sessions[&code].session, 1);
+        assert_eq!(
+            view.pool.len(),
+            2,
+            "CR 903.13b: a Commander pick step drafts two cards"
+        );
+        // Distinct ids: `swap_remove` must not have drawn the same card twice.
+        assert_ne!(view.pool[0].instance_id, view.pool[1].instance_id);
+    }
+
+    /// The paired control: a CR 905.1a kind still takes exactly one card, so
+    /// the change reads the procedure rather than hardcoding two.
+    #[test]
+    fn premier_auto_pick_still_takes_one_card() {
+        let mut mgr = DraftSessionManager::new();
+        let code = start_pod(&mut mgr, test_config());
+
+        mgr.pick_random_for_seat(&code, 1, None).unwrap();
+
+        let view = draft_core::view::filter_for_player(&mgr.sessions[&code].session, 1);
+        assert_eq!(view.pool.len(), 1, "CR 905.1a: one card per pick step");
     }
 
     #[test]
@@ -1268,6 +1378,35 @@ mod tests {
         assert!(restored.sessions.is_empty());
     }
 
+    #[test]
+    fn restore_persisted_session_accepts_chaos_through_redacted_player_views() {
+        let mut source = DraftSessionManager::new();
+        let (code, token, _) = source.create_draft(test_config(), "Alice".to_string());
+        let mut persisted = source.sessions[&code].to_persisted();
+        let chaos_source = DraftSource::Set {
+            layout: draft_core::types::SetLayout::Chaos {
+                candidate_codes: vec!["TST".to_string()],
+                assignments: vec![vec!["TST".to_string(); 3]; 8],
+            },
+        };
+        persisted.config.source = chaos_source.clone();
+        persisted.session.config.source = chaos_source;
+
+        let mut restored = DraftSessionManager::new();
+        restored
+            .restore_persisted_session(persisted)
+            .expect("redacted core views make persisted Chaos sessions safe to restore");
+
+        let view = restored.sessions[&code].view_for_seat(0);
+        let serialized = serde_json::to_string(&view).expect("serialize player view");
+        assert!(
+            !serialized.contains("assignments"),
+            "a server player view must not serialize Chaos assignments: {serialized}"
+        );
+        assert!(restored.sessions.contains_key(&code));
+        assert_eq!(restored.draft_for_token(&token), Some(code.as_str()));
+    }
+
     fn fill_and_start(mgr: &mut DraftSessionManager, code: &str) {
         for i in 1..8 {
             mgr.join_draft(code, format!("Player {i}"), None).unwrap();
@@ -1346,7 +1485,7 @@ mod tests {
             2,
             DraftAction::Pick {
                 seat: 0,
-                card_instance_id: "abc".to_string(),
+                card_instance_ids: vec!["abc".to_string()],
             },
         )
         .expect("seat-scoped action is allowed for any seat");
@@ -1354,7 +1493,7 @@ mod tests {
             action,
             DraftAction::Pick {
                 seat: 2,
-                card_instance_id: "abc".to_string()
+                card_instance_ids: vec!["abc".to_string()]
             }
         );
     }
@@ -1380,13 +1519,21 @@ mod tests {
         );
     }
 
+    /// The seat is TABLE authority and is overwritten with the authenticated
+    /// one; the CR 903.3 designation is PLAYER data and must survive untouched.
+    ///
+    /// The second half is the discriminating assertion for this seam: a
+    /// reconstruction that dropped `commanders` (or reset it to `Vec::new()`)
+    /// would leave the server path silently unable to designate a commander at
+    /// all, while every draft-core test still passed.
     #[test]
-    fn authorize_rebinds_submit_deck_seat() {
+    fn authorize_rebinds_submit_deck_seat_and_carries_the_designation() {
         let action = authorize_client_draft_action(
             3,
             DraftAction::SubmitDeck {
                 seat: 0,
                 main_deck: vec!["x".to_string()],
+                commanders: vec!["x".to_string()],
             },
         )
         .expect("submit deck is allowed for any seat");
@@ -1394,7 +1541,8 @@ mod tests {
             action,
             DraftAction::SubmitDeck {
                 seat: 3,
-                main_deck: vec!["x".to_string()]
+                main_deck: vec!["x".to_string()],
+                commanders: vec!["x".to_string()],
             }
         );
     }
@@ -1449,9 +1597,7 @@ mod tests {
         use engine::types::player::PlayerId;
 
         let config = DraftConfig {
-            source: DraftSource::Set {
-                code: "TST".to_string(),
-            },
+            source: DraftSource::single_set("TST".to_string()),
             set_code: "TST".to_string(),
             kind: DraftKind::Premier,
             pod_size: 2,
@@ -1485,7 +1631,7 @@ mod tests {
             &mut session,
             DraftAction::Pick {
                 seat: 0,
-                card_instance_id: card_id,
+                card_instance_ids: vec![card_id],
             },
             None,
         )

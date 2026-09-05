@@ -891,11 +891,8 @@ pub(super) fn strip_if_you_do_conditional(text: &str) -> (Option<AbilityConditio
     // the multi-word "put onto the battlefield" verb, with subtype filters
     // (Aura/Equipment/...) via `parse_type_phrase`. Replaces the prior
     // hand-rolled past-tense / single-word / top-level-type-only matcher.
-    if let Ok((rest, prefix)) = alt((
-        value("if ", tag::<_, _, OracleError<'_>>("if ")),
-        value("when ", tag("when ")),
-    ))
-    .parse(lower.as_str())
+    if let Ok((rest, _)) =
+        alt((tag::<_, _, OracleError<'_>>("if "), tag("when "))).parse(lower.as_str())
     {
         use crate::parser::oracle_nom::condition as nom_cond;
         // CR 400.7 + CR 608.2c: active-voice reflexive gates that resolve to a
@@ -927,6 +924,28 @@ pub(super) fn strip_if_you_do_conditional(text: &str) -> (Option<AbilityConditio
                 Some(AbilityCondition::ZoneChangedThisWay {
                     filter,
                     destination: Some(Zone::Battlefield),
+                }),
+                text[offset..].to_string(),
+            );
+        }
+        // CR 608.2c + CR 701.25a: active-voice "you put [type] into your
+        // graveyard this way" — the condition following a preceding
+        // "surveil N" instruction (Chandra, Chill of Compliance; Enlightened
+        // Confidant). Runs under both prefixes for the same reason as the
+        // put-onto-battlefield sibling above. Unlike discard/sacrifice/exile
+        // below (cause-bound: the graveyard is inherent to the verb), a
+        // surveilled card's fate is a genuine choice, so this clause stays
+        // destination-bound like put-onto-battlefield — a redirect away from
+        // the graveyard as the card moves defeats it.
+        if let Ok((after_clause, (filter, _negated))) =
+            nom_cond::parse_you_put_into_graveyard_this_way_clause(rest)
+        {
+            let body_lower = strip_reflexive_conditional_body_separator(after_clause);
+            let offset = text.len() - body_lower.len();
+            return (
+                Some(AbilityCondition::ZoneChangedThisWay {
+                    filter,
+                    destination: Some(Zone::Graveyard),
                 }),
                 text[offset..].to_string(),
             );
@@ -965,43 +984,47 @@ pub(super) fn strip_if_you_do_conditional(text: &str) -> (Option<AbilityConditio
                 text[offset..].to_string(),
             );
         }
-        if prefix == "when " {
-            // CR 603.12 + CR 701.9a: "when you discard a card this way, [body]" —
-            // the reflexive gate created by a preceding "discard a card"
-            // instruction (Talion's Messenger, The Ancient One). The discard's
-            // hand → graveyard move publishes the card into
-            // `state.last_zone_changed_ids`, which `ZoneChangedThisWay` checks.
-            if let Ok((after_clause, (filter, _negated))) =
-                crate::parser::oracle_nom::condition::parse_you_discard_this_way_clause(rest)
-            {
-                let body_lower = strip_reflexive_conditional_body_separator(after_clause);
-                let offset = text.len() - body_lower.len();
-                return (
-                    Some(AbilityCondition::ZoneChangedThisWay {
-                        filter,
-                        destination: None,
-                    }),
-                    text[offset..].to_string(),
-                );
-            }
-            // CR 603.12 + CR 701.21a: "when you sacrifice one or more X this way,
-            // [body]" — the reflexive gate created by a preceding "sacrifice
-            // [quantifier] X" instruction (Nyssa of Traken). The sacrifice's
-            // battlefield → graveyard move publishes the permanents into
-            // `state.last_zone_changed_ids`, which `ZoneChangedThisWay` checks.
-            if let Ok((after_clause, (filter, _negated))) =
-                crate::parser::oracle_nom::condition::parse_you_sacrifice_this_way_clause(rest)
-            {
-                let body_lower = strip_reflexive_conditional_body_separator(after_clause);
-                let offset = text.len() - body_lower.len();
-                return (
-                    Some(AbilityCondition::ZoneChangedThisWay {
-                        filter,
-                        destination: None,
-                    }),
-                    text[offset..].to_string(),
-                );
-            }
+        // CR 701.9a: "if/when you discard a[n] X this way, [body]" —
+        // the condition following a preceding "discard a card" instruction.
+        // Runs under BOTH prefixes, like the put-onto-battlefield
+        // and exile siblings above: "When you discard a card this way, ..."
+        // (Talion's Messenger, The Ancient One) and "If you discard a land
+        // card this way, ..." (Silvan Reveler, issue #8122) are the same
+        // resolution-local condition in the two connectors —
+        // nothing about the discard-then-back-reference shape is tied to
+        // "when" specifically. The discard's hand → graveyard move publishes
+        // the card into `state.last_zone_changed_ids`, which `ZoneChangedThisWay` checks.
+        if let Ok((after_clause, (filter, _negated))) =
+            crate::parser::oracle_nom::condition::parse_you_discard_this_way_clause(rest)
+        {
+            let body_lower = strip_reflexive_conditional_body_separator(after_clause);
+            let offset = text.len() - body_lower.len();
+            return (
+                Some(AbilityCondition::ZoneChangedThisWay {
+                    filter,
+                    destination: None,
+                }),
+                text[offset..].to_string(),
+            );
+        }
+        // CR 701.21a: "if/when you sacrifice one or more X this
+        // way, [body]" — the condition following a preceding "sacrifice
+        // [quantifier] X" instruction (Nyssa of Traken). Runs under both
+        // prefixes for the same reason as the discard sibling above. The
+        // sacrifice's battlefield → graveyard move publishes the permanents
+        // into `state.last_zone_changed_ids`, which `ZoneChangedThisWay` checks.
+        if let Ok((after_clause, (filter, _negated))) =
+            crate::parser::oracle_nom::condition::parse_you_sacrifice_this_way_clause(rest)
+        {
+            let body_lower = strip_reflexive_conditional_body_separator(after_clause);
+            let offset = text.len() - body_lower.len();
+            return (
+                Some(AbilityCondition::ZoneChangedThisWay {
+                    filter,
+                    destination: None,
+                }),
+                text[offset..].to_string(),
+            );
         }
     }
     (None, text.to_string())
@@ -4031,6 +4054,20 @@ pub(super) enum InsteadLowering {
     NotOwned,
 }
 
+/// Printed word order for a self-replacement clause.
+///
+/// The axis matters only for Teamwork today: a forward clause whose body begins
+/// with "instead" is already owned by the additional-cost fold that preserves
+/// cast-time alternative targeting. A trailing "instead" (whether the condition
+/// is leading or trailing) has no such owner and lowers through the generic
+/// `ConditionInstead` branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InsteadClauseOrder {
+    ForwardLeadingInstead,
+    ForwardTrailingInstead,
+    Inverted,
+}
+
 pub(super) fn try_parse_generic_instead_clause(
     text: &str,
     kind: AbilityKind,
@@ -4038,8 +4075,8 @@ pub(super) fn try_parse_generic_instead_clause(
 ) -> InsteadLowering {
     // Forward form: "If <cond>, [body] instead." — split on the leading "If, "
     // and strip a trailing/leading "instead" from the body.
-    if let Some((cond_text, effect_text)) = split_forward_instead_clause(text) {
-        return build_instead_def(cond_text, effect_text, kind, ctx);
+    if let Some((cond_text, effect_text, order)) = split_forward_instead_clause(text) {
+        return build_instead_def(cond_text, effect_text, kind, ctx, order);
     }
 
     // CR 614.1a + CR 608.2c: Inverted form — "[body] instead if <cond>." (e.g.
@@ -4048,7 +4085,13 @@ pub(super) fn try_parse_generic_instead_clause(
     // `" instead if "` boundary mirrors the line-level `strip_instead_clause`
     // in `oracle.rs` but operates on a single chunk inside the chain loop.
     if let Some((cond_text, effect_text)) = split_inverted_instead_clause(text) {
-        return build_instead_def(cond_text, effect_text, kind, ctx);
+        return build_instead_def(
+            cond_text,
+            effect_text,
+            kind,
+            ctx,
+            InsteadClauseOrder::Inverted,
+        );
     }
 
     InsteadLowering::NotOwned
@@ -4057,7 +4100,7 @@ pub(super) fn try_parse_generic_instead_clause(
 /// Forward instead form: "If <cond>, [body] instead." Returns the trimmed
 /// `(condition_text, effect_text)` if the leading-conditional + trailing-or-
 /// leading "instead" structure matches. Returns None otherwise.
-fn split_forward_instead_clause(text: &str) -> Option<(String, String)> {
+fn split_forward_instead_clause(text: &str) -> Option<(String, String, InsteadClauseOrder)> {
     let (condition_fragment, raw_body) = split_leading_conditional(text)?;
     let condition_lower = condition_fragment.to_lowercase();
     let cond_text = nom_on_lower(&condition_fragment, &condition_lower, |i| {
@@ -4070,17 +4113,30 @@ fn split_forward_instead_clause(text: &str) -> Option<(String, String)> {
 
     let trimmed_body = raw_body.trim_end_matches('.').trim();
     let trimmed_lower = trimmed_body.to_lowercase();
-    let effect_text = if let Some(stripped) = trimmed_body.strip_suffix(" instead") {
-        stripped.trim().to_string()
+    let trailing_instead = nom_on_lower(trimmed_body, &trimmed_lower, |i| {
+        map(
+            all_consuming(terminated(take_until(" instead"), tag(" instead"))),
+            str::len,
+        )
+        .parse(i)
+    });
+    let (effect_text, order) = if let Some((stripped_len, _)) = trailing_instead {
+        (
+            trimmed_body[..stripped_len].trim().to_string(),
+            InsteadClauseOrder::ForwardTrailingInstead,
+        )
     } else if let Some((_, rest)) = nom_on_lower(trimmed_body, &trimmed_lower, |i| {
         value((), tag("instead ")).parse(i)
     }) {
-        rest.trim().to_string()
+        (
+            rest.trim().to_string(),
+            InsteadClauseOrder::ForwardLeadingInstead,
+        )
     } else {
         return None;
     };
 
-    Some((cond_text, effect_text))
+    Some((cond_text, effect_text, order))
 }
 
 /// Inverted instead form: "[body] instead if <cond>." Returns the trimmed
@@ -4161,6 +4217,7 @@ fn build_instead_def(
     effect_text: String,
     kind: AbilityKind,
     ctx: &mut ParseContext,
+    order: InsteadClauseOrder,
 ) -> InsteadLowering {
     // CR 608.2c: An additional-cost-paid "instead" fold ("if it/this spell was
     // kicked, ... instead") is owned by `strip_additional_cost_conditional`,
@@ -4180,7 +4237,19 @@ fn build_instead_def(
     // replacement. Everything that lowers today still lowers; only the failure
     // path is split, by `condition_names_an_event`, into "defer" vs "fail
     // honestly".
-    let Some(condition) = lower_instead_condition(&cond_text, ctx) else {
+    let condition = lower_instead_condition(&cond_text, ctx).or_else(|| match order {
+        // CR 601.2b/c + CR 608.2c: "if teamwork, instead [body]" remains with
+        // the established additional-cost fold, which announces alternative
+        // target requirements before targets are chosen.
+        InsteadClauseOrder::ForwardLeadingInstead => None,
+        // CR 601.2f + CR 608.2c: "[body] instead if teamwork" and "if teamwork,
+        // [body] instead" are typed resolution-time replacements gated
+        // specifically on the Teamwork cost.
+        InsteadClauseOrder::ForwardTrailingInstead | InsteadClauseOrder::Inverted => {
+            parse_cast_using_teamwork_condition_text(&cond_text)
+        }
+    });
+    let Some(condition) = condition else {
         return if condition_names_an_event(&cond_text) {
             InsteadLowering::NotOwned
         } else {
@@ -6922,7 +6991,7 @@ fn parse_objects_share_quality_reference<'a>(
     }
     if let Ok((rest, ())) = crate::parser::oracle_target::parse_word_bounded(&lower, "it") {
         let offset = text.len() - rest.len();
-        let mut ctx_mut = ctx.clone();
+        let mut ctx_mut = ctx.clone_throwaway();
         return Some((
             crate::parser::oracle_target::resolve_pronoun_target(&mut ctx_mut, "it"),
             &text[offset..],
@@ -7504,7 +7573,7 @@ mod tests {
     use crate::parser::oracle_nom::condition::parse_inner_condition;
     use crate::parser::parse_oracle_text;
     use crate::types::ability::{
-        AggregateFunction, CommanderOwnership, PlayerFilter, SharedQuality,
+        AggregateFunction, CardTypeSetSource, CommanderOwnership, PlayerFilter, SharedQuality,
     };
     use crate::types::counter::{CounterMatch, CounterType};
 
@@ -9160,11 +9229,16 @@ mod tests {
         assert_eq!(
             rhs,
             QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: AggregateFunction::Min,
-                    property: ObjectProperty::Power,
-                    filter: TargetFilter::Typed(TypedFilter::creature()),
-                }
+                qty: QuantityRef::PropertyAggregate(
+                    crate::types::ability::PropertyAggregate::new(
+                        AggregateFunction::Min,
+                        ObjectProperty::Power,
+                        crate::types::ability::CardTypeSetSource::Objects {
+                            filter: TargetFilter::Typed(TypedFilter::creature())
+                        }
+                    )
+                    .expect("statically valid property aggregate")
+                )
             }
         );
     }
@@ -9202,21 +9276,22 @@ mod tests {
             }
         );
         let QuantityExpr::Ref {
-            qty:
-                QuantityRef::Aggregate {
-                    function,
-                    property,
-                    filter,
-                },
+            qty: QuantityRef::PropertyAggregate(aggregate),
         } = rhs
         else {
             panic!("expected Aggregate rhs, got {rhs:?}");
         };
-        assert_eq!(function, AggregateFunction::Min);
-        assert_eq!(property, ObjectProperty::Power);
+        assert_eq!(aggregate.function(), AggregateFunction::Min);
+        assert_eq!(aggregate.property(), ObjectProperty::Power);
+        let CardTypeSetSource::Objects { filter } = aggregate.source() else {
+            panic!(
+                "expected object aggregate source, got {:?}",
+                aggregate.source()
+            );
+        };
         // The "on the battlefield" qualifier rides the aggregate population.
         assert!(
-            matches!(&filter, TargetFilter::Typed(tf)
+            matches!(filter, TargetFilter::Typed(tf)
             if tf.properties.iter().any(|p| matches!(
                 p,
                 FilterProp::InZone { zone: Zone::Battlefield }
@@ -9243,11 +9318,16 @@ mod tests {
         assert_eq!(
             rhs,
             QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: AggregateFunction::Max,
-                    property: ObjectProperty::Toughness,
-                    filter: TargetFilter::Typed(TypedFilter::creature()),
-                }
+                qty: QuantityRef::PropertyAggregate(
+                    crate::types::ability::PropertyAggregate::new(
+                        AggregateFunction::Max,
+                        ObjectProperty::Toughness,
+                        crate::types::ability::CardTypeSetSource::Objects {
+                            filter: TargetFilter::Typed(TypedFilter::creature())
+                        }
+                    )
+                    .expect("statically valid property aggregate")
+                )
             }
         );
     }

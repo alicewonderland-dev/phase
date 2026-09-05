@@ -4,10 +4,11 @@ use engine::types::game_state::PersistedGameState;
 use phase_ai::config::AiDifficulty;
 use serde::{Deserialize, Serialize};
 
-use draft_core::types::{DraftConfig, DraftSession as DraftCoreSession};
+use draft_core::types::{DraftConfig, DraftSession as DraftCoreSession, DraftSource, SetLayout};
 
 use crate::lobby::RegisterGameRequest;
 use crate::protocol::DraftLobbyMetadata;
+use crate::session::AiDriverFault;
 
 /// Serializable snapshot of a game session for disk persistence.
 ///
@@ -20,6 +21,12 @@ pub struct PersistedSession {
     pub game_code: String,
     #[serde(default)]
     pub state_revision: u64,
+    /// A persisted native-driver failure remains terminal across process
+    /// restart; omitting it decodes historical snapshots as healthy.
+    #[serde(default)]
+    pub ai_driver_fault: Option<AiDriverFault>,
+    #[serde(default = "default_next_ai_driver_fault_id")]
+    pub next_ai_driver_fault_id: u64,
     pub state: PersistedGameState,
     pub player_tokens: Vec<String>,
     pub display_names: Vec<String>,
@@ -57,6 +64,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_next_ai_driver_fault_id() -> u64 {
+    1
+}
+
 /// Serializable snapshot of a draft session for disk persistence.
 ///
 /// Fields excluded (reconstructed at restore time):
@@ -81,6 +92,26 @@ impl PersistedDraftSession {
     }
 }
 
+/// Display-safe source label for draft lobby rows.
+///
+/// A persisted Chaos source retains its private assignment matrix for exact
+/// restart behavior. Lobby discovery advertises candidate intent instead, so
+/// `DraftSource::set_code()` cannot disclose the actual assignment union
+/// before a player opens their booster.
+pub fn draft_lobby_source_label(source: &DraftSource) -> String {
+    match source {
+        DraftSource::Set {
+            layout: SetLayout::Chaos {
+                candidate_codes, ..
+            },
+        } => format!("Chaos:{}", candidate_codes.join("+")),
+        DraftSource::Set {
+            layout: SetLayout::UniformByRound { .. },
+        }
+        | DraftSource::Cube { .. } => source.set_code(),
+    }
+}
+
 /// Build the lobby-broker registration payload for a restored draft, if and
 /// only if the persisted snapshot is still joinable. This is the single
 /// production seam used by startup restore in `phase-server` — callers must
@@ -101,10 +132,30 @@ pub fn restored_draft_lobby_register_request(
         current_players: filled as u32,
         max_players: ps.config.pod_size as u32,
         draft_metadata: Some(DraftLobbyMetadata {
-            set_code: ps.config.set_code.clone(),
+            set_code: draft_lobby_source_label(&ps.config.source),
             draft_kind: format!("{:?}", ps.config.kind),
             cube_name: None,
         }),
         ..Default::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::draft_lobby_source_label;
+    use draft_core::types::{DraftSource, SetLayout};
+
+    #[test]
+    fn chaos_lobby_label_exposes_candidates_not_resolved_assignments() {
+        let source = DraftSource::Set {
+            layout: SetLayout::Chaos {
+                candidate_codes: vec!["AAA".to_string(), "BBB".to_string()],
+                // The actual union is intentionally only BBB. A lobby label
+                // based on DraftSource::set_code would leak that draw.
+                assignments: vec![vec!["BBB".to_string()]],
+            },
+        };
+
+        assert_eq!(draft_lobby_source_label(&source), "Chaos:AAA+BBB");
+    }
 }

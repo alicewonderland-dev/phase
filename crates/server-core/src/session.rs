@@ -7,31 +7,35 @@ use engine::database::legality::{validate_cedh_bracket, CedhBracketError};
 use engine::database::CardDatabase;
 use engine::game::deck_loading::{DeckPayload, PlayerDeckPayload};
 use engine::game::engine::{
-    apply, pending_resolve_all_ready_requester, recover_orphaned_resolve_all,
-    resolve_all_ready_access, resolve_all_ready_prefix, start_game, ResolveAllReadyAccess,
+    apply_with_rejection,
+    resume_restored_stack_automation as resume_engine_restored_stack_automation, start_game,
+    RestoredStackAutomationOutcome, RestoredStackAutomationPresentation,
 };
-use engine::game::interaction::{bind_interaction_authority, submit_interaction};
-use engine::game::layers::flush_layers;
+use engine::game::interaction::{bind_interaction_authority, submit_interaction_with_rejection};
 use engine::game::match_flow::apply_trusted_match_forfeit;
-use engine::game::preview::preview_auto_payment_sources;
 use engine::game::public_state::{
     bump_state_revision, finalize_public_state, mark_public_state_all_dirty,
 };
 use engine::game::{
-    create_debug_cards, debug_card_entry_source, load_and_hydrate_decks, preflight_debug_action,
-    rehydrate_game_from_card_db, DebugCardCreateRequest,
+    create_debug_cards_with_rejection, debug_card_entry_source, load_and_hydrate_decks,
+    rehydrate_game_from_card_db_with_finalization, CardDbRehydrationFinalization,
+    DebugCardCreateRequest,
 };
+use engine::types::action_rejection::ActionRejection;
 use engine::types::actions::{DebugAction, GameAction};
 use engine::types::events::GameEvent;
 use engine::types::format::FormatConfig;
-use engine::types::game_state::{GameState, PersistedGameState, WaitingFor};
+use engine::types::game_state::{GameState, PersistedGameState};
 use engine::types::identifiers::ObjectId;
-use engine::types::interaction::{InteractionSessionId, InteractionSubmission};
+use engine::types::interaction::{
+    InteractionPreview, InteractionPreviewRequest, InteractionSessionId, InteractionSubmission,
+};
 use engine::types::log::GameLogEntry;
 use engine::types::mana::ManaCost;
 use engine::types::match_config::MatchConfig;
 use engine::types::match_config::MatchForfeitCause;
 use engine::types::player::PlayerId;
+use phase_ai::auto_play::AiActionsStop;
 use phase_ai::config::{AiConfig, AiDifficulty, Platform};
 use phase_ai::session::AiSession;
 use rand::{Rng, SeedableRng};
@@ -40,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::filter::filter_state_for_player;
-use crate::game_state_snapshot_wire_guard::bounded_resolve_all_log_tail;
+use crate::game_log::GameFileCache;
 use crate::persist::{PersistedLobbyMeta, PersistedSession};
 use crate::protocol::PlayerSlotInfo;
 use crate::reconnect::ReconnectManager;
@@ -98,26 +102,136 @@ pub type ActionResult = (
 /// pairing intact when it fans a snapshot out to multiple viewers.
 pub type RevisionedActionResult = (u64, ActionResult);
 
-/// Maximum server-authorized stack entries in one remote Resolve All request.
-/// The wire request is untrusted, but `0` remains the engine-defined uncapped
-/// sentinel; the active consent run, not this transport value, owns the cap.
-pub const MAX_RESOLVE_ALL_RESOLUTIONS: u32 = 5_000;
-
-/// Backstop on `run_ai`'s AI-play → collapse-latch → AI-play hand-off loop.
-/// `BeginResolveAll` is not an AI candidate action, so AI play alone cannot
-/// mint a second consent epoch and the loop terminates on its own; this only
-/// bounds the damage if that ever stops being true.
-const MAX_AI_RESOLVE_ALL_HANDOFFS: usize = 8;
-
-#[derive(Debug, Clone)]
-pub struct ResolveAllSummary {
-    pub items_resolved: u32,
-    pub total: u32,
+/// Distinguishes an engine-owned, viewer-safe action refusal from an
+/// operational session failure. Only the former is eligible for a structured
+/// `ActionRejected` frame at the WebSocket boundary.
+#[derive(Debug)]
+pub enum SessionActionError {
+    Operational(String),
+    /// A request-only lifecycle operation cannot proceed. Game-action-shaped
+    /// attempts use [`Self::Rejected`] so their pending client promises settle
+    /// on correlated action-response frames.
+    RequestRejected(String),
+    Rejected(ActionRejection),
 }
 
-/// The optional state transition and typed batch acknowledgement from one
-/// authenticated Resolve All request.
-pub type ResolveAllActionResult = (Option<RevisionedActionResult>, ResolveAllSummary);
+impl From<String> for SessionActionError {
+    fn from(value: String) -> Self {
+        Self::Operational(value)
+    }
+}
+
+impl SessionActionError {
+    fn into_legacy_reason(self) -> String {
+        match self {
+            Self::Operational(reason) | Self::RequestRejected(reason) => reason,
+            Self::Rejected(rejection) => rejection.message,
+        }
+    }
+}
+
+/// The refusals a read-only preview can produce.
+///
+/// Deliberately narrower than [`SessionActionError`]: a preview is answered on
+/// its own request-correlated channel, and every refusal here carries a message
+/// the transport attaches to that request. There is no request-level variant, so
+/// the uncorrelated `RequestRejected` answer — which settles no pending preview
+/// promise — cannot be written at a preview transport arm.
+#[derive(Debug)]
+pub enum PreviewRefusal {
+    Operational(String),
+    Rejected(ActionRejection),
+}
+
+impl From<String> for PreviewRefusal {
+    fn from(value: String) -> Self {
+        Self::Operational(value)
+    }
+}
+
+impl PreviewRefusal {
+    fn into_legacy_reason(self) -> String {
+        match self {
+            Self::Operational(reason) => reason,
+            Self::Rejected(rejection) => rejection.message,
+        }
+    }
+}
+
+/// The server-visible result of driving the native AI after an authoritative
+/// transition. A non-empty `failure` is terminal for the AI driver, but does
+/// not discard transitions that were already committed before that failure.
+#[derive(Debug)]
+pub struct AiRunOutcome {
+    pub transitions: Vec<RevisionedActionResult>,
+    pub failure: Option<AiDriverFailure>,
+    /// The durable terminal record, when this invocation observed or created
+    /// an AI driver failure. Transports must send the final state frames before
+    /// publishing this record.
+    pub fault: Option<AiDriverFault>,
+}
+
+/// Internal result of one uninterrupted AI decision batch. Keeping the exact
+/// stop reason until [`GameSession::run_ai`] has finished the engine-owned
+/// stack-resolution session is necessary: a safety cap is terminal only when
+/// an AI submitter is still eligible in the resulting state.
+struct AiActionBatch {
+    transitions: Vec<RevisionedActionResult>,
+    stop: AiActionsStop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AiDriverFailure {
+    MissingAiConfig { player: PlayerId },
+    ChooseActionNone { player: PlayerId },
+    ApplyFailed { player: PlayerId, error: String },
+    ActionSafetyCapReached { limit: usize },
+}
+
+/// Durable, server-authored terminal state for the native AI driver.
+///
+/// This is deliberately separate from `GameState`: it is a transport/runtime
+/// failure, not a Magic game-rule result. The revision is allocated once when
+/// the fault is recorded, so a reconnect can prove it has received the final
+/// state snapshot before showing the fault.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AiDriverFault {
+    pub id: u64,
+    /// The last state revision a client must have applied before rendering
+    /// this out-of-band driver failure. The session revision is then bumped
+    /// separately as a durable persistence fence.
+    pub after_state_revision: u64,
+    pub cause: AiDriverFailure,
+}
+
+impl AiDriverFailure {
+    pub fn message(&self) -> String {
+        match self {
+            Self::MissingAiConfig { player } => {
+                format!(
+                    "Native AI driver is missing configuration for player {}.",
+                    player.0
+                )
+            }
+            Self::ChooseActionNone { player } => {
+                format!(
+                    "Native AI could not choose an action for player {}.",
+                    player.0
+                )
+            }
+            Self::ApplyFailed { player, error } => {
+                format!(
+                    "Native AI action for player {} was rejected: {error}",
+                    player.0
+                )
+            }
+            Self::ActionSafetyCapReached { limit } => {
+                format!("Native AI stopped after its {limit}-action safety limit.")
+            }
+        }
+    }
+}
 
 /// Stable identity for one lifetime of a Full authoritative session.
 ///
@@ -170,6 +284,25 @@ pub type BroadcastSnapshot = (
     HashMap<ObjectId, ManaCost>,
     HashMap<ObjectId, Vec<GameAction>>,
 );
+
+/// Server-owned result of explicitly resuming persisted stack automation.
+///
+/// Persistence reconstruction remains pure: callers invoke this only after the
+/// restored session has been hydrated, finalized, bound to fresh interaction
+/// authority, and stamped with this process's hosting policy. The engine keeps
+/// the complete event batch for server bookkeeping; the transport receives
+/// only its bounded presentation plus a freshly-derived snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoredStackAutomationResume {
+    /// Allocated exactly once when the engine progressed or repaired a saved
+    /// automation session. A no-op leaves the restored revision unchanged.
+    pub state_revision: Option<u64>,
+    /// Engine-authored, bounded transport presentation of the resume outcome.
+    pub presentation: RestoredStackAutomationPresentation,
+    /// Recomputed only for a state-changing resume. Its state and legal-action
+    /// projections are the authoritative payload for the subsequent broadcast.
+    pub broadcast: Option<BroadcastSnapshot>,
+}
 
 pub const PUBLIC_SEAT_RESERVATION_MS: u64 = 120_000;
 
@@ -235,6 +368,11 @@ pub enum HostingMode {
 
 pub struct GameSession {
     pub game_code: String,
+    /// Per-game JSON debug log sink (issue #7978), copied from the owning
+    /// `SessionManager` at creation and re-stamped, never deserialized, at
+    /// `SessionManager::restore_session` — same lifecycle as `hosting`
+    /// below, for the same reason: a runtime handle, not session state.
+    pub game_log: Arc<GameFileCache>,
     /// Server-issued durable identity for a Full session lifetime. This is
     /// stamped by phase-server after persistence binds the newly-created
     /// session; it is not trusted from the serialized game blob.
@@ -243,6 +381,12 @@ pub struct GameSession {
     /// Read-only snapshots reuse this value; mutators advance it before their
     /// per-viewer views are captured for transport.
     pub state_revision: u64,
+    /// A native AI-driver failure permanently closes this session to further
+    /// game mutations. Persist it so restart/reconnect cannot turn an
+    /// actionable AI priority into a silent freeze again.
+    pub ai_driver_fault: Option<AiDriverFault>,
+    /// Monotonic per-session identifier for durable driver faults.
+    pub next_ai_driver_fault_id: u64,
     pub state: GameState,
     /// Player tokens indexed by seat (0..player_count). Empty string = seat not yet claimed.
     pub player_tokens: Vec<String>,
@@ -276,9 +420,9 @@ pub struct GameSession {
     ///    authoritative transition handlers, all of which require a started
     ///    game. Deliberately not a count: the tally here has been wrong before,
     ///    and the property that matters is "every caller is post-start", which
-    ///    no number states. `recover_orphaned_resolve_all` is NOT one of them —
-    ///    it runs inside `from_persisted`, the placeholder window this fence
-    ///    warns about, and never calls `observe_transition`.
+    ///    no number states. `resume_restored_stack_automation` reaches this
+    ///    reader only after `SessionManager::restore_session` has re-stamped
+    ///    this field for the current process.
     /// 3. `takeback::offers_turn_rewind`, via `GameSession::rewind_options`
     ///    and `GameSession::request_takeback` — likewise post-start.
     ///
@@ -341,6 +485,41 @@ pub struct GameSession {
 }
 
 impl GameSession {
+    pub fn ai_driver_fault(&self) -> Option<&AiDriverFault> {
+        self.ai_driver_fault.as_ref()
+    }
+
+    pub(crate) fn reject_if_ai_driver_faulted(&self) -> Result<(), String> {
+        self.ai_driver_fault
+            .as_ref()
+            .map(|fault| {
+                format!(
+                    "Native AI driver fault {}: {}",
+                    fault.id,
+                    fault.cause.message()
+                )
+            })
+            .map_or(Ok(()), Err)
+    }
+
+    fn record_ai_driver_fault(&mut self, cause: AiDriverFailure) -> AiDriverFault {
+        if let Some(fault) = &self.ai_driver_fault {
+            return fault.clone();
+        }
+        let fault = AiDriverFault {
+            id: self.next_ai_driver_fault_id,
+            after_state_revision: self.state_revision,
+            cause,
+        };
+        // Allocate a fresh persistence revision without inventing a state
+        // transition for clients to render. This lets the database fence the
+        // durable fault while delivery remains ordered after the last actual
+        // state frame.
+        self.advance_state_revision();
+        self.next_ai_driver_fault_id = self.next_ai_driver_fault_id.saturating_add(1);
+        self.ai_driver_fault = Some(fault.clone());
+        fault
+    }
     /// Allocates the revision for one completed authoritative state transition.
     pub fn advance_state_revision(&mut self) -> u64 {
         self.state_revision = self.state_revision.saturating_add(1);
@@ -564,7 +743,7 @@ impl GameSession {
             // `debug_mode` unconditionally for single-player. The sandbox
             // *format* flag stays false, so own-library name exposure
             // (`engine::game::visibility`) and the host grant/revoke flow
-            // (rejected above with "Sandbox mode is not enabled") remain
+            // (rejected above as ActionNotAllowed) remain
             // closed — this grants the debug panel, not a shared sandbox.
             //
             // Human seats only. An AI seat has no client and never submits a
@@ -617,6 +796,9 @@ impl GameSession {
     }
 
     pub fn apply_seat_delta(&mut self, new_state: SeatState, delta: &SeatDelta, db: &CardDatabase) {
+        if self.ai_driver_fault.is_some() {
+            return;
+        }
         let old_player_count = self.player_count;
         let new_player_count = new_state.seats.len() as u8;
 
@@ -761,6 +943,11 @@ impl GameSession {
     }
 
     pub fn start_game(&mut self, db: &CardDatabase) -> Result<(), CedhBracketError> {
+        // A faulted game is never restarted in place: doing so would create a
+        // new playable state behind the durable terminal fault record.
+        if self.ai_driver_fault.is_some() {
+            return Ok(());
+        }
         // Gate: if any AI seat is configured for cEDH difficulty, validate that
         // every submitted deck is declared at the cEDH bracket tier before
         // mutating any session state.
@@ -811,6 +998,10 @@ impl GameSession {
         // can surface them; the broadcaster clears `start_events` afterward so
         // joiners/reconnects do not re-see the dice.
         let result = start_game(&mut self.state);
+        // Per-game JSON debug log (issue #7978): "Game started"/"Turn 1" rows
+        // — otherwise every game's events.jsonl would start mid-game.
+        self.game_log
+            .write_game_log_entries(&self.game_code, &result.log_entries);
         // Deliberately NOT a turn-rewind capture site, unlike the four
         // transition handlers. These events never reach a transition handler,
         // and turn 1's opening state sits adjacent to the mulligan flow —
@@ -826,11 +1017,9 @@ impl GameSession {
 
     /// Run AI actions and return per-action broadcast data.
     ///
-    /// Most entries are one AI action: raw state snapshot, events, legal actions,
-    /// and log entries. An entry may instead be a Resolve All collapse frame,
-    /// which carries no events and a bounded log tail — see
-    /// [`Self::consume_ai_granted_resolve_all`] for why the wire form differs
-    /// from what the session observes.
+    /// Each entry is one authoritative transition: raw state snapshot, events,
+    /// legal actions, and log entries. Stack automation remains in that ordinary
+    /// engine transition stream rather than using a separate Resolve All frame.
     /// The caller is responsible for filtering the state per-player before sending.
     /// Returns an empty vec if the session has no AI seats.
     ///
@@ -841,81 +1030,55 @@ impl GameSession {
     /// turn — out from under the snapshot the table is voting to roll back
     /// to. Every call site (join-fills-the-room, reconnect, fresh AI-game
     /// creation) is gated here once rather than at each caller.
-    pub fn run_ai(&mut self) -> Vec<RevisionedActionResult> {
+    pub fn run_ai(&mut self) -> AiRunOutcome {
+        if let Some(fault) = self.ai_driver_fault.clone() {
+            return AiRunOutcome {
+                transitions: Vec::new(),
+                failure: None,
+                fault: Some(fault),
+            };
+        }
         if self.ai_seats.is_empty() || self.pending_takeback.is_some() {
-            return vec![];
+            return AiRunOutcome {
+                transitions: Vec::new(),
+                failure: None,
+                fault: None,
+            };
         }
 
-        let mut transitions = Vec::new();
-        let mut handoffs = 0usize;
-        // One pass per Resolve All latch our own AI seats complete. Collapsing
-        // that batch hands priority back — possibly to another AI seat — so the
-        // ordinary hand-off has to run again, exactly as `handle_resolve_all`
-        // re-runs it after a client-requested batch. `BeginResolveAll` is not an
-        // AI candidate action, so only a human action can mint a further epoch
-        // and the loop cannot be re-entered by AI play alone; the iteration cap
-        // is a backstop, not the terminating argument.
-        for _ in 0..MAX_AI_RESOLVE_ALL_HANDOFFS {
-            let batch = self.run_ai_action_batch();
-            if batch.is_empty() {
-                break;
+        let batch = self.run_ai_action_batch();
+        let transitions = batch.transitions;
+        let failure = match batch.stop {
+            AiActionsStop::NoEligibleAiActor | AiActionsStop::ActionBudgetReached { .. } => None,
+            AiActionsStop::MissingAiConfig { player } => {
+                Some(AiDriverFailure::MissingAiConfig { player })
             }
-            // POSITIVE evidence that the final Grant was ours: one of the
-            // actions we just applied left the game at Ready. Each entry's
-            // state is the post-action clone, so a latch minted by this batch
-            // is visible in the batch itself.
-            //
-            // This deliberately replaces the earlier proxy, "we acted at all".
-            // That proxy was correct only because no AI seat can act while a
-            // latch is standing, which in turn held only because
-            // `WaitingFor::acting_players()` is empty for `ResolveAllReady` —
-            // an invariant this module neither owns nor can enforce, and one
-            // there is active interest in changing.
-            //
-            // The residual assumption, stated rather than claimed away: a
-            // post-state of Ready means WE minted it only while no action can
-            // be applied AT Ready and leave the state AT Ready. That holds
-            // today because the sole reducer arm accepting an action at Ready
-            // is `RevokeResolveAllConsent`, which always restores the frozen
-            // priority snapshot and therefore always exits Ready. This is a
-            // strictly weaker dependency than the old one — it is a local,
-            // reducer-visible fact rather than a property of a foreign type —
-            // but it is not none. A Ready-preserving action (a confirm, a
-            // no-op, a preference action admitted here) would let an AI acting
-            // at a HUMAN's standing latch set this flag. If one is ever added,
-            // compare each entry against its predecessor instead: entry `i`
-            // minted the latch iff its post-state is Ready and the state before
-            // it was not Ready at that epoch.
-            let minted_here = batch.iter().any(|(_, (post_state, ..))| {
-                matches!(post_state.waiting_for, WaitingFor::ResolveAllReady { .. })
-            });
-            transitions.extend(batch);
-            if !minted_here {
-                break;
+            AiActionsStop::ChooseActionNone { player } => {
+                Some(AiDriverFailure::ChooseActionNone { player })
             }
-            match self.consume_ai_granted_resolve_all() {
-                Some(collapsed) => transitions.push(collapsed),
-                None => break,
+            AiActionsStop::ApplyFailed { player, error, .. } => {
+                Some(AiDriverFailure::ApplyFailed {
+                    player,
+                    error: error.to_string(),
+                })
             }
-            handoffs += 1;
+            AiActionsStop::ActionSafetyCapReached { limit } if self.ai_seat_can_act() => {
+                Some(AiDriverFailure::ActionSafetyCapReached { limit })
+            }
+            AiActionsStop::ActionSafetyCapReached { .. } => None,
+        };
+        let fault = failure
+            .clone()
+            .map(|failure| self.record_ai_driver_fault(failure));
+        AiRunOutcome {
+            transitions,
+            failure,
+            fault,
         }
-        // Reaching the cap means the terminating argument above is wrong: AI
-        // play alone minted more epochs than it can. `run_ai` returns with
-        // seats that may still be able to act and nothing left to re-drive
-        // them, which is the hang class this hand-off exists to prevent, so it
-        // must be diagnosable rather than silent.
-        if handoffs == MAX_AI_RESOLVE_ALL_HANDOFFS {
-            warn!(
-                game = %self.game_code,
-                cap = MAX_AI_RESOLVE_ALL_HANDOFFS,
-                "AI Resolve All hand-off hit its iteration cap"
-            );
-        }
-        transitions
     }
 
     /// One uninterrupted run of AI decisions from the current state.
-    fn run_ai_action_batch(&mut self) -> Vec<RevisionedActionResult> {
+    fn run_ai_action_batch(&mut self) -> AiActionBatch {
         let mut rng = rand::rng();
         let ai_session = self
             .ai_session
@@ -932,7 +1095,10 @@ impl GameSession {
             debug!(game = %self.game_code, ai_actions = ai_results.len(), "AI actions computed");
         }
 
-        ai_results
+        let stop = ai_results.stop;
+
+        let transitions = ai_results
+            .results
             .into_iter()
             .map(|r| {
                 let (legal, spell_costs, by_object) = engine_legal_actions_full(&r.state);
@@ -944,6 +1110,15 @@ impl GameSession {
                 // point; a rule that promoted entries out of
                 // `takeback_history` could not, because `run_ai` pushes none.
                 self.observe_transition(&r.events, &r.state);
+                // Per-game JSON debug log (issue #7978): this is the single
+                // AI-transition mint point every caller of `run_ai` funnels
+                // through (takeback approve/reject, reconnect, game start,
+                // Play-vs-AI start, and the AI follow-up after a human
+                // action) — one hook here covers all of them, matching the
+                // human-action hooks in `handle_action`/
+                // `handle_interaction_with_rejection`.
+                self.game_log
+                    .write_game_log_entries(&self.game_code, &r.log_entries);
                 (
                     revision,
                     (
@@ -957,91 +1132,15 @@ impl GameSession {
                     ),
                 )
             })
-            .collect()
+            .collect();
+
+        AiActionBatch { transitions, stop }
     }
 
-    /// Consumes a `WaitingFor::ResolveAllReady` latch this session's own AI
-    /// seats just completed.
-    ///
-    /// `ResolveAllReady` has no acting player (`WaitingFor::acting_player` is
-    /// `None`), so `run_ai_actions` stops the moment the last AI representative
-    /// grants, no seat is offered a legal action, and no client is prompted to
-    /// send `ClientMessage::ResolveAll`. Whoever submits the final Grant owes
-    /// the consumption: a human's client does it from its consent modal, and
-    /// the browser's local AI controller does it for a browser-driven seat.
-    /// A server-driven AI seat had no such owner, which parked solo-vs-AI
-    /// tables forever with an unresolvable stack.
-    ///
-    /// TWO gates, and only one of them is here. The caller requires positive
-    /// evidence that one of the AI actions it just applied minted the latch —
-    /// see [`Self::run_ai`]. This function adds only the presence of the latch
-    /// at the moment it runs.
-    ///
-    /// Ownership is what both gates are about. A latch belongs to whoever cast
-    /// its final Grant, because that submitter's own client is the thing that
-    /// will send `ResolveAll` for it. Consuming a human's latch here races that
-    /// client and returns their request as an error; declining our own strands
-    /// the game, since nothing renders `ResolveAllReady`.
-    ///
-    /// Worth recording what this gate is deliberately NOT built on.
-    /// `candidate_actions` does offer every grantor a
-    /// `RevokeResolveAllConsent` at Ready, so the candidate set is not empty;
-    /// the AI simply never sees it, because `run_ai_actions_bounded` selects
-    /// its actor from `WaitingFor::acting_players()`, which is empty for this
-    /// variant. That is a true fact about today's engine and a bad thing to
-    /// depend on — it belongs to a type this module does not own, and giving
-    /// `ResolveAllReady` an acting set is an actively discussed change. The
-    /// caller therefore reads its own batch rather than inferring ownership
-    /// from the driver's silence.
-    ///
-    /// It deliberately does NOT gate on the run still being coherent. That was
-    /// the shape of the original defect: `ready_consent_run` requires an empty
-    /// `auto_pass` and an exact priority-snapshot match, so any seat holding an
-    /// End Turn auto-pass makes every latch that turn incoherent — and an
-    /// incoherent latch is precisely the one with no other exit, since no
-    /// client renders anything at `ResolveAllReady`. Declining it here would
-    /// leave the hang this seam exists to close.
-    ///
-    /// Admit-and-repair instead, matching every other consumer
-    /// ([`Self::resolve_all_for_player`], wasm `resolve_all`, and
-    /// [`recover_orphaned_resolve_all`]): the resolver collapses a coherent
-    /// run and repairs an incoherent one back to ordinary priority.
-    fn consume_ai_granted_resolve_all(&mut self) -> Option<RevisionedActionResult> {
-        if !matches!(self.state.waiting_for, WaitingFor::ResolveAllReady { .. }) {
-            return None;
-        }
-        // Prefer the frozen run's own requester — `ResolveAllConsentRun` exists
-        // so a live turn-control change cannot rebind an already-issued
-        // authorization. When no requester can succeed, ANY seat reaches the
-        // repair branch by construction, which is the only exit left.
-        let requester =
-            pending_resolve_all_ready_requester(&self.state).unwrap_or(self.state.priority_player);
-        let batch = resolve_all_ready_prefix(&mut self.state, requester);
-        let (legal, spell_costs, by_object) = engine_legal_actions_full(&self.state);
-        let auto_pass = auto_pass_recommended(&self.state, &legal);
-        let revision = self.advance_state_revision();
-        let post_state = self.state.clone();
-        // Bookkeeping sees the batch whole; the wire frame does not. A collapse
-        // can author thousands of events and log lines, and
-        // `guard_state_snapshot_broadcast` rejects an over-budget frame instead
-        // of trimming it — shipping them unbounded would drop the very update
-        // that carries the post-batch state. Events go entirely: the Resolve All
-        // UI does not animate a batch on any transport (see
-        // `ResolveAllFastForwardResult`, and `handle_resolve_all`'s equivalent
-        // handling of a client-requested batch).
-        self.observe_transition(&batch.events, &post_state);
-        Some((
-            revision,
-            (
-                post_state,
-                Vec::new(),
-                legal,
-                bounded_resolve_all_log_tail(batch.log_entries),
-                auto_pass,
-                spell_costs,
-                by_object,
-            ),
-        ))
+    fn ai_seat_can_act(&self) -> bool {
+        acting_players(&self.state)
+            .into_iter()
+            .any(|player| self.ai_seats.contains(&player))
     }
 
     /// Recomputes the broadcast-ready fields (legal actions, auto-pass,
@@ -1072,6 +1171,8 @@ impl GameSession {
         PersistedSession {
             game_code: self.game_code.clone(),
             state_revision: self.state_revision,
+            ai_driver_fault: self.ai_driver_fault.clone(),
+            next_ai_driver_fault_id: self.next_ai_driver_fault_id,
             state: PersistedGameState::capture(self.state.clone()),
             player_tokens: self.player_tokens.clone(),
             display_names: self.display_names.clone(),
@@ -1098,33 +1199,41 @@ impl GameSession {
     /// one. It is the saved high-water of the stream the old seed generated, and has no
     /// meaning against the new one.
     pub fn from_persisted(ps: PersistedSession, db: &CardDatabase) -> Result<Self, String> {
-        let mut state = ps.state.into_game_state();
-        state
-            .format_config
-            .validate_for_player_count(ps.player_count)?;
-        state
-            .format_config
-            .reject_unimplemented_range_of_influence()?;
+        let mut state = ps
+            .state
+            .prepare_for_restore(
+                engine::types::game_state::PersistedRestoreFinalization::DeferUntilRehydrated,
+            )
+            .map_err(|error| error.to_string())?
+            .finalize_after_rehydration(|state| {
+                state
+                    .format_config
+                    .validate_for_player_count(ps.player_count)?;
+                state
+                    .format_config
+                    .reject_unimplemented_range_of_influence()?;
 
-        // Restore #[serde(skip)] fields
-        state.all_card_names = db.card_names().into();
-        state.log_player_names = ps.display_names.clone();
-        rehydrate_game_from_card_db(&mut state, db);
+                // Restore #[serde(skip)] fields before the engine computes the
+                // first externally visible state from this snapshot.
+                state.all_card_names = db.card_names().into();
+                state.log_player_names = ps.display_names.clone();
+                rehydrate_game_from_card_db_with_finalization(
+                    state,
+                    db,
+                    CardDbRehydrationFinalization::Defer,
+                );
 
-        // Re-seed RNG with fresh randomness (stale rng_seed would produce
-        // deterministic sequences identical across all restored games)
-        let fresh_seed: u64 = rand::rng().random();
-        state.rng_seed = fresh_seed;
-        state.rng = rand_chacha::ChaCha20Rng::seed_from_u64(fresh_seed);
-        // A fresh stream starts at word 0, so the saved high-water — which indexes into the
-        // OLD keystream and is meaningless against this one — has to go with the old seed.
-        // Leaving it behind is what broke restore: the chokepoint's `rehydrate_rng` had put
-        // live and high-water in agreement, the re-seed above rewound live to 0, and the next
-        // `capture_rng_word_pos` (`game::library::resolve_and_apply_library_shuffle` performs
-        // one before every shuffle) `.expect`-panicked `HighWaterRegression`. Same three-
-        // statement resume policy as `engine-wasm`'s `resume_multiplayer_host_state`.
-        state.rng_word_pos = 0;
-        finalize_public_state(&mut state);
+                // Re-seed RNG with fresh randomness (stale rng_seed would produce
+                // deterministic sequences identical across all restored games)
+                let fresh_seed: u64 = rand::rng().random();
+                state.rng_seed = fresh_seed;
+                state.rng = rand_chacha::ChaCha20Rng::seed_from_u64(fresh_seed);
+                // A fresh stream starts at word 0, so the saved high-water — which indexes into the
+                // OLD keystream and is meaningless against this one — has to go with the old seed.
+                state.rng_word_pos = 0;
+                Ok(())
+            })
+            .map_err(|error| error.to_string())?;
         // Re-bind rather than trusting any id the blob carries, on the same
         // principle that `restore_session` re-stamps `hosting` and revokes an
         // unentitled debug capability: a persisted blob never drives authority.
@@ -1155,10 +1264,12 @@ impl GameSession {
 
         let rewind_game_number = state.game_number;
 
-        let mut session = GameSession {
+        Ok(GameSession {
             game_code: ps.game_code,
             full_runtime: None,
             state_revision: ps.state_revision,
+            ai_driver_fault: ps.ai_driver_fault,
+            next_ai_driver_fault_id: ps.next_ai_driver_fault_id.max(1),
             state,
             player_tokens: ps.player_tokens,
             connected: vec![false; pc],
@@ -1166,6 +1277,12 @@ impl GameSession {
             display_names: ps.display_names,
             reservations: HashMap::new(),
             timer_seconds: ps.timer_seconds,
+            // Placeholder, same rationale as `hosting` below: a runtime
+            // handle, not persisted state, re-stamped by
+            // `SessionManager::restore_session`. `Arc::default()` is a
+            // disabled (no-op) sink, so nothing is under- or over-logged
+            // between here and that stamp.
+            game_log: Arc::default(),
             // Least-privilege placeholder. `hosting` is a property of THIS
             // process, not of the persisted blob, and is re-stamped by
             // `SessionManager::restore_session`. Between here and that stamp
@@ -1186,35 +1303,47 @@ impl GameSession {
             takeback_history: VecDeque::new(),
             turn_rewind_history: VecDeque::new(),
             rewind_game_number,
-        };
-        session.recover_orphaned_resolve_all();
-        Ok(session)
+        })
     }
 
-    /// Discharges a `WaitingFor::ResolveAllReady` latch whose consumer did not
-    /// survive the process.
+    /// Explicitly resumes a persisted stack automation session after the
+    /// restore owner has finished attaching runtime authority.
     ///
-    /// The latch is consumed by whoever submitted its final Grant — a client
-    /// from its consent modal, or this session's own AI hand-off. Neither
-    /// outlives a restart, and the state itself offers no way out: it has no
-    /// acting player, every seat's legal-action set is empty, and no client
-    /// will volunteer `ClientMessage::ResolveAll` for a batch it never started.
-    /// A session restored into that state would be permanently unadvanceable.
-    ///
-    /// Running engine work at load time is deliberate and bounded: the consent
-    /// was already unanimous and its cap was frozen at `BeginResolveAll`, so
-    /// this discharges an authorization the players already gave rather than
-    /// making a new decision. Nothing can race it — no socket is attached yet.
-    fn recover_orphaned_resolve_all(&mut self) {
-        let Some(batch) = recover_orphaned_resolve_all(&mut self.state) else {
-            return;
-        };
-        warn!(
-            game = %self.game_code,
-            items_resolved = batch.items_resolved,
-            "discharged an orphaned Resolve All latch on session restore"
-        );
-        self.advance_state_revision();
+    /// Generic [`Self::from_persisted`] intentionally does not call this: a
+    /// decode is not an implicit priority pass. The restore owner invokes this
+    /// once after it has supplied process-owned hosting policy, then broadcasts
+    /// the returned bounded presentation with the recomputed snapshot.
+    pub fn resume_restored_stack_automation(&mut self) -> RestoredStackAutomationResume {
+        let resumed = resume_engine_restored_stack_automation(&mut self.state);
+        let presentation = resumed.presentation.clone();
+        if presentation.outcome == RestoredStackAutomationOutcome::Noop {
+            return RestoredStackAutomationResume {
+                state_revision: None,
+                presentation,
+                broadcast: None,
+            };
+        }
+
+        // The engine's complete event batch stays server-internal. In
+        // particular, a collapsed session can contain far more lifecycle
+        // events than a transport frame may carry, while rewind bookkeeping
+        // still needs to observe every one of them.
+        let post_state = self.state.clone();
+        self.observe_transition(&resumed.action_result().events, &post_state);
+        // Per-game JSON debug log (issue #7978): stack automation replayed
+        // after a server restart is exactly the post-crash scenario this log
+        // exists to make debuggable — it must not be invisible here.
+        self.game_log
+            .write_game_log_entries(&self.game_code, &resumed.action_result().log_entries);
+        let revision = self.advance_state_revision();
+        let (legal_actions, spell_costs, by_object) = engine_legal_actions_full(&self.state);
+        let auto_pass = auto_pass_recommended(&self.state, &legal_actions);
+
+        RestoredStackAutomationResume {
+            state_revision: Some(revision),
+            presentation,
+            broadcast: Some((post_state, legal_actions, auto_pass, spell_costs, by_object)),
+        }
     }
 }
 
@@ -1226,6 +1355,11 @@ pub struct SessionManager {
     pub hosting: HostingMode,
     /// Maps player_token -> game_code for token-based lookups.
     token_to_game: HashMap<String, String>,
+    /// Per-game JSON debug log sink (issue #7978), stamped onto every session
+    /// this manager creates or restores — same lifecycle as `hosting`.
+    /// Disabled (no-op writes) unless the transport wires a real one in
+    /// (`phase-server` does this once at startup, from `PHASE_LOG_DIR`).
+    pub game_log: Arc<GameFileCache>,
 }
 
 impl SessionManager {
@@ -1236,6 +1370,7 @@ impl SessionManager {
             reconnect: ReconnectManager::default(),
             hosting: HostingMode::Shared,
             token_to_game: HashMap::new(),
+            game_log: Arc::default(),
         }
     }
 
@@ -1248,6 +1383,7 @@ impl SessionManager {
             reconnect: ReconnectManager::new(grace_period),
             hosting: HostingMode::SingleUser,
             token_to_game: HashMap::new(),
+            game_log: Arc::default(),
         }
     }
 
@@ -1332,6 +1468,8 @@ impl SessionManager {
             game_code: game_code.clone(),
             full_runtime: None,
             state_revision: 0,
+            ai_driver_fault: None,
+            next_ai_driver_fault_id: 1,
             state,
             player_tokens,
             connected,
@@ -1340,6 +1478,7 @@ impl SessionManager {
             reservations: HashMap::new(),
             timer_seconds,
             hosting: self.hosting,
+            game_log: Arc::clone(&self.game_log),
             player_count,
             ai_seats: HashSet::new(),
             ai_configs: HashMap::new(),
@@ -1393,6 +1532,8 @@ impl SessionManager {
             .sessions
             .get_mut(game_code)
             .ok_or_else(|| format!("Game not found: {}", game_code))?;
+
+        session.reject_if_ai_driver_faulted()?;
         session.cleanup_expired_reservations();
         if session.game_started {
             return Err("Game has already started".to_string());
@@ -1554,16 +1695,79 @@ impl SessionManager {
         player_token: &str,
         action: &GameAction,
     ) -> Result<Vec<ObjectId>, String> {
+        self.preview_mana_payment_with_rejection(game_code, player_token, action)
+            .map_err(PreviewRefusal::into_legacy_reason)
+    }
+
+    /// Viewer-safe preview form for the Full transport.
+    pub fn preview_mana_payment_with_rejection(
+        &self,
+        game_code: &str,
+        player_token: &str,
+        action: &GameAction,
+    ) -> Result<Vec<ObjectId>, PreviewRefusal> {
         let session = self
             .sessions
             .get(game_code)
             .ok_or_else(|| format!("Game not found: {game_code}"))?;
+        session.reject_if_ai_driver_faulted()?;
         let player = session
             .player_for_token(player_token)
             .ok_or_else(|| "Invalid player token".to_string())?;
 
-        preview_auto_payment_sources(&session.state, player, action)
-            .map_err(|error| format!("Engine error: {error}"))
+        engine::game::preview::preview_auto_payment_sources_with_rejection(
+            &session.state,
+            player,
+            action,
+        )
+        .map_err(PreviewRefusal::Rejected)
+    }
+
+    /// Answers the preview a player authored without moving the authenticated
+    /// session. Sibling of `handle_interaction_with_rejection` minus everything
+    /// that mutates: no `session.state` write, no `push_takeback_state`, no
+    /// `log_player_names` write, no `observe_transition`, no game-log write and
+    /// no broadcast. `&self`, not `&mut self`, so that subtraction is enforced
+    /// by the borrow checker before any test runs.
+    ///
+    /// `preview_interaction` — not `preview_interaction_with_rejection` — is
+    /// the callee on purpose: it is the function `preview_interaction_js`
+    /// already calls, so a networked seat's answer is byte-identical to the
+    /// local seat's for the same request, and every engine-level refusal rides
+    /// inside `InteractionPreviewStatus::Rejected` rather than needing a
+    /// rejection channel of its own.
+    pub fn preview_interaction_with_rejection(
+        &self,
+        game_code: &str,
+        player_token: &str,
+        request: &InteractionPreviewRequest,
+    ) -> Result<InteractionPreview, PreviewRefusal> {
+        let session = self
+            .sessions
+            .get(game_code)
+            .ok_or_else(|| format!("Game not found: {game_code}"))?;
+        session.reject_if_ai_driver_faulted()?;
+        let player = session
+            .player_for_token(player_token)
+            .ok_or_else(|| "Invalid player token".to_string())?;
+
+        // GH #1507: the authoritative state must not move while the table is
+        // voting on a rollback. Copied from `handle_interaction_with_rejection`
+        // rather than from `preview_mana_payment_with_rejection`, which carries
+        // no such interlock — a divergence from the traced sibling, taken
+        // because a preview answered mid-vote describes a board the vote is
+        // about to discard.
+        if session.pending_takeback.is_some() {
+            return Err(PreviewRefusal::Rejected(ActionRejection::new(
+                engine::types::action_rejection::ActionRejectionCode::ActionNotAllowed,
+            )));
+        }
+
+        Ok(engine::game::interaction::preview_interaction(
+            &session.state,
+            player,
+            request,
+        ))
     }
 
     /// Handle a game action from a player.
@@ -1589,10 +1793,27 @@ impl SessionManager {
         action: GameAction,
         card_db: Option<&CardDatabase>,
     ) -> Result<ActionResult, String> {
+        self.handle_action_with_card_db_outcome(game_code, player_token, action, card_db)
+            .map_err(SessionActionError::into_legacy_reason)
+    }
+
+    /// Rich form used by the Full WebSocket transport. Engine rejection DTOs
+    /// remain distinct from session/database failures so the transport never
+    /// has to infer meaning from a diagnostic string.
+    #[allow(clippy::type_complexity)]
+    pub fn handle_action_with_card_db_outcome(
+        &mut self,
+        game_code: &str,
+        player_token: &str,
+        action: GameAction,
+        card_db: Option<&CardDatabase>,
+    ) -> Result<ActionResult, SessionActionError> {
         let session = self
             .sessions
             .get_mut(game_code)
             .ok_or_else(|| format!("Game not found: {}", game_code))?;
+
+        session.reject_if_ai_driver_faulted()?;
 
         let player = session
             .player_for_token(player_token)
@@ -1604,10 +1825,9 @@ impl SessionManager {
         // voting on or silently discard the action once the rollback lands.
         // Require the table to resolve (approve/decline/cancel) first.
         if session.pending_takeback.is_some() {
-            return Err(
-                "A takeback request is pending — resolve it before taking further actions"
-                    .to_string(),
-            );
+            return Err(SessionActionError::Rejected(ActionRejection::new(
+                engine::types::action_rejection::ActionRejectionCode::ActionNotAllowed,
+            )));
         }
 
         // Debug capability gate. `debug_permitted` is the single authority:
@@ -1619,10 +1839,13 @@ impl SessionManager {
         // `RevokeDebugPermission` (sandbox games only). Naming a mode in the
         // refusal would be wrong for the single-user source, so the message
         // stays on the seat, which is what was actually checked.
-        if matches!(action, GameAction::Debug(_))
-            && !session.state.debug_permitted.contains(&player)
-        {
-            return Err("Debug actions are not permitted for this seat".to_string());
+        if let GameAction::Debug(debug_action) = &action {
+            engine::game::preflight_debug_action_with_rejection(
+                &session.state,
+                player,
+                debug_action,
+            )
+            .map_err(SessionActionError::Rejected)?;
         }
 
         // Grant/Revoke debug permission: host-only, and only meaningful in a
@@ -1632,17 +1855,23 @@ impl SessionManager {
         match &action {
             GameAction::GrantDebugPermission { .. } | GameAction::RevokeDebugPermission { .. } => {
                 if !session.state.format_config.allow_debug_actions {
-                    return Err("Sandbox mode is not enabled for this game".to_string());
+                    return Err(SessionActionError::Rejected(ActionRejection::new(
+                        engine::types::action_rejection::ActionRejectionCode::ActionNotAllowed,
+                    )));
                 }
                 if player != HOST_PLAYER {
-                    return Err("Only the host can grant or revoke debug permission".to_string());
+                    return Err(SessionActionError::Rejected(ActionRejection::new(
+                        engine::types::action_rejection::ActionRejectionCode::ActionNotAllowed,
+                    )));
                 }
                 if let GameAction::RevokeDebugPermission {
                     player_id: target, ..
                 } = &action
                 {
                     if *target == HOST_PLAYER {
-                        return Err("The host cannot revoke their own debug permission".to_string());
+                        return Err(SessionActionError::Rejected(ActionRejection::new(
+                            engine::types::action_rejection::ActionRejectionCode::ActionNotAllowed,
+                        )));
                     }
                 }
             }
@@ -1654,10 +1883,6 @@ impl SessionManager {
         // access; the engine validates actor authorization and action shape.
         // Candidate enumeration is advisory for clients and AI, not a second
         // legality gate: several legal action classes are combinatorial.
-        if let GameAction::Debug(debug_action) = &action {
-            preflight_debug_action(&session.state, player, debug_action)
-                .map_err(|error| format!("Engine error: {error}"))?;
-        }
         if matches!(&action, GameAction::Debug(debug_action) if debug_action.is_zero_count_create())
         {
             let (legal_actions, spell_costs, by_object) = engine_legal_actions_full(&session.state);
@@ -1708,7 +1933,7 @@ impl SessionManager {
                 nonlegendary,
                 ..
             }) => {
-                let result = create_debug_cards(
+                let result = create_debug_cards_with_rejection(
                     &mut session.state,
                     DebugCardCreateRequest {
                         actor: player,
@@ -1722,16 +1947,14 @@ impl SessionManager {
                         nonlegendary,
                     },
                 )
-                .map_err(|error| format!("Engine error: {error}"))?;
+                .map_err(SessionActionError::Rejected)?;
                 bump_state_revision(&mut session.state);
                 mark_public_state_all_dirty(&mut session.state);
                 finalize_public_state(&mut session.state);
                 result
             }
-            action => apply(&mut session.state, player, action).map_err(|e| {
-                warn!(game = %game_code, player = ?player, error = %e, reason = "engine_error", "action rejected");
-                format!("Engine error: {}", e)
-            })?,
+            action => apply_with_rejection(&mut session.state, player, action)
+                .map_err(SessionActionError::Rejected)?,
         };
         if let Some(snapshot) = pre_action_state {
             session.push_takeback_state(player, snapshot);
@@ -1758,6 +1981,16 @@ impl SessionManager {
         let post_state = session.state.clone();
         session.observe_transition(&result.events, &post_state);
 
+        // Per-game JSON debug log (issue #7978): written here, at the point
+        // the engine's `GameLogEntry` rows are minted, not by each transport
+        // call site — so every path that reaches this function (and
+        // `handle_interaction_with_rejection`, and AI transitions via
+        // `run_ai_action_batch`) is covered without remembering a hook per
+        // caller.
+        session
+            .game_log
+            .write_game_log_entries(&session.game_code, &result.log_entries);
+
         Ok((
             post_state,
             result.events,
@@ -1766,89 +1999,6 @@ impl SessionManager {
             auto_pass,
             spell_costs,
             by_object,
-        ))
-    }
-
-    /// Consumes an engine-issued unanimous Resolve All consent run for an
-    /// authenticated player. AI seats do not authorize future priority passes;
-    /// each representative grants through the engine's consent protocol first.
-    /// `max_resolutions` remains range-checked for wire compatibility, while
-    /// the already-issued consent run owns the resolution cap.
-    pub fn resolve_all_for_player(
-        &mut self,
-        game_code: &str,
-        player_token: &str,
-        max_resolutions: u32,
-    ) -> Result<ResolveAllActionResult, String> {
-        if max_resolutions > MAX_RESOLVE_ALL_RESOLUTIONS {
-            return Err(format!(
-                "Resolve All maximum must not exceed {MAX_RESOLVE_ALL_RESOLUTIONS}"
-            ));
-        }
-
-        let session = self
-            .sessions
-            .get_mut(game_code)
-            .ok_or_else(|| format!("Game not found: {game_code}"))?;
-        let requester = session
-            .player_for_token(player_token)
-            .ok_or_else(|| "Invalid player token".to_string())?;
-
-        if session.pending_takeback.is_some() {
-            return Err(
-                "A takeback request is pending — resolve it before taking further actions"
-                    .to_string(),
-            );
-        }
-
-        // Reject only an unentitled caller. A latch whose frozen run has gone
-        // stale is still routed into the resolver, whose fail-closed
-        // invalidation restores ordinary priority — rejecting it here instead
-        // would leave the game parked with no acting player and, in practice,
-        // nothing any client offers the player to press.
-        // Exhaustive rather than an equality test: a future variant must be
-        // classified here instead of silently defaulting to allowed.
-        match resolve_all_ready_access(&session.state, requester) {
-            ResolveAllReadyAccess::Refused => {
-                return Err("Resolve All consent is not ready".to_string());
-            }
-            ResolveAllReadyAccess::Admitted => {}
-        }
-
-        session.state.log_player_names = session.display_names.clone();
-        flush_layers(&mut session.state);
-        let pre_action_state = session.state.clone();
-        // The cap is frozen into the consent run by BeginResolveAll. The wire
-        // argument remains range-checked above for transport compatibility but
-        // cannot enlarge or replace that explicit authorization.
-        let _ = max_resolutions;
-        let batch = resolve_all_ready_prefix(&mut session.state, requester);
-        let summary = ResolveAllSummary {
-            items_resolved: batch.items_resolved,
-            total: batch.total,
-        };
-
-        session.push_takeback_state(requester, pre_action_state);
-        let (legal_actions, spell_costs, by_object) = engine_legal_actions_full(&session.state);
-        let auto_pass = auto_pass_recommended(&session.state, &legal_actions);
-        let post_state = session.state.clone();
-        session.observe_transition(&batch.events, &post_state);
-        let revision = session.advance_state_revision();
-
-        Ok((
-            Some((
-                revision,
-                (
-                    post_state,
-                    batch.events,
-                    legal_actions,
-                    batch.log_entries,
-                    auto_pass,
-                    spell_costs,
-                    by_object,
-                ),
-            )),
-            summary,
         ))
     }
 
@@ -1884,10 +2034,24 @@ impl SessionManager {
         player_token: &str,
         submission: InteractionSubmission,
     ) -> Result<ActionResult, String> {
+        self.handle_interaction_with_rejection(game_code, player_token, submission)
+            .map_err(SessionActionError::into_legacy_reason)
+    }
+
+    /// Rich interaction form for the authenticated Full transport.
+    #[allow(clippy::type_complexity)]
+    pub fn handle_interaction_with_rejection(
+        &mut self,
+        game_code: &str,
+        player_token: &str,
+        submission: InteractionSubmission,
+    ) -> Result<ActionResult, SessionActionError> {
         let session = self
             .sessions
             .get_mut(game_code)
             .ok_or_else(|| format!("Game not found: {game_code}"))?;
+
+        session.reject_if_ai_driver_faulted()?;
 
         let player = session
             .player_for_token(player_token)
@@ -1896,10 +2060,9 @@ impl SessionManager {
         // GH #1507: the authoritative state must not move while the table is
         // voting on a rollback. Same interlock, same reason, as `handle_action`.
         if session.pending_takeback.is_some() {
-            return Err(
-                "A takeback request is pending — resolve it before taking further actions"
-                    .to_string(),
-            );
+            return Err(SessionActionError::Rejected(ActionRejection::new(
+                engine::types::action_rejection::ActionRejectionCode::ActionNotAllowed,
+            )));
         }
 
         // Snapshot BEFORE `log_player_names` is written, matching
@@ -1919,22 +2082,8 @@ impl SessionManager {
         // Set player names for log resolution.
         session.state.log_player_names = session.display_names.clone();
 
-        let applied =
-            submit_interaction(&mut session.state, player, submission).map_err(|error| {
-                warn!(
-                    game = %game_code,
-                    player = ?player,
-                    code = ?error.code,
-                    reason = "interaction_rejected",
-                    "interaction rejected"
-                );
-                // Byte-identical to the WASM transport
-                // (`engine-wasm/src/lib.rs`) and to
-                // `interaction_payload_guard`, so every layer that reports an
-                // engine reason code, on both transports, classifies the same
-                // rejection identically.
-                format!("Engine error: {:?}", error.code)
-            })?;
+        let applied = submit_interaction_with_rejection(&mut session.state, player, submission)
+            .map_err(SessionActionError::Rejected)?;
 
         if !applied.action.is_actor_scoped_preference() {
             session.push_takeback_state(player, pre_action_state);
@@ -1955,6 +2104,12 @@ impl SessionManager {
         let post_state = session.state.clone();
         session.observe_transition(&applied.result.events, &post_state);
 
+        // Per-game JSON debug log (issue #7978) — see `handle_action`'s
+        // sibling comment above; this is the interaction-path mint point.
+        session
+            .game_log
+            .write_game_log_entries(&session.game_code, &applied.result.log_entries);
+
         Ok((
             post_state,
             applied.result.events,
@@ -1974,6 +2129,20 @@ impl SessionManager {
         game_code: &str,
         player_token: &str,
     ) -> Result<RevisionedActionResult, String> {
+        self.handle_match_concede_outcome(game_code, player_token)
+            .map_err(SessionActionError::into_legacy_reason)
+    }
+
+    /// Three-way result for the transport-owned match-concede request.
+    ///
+    /// Authentication/session availability remains operational. A request that
+    /// is validly authenticated but cannot forfeit the current match is a
+    /// requester-visible lifecycle refusal instead.
+    pub fn handle_match_concede_outcome(
+        &mut self,
+        game_code: &str,
+        player_token: &str,
+    ) -> Result<RevisionedActionResult, SessionActionError> {
         let session = self
             .sessions
             .get_mut(game_code)
@@ -1981,17 +2150,19 @@ impl SessionManager {
         let player = session
             .player_for_token(player_token)
             .ok_or_else(|| "Invalid player token".to_string())?;
+        session.reject_if_ai_driver_faulted()?;
         if session.pending_takeback.is_some() {
-            return Err(
+            return Err(SessionActionError::RequestRejected(
                 "A takeback request is pending — resolve it before conceding the match".to_string(),
-            );
+            ));
         }
 
         let events = apply_trusted_match_forfeit(
             &mut session.state,
             player,
             MatchForfeitCause::MatchConcede,
-        )?;
+        )
+        .map_err(SessionActionError::RequestRejected)?;
         let (legal_actions, spell_costs, by_object) = engine_legal_actions_full(&session.state);
         let auto_pass = auto_pass_recommended(&session.state, &legal_actions);
         let revision = session.advance_state_revision();
@@ -2091,11 +2262,20 @@ impl SessionManager {
 
     /// Remove a game session entirely, cleaning up the token-to-game index.
     /// Returns the removed session if it existed.
+    ///
+    /// Also releases this game's cached per-game log writers (issue #7978
+    /// follow-up): every removal path — normal game-over cleanup, restored-
+    /// terminal cleanup, and reconnect-grace expiry — funnels through here,
+    /// and some of those (restored-terminal, expiry) run before any
+    /// `game_session` tracing span exists, so `GameFileLayer::on_close`
+    /// never fires for them. Closing here, once, covers all of them instead
+    /// of requiring every removal call site to remember it.
     pub fn remove_game(&mut self, game_code: &str) -> Option<GameSession> {
         let session = self.sessions.remove(game_code)?;
         for token in &session.player_tokens {
             self.unindex_token(token);
         }
+        self.game_log.close(game_code);
         Some(session)
     }
 
@@ -2113,6 +2293,7 @@ impl SessionManager {
         // sole entry for a restored session into a manager (`sessions.insert`
         // has exactly two call sites: create, and this one).
         session.hosting = self.hosting;
+        session.game_log = Arc::clone(&self.game_log);
         // The stamp above only stops the blob from driving a future
         // *derivation*. `debug_mode` / `debug_permitted` are serialized state
         // and arrive already set, so a sidecar's capability would otherwise
@@ -2153,7 +2334,7 @@ pub fn generate_player_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use engine::database::card_db::CardDatabase;
     use engine::game::deck_loading::DeckEntry;
@@ -2162,12 +2343,15 @@ mod tests {
     use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
     use engine::game::scenario_db::GameScenarioDbExt;
     use engine::types::ability::{Effect, ResolvedAbility, TargetRef};
-    use engine::types::actions::{PrecastCopyShortcutResponse, ResolveAllConsentDecision};
+    use engine::types::actions::{
+        PrecastCopyShortcutResponse, ResolveAllConsentDecision, ResolveAllScope,
+    };
     use engine::types::card::CardFace;
     use engine::types::card_type::CardType;
     use engine::types::game_state::{
         AutoPassMode, CastPaymentMode, PersistedGameState, StackEntry, StackEntryKind,
-        TurnBoundary, WaitingFor,
+        StackResolutionAutoPassOverlay, StackResolutionBudget, StackResolutionEntryFence,
+        StackResolutionPolicy, StackResolutionSession, WaitingFor,
     };
     use engine::types::interaction::{
         InteractionAvailability, InteractionChoiceId, InteractionReasonCode, InteractionResponse,
@@ -2364,7 +2548,10 @@ mod tests {
         let mut mgr = SessionManager::new();
         let (code, _token) = mgr.create_game(make_deck());
         let mut persisted = mgr.sessions.get(&code).unwrap().to_persisted();
-        let mut state = persisted.state.into_game_state();
+        let mut state = persisted
+            .state
+            .into_game_state()
+            .expect("test snapshot satisfies the checked restore contract");
         state.format_config.range_of_influence =
             Some(Box::new(engine::types::format::RangeOfInfluenceConfig {
                 default_range: 0,
@@ -2453,6 +2640,57 @@ mod tests {
             .expect_err("limited range must remain disabled at the session boundary")
             .contains("not supported"));
         assert!(mgr.sessions.is_empty());
+    }
+
+    /// CR 103.4: each player begins with a starting life total of 20, and some
+    /// variant games use a different one — so a host-configured `starting_life`
+    /// is the authority, not the format's default.
+    ///
+    /// This is the server-side half of the desktop (Tauri) solo/host route: the
+    /// native engine is this phase-server running as a sidecar, and the client
+    /// hands it the edited `FormatConfig` in `CreateGameWithSettings`. Dropping
+    /// it here would silently seat every player at the format default.
+    ///
+    /// REVERT-FAIL: make `create_game_n_players` ignore its `format_config`
+    /// argument (or re-derive one from `format_config.format`) ⇒ life is 40.
+    #[test]
+    fn create_game_honors_a_configured_starting_life() {
+        let mut mgr = SessionManager::new();
+        let mut format_config = FormatConfig::commander();
+        format_config.starting_life = 25;
+
+        let (code, _) = mgr
+            .create_game_n_players(
+                make_deck(),
+                "Host".to_string(),
+                None,
+                2,
+                MatchConfig::default(),
+                Some(format_config),
+            )
+            .expect("a custom starting life is a supported configuration");
+
+        let session = mgr.sessions.get(&code).unwrap();
+        assert_eq!(session.state.format_config.starting_life, 25);
+        for player in &session.state.players {
+            assert_eq!(
+                player.life, 25,
+                "every seat must start on the configured life total, not Commander's 40"
+            );
+        }
+
+        // The between-games rebuild re-reads the session's own format config, so
+        // game 2 of a match must not silently revert to the format default.
+        mgr.sessions
+            .get_mut(&code)
+            .unwrap()
+            .rebuild_pregame_state(2);
+        for player in &mgr.sessions.get(&code).unwrap().state.players {
+            assert_eq!(
+                player.life, 25,
+                "the rebuild must preserve the configured life total"
+            );
+        }
     }
 
     /// CR 732.2a (#4603 opt-in, Best-of-N): the combo-detector opt-in lives on the
@@ -2741,6 +2979,160 @@ mod tests {
             }
         }
         (mgr, code, token0, token1)
+    }
+
+    /// Proves a production mint point (`handle_action` ->
+    /// `handle_action_with_card_db_outcome`'s write hook) actually reaches a
+    /// real `GameFileCache`, not just that `write_game_log_entries` works in
+    /// isolation. Attaching the cache post-hoc on `setup_two_player_game`'s
+    /// manager would not do this: `GameSession.game_log` is copied from
+    /// `SessionManager.game_log` at session-creation time, so the cache must
+    /// be installed before `create_game`. This is also the exact wiring gap
+    /// (`GameCodeVisitor::record_debug` never captured the span field) that
+    /// the second review round caught — a test reaching the real hook is what
+    /// would have caught it directly.
+    #[test]
+    fn handle_action_hook_writes_real_events_stream_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let games_dir = dir.path().join("games");
+        std::fs::create_dir_all(&games_dir).unwrap();
+
+        let mut mgr = SessionManager::new();
+        mgr.game_log = std::sync::Arc::new(GameFileCache::new(games_dir.clone()));
+        let (code, token0) = mgr.create_game(make_deck());
+        let (token1, _) = mgr.join_game(&code, make_deck()).unwrap();
+        for _ in 0..20 {
+            let session = mgr.sessions.get(&code).unwrap();
+            match &session.state.waiting_for.clone() {
+                WaitingFor::MulliganDecision { pending, .. } => {
+                    for entry in pending {
+                        let tok = if entry.player == PlayerId(0) {
+                            token0.clone()
+                        } else {
+                            token1.clone()
+                        };
+                        let _ = mgr.handle_action(
+                            &code,
+                            &tok,
+                            GameAction::MulliganDecision {
+                                choice: engine::types::actions::MulliganChoice::Keep,
+                            },
+                        );
+                    }
+                }
+                WaitingFor::Priority { .. } => break,
+                _ => break,
+            }
+        }
+
+        let priority_player = match &mgr.sessions.get(&code).unwrap().state.waiting_for {
+            WaitingFor::Priority { player } => *player,
+            other => panic!("expected Priority, got {other:?}"),
+        };
+        let acting_token = if priority_player == PlayerId(0) {
+            &token0
+        } else {
+            &token1
+        };
+        let result = mgr.handle_action(&code, acting_token, GameAction::PassPriority);
+        assert!(result.is_ok(), "PassPriority should succeed: {result:?}");
+
+        let events_path = games_dir.join(format!("{code}.events.jsonl"));
+        let content = std::fs::read_to_string(&events_path)
+            .expect("a real production action hook must have written the events stream file");
+        assert!(
+            !content.trim().is_empty(),
+            "events stream file exists but is empty"
+        );
+        let row: serde_json::Value = serde_json::from_str(content.lines().next().unwrap())
+            .expect("each row must be valid JSON");
+        assert!(
+            row.get("category").is_some(),
+            "row must carry the engine's LogCategory field: {row}"
+        );
+        assert!(row.get("ts").is_some(), "row must carry a ts field: {row}");
+    }
+
+    /// Proves `GameSession::start_game`'s write hook is reachable, not just
+    /// present in source — `create_game_n_players`/`join_game` never call
+    /// `start_game` (see `handle_action_hook_writes_real_events_stream_file`'s
+    /// doc comment), so `create_game_with_ai` is the only `SessionManager`
+    /// path that reaches it, mirroring `takeback_auto_approves_for_sole_human_seat`'s setup.
+    #[test]
+    fn start_game_hook_writes_real_events_stream_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let games_dir = dir.path().join("games");
+        std::fs::create_dir_all(&games_dir).unwrap();
+
+        let mut mgr = SessionManager::new();
+        mgr.game_log = std::sync::Arc::new(GameFileCache::new(games_dir.clone()));
+        let db = engine::database::CardDatabase::default();
+        let (code, _token) = mgr
+            .create_game_with_ai(
+                make_deck(),
+                "Host".to_string(),
+                None,
+                MatchConfig::default(),
+                vec![(1, AiDifficulty::Easy, make_deck())],
+                Vec::new(),
+                None,
+                &db,
+            )
+            .expect("supported format config");
+
+        let events_path = games_dir.join(format!("{code}.events.jsonl"));
+        let content = std::fs::read_to_string(&events_path)
+            .expect("start_game's write hook must have written the events stream file");
+        assert!(
+            !content.trim().is_empty(),
+            "events stream file exists but is empty"
+        );
+    }
+
+    /// Maintainer review finding on PR #8245: `GameFileCache` cached a
+    /// writer for every game it ever logged and never released it —
+    /// `GameFileCache::close` existed, but nothing called it from
+    /// `SessionManager::remove_game`, so every removal path (game-over,
+    /// restored-terminal cleanup, reconnect-grace expiry) leaked the cached
+    /// `BufWriter`/file handle for the process lifetime. This setup has no
+    /// tracing span at all (server-core doesn't do tracing) — deliberately
+    /// exercising the "no active `game_session` span" removal shape the
+    /// finding named, where `GameFileLayer::on_close` (the OTHER eviction
+    /// path, span-teardown-triggered) never fires.
+    #[test]
+    fn remove_game_evicts_cached_log_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let games_dir = dir.path().join("games");
+        std::fs::create_dir_all(&games_dir).unwrap();
+
+        let mut mgr = SessionManager::new();
+        mgr.game_log = std::sync::Arc::new(GameFileCache::new(games_dir));
+        let db = engine::database::CardDatabase::default();
+        let (code, _token) = mgr
+            .create_game_with_ai(
+                make_deck(),
+                "Host".to_string(),
+                None,
+                MatchConfig::default(),
+                vec![(1, AiDifficulty::Easy, make_deck())],
+                Vec::new(),
+                None,
+                &db,
+            )
+            .expect("supported format config");
+
+        assert!(
+            mgr.game_log.cached_entry_count() > 0,
+            "start_game's write hook should have opened and cached a writer"
+        );
+
+        mgr.remove_game(&code);
+
+        assert_eq!(
+            mgr.game_log.cached_entry_count(),
+            0,
+            "remove_game must evict this game's cached writers, not just the session"
+        );
     }
 
     /// `SetPhaseStops` is keyed to the authenticated player and delegated to the
@@ -3371,11 +3763,15 @@ mod tests {
             .request_takeback(priority_player, RewindTarget::LastAction)
             .unwrap();
 
-        let result = mgr.handle_action(&code, &other_token, GameAction::PassPriority);
-        assert!(
-            result.is_err(),
-            "action should be rejected while a takeback is pending"
-        );
+        let result = mgr
+            .handle_action_with_card_db_outcome(&code, &other_token, GameAction::PassPriority, None)
+            .expect_err("action should be rejected while a takeback is pending");
+        assert!(matches!(
+            result,
+            SessionActionError::Rejected(rejection)
+                if rejection.code
+                    == engine::types::action_rejection::ActionRejectionCode::ActionNotAllowed
+        ));
     }
 
     /// A solo human vs. AI seats auto-resolves their own takeback request —
@@ -3536,7 +3932,7 @@ mod tests {
         let state_before = session.state.clone();
         let ai_results = session.run_ai();
         assert!(
-            ai_results.is_empty(),
+            ai_results.transitions.is_empty(),
             "run_ai must no-op while a takeback vote is pending, even though the AI seat has a legal action"
         );
         assert_eq!(
@@ -4154,6 +4550,104 @@ mod tests {
         (mgr, code, token0, ai_seat)
     }
 
+    #[test]
+    fn ai_driver_failure_gate_requires_an_authorized_ai_submitter() {
+        let (mut mgr, code, _token0, ai_seat) = single_user_game_vs_ai();
+        let session = mgr.sessions.get_mut(&code).unwrap();
+
+        session.state.waiting_for = WaitingFor::Priority { player: ai_seat };
+        assert!(
+            session.ai_seat_can_act(),
+            "an AI priority holder must keep a capped driver diagnosable"
+        );
+
+        session.state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        assert!(
+            !session.ai_seat_can_act(),
+            "a human priority holder is a normal hand-off, not an AI driver failure"
+        );
+
+        session.state.waiting_for = WaitingFor::GameOver {
+            winner: Some(ai_seat),
+        };
+        assert!(
+            !session.ai_seat_can_act(),
+            "a terminal state cannot be reported as an AI driver stall"
+        );
+    }
+
+    #[test]
+    fn ai_driver_fault_fences_persistence_without_synthetic_state_transition() {
+        let (mut mgr, code, _token0, ai_seat) = single_user_game_vs_ai();
+        let session = mgr.sessions.get_mut(&code).unwrap();
+        session.ai_configs.remove(&ai_seat);
+        session.state.waiting_for = WaitingFor::Priority { player: ai_seat };
+        let before = session.state_revision;
+
+        let outcome = session.run_ai();
+
+        assert!(outcome.transitions.is_empty());
+        assert!(matches!(
+            outcome.failure,
+            Some(AiDriverFailure::MissingAiConfig { player }) if player == ai_seat
+        ));
+        let fault = outcome
+            .fault
+            .expect("missing configuration records a fault");
+        assert_eq!(fault.after_state_revision, before);
+        assert_eq!(session.state_revision, before + 1);
+        assert_eq!(
+            session.to_persisted().state_revision,
+            before + 1,
+            "the durable snapshot must be fenced beyond the last delivered state"
+        );
+    }
+
+    #[test]
+    fn ai_driver_fault_blocks_takebacks_and_match_concede() {
+        let (mut mgr, code, token0, _ai_seat) = single_user_game_vs_ai();
+        let session = mgr.sessions.get_mut(&code).unwrap();
+        session.record_ai_driver_fault(AiDriverFailure::ActionSafetyCapReached { limit: 1 });
+
+        for result in [
+            session
+                .request_takeback(PlayerId(0), RewindTarget::LastAction)
+                .map(|_| ()),
+            session.respond_takeback(PlayerId(0), true).map(|_| ()),
+            session.cancel_takeback(PlayerId(0)),
+        ] {
+            assert!(result
+                .expect_err("a terminal AI driver fault blocks takeback mutation")
+                .contains("Native AI driver fault"));
+        }
+
+        let err = mgr
+            .handle_match_concede(&code, &token0)
+            .expect_err("a terminal AI driver fault blocks match concede");
+        assert!(err.contains("Native AI driver fault"));
+    }
+
+    #[test]
+    fn match_concede_distinguishes_lifecycle_refusal_from_operational_failure() {
+        let (mut mgr, code, token0, _token1) = setup_two_player_game();
+
+        let lifecycle = mgr
+            .handle_match_concede_outcome(&code, &token0)
+            .expect_err("a non-Bo3 match cannot be conceded as a match");
+        assert!(matches!(
+            lifecycle,
+            SessionActionError::RequestRejected(reason)
+                if reason == "Match forfeits require a best-of-three match"
+        ));
+
+        let operational = mgr
+            .handle_match_concede_outcome("missing", &token0)
+            .expect_err("an absent session is operational");
+        assert!(matches!(operational, SessionActionError::Operational(_)));
+    }
+
     /// Drives the fixture until **`run_ai` itself** publishes a turn boundary
     /// whose active player is the AI seat, and returns that turn number.
     ///
@@ -4187,7 +4681,7 @@ mod tests {
             });
             if let Some(option) = gained {
                 assert!(
-                    !ai_results.is_empty(),
+                    !ai_results.transitions.is_empty(),
                     "a boundary appeared across a `run_ai` call that returned nothing — \
                      the fixture is not measuring what it claims to"
                 );
@@ -4283,7 +4777,7 @@ mod tests {
         let waiting_before = session.state.waiting_for.clone();
         let resumed = session.run_ai();
         assert!(
-            !resumed.is_empty(),
+            !resumed.transitions.is_empty(),
             "a rewind onto an AI-active boundary must resume the AI, not freeze the game"
         );
         assert_ne!(
@@ -4310,7 +4804,7 @@ mod tests {
         let waiting_before = session.state.waiting_for.clone();
         let turn_before = session.state.turn_number;
         assert!(
-            session.run_ai().is_empty(),
+            session.run_ai().transitions.is_empty(),
             "with the human on priority the AI has nothing to do"
         );
         assert_eq!(session.state.waiting_for, waiting_before, "state unchanged");
@@ -4500,7 +4994,10 @@ mod tests {
                 }),
             )
             .expect_err("an invalid owner must fail before database lookup");
-        assert!(owner_error.contains("invalid owner player id"));
+        assert_eq!(
+            owner_error,
+            "That action is not valid in the current game state."
+        );
         assert!(!owner_error.contains("card database"));
 
         let session = &mgr.sessions[&code];
@@ -4550,7 +5047,10 @@ mod tests {
                 }),
             )
             .expect_err("a real entry off Priority must fail before database lookup");
-        assert!(priority_error.contains("Priority window"));
+        assert_eq!(
+            priority_error,
+            "That action is not valid in the current game state."
+        );
         assert!(!priority_error.contains("card database"));
     }
 
@@ -4608,10 +5108,7 @@ mod tests {
         );
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(
-            err.contains("not permitted") || err.contains("permission"),
-            "{err}"
-        );
+        assert_eq!(err, "That action is not valid in the current game state.");
     }
 
     /// Fixture shape for the `HostingMode` tests below, matching the existing
@@ -5008,7 +5505,11 @@ mod tests {
         let blob: crate::persist::PersistedSession = serde_json::from_str(&json).unwrap();
 
         // Premise 2, measured: the position survives disk AND the chokepoint resumes it.
-        let chokepoint_only = blob.state.clone().into_game_state();
+        let chokepoint_only = blob
+            .state
+            .clone()
+            .into_game_state()
+            .expect("test snapshot satisfies the checked restore contract");
         assert_eq!(
             chokepoint_only.rng_word_pos, SAVED_WORD_POS,
             "premise: the persisted blob carries the position across disk",
@@ -5255,7 +5756,7 @@ mod tests {
                 None,
             )
             .expect_err("revoked guests cannot reach the server CreateCard path");
-        assert_eq!(err, "Debug actions are not permitted for this seat");
+        assert_eq!(err, "You are not authorized to use debug actions.");
     }
 
     #[test]
@@ -5323,7 +5824,7 @@ mod tests {
         );
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("host"), "{err}");
+        assert_eq!(err, "That action is not allowed right now.");
     }
 
     #[test]
@@ -5339,7 +5840,7 @@ mod tests {
         );
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("own"), "{err}");
+        assert_eq!(err, "That action is not allowed right now.");
     }
 
     #[test]
@@ -5355,7 +5856,7 @@ mod tests {
         );
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("Sandbox"), "{err}");
+        assert_eq!(err, "That action is not allowed right now.");
     }
 
     #[test]
@@ -5383,8 +5884,11 @@ mod tests {
 
         let mut session = GameSession {
             game_code: "TEST01".to_string(),
+            game_log: Arc::default(),
             full_runtime: None,
             state_revision: 0,
+            ai_driver_fault: None,
+            next_ai_driver_fault_id: 1,
             state,
             player_tokens: vec!["host_token".to_string(), String::new()],
             connected: vec![true, true],
@@ -6001,7 +6505,7 @@ mod tests {
         // Illegal division first: wrong total (4 != 5). It reaches apply() and
         // is rejected by the engine, proving candidate removal does not weaken
         // structural validation.
-        let illegal = mgr.handle_action(
+        let illegal = mgr.handle_action_with_card_db_outcome(
             &code,
             &token,
             GameAction::AssignCombatDamage {
@@ -6010,11 +6514,16 @@ mod tests {
                 trample_damage: 0,
                 controller_damage: 0,
             },
+            None,
         );
         match illegal {
-            Err(e) => assert!(
-                e.starts_with("Engine error:"),
-                "wrong-total division must be rejected by apply(), not the gate, got: {e}"
+            Err(SessionActionError::Rejected(rejection)) => assert_eq!(
+                rejection.code,
+                engine::types::action_rejection::ActionRejectionCode::InvalidAction,
+                "wrong-total division must be rejected by apply(), not the gate"
+            ),
+            Err(error) => panic!(
+                "wrong-total division must be rejected by apply(), not the gate, got: {error:?}"
             ),
             Ok(_) => panic!("wrong-total combat damage division must be rejected"),
         }
@@ -6125,7 +6634,7 @@ mod tests {
 
         // The bypass must not weaken validation: a malformed freeform declaration
         // reaches the engine and is rejected there rather than by candidate lookup.
-        let duplicate = mgr.handle_action(
+        let duplicate = mgr.handle_action_with_card_db_outcome(
             &code,
             &token0,
             GameAction::DeclareAttackers {
@@ -6135,9 +6644,15 @@ mod tests {
                 ],
                 bands: vec![],
             },
+            None,
         );
         assert!(
-            matches!(duplicate, Err(ref error) if error.starts_with("Engine error:")),
+            matches!(
+                duplicate,
+                Err(SessionActionError::Rejected(ref rejection))
+                    if rejection.code
+                        == engine::types::action_rejection::ActionRejectionCode::InvalidAction
+            ),
             "a duplicate attacker must be rejected by the engine, got: {duplicate:?}"
         );
 
@@ -6205,10 +6720,7 @@ mod tests {
 
         let forged = mgr.handle_interaction(&code, other_token, witness.clone());
         let error = forged.expect_err("a valid token for another seat must not spend this slot");
-        assert!(
-            error.contains("NotAuthorized"),
-            "unexpected reason: {error}"
-        );
+        assert_eq!(error, "You are not authorized to answer that interaction.");
         assert_eq!(
             mgr.sessions[&code].state.active_interaction_slots, before,
             "a refused submission must not consume the capability"
@@ -6257,7 +6769,7 @@ mod tests {
         let error = mgr
             .handle_interaction(&code, acting_token, witness)
             .expect_err("an interaction id is single-use");
-        assert!(error.contains("StaleInteraction"), "unexpected: {error}");
+        assert_eq!(error, "That interaction has already changed.");
     }
 
     #[test]
@@ -6276,7 +6788,7 @@ mod tests {
         let error = mgr
             .handle_interaction(&code, acting_token, oversized)
             .expect_err("an oversized response is refused");
-        assert_eq!(error, "Engine error: PayloadTooLarge");
+        assert_eq!(error, "That interaction response is too large.");
 
         // Negative sibling: the boundary sits at the constant, not at "any
         // large list". The same shape at exactly the limit is still refused,
@@ -6291,7 +6803,7 @@ mod tests {
             .handle_interaction(&code, acting_token, at_limit)
             .expect_err("unknown choices are still refused");
         assert!(
-            !error.contains("PayloadTooLarge"),
+            error != "That interaction response is too large.",
             "the bound must be the constant, not list size in general: {error}"
         );
     }
@@ -6313,10 +6825,7 @@ mod tests {
         let error = mgr
             .handle_interaction(&code, acting_token, witness.clone())
             .expect_err("the table is voting; the state must not move");
-        assert!(
-            error.contains("takeback request is pending"),
-            "unexpected: {error}"
-        );
+        assert_eq!(error, "That action is not allowed right now.");
         assert_eq!(
             mgr.sessions[&code].state.active_interaction_slots,
             before_slots
@@ -6327,6 +6836,273 @@ mod tests {
         mgr.sessions.get_mut(&code).unwrap().pending_takeback = None;
         mgr.handle_interaction(&code, acting_token, witness)
             .expect("with no pending takeback the same submission applies");
+    }
+
+    fn preview_request(
+        id: &str,
+        witness: &InteractionSubmission,
+    ) -> engine::types::interaction::InteractionPreviewRequest {
+        engine::types::interaction::InteractionPreviewRequest {
+            request_id: engine::types::interaction::PreviewRequestId(id.to_string()),
+            interaction_id: witness.interaction_id.clone(),
+            response: witness.response.clone(),
+        }
+    }
+
+    /// Three pins whose `amounts` are each under `MAX_INTERACTION_LIST_LEN` and
+    /// whose sum is not — the cumulative branch a naive per-field guard misses.
+    fn oversized_preview_request(
+        id: &str,
+        witness: &InteractionSubmission,
+    ) -> engine::types::interaction::InteractionPreviewRequest {
+        use engine::types::interaction::{
+            AmountAssignment, InteractionShortcutDecision, InteractionShortcutPin,
+        };
+        let per_pin = MAX_INTERACTION_LIST_LEN / 2;
+        let pins: Vec<InteractionShortcutPin> = (0..3)
+            .map(|group| InteractionShortcutPin {
+                group,
+                choice_ids: vec![InteractionChoiceId("a".to_string())],
+                amounts: vec![
+                    AmountAssignment {
+                        choice_id: InteractionChoiceId("a".to_string()),
+                        amount: 1,
+                    };
+                    per_pin
+                ],
+            })
+            .collect();
+        for pin in &pins {
+            assert!(pin.amounts.len() <= MAX_INTERACTION_LIST_LEN);
+        }
+        engine::types::interaction::InteractionPreviewRequest {
+            request_id: engine::types::interaction::PreviewRequestId(id.to_string()),
+            interaction_id: witness.interaction_id.clone(),
+            response: engine::types::interaction::InteractionResponse::Shortcut {
+                decision: InteractionShortcutDecision::AcceptSuggested,
+                pins,
+            },
+        }
+    }
+
+    /// Row 2. `&self` already forbids a write; this asserts the whole
+    /// authoritative session is byte-identical across a run of previews that
+    /// includes an accepted one, a refused one and an over-budget one — a
+    /// mutation on any of those paths moves the serialization.
+    #[test]
+    fn preview_interaction_commits_nothing() {
+        use engine::types::interaction::InteractionPreviewStatus;
+        let (mut mgr, code, token0, token1) = started_two_seat_game();
+        let (_acting, acting_token, other_token, witness) =
+            live_witness(&mgr, &code, &token0, &token1);
+
+        let before_json = serde_json::to_string(&mgr.sessions[&code].state).expect("serializes");
+        let before_slots = mgr.sessions[&code].state.active_interaction_slots.clone();
+        let before_waiting = mgr.sessions[&code].state.waiting_for.clone();
+        let before_life: Vec<i32> = mgr.sessions[&code]
+            .state
+            .players
+            .iter()
+            .map(|player| player.life)
+            .collect();
+        let before_battlefield = mgr.sessions[&code].state.battlefield.clone();
+        let before_takeback_depth = mgr.sessions[&code].takeback_history.len();
+        // The field `handle_interaction_with_rejection` writes before applying,
+        // for log resolution — the preview route must not reach it.
+        let before_log_names = mgr.sessions[&code].state.log_player_names.clone();
+
+        let accepted = mgr
+            .preview_interaction_with_rejection(
+                &code,
+                acting_token,
+                &preview_request("a", &witness),
+            )
+            .expect("the owning seat's preview is answered");
+        assert!(
+            matches!(accepted.status, InteractionPreviewStatus::Confirmable),
+            "the accepted leg must actually reach the reducer simulation: {:?}",
+            accepted.status
+        );
+
+        let foreign = mgr
+            .preview_interaction_with_rejection(&code, other_token, &preview_request("b", &witness))
+            .expect("a valid foreign token is answered, not errored");
+        assert!(matches!(
+            foreign.status,
+            InteractionPreviewStatus::Rejected {
+                reason: InteractionReasonCode::NotAuthorized
+            }
+        ));
+
+        let over_budget = mgr
+            .preview_interaction_with_rejection(
+                &code,
+                acting_token,
+                &oversized_preview_request("c", &witness),
+            )
+            .expect("an over-budget preview is a status, not an error");
+        assert!(matches!(
+            over_budget.status,
+            InteractionPreviewStatus::Rejected {
+                reason: InteractionReasonCode::PayloadTooLarge
+            }
+        ));
+
+        assert_eq!(
+            mgr.sessions[&code].state.active_interaction_slots,
+            before_slots
+        );
+        assert_eq!(mgr.sessions[&code].state.waiting_for, before_waiting);
+        assert_eq!(
+            mgr.sessions[&code]
+                .state
+                .players
+                .iter()
+                .map(|player| player.life)
+                .collect::<Vec<_>>(),
+            before_life
+        );
+        assert_eq!(mgr.sessions[&code].state.battlefield, before_battlefield);
+        assert_eq!(
+            mgr.sessions[&code].takeback_history.len(),
+            before_takeback_depth
+        );
+        assert_eq!(mgr.sessions[&code].state.log_player_names, before_log_names);
+        assert_eq!(
+            serde_json::to_string(&mgr.sessions[&code].state).expect("serializes"),
+            before_json,
+            "no field of the authoritative state may move on the preview route"
+        );
+
+        // Reach guard: the identity above is over a state a submission of the
+        // SAME witness demonstrably moves, so it is not the identity of a
+        // session nothing can change.
+        mgr.handle_interaction(&code, acting_token, witness)
+            .expect("the same witness submitted does apply");
+        assert_ne!(
+            mgr.sessions[&code].state.active_interaction_slots, before_slots,
+            "the submission route moves what the preview route left alone"
+        );
+        assert_ne!(
+            serde_json::to_string(&mgr.sessions[&code].state).expect("serializes"),
+            before_json
+        );
+    }
+
+    /// Row 3. The multi-authority hostile fixture, on the preview route: two
+    /// legitimately authenticated seats, one live capability. Sibling of
+    /// `handle_interaction_binds_the_actor_to_the_authenticated_token`.
+    #[test]
+    fn preview_interaction_binds_the_actor_to_the_authenticated_token() {
+        use engine::types::interaction::InteractionPreviewStatus;
+        let (mgr, code, token0, token1) = started_two_seat_game();
+        let (_acting, acting_token, other_token, witness) =
+            live_witness(&mgr, &code, &token0, &token1);
+        let request = preview_request("req-1", &witness);
+
+        let forged = mgr
+            .preview_interaction_with_rejection(&code, other_token, &request)
+            .expect("a validly authenticated foreign seat gets a status, not an Err");
+        assert!(
+            matches!(
+                forged.status,
+                InteractionPreviewStatus::Rejected {
+                    reason: InteractionReasonCode::NotAuthorized
+                }
+            ),
+            "the reason code, not merely 'not Confirmable' — a stale or malformed \
+             id answers with a different one: {:?}",
+            forged.status
+        );
+        assert_eq!(
+            forged.request_id, request.request_id,
+            "the answer is correlated"
+        );
+
+        // Reach guard: the identical request from the owning token IS answered,
+        // so the refusal above is attributable to authorization and not to a
+        // stale witness or a broken session.
+        let owned = mgr
+            .preview_interaction_with_rejection(&code, acting_token, &request)
+            .expect("the owning seat's preview is answered");
+        assert!(matches!(
+            owned.status,
+            InteractionPreviewStatus::Confirmable
+        ));
+        assert_eq!(owned.request_id, request.request_id);
+        assert_eq!(owned.interaction_id, witness.interaction_id);
+
+        // A token that is no seat at all is a different channel entirely.
+        let unknown = mgr
+            .preview_interaction_with_rejection(&code, "not-a-real-token", &request)
+            .expect_err("an unknown token is not a seat");
+        assert!(matches!(
+            unknown,
+            PreviewRefusal::Operational(ref reason) if reason == "Invalid player token"
+        ));
+    }
+
+    /// Row 11. Both interlocks, each with the paired positive that the
+    /// identical request is answered once the interlock is cleared, and each
+    /// asserting the CHANNEL and the code — a pending takeback must not be
+    /// reported as an operational failure, nor a driver fault as a rejection.
+    #[test]
+    fn preview_interaction_refuses_while_either_interlock_holds() {
+        use engine::types::interaction::InteractionPreviewStatus;
+        let (mut mgr, code, token0, token1) = started_two_seat_game();
+        let (acting, acting_token, _other, witness) = live_witness(&mgr, &code, &token0, &token1);
+        let request = preview_request("req-1", &witness);
+
+        let target_state = mgr.sessions[&code].state.clone();
+        mgr.sessions.get_mut(&code).unwrap().pending_takeback = Some(PendingTakeback {
+            requested_by: acting,
+            target_state,
+            approvals: HashSet::new(),
+            history_truncate_len: 0,
+        });
+        let refused = mgr
+            .preview_interaction_with_rejection(&code, acting_token, &request)
+            .expect_err("the table is voting; the preview waits");
+        match refused {
+            PreviewRefusal::Rejected(rejection) => assert_eq!(
+                rejection.code,
+                engine::types::action_rejection::ActionRejectionCode::ActionNotAllowed
+            ),
+            other => panic!("a pending takeback is a game rejection, not {other:?}"),
+        }
+
+        mgr.sessions.get_mut(&code).unwrap().pending_takeback = None;
+        let cleared = mgr
+            .preview_interaction_with_rejection(&code, acting_token, &request)
+            .expect("with no pending takeback the identical request is answered");
+        assert!(matches!(
+            cleared.status,
+            InteractionPreviewStatus::Confirmable
+        ));
+
+        mgr.sessions
+            .get_mut(&code)
+            .unwrap()
+            .record_ai_driver_fault(AiDriverFailure::ActionSafetyCapReached { limit: 1 });
+        let faulted = mgr
+            .preview_interaction_with_rejection(&code, acting_token, &request)
+            .expect_err("a faulted driver fences the whole session");
+        match faulted {
+            PreviewRefusal::Operational(reason) => assert!(
+                reason.contains("Native AI driver fault"),
+                "the fault's own message must ride the operational channel: {reason}"
+            ),
+            other => panic!("a driver fault is operational, not {other:?}"),
+        }
+
+        mgr.sessions.get_mut(&code).unwrap().ai_driver_fault = None;
+        let recovered = mgr
+            .preview_interaction_with_rejection(&code, acting_token, &request)
+            .expect("with the fault cleared the identical request is answered");
+        assert!(matches!(
+            recovered.status,
+            InteractionPreviewStatus::Confirmable
+        ));
     }
 
     /// Parks a one-entry stack in front of a human seat that has already been
@@ -6369,18 +7145,12 @@ mod tests {
         (mgr, game_code, ai_player)
     }
 
-    /// An AI-granted latch whose run is INCOHERENT is the one with no exit at
-    /// all, so it is the one the hand-off must not decline.
-    ///
-    /// `ready_consent_run` requires `auto_pass.is_empty()`, so a single seat
-    /// holding an End Turn auto-pass makes every latch minted that turn
-    /// incoherent. The hand-off previously read its requester through
-    /// `pending_resolve_all_ready_requester`, whose `?` propagates exactly that
-    /// coherence test — so it returned `None` here and left the latch standing:
-    /// no acting player, and no client that renders `ResolveAllReady`. This is
-    /// the reported hang, reachable from the ordinary End Turn button.
+    /// CR 117.3d: a human Resolve All at a table with AI seats enters the same
+    /// fenced session used by direct `UntilStackEmpty` without asking the AI for
+    /// anything. The AI seat owing a response is exactly what used to park the
+    /// human on a consent prompt they could not clear.
     #[test]
-    fn run_ai_repairs_its_own_grant_when_the_frozen_run_is_incoherent() {
+    fn resolve_all_at_an_ai_table_needs_no_ai_consent() {
         let (mut mgr, game_code, _ai_player) = ai_table_awaiting_one_consent();
         let session = mgr
             .sessions
@@ -6390,68 +7160,40 @@ mod tests {
         apply(
             &mut session.state,
             PlayerId(0),
-            GameAction::BeginResolveAll { max_resolutions: 1 },
-        )
-        .expect("the priority holder may start Resolve All consent");
-        // Freeze the run first, THEN make the live game disagree with the
-        // snapshot it froze. `BeginResolveAll` has no auto-pass precondition,
-        // and `apply` exempts consent actions from clearing the actor's entry,
-        // so this is the ordinary End Turn shape and not a contrived state.
-        session.state.auto_pass.insert(
-            PlayerId(0),
-            AutoPassMode::UntilTurnBoundary {
-                until: TurnBoundary::EndOfCurrentTurn,
+            GameAction::BeginResolveAll {
+                max_resolutions: 1,
+                scope: ResolveAllScope::Own,
             },
-        );
-        assert!(
-            matches!(
-                session.state.waiting_for,
-                WaitingFor::ResolveAllConsent { .. }
-            ),
-            "the AI representative must still owe a consent response, got {:?}",
-            session.state.waiting_for
-        );
-
-        let transitions = session.run_ai();
-
-        // Non-vacuity, and the control this test genuinely needs: every
-        // assertion below is equally true of an AI that DECLINED and never
-        // minted a latch at all. This pins that a Ready latch was actually
-        // reached, by reading the grant's own broadcast frame.
-        assert!(
-            transitions
-                .iter()
-                .any(|(_, (broadcast_state, ..))| matches!(
-                    broadcast_state.waiting_for,
-                    WaitingFor::ResolveAllReady { .. }
-                )),
-            "no broadcast frame shows the AI's grant reaching a Ready latch"
-        );
+        )
+        .expect("the priority holder may start Resolve All");
         assert!(
             !matches!(
                 session.state.waiting_for,
-                WaitingFor::ResolveAllReady { .. }
+                WaitingFor::ResolveAllConsent { .. } | WaitingFor::ResolveAllReady { .. }
             ),
-            "an incoherent AI-granted latch must not survive its own hand-off, got {:?}",
+            "the human must never be parked on an AI's consent, got {:?}",
             session.state.waiting_for
         );
         assert!(
             session.state.resolve_all_consent_run.is_none(),
-            "the repair discards the run it could not honor"
+            "the requester's single-participant run materializes immediately"
         );
+
+        session.run_ai();
+
+        assert!(session.state.stack.is_empty());
+        assert!(session.state.resolve_all_consent_run.is_none());
+        assert!(session.state.stack_resolution_session.is_none());
+        assert!(!matches!(
+            session.state.waiting_for,
+            WaitingFor::ResolveAllReady { .. }
+        ));
     }
 
-    /// The regression this whole seam exists for: when the LAST Resolve All
-    /// consent comes from a server-driven AI seat, nothing else will ever
-    /// consume the resulting latch.
-    ///
-    /// `WaitingFor::ResolveAllReady` has no acting player, so `run_ai_actions`
-    /// stops there, every seat's legal-action set is empty, and no client is
-    /// prompted to send `ClientMessage::ResolveAll`. Before `run_ai` consumed
-    /// its own AI seats' grant, a solo-vs-AI table parked here permanently with
-    /// an unresolvable stack.
+    /// The public server driver observes the final state after the engine-owned
+    /// runner, with no extra Resolve All transport action.
     #[test]
-    fn run_ai_consumes_the_ready_latch_its_own_grant_produced() {
+    fn run_ai_publishes_the_completed_shared_session() {
         let (mut mgr, game_code, _ai_player) = ai_table_awaiting_one_consent();
         let session = mgr
             .sessions
@@ -6461,27 +7203,15 @@ mod tests {
         apply(
             &mut session.state,
             PlayerId(0),
-            GameAction::BeginResolveAll { max_resolutions: 1 },
+            GameAction::BeginResolveAll {
+                max_resolutions: 1,
+                scope: ResolveAllScope::Own,
+            },
         )
-        .expect("the priority holder may start Resolve All consent");
-        assert!(
-            matches!(
-                session.state.waiting_for,
-                WaitingFor::ResolveAllConsent { .. }
-            ),
-            "the AI representative must still owe a consent response, got {:?}",
-            session.state.waiting_for
-        );
+        .expect("the priority holder may start Resolve All");
 
         let transitions = session.run_ai();
 
-        assert!(
-            !matches!(
-                session.state.waiting_for,
-                WaitingFor::ResolveAllReady { .. }
-            ),
-            "an AI-granted Ready latch must not survive its own hand-off"
-        );
         assert!(
             session.state.stack.is_empty(),
             "the consented entry must have resolved, stack: {:?}",
@@ -6491,46 +7221,45 @@ mod tests {
             session.state.resolve_all_consent_run.is_none(),
             "one run authorizes one batch and must not outlive it"
         );
-        // The collapse has to reach the wire as its own transition, or the
-        // client would render a state the server has already moved past.
-        // Anchored on the FIRST transition still carrying the stack: the loop's
-        // follow-up AI batch can append further transitions, so asserting only
-        // on the last one would pass without the collapse frame ever existing.
+        // CR 117.3d: an `Own` run asks nobody, so the AI-grant round-trip that
+        // used to supply a second transition here no longer happens -- that
+        // round-trip is the defect this test's fixture reproduces. What must
+        // still hold is that the engine-owned runner published, and that no
+        // frame it published ever parked a player on a consent decision.
         assert!(
-            transitions.len() >= 2,
-            "expected the AI grant and the collapsed batch, got {}",
-            transitions.len()
-        );
-        let (_, (granted_state, ..)) = transitions.first().expect("the AI grant transition");
-        assert_eq!(
-            granted_state.stack.len(),
-            1,
-            "the Grant itself resolves nothing; the collapse must be a later frame"
+            !transitions.transitions.is_empty(),
+            "the engine-owned runner must publish the post-collapse state"
         );
         assert!(
             transitions
+                .transitions
+                .iter()
+                .all(|(_, (broadcast_state, ..))| !matches!(
+                    broadcast_state.waiting_for,
+                    WaitingFor::ResolveAllConsent { .. } | WaitingFor::ResolveAllReady { .. }
+                )),
+            "a published frame parked a player on a Resolve All consent decision"
+        );
+        assert!(
+            transitions
+                .transitions
                 .iter()
                 .any(|(_, (broadcast_state, ..))| broadcast_state.stack.is_empty()),
             "no broadcast frame carried the post-collapse state"
         );
     }
 
-    /// A human submitting the final consent keeps owning the consumption: their
-    /// own client sends `ResolveAll`. `run_ai` must not race ahead of it, or
-    /// that client's request would come back as an error.
-    ///
-    /// The fixture drives all the way to a Ready latch the human produced, so
-    /// the assertion is about the "we acted in this call" gate and not about
-    /// the latch simply being absent — removing the gate turns this red.
+    /// The same rule read from the other side: an AI seat's Resolve All is that
+    /// seat's own pre-commitment too, so it never interrupts the human for a
+    /// consent decision and never leaves a Ready latch behind.
     #[test]
-    fn run_ai_leaves_a_human_granted_ready_latch_for_its_own_client() {
+    fn an_ai_resolve_all_does_not_prompt_the_human() {
         let (mut mgr, game_code, ai_player) = ai_table_awaiting_one_consent();
         let session = mgr
             .sessions
             .get_mut(&game_code)
             .expect("the game retains its session");
-        // Flip the roles: the AI opens the run (auto-granting itself) so the
-        // remaining representative is the human.
+        // Flip the roles: the AI seat is the one starting Resolve All.
         session.state.priority_player = ai_player;
         session.state.waiting_for = WaitingFor::Priority { player: ai_player };
         session.state.priority_passes.clear();
@@ -6539,226 +7268,160 @@ mod tests {
         apply(
             &mut session.state,
             ai_player,
-            GameAction::BeginResolveAll { max_resolutions: 1 },
-        )
-        .expect("the priority holder may start Resolve All consent");
-        let WaitingFor::ResolveAllConsent {
-            epoch,
-            representative,
-        } = session.state.waiting_for
-        else {
-            panic!(
-                "expected a pending consent prompt, got {:?}",
-                session.state.waiting_for
-            );
-        };
-        assert_eq!(
-            representative,
-            PlayerId(0),
-            "the human must be the outstanding representative"
-        );
-
-        apply(
-            &mut session.state,
-            PlayerId(0),
-            GameAction::RespondResolveAllConsent {
-                epoch,
-                decision: ResolveAllConsentDecision::Grant,
+            GameAction::BeginResolveAll {
+                max_resolutions: 1,
+                scope: ResolveAllScope::Own,
             },
         )
-        .expect("the human representative may grant");
-        assert!(
-            matches!(
-                session.state.waiting_for,
-                WaitingFor::ResolveAllReady { .. }
-            ),
-            "the fixture must reach the latch, or the gate is untested"
-        );
-        // Non-vacuity, and a trap worth pinning: the latch really is
-        // consumable, so nothing about coherence is holding `run_ai` back.
-        // Note WHO it names — `pending_resolve_all_ready_requester` returns the
-        // run's INITIATOR (`participants[0]`, the seat that called
-        // `BeginResolveAll` — the AI here), NOT the seat whose Grant completed
-        // it (the human). Ownership of a latch follows the FINAL Grant, so this
-        // value can never be the gate: it says "an AI started this run", which
-        // is true in exactly the case `run_ai` must keep its hands off.
-        assert_eq!(
-            pending_resolve_all_ready_requester(&session.state),
-            Some(ai_player),
-            "the requester is the run's initiator, not its final grantor"
-        );
-
-        // SCOPE OF THIS TEST, measured rather than assumed. It pins the
-        // behavioural contract "run_ai never touches a latch that predates its
-        // own actions" — a gate keyed on latch-presence-at-entry instead of on
-        // batch contents turns all three assertions below red.
-        //
-        // It does NOT discriminate `minted_here` from the older `!batch
-        // .is_empty()` proxy, and cannot: the latch already stands at entry, so
-        // `acting_players()` is empty, so the batch is empty, so the
-        // `batch.is_empty()` break at the top of the loop fires before either
-        // predicate is read. Both mutations stay green here. The distinguishing
-        // input — a non-empty batch alongside a pre-existing latch — is
-        // unreachable precisely while `ResolveAllReady` has no acting set,
-        // which is the invariant the refinement exists to stop depending on.
-        // It becomes testable when that changes; until then, do not add a pin
-        // that only appears to cover it.
-        assert!(
-            session.run_ai().is_empty(),
-            "no AI seat may act at a latch with no acting player"
-        );
-        assert!(
-            matches!(
-                session.state.waiting_for,
-                WaitingFor::ResolveAllReady { .. }
-            ),
-            "a human-granted latch belongs to that human's client, got {:?}",
-            session.state.waiting_for
-        );
-        assert_eq!(
-            session.state.stack.len(),
-            1,
-            "run_ai must not collapse a batch it did not authorize"
-        );
-    }
-
-    /// A Ready latch whose frozen run is gone can prove no owner, so refusing
-    /// every seat would leave the game with no exit at all. Any seat may ask
-    /// for the repair, and the repair resolves nothing.
-    #[test]
-    fn resolve_all_for_player_repairs_a_ready_latch_with_no_run() {
-        let (mut mgr, game_code, ai_player) = ai_table_awaiting_one_consent();
-        let session = mgr
-            .sessions
-            .get_mut(&game_code)
-            .expect("the game retains its session");
-        apply(
-            &mut session.state,
-            PlayerId(0),
-            GameAction::BeginResolveAll { max_resolutions: 1 },
-        )
-        .expect("the priority holder may start Resolve All consent");
-        let WaitingFor::ResolveAllConsent { epoch, .. } = session.state.waiting_for else {
-            panic!("expected a pending consent prompt");
-        };
-        apply(
-            &mut session.state,
-            ai_player,
-            GameAction::RespondResolveAllConsent {
-                epoch,
-                decision: ResolveAllConsentDecision::Grant,
-            },
-        )
-        .expect("the AI representative may grant");
-        assert!(matches!(
-            session.state.waiting_for,
-            WaitingFor::ResolveAllReady { .. }
-        ));
-
-        // Strand the latch exactly as a dropped run would.
-        session.state.resolve_all_consent_run = None;
-        let token = session
-            .player_tokens
-            .first()
-            .cloned()
-            .expect("the host holds a token");
-
-        let (_, summary) = mgr
-            .resolve_all_for_player(&game_code, &token, 1)
-            .expect("a stranded latch is repaired, not rejected");
-        assert_eq!(
-            summary.items_resolved, 0,
-            "the repair must not resolve a stack entry"
-        );
-        let session = mgr.sessions.get(&game_code).expect("session survives");
-        assert!(
-            matches!(session.state.waiting_for, WaitingFor::Priority { .. }),
-            "the repair must restore ordinary priority, got {:?}",
-            session.state.waiting_for
-        );
-        assert_eq!(
-            session.state.stack.len(),
-            1,
-            "no stack entry may resolve through a repair"
-        );
-    }
-    /// A latch outlives the process that owed its consumption. Restoring a
-    /// session into `ResolveAllReady` would otherwise hand the players back a
-    /// game with no acting player and no client willing to send `ResolveAll` for
-    /// a batch it never started.
-    #[test]
-    fn restoring_a_session_discharges_an_orphaned_resolve_all_latch() {
-        let (mut mgr, game_code, ai_player) = ai_table_awaiting_one_consent();
-        let session = mgr
-            .sessions
-            .get_mut(&game_code)
-            .expect("the game retains its session");
-        apply(
-            &mut session.state,
-            PlayerId(0),
-            GameAction::BeginResolveAll { max_resolutions: 1 },
-        )
-        .expect("the priority holder may start Resolve All consent");
-        let WaitingFor::ResolveAllConsent { epoch, .. } = session.state.waiting_for else {
-            panic!("expected a pending consent prompt");
-        };
-        apply(
-            &mut session.state,
-            ai_player,
-            GameAction::RespondResolveAllConsent {
-                epoch,
-                decision: ResolveAllConsentDecision::Grant,
-            },
-        )
-        .expect("the AI representative may grant");
-        assert!(matches!(
-            session.state.waiting_for,
-            WaitingFor::ResolveAllReady { .. }
-        ));
-        let revision_before = session.state_revision;
-        let persisted = session.to_persisted();
-
-        let restored = GameSession::from_persisted(persisted, &CardDatabase::default())
-            .expect("the snapshot restores");
+        .expect("the priority holder may start Resolve All");
 
         assert!(
             !matches!(
-                restored.state.waiting_for,
-                WaitingFor::ResolveAllReady { .. }
+                session.state.waiting_for,
+                WaitingFor::ResolveAllConsent { .. } | WaitingFor::ResolveAllReady { .. }
             ),
-            "an orphaned latch must not survive restore, got {:?}",
-            restored.state.waiting_for
+            "the human is never asked to approve another seat's Resolve All, got {:?}",
+            session.state.waiting_for
         );
         assert!(
-            restored.state.stack.is_empty(),
-            "the consented entry must have resolved on restore"
+            session.state.resolve_all_consent_run.is_none(),
+            "the requester's single-participant run materializes immediately"
         );
-        assert!(restored.state.resolve_all_consent_run.is_none());
-        assert!(
-            restored.state_revision > revision_before,
-            "clients must not see changed content under an unchanged revision"
-        );
+        assert!(session.state.stack.is_empty());
+        assert!(session.state.stack_resolution_session.is_none());
     }
 
-    /// The restore repair must also cover a latch whose run is gone, where
-    /// there is no prefix to collapse and the only correct outcome is a return
-    /// to ordinary priority with the stack untouched.
+    /// Generic reconstruction deliberately preserves a coherent automation
+    /// session. The restore owner must opt into the one explicit resume after
+    /// it finishes attaching runtime authority.
     #[test]
-    fn restoring_a_session_repairs_a_latch_whose_run_is_gone() {
+    fn restored_session_resumes_a_coherent_automation_once_on_explicit_request() {
         let (mut mgr, game_code, ai_player) = ai_table_awaiting_one_consent();
         let session = mgr
             .sessions
             .get_mut(&game_code)
             .expect("the game retains its session");
+        let initial_stack_len = session.state.stack.len();
+        let entry = session
+            .state
+            .stack
+            .back()
+            .expect("fixture retains a stack entry");
+        session.state.stack_resolution_session = Some(StackResolutionSession {
+            entries: vec![StackResolutionEntryFence::capture(entry)],
+            cursor: 0,
+            representatives: BTreeSet::from([PlayerId(0), ai_player]),
+            verified_pass_representatives: BTreeSet::new(),
+            budget: StackResolutionBudget::Unlimited,
+            policy: StackResolutionPolicy::Committed,
+            auto_pass_overlay: StackResolutionAutoPassOverlay {
+                baseline: BTreeMap::new(),
+            },
+        });
+        for representative in [PlayerId(0), ai_player] {
+            session.state.auto_pass.insert(
+                representative,
+                AutoPassMode::UntilStackEmpty {
+                    initial_stack_len,
+                    policy: StackResolutionPolicy::Committed,
+                },
+            );
+        }
+        assert!(session.state.stack_resolution_session.is_some());
+        let revision_before = session.state_revision;
+        let persisted = session.to_persisted();
+
+        let mut restored = GameSession::from_persisted(persisted, &CardDatabase::default())
+            .expect("the snapshot restores");
+
+        assert!(
+            restored.state.stack_resolution_session.is_some(),
+            "generic restore must preserve the active shared session"
+        );
+        assert!(
+            !restored.state.stack.is_empty(),
+            "generic restore must not resolve a stack entry"
+        );
+        assert_eq!(restored.state_revision, revision_before);
+
+        let resumed = restored.resume_restored_stack_automation();
+        assert_eq!(
+            resumed.presentation.outcome,
+            RestoredStackAutomationOutcome::Progressed,
+            "the coherent authorization enters the ordinary runner"
+        );
+        assert_eq!(resumed.state_revision, Some(revision_before + 1));
+        let broadcast = resumed
+            .broadcast
+            .as_ref()
+            .expect("resume recomputes broadcast");
+        let (expected_legal, expected_costs, expected_by_object) =
+            engine_legal_actions_full(&restored.state);
+        assert_eq!(&broadcast.0, &restored.state);
+        assert_eq!(&broadcast.1, &expected_legal);
+        assert_eq!(
+            broadcast.2,
+            auto_pass_recommended(&restored.state, &broadcast.1)
+        );
+        assert_eq!(&broadcast.3, &expected_costs);
+        assert_eq!(&broadcast.4, &expected_by_object);
+        assert!(
+            resumed.presentation.omitted_event_count > 0,
+            "the runner's complete internal event batch must be accounted for"
+        );
+        let presentation_wire =
+            serde_json::to_string(&resumed.presentation).expect("bounded presentation serializes");
+        assert!(
+            !presentation_wire.contains("events"),
+            "the transport presentation must not serialize the internal event batch"
+        );
+        assert!(restored.state.stack.is_empty());
+        assert!(restored.state.stack_resolution_session.is_none());
+
+        let repeated = restored.resume_restored_stack_automation();
+        assert_eq!(
+            repeated.presentation.outcome,
+            RestoredStackAutomationOutcome::Noop
+        );
+        assert_eq!(repeated.state_revision, None);
+        assert!(repeated.broadcast.is_none());
+        assert_eq!(
+            restored.state_revision,
+            revision_before + 1,
+            "the explicit resume must be one-shot"
+        );
+    }
+
+    /// Legacy Ready persistence is identified exclusively by its missing
+    /// baseline; its explicit resume repair remains readable during migration.
+    #[test]
+    fn explicit_restore_resume_repairs_a_legacy_latch_whose_run_is_gone() {
+        let (mut mgr, game_code, ai_player) = ai_table_awaiting_one_consent();
+        let session = mgr
+            .sessions
+            .get_mut(&game_code)
+            .expect("the game retains its session");
+        // `Shared` is the scope that still opens a consent queue; a missing
+        // baseline is then what identifies the run as the legacy encoding this
+        // migration path repairs.
         apply(
             &mut session.state,
             PlayerId(0),
-            GameAction::BeginResolveAll { max_resolutions: 1 },
+            GameAction::BeginResolveAll {
+                max_resolutions: 1,
+                scope: ResolveAllScope::Shared,
+            },
         )
-        .expect("the priority holder may start Resolve All consent");
+        .expect("the priority holder may start a shared Resolve All");
         let WaitingFor::ResolveAllConsent { epoch, .. } = session.state.waiting_for else {
             panic!("expected a pending consent prompt");
         };
+        session
+            .state
+            .resolve_all_consent_run
+            .as_mut()
+            .expect("fresh consent run exists")
+            .auto_pass_baseline = None;
         apply(
             &mut session.state,
             ai_player,
@@ -6771,8 +7434,15 @@ mod tests {
         session.state.resolve_all_consent_run = None;
         let persisted = session.to_persisted();
 
-        let restored = GameSession::from_persisted(persisted, &CardDatabase::default())
+        let mut restored = GameSession::from_persisted(persisted, &CardDatabase::default())
             .expect("the snapshot restores");
+
+        assert!(matches!(
+            restored.state.waiting_for,
+            WaitingFor::ResolveAllReady { .. }
+        ));
+        let revision_before = restored.state_revision;
+        let resumed = restored.resume_restored_stack_automation();
 
         assert!(
             matches!(restored.state.waiting_for, WaitingFor::Priority { .. }),
@@ -6784,5 +7454,31 @@ mod tests {
             1,
             "nothing may resolve without a run to authorize it"
         );
+        assert_eq!(
+            resumed.presentation.outcome,
+            RestoredStackAutomationOutcome::ZeroResolutionRepair
+        );
+        assert_eq!(resumed.state_revision, Some(revision_before + 1));
+        assert!(resumed.broadcast.is_some());
+    }
+
+    #[test]
+    fn explicit_restore_resume_is_a_revision_preserving_noop_for_ordinary_priority() {
+        let (mgr, game_code, _) = ai_table_awaiting_one_consent();
+        let session = mgr.sessions.get(&game_code).expect("session exists");
+        let persisted = session.to_persisted();
+        let mut restored = GameSession::from_persisted(persisted, &CardDatabase::default())
+            .expect("ordinary state restores");
+        let revision_before = restored.state_revision;
+
+        let resumed = restored.resume_restored_stack_automation();
+
+        assert_eq!(
+            resumed.presentation.outcome,
+            RestoredStackAutomationOutcome::Noop
+        );
+        assert_eq!(resumed.state_revision, None);
+        assert!(resumed.broadcast.is_none());
+        assert_eq!(restored.state_revision, revision_before);
     }
 }

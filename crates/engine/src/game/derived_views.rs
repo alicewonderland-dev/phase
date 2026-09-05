@@ -32,7 +32,7 @@ use crate::types::events::GameEvent;
 use crate::types::format::GameFormat;
 use crate::types::game_state::{
     CastingVariant, GameState, StackEntry, StackEntryKind, StackPaidSnapshot,
-    SyntheticTriggerProvenance,
+    SyntheticTriggerProvenance, WaitingFor,
 };
 use crate::types::identifiers::ObjectId;
 use crate::types::keywords::Keyword;
@@ -105,6 +105,13 @@ pub struct StackEntryDisplay {
     /// stack provenance surface consumed by the frontend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<SyntheticTriggerProvenance>,
+    /// CR 112.2 + CR 613.1b: the LIVE controller of this stack object, as
+    /// `stack::stack_object_controller` derives it. The wire `StackEntry.controller`
+    /// stays the CR 112.2 by-default controller (rules state, replay-load-bearing);
+    /// this is the engine's answer to "who controls it right now", so the display layer
+    /// renders one engine-provided value and never picks between two.
+    #[serde(default)]
+    pub controller: PlayerId,
 }
 
 /// A single player-affecting condition the HUD surfaces as a status icon.
@@ -520,6 +527,69 @@ pub enum LegendCandidateIdentity {
     Unknown,
 }
 
+/// CR 115.1: "The targets are object(s) and/or player(s) the spell or ability
+/// will affect." What the live target announcement is asking the announcing
+/// player to choose from, classified over that exact and/or axis — so a mixed
+/// offer is a representable value rather than a case that falls through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// Adjacently tagged, matching every other payload-carrying tagged enum in this
+// module (`StackPaidFactView`, `PlayerConditionKind`, `FamilyCollapseState`)
+// and the hand-written client mirrors that already read `data` for them. The
+// mirror for this enum is hand-written too, with no generated binding to force
+// agreement, so the representation a reader would assume from its neighbours
+// has to be the representation that is true.
+#[serde(tag = "type", content = "data")]
+pub enum TargetChoiceKind {
+    /// CR 102.1: every offered choice is a player.
+    Players,
+    /// CR 109.1: every offered choice is an object, of `category`.
+    Objects { category: TargetObjectCategory },
+    /// CR 115.1 + CR 115.4: the offer mixes objects of `category` with players
+    /// — the "any target" shape.
+    ObjectsAndPlayers { category: TargetObjectCategory },
+}
+
+/// CR 109.1 + CR 205.2a: the narrowest category of the CR object taxonomy that
+/// is true of EVERY object in one announcement's offered choice set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TargetObjectCategory {
+    /// CR 112.1: a spell — a card on the stack.
+    Spell,
+    /// CR 110.4: creature is one of the six permanent types.
+    Creature,
+    /// CR 110.4: planeswalker is one of the six permanent types.
+    Planeswalker,
+    /// CR 110.4: permanents, none of which is a land.
+    NonlandPermanent,
+    /// CR 110.1: a permanent, with no narrower category true of all of them.
+    Permanent,
+    /// CR 109.1 + CR 115.2: an object with no narrower true category — a card in
+    /// a graveyard/exile/library/hand, an ability on the stack (CR 113.7a), a
+    /// mixed-zone offer, or an object this projection cannot resolve.
+    Object,
+}
+
+/// CR 309.4a-c: Where one player's venture marker currently sits, named.
+///
+/// `state.dungeon_progress` carries only `(DungeonId, room index)`; the room's
+/// printed name (CR 309.4b) and its room ability's printed effect (CR 309.4c)
+/// live in the static dungeon definitions, which the client has no copy of.
+/// Projecting them here is what lets the dungeon HUD badge say which room the
+/// marker is on and what that room did, instead of a bare index.
+///
+/// Built by `dungeon_rooms` from `game::dungeon`, the same authority the
+/// venture prompts and the game log read, so no two surfaces can describe one
+/// room differently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DungeonRoomView {
+    pub dungeon: crate::game::dungeon::DungeonId,
+    pub dungeon_name: String,
+    pub room: crate::game::dungeon::RoomPreview,
+    /// CR 309.4: total rooms on the dungeon card, so the badge can place the
+    /// marker ("room 3 of 7") rather than showing a naked index.
+    pub room_count: u8,
+}
+
 /// Engine-authored projections used by the display layer. Keep this struct
 /// small — every field becomes mandatory payload on every state snapshot
 /// the client receives. Add a new field only when the frontend would
@@ -530,6 +600,11 @@ pub struct DerivedViews {
     /// when there is no actor or multiple distinct authorized submitters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unique_authorized_submitter: Option<PlayerId>,
+    /// Viewer-visible object ids in each player's shared exile pile. This is
+    /// projected after face-down visibility filtering so the client can anchor
+    /// rejection feedback without reimplementing private-information rules.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub visible_exile_object_ids: BTreeMap<PlayerId, Vec<ObjectId>>,
     /// Debug-only identities for the viewing player's own library. The normal
     /// `GameState` projection keeps those objects hidden; this capability is
     /// intentionally narrow so a debug browser can select a card by name.
@@ -540,6 +615,25 @@ pub struct DerivedViews {
     /// can render the compact strip without reinterpreting keyword timing.
     /// Keyed by object ID; absent when a permanent has no display-relevant
     /// keyword.
+    ///
+    /// CR 708.2 + CR 708.2a: face-down permanents are INCLUDED, unlike
+    /// `copied_permanents` below. A face-down permanent has "no characteristics
+    /// other than those listed by the ability or rules that allowed" it to be
+    /// face down, so every keyword it carries is public: the face-down rules'
+    /// own grant (cloak's ward {2}, CR 701.58a; disguise's, CR 702.168a) or an
+    /// external effect. The hidden card's own text is not here — the authority
+    /// for that is `morph::apply_face_down_creature_characteristics`, which
+    /// blanks `keywords`/`base_keywords` to the profile, plus layer 1's reseed
+    /// on every pass (pinned by `morph::tests::manifest_puts_top_card_face_down_as_2_2`).
+    ///
+    /// That invariant is deliberately NOT asserted in this loop: an externally
+    /// granted keyword legitimately lands in `base_keywords` too
+    /// (`PerpetualModification::GrantKeywords` puts it there on purpose so it
+    /// survives the layer reset, CR 613.1), so no local predicate here can tell
+    /// a leaked printed keyword from a granted one. Issue #7822 is what a real
+    /// leak looks like — a manifested planeswalker kept its loyalty and badged
+    /// it — and it was fixed at the stripping authority, which is where the
+    /// next one belongs too.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub battlefield_keyword_badges: HashMap<ObjectId, Vec<Keyword>>,
 
@@ -591,12 +685,41 @@ pub struct DerivedViews {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub legend_candidate_identities: BTreeMap<ObjectId, LegendCandidateIdentity>,
 
+    /// CR 115.1 + CR 601.2c: what the LIVE target announcement is offering the
+    /// announcing player, classified over CR 115.1's object/player axis. Derived
+    /// from `TargetSelectionProgress::current_legal_targets` — deliberately the
+    /// OFFERED set, not the slot's declared `legal_targets` or `TargetFilter`,
+    /// which `legal_targets_for_slot` narrows by cross-slot constraint validation
+    /// (CR 115.3) and completion feasibility; naming that superset would let the
+    /// sentence and the clickable controls describe different populations.
+    ///
+    /// `game::interaction::target_sequence_projection` reads the same array and is
+    /// the long-term home for this; fold it there and delete this field once
+    /// `TargetingOverlay` consumes `viewerInteraction`. Absent unless a
+    /// `TargetSelection` or `TriggerTargetSelection` prompt is live; where a viewer's
+    /// characteristics are redacted (CR 400.2) it degrades to `Object` rather than
+    /// answering confidently from the subset of the offer it can still resolve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_target_kind: Option<TargetChoiceKind>,
+
     /// Commander damage grouped by the attacking commander's current
     /// controller. Each inner entry preserves per-commander identity so
     /// partner commanders under one controller render as separate badges.
     /// Empty in non-Commander formats (see `derive_views` JIT short-circuit).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub commander_damage_by_attacker: BTreeMap<PlayerId, Vec<CommanderDamageView>>,
+
+    /// CR 309.4a-c: the named room each venturing player's marker sits on,
+    /// keyed by that player. Absent for players with no dungeon in the command
+    /// zone, and omitted entirely when nobody is venturing — which is every
+    /// game without a dungeon card in it.
+    ///
+    /// CR 309.2b + CR 400.2 + CR 309.4: the dungeon card sits in the command
+    /// zone, the command zone is a public zone, and the venture marker on it
+    /// shows which room its owner is in. All of that is public, so this
+    /// projection is not viewer-filtered.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dungeon_rooms: BTreeMap<PlayerId, DungeonRoomView>,
 
     /// Engine-authored coalesced view of the stack. Adjacent entries with
     /// the same (source, kind, description, targets) signature collapse
@@ -611,6 +734,12 @@ pub struct DerivedViews {
     /// paid cast facts, and public trigger context. Empty when the stack is empty.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub stack_entry_details: HashMap<ObjectId, StackEntryDisplay>,
+
+    /// CR 702.40a: the public number of copies the current Storm trigger will
+    /// create, or that a newly cast Storm spell would create when no Storm
+    /// trigger is pending. It is table-wide; spell copies never increment it.
+    #[serde(default)]
+    pub storm_count: u32,
 
     /// CR 702.40a: copy counts for Storm spells in the viewing player's hand.
     /// Keyed only by that viewer's hand object ids so hidden opponents' card
@@ -638,6 +767,47 @@ pub struct DerivedViews {
     /// no granting static, or no qualifying card.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub web_slinging_costs: HashMap<ObjectId, ManaCost>,
+
+    /// CR 709.3 + CR 712.11b: for each card the VIEWER may cast whose player
+    /// chooses a spell face at cast time (a split card such as a Room, or a
+    /// spell//spell MDFC), the live cost of the OTHER face — the one the
+    /// single-cost `spell_costs` sweep never reports, because that sweep
+    /// prepares the live face only. Resolved by
+    /// `casting::display_back_face_spell_cost`, so every cost-modifying static
+    /// that shapes the live face's badge shapes this one too. Keyed by ObjectId.
+    /// The cost badge renders both faces from this map; presence here is the
+    /// engine's statement that the card has two payable spell faces, so the
+    /// frontend never inspects layouts to decide.
+    ///
+    /// Viewer-scoped by the cast pipeline itself, the way `spell_costs` is:
+    /// `display_spell_cost`'s eligibility admits another player's card only
+    /// under a permission naming the viewer (CR 109.5), so no owner pre-filter
+    /// sits here — the same warning `spell_costs` carries against one. (On
+    /// the served path the viewer projection has already redacted a hidden
+    /// foreign card's back face, so that permission matters for the public
+    /// zones.) A face-down card is excluded (CR 406.3a: a card exiled face
+    /// down has no characteristics). Computed only while the viewer holds priority, which
+    /// is stricter than `spell_costs`'s binding to the priority holder; the
+    /// frontend pairs a back cost only with a live front. Which zones offer the
+    /// choice is the gate's question, not this map's. Cost: a state clone per
+    /// card that passes the gate, plus the display preparation's own. Empty
+    /// when no viewer or no such card.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub back_face_spell_costs: HashMap<ObjectId, ManaCost>,
+
+    /// CR 709.5b + CR 709.5e + CR 707.2: both halves of each battlefield Room,
+    /// resolved through `room::effective_room_halves` so a permanent that is a
+    /// COPY of a Room reports the halves it COPIED. The unlock special action
+    /// names a half and costs that half's mana cost, and for a copy neither is
+    /// on the recipient's own printed card — its `back_face` is empty and its
+    /// printed name is its own. Deriving printed order is engine work besides
+    /// (`room::live_face_door` reads `modal_back_face`, the CR 709.5d mapping),
+    /// so the frontend is handed the resolved pair and only formats it.
+    ///
+    /// Face-down permanents are excluded: CR 708.2a gives them no name or mana
+    /// cost to publish.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub room_half_identities: HashMap<ObjectId, crate::types::ability::RoomCopiableHalves>,
 
     /// Player-affecting continuous conditions (CR 104.2b / 119.7 / 119.8 /
     /// 118.3 / 101.2 / 702.50b) the HUD renders as status icons. Aggregates
@@ -726,6 +896,13 @@ pub struct DerivedViews {
     /// viewer filtering. Empty (and omitted) when no object-growth loop is active.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unbounded_pile: Vec<ObjectId>,
+
+    /// CR 732.2a: the open loop-shortcut window's own repetition ceiling — the largest number of
+    /// repetitions the proposal may specify. Absent whenever no such window is open, and absent for
+    /// a window whose producer never narrowed the bound. Display surfaces state it; nothing
+    /// re-derives or clamps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounded_loop_max_repetitions: Option<u32>,
 
     /// CR 122.1 + CR 732.2a: the COMPLETE per-object counter-display projection — every counter
     /// row every display surface renders, for EVERY object that has one, in ANY zone. The single
@@ -840,6 +1017,7 @@ fn client_state_wire_value(
     root.remove("stack_trigger_firings");
     root.remove("resolving_trigger_firing");
     root.remove("resolved_rules_journal");
+    root.remove("stack_resolution_session");
     // CR 605.4a + CR 117.3c: Defense in depth for direct `ClientGameStateRef`
     // callers that did not first run `visibility::filter_state_for_viewer`.
     // Both are trusted persistence authorities, never client schema.
@@ -885,16 +1063,22 @@ impl<'a> ClientGameStateRef<'a> {
     /// Viewer-filtered paths must use [`Self::wrap_filtered`] so redaction cannot
     /// erase an authoritative decision projection.
     pub fn wrap(state: &'a GameState, viewer: Option<PlayerId>) -> Self {
-        let display_visible_object_ids = viewer.map(|viewer| {
-            crate::game::visibility::filter_state_for_viewer(state, viewer)
+        let filtered_state =
+            viewer.map(|viewer| crate::game::visibility::filter_state_for_viewer(state, viewer));
+        let display_visible_object_ids = filtered_state.as_ref().map(|filtered| {
+            filtered
                 .objects
                 .iter()
                 .filter_map(|(id, object)| object.display_visible_to_viewer.then_some(*id))
                 .collect()
         });
+        let mut derived = derive_views(state, viewer);
+        if let Some(filtered) = filtered_state.as_ref() {
+            derived.visible_exile_object_ids = visible_exile_object_ids(filtered);
+        }
         Self {
             state,
-            derived: derive_views(state, viewer),
+            derived,
             display_visible_object_ids,
         }
     }
@@ -915,10 +1099,22 @@ impl<'a> ClientGameStateRef<'a> {
     }
 }
 
-/// Owned counterpart for deserialize paths (round-trip tests, any future
-/// state-restore flow that ingests the wire format). The JSON shape matches
+/// Owned counterpart for deserialize paths. The JSON shape matches
 /// `ClientGameStateRef` exactly — fields named identically, no
 /// `#[serde(flatten)]` — so serialize/deserialize round-trip is lossless.
+///
+/// A [`ClientGameStateRef::wrap_filtered`] payload is a VIEWER PROJECTION: its
+/// `state` half carries `viewer_projection: Some(..)`. That decodes fine here —
+/// displaying a projection is exactly what this type is for.
+///
+/// What a projection may NOT do is come back as a saved game. A state-restore
+/// flow must ingest an authoritative snapshot through the
+/// `TrustedGameStateEnvelope` / `PersistedGameState` route, where
+/// `reject_viewer_projection_as_authority` refuses a marked projection. That is
+/// deliberate: a projection has had the RNG seed zeroed, the rules journal
+/// cleared and every private resume cursor blanked while its public
+/// `waiting_for` survives, so installing one leaves a prompt no player can
+/// answer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientGameState {
     pub state: GameState,
@@ -987,6 +1183,180 @@ fn pending_payment_remaining(state: &GameState, viewer: PlayerId) -> Option<Mana
         false,
         None,
     ))
+}
+
+/// CR 309.4a-c: name the room each venturing player's marker currently sits on.
+///
+/// `dungeon_progress` may keep an entry with `current_dungeon: None` after a
+/// dungeon is completed (CR 309.7), so the active dungeon — not the presence of
+/// an entry — is the projection's gate. Empty (and omitted from the wire) in
+/// every game without a dungeon, which is the dominant case.
+fn dungeon_rooms(state: &GameState) -> BTreeMap<PlayerId, DungeonRoomView> {
+    state
+        .dungeon_progress
+        .iter()
+        .filter_map(|(&player, progress)| {
+            let dungeon = progress.current_dungeon?;
+            Some((
+                player,
+                DungeonRoomView {
+                    dungeon,
+                    dungeon_name: crate::game::dungeon::get_definition(dungeon)
+                        .name
+                        .to_string(),
+                    room: crate::game::dungeon::room_preview(dungeon, progress.current_room),
+                    room_count: crate::game::dungeon::room_count(dungeon),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// CR 115.1 + CR 601.2c: classify what the LIVE target announcement is offering
+/// the announcing player, so the client can name the choice instead of
+/// re-deriving it from raw object fields.
+///
+/// `None` whenever no target announcement is live. Both gated variants carry
+/// `selection: TargetSelectionProgress`, so one combined arm covers the whole
+/// class: `TargetSelection` is the `PendingCast`-carrying path (spell casts,
+/// activated abilities, loyalty abilities) and `TriggerTargetSelection` is the
+/// trigger path.
+fn current_target_kind(state: &GameState) -> Option<TargetChoiceKind> {
+    let selection = match &state.waiting_for {
+        WaitingFor::TargetSelection { selection, .. }
+        | WaitingFor::TriggerTargetSelection { selection, .. } => selection,
+        _ => return None,
+    };
+    // The LIVE, NARROWED offer. Not `target_slots[..].legal_targets`:
+    // `legal_targets_for_slot` filters the slot's declared set by cross-slot
+    // constraint validation (CR 115.3) and completion feasibility, and it is
+    // the narrowed array the client turns into clickable controls.
+    target_choice_kind(state, &selection.current_legal_targets)
+}
+
+/// CR 115.1: fold one announcement's offered choice set onto the object/player
+/// axis the rule names.
+///
+/// `TargetRef` has exactly two variants, so the fold is total and the match
+/// over `(no objects, any player)` needs no wildcard arm.
+fn target_choice_kind(state: &GameState, targets: &[TargetRef]) -> Option<TargetChoiceKind> {
+    let mut object_ids: Vec<ObjectId> = Vec::new();
+    let mut has_player = false;
+    for target in targets {
+        match target {
+            TargetRef::Object(object_id) => object_ids.push(*object_id),
+            TargetRef::Player(_) => has_player = true,
+        }
+    }
+
+    match (object_ids.is_empty(), has_player) {
+        (true, true) => Some(TargetChoiceKind::Players),
+        // NO OFFER WAS MADE AT ALL: the announcement is live, but its current
+        // slot offers nothing to choose. This is adjacent to, not identical
+        // with, CR 115.6 ("A spell or ability that requires targets may allow
+        // zero targets to be chosen") — that rule licenses an optional slot
+        // taking no target, whereas here no choice was presented in the first
+        // place. The absence of an offer is not a kind of choice, so the
+        // projection is omitted rather than invented.
+        //
+        // This arm is reached, not merely total: the completion guard that the
+        // incremental `choose_target` path applies has no counterpart on
+        // `begin_target_selection`, so an all-optional announcement that
+        // auto-skips to completion installs a progress whose
+        // `current_legal_targets` is empty.
+        (true, false) => None,
+        (false, false) => Some(TargetChoiceKind::Objects {
+            category: target_object_category(state, &object_ids),
+        }),
+        (false, true) => Some(TargetChoiceKind::ObjectsAndPlayers {
+            category: target_object_category(state, &object_ids),
+        }),
+    }
+}
+
+/// CR 109.1 + CR 205.2a: the narrowest object category true of EVERY offered
+/// object.
+///
+/// Only ever called with a non-empty `ids` — the empty case is the caller's
+/// player-only and no-offer arms — so each `all` below is a real
+/// quantification rather than a vacuous truth.
+fn target_object_category(state: &GameState, ids: &[ObjectId]) -> TargetObjectCategory {
+    // CR 400.2: library and hand are hidden zones, so a viewer-filtered state
+    // can legitimately not contain an offered object. Degrade the whole answer
+    // instead of classifying from the resolvable subset — a partial set could
+    // confidently name a category that is false of the real offer.
+    let Some(objects) = ids
+        .iter()
+        .map(|object_id| state.objects.get(object_id))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return TargetObjectCategory::Object;
+    };
+
+    // CR 112.1: a spell is a card on the stack. CR 113.7a: an activated or
+    // triggered ability exists on the stack independently of its source and is
+    // not a spell, so stack residency alone does not answer this — the stack
+    // entry's own kind does.
+    if objects.iter().all(|object| object.zone == Zone::Stack) {
+        return if objects
+            .iter()
+            .all(|object| stack_entry_is_spell(state, object.id))
+        {
+            TargetObjectCategory::Spell
+        } else {
+            TargetObjectCategory::Object
+        };
+    }
+
+    // CR 110.1 + CR 115.2: only a card or token ON THE BATTLEFIELD is a
+    // permanent, and an object in another zone can still be a legal target.
+    // This zone gate is what keeps a graveyard card from being called one.
+    if objects
+        .iter()
+        .all(|object| object.zone == Zone::Battlefield)
+    {
+        let all_are = |core_type: CoreType| {
+            objects
+                .iter()
+                .all(|object| object.card_types.core_types.contains(&core_type))
+        };
+        // CR 110.4 + CR 205.1b: Creature is tested BEFORE Planeswalker. An
+        // effect can make a permanent a creature while it is "still a
+        // planeswalker", and on such an object both guards hold; creature is
+        // the narrower noun for the player answering the prompt.
+        if all_are(CoreType::Creature) {
+            return TargetObjectCategory::Creature;
+        }
+        if all_are(CoreType::Planeswalker) {
+            return TargetObjectCategory::Planeswalker;
+        }
+        // CR 110.4: land is one of the six permanent types; a land in the
+        // offer widens the answer to the bare permanent category.
+        if objects
+            .iter()
+            .all(|object| !object.card_types.core_types.contains(&CoreType::Land))
+        {
+            return TargetObjectCategory::NonlandPermanent;
+        }
+        return TargetObjectCategory::Permanent;
+    }
+
+    // CR 109.1: an object, with no narrower category true of all of them — a
+    // mixed-zone offer, or an offer wholly inside a zone that has no permanent
+    // or spell category of its own.
+    TargetObjectCategory::Object
+}
+
+/// CR 112.1 vs CR 113.7a: true only when `id` is on the stack AS A SPELL, not
+/// as an activated or triggered ability.
+///
+/// `StackEntry.id` is the `ObjectId` of the stack object itself, which is what
+/// makes comparing it against an offered `TargetRef::Object` sound.
+fn stack_entry_is_spell(state: &GameState, id: ObjectId) -> bool {
+    state
+        .stack
+        .iter()
+        .any(|entry| entry.id == id && matches!(entry.kind, StackEntryKind::Spell { .. }))
 }
 
 /// CR 613.2a + CR 707.2: true when a live copy effect is currently supplying
@@ -1091,6 +1461,9 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
         unique_authorized_submitter: unique_authorized_submitter(state),
         blocker_assignment_pairs: blocker_assignment_pairs(state),
         debug_library_cards: debug_library_cards(state, viewer),
+        current_target_kind: current_target_kind(state),
+        dungeon_rooms: dungeon_rooms(state),
+        storm_count: storm_count(state),
         ..DerivedViews::default()
     };
 
@@ -1128,6 +1501,14 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
         }
         if let Some(source_id) = temporary_cant_be_blocked_source(state, obj_id) {
             views.temporary_cant_be_blocked.insert(obj_id, source_id);
+        }
+        // CR 709.5b + CR 708.2a: publish a Room's two halves for the unlock
+        // offer. Room-ness is this caller's gate — `effective_room_halves` is a
+        // pure projection and does not check it (see its doc).
+        if !obj.face_down && obj.card_types.subtypes.iter().any(|s| s == "Room") {
+            views
+                .room_half_identities
+                .insert(obj_id, crate::game::room::effective_room_halves(obj));
         }
         if obj.card_types.core_types.contains(&CoreType::Creature)
             && crate::game::combat::has_cant_be_blocked_static_from_precomputed(
@@ -1243,13 +1624,8 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
                             .iter()
                             .any(|keyword| matches!(keyword, Keyword::Storm)))
                 {
-                    let copy_count = *copy_count.get_or_insert_with(|| {
-                        state
-                            .spells_cast_this_turn_by_player
-                            .values()
-                            .map(|records| records.len())
-                            .sum::<usize>() as u32
-                    });
+                    let copy_count =
+                        *copy_count.get_or_insert_with(|| spells_cast_this_turn(state));
                     views.prospective_storm_counts.insert(hand_id, copy_count);
                 }
             }
@@ -1273,6 +1649,34 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
                     {
                         views.web_slinging_costs.insert(hand_id, cost);
                     }
+                }
+            }
+        }
+
+        // CR 709.3 + CR 712.11b: second-face costs, only while the viewer
+        // holds priority. No owner or zone filter here: eligibility is the
+        // cast pipeline's (`spell_costs` carries the same warning against an
+        // owner pre-filter — a `CastFromZone`-style grant may admit another
+        // player's card), and which zones offer a cast-time face choice is the
+        // gate's inside `display_back_face_spell_cost`. Only a face-down card
+        // is skipped outright (CR 406.3a).
+        if matches!(state.waiting_for, WaitingFor::Priority { player } if player == viewer) {
+            for obj in state.objects.values() {
+                // Zone pre-filter is performance-only, as in the `spell_costs`
+                // sweep in `ai_support`: a superset of the gate's zones, skipping the
+                // battlefield/stack/library walk that cannot yield a face
+                // choice. Eligibility stays the gate's.
+                if !matches!(
+                    obj.zone,
+                    Zone::Hand | Zone::Command | Zone::Exile | Zone::Graveyard
+                ) || obj.face_down
+                {
+                    continue;
+                }
+                if let Some(cost) =
+                    crate::game::casting::display_back_face_spell_cost(state, viewer, obj.id)
+                {
+                    views.back_face_spell_costs.insert(obj.id, cost);
                 }
             }
         }
@@ -1470,6 +1874,12 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
             // read here, deliberately not the display-filtered one: `object_growth_backing`
             // returns `None` for `Mana(_)` today, so the two happen to agree — an accident
             // between two functions, not an invariant either of them states.
+            //
+            // A mana axis now reaches here with `accepted_axes` HOLDING it, so its row is kept
+            // solely by `object_growth_backing`'s `None` arm. If that arm ever moves, `Mana(_)`
+            // rows start disappearing during the accept→boundary window — decide it there,
+            // deliberately. Pinned by
+            // `combo_infinite_pile::low3_mixed_axis_replay_collapses_only_the_deferred_life_axis`.
             if !accepted_axes.contains_key(&axis)
                 && object_growth_backing(state, controller, axis) == Some(false)
             {
@@ -1527,6 +1937,18 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
     //
     // Unconditional while a collapse is merely scheduled — see the CR 732 timing block above.
     views.counter_display = counter_display_views(state);
+
+    // CR 732.2a: an open shortcut window states the largest number of repetitions its proposal may
+    // specify. Publish that count; nothing downstream may re-derive it. The `is_bounded()` guard is
+    // the single authority for "the producer narrowed the bound"; an unnarrowed offer publishes
+    // nothing. Emitted HERE, above the Commander short-circuit below, for the same reason the
+    // channels above are.
+    views.bounded_loop_max_repetitions = match &state.waiting_for {
+        WaitingFor::LoopShortcut { schema, .. } if schema.is_bounded() => {
+            Some(schema.max_iterations)
+        }
+        _ => None,
+    };
 
     if state.format_config.commander_damage_threshold.is_none() {
         return views;
@@ -1665,11 +2087,68 @@ pub fn derive_filtered_views(
     let mut views = derive_views(filtered_state, viewer);
     views.unique_authorized_submitter = unique_authorized_submitter(authoritative_state);
     views.debug_library_cards = debug_library_cards(authoritative_state, viewer);
+    views.visible_exile_object_ids = visible_exile_object_ids(filtered_state);
     // CR 509.1g: blocking relationships are public information. Preserve this
     // display projection even when a viewer-safe state intentionally omits raw
     // combat records unrelated to rendering.
     views.blocker_assignment_pairs = blocker_assignment_pairs(authoritative_state);
     views
+}
+
+/// CR 702.40a: Storm counts each other spell cast before it this turn. A
+/// pending Storm trigger carries the cast-time snapshot that the production
+/// trigger uses, so it excludes its own spell even though that spell is already
+/// in the cast ledger. With no pending Storm trigger, the ledger total is the
+/// number a newly cast Storm spell would snapshot.
+fn storm_count(state: &GameState) -> u32 {
+    state
+        .stack
+        .iter()
+        .rev()
+        .find_map(|entry| match &entry.kind {
+            StackEntryKind::TriggeredAbility {
+                provenance: Some(SyntheticTriggerProvenance::Storm { copy_count }),
+                ..
+            } => Some(*copy_count),
+            StackEntryKind::Spell { .. }
+            | StackEntryKind::ActivatedAbility { .. }
+            | StackEntryKind::TriggeredAbility { .. }
+            | StackEntryKind::KeywordAction { .. } => None,
+        })
+        .unwrap_or_else(|| spells_cast_this_turn(state))
+}
+
+/// The table-wide count of spells actually cast this turn. This is intentionally
+/// private: public Storm presentation must use [`storm_count`] so an active
+/// Storm trigger uses its cast-time snapshot rather than including itself.
+fn spells_cast_this_turn(state: &GameState) -> u32 {
+    state
+        .spells_cast_this_turn_by_player
+        .values()
+        .fold(0, |count, records| {
+            count.saturating_add(records.len() as u32)
+        })
+}
+
+fn visible_exile_object_ids(state: &GameState) -> BTreeMap<PlayerId, Vec<ObjectId>> {
+    state
+        .players
+        .iter()
+        .filter_map(|player| {
+            let object_ids: Vec<ObjectId> = state
+                .exile
+                .iter()
+                .copied()
+                .filter(|object_id| {
+                    state.objects.get(object_id).is_some_and(|object| {
+                        object.owner == player.id
+                            && (!object.face_down || object.display_visible_to_viewer)
+                    })
+                })
+                .collect();
+            (!object_ids.is_empty()).then_some((player.id, object_ids))
+        })
+        .collect()
 }
 
 fn debug_library_cards(state: &GameState, viewer: Option<PlayerId>) -> Vec<DebugLibraryCardView> {
@@ -1872,13 +2351,17 @@ fn accepted_collapse_axes(
 /// promise is false the moment it is made; this one can only become false later, which is why the
 /// two are handled differently.
 ///
-/// Note this exclusion is also NOT "no materialization touches mana": a `DriveSequence` names the
-/// loop's whole `proposal.unbounded` set, so `clear_collapsed_materializations` really does drop
-/// the `Mana(_)` axis when that collapse applies. (On the production path that drop is usually a
-/// no-op, because `turns::drain_pending_phase_transition_progress` has already removed the mana
-/// axis at CR 500.5 before the prompt that reaches it; it stays live for `debug_infinite_mana`
-/// seats, which that clear excludes.) The badge still must not promise a bound the player's
-/// spendable pool never had.
+/// This exclusion answers a DIFFERENT question from the collapse filter at the registration site:
+/// what the badge may PROMISE during the accept→boundary window, versus which authority ends the
+/// axis. The collapse no longer drops the `Mana(_)` axis at all —
+/// `game::engine::materialize_object_growth_shortcut` stores only `DeferredAccrual` axes in a
+/// `DriveSequence`'s `collapsed_axes` (`analysis::resource::ResourceAxis::unbounded_mark_kind`),
+/// and the batched items never named one — so no `PersistentAxisMaterialization` kind can schedule
+/// a `Mana(_)` axis, and this `retain` is a no-op on every production path today.
+///
+/// It is kept deliberately, as DEFENSE IN DEPTH: a future stash kind that scheduled a mana axis
+/// would otherwise silently start promising a bound on a pool the player is already spending
+/// without bound. The badge must not promise a bound the player's spendable pool never had.
 fn scheduled_display_axes(
     accepted: &BTreeMap<ResourceAxis, CollapseCertainty>,
 ) -> BTreeMap<ResourceAxis, CollapseCertainty> {
@@ -2286,6 +2769,28 @@ fn stack_entry_detail(state: &GameState, entry: &StackEntry) -> StackEntryDispla
             | StackEntryKind::ActivatedAbility { .. }
             | StackEntryKind::KeywordAction { .. } => None,
         },
+        // CR 109.4 + CR 601.2a: the live controller, EXCEPT during the
+        // announcement window. Between `announce_spell_on_stack` and cast
+        // finalization the `StackEntry` is already on the stack while the
+        // object is still in its ORIGIN zone, and an off-stack, off-battlefield
+        // object's `controller` is its OWNER — so for a cast from a zone the
+        // caster does not own (Gonti / Etali / Memory Plunder), reading the
+        // object there renders the row under the opponent's seat and inverts
+        // the You/Opp label for both players until finalization.
+        //
+        // `stack_object_controller`'s own doc records this window but argues it
+        // is unobservable because only the caster holds priority; that argument
+        // covers LEGALITY reads, and this is a display projection, which is
+        // exactly the non-legality observer that does see it. Guarded here
+        // rather than inside the accessor so the legality readers keep the
+        // semantics they were reasoned about with — `derive_views` takes
+        // `&GameState` and structurally cannot flush, so the projection is the
+        // one caller that needs the narrower answer.
+        controller: state
+            .objects
+            .get(&entry.id)
+            .filter(|obj| obj.zone == crate::types::zones::Zone::Stack)
+            .map_or(entry.controller, |obj| obj.controller),
     }
 }
 
@@ -2450,6 +2955,26 @@ fn trigger_event_display(state: &GameState, event: &GameEvent) -> Option<Trigger
             object_id: Some(*object_id),
             player: Some(record.controller),
         }),
+        // CR 701.17a: an action-worded mill trigger's event slot holds only
+        // `Milled`, so this is the arm the stack tooltip reads. `fallback` is
+        // deliberately empty: `visible_zone_change_object_name` returns the live
+        // object's name when present and otherwise "Hidden Card" whenever `from`
+        // or `to` is hidden — and `from` is the library on every `Milled` event
+        // by construction, so the label never degrades to empty.
+        GameEvent::Milled {
+            player_id,
+            object_id,
+            to,
+        } => Some(TriggerContextDisplay {
+            label: format!(
+                "{} milled {} to {}",
+                player_label(state, *player_id),
+                visible_zone_change_object_name(state, *object_id, "", Some(Zone::Library), *to),
+                zone_label(Some(*to))
+            ),
+            object_id: Some(*object_id),
+            player: Some(*player_id),
+        }),
         GameEvent::CardsRevealed {
             player, card_ids, ..
         } => Some(TriggerContextDisplay {
@@ -2561,14 +3086,15 @@ mod tests {
     use crate::game::triggers::{PendingTrigger, PendingTriggerContext};
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        DelayedTriggerCondition, Duration, Effect, ModalChoice, ResolvedAbility, RestrictionExpiry,
-        StaticCondition, TargetFilter, TargetRef,
+        DelayedTriggerCondition, Duration, Effect, EffectKind, ModalChoice, ResolvedAbility,
+        RestrictionExpiry, StaticCondition, TargetFilter, TargetRef,
     };
     use crate::types::card_type::CoreType;
     use crate::types::format::FormatConfig;
     use crate::types::game_state::{
         CommanderDamageEntry, DelayedTrigger, PendingCast, StackEntry, StackEntryKind,
-        StackPaidSnapshot, TriggerOrderGroup, WaitingFor, ZoneChangeRecord,
+        StackPaidSnapshot, TargetEffectDetail, TargetSelectionProgress, TargetSelectionSlot,
+        TriggerOrderGroup, WaitingFor, ZoneChangeRecord,
     };
     use crate::types::identifiers::{
         CardId, DelayedTriggerInstanceId, DelayedTriggerOrigin, DelayedTriggerToken, TriggerFiring,
@@ -2578,6 +3104,62 @@ mod tests {
     use crate::types::statics::ActivationExemption;
     use crate::types::zones::Zone;
     use std::collections::HashMap;
+
+    /// CR 701.17a: after the mill re-key, a `TriggerMode::Milled*` trigger's
+    /// event slot holds only `Milled`, so `trigger_event_display` must answer for
+    /// it or the stack tooltip disappears (`trigger_event_display` ends in
+    /// `_ => None`, which the compiler never asks about).
+    #[test]
+    fn trigger_event_display_labels_a_milled_event() {
+        let mut state = GameState::new_two_player(42);
+        let card = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Milled Card".to_string(),
+            Zone::Graveyard,
+        );
+
+        let display = trigger_event_display(
+            &state,
+            &GameEvent::Milled {
+                player_id: PlayerId(1),
+                object_id: card,
+                to: Zone::Graveyard,
+            },
+        )
+        .expect("a mill trigger's context must render");
+        assert_eq!(display.object_id, Some(card));
+        assert_eq!(display.player, Some(PlayerId(1)));
+        assert!(display.label.contains("Milled Card"));
+
+        // Live control: the zone-change surface this arm inherits from still
+        // renders, and an explicit abstain still abstains — so a blanket `Some`
+        // cannot pass this row.
+        assert!(trigger_event_display(
+            &state,
+            &GameEvent::ZoneChanged {
+                object_id: card,
+                from: Some(Zone::Library),
+                to: Zone::Graveyard,
+                record: Box::new(ZoneChangeRecord::test_minimal(
+                    card,
+                    Some(Zone::Library),
+                    Zone::Graveyard,
+                )),
+            },
+        )
+        .is_some());
+        assert!(trigger_event_display(
+            &state,
+            &GameEvent::HiddenSearchViewed {
+                searcher: PlayerId(1),
+                cards: Vec::new(),
+                audience: Vec::new(),
+            },
+        )
+        .is_none());
+    }
 
     fn setup_commander_game(num_players: u8) -> GameState {
         let mut state = GameState::new(FormatConfig::commander(), num_players, 42);
@@ -2593,6 +3175,53 @@ mod tests {
             }
         }
         state
+    }
+
+    /// CR 309.4b-c: the HUD badge reads the room's name and printed effect off
+    /// this projection, because `dungeon_progress` carries only a room index
+    /// and the client has no copy of the dungeon definitions.
+    #[test]
+    fn dungeon_rooms_names_the_room_the_marker_is_on() {
+        use crate::game::dungeon::{DungeonId, DungeonProgress};
+
+        let mut state = GameState::new_two_player(42);
+        state.dungeon_progress.insert(
+            PlayerId(0),
+            DungeonProgress {
+                current_dungeon: Some(DungeonId::LostMineOfPhandelver),
+                current_room: 2,
+                ..Default::default()
+            },
+        );
+
+        let views = derive_views(&state, None);
+        let room = views
+            .dungeon_rooms
+            .get(&PlayerId(0))
+            .expect("venturing player is projected");
+
+        assert_eq!(room.dungeon, DungeonId::LostMineOfPhandelver);
+        assert_eq!(room.dungeon_name, "Lost Mine of Phandelver");
+        assert_eq!(room.room.index, 2);
+        assert_eq!(room.room.name, "Mine Tunnels");
+        assert_eq!(room.room.text, "Create a Treasure token.");
+        assert_eq!(room.room_count, 7);
+    }
+
+    /// CR 309.7: a completed dungeon leaves a `current_dungeon: None` entry
+    /// behind. The active dungeon — not the presence of the entry — gates the
+    /// projection, so a player who finished a dungeon shows no badge.
+    #[test]
+    fn dungeon_rooms_skips_players_with_no_active_dungeon() {
+        use crate::game::dungeon::{DungeonId, DungeonProgress};
+
+        let mut state = GameState::new_two_player(42);
+        let mut progress = DungeonProgress::default();
+        progress.completed.insert(DungeonId::TombOfAnnihilation);
+        state.dungeon_progress.insert(PlayerId(0), progress);
+
+        let views = derive_views(&state, None);
+        assert!(views.dungeon_rooms.is_empty());
     }
 
     /// JIT short-circuit: non-Commander formats must return an empty view
@@ -2753,7 +3382,12 @@ mod tests {
             if accepted {
                 state.register_pending_materialization(
                     p0,
-                    PersistentAxisMaterialization::Tokens(family_test_token_profile()),
+                    PersistentAxisMaterialization::Tokens(Box::new(
+                        crate::types::game_state::TokenGrowth {
+                            profile: family_test_token_profile(),
+                            per_cycle_delta: 1,
+                        },
+                    )),
                 );
             }
             let mut events: Vec<GameEvent> = Vec::new();
@@ -3063,10 +3697,15 @@ mod tests {
             Some(PlayerId(0)),
         ))
         .expect("serialize filtered client state");
-        let client: ClientGameState =
-            serde_json::from_str(&json).expect("deserialize filtered client state");
+        // A `wrap_filtered` payload is a viewer projection, which
+        // `reject_viewer_projection_as_authority` refuses at decode — so decode the
+        // `derived` half alone, which is what this test asserts on anyway.
+        let wire: serde_json::Value =
+            serde_json::from_str(&json).expect("deserialize filtered client wire");
+        let derived: DerivedViews = serde_json::from_value(wire["derived"].clone())
+            .expect("deserialize filtered derived views");
         assert_eq!(
-            client.derived.blocker_assignment_pairs,
+            derived.blocker_assignment_pairs,
             vec![(blocker, attacker)],
             "the authoritative public blocking pair survives the filtered viewer wire path"
         );
@@ -3134,19 +3773,27 @@ mod tests {
             Some(PlayerId(0)),
         ))
         .expect("serialize filtered debug viewer state");
-        let client: ClientGameState =
-            serde_json::from_str(&wire).expect("deserialize filtered debug viewer state");
+        // A `wrap_filtered` payload is a viewer projection and no longer decodes as a
+        // whole `ClientGameState`. Neither claim below needs a `GameState` to exist: the
+        // redaction claim is about the WIRE, so read it off the wire directly (the idiom
+        // `temporary_cant_be_blocked_view.rs` already uses), and decode only `derived`.
+        let wire: serde_json::Value =
+            serde_json::from_str(&wire).expect("inspect filtered debug viewer wire");
 
         assert_eq!(
-            client.state.objects[&own].name, "Hidden Card",
+            wire["state"]["objects"][own.0.to_string()]["name"],
+            "Hidden Card",
             "normal filtered library objects must remain hidden"
         );
         assert_eq!(
-            client.state.objects[&opponent].name, "Hidden Card",
+            wire["state"]["objects"][opponent.0.to_string()]["name"],
+            "Hidden Card",
             "an opponent's library must remain hidden"
         );
+        let derived: DerivedViews = serde_json::from_value(wire["derived"].clone())
+            .expect("deserialize filtered debug derived views");
         assert_eq!(
-            client.derived.debug_library_cards,
+            derived.debug_library_cards,
             vec![
                 DebugLibraryCardView {
                     object_id: own,
@@ -3167,7 +3814,7 @@ mod tests {
             serde_json::from_str(&local_wire).expect("deserialize local debug viewer state");
         assert_eq!(
             local.derived.debug_library_cards,
-            client.derived.debug_library_cards
+            derived.debug_library_cards
         );
 
         let unauthorized = derive_views(&state, Some(PlayerId(1)));
@@ -3319,7 +3966,7 @@ mod tests {
         let values = crate::game::printed_cards::intrinsic_copiable_values(
             state.objects.get(&target).unwrap(),
         );
-        let tce_id = state.add_transient_continuous_effect(
+        let tce_id = state.add_transient_continuous_effect_with_bindings(
             source,
             PlayerId(0),
             Duration::ForAsLongAs {
@@ -3335,10 +3982,19 @@ mod tests {
                 token_image_ref: None,
             }],
             None,
+            crate::types::game_state::TransientContinuousEffectBindings {
+                affected_recipient: Some(
+                    crate::types::identifiers::ObjectIncarnationRef::from_object(
+                        &state.objects[&source],
+                    ),
+                ),
+                duration_subject: Some(
+                    crate::types::identifiers::ObjectIncarnationRef::from_object(
+                        &state.objects[&target],
+                    ),
+                ),
+            },
         );
-        // CR 611.2b: the duration tracks the copy TARGET's tap state, not the
-        // source's — the same binding the layer engine uses.
-        state.set_transient_duration_subject(tce_id, target);
 
         assert_eq!(
             derive_views(&state, None).copied_permanents,
@@ -3486,6 +4142,120 @@ mod tests {
             Zone::Battlefield,
         );
         assert!(derive_views(&state, None).copied_permanents.is_empty());
+    }
+
+    /// CR 708.2 + CR 708.2a: a face-down permanent has "no characteristics
+    /// other than those listed by the ability or rules that allowed" it to be
+    /// face down, and the plain default carries "no text" — none of the hidden
+    /// card's own
+    /// abilities — `manifest` strips them into `back_face` and layer 1 reseeds
+    /// the face-down profile on every pass. What such a permanent still carries
+    /// is public either way: the face-down rules' OWN grant (cloak enters with ward {2}, CR 701.58a;
+    /// disguise likewise, CR 702.168a — both via
+    /// `apply_face_down_creature_characteristics`)
+    /// or an external effect (an Aura's menace, a lord's flying). Neither is the
+    /// hidden card's text, which is why the badge strip can be rendered.
+    /// `PermanentCard` relies on exactly this contract; pin it here so the
+    /// client never has to re-derive it.
+    ///
+    /// What this test does NOT prove: it stays green with and without the
+    /// client change it backs (the diff touches no engine runtime), and it
+    /// writes the granted keyword straight onto the object instead of resolving
+    /// an Aura — the layer pass that would grant it is not exercised. The
+    /// stripping half is covered by `morph::tests::manifest_puts_top_card_face_down_as_2_2`,
+    /// CR 701.58a (cloak) + CR 702.168a (disguise): the OTHER half of the same
+    /// contract — such a permanent's ward {2} is part of being face down, not
+    /// the hidden card's text, so it belongs on the strip. Measured because the
+    /// sibling test's vanilla manifest profile carries no keyword at all and
+    /// would let a "face-down permanents never badge anything" reading pass.
+    ///
+    /// The profile is built by the authority that writes it
+    /// (`apply_face_down_creature_characteristics` + `FaceDownProfile::cloaked_2_2`)
+    /// and the expectation is read back out of that same profile, so a change
+    /// to the face-down ward moves the test with it instead of silently
+    /// leaving it green.
+    #[test]
+    fn a_face_down_profile_ward_is_badged_like_any_public_keyword() {
+        let mut state = GameState::new(FormatConfig::standard(), 2, 42);
+        let cloaked = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Cloaked Card".into(),
+            Zone::Battlefield,
+        );
+        let profile = crate::types::ability::FaceDownProfile::cloaked_2_2();
+        crate::game::morph::apply_face_down_creature_characteristics(
+            state.objects.get_mut(&cloaked).unwrap(),
+            &profile,
+        );
+
+        let expected = Keyword::Ward(
+            profile
+                .ward
+                .clone()
+                .expect("the cloaked profile is the warded one"),
+        );
+        let views = derive_views(&state, None);
+        assert_eq!(
+            views.battlefield_keyword_badges.get(&cloaked),
+            Some(&vec![expected]),
+            "the face-down profile's own ward is public and belongs on the strip",
+        );
+    }
+
+    /// Like its ward sibling, this test stays green with and without the
+    /// client change it backs — it pins the engine-side contract, not the diff.
+    #[test]
+    fn face_down_keyword_badges_carry_only_granted_keywords() {
+        let mut state = GameState::new(FormatConfig::standard(), 2, 42);
+        let player = PlayerId(0);
+        let hidden = create_object(
+            &mut state,
+            CardId(1),
+            player,
+            "Hidden Flyer".into(),
+            Zone::Library,
+        );
+        {
+            let obj = state.objects.get_mut(&hidden).unwrap();
+            obj.power = Some(3);
+            obj.toughness = Some(3);
+            obj.card_types = crate::types::card_type::CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec![],
+            };
+            obj.keywords = vec![Keyword::Flying];
+            obj.base_keywords = obj.keywords.clone();
+        }
+
+        let mut events = Vec::new();
+        crate::game::morph::manifest(&mut state, player, &mut events)
+            .expect("manifest the top card face down");
+        assert!(
+            state.objects[&hidden].face_down,
+            "the fixture must actually be face down",
+        );
+
+        // What layer 6 writes onto the permanent while an Aura grants menace.
+        state.objects.get_mut(&hidden).unwrap().keywords = vec![Keyword::Menace];
+
+        let views = derive_views(&state, None);
+        assert_eq!(
+            views.battlefield_keyword_badges.get(&hidden),
+            Some(&vec![Keyword::Menace]),
+            "the granted keyword is public and belongs on the strip",
+        );
+        assert_eq!(
+            state.objects[&hidden]
+                .back_face
+                .as_ref()
+                .expect("the hidden card is kept for the turn-up")
+                .keywords,
+            vec![Keyword::Flying],
+            "the hidden card's own keyword still exists — and stayed off the strip",
+        );
     }
 
     #[test]
@@ -3864,6 +4634,104 @@ mod tests {
     }
 
     #[test]
+    fn storm_count_uses_the_current_storm_trigger_snapshot_table_wide() {
+        use crate::game::scenario::{GameScenario, P0, P1};
+
+        let mut scenario = GameScenario::new_n_player(3, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        let p0_prior = scenario
+            .add_spell_to_hand(P0, "P0 prior spell", true)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let p1_prior = scenario
+            .add_spell_to_hand(P1, "P1 prior spell", true)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let storm_spell = scenario
+            .add_spell_to_hand(P0, "Storm spell", true)
+            .with_keyword(Keyword::Storm)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let mut runner = scenario.build();
+
+        runner.cast(p0_prior).resolve();
+        runner.state_mut().priority_player = P1;
+        runner.state_mut().waiting_for = WaitingFor::Priority { player: P1 };
+        runner.cast(p1_prior).resolve();
+        runner.state_mut().priority_player = P0;
+        runner.state_mut().waiting_for = WaitingFor::Priority { player: P0 };
+
+        // This exercises the full cast pipeline: the current Storm spell is
+        // already in the ledger when its production trigger snapshots the two
+        // earlier table-wide casts.
+        let committed = runner.cast(storm_spell).commit();
+        let state = committed.state();
+        assert_eq!(
+            state
+                .spells_cast_this_turn_by_player
+                .get(&P0)
+                .map_or(0, im::Vector::len),
+            2,
+            "the current Storm spell is recorded alongside P0's earlier cast"
+        );
+        assert_eq!(
+            state
+                .spells_cast_this_turn_by_player
+                .get(&P1)
+                .map_or(0, im::Vector::len),
+            1,
+            "an opponent's earlier cast contributes to Storm"
+        );
+        assert!(state.stack.iter().any(|entry| matches!(
+            &entry.kind,
+            StackEntryKind::TriggeredAbility {
+                provenance: Some(SyntheticTriggerProvenance::Storm { copy_count: 2 }),
+                ..
+            }
+        )));
+        for viewer in [P0, P1, PlayerId(2)] {
+            assert_eq!(derive_views(state, Some(viewer)).storm_count, 2);
+        }
+        assert_eq!(
+            serde_json::to_value(derive_views(state, Some(PlayerId(2))))
+                .expect("serialize public storm projection")["storm_count"],
+            2,
+        );
+
+        let outcome = committed.resolve();
+        assert_eq!(
+            outcome
+                .events()
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GameEvent::SpellCopied { original_id, .. } if *original_id == storm_spell
+                ))
+                .count(),
+            2,
+            "the production Storm trigger creates one copy for each prior spell"
+        );
+        assert_eq!(
+            outcome
+                .state()
+                .spells_cast_this_turn_by_player
+                .values()
+                .map(im::Vector::len)
+                .sum::<usize>(),
+            3,
+            "the generated spell copies do not enter the cast ledger"
+        );
+
+        // The turn-transition authority clears the table-wide cast ledger.
+        crate::game::turns::start_next_turn(runner.state_mut(), &mut Vec::new());
+        assert!(runner.state().spells_cast_this_turn_by_player.is_empty());
+        assert_eq!(
+            derive_views(runner.state(), Some(PlayerId(2))).storm_count,
+            0
+        );
+    }
+
+    #[test]
     fn prospective_storm_counts_include_effectively_granted_storm() {
         use crate::types::ability::{ControllerRef, StaticDefinition, TypeFilter, TypedFilter};
 
@@ -4198,9 +5066,13 @@ mod tests {
             Some(PlayerId(1)),
         ))
         .expect("serialize filtered opponent view");
-        let client: ClientGameState = serde_json::from_str(&json).expect("deserialize client view");
-        let details = client
-            .derived
+        // A `wrap_filtered` payload is a viewer projection; decode only the `derived`
+        // half, which is the half this test asserts on.
+        let wire: serde_json::Value =
+            serde_json::from_str(&json).expect("deserialize filtered client wire");
+        let derived: DerivedViews = serde_json::from_value(wire["derived"].clone())
+            .expect("deserialize filtered derived views");
+        let details = derived
             .stack_entry_details
             .get(&spell)
             .expect("public pending spell has stack details");
@@ -4230,6 +5102,7 @@ mod tests {
             paid: Vec::new(),
             trigger_context: Vec::new(),
             provenance: None,
+            controller: PlayerId(0),
         };
         let empty_json = serde_json::to_string(&empty).expect("serialize empty display");
         assert!(
@@ -4505,6 +5378,12 @@ mod tests {
         ))
         .expect("serialize filtered client state");
 
+        // BOTH wires are refused for the SAME reason: client redaction drops
+        // `pending_trigger_firing` while `pending_trigger` stands. The
+        // `viewer_projection` marker rides along on the filtered wire but does NOT
+        // refuse here — this is the transport decode path, which carries projections
+        // on purpose. The marker only refuses on the persistence ingress; see
+        // `tests/integration/viewer_projection_ingest_gate.rs`.
         for client_state in [&client["state"], &filtered_client["state"]] {
             let error = serde_json::from_value::<GameState>(client_state.clone())
                 .expect_err("redacted client state must not restore as trusted authority");
@@ -4512,7 +5391,8 @@ mod tests {
                 error
                     .to_string()
                     .contains("pending trigger has no firing carrier"),
-                "client redaction must fail only because it removes private trigger authority: {error}"
+                "client redaction must fail only because it removes private trigger \
+                 authority: {error}"
             );
             for private_field in [
                 "next_delayed_trigger_token",
@@ -4748,6 +5628,98 @@ mod tests {
         );
     }
 
+    /// CR 709.5b + CR 707.2 + CR 708.2a: the published halves come from the
+    /// EFFECTIVE form. A permanent that copies a Room has no `back_face` of its
+    /// own, so a projection off its printed shape would report a single half
+    /// named after the recipient — the copied pair is the only correct answer.
+    /// A face-down permanent publishes nothing, and a non-Room is absent.
+    ///
+    /// Revert-failing assertions: the copy's two halves (drop
+    /// `effective_room_halves` for `own_room_halves` and both names are wrong)
+    /// and the face-down absence (drop the `face_down` guard and it appears).
+    #[test]
+    fn room_half_identities_report_the_copied_halves_and_skip_face_down() {
+        use crate::types::ability::{RoomCopiableHalves, RoomHalfIdentity};
+        use crate::types::mana::ManaCost;
+
+        let mut state = GameState::new(FormatConfig::standard(), 2, 7);
+
+        let halves = RoomCopiableHalves {
+            left: RoomHalfIdentity {
+                name: "Greenhouse".to_string(),
+                mana_cost: ManaCost::default(),
+            },
+            right: Some(RoomHalfIdentity {
+                name: "Rickety Gazebo".to_string(),
+                mana_cost: ManaCost::default(),
+            }),
+        };
+
+        // A Copy Enchantment that entered as a copy of a two-halved Room: its
+        // OWN printed shape is a single-faced enchantment.
+        let copy = create_object(
+            &mut state,
+            CardId(9100),
+            PlayerId(0),
+            "Copy Enchantment".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&copy).unwrap();
+            obj.card_types.subtypes.push("Room".to_string());
+            obj.back_face = None;
+            obj.copied_room_halves = Some(halves.clone());
+        }
+
+        // Same shape, but face down (CR 708.2a).
+        let hidden = create_object(
+            &mut state,
+            CardId(9101),
+            PlayerId(0),
+            "Copy Enchantment".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&hidden).unwrap();
+            obj.card_types.subtypes.push("Room".to_string());
+            obj.back_face = None;
+            obj.copied_room_halves = Some(halves);
+            obj.face_down = true;
+        }
+
+        // An ordinary permanent that is not a Room at all.
+        let bear = create_object(
+            &mut state,
+            CardId(9102),
+            PlayerId(0),
+            "Grizzly Bears".to_string(),
+            Zone::Battlefield,
+        );
+
+        let views = derive_views(&state, Some(PlayerId(0)));
+
+        let published = views
+            .room_half_identities
+            .get(&copy)
+            .expect("a battlefield Room publishes its halves");
+        assert_eq!(published.left.name, "Greenhouse");
+        assert_eq!(
+            published.right.as_ref().map(|half| half.name.as_str()),
+            Some("Rickety Gazebo"),
+            "the right door exists through the COPIED halves, not through the \
+             recipient's own (absent) back face"
+        );
+
+        assert!(
+            !views.room_half_identities.contains_key(&hidden),
+            "CR 708.2a: a face-down permanent has no name or mana cost to publish"
+        );
+        assert!(
+            !views.room_half_identities.contains_key(&bear),
+            "a non-Room permanent has no halves"
+        );
+    }
+
     /// CR 702.188a + CR 604.1: web-slinging costs are VIEWER-scoped. P0 controls
     /// the grantor; both P0 and P1 hold a qualifying spell. `derive_views` for P0
     /// must surface ONLY P0's card (never P1's, even though the grant is symmetric
@@ -4830,6 +5802,281 @@ mod tests {
         assert!(
             none_views.web_slinging_costs.is_empty(),
             "derive_views(_, None) must not populate web-slinging costs"
+        );
+    }
+
+    /// CR 709.3 + CR 712.11b: a card whose player chooses a spell face at cast
+    /// time has a second payable cost the single-cost sweep never reports.
+    /// `back_face_spell_costs` publishes the OTHER face's live cost for both
+    /// members of the class — a split card (Room) and a spell//spell MDFC —
+    /// VIEWER-scoped by the cast pipeline: P0 sees its own hand, never P1's
+    /// hand or graveyard without a permission naming P0; P0's own face-down
+    /// exiled card is excluded outright (CR 406.3a) even though its impulse
+    /// permission would admit it to the pipeline;
+    /// a single-faced card has no entry; no viewer surfaces nothing.
+    ///
+    /// Revert-failing assertions: the {3}{G} value (drop the back-face
+    /// simulation in `display_back_face_spell_cost` and the live face's {2}{G}
+    /// comes back), the face-down absence
+    /// (drop the `face_down` guard), the bear's absence (drop the face-choice
+    /// gate), and the MDFC entry (narrow the gate to `Split`).
+    #[test]
+    fn back_face_spell_costs_publish_the_other_face_viewer_scoped() {
+        use crate::game::game_object::BackFaceData;
+        use crate::types::ability::{
+            CardPlayMode, CastingPermission, Duration, PlayFromExileProvenance,
+        };
+        use crate::types::card::LayoutKind;
+        use crate::types::card_type::CardType;
+        use crate::types::mana::ManaCostShard;
+        use crate::types::statics::CastFrequency;
+
+        let mut state = GameState::new(FormatConfig::standard(), 2, 7);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        let room_types = || CardType {
+            supertypes: vec![],
+            core_types: vec![CoreType::Enchantment],
+            subtypes: vec!["Room".to_string()],
+        };
+        let green = |generic: u32| ManaCost::Cost {
+            shards: vec![ManaCostShard::Green],
+            generic,
+        };
+
+        // Greenhouse {2}{G} // Rickety Gazebo {3}{G}: the live face is the left
+        // half, the right half sits in the stored slot as a Split face.
+        let add_room = |state: &mut GameState, card: CardId, owner: PlayerId, zone: Zone| {
+            let id = create_object(state, card, owner, "Greenhouse".to_string(), zone);
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types = room_types();
+            obj.base_card_types = room_types();
+            obj.mana_cost = green(2);
+            obj.base_mana_cost = green(2);
+            obj.back_face = Some(BackFaceData {
+                name: "Rickety Gazebo".to_string(),
+                card_types: room_types(),
+                mana_cost: green(3),
+                layout_kind: Some(LayoutKind::Split),
+                ..BackFaceData::default()
+            });
+            id
+        };
+        let p0_room = add_room(&mut state, CardId(9200), PlayerId(0), Zone::Hand);
+        let p1_room = add_room(&mut state, CardId(9201), PlayerId(1), Zone::Hand);
+        let p1_graveyard_room = add_room(&mut state, CardId(9203), PlayerId(1), Zone::Graveyard);
+        // P0's own Room, exiled face down with an impulse-draw permission: the
+        // cast pipeline WOULD admit it, so only the face-down guard keeps it out.
+        let p0_hidden_room = add_room(&mut state, CardId(9204), PlayerId(0), Zone::Exile);
+        {
+            let obj = state.objects.get_mut(&p0_hidden_room).unwrap();
+            obj.face_down = true;
+            obj.casting_permissions
+                .push(CastingPermission::PlayFromExile {
+                    provenance: PlayFromExileProvenance::Impulse,
+                    mode: CardPlayMode::Play,
+                    duration: Duration::Permanent,
+                    granted_to: PlayerId(0),
+                    frequency: CastFrequency::Unlimited,
+                    source_id: None,
+                    invalidation: None,
+                    exiled_by_ability_controller: None,
+                    mana_spend_permission: None,
+                    card_filter: None,
+                    single_use_group: None,
+                    single_use: false,
+                    cast_cost_raise: None,
+                    alt_ability_cost: None,
+                    land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                });
+        }
+
+        // Esika, God of the Tree {1}{G}{G} // The Prismatic Bridge {W}{U}{B}{R}{G}:
+        // the spell//spell MDFC member of the class.
+        let p0_mdfc = create_object(
+            &mut state,
+            CardId(9205),
+            PlayerId(0),
+            "Esika, God of the Tree".to_string(),
+            Zone::Hand,
+        );
+        let bridge_cost = ManaCost::Cost {
+            shards: vec![
+                ManaCostShard::White,
+                ManaCostShard::Blue,
+                ManaCostShard::Black,
+                ManaCostShard::Red,
+                ManaCostShard::Green,
+            ],
+            generic: 0,
+        };
+        {
+            let obj = state.objects.get_mut(&p0_mdfc).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.mana_cost = ManaCost::Cost {
+                shards: vec![ManaCostShard::Green, ManaCostShard::Green],
+                generic: 1,
+            };
+            obj.back_face = Some(BackFaceData {
+                name: "The Prismatic Bridge".to_string(),
+                card_types: CardType {
+                    supertypes: vec![],
+                    core_types: vec![CoreType::Enchantment],
+                    subtypes: vec![],
+                },
+                mana_cost: bridge_cost.clone(),
+                layout_kind: Some(LayoutKind::Modal),
+                ..BackFaceData::default()
+            });
+        }
+        let bear = create_object(
+            &mut state,
+            CardId(9202),
+            PlayerId(0),
+            "Grizzly Bears".to_string(),
+            Zone::Hand,
+        );
+
+        let p0_views = derive_views(&state, Some(PlayerId(0)));
+        assert_eq!(
+            p0_views.back_face_spell_costs.get(&p0_room),
+            Some(&green(3)),
+            "P0's Room publishes its RIGHT half's cost, not the live face's {{2}}{{G}}"
+        );
+        assert_eq!(
+            p0_views.back_face_spell_costs.get(&p0_mdfc),
+            Some(&bridge_cost),
+            "a spell//spell MDFC publishes its back face's cost"
+        );
+        assert!(
+            !p0_views
+                .back_face_spell_costs
+                .contains_key(&p1_graveyard_room),
+            "P1's graveyard is public, but P0 holds no permission to cast from it"
+        );
+        assert!(
+            !p0_views.back_face_spell_costs.contains_key(&p1_room),
+            "P1's hand card must NOT reach P0: the cast pipeline admits another \
+             player's card only under a permission naming P0"
+        );
+        assert!(
+            !p0_views.back_face_spell_costs.contains_key(&p0_hidden_room),
+            "CR 406.3a: a face-down exiled card has no characteristics to publish, \
+             even one the pipeline would admit through its impulse permission"
+        );
+        assert!(
+            !p0_views.back_face_spell_costs.contains_key(&bear),
+            "a single-faced card offers no face choice and has no entry"
+        );
+
+        let none_views = derive_views(&state, None);
+        assert!(
+            none_views.back_face_spell_costs.is_empty(),
+            "derive_views(_, None) must not populate second-face costs"
+        );
+    }
+
+    /// The published cost is the LIVE one: the same statics that shape the
+    /// live face's `spell_costs` entry shape the back face's. Omniscience
+    /// (CR 118.9: cast without paying its mana cost) turns a Room's {3}{G}
+    /// right half into `NoCost`, and the map goes quiet once the viewer no
+    /// longer holds priority — the authority `spell_costs` is reported under.
+    ///
+    /// Revert-failing assertions: `NoCost` (return `back_face.mana_cost`
+    /// verbatim instead of preparing the swapped face and {3}{G} comes back),
+    /// and the off-priority emptiness (drop the `WaitingFor::Priority` guard).
+    #[test]
+    fn back_face_spell_costs_are_live_and_priority_bound() {
+        use crate::game::game_object::BackFaceData;
+        use crate::types::ability::{StaticDefinition, TargetFilter};
+        use crate::types::card::LayoutKind;
+        use crate::types::card_type::CardType;
+        use crate::types::mana::ManaCostShard;
+        use crate::types::statics::{CastFreeOrigin, CastFrequency, StaticMode};
+
+        let mut state = GameState::new(FormatConfig::standard(), 2, 7);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        let room_types = || CardType {
+            supertypes: vec![],
+            core_types: vec![CoreType::Enchantment],
+            subtypes: vec!["Room".to_string()],
+        };
+        let green = |generic: u32| ManaCost::Cost {
+            shards: vec![ManaCostShard::Green],
+            generic,
+        };
+        let room = create_object(
+            &mut state,
+            CardId(9300),
+            PlayerId(0),
+            "Greenhouse".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&room).unwrap();
+            obj.card_types = room_types();
+            obj.base_card_types = room_types();
+            obj.mana_cost = green(2);
+            obj.base_mana_cost = green(2);
+            obj.back_face = Some(BackFaceData {
+                name: "Rickety Gazebo".to_string(),
+                card_types: room_types(),
+                mana_cost: green(3),
+                layout_kind: Some(LayoutKind::Split),
+                ..BackFaceData::default()
+            });
+        }
+        let omniscience = create_object(
+            &mut state,
+            CardId(9301),
+            PlayerId(0),
+            "Omniscience".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&omniscience).unwrap();
+            obj.card_types.core_types.push(CoreType::Enchantment);
+            obj.static_definitions = vec![StaticDefinition {
+                mode: StaticMode::CastFromHandFree {
+                    frequency: CastFrequency::Unlimited,
+                    origin: CastFreeOrigin::Hand,
+                },
+                affected: Some(TargetFilter::Any),
+                modifications: vec![],
+                condition: None,
+                per_player_condition: None,
+                affected_zone: None,
+                effect_zone: None,
+                active_zones: vec![],
+                characteristic_defining: false,
+                description: None,
+                attack_defended: None,
+                source_controller: None,
+                source_object: None,
+                bypass_beneficiary: None,
+                protection_does_not_remove: None,
+                room_door: None,
+            }]
+            .into();
+        }
+
+        let views = derive_views(&state, Some(PlayerId(0)));
+        assert_eq!(
+            views.back_face_spell_costs.get(&room),
+            Some(&ManaCost::NoCost),
+            "Omniscience zeroes the right half too — the published cost is live, not printed"
+        );
+
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(1),
+        };
+        let views = derive_views(&state, Some(PlayerId(0)));
+        assert!(
+            views.back_face_spell_costs.is_empty(),
+            "off priority the map is empty, exactly as spell_costs is"
         );
     }
 
@@ -5237,9 +6484,12 @@ mod tests {
         // `Tokens` is Conditional, because its boundary mint can park on a replacement choice.
         state.register_pending_materialization(
             PlayerId(0),
-            crate::types::game_state::PersistentAxisMaterialization::Tokens(
-                family_test_token_profile(),
-            ),
+            crate::types::game_state::PersistentAxisMaterialization::Tokens(Box::new(
+                crate::types::game_state::TokenGrowth {
+                    profile: family_test_token_profile(),
+                    per_cycle_delta: 1,
+                },
+            )),
         );
         let scheduled_views = derive_views(&state, None);
         assert!(
@@ -5401,8 +6651,12 @@ mod tests {
                 ResourceAxis::Mana(ManaType::White),
             ],
         );
-        // A DriveSequence naming the whole unbounded set — the one stash kind that would schedule
-        // a mana axis if the exclusion were dropped.
+        // A DELIBERATELY HOSTILE graft. Post-`ResourceAxis::unbounded_mark_kind`, production
+        // filters `Mana(_)` out of a `DriveSequence`'s `collapsed_axes`, so NO accept can build
+        // this stash. It is constructed by hand precisely so the `scheduled_display_axes`
+        // exclusion is still exercised: the row asks "if a mana axis DID reach the announcement,
+        // would the badge fold and stay `Unscheduled`?", which is a question about the PROJECTION,
+        // not about the filter. Do not "simplify" it to match production — that vacates the row.
         state.register_pending_materialization(
             p0,
             PersistentAxisMaterialization::DriveSequence {
@@ -6402,6 +7656,837 @@ mod tests {
             state.pending_triggered_mana_resume.is_some()
                 && state.pending_trigger_construction_priority_recipient == Some(PlayerId(1)),
             "projection must not alter the authoritative carriers"
+        );
+    }
+
+    #[test]
+    fn stack_resolution_session_never_reaches_any_client_envelope() {
+        use crate::types::game_state::{
+            StackResolutionAutoPassOverlay, StackResolutionBudget, StackResolutionEntryFence,
+            StackResolutionPolicy, StackResolutionSession,
+        };
+
+        const MARKER: &str = "WIRE-PRIVATE-STACK-SESSION-SENTINEL";
+
+        let mut state = GameState::new(FormatConfig::standard(), 3, 42);
+        let entry = StackEntry {
+            id: ObjectId(70_701),
+            source_id: ObjectId(70_702),
+            controller: PlayerId(0),
+            kind: StackEntryKind::TriggeredAbility {
+                source_id: ObjectId(70_702),
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::NoOp,
+                    Vec::new(),
+                    ObjectId(70_702),
+                    PlayerId(0),
+                )),
+                condition: None,
+                trigger_event: None,
+                description: Some(MARKER.to_string()),
+                source_name: MARKER.to_string(),
+                subject_match_count: None,
+                die_result: None,
+                provenance: None,
+            },
+        };
+        state.stack_resolution_session = Some(StackResolutionSession {
+            entries: vec![StackResolutionEntryFence::capture(&entry)],
+            cursor: 0,
+            representatives: BTreeSet::from([PlayerId(0)]),
+            verified_pass_representatives: BTreeSet::new(),
+            budget: StackResolutionBudget::from_legacy_max_resolutions(3),
+            policy: StackResolutionPolicy::Committed,
+            auto_pass_overlay: StackResolutionAutoPassOverlay {
+                baseline: BTreeMap::new(),
+            },
+        });
+
+        let trusted = serde_json::to_value(&state).expect("serialize trusted state");
+        assert!(
+            trusted
+                .as_object()
+                .expect("trusted state is an object")
+                .contains_key("stack_resolution_session"),
+            "test precondition: trusted persistence retains the exact private key"
+        );
+
+        let owner_view = crate::game::visibility::filter_state_for_viewer(&state, PlayerId(0));
+        let opponent_view = crate::game::visibility::filter_state_for_viewer(&state, PlayerId(1));
+        let projections = [
+            serde_json::to_value(ClientGameStateRef::wrap(&state, Some(PlayerId(0))))
+                .expect("direct owner wrap serializes"),
+            serde_json::to_value(ClientGameStateRef::wrap(&state, Some(PlayerId(1))))
+                .expect("direct opponent wrap serializes"),
+            serde_json::to_value(ClientGameStateRef::wrap_filtered(
+                &state,
+                &owner_view,
+                Some(PlayerId(0)),
+            ))
+            .expect("filtered owner wrap serializes"),
+            serde_json::to_value(ClientGameStateRef::wrap_filtered(
+                &state,
+                &opponent_view,
+                Some(PlayerId(1)),
+            ))
+            .expect("filtered opponent wrap serializes"),
+        ];
+
+        for (index, projection) in projections.iter().enumerate() {
+            assert!(
+                projection["state"]
+                    .get("stack_resolution_session")
+                    .is_none(),
+                "projection {index} leaked the private session key"
+            );
+            assert!(
+                !serde_json::to_string(projection)
+                    .expect("projection serializes")
+                    .contains(MARKER),
+                "projection {index} leaked private session provenance"
+            );
+        }
+
+        assert!(
+            state.stack_resolution_session.is_some(),
+            "projection must not mutate the authoritative session"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // `current_target_kind` — the engine-classified target announcement.
+    //
+    // Every test below asserts through `derive_views` / `derive_filtered_views`,
+    // never through the private classifier, so each one also covers the
+    // projection wiring: no test here can pass while the field is left
+    // unpopulated.
+    // ---------------------------------------------------------------------
+
+    fn two_player_state() -> GameState {
+        GameState::new(FormatConfig::standard(), 2, 42)
+    }
+
+    /// An object in `zone` whose post-layer type line is exactly `core_types`.
+    fn offered_object(
+        state: &mut GameState,
+        name: &str,
+        zone: Zone,
+        core_types: Vec<CoreType>,
+    ) -> ObjectId {
+        let card_id = CardId(state.next_object_id);
+        let id = create_object(state, card_id, PlayerId(0), name.to_string(), zone);
+        state
+            .objects
+            .get_mut(&id)
+            .expect("the object was just created")
+            .card_types
+            .core_types = core_types;
+        id
+    }
+
+    /// `TargetSelectionSlot` has no `Default`, so every field is spelled out.
+    /// The classifier reads neither `effect_kind` nor `effect_detail`, so both
+    /// carry the same inert filler in every fixture and a reader should not
+    /// look for meaning in them.
+    fn target_slot(legal_targets: Vec<TargetRef>) -> TargetSelectionSlot {
+        TargetSelectionSlot {
+            legal_targets,
+            optional: false,
+            chooser: None,
+            effect_kind: EffectKind::DealDamage,
+            effect_detail: TargetEffectDetail::None,
+        }
+    }
+
+    /// A live `TriggerTargetSelection`. All ten fields are written out because
+    /// this is a struct literal, not a deserialization — the variant's
+    /// `serde(default)` attributes do not apply here.
+    fn trigger_prompt(
+        target_slots: Vec<TargetSelectionSlot>,
+        selection: TargetSelectionProgress,
+    ) -> WaitingFor {
+        WaitingFor::TriggerTargetSelection {
+            player: PlayerId(0),
+            trigger_controller: None,
+            trigger_event: None,
+            trigger_events: Vec::new(),
+            target_slots,
+            mode_labels: Vec::new(),
+            target_constraints: Vec::new(),
+            selection,
+            source_id: None,
+            description: None,
+        }
+    }
+
+    /// The common fixture: a live trigger announcement whose current slot
+    /// offers `offer`.
+    fn offering(offer: Vec<TargetRef>) -> WaitingFor {
+        trigger_prompt(
+            Vec::new(),
+            TargetSelectionProgress {
+                current_legal_targets: offer,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn kind_of(state: &GameState) -> Option<TargetChoiceKind> {
+        derive_views(state, Some(PlayerId(0))).current_target_kind
+    }
+
+    /// CR 115.1's targets are "object(s)
+    /// and/or player(s)"; an offer holding both must name both halves rather
+    /// than collapsing to whichever half the client happens to inspect.
+    #[test]
+    fn a_mixed_offer_names_both_objects_and_players() {
+        let mut state = two_player_state();
+        let bear = offered_object(
+            &mut state,
+            "Bear",
+            Zone::Battlefield,
+            vec![CoreType::Creature],
+        );
+        state.waiting_for = offering(vec![
+            TargetRef::Object(bear),
+            TargetRef::Player(PlayerId(1)),
+        ]);
+
+        let views = derive_views(&state, Some(PlayerId(0)));
+        assert_eq!(
+            views.current_target_kind,
+            Some(TargetChoiceKind::ObjectsAndPlayers {
+                category: TargetObjectCategory::Creature
+            }),
+            "a mixed offer must name BOTH halves; naming only the object half is #7692 itself"
+        );
+
+        // THE WIRE CONTRACT for a payload-carrying variant. Unlike the
+        // payload-free pin on the player-only offer, this one IS sensitive to
+        // the tagging mode: dropping
+        // `content = "data"` flattens the category alongside the tag and reds
+        // here. The client mirror is hand-written with no generated binding to
+        // force agreement, so this assertion is the only thing holding the two
+        // hand-written sides of the contract together.
+        assert_eq!(
+            serde_json::to_value(&views).expect("the derived views serialize")
+                ["current_target_kind"],
+            serde_json::json!({
+                "type": "ObjectsAndPlayers",
+                "data": { "category": "Creature" }
+            }),
+            "the mixed variant's wire shape is what phase 2 renders the noun from"
+        );
+    }
+
+    /// The mixed arm must not swallow the pure-player case.
+    #[test]
+    fn an_all_player_offer_names_players() {
+        let mut state = two_player_state();
+        state.waiting_for = offering(vec![
+            TargetRef::Player(PlayerId(0)),
+            TargetRef::Player(PlayerId(1)),
+        ]);
+
+        let views = derive_views(&state, Some(PlayerId(0)));
+        assert_eq!(
+            views.current_target_kind,
+            Some(TargetChoiceKind::Players),
+            "an offer of players only is `Players`, not the mixed kind"
+        );
+
+        // The WIRE form of the payload-free variant — a different claim from
+        // the classification above: that one pins the classifier, this one pins
+        // what a player-only offer actually reaches the client as.
+        //
+        // WHAT THIS DOES NOT PIN, stated so nobody reads a guarantee into it:
+        // `Players` carries no payload, so `content = "data"` has nothing to
+        // wrap and its encoding is IDENTICAL under adjacent and internal
+        // tagging. This assertion therefore cannot detect a change of tagging
+        // mode. The variants that can are the payload-carrying ones, pinned by
+        // `a_mixed_offer_names_both_objects_and_players` and
+        // `a_creature_offer_is_narrowed_past_nonland_permanent`.
+        assert_eq!(
+            serde_json::to_value(&views).expect("the derived views serialize")
+                ["current_target_kind"],
+            serde_json::json!({ "type": "Players" }),
+            "a payload-free variant reaches the wire as a bare tagged object, with no content key"
+        );
+    }
+
+    /// CR 109.1 + CR 110.4: the narrowest true category wins, so a
+    /// creature-only offer is a creature and not merely a nonland permanent.
+    #[test]
+    fn a_creature_offer_is_narrowed_past_nonland_permanent() {
+        let mut state = two_player_state();
+        let bear = offered_object(
+            &mut state,
+            "Bear",
+            Zone::Battlefield,
+            vec![CoreType::Creature],
+        );
+        let elf = offered_object(
+            &mut state,
+            "Elf",
+            Zone::Battlefield,
+            vec![CoreType::Creature],
+        );
+        state.waiting_for = offering(vec![TargetRef::Object(bear), TargetRef::Object(elf)]);
+
+        let views = derive_views(&state, Some(PlayerId(0)));
+        assert_eq!(
+            views.current_target_kind,
+            Some(TargetChoiceKind::Objects {
+                category: TargetObjectCategory::Creature
+            }),
+            "an all-creature offer narrows to Creature; stopping at NonlandPermanent means the \
+             land test ran before the creature test"
+        );
+
+        // The SECOND tagging-sensitive encoding, pinned so neither payload-
+        // carrying variant can move unobserved. Placed after the narrowing
+        // claim above deliberately: a serialization failure must not fire first
+        // and leave the row's primary claim unprobed.
+        assert_eq!(
+            serde_json::to_value(&views).expect("the derived views serialize")
+                ["current_target_kind"],
+            serde_json::json!({
+                "type": "Objects",
+                "data": { "category": "Creature" }
+            }),
+            "the object-only variant's wire shape"
+        );
+    }
+
+    /// The same narrowing for CR 110.4's planeswalker permanent type.
+    #[test]
+    fn a_planeswalker_offer_is_narrowed_past_nonland_permanent() {
+        let mut state = two_player_state();
+        let jace = offered_object(
+            &mut state,
+            "Jace",
+            Zone::Battlefield,
+            vec![CoreType::Planeswalker],
+        );
+        state.waiting_for = offering(vec![TargetRef::Object(jace)]);
+
+        assert_eq!(
+            kind_of(&state),
+            Some(TargetChoiceKind::Objects {
+                category: TargetObjectCategory::Planeswalker
+            }),
+            "an all-planeswalker offer narrows to Planeswalker"
+        );
+    }
+
+    /// Narrowing did not eat the NonlandPermanent arm: a permanent
+    /// that is neither creature nor planeswalker still reaches it.
+    #[test]
+    fn a_nonland_noncreature_permanent_offer_stays_nonland_permanent() {
+        let mut state = two_player_state();
+        let signet = offered_object(
+            &mut state,
+            "Signet",
+            Zone::Battlefield,
+            vec![CoreType::Artifact],
+        );
+        state.waiting_for = offering(vec![TargetRef::Object(signet)]);
+
+        assert_eq!(
+            kind_of(&state),
+            Some(TargetChoiceKind::Objects {
+                category: TargetObjectCategory::NonlandPermanent
+            }),
+            "a lone battlefield artifact is a nonland permanent — deleting that arm reds here"
+        );
+    }
+
+    /// CR 110.4: a land in the offer widens the answer to the bare
+    /// permanent category, because "nonland permanent" is then false of it.
+    #[test]
+    fn a_land_and_creature_offer_widens_to_permanent() {
+        let mut state = two_player_state();
+        let forest = offered_object(
+            &mut state,
+            "Forest",
+            Zone::Battlefield,
+            vec![CoreType::Land],
+        );
+        let bear = offered_object(
+            &mut state,
+            "Bear",
+            Zone::Battlefield,
+            vec![CoreType::Creature],
+        );
+        state.waiting_for = offering(vec![TargetRef::Object(forest), TargetRef::Object(bear)]);
+
+        assert_eq!(
+            kind_of(&state),
+            Some(TargetChoiceKind::Objects {
+                category: TargetObjectCategory::Permanent
+            }),
+            "a Land beside a Creature widens to Permanent; dropping the land test would call this \
+             offer a nonland permanent, which is false of the Forest"
+        );
+    }
+
+    /// The hostile fixture: a Land Planeswalker (the Wrenn
+    /// and One shape, `core_types = [Land, Planeswalker]`) beside an ordinary
+    /// creature must widen to Permanent rather than break the lattice.
+    #[test]
+    fn a_land_planeswalker_beside_a_creature_widens_to_permanent() {
+        let mut state = two_player_state();
+        let wrenn = offered_object(
+            &mut state,
+            "Wrenn and One",
+            Zone::Battlefield,
+            vec![CoreType::Land, CoreType::Planeswalker],
+        );
+        let bear = offered_object(
+            &mut state,
+            "Bear",
+            Zone::Battlefield,
+            vec![CoreType::Creature],
+        );
+        state.waiting_for = offering(vec![TargetRef::Object(wrenn), TargetRef::Object(bear)]);
+
+        assert_eq!(
+            kind_of(&state),
+            Some(TargetChoiceKind::Objects {
+                category: TargetObjectCategory::Permanent
+            }),
+            "a Land Planeswalker beside a Creature is neither all-creature nor all-planeswalker \
+             nor land-free, so the honest answer is the bare permanent category"
+        );
+    }
+
+    /// The same card offered ALONE narrows back to Planeswalker. Paired with
+    /// `a_land_planeswalker_beside_a_creature_widens_to_permanent`: together they
+    /// prove the lattice moves in both directions rather than defaulting one way.
+    #[test]
+    fn a_land_planeswalker_alone_is_named_a_planeswalker() {
+        let mut state = two_player_state();
+        let wrenn = offered_object(
+            &mut state,
+            "Wrenn and One",
+            Zone::Battlefield,
+            vec![CoreType::Land, CoreType::Planeswalker],
+        );
+        state.waiting_for = offering(vec![TargetRef::Object(wrenn)]);
+
+        assert_eq!(
+            kind_of(&state),
+            Some(TargetChoiceKind::Objects {
+                category: TargetObjectCategory::Planeswalker
+            }),
+            "offered alone it IS all-planeswalker; moving the land guard above the planeswalker \
+             guard would answer Permanent here"
+        );
+    }
+
+    /// CR 110.1 + CR 115.2: a permanent is a card on the battlefield,
+    /// and an off-battlefield object can still be a legal target. A creature
+    /// card in a graveyard must not be called a permanent.
+    #[test]
+    fn a_graveyard_card_offer_is_not_called_a_permanent() {
+        let mut state = two_player_state();
+        let corpse = offered_object(
+            &mut state,
+            "Dead Bear",
+            Zone::Graveyard,
+            vec![CoreType::Creature],
+        );
+        state.waiting_for = offering(vec![TargetRef::Object(corpse)]);
+
+        assert_eq!(
+            kind_of(&state),
+            Some(TargetChoiceKind::Objects {
+                category: TargetObjectCategory::Object
+            }),
+            "a creature CARD in a graveyard is an object, not a permanent — dropping the zone \
+             gate would call it a creature permanent"
+        );
+    }
+
+    /// CR 112.1: a spell is a card on the stack. The paired positive for
+    /// `an_ability_on_the_stack_is_not_called_a_spell`, so that row's negative
+    /// cannot pass on a dead predicate.
+    #[test]
+    fn a_spell_offer_names_a_spell() {
+        let mut state = two_player_state();
+        let bolt = offered_object(
+            &mut state,
+            "Lightning Bolt",
+            Zone::Stack,
+            vec![CoreType::Instant],
+        );
+        state.stack.push_back(StackEntry {
+            id: bolt,
+            source_id: bolt,
+            controller: PlayerId(0),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(1),
+                ability: None,
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 1,
+            },
+        });
+        state.waiting_for = offering(vec![TargetRef::Object(bolt)]);
+
+        assert_eq!(
+            kind_of(&state),
+            Some(TargetChoiceKind::Objects {
+                category: TargetObjectCategory::Spell
+            }),
+            "a stack object whose stack entry is a Spell is a spell"
+        );
+    }
+
+    /// CR 113.7a: an activated ability exists on the stack
+    /// independently of its source and is NOT a spell (CR 112.1). Stack
+    /// residency alone must not answer this.
+    #[test]
+    fn an_ability_on_the_stack_is_not_called_a_spell() {
+        let mut state = two_player_state();
+        let source = offered_object(
+            &mut state,
+            "Prodigal Sorcerer",
+            Zone::Battlefield,
+            vec![CoreType::Creature],
+        );
+        let ability_object = offered_object(&mut state, "Pinger Ability", Zone::Stack, vec![]);
+        let ability = ResolvedAbility::new(
+            Effect::unimplemented("ping", "inert fixture effect"),
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        state.stack.push_back(StackEntry {
+            id: ability_object,
+            source_id: source,
+            controller: PlayerId(0),
+            kind: StackEntryKind::ActivatedAbility {
+                source_id: source,
+                ability: Box::new(ability),
+            },
+        });
+        state.waiting_for = offering(vec![TargetRef::Object(ability_object)]);
+
+        assert_eq!(
+            kind_of(&state),
+            Some(TargetChoiceKind::Objects {
+                category: TargetObjectCategory::Object
+            }),
+            "an ability on the stack is an object but not a spell; answering Spell for any \
+             Zone::Stack object reds here while row 10 still passes"
+        );
+    }
+
+    /// CR 400.2: an offered object the projection cannot resolve
+    /// degrades the WHOLE answer, rather than being dropped so the remainder
+    /// can be classified confidently. The fixture deliberately mixes a
+    /// resolvable creature with an unresolvable id: a `filter_map` drop would
+    /// answer Creature here, which is false of the real offer.
+    #[test]
+    fn an_unresolvable_offered_object_degrades_to_object() {
+        let mut state = two_player_state();
+        let bear = offered_object(
+            &mut state,
+            "Bear",
+            Zone::Battlefield,
+            vec![CoreType::Creature],
+        );
+        let missing = ObjectId(9_999);
+        assert!(
+            !state.objects.contains_key(&missing),
+            "reach-guard: the fixture id must really be absent from `state.objects`, or this test \
+             is measuring an ordinary two-creature offer"
+        );
+        state.waiting_for = offering(vec![TargetRef::Object(bear), TargetRef::Object(missing)]);
+
+        assert_eq!(
+            kind_of(&state),
+            Some(TargetChoiceKind::Objects {
+                category: TargetObjectCategory::Object
+            }),
+            "one unresolvable member degrades the whole classification; swapping the \
+             all-or-nothing collect for a filter-map drop answers Creature and reds here"
+        );
+    }
+
+    /// An empty offer on a LIVE prompt yields no kind. The absence of
+    /// an offer is not a kind of choice. This state is reached, not merely
+    /// total: an all-optional announcement can auto-skip to completion and
+    /// install a progress whose `current_legal_targets` is empty.
+    #[test]
+    fn an_empty_offer_on_a_live_prompt_emits_no_kind() {
+        let mut state = two_player_state();
+        let bear = offered_object(
+            &mut state,
+            "Bear",
+            Zone::Battlefield,
+            vec![CoreType::Creature],
+        );
+
+        state.waiting_for = offering(vec![]);
+        assert!(
+            matches!(state.waiting_for, WaitingFor::TriggerTargetSelection { .. }),
+            "reach-guard: the prompt must be LIVE, or this test merely repeats the no-prompt case"
+        );
+        assert_eq!(
+            kind_of(&state),
+            None,
+            "an empty offer on a live prompt publishes no kind"
+        );
+
+        // PAIRED POSITIVE, same prompt shape: proves the `None` above is caused
+        // by the empty offer and not by a fixture that failed to install a
+        // classifiable prompt at all.
+        state.waiting_for = offering(vec![TargetRef::Object(bear)]);
+        assert_eq!(
+            kind_of(&state),
+            Some(TargetChoiceKind::Objects {
+                category: TargetObjectCategory::Creature
+            }),
+            "the identical prompt shape with a non-empty offer DOES classify"
+        );
+    }
+
+    /// No prompt means no wire key, AND the key is genuinely present when a
+    /// prompt is live. Both halves live in one test on purpose: without the
+    /// positive half, the negative passes even if the field is never populated
+    /// at all. It is also the negative for the whole gate — every `WaitingFor`
+    /// variant outside the two gated ones reaches the same arm.
+    #[test]
+    fn no_targeting_prompt_emits_no_kind() {
+        let mut state = two_player_state();
+        let bear = offered_object(
+            &mut state,
+            "Bear",
+            Zone::Battlefield,
+            vec![CoreType::Creature],
+        );
+
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        let views = derive_views(&state, Some(PlayerId(0)));
+        assert_eq!(
+            views.current_target_kind, None,
+            "a non-targeting prompt publishes no kind"
+        );
+        let wire = serde_json::to_value(&views).expect("the derived views serialize");
+        assert!(
+            wire.get("current_target_kind").is_none(),
+            "the key must be absent from the wire at Priority, got {wire}"
+        );
+
+        state.waiting_for = offering(vec![TargetRef::Object(bear)]);
+        let views = derive_views(&state, Some(PlayerId(0)));
+        assert_eq!(
+            views.current_target_kind,
+            Some(TargetChoiceKind::Objects {
+                category: TargetObjectCategory::Creature
+            }),
+            "the paired positive: a live prompt DOES populate the field"
+        );
+        let wire = serde_json::to_value(&views).expect("the derived views serialize");
+        assert!(
+            wire.get("current_target_kind").is_some(),
+            "the key must reach the wire under a live prompt, got {wire}"
+        );
+    }
+
+    /// The filtered projection agrees on a public offer. It must do so
+    /// by delegating to `derive_views(filtered_state, ..)`, not by re-sourcing
+    /// from authoritative state: re-sourcing would characterize an object the
+    /// viewer is not entitled to characterize (CR 400.2).
+    #[test]
+    fn the_filtered_projection_agrees_on_a_public_offer() {
+        let mut state = two_player_state();
+        let bear = offered_object(
+            &mut state,
+            "Bear",
+            Zone::Battlefield,
+            vec![CoreType::Creature],
+        );
+        state.waiting_for = offering(vec![
+            TargetRef::Object(bear),
+            TargetRef::Player(PlayerId(0)),
+        ]);
+
+        let viewer = PlayerId(1);
+        let filtered = crate::game::visibility::filter_state_for_viewer(&state, viewer);
+        assert!(
+            matches!(
+                filtered.waiting_for,
+                WaitingFor::TriggerTargetSelection { .. }
+            ),
+            "reach-guard: filtering must retain the public prompt, or the assertion below is \
+             about a state with nothing to classify"
+        );
+
+        assert_eq!(
+            derive_filtered_views(&state, &filtered, Some(viewer)).current_target_kind,
+            Some(TargetChoiceKind::ObjectsAndPlayers {
+                category: TargetObjectCategory::Creature
+            }),
+            "a public battlefield offer classifies identically through the filtered path"
+        );
+    }
+
+    /// Provenance axis 1: the kind binds to the LIVE slot, not slot 0.
+    /// The two slots classify differently on purpose, so reading
+    /// `target_slots[0]` answers Permanent and reds.
+    #[test]
+    fn the_kind_binds_to_the_live_slot_not_the_first_slot() {
+        let mut state = two_player_state();
+        let forest = offered_object(
+            &mut state,
+            "Forest",
+            Zone::Battlefield,
+            vec![CoreType::Land],
+        );
+        let bear = offered_object(
+            &mut state,
+            "Bear",
+            Zone::Battlefield,
+            vec![CoreType::Creature],
+        );
+
+        state.waiting_for = trigger_prompt(
+            vec![
+                target_slot(vec![TargetRef::Object(forest)]),
+                target_slot(vec![TargetRef::Object(bear)]),
+            ],
+            TargetSelectionProgress {
+                current_slot: 1,
+                selected_slots: vec![Some(TargetRef::Object(forest))],
+                current_legal_targets: vec![TargetRef::Object(bear)],
+            },
+        );
+
+        assert_eq!(
+            kind_of(&state),
+            Some(TargetChoiceKind::Objects {
+                category: TargetObjectCategory::Creature
+            }),
+            "slot 1 is live and offers a creature; reading slot 0's Land answers Permanent"
+        );
+    }
+
+    /// BOTH gated variants are classified. Every other unit test here
+    /// drives `TriggerTargetSelection`; dropping `TargetSelection` from the
+    /// combined arm would leave every ordinary spell cast, activated ability
+    /// and loyalty activation publishing nothing, with all of them still green.
+    #[test]
+    fn a_pending_cast_target_selection_is_classified_too() {
+        let mut state = two_player_state();
+        let spell = offered_object(&mut state, "Shock", Zone::Stack, vec![CoreType::Instant]);
+        let bear = offered_object(
+            &mut state,
+            "Bear",
+            Zone::Battlefield,
+            vec![CoreType::Creature],
+        );
+        let ability = ResolvedAbility::new(
+            Effect::unimplemented("damage", "inert fixture effect"),
+            vec![],
+            spell,
+            PlayerId(0),
+        );
+
+        state.waiting_for = WaitingFor::TargetSelection {
+            player: PlayerId(0),
+            pending_cast: Box::new(PendingCast::new(
+                spell,
+                CardId(1),
+                ability,
+                ManaCost::NoCost,
+            )),
+            target_slots: vec![target_slot(vec![TargetRef::Object(bear)])],
+            mode_labels: Vec::new(),
+            selection: TargetSelectionProgress {
+                current_legal_targets: vec![TargetRef::Object(bear)],
+                ..Default::default()
+            },
+        };
+
+        assert_eq!(
+            kind_of(&state),
+            Some(TargetChoiceKind::Objects {
+                category: TargetObjectCategory::Creature
+            }),
+            "the PendingCast-carrying variant is classified by the same combined arm"
+        );
+    }
+
+    /// CR 205.1b: an effect can make a permanent a creature while it
+    /// is "still a planeswalker", so both guards are true of this object. It is
+    /// the ONLY input on which the guard ORDER is observable, and therefore the
+    /// only fixture here that reds a swapped Creature/Planeswalker order — the
+    /// Land Planeswalker fixtures never make both guards true.
+    #[test]
+    fn an_animated_planeswalker_is_named_a_creature_not_a_planeswalker() {
+        let mut state = two_player_state();
+        let gideon = offered_object(
+            &mut state,
+            "Gideon Blackblade",
+            Zone::Battlefield,
+            vec![CoreType::Planeswalker, CoreType::Creature],
+        );
+        state.waiting_for = offering(vec![TargetRef::Object(gideon)]);
+
+        assert_eq!(
+            kind_of(&state),
+            Some(TargetChoiceKind::Objects {
+                category: TargetObjectCategory::Creature
+            }),
+            "both guards hold on an animated planeswalker; Creature is tested first, so swapping \
+             the two guards answers Planeswalker and reds exactly here"
+        );
+    }
+
+    /// Provenance axis 2: the kind reads the NARROWED offer, not the slot's
+    /// declared set. Only one slot exists, so `current_slot` is 0 and
+    /// `the_kind_binds_to_the_live_slot_not_the_first_slot` cannot catch this
+    /// revert; reading
+    /// `target_slots[current_slot].legal_targets` answers Permanent.
+    #[test]
+    fn the_kind_reads_the_narrowed_offer_not_the_slots_declared_set() {
+        let mut state = two_player_state();
+        let forest = offered_object(
+            &mut state,
+            "Forest",
+            Zone::Battlefield,
+            vec![CoreType::Land],
+        );
+        let bear = offered_object(
+            &mut state,
+            "Bear",
+            Zone::Battlefield,
+            vec![CoreType::Creature],
+        );
+
+        state.waiting_for = trigger_prompt(
+            vec![target_slot(vec![
+                TargetRef::Object(forest),
+                TargetRef::Object(bear),
+            ])],
+            TargetSelectionProgress {
+                current_slot: 0,
+                selected_slots: Vec::new(),
+                current_legal_targets: vec![TargetRef::Object(bear)],
+            },
+        );
+
+        assert_eq!(
+            kind_of(&state),
+            Some(TargetChoiceKind::Objects {
+                category: TargetObjectCategory::Creature
+            }),
+            "the declared set holds a Land and would classify Permanent; the narrowed offer the \
+             client actually renders holds only the creature"
         );
     }
 }

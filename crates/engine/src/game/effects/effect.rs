@@ -70,7 +70,7 @@ pub fn resolve(
         // Contracts; Llanowar Greenwidow; Realmbreaker; Spirit-Sister's Call)
         // must last as long as the affected object exists, so promote that def to
         // Duration::Permanent. It then survives its granting source leaving
-        // (`prune_host_left_effects` only prunes UntilHostLeavesPlay) and is
+        // (`prune_host_left_effects` prunes all three host-lifetime readings) and is
         // cleaned up when the reanimated object itself leaves
         // (`prune_affected_object_left_effects`). A STATED duration arrives on the
         // wrapper (Elemental Expressionist's "Until end of turn" lives on the
@@ -398,8 +398,18 @@ fn register_transient_effect(
     // Short-circuit BEFORE the chosen-targets branch so chained Effect
     // sub-abilities with `target: SelfRef` don't inherit the parent's targets
     // via chain propagation in `effects::mod.rs::resolve_ability_chain`.
+    //
+    // Classify through `generic_effect_application_filter`, the single authority
+    // that gives an inherited-reference `affected` precedence over the outer
+    // targeting descriptor (`generic_effect_affected_uses_inherited_targets`:
+    // `TriggeringSource`, `ParentTarget`, `CostPaidObject`, `AmassedArmy`).
+    // Enumerating a subset here would pin those to `ability.source_id` and skip
+    // their resolution-local binding arms in the `match application_filter`
+    // below, and would let this install path drift from the prune path in
+    // `effects::mod.rs::generic_effect_depends_on_missing_forward_result`, which
+    // already classifies with the same helper.
     if matches!(
-        target_filter.or(static_def.affected.as_ref()),
+        generic_effect_application_filter(target_filter, static_def.affected.as_ref()),
         Some(TargetFilter::SelfRef)
     ) {
         install_transient(
@@ -442,7 +452,7 @@ fn register_transient_effect(
     // TriggeringSource` (the GenericEffect `target` parameter); a SequentialSibling
     // continuous grant on a non-targeted trigger ("put a +1/+1 counter on it. It
     // gains haste until end of turn" — Surrak and Goreclaw, issue #2378) instead
-    // carries `affected: TriggeringSource` with `target: None`. Both name the
+    // carries `affected: TriggeringSource`. Both name the
     // triggering object directly, so when there is no chosen target to inherit
     // (`ability.targets.is_empty()`), resolve via `resolve_event_context_target`
     // here. We must NOT short-circuit when targets exist: `affected:
@@ -453,7 +463,7 @@ fn register_transient_effect(
         .as_ref()
         .is_some_and(|filter| matches!(filter, TargetFilter::TriggeringSource));
     if matches!(target_filter, Some(TargetFilter::TriggeringSource))
-        || (target_filter.is_none() && affected_is_triggering_source && ability.targets.is_empty())
+        || (affected_is_triggering_source && ability.targets.is_empty())
     {
         if let Some(TargetRef::Object(obj_id)) =
             crate::game::targeting::resolve_event_context_target(
@@ -490,15 +500,19 @@ fn register_transient_effect(
             .affected
             .as_ref()
             .is_some_and(crate::game::ability_utils::filter_references_target_player);
-    let inherited_object_target = static_def
+    let forwarded_parent_target = ability.context.forwarded_result_context.is_some()
+        && application_filter.is_some_and(crate::game::effects::filter_refs_parent_target);
+    let inherited_object_target = (static_def
         .affected
         .as_ref()
         .is_some_and(generic_effect_affected_uses_inherited_targets)
+        || application_filter.is_some_and(generic_effect_affected_uses_inherited_targets))
         && !static_affected_references_target_player
-        && ability
+        && (ability
             .targets
             .iter()
-            .any(|target| matches!(target, TargetRef::Object(_)));
+            .any(|target| matches!(target, TargetRef::Object(_)))
+            || forwarded_parent_target);
     let direct_binding_uses_targets = target_filter.is_some()
         || application_filter.is_some_and(generic_effect_affected_uses_inherited_targets)
         || inherited_object_target;
@@ -515,7 +529,7 @@ fn register_transient_effect(
     // that scan `state.transient_continuous_effects` directly.
     // A `ControllerRef::TargetPlayer` affected filter is different: its player
     // target parameterizes a broadcast object filter and is resolved below.
-    if !ability.targets.is_empty()
+    if (!ability.targets.is_empty() || forwarded_parent_target)
         && direct_binding_uses_targets
         && !static_affected_references_target_player
     {
@@ -679,6 +693,32 @@ fn register_transient_effect(
                 );
             }
         }
+        // CR 701.47c: A grant whose affected object is "the amassed Army"
+        // (e.g. a future "amass N, then the amassed Army gains/gets ..."
+        // continuation) resolves directly from the recursively-stamped
+        // `amassed_army_object`, never a target — mirrors the `CostPaidObject`
+        // arm immediately above. Unlike `CostPaidObject`, the Army is always
+        // on the battlefield when this resolves, so the broadcast-scan branch
+        // below would coincidentally bind the same single object too; this arm
+        // is still the correct seam because it names the object directly
+        // instead of relying on a battlefield re-scan happening to narrow to
+        // exactly one match.
+        Some(TargetFilter::AmassedArmy)
+            if ability.targets.is_empty() && ability.amassed_army_object.is_some() =>
+        {
+            if let Some(snap) = &ability.amassed_army_object {
+                install_transient(
+                    state,
+                    end_permission,
+                    ability.source_id,
+                    ability.controller,
+                    duration.clone(),
+                    TargetFilter::SpecificObject { id: snap.object_id },
+                    modifications.clone(),
+                    static_def.condition.clone(),
+                );
+            }
+        }
         // TriggeringSource is handled via early short-circuit to avoid target propagation bugs.
         Some(TargetFilter::ParentTarget) if ability.targets.is_empty() => {
             let tracked = state
@@ -757,6 +797,17 @@ fn transient_bound_filters(
         let Some(filter) = resolved_filter else {
             return Vec::new();
         };
+        if let Some(objects) = forwarded_result_object_targets(state, ability, filter) {
+            // CR 608.2c: A forward-result antecedent is independent of the
+            // ability's declared targets. `ParentTargetSlot` indexes the raw
+            // event-order list; broad `ParentTarget` filters only live objects
+            // after that contextual binding. An empty completed result returns
+            // no bindings instead of falling back to an older target list.
+            return objects
+                .into_iter()
+                .map(|id| TargetFilter::SpecificObject { id })
+                .collect();
+        }
         // Slot carve-out (§5.4b): this hands its list straight to
         // `effect_object_targets`, which indexes `ParentTargetSlot`
         // POSITIONALLY. A pin-filtered list would renumber the slots, so the
@@ -787,10 +838,42 @@ fn transient_bound_filters(
         .collect()
 }
 
+/// CR 400.7 + CR 608.2c: Resolve an inherited forward-result reference from the
+/// result event's ordered object list, keeping only the same object incarnations.
+/// `None` distinguishes absence of the carrier from an empty completed result.
+fn forwarded_result_object_targets(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    filter: &TargetFilter,
+) -> Option<Vec<ObjectId>> {
+    ability
+        .context
+        .forwarded_result_context
+        .as_ref()
+        .map(|context| {
+            crate::game::effects::effect_object_targets(filter, &context.targets)
+                .into_iter()
+                .filter(|id| context.object_pin_is_current(*id, state))
+                .collect()
+        })
+}
+
 pub fn generic_effect_affected_uses_inherited_targets(filter: &TargetFilter) -> bool {
     matches!(
         filter,
-        TargetFilter::TriggeringSource | TargetFilter::ParentTarget | TargetFilter::CostPaidObject
+        TargetFilter::TriggeringSource
+            | TargetFilter::ParentTarget
+            | TargetFilter::ParentTargetSlot { .. }
+            | TargetFilter::CostPaidObject
+            // CR 701.47c: "the amassed Army" is a resolution-local single-object
+            // reference (`ResolvedAbility.amassed_army_object`), not a broadcast
+            // population — mirrors `CostPaidObject` immediately above. This
+            // routes a future "amass N, then the amassed Army gains/gets ..."
+            // continuous grant to the dedicated `amassed_army_object` arm below
+            // (mirroring the `CostPaidObject` arm) and to the matching
+            // early-return guard in the broadcast-scan arm, instead of relying
+            // on the battlefield re-scan happening to narrow to one object.
+            | TargetFilter::AmassedArmy
     )
 }
 
@@ -897,7 +980,11 @@ fn snapshot_transient_modifications(
             ) =>
             {
                 let ids =
-                    crate::game::targeting::resolved_object_ids_for_filter(state, ability, filter);
+                    forwarded_result_object_targets(state, ability, filter).unwrap_or_else(|| {
+                        crate::game::targeting::resolved_object_ids_for_filter(
+                            state, ability, filter,
+                        )
+                    });
                 ContinuousModification::AddKeyword {
                     keyword: crate::types::keywords::Keyword::Enchant(
                         ids.first()
@@ -906,6 +993,65 @@ fn snapshot_transient_modifications(
                     ),
                 }
             }
+            // CR 608.2h: the granted "protection/hexproof from
+            // the [chosen] color" requires information from a specific object — the
+            // granting source's chosen colour — and CR 608.2h fixes that answer ONCE, when
+            // the effect is applied. Latch it into the payload here so the recipient's
+            // keyword is self-contained and a LATER choice by the same source can no
+            // longer retroactively change a grant that has already begun.
+            //
+            // CR 611.3a scopes this deliberately: only continuous effects
+            // generated by RESOLUTION are locked in. A printed static ability's grant
+            // (Floating Shield's "Enchanted creature has protection from the chosen
+            // color", Voice of All, Ward Sliver) never reaches this function — it lives
+            // on `static_definitions`, is gathered by `gather_active_continuous_effects`,
+            // and is resolved live in
+            // `game/layers.rs::apply_continuous_effect_filtered`.
+            //
+            // CR 608.2h's SECOND sentence is what authorizes the read when the source is
+            // already gone: Floating Shield sacrifices its granting source as the
+            // activation cost, so at this point the source is in the graveyard.
+            // `state.objects` is id-keyed and `chosen_attributes` is cleared only by
+            // `reset_for_battlefield_entry`, which a graveyard move never reaches.
+            ContinuousModification::AddKeyword {
+                keyword:
+                    crate::types::keywords::Keyword::Protection(
+                        crate::types::keywords::ProtectionTarget::ChosenColor,
+                    ),
+            } => match crate::game::effects::choose::resolution_chosen_color(
+                state,
+                ability.source_id,
+            ) {
+                Some(color) => ContinuousModification::AddKeyword {
+                    keyword: crate::types::keywords::Keyword::Protection(
+                        crate::types::keywords::ProtectionTarget::Color(color),
+                    ),
+                },
+                // CR 609.3 + follow-up F1: no colour was chosen, because a
+                // PRINTED `Choose a color.` still lowers `persist: false` in the
+                // in-chain imperative route. Measured: a minority of the seam-reaching
+                // pool cards take this arm (census `<SP>/census-base.out`). Leave the
+                // payload untouched so `game/layers.rs`'s existing unresolved handling
+                // stays byte-identical. This is what keeps F1 out of scope.
+                None => modification.clone(),
+            },
+            ContinuousModification::AddKeyword {
+                keyword:
+                    crate::types::keywords::Keyword::HexproofFrom(
+                        crate::types::keywords::HexproofFilter::ChosenColor,
+                    ),
+            } => match crate::game::effects::choose::resolution_chosen_color(
+                state,
+                ability.source_id,
+            ) {
+                Some(color) => ContinuousModification::AddKeyword {
+                    keyword: crate::types::keywords::Keyword::HexproofFrom(
+                        crate::types::keywords::HexproofFilter::Color(color),
+                    ),
+                },
+                // Symmetric with the Protection arm above: CR 609.3 + F1.
+                None => modification.clone(),
+            },
             _ => modification.clone(),
         })
         .collect()
@@ -1091,6 +1237,243 @@ mod tests {
             tce.modifications,
             vec![ContinuousModification::AddKeyword {
                 keyword: Keyword::Flying,
+            }]
+        );
+    }
+
+    /// CR 701.47c: a hypothetical "amass N, then the amassed Army gains/gets
+    /// ..." continuous grant (`GenericEffect { affected: AmassedArmy }`) must
+    /// bind directly to the exact Army object `amassed_army_object` names —
+    /// the sibling-coverage counterpart of the `SelfRef` test above, and of
+    /// the pre-existing `CostPaidObject` dedicated-arm handling in
+    /// `resolve()`. Revert-fail: if `AmassedArmy` were removed from either
+    /// `generic_effect_affected_uses_inherited_targets` or its dedicated
+    /// resolution arm (while the other half stayed), this test fails —
+    /// dropping the helper-only half makes the broadcast-scan arm's
+    /// early-return guard fire before ever finding the object, so ZERO
+    /// transient effects install (not merely a different-looking one), which
+    /// is exactly the silent-no-op class of bug `is_context_ref` was fixed
+    /// for elsewhere in this same card's implementation.
+    #[test]
+    fn generic_effect_registers_transient_effect_for_amassed_army() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let army = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Army Token".to_string(),
+            Zone::Battlefield,
+        );
+        // A second, unrelated battlefield object: if `AmassedArmy` fell
+        // through to a real broadcast scan with an unfiltered/mismatched
+        // resolved filter, this decoy would surface a second (wrong) TCE.
+        let _decoy = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Decoy".to_string(),
+            Zone::Battlefield,
+        );
+        let snapshot = crate::types::ability::CostPaidObjectSnapshot {
+            object_id: army,
+            lki: state.objects[&army].snapshot_public_characteristics(),
+        };
+
+        let static_def = StaticDefinition::continuous()
+            .affected(TargetFilter::AmassedArmy)
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Menace,
+            }]);
+
+        let mut ability = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![static_def],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: None,
+                end_cost: None,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        )
+        .duration(Duration::UntilEndOfTurn);
+        ability.set_amassed_army_object_recursive(snapshot);
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(
+            state.transient_continuous_effects.len(),
+            1,
+            "must bind exactly one TCE, to the amassed Army — not zero (silent \
+             no-op) and not a battlefield-wide broadcast"
+        );
+        let tce = &state.transient_continuous_effects[0];
+        assert_eq!(tce.affected, TargetFilter::SpecificObject { id: army });
+        assert_eq!(
+            tce.modifications,
+            vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Menace,
+            }]
+        );
+    }
+
+    #[test]
+    fn forwarded_result_context_does_not_skip_cost_paid_object_binding() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let paid = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Paid Object".to_string(),
+            Zone::Exile,
+        );
+        let snapshot = crate::types::ability::CostPaidObjectSnapshot {
+            object_id: paid,
+            lki: state.objects[&paid].snapshot_public_characteristics(),
+        };
+        let static_def = StaticDefinition::continuous()
+            .affected(TargetFilter::CostPaidObject)
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Flying,
+            }]);
+        let mut ability = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![static_def],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: None,
+                end_cost: None,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        )
+        .duration(Duration::UntilEndOfTurn);
+        ability.set_cost_paid_object_recursive(snapshot);
+        ability.context.forwarded_result_context = Some(Box::new(
+            crate::types::ability::ForwardedResultContext::from_object_ids(&state, &[]),
+        ));
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.transient_continuous_effects.len(), 1);
+        assert_eq!(
+            state.transient_continuous_effects[0].affected,
+            TargetFilter::SpecificObject { id: paid }
+        );
+    }
+
+    #[test]
+    fn forwarded_result_context_rejects_a_new_object_incarnation() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let target = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Forwarded Object".to_string(),
+            Zone::Battlefield,
+        );
+        let context =
+            crate::types::ability::ForwardedResultContext::from_object_ids(&state, &[target]);
+        state.objects.get_mut(&target).unwrap().bump_incarnation();
+        let static_def = StaticDefinition::continuous()
+            .affected(TargetFilter::ParentTarget)
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Haste,
+            }]);
+        let mut ability = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![static_def],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: None,
+                end_cost: None,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        )
+        .duration(Duration::UntilEndOfTurn);
+        ability.context.forwarded_result_context = Some(Box::new(context));
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert!(state.transient_continuous_effects.is_empty());
+    }
+
+    #[test]
+    fn forwarded_result_context_concretizes_reanimator_enchant_target() {
+        let mut state = GameState::new_two_player(42);
+        let aura = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Reanimator Aura".to_string(),
+            Zone::Battlefield,
+        );
+        let reanimated_creature = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Reanimated Creature".to_string(),
+            Zone::Battlefield,
+        );
+        let static_def = StaticDefinition::continuous()
+            .affected(TargetFilter::SelfRef)
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Enchant(TargetFilter::ParentTarget),
+            }]);
+        let mut ability = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![static_def],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: None,
+                end_cost: None,
+            },
+            vec![],
+            aura,
+            PlayerId(0),
+        )
+        .duration(Duration::UntilEndOfTurn);
+        ability.context.forwarded_result_context = Some(Box::new(
+            crate::types::ability::ForwardedResultContext::from_object_ids(
+                &state,
+                &[reanimated_creature],
+            ),
+        ));
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.transient_continuous_effects.len(), 1);
+        assert_eq!(
+            state.transient_continuous_effects[0].modifications,
+            vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Enchant(TargetFilter::SpecificObject {
+                    id: reanimated_creature,
+                }),
             }]
         );
     }

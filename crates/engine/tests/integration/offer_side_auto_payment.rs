@@ -1302,6 +1302,8 @@ fn exile_alt_cost_permission(
     cost: ManaCost,
 ) -> CastingPermission {
     CastingPermission::ExileWithAltCost {
+        source_id: None,
+        cost_provenance: engine::types::ability::ExileGrantCostProvenance::Alternative,
         cost,
         cast_transformed: false,
         constraint: None,

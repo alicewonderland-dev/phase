@@ -107,6 +107,32 @@ jobs:
           fi
           ./scripts/check-engine-authorities.sh "$BASE"
 
+      - name: Release dispatch guard tests
+        # release.yml's recovery guard is release authorization: it decides
+        # whether a workflow_dispatch run may publish the tag it asks for. The
+        # tests read the guard's shell out of the committed workflow, so an edit
+        # that weakens it fails here instead of shipping unnoticed.
+        run: python3 scripts/release_dispatch_guard_tests.py
+
+      - name: Action pin checker unit tests
+        # Exercises the checker against throwaway repositories only; it does
+        # not walk this repository's own workflows. The gate over the real tree
+        # is action-pin-audit.yml, which runs the default branch's copy of this
+        # checker against the evaluated commit.
+        run: python3 scripts/check_action_pins_tests.py
+
+      - name: Action pin regression coverage
+        # Walks reusable-workflow and composite-action calls out of the
+        # release/deploy workflows: those run with deploy and signing secrets,
+        # so an action one call away from the edited file is the same exposure
+        # with less visibility. Pinning only top-level files would miss it.
+        #
+        # This runs from the pull request's checkout, so it is fast feedback and
+        # NOT the control: a commit can change a privileged workflow and this
+        # checker together. The authority is action-pin-audit.yml, which runs
+        # the default branch's copy of the checker against this commit.
+        run: python3 scripts/check_action_pins.py
+
       - name: Resolution-frame boundary guard
         # Full-tree guard: legacy resolution keys are reader/fixture-only, and
         # ResolutionStack mutation remains top-only or adjacent-pair scoped.
@@ -123,22 +149,17 @@ jobs:
           fi
           ./scripts/check-test-card-data-load.sh "$BASE"
 
-  rust-test:
-    name: Rust tests (shard ${{ matrix.shard }}/4)
+  rust-test-build:
+    name: Rust tests (build archive)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
 
       - name: Free runner disk for Rust test linking
-        # The nextest count partition splits execution, but each shard still
-        # runs `cargo test --no-run` for the whole workspace. Keep the Rust
-        # caches intact and reclaim only unused hosted-image payloads before
-        # setup-rust-toolchain restores/saves Cargo state.
+        # Build the workspace's test binaries once. Keep the Rust caches intact
+        # and reclaim only unused hosted-image payloads before setup-rust-toolchain
+        # restores/saves Cargo state.
         run: |
           echo "Disk before cleanup:"
           df -h /
@@ -174,13 +195,95 @@ jobs:
         with:
           tool: cargo-nextest
 
+      - name: Build test archive
+        # This is the only Rust test compilation. The archive includes all
+        # test binaries and their runtime dependencies for the shard jobs.
+        run: cargo nextest archive --profile ci --workspace --exclude phase-tauri --features engine/proptest --archive-file nextest-archive.tar.zst
+
+      - name: Build binaries launched by integration tests
+        # `CARGO_BIN_EXE_*` embeds target/debug paths. Nextest's archive does
+        # not preserve those launcher paths, so share the binaries the
+        # integration tests execute directly with every shard. This list and the
+        # two below must cover every such binary: a launcher added here must also
+        # be uploaded and made executable below, or the shard fails on the leg
+        # that was missed rather than on the one that was added.
+        # `crates/phase-ai/tests/gate_cli.rs` reds when they fall behind.
+        run: |
+          cargo build -p probe-pin
+          cargo build -p phase-ai --bin ai-commander --bin ai-duel --bin ai-gate
+
+      - name: Upload test archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive
+          path: nextest-archive.tar.zst
+          compression-level: 0
+          retention-days: 1
+
+      - name: Upload test runtime binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-runtime-binaries
+          path: |
+            target/debug/probe-pin
+            target/debug/ai-commander
+            target/debug/ai-duel
+            target/debug/ai-gate
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  rust-test:
+    name: Rust tests (shard ${{ matrix.shard }}/4)
+    needs: rust-test-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Some snapshot tests query Cargo metadata at runtime. This makes Cargo
+      # available but does not build test binaries; those come from the archive.
+      # Do not restore or save a Rust target cache: the archive is the cache.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: wasm32-unknown-unknown
+          cache: false
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Download test archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+
+      - name: Prepare test archive destination
+        run: mkdir -p target
+
+      - name: Download test runtime binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: test-runtime-binaries
+          path: target/debug
+
+      - name: Restore test runtime binary permissions
+        # Actions artifacts preserve file contents but not executable bits.
+        run: chmod +x target/debug/probe-pin target/debug/ai-commander target/debug/ai-duel target/debug/ai-gate
+
       - name: Run tests
+        # The archive retains build options. Each shard only extracts it and
+        # executes its partition; it does not invoke Cargo or compile Rust.
         # PROPTEST_CASES split: PRs run a smaller case count for fast feedback;
         # pushes to main run the default (256) so any property regression is
         # caught before it lands on the branch that feeds staging/preview.
         env:
           PROPTEST_CASES: ${{ github.event_name == 'pull_request' && '32' || '256' }}
-        run: cargo nextest run --profile ci --partition count:${{ matrix.shard }}/4 --workspace --exclude phase-tauri --features engine/proptest --status-level fail --final-status-level fail
+        run: cargo-nextest nextest run --profile ci --partition count:${{ matrix.shard }}/4 --archive-file nextest-archive.tar.zst --extract-to target --status-level fail --final-status-level fail
 
   card-data-gate:
     name: Card data (generate, validate, coverage)
@@ -692,29 +795,137 @@ jobs:
         # need their own step or they'd never run in CI at all.
         run: cargo test --locked --manifest-path client/src-tauri/Cargo.toml
 
+  android-debug-apk:
+    name: Android debug APK (ARM64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 9.15.9
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: client/pnpm-lock.yaml
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          target: aarch64-linux-android
+          cache-shared-key: rust-tauri-android-arm64
+          cache-workspaces: client/src-tauri -> target
+
+      - name: Install pinned Android SDK and NDK
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;28.2.13676358"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - name: Install frozen client dependencies
+        run: cd client && pnpm install --frozen-lockfile
+
+      - name: Build ARM64 debug APK through the project CLI
+        run: |
+          set -euo pipefail
+          NODE_BIN=$(realpath "$(command -v node)")
+          TAURI_JS="$GITHUB_WORKSPACE/client/node_modules/@tauri-apps/cli/tauri.js"
+          test -f "$NODE_BIN"
+          test -x "$NODE_BIN"
+          test -f "$TAURI_JS"
+          export ORG_GRADLE_PROJECT_phaseNodeExecutable="$NODE_BIN"
+          (
+            cd client
+            "$NODE_BIN" "$TAURI_JS" android build --debug --target aarch64 --apk
+          )
+
+      - name: Inspect ARM64 debug APK
+        run: |
+          set -euo pipefail
+          APK=$(find client/src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' -print -quit)
+          test -n "$APK"
+          test -f "$APK"
+
+          AAPT2="$ANDROID_HOME/build-tools/36.0.0/aapt2"
+          APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          TAURI_PROPERTIES="client/src-tauri/gen/android/app/tauri.properties"
+          test -f "$TAURI_PROPERTIES"
+          APP_VERSION=$(sed -n 's/^tauri.android.versionName=//p' "$TAURI_PROPERTIES")
+          VERSION_CODE=$(sed -n 's/^tauri.android.versionCode=//p' "$TAURI_PROPERTIES")
+          test -n "$APP_VERSION"
+          [[ "$VERSION_CODE" =~ ^[0-9]+$ ]]
+          BADGING=$($AAPT2 dump badging "$APK")
+          grep -F "package: name='rs.phase.app.debug' versionCode='$VERSION_CODE' versionName='$APP_VERSION'" <<<"$BADGING"
+          grep -F "minSdkVersion:'24'" <<<"$BADGING"
+          grep -F "targetSdkVersion:'36'" <<<"$BADGING"
+
+          SIGNING=$($APKSIGNER verify --verbose --print-certs "$APK")
+          grep -F 'Verified using v2 scheme (APK Signature Scheme v2): true' <<<"$SIGNING"
+          grep -F 'CN=Android Debug' <<<"$SIGNING"
+
+          mapfile -t ABIS < <(unzip -Z1 "$APK" | sed -nE 's#^lib/([^/]+)/.*\.so$#\1#p' | sort -u)
+          test "${#ABIS[@]}" -eq 1
+          test "${ABIS[0]}" = 'arm64-v8a'
+          if unzip -Z1 "$APK" | grep -Eq '(^|/)(update\.json|.*\.sig)$'; then
+            echo 'Android debug APK unexpectedly contains updater material'
+            exit 1
+          fi
+          cp "$APK" Phase-Android-ARM64-debug.apk
+
+      - name: Upload inspected Android debug APK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: phase-android-arm64-debug
+          path: Phase-Android-ARM64-debug.apk
+          retention-days: 14
+
   rust-check:
     name: Rust (fmt, clippy, test, coverage-gate)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs:
       - rust-lint
+      - rust-test-build
       - rust-test
       - card-data-gate
       - draft-pools
       - wasm-check
       - tauri-check
+      - android-debug-apk
     if: always()
     steps:
       - name: Check split Rust jobs
         env:
           RUST_LINT_RESULT: ${{ needs.rust-lint.result }}
+          RUST_TEST_BUILD_RESULT: ${{ needs.rust-test-build.result }}
           RUST_TEST_RESULT: ${{ needs.rust-test.result }}
           CARD_DATA_RESULT: ${{ needs.card-data-gate.result }}
           DRAFT_POOLS_RESULT: ${{ needs.draft-pools.result }}
           WASM_RESULT: ${{ needs.wasm-check.result }}
           TAURI_RESULT: ${{ needs.tauri-check.result }}
+          ANDROID_RESULT: ${{ needs.android-debug-apk.result }}
         run: |
-          results="$RUST_LINT_RESULT $RUST_TEST_RESULT $CARD_DATA_RESULT $DRAFT_POOLS_RESULT $WASM_RESULT $TAURI_RESULT"
+          if [ "$RUST_TEST_BUILD_RESULT" != "success" ]; then
+            echo "Rust test archive build failed: $RUST_TEST_BUILD_RESULT"
+            exit 1
+          fi
+          results="$RUST_LINT_RESULT $RUST_TEST_RESULT $CARD_DATA_RESULT $DRAFT_POOLS_RESULT $WASM_RESULT $TAURI_RESULT $ANDROID_RESULT"
           # `skipped` is a pass: draft-pools is main-only and is skipped on PRs.
           for result in $results; do
             if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then

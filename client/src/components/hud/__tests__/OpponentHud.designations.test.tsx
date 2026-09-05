@@ -52,12 +52,14 @@ function createTwoPlayerState(overrides: Partial<GameState> = {}): GameState {
       starting_life: 20,
       min_players: 2,
       max_players: 2,
-      deck_size: 60,
+      deck_size: { type: "Minimum", data: 60 },
       singleton: false,
       command_zone: false,
       commander_damage_threshold: null,
       range_of_influence: null,
       team_based: false,
+      sideboard_policy: { type: "Limited", data: 15 },
+      default_deck_copy_limit: { type: "UpTo", data: 4 },
       uses_commander: false,
 
       allow_debug_actions: false,
@@ -138,18 +140,32 @@ describe("OpponentHud designations (single-opponent path)", () => {
     expect(screen.getByLabelText("7 energy counters")).toBeInTheDocument();
   });
 
-  it("renders the dungeon badge when the opponent is venturing", () => {
+  // CR 309.4b-c: the room's name and printed effect come from the engine
+  // projection `derived.dungeon_rooms`; the FE never derives them.
+  it("renders the dungeon badge naming the room the opponent's marker is on", () => {
     act(() => {
       useGameStore.setState({
         gameState: createTwoPlayerState({
           dungeon_progress: {
             "1": { current_dungeon: "TombOfAnnihilation", current_room: 0, completed: [] },
           },
+          derived: {
+            dungeon_rooms: {
+              "1": {
+                dungeon: "TombOfAnnihilation",
+                dungeon_name: "Tomb of Annihilation",
+                room: { index: 0, name: "Trapped Entry", text: "Each player loses 1 life." },
+                room_count: 5,
+              },
+            },
+          },
         }),
       });
     });
     render(<OpponentHud />);
-    expect(screen.getByLabelText("Venturing in Tomb, room 1")).toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Venturing in Tomb of Annihilation, Trapped Entry, room 1 of 5"),
+    ).toBeInTheDocument();
   });
 
   it("does not render the dungeon badge when the opponent has only completed dungeons", () => {
@@ -209,12 +225,14 @@ describe("OpponentHud designations (multiplayer tab path)", () => {
         starting_life: 40,
         min_players: 2,
         max_players: 4,
-        deck_size: 100,
+        deck_size: { type: "Exactly", data: 100 },
         singleton: true,
         command_zone: true,
         commander_damage_threshold: 21,
         range_of_influence: null,
         team_based: false,
+        sideboard_policy: { type: "Forbidden" },
+        default_deck_copy_limit: { type: "UpTo", data: 1 },
         uses_commander: true,
 
         allow_debug_actions: false,

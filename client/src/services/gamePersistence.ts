@@ -105,11 +105,22 @@ export interface PersistedP2PHostSession {
   gameStarted: boolean;
   seatState?: SeatState;
   /**
+   * Native AI driver failure retained so reconnecting guests receive the same
+   * terminal fault after the resumed host has restored their state snapshot.
+   */
+  nativeAiDriverFault?: NativeAiDriverFault;
+  /**
    * Present when the desktop host delegated authority to its local
    * phase-server. The server persists the game state; IndexedDB retains only
    * the opaque credentials needed to reconnect each host-local viewer.
    */
   nativeSession?: NativeP2PServerSession;
+}
+
+export interface NativeAiDriverFault {
+  id: number;
+  revision: number;
+  message: string;
 }
 
 export interface NativeP2PServerSession {
@@ -135,6 +146,14 @@ const P2P_HOST_KEY_PREFIX = "phase-p2p-host:";
  */
 let _gameStore: ReturnType<typeof createStore> | undefined;
 
+function isTerminalPersistedState(state: PersistedGameState): boolean {
+  const publicState = "state" in state ? state.state : state;
+  return (
+    publicState.match_phase === "Completed"
+    || (!publicState.match_phase && publicState.waiting_for.type === "GameOver")
+  );
+}
+
 function getGameStore(): ReturnType<typeof createStore> {
   if (!_gameStore) {
     _gameStore = createStore("phase-game-state", "phase-game-state");
@@ -145,11 +164,7 @@ function getGameStore(): ReturnType<typeof createStore> {
 // ── Game State (IndexedDB) ──────────────────────────────────────────────
 
 export async function saveGame(gameId: string, state: PersistedGameState): Promise<void> {
-  const publicState = "state" in state ? state.state : state;
-  if (
-    publicState.match_phase === "Completed"
-    || (!publicState.match_phase && publicState.waiting_for.type === "GameOver")
-  ) {
+  if (isTerminalPersistedState(state)) {
     // A terminal StateUpdate can arrive before its recipient-specific GameOver
     // envelope. The latter carries the terminal access record, so this path
     // must not clear resumable state before that record has been committed.
@@ -160,6 +175,21 @@ export async function saveGame(gameId: string, state: PersistedGameState): Promi
   } catch (err) {
     console.warn("[saveGame] IndexedDB write failed:", err);
   }
+}
+
+/**
+ * Writes a known-resumable authority snapshot. Resume initialization uses this
+ * strict boundary before a host may publish or accept a reconnect: swallowing
+ * a failed write there could replay an already-consumed automation session.
+ */
+export async function saveResumableGameStrict(
+  gameId: string,
+  state: PersistedGameState,
+): Promise<void> {
+  if (isTerminalPersistedState(state)) {
+    throw new Error("Refusing to retain a terminal game as resumable state");
+  }
+  await set(GAME_KEY_PREFIX + gameId, state, getGameStore());
 }
 
 /**

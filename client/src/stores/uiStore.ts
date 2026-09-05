@@ -15,6 +15,10 @@ import type { FilterKey } from "../components/modal/cardChoice/gridSelection";
  */
 export type BlockerAssignments = Map<ObjectId, Set<ObjectId>>;
 export type PreviewPlacement = "cursor" | "side";
+export type DebugContextMenuSurface =
+  | "game"
+  | "zone-viewer"
+  | "debug-library-viewer";
 
 /** Flatten the UI's per-blocker representation at the engine action boundary. */
 export function blockerAssignmentPairs(
@@ -261,7 +265,12 @@ interface UiStoreState {
    *  mode itself stays in `debugInteractionMode`; this only controls access to
    *  the fast toggle for repeated sandbox edits. */
   debugClickModeButtonVisible: boolean;
-  debugContextMenu: { objectId: ObjectId; x: number; y: number } | null;
+  debugContextMenu: {
+    objectId: ObjectId;
+    x: number;
+    y: number;
+    surface: DebugContextMenuSurface;
+  } | null;
   /** Debug-only library browser: when set, a modal lists the player's full
    *  library (in a stable randomized order) so individual cards can be moved to
    *  any zone via the standard debug context menu. `null` when closed. */
@@ -303,6 +312,9 @@ interface UiStoreActions {
     timing?: "hover" | "immediate",
     placement?: PreviewPlacement,
   ) => void;
+  /** Open a preview from an explicit interaction and keep it visible until a
+   * later outside interaction dismisses it. */
+  inspectObjectSticky: (id: ObjectId, faceIndex?: number, placement?: PreviewPlacement) => void;
   dismissPreview: () => void;
   setAltHeld: (held: boolean) => void;
   setShiftHeld: (held: boolean) => void;
@@ -352,7 +364,12 @@ interface UiStoreActions {
   openSandboxTools: () => void;
   toggleDebugInteractionMode: () => void;
   toggleDebugClickModeButtonVisible: () => void;
-  openDebugContextMenu: (menu: { objectId: ObjectId; x: number; y: number }) => void;
+  openDebugContextMenu: (menu: {
+    objectId: ObjectId;
+    x: number;
+    y: number;
+    surface: DebugContextMenuSurface;
+  }) => void;
   closeDebugContextMenu: () => void;
   openDebugLibraryViewer: (playerId: number) => void;
   closeDebugLibraryViewer: () => void;
@@ -364,7 +381,11 @@ interface UiStoreActions {
   setDebugHighlightedObjectId: (id: ObjectId | null) => void;
   /** Set or clear the debug-panel preview highlight for a player. */
   setDebugHighlightedPlayerId: (id: number | null) => void;
+  /** Engine-initiated visibility change. Does NOT remember the value. */
   setLogPanelOpen: (open: boolean) => void;
+  /** User-initiated visibility change. Remembers the value for the next game. */
+  setLogPanelOpenByUser: (open: boolean) => void;
+  /** User-initiated visibility change. Remembers the value for the next game. */
   toggleLogPanel: () => void;
   setFlexEditMode: (active: boolean) => void;
   toggleFlexEditMode: () => void;
@@ -526,6 +547,21 @@ export const useUiStore = create<UiStore>()((set, get) => ({
         });
       }, 50);
     }
+  },
+
+  inspectObjectSticky: (id, faceIndex = 0, placement = "cursor") => {
+    if (pendingClearTimer != null) {
+      clearTimeout(pendingClearTimer);
+      pendingClearTimer = null;
+    }
+    cancelPendingShow();
+    set({
+      inspectedObjectId: id,
+      inspectedFaceIndex: faceIndex,
+      previewPlacement: placement,
+      previewSticky: true,
+      altHeld: false,
+    });
   },
 
   dismissPreview: () => {
@@ -748,8 +784,20 @@ export const useUiStore = create<UiStore>()((set, get) => ({
   toggleHelpSheet: () => set((state) => ({ helpSheetOpen: !state.helpSheetOpen })),
   openCardReportDialog: () => set({ cardReportDialogOpen: true }),
   closeCardReportDialog: () => set({ cardReportDialogOpen: false }),
+  // Engine-initiated visibility. Deliberately does NOT remember: the mount
+  // seed and the game-over reveal both open the panel without the user asking,
+  // and remembering those would re-open the log at the start of every game for
+  // a player who keeps it closed.
   setLogPanelOpen: (open) => set({ logPanelOpen: open }),
-  toggleLogPanel: () => set((state) => ({ logPanelOpen: !state.logPanelOpen })),
+  // The single authority for a USER-initiated visibility change — it updates
+  // the live panel and remembers the choice for the next game. Every user entry
+  // point (game menu, board context menu, the panel's own ×) routes here, so no
+  // call site has to remember to persist.
+  setLogPanelOpenByUser: (open) => {
+    set({ logPanelOpen: open });
+    usePreferencesStore.getState().setLogPanelLastChoice(open ? "open" : "closed");
+  },
+  toggleLogPanel: () => get().setLogPanelOpenByUser(!get().logPanelOpen),
   setFlexEditMode: (active) => set({ flexEditMode: active }),
   toggleFlexEditMode: () => set((state) => ({ flexEditMode: !state.flexEditMode })),
   setManualManaOverride: (on) => set({ manualManaOverride: on }),

@@ -128,6 +128,7 @@ pub fn resolve(
         up_to: false,
         constraint: None,
         source_id,
+        reciprocal_role: None,
     };
 
     events.push(GameEvent::EffectResolved {
@@ -211,6 +212,8 @@ pub fn resolve_exile(
             if let Some(obj) = state.objects.get_mut(&obj_id) {
                 obj.casting_permissions
                     .push(CastingPermission::PlayFromExile {
+                        provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                        mode: crate::types::ability::CardPlayMode::Play,
                         duration: crate::types::ability::Duration::Permanent,
                         granted_to: controller,
                         frequency: CastFrequency::Unlimited,
@@ -222,6 +225,7 @@ pub fn resolve_exile(
                         single_use_group: None,
                         single_use: false,
                         cast_cost_raise: None,
+                        alt_ability_cost: None,
                         land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     });
             }

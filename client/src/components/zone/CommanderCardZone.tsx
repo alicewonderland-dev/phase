@@ -11,6 +11,7 @@ import { useCardImage } from "../../hooks/useCardImage.ts";
 import { useIsCompactHeight } from "../../hooks/useIsCompactHeight.ts";
 import { getPlayerId, useCanActForWaitingState } from "../../hooks/usePlayerId.ts";
 import { useDragToCast } from "../../hooks/useDragToCast.ts";
+import { objectImageProps } from "../../services/cardImageLookup.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
 import {
@@ -20,6 +21,8 @@ import {
 } from "../../viewmodel/cardActionChoice.ts";
 import { CASTABLE_AFFORDANCE_ACTIVE } from "../../viewmodel/castableAffordance.ts";
 import { commandZoneLeaders } from "../../viewmodel/commanderColumn.ts";
+import { CardArtFallback } from "../card/CardArtFallback.tsx";
+import { getCardImageSrcSetProps } from "../card/cardImageSrcSet.ts";
 import { ManaCostPips } from "../mana/ManaCostPips.tsx";
 
 interface CommanderCardZoneProps {
@@ -76,7 +79,23 @@ function CommanderCard({
   );
   const inspectObject = useUiStore((s) => s.inspectObject);
   const setPendingAbilityChoice = useUiStore((s) => s.setPendingAbilityChoice);
-  const { src } = useCardImage(commander.name, { size: "normal" });
+  // Canonical art path (services/cardImageLookup): resolve by the engine's
+  // `printed_ref.oracle_id` + face name, exactly as every other object surface
+  // (PermanentCard, StackEntry, GraveyardPile, CardPreview) does. The bare
+  // `commander.name` lookup this replaced is documented as the legacy fallback
+  // for objects carrying no `printed_ref` — command-zone leaders always carry
+  // one — and it indexes faces numerically, so a leader whose active face is
+  // not Scryfall's front resolved to the wrong face's art.
+  const imageProps = objectImageProps(commander);
+  const { src, isLoading, rungs, advanceFailedSource } = useCardImage(imageProps.cardName, {
+    size: "normal",
+    faceIndex: imageProps.faceIndex,
+    isToken: imageProps.isToken,
+    tokenFilters: imageProps.tokenFilters,
+    tokenImageRef: imageProps.tokenImageRef,
+    oracleId: imageProps.oracleId,
+    faceName: imageProps.faceName,
+  });
   const { handlers: hoverHandlers, firedRef } = useCardHover(commander.id);
   const tax = commander.commander_tax ?? 0;
 
@@ -192,7 +211,12 @@ function CommanderCard({
         if (firedRef.current) return;
         if (useUiStore.getState().debugInteractionMode) {
           e.stopPropagation();
-          useUiStore.getState().openDebugContextMenu({ objectId: commander.id, x: e.clientX, y: e.clientY });
+          useUiStore.getState().openDebugContextMenu({
+            objectId: commander.id,
+            x: e.clientX,
+            y: e.clientY,
+            surface: "game",
+          });
           return;
         }
         // Commander ninjutsu is a click affordance (unlike drag-to-cast): a
@@ -209,6 +233,7 @@ function CommanderCard({
       onDragStart={startManaPaymentPreview}
       onDragEnd={onDragEnd}
       whileDrag={{ cursor: "grabbing", scale: 1.04 }}
+      data-object-id={commander.id}
       className={`group relative ${
         canCast ? "cursor-grab" : canNinjutsu ? "cursor-pointer" : "cursor-default"
       }`}
@@ -235,17 +260,27 @@ function CommanderCard({
     >
       {/* Card image */}
       <div className="relative h-full w-full overflow-hidden rounded-lg border border-amber-400/60 shadow-md">
-        {src ? (
+        {/* Three-state art contract, mirroring StackEntry: a pulsing skeleton
+            while resolution is in flight, the shared name tile only once we know
+            there is no art, then the image. Collapsing the first two — the bare
+            name tile stood in for BOTH — made the multi-second
+            `scryfall-data.json` fetch look like permanently broken commander
+            art, which is how it got reported. */}
+        {isLoading ? (
+          <div className="h-full w-full animate-pulse bg-gray-700" />
+        ) : src ? (
           <img
             src={src}
+            {...getCardImageSrcSetProps(src, rungs)}
             alt={commander.name}
             className="h-full w-full object-cover"
             draggable={false}
+            onError={() => advanceFailedSource?.(src)}
           />
         ) : (
-          <div className="flex h-full w-full items-center justify-center bg-gray-700 text-[10px] text-gray-400">
-            {commander.name}
-          </div>
+          /* `artCrop` centres and wraps the name; `fullCard` top-aligns and
+             truncates it, which this tile is too narrow to read. */
+          <CardArtFallback name={commander.name} variant="artCrop" className="h-full w-full" />
         )}
 
         {/* Translucent overlay — amber tint, lighter when actionable (castable

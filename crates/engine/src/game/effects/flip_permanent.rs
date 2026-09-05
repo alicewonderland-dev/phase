@@ -123,6 +123,7 @@ mod tests {
         obj.color = vec![ManaColor::Black];
         obj.base_color = obj.color.clone();
         obj.back_face = Some(BackFaceData {
+            is_swap_snapshot: false,
             name: "Stabwhisker the Odious".to_string(),
             power: Some(3),
             toughness: Some(3),

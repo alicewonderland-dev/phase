@@ -5,6 +5,10 @@
     "close": "Fechar",
     "closeNamed": "Fechar {{name}}"
   },
+  "debug": {
+    "exportAuthoritative": "Exportar estado de jogo autoritativo",
+    "exportAuthoritativeTitle": "Baixa o estado controlado pelo mecanismo usado para diagnosticar e restaurar este jogo"
+  },
   "quantityRef": {
     "highestNumber": "o número mais alto",
     "lowestNumber": "o número mais baixo",
@@ -19,7 +23,8 @@
     "defaultEyebrow": "Ferramenta de Workspace"
   },
   "pausedBanner": {
-    "message": "Jogo pausado — {{reason}}"
+    "message": "Jogo pausado — {{reason}}",
+    "resume": "Retomar jogo"
   },
   "fullscreen": {
     "enter": "Entrar em tela cheia",
@@ -60,7 +65,6 @@
   "comboDetector": {
     "label": "Detector de combos (experimental)",
     "title": "Detectar loops infinitos: encerrar loops obrigatórios automaticamente e mostrar recursos ∞ (desativado por padrão)",
-    "on": "Ligado",
     "off": "Desligado",
     "interactive": "Interativo"
   },
@@ -78,12 +82,18 @@
     "clickModeButton": "Botão de modo de clique",
     "shown": "Visível",
     "hidden": "Oculto",
-    "resume": "Continuar",
+    "openGameLog": "Abrir o registro do jogo",
+    "closeGameLog": "Fechar o registro do jogo",
     "settings": "Configurações",
     "boardLayoutSplit": "Dividido",
     "boardLayoutLegacy": "Legacy",
     "switchToSplitView": "Alternar para visualização de mesa dividida",
     "switchToLegacyView": "Alternar para visualização legacy focada",
+    "multiplayerSplitLayoutNudge": {
+      "message": "Veja todos os oponentes de uma vez na visualização de mesa dividida.",
+      "trySplit": "Experimentar visualização dividida",
+      "dismiss": "Agora não"
+    },
     "helpShortcuts": "Ajuda e Atalhos",
     "showAiHand": "Mostrar Mão da IA",
     "hideAiHand": "Ocultar Mão da IA",
@@ -97,6 +107,7 @@
   },
   "volume": {
     "deviceBlocked": "Áudio indisponível — o servidor de áudio do sistema não responde. Reinicie o aplicativo para tentar novamente.",
+    "mediaUnavailable": "Áudio indisponível — faltam neste sistema os componentes de mídia necessários para reproduzir som. Instale os pacotes de plugins do GStreamer da sua distribuição e reinicie o aplicativo.",
     "mute": "Silenciar",
     "unmute": "Reativar som",
     "volume": "Volume"
@@ -289,7 +300,15 @@
     "back": "Voltar",
     "settings": "Configurações",
     "languageSettings": "Idioma ({{lang}}) — abrir configurações",
-    "languageTitle": "Idioma: {{lang}}"
+    "languageTitle": "Idioma: {{lang}}",
+    "statusBanner": {
+      "dismiss": "Dispensar esta mensagem",
+      "severity": {
+        "info": "Aviso",
+        "warning": "Atenção",
+        "critical": "Importante"
+      }
+    }
   },
   "errorBoundary": {
     "heading": "Algo deu errado",

@@ -13,6 +13,7 @@ use engine::types::phase::Phase;
 
 fn specialize_back(name: &str, color: ManaColor, shard: ManaCostShard) -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
         name: name.into(),
         power: Some(3),
         toughness: Some(3),

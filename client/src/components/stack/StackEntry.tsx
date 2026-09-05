@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties } from "react";
+import type { CSSProperties } from "react";
 
 import { motion } from "framer-motion";
 import { useTranslation } from "react-i18next";
@@ -9,18 +9,25 @@ import { UnimplementedMechanicsBadge } from "../card/UnimplementedMechanicsBadge
 import { useCardImage } from "../../hooks/useCardImage.ts";
 import { useIsMobile } from "../../hooks/useIsMobile.ts";
 import { useLongPress } from "../../hooks/useLongPress.ts";
-import { usePlayerId } from "../../hooks/usePlayerId.ts";
+import { useCanActForWaitingState, usePlayerId } from "../../hooks/usePlayerId.ts";
 import { useSeatColor } from "../../hooks/useSeatColor.ts";
 import { dispatchAction } from "../../game/dispatch.ts";
-import { cardImageLookup, tokenFiltersForObject } from "../../services/cardImageLookup.ts";
+import { objectImageProps } from "../../services/cardImageLookup.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
+import { getWaitingForObjectChoiceIds } from "../../viewmodel/gameStateView.ts";
 import { renderDescription } from "../../utils/description.ts";
 import { ManaCostPips } from "../mana/ManaCostPips.tsx";
+import { getCardImageSrcSetProps } from "../card/cardImageSrcSet.ts";
 import { PopoverMenu } from "../menu/PopoverMenu.tsx";
 import { YieldMuteIcon } from "./YieldMuteIcon.tsx";
 import { RichLabel } from "../mana/RichLabel.tsx";
-import type { StackEntry as StackEntryType, StackEntryDisplay, StackPaidFactView } from "../../adapter/types.ts";
+import type {
+  ObjectId,
+  StackEntry as StackEntryType,
+  StackEntryDisplay,
+  StackPaidFactView,
+} from "../../adapter/types.ts";
 
 interface StackEntryProps {
   entry: StackEntryType;
@@ -43,15 +50,23 @@ interface StackEntryProps {
    * that don't proxy group data keep the prior per-entry rendering.
    */
   groupCount?: number;
+  /**
+   * The engine-selected object identity for a compact coalesced group. The
+   * visible card remains `entry`; choice membership and dispatch use this id.
+   */
+  choiceObjectId?: ObjectId;
+  /** All object identities represented by a compact group. */
+  groupedObjectIds?: ObjectId[];
   details?: StackEntryDisplay;
 }
 
-export function StackEntry({ entry, index, isTop, isPending, cardSize, style, onHoverChange, pacingMultiplier = 1, groupCount = 1, details }: StackEntryProps) {
+export function StackEntry({ entry, choiceObjectId = entry.id, groupedObjectIds, index, isTop, isPending, cardSize, style, onHoverChange, pacingMultiplier = 1, groupCount = 1, details }: StackEntryProps) {
   const { t } = useTranslation("game");
   const isMobile = useIsMobile();
   const playerId = usePlayerId();
   const objects = useGameStore((s) => s.gameState?.objects);
-  const waitingFor = useGameStore((s) => s.gameState?.waiting_for);
+  const waitingFor = useGameStore((s) => s.waitingFor);
+  const canActForWaitingState = useCanActForWaitingState();
   const pendingCast = useGameStore((s) => s.gameState?.pending_cast);
   const inspectObject = useUiStore((s) => s.inspectObject);
 
@@ -87,24 +102,23 @@ export function StackEntry({ entry, index, isTop, isPending, cardSize, style, on
   const triggerSourceName =
     entry.kind.type === "TriggeredAbility" ? entry.kind.data.source_name : undefined;
   const sourceName = details?.source_name || triggerSourceName || sourceObj?.name || "";
-  const imageLookup = sourceObj
-    ? cardImageLookup(sourceObj)
-    : { name: "", faceIndex: 0, oracleId: undefined, faceName: undefined };
+  const imageProps = sourceObj ? objectImageProps(sourceObj) : null;
   const sourceIsToken = sourceObj?.display_source === "Token" || Boolean(details?.token_image_ref);
   const sourceTokenImageRef =
     sourceObj?.display_source === "Token" ? sourceObj.token_image_ref : details?.token_image_ref;
 
-  const { src, isLoading } = useCardImage(sourceObj ? imageLookup.name : sourceName, {
+  const { src, isLoading, rungs, advanceFailedSource } = useCardImage(
+    imageProps?.cardName ?? sourceName,
+    {
     size: "normal",
-    faceIndex: imageLookup.faceIndex,
+    faceIndex: imageProps?.faceIndex ?? 0,
     isToken: sourceIsToken,
-    tokenFilters: sourceObj?.display_source === "Token" ? tokenFiltersForObject(sourceObj) : undefined,
+    tokenFilters: imageProps?.tokenFilters,
     tokenImageRef: sourceTokenImageRef,
-    oracleId: imageLookup.oracleId,
-    faceName: imageLookup.faceName,
-  });
-  const [artError, setArtError] = useState(false);
-  useEffect(() => setArtError(false), [src]);
+    oracleId: imageProps?.oracleId,
+    faceName: imageProps?.faceName,
+    },
+  );
 
   const isSpell = entry.kind.type === "Spell";
   const displayManaCost =
@@ -166,28 +180,30 @@ export function StackEntry({ entry, index, isTop, isPending, cardSize, style, on
   const stormCopyCount = details?.provenance?.type === "Storm"
     ? details.provenance.data.copy_count
     : undefined;
-  const controllerLabel = entry.controller === playerId ? t("stack.controllerYou") : t("stack.controllerOpp");
-  const seatColor = useSeatColor(entry.controller);
+  // The engine computes the live controller (CR 112.2 + CR 613.1b); `??` is this
+  // file's own established structural fallback for a prop the sole production
+  // caller always supplies (`details?.source_name`, `details?.kind_label`,
+  // `details?.targets` all use it above), not a semantic choice between two
+  // engine fields.
+  const liveController = details?.controller ?? entry.controller;
+  const controllerLabel =
+    liveController === playerId ? t("stack.controllerYou") : t("stack.controllerOpp");
+  const seatColor = useSeatColor(liveController);
   const controllerInitial =
-    entry.controller === playerId ? t("stack.controllerInitialYou") : t("stack.controllerInitialOpp", { seat: entry.controller });
+    liveController === playerId
+      ? t("stack.controllerInitialYou")
+      : t("stack.controllerInitialOpp", { seat: liveController });
 
-  // Targeting: check if this stack entry is a valid target for the current selection
-  const isHumanTargetSelection =
-    (waitingFor?.type === "TargetSelection" || waitingFor?.type === "TriggerTargetSelection")
-    && waitingFor.data.player === playerId;
-  // CR 115.7: A single-target retarget can redirect to another spell/ability on
-  // the stack (Bolt Bend on a counterspell), so stack entries are click targets.
-  const isRetargetChoice = waitingFor?.type === "RetargetChoice"
-    && waitingFor.data.player === playerId
-    && waitingFor.data.scope.type === "Single";
-  const currentTargetRefs = isHumanTargetSelection
-    ? (waitingFor.data.selection?.current_legal_targets ?? [])
-    : isRetargetChoice
-      ? waitingFor.data.legal_new_targets
-      : [];
-  const isValidTarget = (isHumanTargetSelection || isRetargetChoice) && currentTargetRefs.some(
-    (target) => "Object" in target && target.Object === entry.id,
-  );
+  // Targeting: whether the engine is currently asking THIS seat to choose an
+  // object and this stack entry is one of the choices. `getWaitingForObjectChoiceIds`
+  // is the single WaitingFor -> choosable-ObjectId authority the battlefield,
+  // zones, and attachment dialogs already read; the stack reads it too, so every
+  // variant whose engine-authored legal set can name a stack object lights up
+  // here without a per-variant branch — CR 115.7 retargets (Bolt Bend onto a
+  // counterspell), CR 707.10c "may choose new targets for the copy", and plain
+  // CR 601.2c target announcement alike.
+  const isValidTarget =
+    canActForWaitingState && getWaitingForObjectChoiceIds(waitingFor).includes(choiceObjectId);
 
   // Ring style: targeting glow overrides default ring
   const ringClass = isValidTarget
@@ -197,7 +213,7 @@ export function StackEntry({ entry, index, isTop, isPending, cardSize, style, on
   const handleClick = () => {
     if (longPressFired.current) { longPressFired.current = false; return; }
     if (isValidTarget) {
-      dispatchAction({ type: "ChooseTarget", data: { target: { Object: entry.id } } });
+      dispatchAction({ type: "ChooseTarget", data: { target: { Object: choiceObjectId } } });
     } else {
       inspectObject(entry.source_id);
     }
@@ -215,6 +231,8 @@ export function StackEntry({ entry, index, isTop, isPending, cardSize, style, on
       }}
       style={style}
       data-stack-entry={entry.id}
+      data-object-id={entry.id}
+      data-grouped-ids={groupedObjectIds && groupedObjectIds.length > 1 ? groupedObjectIds.join(" ") : undefined}
       data-card-hover
       className="relative cursor-pointer"
       onClick={handleClick}
@@ -243,7 +261,7 @@ export function StackEntry({ entry, index, isTop, isPending, cardSize, style, on
             className="animate-pulse rounded-lg bg-gray-700 border border-gray-600"
             style={{ width: cardSize.width, height: cardSize.height }}
           />
-        ) : !src || artError ? (
+        ) : !src ? (
           // Issue #6156 on the stack: this path is explicitly token-aware
           // (`sourceIsToken` / `sourceTokenImageRef` above), so an artless
           // token's triggered or activated ability landed here and pulsed
@@ -256,10 +274,11 @@ export function StackEntry({ entry, index, isTop, isPending, cardSize, style, on
         ) : (
           <img
             src={src}
+            {...getCardImageSrcSetProps(src, rungs)}
             alt={sourceName}
             className="h-full w-full object-cover"
             draggable={false}
-            onError={() => setArtError(true)}
+            onError={() => advanceFailedSource?.(src)}
           />
         )}
       </div>

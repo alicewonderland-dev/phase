@@ -363,6 +363,7 @@ fn tithing_blade_crafts_into_transformed_sepulcher() {
 /// idiom in `game/transform.rs` tests and `integration_bending.rs`).
 fn consuming_sepulcher_back_face() -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
         name: "Consuming Sepulcher".to_string(),
         power: None,
         toughness: None,

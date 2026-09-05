@@ -483,7 +483,7 @@ mod tests {
     use engine::game::zones::create_object;
     use engine::types::ability::{
         ContinuousModification, CounterCostSelection, Effect, QuantityExpr, ResolvedAbility,
-        StaticCondition, StaticDefinition, TargetFilter,
+        StaticCondition, StaticDefinition, TapCreaturesSelectionMode, TargetFilter,
     };
     use engine::types::game_state::{CastingVariant, PendingCast, StackEntry, StackEntryKind};
     use engine::types::identifiers::CardId;
@@ -1316,7 +1316,12 @@ mod tests {
             6.0,
             "reach guard: a surrendered permanent carries the literal premium"
         );
-        assert_eq!(delta(PayCostKind::TapCreatures { aggregate: None }), 0.0);
+        assert_eq!(
+            delta(PayCostKind::TapCreatures {
+                mode: TapCreaturesSelectionMode::Fixed
+            }),
+            0.0
+        );
         assert_eq!(
             delta(PayCostKind::RemoveCounter {
                 counter_type: CounterMatch::Any,

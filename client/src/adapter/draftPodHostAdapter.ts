@@ -15,10 +15,11 @@ import type { DraftKind, DraftPlayerView, PairingView, PodPolicy, PoolInput, Sea
 import type { MatchScore } from "./types";
 import { P2PDraftHost, type DraftHostEvent } from "./p2p-draft-host";
 import { hostRoom, type HostResult } from "../network/connection";
-import type { DraftMatchLaunch, DraftMatchSettlement, DraftPauseReason } from "../network/draftProtocol";
+import type { DraftMatchDeckPayload, DraftMatchLaunch, DraftMatchSettlement, DraftPauseReason } from "../network/draftProtocol";
 import type { BrokerClient, RegisterHostRequest } from "../services/brokerClient";
 import { loadDraftHostSession } from "../services/draftPersistence";
 import type { DraftIntergameCommand, DraftIntergameCommandAck } from "../services/intergameCommandLedger";
+import type { DraftWorkspaceState } from "../components/draft/workspace/types";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -37,11 +38,13 @@ export type DraftPodHostStatus =
 export type DraftPodHostEvent =
   | { type: "statusChanged"; status: DraftPodHostStatus }
   | { type: "roomCreated"; roomCode: string }
+  | { type: "workspaceRestored"; workspaceState: DraftWorkspaceState | null }
   | { type: "viewUpdated"; view: DraftPlayerView }
   | { type: "lobbyUpdate"; seats: SeatPublicView[]; joined: number; total: number }
   | { type: "lobbyFull" }
   | { type: "draftStarted"; view: DraftPlayerView }
-  | { type: "pickReceived"; seatIndex: number; cardInstanceId: string }
+  /** `cardInstanceIds` = the cards this seat drafted in this step, on both the normal and the draft-effect path. */
+  | { type: "pickReceived"; seatIndex: number; cardInstanceIds: string[] }
   | { type: "roundComplete" }
   | { type: "draftComplete" }
   | { type: "deckSubmitted"; seatIndex: number }
@@ -55,7 +58,7 @@ export type DraftPodHostEvent =
   | { type: "pairingsGenerated"; round: number; pairings: PairingView[] }
   | { type: "matchStart"; launch: DraftMatchLaunch }
   | { type: "matchResultReceived"; matchId: string; winnerSeat: number | null }
-  | { type: "roundAdvanced"; newRound: number }
+  | { type: "roundAdvanced" }
   | { type: "timerExpired" }
   | {
       type: "bo3SideboardPrompt";
@@ -120,6 +123,8 @@ export interface DraftPodHostConfig {
   persistenceId?: string;
   /** Resume from a specific room code (re-hosts on the same PeerJS ID). */
   preferredRoomCode?: string;
+  /** HTTP origin of the selected phase-server for best-effort P2P backups. */
+  backupEndpoint?: string;
   /** Abort signal for cancellation during setup. */
   signal?: AbortSignal;
 }
@@ -131,8 +136,13 @@ export class DraftPodHostAdapter {
   private host: P2PDraftHost | null = null;
   private hostResult: HostResult | null = null;
   private hostEventUnsub: (() => void) | null = null;
+  /** Closes an in-flight local host before a replacement may be created. */
+  private pendingDispose: (() => Promise<void>) | null = null;
+  /** Settles only after a canceled initializer has released every local resource. */
+  private pendingInitialization: Promise<void> | null = null;
   private _status: DraftPodHostStatus = "idle";
   private _roomCode: string | null = null;
+  private disposed = false;
 
   onEvent(listener: DraftPodHostEventListener): () => void {
     this.listeners.push(listener);
@@ -167,13 +177,54 @@ export class DraftPodHostAdapter {
    * accepting guest connections.
    */
   async initialize(config: DraftPodHostConfig): Promise<void> {
+    this.disposed = false;
     this.setStatus("connecting");
+    let finishInitialization!: () => void;
+    const initializationSettled = new Promise<void>((resolve) => {
+      finishInitialization = resolve;
+    });
+    this.pendingInitialization = initializationSettled;
+    let pendingHost: P2PDraftHost | null = null;
+    let pendingHostDisposed = false;
+    let pendingHostResult: HostResult | null = null;
+    let pendingHostResultDestroyed = false;
+
+    const abortIfRequested = () => {
+      if (config.signal?.aborted || this.disposed) {
+        throw new Error("Draft pod host initialization aborted");
+      }
+    };
+    const disposePending = async () => {
+      if (this.hostEventUnsub) {
+        this.hostEventUnsub();
+        this.hostEventUnsub = null;
+      }
+      if (pendingHost && !pendingHostDisposed) {
+        pendingHostDisposed = true;
+        await pendingHost.dispose();
+      }
+      if (pendingHostResult && !pendingHostResultDestroyed) {
+        pendingHostResultDestroyed = true;
+        pendingHostResult.destroy();
+      }
+      if (pendingHostResult) {
+        if (this.hostResult === pendingHostResult) this.hostResult = null;
+        pendingHostResult = null;
+      }
+      this._roomCode = null;
+    };
+    this.pendingDispose = disposePending;
 
     try {
       // 1. Create PeerJS host peer
       const hostResult = await hostRoom(config.signal, {
         preferredRoomCode: config.preferredRoomCode,
       });
+      pendingHostResult = hostResult;
+      // `hostRoom` is only cancellation-aware while it is pending. Once it
+      // resolves, every following async boundary must re-check before making
+      // this peer discoverable or starting its local draft host.
+      abortIfRequested();
       this.hostResult = hostResult;
       this._roomCode = hostResult.roomCode;
       this.emit({ type: "roomCreated", roomCode: hostResult.roomCode });
@@ -192,24 +243,42 @@ export class DraftPodHostAdapter {
             hostPeerId: hostResult.peerId,
           });
         } catch (err) {
+          if (config.signal?.aborted || this.disposed) throw err;
           console.warn("[DraftPodHostAdapter] broker registration failed:", err);
           // Non-fatal: direct room code still works
         }
+        abortIfRequested();
       }
 
-      // 3. For cube drafts, the WASM CARD_DB must be populated before
-      //    create_multiplayer_draft is invoked (it resolves cube cards
-      //    against the database). The set branch reads its pool from JSON
-      //    and never touches CARD_DB.
-      if (config.poolInput.type === "Cube") {
+      // 3. Two pod shapes need the WASM CARD_DB, for different reasons.
+      //    A CUBE pod needs it before create_multiplayer_draft is invoked,
+      //    which resolves cube cards against the database. A COMMANDERDRAFT
+      //    pod needs it before get_bot_deck, which designates each bot seat's
+      //    commander (CR 903.3) and constrains that seat's deck to the
+      //    designation's colour identity (CR 903.5c) — both read off a
+      //    `CardFace`, so with no database draft-wasm refuses rather than
+      //    shipping an unjudged deck. A Set pool for any of the four
+      //    CR 905.1a kinds still reads its pool from JSON and needs no
+      //    database. A Chaos pool is set-backed too: draft-wasm resolves its
+      //    private assignments from supplied pool JSON and needs no card DB.
+      //
+      //    The kind gate is required, not stylistic: widening this to all
+      //    set-backed pools would turn the landed "skips the CARD_DB fetch for Set pods"
+      //    row (fixture `kind: "Premier"`) red.
+      if (config.poolInput.type === "Cube" || config.kind === "CommanderDraft") {
         const resp = await fetch(__CARD_DATA_URL__);
+        abortIfRequested();
         if (!resp.ok) {
           throw new Error(`Failed to load card data: ${resp.status}`);
         }
-        await new DraftAdapter().loadCardDatabase(await resp.text());
+        const cardData = await resp.text();
+        abortIfRequested();
+        await new DraftAdapter().loadCardDatabase(cardData);
+        abortIfRequested();
       }
 
       // 4. Create P2PDraftHost
+      abortIfRequested();
       const host = new P2PDraftHost(
         hostResult.peer,
         hostResult.onGuestConnected,
@@ -222,7 +291,9 @@ export class DraftPodHostAdapter {
         undefined, // default grace period
         config.persistenceId,
         hostResult.roomCode,
+        config.backupEndpoint,
       );
+      pendingHost = host;
 
       // 4. Wire host events
       this.hostEventUnsub = host.onEvent((event) => {
@@ -232,10 +303,13 @@ export class DraftPodHostAdapter {
       // 5. Check for persisted session to restore
       if (config.persistenceId) {
         const persisted = await loadDraftHostSession(config.persistenceId);
+        abortIfRequested();
         if (persisted) {
           const view = await host.restoreFromPersisted(persisted);
+          abortIfRequested();
           if (view) {
             this.setStatus(hostStatusForView(view));
+            this.emit({ type: "workspaceRestored", workspaceState: host.getHostWorkspaceState() });
             this.emit({ type: "viewUpdated", view });
           }
         }
@@ -243,16 +317,31 @@ export class DraftPodHostAdapter {
 
       // 6. Start accepting connections
       await host.initialize();
+      abortIfRequested();
       this.host = host;
+      pendingHost = null;
+      pendingHostResult = null;
+      if (this.pendingDispose === disposePending) this.pendingDispose = null;
 
       if (this._status === "connecting") {
         this.setStatus("lobby");
       }
     } catch (err) {
+      await disposePending();
+      if (config.signal?.aborted || this.disposed) {
+        this.setStatus("idle");
+        throw err;
+      }
       this.setStatus("error");
       const message = err instanceof Error ? err.message : String(err);
       this.emit({ type: "error", message });
       throw err;
+    } finally {
+      finishInitialization();
+      if (this.pendingDispose === disposePending) this.pendingDispose = null;
+      if (this.pendingInitialization === initializationSettled) {
+        this.pendingInitialization = null;
+      }
     }
   }
 
@@ -299,7 +388,7 @@ export class DraftPodHostAdapter {
         this.emit({
           type: "pickReceived",
           seatIndex: event.seatIndex,
-          cardInstanceId: event.cardInstanceId,
+          cardInstanceIds: event.cardInstanceIds,
         });
         break;
       case "roundComplete":
@@ -313,7 +402,13 @@ export class DraftPodHostAdapter {
         this.emit({ type: "deckSubmitted", seatIndex: event.seatIndex });
         break;
       case "allDecksSubmitted":
-        this.setStatus("pairing");
+        // Shape B: no status is written here. `allDecksSubmitted` fires for
+        // EVERY pod kind, and this arm cannot know which one — a
+        // `PostDraftPlay::CompleteImmediately` pod is already `Complete`
+        // (draft-core session.rs:902), so writing "pairing" here overwrote the
+        // reducer's own answer. The `viewUpdated` the host broadcasts on the
+        // next line of its funnel carries the engine-published status, and the
+        // `viewUpdated` case below maps it through `hostStatusForView`.
         this.emit({ type: "allDecksSubmitted" });
         break;
       case "draftPaused":
@@ -326,6 +421,17 @@ export class DraftPodHostAdapter {
         this.emit({ type: "error", message: event.message });
         break;
       case "viewUpdated":
+        // The engine-published view is the single status authority, matching
+        // the restore path (:249-250) and `draftStarted` (:306-307).
+        // `setStatus` goes BEFORE the emit, so the store sees `statusChanged`
+        // first (writing `phase` and a no-view `saveDraftPodProgress`) and
+        // `viewUpdated` second (writing `phase` again and the VIEW-CARRYING
+        // `saveDraftPodProgress`). That order is a readability choice, not a
+        // correctness one: `saveDraftPodProgress` re-reads meta and writes
+        // `view?.pool.length ?? meta.pickCount`, so the no-view form echoes
+        // back whatever the view-carrying form persisted rather than clearing
+        // it, and either order leaves the same record.
+        this.setStatus(hostStatusForView(event.view));
         this.emit({ type: "viewUpdated", view: event.view });
         break;
       case "pairingsGenerated":
@@ -341,7 +447,7 @@ export class DraftPodHostAdapter {
         break;
       case "roundAdvanced":
         this.setStatus("pairing");
-        this.emit({ type: "roundAdvanced", newRound: event.newRound });
+        this.emit({ type: "roundAdvanced" });
         break;
       case "timerExpired":
         this.emit({ type: "timerExpired" });
@@ -395,9 +501,9 @@ export class DraftPodHostAdapter {
     await this.host.startDraft(botFillEmptySeats);
   }
 
-  async submitPick(cardInstanceId: string): Promise<DraftPlayerView> {
+  async submitPick(cardInstanceIds: string[]): Promise<DraftPlayerView> {
     if (!this.host) throw new Error("Host not initialized");
-    return this.host.submitHostPick(cardInstanceId);
+    return this.host.submitHostPick(cardInstanceIds);
   }
 
   async submitPickWithDraftEffect(
@@ -408,9 +514,14 @@ export class DraftPodHostAdapter {
     return this.host.submitHostPickWithDraftEffect(effectCardInstanceId, cardInstanceIds);
   }
 
-  async submitDeck(mainDeck: string[]): Promise<DraftPlayerView> {
+  async submitDeck(mainDeck: string[], commanders: string[]): Promise<DraftPlayerView> {
     if (!this.host) throw new Error("Host not initialized");
-    return this.host.submitHostDeck(mainDeck);
+    return this.host.submitHostDeck(mainDeck, commanders);
+  }
+
+  async updateWorkspace(state: DraftWorkspaceState): Promise<void> {
+    if (!this.host) throw new Error("Host not initialized");
+    await this.host.updateHostWorkspace(state);
   }
 
   async getHostView(): Promise<DraftPlayerView> {
@@ -420,9 +531,9 @@ export class DraftPodHostAdapter {
 
   // ── Match coordination ──────────────────────────────────────────────
 
-  async generatePairings(round: number): Promise<void> {
+  async generatePairings(): Promise<void> {
     if (!this.host) throw new Error("Host not initialized");
-    await this.host.generatePairings(round);
+    await this.host.generatePairings();
   }
 
   async advanceRound(): Promise<void> {
@@ -438,6 +549,19 @@ export class DraftPodHostAdapter {
   async submitMatchSettlement(settlement: DraftMatchSettlement): Promise<void> {
     if (!this.host) throw new Error("Host not initialized");
     await this.host.submitHostMatchSettlement(settlement);
+  }
+
+  /**
+   * CR 903.13a: the N-seat deck payload a completed Commander pod launches its
+   * multiplayer game from. The store holds this wrapper, not the underlying
+   * `P2PDraftHost`, so every host call goes through a delegate like this one.
+   */
+  async podCommanderDeckPayload(
+    view: DraftPlayerView,
+    localSeat: number,
+  ): Promise<DraftMatchDeckPayload> {
+    if (!this.host) throw new Error("Host not initialized");
+    return this.host.podCommanderDeckPayload(view, localSeat);
   }
 
   async replaceSeatWithBot(seat: number): Promise<void> {
@@ -496,13 +620,18 @@ export class DraftPodHostAdapter {
   // ── Cleanup ────────────────────────────────────────────────────────
 
   async dispose(options: { preserveSession?: boolean } = {}): Promise<void> {
+    this.disposed = true;
+    const pendingDispose = this.pendingDispose;
+    const pendingInitialization = this.pendingInitialization;
+    if (pendingDispose) await pendingDispose();
+    if (pendingInitialization) await pendingInitialization;
     if (this.hostEventUnsub) {
       this.hostEventUnsub();
       this.hostEventUnsub = null;
     }
     if (this.host) {
       if (options.preserveSession) {
-        this.host.dispose();
+        await this.host.dispose();
       } else {
         await this.host.terminateDraft();
       }

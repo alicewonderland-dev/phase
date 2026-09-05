@@ -5,6 +5,10 @@
     "close": "Close",
     "closeNamed": "Close {{name}}"
   },
+  "debug": {
+    "exportAuthoritative": "Export Authoritative Game State",
+    "exportAuthoritativeTitle": "Download the engine-owned state used to diagnose and restore this game"
+  },
   "quantityRef": {
     "highestNumber": "the highest number",
     "lowestNumber": "the lowest number",
@@ -19,7 +23,8 @@
     "defaultEyebrow": "Workspace Tool"
   },
   "pausedBanner": {
-    "message": "Game paused — {{reason}}"
+    "message": "Game paused — {{reason}}",
+    "resume": "Resume game"
   },
   "fullscreen": {
     "enter": "Enter fullscreen",
@@ -60,7 +65,6 @@
   "comboDetector": {
     "label": "Combo Detector (experimental)",
     "title": "Detect infinite loops: end mandatory loops automatically and show ∞ resources (off by default)",
-    "on": "On",
     "off": "Off",
     "interactive": "Interactive"
   },
@@ -78,12 +82,18 @@
     "clickModeButton": "Click Mode Button",
     "shown": "Shown",
     "hidden": "Hidden",
-    "resume": "Resume",
+    "openGameLog": "Open Game Log",
+    "closeGameLog": "Close Game Log",
     "settings": "Settings",
     "boardLayoutSplit": "Split",
     "boardLayoutLegacy": "Legacy",
     "switchToSplitView": "Switch to split table view",
     "switchToLegacyView": "Switch to legacy focused view",
+    "multiplayerSplitLayoutNudge": {
+      "message": "See every opponent at once with split table view.",
+      "trySplit": "Try split view",
+      "dismiss": "Not now"
+    },
     "helpShortcuts": "Help & Shortcuts",
     "showAiHand": "Show AI Hand",
     "hideAiHand": "Hide AI Hand",
@@ -97,6 +107,7 @@
   },
   "volume": {
     "deviceBlocked": "Audio unavailable — system audio server is not responding. Restart the app to retry.",
+    "mediaUnavailable": "Audio unavailable — this system is missing the media components needed to play sound. Install your distribution's GStreamer plugin packages, then restart the app.",
     "mute": "Mute",
     "unmute": "Unmute",
     "volume": "Volume"
@@ -289,7 +300,15 @@
     "back": "Back",
     "settings": "Settings",
     "languageSettings": "Language ({{lang}}) — open settings",
-    "languageTitle": "Language: {{lang}}"
+    "languageTitle": "Language: {{lang}}",
+    "statusBanner": {
+      "dismiss": "Dismiss this message",
+      "severity": {
+        "info": "Notice",
+        "warning": "Heads up",
+        "critical": "Important"
+      }
+    }
   },
   "errorBoundary": {
     "heading": "Something went wrong",

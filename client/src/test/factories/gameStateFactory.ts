@@ -1,6 +1,7 @@
 import { Factory } from "fishery";
 
 import type {
+  CopyTargetSlot,
   FormatConfig,
   GameAction,
   GameObject,
@@ -35,6 +36,16 @@ type AssistPaymentWaitingFor = Extract<WaitingFor, { type: "AssistPayment" }>;
 type CastOfferWaitingFor = Extract<WaitingFor, { type: "CastOffer" }>;
 type LoopShortcutWaitingFor = Extract<WaitingFor, { type: "LoopShortcut" }>;
 type RespondToShortcutWaitingFor = Extract<WaitingFor, { type: "RespondToShortcut" }>;
+type CopyRetargetWaitingFor = Extract<WaitingFor, { type: "CopyRetarget" }>;
+type CopyTargetChoiceWaitingFor = Extract<WaitingFor, { type: "CopyTargetChoice" }>;
+type ExploreChoiceWaitingFor = Extract<WaitingFor, { type: "ExploreChoice" }>;
+type PopulateChoiceWaitingFor = Extract<WaitingFor, { type: "PopulateChoice" }>;
+type RetargetChoiceWaitingFor = Extract<WaitingFor, { type: "RetargetChoice" }>;
+type ReturnAsAuraTargetWaitingFor = Extract<WaitingFor, { type: "ReturnAsAuraTarget" }>;
+type ResolutionOptionalPaymentWaitingFor = Extract<
+  WaitingFor,
+  { type: "ResolutionOptionalPaymentChoice" }
+>;
 type WaitingForWithData = Extract<WaitingFor, { data: object }>;
 
 /**
@@ -121,12 +132,14 @@ export const formatConfigFactory = Factory.define<FormatConfig>(() => ({
   starting_life: 20,
   min_players: 2,
   max_players: 2,
-  deck_size: 60,
+  deck_size: { type: "Minimum", data: 60 },
   singleton: false,
   command_zone: false,
   commander_damage_threshold: null,
   range_of_influence: null,
   team_based: false,
+  sideboard_policy: { type: "Limited", data: 15 },
+  default_deck_copy_limit: { type: "UpTo", data: 4 },
   uses_commander: false,
   allow_debug_actions: false,
 }));
@@ -145,11 +158,12 @@ export const buildCommanderFormatConfig = (
     starting_life: 40,
     min_players: 2,
     max_players: 4,
-    deck_size: 100,
+    deck_size: { type: "Exactly", data: 100 },
     singleton: true,
     command_zone: true,
     commander_damage_threshold: 21,
     uses_commander: true,
+    default_deck_copy_limit: { type: "UpTo", data: 1 },
     ...overrides,
   });
 };
@@ -179,6 +193,20 @@ export const buildManaPaymentWaitingFor = (
 ): ManaPaymentWaitingFor => {
   return manaPaymentWaitingForFactory.withData(overrides.data ?? {}).build();
 };
+
+export class ResolutionOptionalPaymentWaitingForFactory extends PlayerWaitingForFactory<ResolutionOptionalPaymentWaitingFor> {}
+
+export const resolutionOptionalPaymentWaitingForFactory =
+  ResolutionOptionalPaymentWaitingForFactory.define(
+    (): ResolutionOptionalPaymentWaitingFor => ({
+      type: "ResolutionOptionalPaymentChoice",
+      data: {
+        player: 0,
+        source_id: 1,
+        costs: [{ index: 0, cost: { type: "Mana", cost: { type: "Cost", shards: [], generic: 1 } } }],
+      },
+    }),
+  );
 
 export class UntapChoiceWaitingForFactory extends PlayerWaitingForFactory<UntapChoiceWaitingFor> {}
 
@@ -216,6 +244,16 @@ export const buildTargetSelectionSlot = (
   overrides: Partial<TargetSelectionSlot> = {},
 ): TargetSelectionSlot => {
   return { ...targetSelectionSlotFactory.build(), ...overrides };
+};
+
+export const copyTargetSlotFactory = Factory.define<CopyTargetSlot>(() => ({
+  legal_alternatives: [],
+}));
+
+export const buildCopyTargetSlot = (
+  overrides: Partial<CopyTargetSlot> = {},
+): CopyTargetSlot => {
+  return { ...copyTargetSlotFactory.build(), ...overrides };
 };
 
 export const targetSelectionProgressFactory =
@@ -265,6 +303,111 @@ export const buildTriggerTargetSelectionWaitingFor = (
   overrides: Partial<TriggerTargetSelectionWaitingFor> = {},
 ): TriggerTargetSelectionWaitingFor => {
   return triggerTargetSelectionWaitingForFactory.withData(overrides.data ?? {}).build();
+};
+
+export class CopyRetargetWaitingForFactory extends PlayerWaitingForFactory<CopyRetargetWaitingFor> {}
+
+export const copyRetargetWaitingForFactory =
+  CopyRetargetWaitingForFactory.define((): CopyRetargetWaitingFor => ({
+    type: "CopyRetarget",
+    data: {
+      player: 0,
+      copy_id: 1,
+      current_slot: 0,
+      target_slots: [buildCopyTargetSlot()],
+    },
+  }));
+
+export const buildCopyRetargetWaitingFor = (
+  overrides: Partial<CopyRetargetWaitingFor> = {},
+): CopyRetargetWaitingFor => {
+  return copyRetargetWaitingForFactory.withData(overrides.data ?? {}).build();
+};
+
+export class CopyTargetChoiceWaitingForFactory
+  extends PlayerWaitingForFactory<CopyTargetChoiceWaitingFor> {}
+
+export const copyTargetChoiceWaitingForFactory =
+  CopyTargetChoiceWaitingForFactory.define((): CopyTargetChoiceWaitingFor => ({
+    type: "CopyTargetChoice",
+    data: { player: 0, source_id: 1, valid_targets: [] },
+  }));
+
+export const buildCopyTargetChoiceWaitingFor = (
+  overrides: Partial<CopyTargetChoiceWaitingFor> = {},
+): CopyTargetChoiceWaitingFor => {
+  return copyTargetChoiceWaitingForFactory.withData(overrides.data ?? {}).build();
+};
+
+export class ExploreChoiceWaitingForFactory extends PlayerWaitingForFactory<ExploreChoiceWaitingFor> {}
+
+export const exploreChoiceWaitingForFactory =
+  ExploreChoiceWaitingForFactory.define((): ExploreChoiceWaitingFor => ({
+    type: "ExploreChoice",
+    data: { player: 0, source_id: 1, choosable: [], remaining: [], pending_effect: {} },
+  }));
+
+export const buildExploreChoiceWaitingFor = (
+  overrides: Partial<ExploreChoiceWaitingFor> = {},
+): ExploreChoiceWaitingFor => {
+  return exploreChoiceWaitingForFactory.withData(overrides.data ?? {}).build();
+};
+
+export class PopulateChoiceWaitingForFactory extends PlayerWaitingForFactory<PopulateChoiceWaitingFor> {}
+
+export const populateChoiceWaitingForFactory =
+  PopulateChoiceWaitingForFactory.define((): PopulateChoiceWaitingFor => ({
+    type: "PopulateChoice",
+    data: { player: 0, source_id: 1, valid_tokens: [] },
+  }));
+
+export const buildPopulateChoiceWaitingFor = (
+  overrides: Partial<PopulateChoiceWaitingFor> = {},
+): PopulateChoiceWaitingFor => {
+  return populateChoiceWaitingForFactory.withData(overrides.data ?? {}).build();
+};
+
+export class RetargetChoiceWaitingForFactory extends PlayerWaitingForFactory<RetargetChoiceWaitingFor> {}
+
+export const retargetChoiceWaitingForFactory =
+  RetargetChoiceWaitingForFactory.define((): RetargetChoiceWaitingFor => ({
+    type: "RetargetChoice",
+    data: {
+      player: 0,
+      stack_entry_index: 0,
+      scope: { type: "Single" },
+      current_targets: [],
+      slots: [],
+      slot_pools: [],
+      legal_new_targets: [],
+    },
+  }));
+
+export const buildRetargetChoiceWaitingFor = (
+  overrides: Partial<RetargetChoiceWaitingFor> = {},
+): RetargetChoiceWaitingFor => {
+  return retargetChoiceWaitingForFactory.withData(overrides.data ?? {}).build();
+};
+
+export class ReturnAsAuraTargetWaitingForFactory
+  extends PlayerWaitingForFactory<ReturnAsAuraTargetWaitingFor> {}
+
+export const returnAsAuraTargetWaitingForFactory =
+  ReturnAsAuraTargetWaitingForFactory.define((): ReturnAsAuraTargetWaitingFor => ({
+    type: "ReturnAsAuraTarget",
+    data: {
+      player: 0,
+      source_id: 1,
+      returned_id: 2,
+      legal_targets: [],
+      pending_effect: null,
+    },
+  }));
+
+export const buildReturnAsAuraTargetWaitingFor = (
+  overrides: Partial<ReturnAsAuraTargetWaitingFor> = {},
+): ReturnAsAuraTargetWaitingFor => {
+  return returnAsAuraTargetWaitingForFactory.withData(overrides.data ?? {}).build();
 };
 
 export class ChooseXValueWaitingForFactory extends PlayerWaitingForFactory<ChooseXValueWaitingFor> {}
@@ -395,6 +538,14 @@ export class WaitingForVariantFactory extends Factory<WaitingFor, WaitingForTran
     return this.variant(manaPaymentWaitingForFactory.forPlayer(player).build());
   }
 
+  resolutionOptionalPayment(
+    data: Partial<ResolutionOptionalPaymentWaitingFor["data"]> = {},
+  ) {
+    return this.variant(
+      resolutionOptionalPaymentWaitingForFactory.withData(data).build(),
+    );
+  }
+
   untapChoice(data: Partial<UntapChoiceWaitingFor["data"]> = {}) {
     return this.variant(untapChoiceWaitingForFactory.withData(data).build());
   }
@@ -407,6 +558,18 @@ export class WaitingForVariantFactory extends Factory<WaitingFor, WaitingForTran
     data: Partial<TriggerTargetSelectionWaitingFor["data"]> = {},
   ) {
     return this.variant(triggerTargetSelectionWaitingForFactory.withData(data).build());
+  }
+
+  copyTargetChoice(data: Partial<CopyTargetChoiceWaitingFor["data"]> = {}) {
+    return this.variant(copyTargetChoiceWaitingForFactory.withData(data).build());
+  }
+
+  exploreChoice(data: Partial<ExploreChoiceWaitingFor["data"]> = {}) {
+    return this.variant(exploreChoiceWaitingForFactory.withData(data).build());
+  }
+
+  populateChoice(data: Partial<PopulateChoiceWaitingFor["data"]> = {}) {
+    return this.variant(populateChoiceWaitingForFactory.withData(data).build());
   }
 
   chooseXValue(data: Partial<ChooseXValueWaitingFor["data"]> = {}) {
@@ -642,6 +805,12 @@ export class GameStateFactory extends Factory<GameState> {
     return this.waitingFor(waitingForFactory.manaPayment(player).build());
   }
 
+  resolutionOptionalPayment(
+    data: Partial<ResolutionOptionalPaymentWaitingFor["data"]> = {},
+  ) {
+    return this.waitingFor(waitingForFactory.resolutionOptionalPayment(data).build());
+  }
+
   untapChoice(data: Partial<UntapChoiceWaitingFor["data"]> = {}) {
     return this.waitingFor(waitingForFactory.untapChoice(data).build());
   }
@@ -654,6 +823,18 @@ export class GameStateFactory extends Factory<GameState> {
     data: Partial<TriggerTargetSelectionWaitingFor["data"]> = {},
   ) {
     return this.waitingFor(waitingForFactory.triggerTargetSelection(data).build());
+  }
+
+  copyTargetChoice(data: Partial<CopyTargetChoiceWaitingFor["data"]> = {}) {
+    return this.waitingFor(waitingForFactory.copyTargetChoice(data).build());
+  }
+
+  exploreChoice(data: Partial<ExploreChoiceWaitingFor["data"]> = {}) {
+    return this.waitingFor(waitingForFactory.exploreChoice(data).build());
+  }
+
+  populateChoice(data: Partial<PopulateChoiceWaitingFor["data"]> = {}) {
+    return this.waitingFor(waitingForFactory.populateChoice(data).build());
   }
 
   chooseXValue(data: Partial<ChooseXValueWaitingFor["data"]> = {}) {

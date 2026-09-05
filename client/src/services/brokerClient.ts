@@ -7,11 +7,41 @@ import type {
   PeerInfo,
 } from "../adapter/types";
 import type { ServerInfo } from "../adapter/ws-adapter";
+import { isFormatConfigShape } from "../adapter/format-config-shape";
 import {
   HandshakeError,
   openPhaseSocket,
   type PhaseSocket,
 } from "./openPhaseSocket";
+
+/**
+ * Structurally validate the `format_config` on a broker-sent `PeerInfo` /
+ * `JoinTargetInfo` before the rest of the client trusts it.
+ *
+ * These frames arrive via `JSON.parse` and are cast straight to their TS type,
+ * which is erased at runtime — nothing else validates their shape, and this is
+ * the one wire direction where no per-frame rejection exists (see
+ * `MIN_SUPPORTED_LOBBY_PROTOCOL`'s doc in `crates/lobby-broker/src/protocol.rs`).
+ * A stale or malformed config would otherwise reach code reading
+ * `.min_players`, `.deck_size.type`, `.custom_rules`, and so on.
+ *
+ * A bad config is dropped to `null` rather than failing the whole frame:
+ * `format_config` is already optional on both types, every consumer handles its
+ * absence (they read it as `format_config?.format ?? fallback`), and the
+ * peer id / game code the frame primarily carries are still good. Failing the
+ * frame would deny a join over a field used only for a pre-flight hint.
+ */
+function withValidatedFormatConfig<T extends { format_config?: FormatConfig | null }>(
+  info: T,
+): T {
+  if (info.format_config == null) return info;
+  if (isFormatConfigShape(info.format_config)) return info;
+  console.warn(
+    "[broker] dropping a malformed format_config from a lobby frame; "
+      + "the room's format will be treated as unknown",
+  );
+  return { ...info, format_config: null };
+}
 
 export interface RegisterHostRequest {
   /** PeerJS peer ID guests dial to reach the host's engine. */
@@ -106,7 +136,11 @@ export async function openBrokerClient(
   wsUrl: string,
   opts: OpenBrokerOptions = {},
 ): Promise<BrokerClient> {
-  const socket = await openPhaseSocket(wsUrl, opts);
+  const socket = await openPhaseSocket(wsUrl, { ...opts, surface: "lobby" });
+  // Load-bearing for surface safety, not just for API shape: `registerHost`
+  // sends `CreateGameWithSettings`, which a `Full` server answers by creating a
+  // server-run game and streaming its state. Refusing every non-`LobbyOnly`
+  // server here is what keeps that frame off a lobby-surface socket.
   if (socket.serverInfo.mode !== "LobbyOnly") {
     socket.close();
     throw new HandshakeError(
@@ -279,10 +313,39 @@ export function resolveGuestOver(
   password?: string,
   opts: ResolveGuestOptions = {},
 ): Promise<ResolveResult> {
-  const { ws } = socket;
+  const { ws, serverInfo } = socket;
   const { signal, timeoutMs = 10_000 } = opts;
 
   return new Promise<ResolveResult>((resolve) => {
+    // SINGLE AUTHORITY for putting `JoinGameWithPassword` on the wire, and the
+    // only frame a lobby-surface socket sends that a `Full` server can answer
+    // off its server-run game path.
+    //
+    // This resolver asks for `PeerInfo` — the peer id of a P2P host. A `Full`
+    // server has none to give: both of its lobby registrations hardcode
+    // `host_peer_id: String::new()` ("Full-mode server runs the engine itself —
+    // no PeerJS peer is involved"), so every row it publishes carries
+    // `is_p2p: false` and no caller should route a Full server's code here.
+    //
+    // Sending anyway would be worse than useless. The frame skips the broker
+    // branch on a `Full` server (`if matches!(mode, ServerMode::LobbyOnly)` in
+    // `crates/phase-server/src/main.rs`), attaches a session, and replies
+    // `SessionAttached` + `StateUpdate` — neither of which the listener below
+    // handles, so the promise would hang to its timeout and report
+    // `connection_lost` AFTER the server had already seated the guest. Refusing
+    // every `Full` server, not merely the version-mismatched ones, is what makes
+    // "a relaxed lobby socket never carries a full-game join" unconditional.
+    // Browsing such a server's lobby stays available; only joining through this
+    // resolver is refused.
+    if (serverInfo.mode === "Full") {
+      resolve({
+        ok: false,
+        reason: "error",
+        message:
+          "This server runs its own games, so it has no peer-to-peer room to join.",
+      });
+      return;
+    }
     if (ws.readyState !== WebSocket.OPEN) {
       resolve({
         ok: false,
@@ -313,7 +376,7 @@ export function resolveGuestOver(
         const data = msg.data as PeerInfo;
         if (data.game_code !== code) return;
         cleanup();
-        resolve({ ok: true, peerInfo: data });
+        resolve({ ok: true, peerInfo: withValidatedFormatConfig(data) });
       } else if (msg.type === "PasswordRequired") {
         const data = msg.data as { game_code: string };
         if (data.game_code !== code) return;
@@ -431,7 +494,7 @@ export function lookupJoinTargetOver(
         const data = msg.data as JoinTargetInfo;
         if (data.game_code !== code) return;
         cleanup();
-        resolve({ ok: true, info: data });
+        resolve({ ok: true, info: withValidatedFormatConfig(data) });
       } else if (msg.type === "PasswordRequired") {
         const data = msg.data as { game_code: string };
         if (data.game_code !== code) return;

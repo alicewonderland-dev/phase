@@ -15,6 +15,7 @@ import { P2PDraftHost } from "../p2p-draft-host";
 import type { DraftMatchBinding, DraftMatchLaunch, DraftP2PMessage } from "../../network/draftProtocol";
 import type { DraftPlayerView, PairingView } from "../draft-adapter";
 import { draftIntergameDigest, type DraftIntergameCommand } from "../../services/intergameCommandLedger";
+import type { DraftWorkspaceState } from "../../components/draft/workspace/types";
 
 describe("P2PDraftHost Bo3", () => {
   describe("durable intergame ledger", () => {
@@ -32,10 +33,10 @@ describe("P2PDraftHost Bo3", () => {
       };
     }
 
-    it("authorizes both Traditional sideboards only after both held commands arrive", () => {
+    it("authorizes both Traditional sideboards only after both held commands arrive", async () => {
       const host = new P2PDraftHost(
         { id: "host" } as never, () => () => {},
-        { type: "Set", data: { set_pool_json: "{}" } } as never,
+        { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } } as never,
         "Traditional", 8, "Host", "Swiss", "Casual",
       );
       const sent = new Map<number, DraftP2PMessage[]>([[1, []], [2, []]]);
@@ -64,7 +65,7 @@ describe("P2PDraftHost Bo3", () => {
       host.submitAuthorized(1, command(1, launch1));
       expect(sent.get(1)).toEqual([]);
       host.submitAuthorized(2, command(2, launch2));
-      expect(sent.get(1)?.[0]?.type).toBe("draft_bo3_intergame_authorized");
+      await vi.waitFor(() => expect(sent.get(1)?.[0]?.type).toBe("draft_bo3_intergame_authorized"));
       expect(sent.get(2)?.[0]?.type).toBe("draft_bo3_intergame_authorized");
       expect(privateHost.intergameCommands.snapshot().every((entry) => entry.status === "Executing")).toBe(true);
     });
@@ -72,7 +73,7 @@ describe("P2PDraftHost Bo3", () => {
     it("rejects forged and stale held commands before authorization", () => {
       const host = new P2PDraftHost(
         { id: "host" } as never, () => () => {},
-        { type: "Set", data: { set_pool_json: "{}" } } as never,
+        { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } } as never,
         "Traditional", 8, "Host", "Swiss", "Casual",
       );
       const privateHost = host as unknown as {
@@ -98,7 +99,7 @@ describe("P2PDraftHost Bo3", () => {
     it("rejects a sideboard submission that changes the registered deck pool", () => {
       const host = new P2PDraftHost(
         { id: "host" } as never, () => () => {},
-        { type: "Set", data: { set_pool_json: "{}" } } as never,
+        { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } } as never,
         "Traditional", 8, "Host", "Swiss", "Casual",
       );
       const sent: DraftP2PMessage[] = [];
@@ -137,12 +138,12 @@ describe("P2PDraftHost Bo3", () => {
   });
 
   describe("BO3-02: sideboard timer auto-submit", () => {
-    it("issues unchanged deck defaults through the authorized intergame ledger", () => {
+      it("issues unchanged deck defaults through the authorized intergame ledger", async () => {
       vi.useFakeTimers();
       try {
         const host = new P2PDraftHost(
           { id: "host" } as never, () => () => {},
-          { type: "Set", data: { set_pool_json: "{}" } } as never,
+          { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } } as never,
           "Traditional", 8, "Host", "Swiss", "Competitive",
         );
         const sent = new Map<number, DraftP2PMessage[]>([[1, []], [2, []]]);
@@ -198,7 +199,7 @@ describe("P2PDraftHost Bo3", () => {
         vi.advanceTimersByTime(60_000);
 
         for (const seat of [1, 2]) {
-          expect(sent.get(seat)).toContainEqual(expect.objectContaining({
+          await vi.waitFor(() => expect(sent.get(seat)).toContainEqual(expect.objectContaining({
             type: "draft_bo3_intergame_authorized",
             command: expect.objectContaining({
               seat,
@@ -208,7 +209,7 @@ describe("P2PDraftHost Bo3", () => {
                 sideboard: [{ name: "Negate", count: 1 }],
               },
             }),
-          }));
+          })));
         }
         expect(privateHost.intergameCommands.snapshot().every((command) => command.status === "Executing")).toBe(true);
         host.dispose();
@@ -217,12 +218,12 @@ describe("P2PDraftHost Bo3", () => {
       }
     });
 
-    it("issues the play-first default through the same ledger when the choice timer expires", () => {
+      it("issues the play-first default through the same ledger when the choice timer expires", async () => {
       vi.useFakeTimers();
       try {
         const host = new P2PDraftHost(
           { id: "host" } as never, () => () => {},
-          { type: "Set", data: { set_pool_json: "{}" } } as never,
+          { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } } as never,
           "Traditional", 8, "Host", "Swiss", "Competitive",
         );
         const launch = {
@@ -257,10 +258,10 @@ describe("P2PDraftHost Bo3", () => {
         privateHost.startPlayDrawTimer("bo3-1");
         vi.advanceTimersByTime(10_000);
 
-        expect(sent).toContainEqual(expect.objectContaining({
+        await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
           type: "draft_bo3_intergame_authorized",
           command: expect.objectContaining({ payload: { type: "ChoosePlayDraw", playFirst: true } }),
-        }));
+        })));
         host.dispose();
       } finally {
         vi.useRealTimers();
@@ -269,10 +270,10 @@ describe("P2PDraftHost Bo3", () => {
   });
 
   describe("BO3-03: no timer in Casual", () => {
-    it("publishes an untimed sideboard prompt without arming the production timer", () => {
+    it("publishes an untimed sideboard prompt without arming the production timer", async () => {
       const host = new P2PDraftHost(
         { id: "host" } as never, () => () => {},
-        { type: "Set", data: { set_pool_json: "{}" } } as never,
+        { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } } as never,
         "Traditional", 8, "Host", "Swiss", "Casual",
       );
       const events: unknown[] = [];
@@ -283,10 +284,10 @@ describe("P2PDraftHost Bo3", () => {
       );
 
       expect(host.activeTimerContext).toBeNull();
-      expect(events).toContainEqual(expect.objectContaining({
+      await vi.waitFor(() => expect(events).toContainEqual(expect.objectContaining({
         type: "bo3SideboardPrompt",
         timerMs: 0,
-      }));
+      })));
       host.dispose();
     });
   });
@@ -380,7 +381,7 @@ describe("P2PDraftHost Bo3", () => {
       host = new P2PDraftHost(
         { id: "host" } as never,
         () => () => {},
-        { type: "Set", data: { set_pool_json: "{}" } } as never,
+        { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } } as never,
         "Premier",
         8,
         "Host",
@@ -418,6 +419,63 @@ describe("P2PDraftHost Bo3", () => {
       ]);
     });
 
+    it("assigns a bot match settlement to the human even when the bot has the lower seat", async () => {
+      const botPairing = pairing("bot-12", 2, 1, 2);
+      const botView = {
+        current_round: 2,
+        seats: [
+          { seat_index: 1, is_bot: true },
+          { seat_index: 2, is_bot: false },
+        ],
+      } as DraftPlayerView;
+      const privateHost = host as unknown as {
+        adapter: { exportSession: () => Promise<string> };
+        botDeckForSeat: () => Promise<{ main_deck: string[]; sideboard: string[]; commander: string[] }>;
+        sendMatchLaunch: (seat: number, launch: DraftMatchLaunch) => Promise<void>;
+        dispatchMatchLaunch: (pairing: PairingView, view: DraftPlayerView) => Promise<void>;
+        matchBindings: Map<string, DraftMatchBinding>;
+      };
+      privateHost.adapter.exportSession = vi.fn(async () => JSON.stringify({
+        pools: [[], [], []],
+        submitted_decks: {
+          human: { seat: 2, main_deck: ["Plains"] },
+        },
+      }));
+      privateHost.botDeckForSeat = vi.fn(async () => ({ main_deck: ["Island"], sideboard: [], commander: [] }));
+      privateHost.sendMatchLaunch = vi.fn(async () => {});
+
+      await privateHost.dispatchMatchLaunch(botPairing, botView);
+
+      expect(privateHost.sendMatchLaunch).toHaveBeenCalledWith(2, expect.objectContaining({
+        type: "Bot",
+        binding: expect.objectContaining({ matchAuthoritySeat: 2 }),
+      }));
+      const issuedBinding = privateHost.matchBindings.get("bot-12")!;
+      setHostView({ current_round: 2, pairings: [botPairing] });
+      await deliverSettlement(2, issuedBinding);
+      expect(reportSpy).toHaveBeenCalledWith("bot-12", 1);
+    });
+
+    it("does not create a participant binding for a bot-only pairing", async () => {
+      const botPairing = pairing("bots-12", 2, 1, 2);
+      const botView = {
+        current_round: 2,
+        seats: [
+          { seat_index: 1, is_bot: true },
+          { seat_index: 2, is_bot: true },
+        ],
+      } as DraftPlayerView;
+      const privateHost = host as unknown as {
+        dispatchMatchLaunch: (pairing: PairingView, view: DraftPlayerView) => Promise<void>;
+        matchBindings: Map<string, DraftMatchBinding>;
+      };
+
+      await privateHost.dispatchMatchLaunch(botPairing, botView);
+
+      expect(privateHost.matchBindings.has("bots-12")).toBe(false);
+      expect(reportSpy).toHaveBeenCalledWith("bots-12", 1);
+    });
+
     it("rejects the raw result shape", async () => {
       await deliverRaw(1, "m-12", 1);
       expect(reportSpy).not.toHaveBeenCalled();
@@ -445,5 +503,98 @@ describe("P2PDraftHost Bo3", () => {
         { type: "draft_error", reason: "Unauthorized match settlement" },
       ]);
     });
+  });
+
+  it("keeps Traditional authorities independent from recoverable workspace updates", async () => {
+    const host = new P2PDraftHost(
+      { id: "host" } as never,
+      () => () => {},
+      { type: "Set", data: { set_pool_json: "{}" } } as never,
+      "Traditional",
+      8,
+      "Host",
+      "Swiss",
+      "Competitive",
+    );
+    const privateHost = host as unknown as {
+      adapter: { getViewForSeat: (seat: number) => Promise<DraftPlayerView> };
+      bo3State: Map<string, unknown>;
+      launchDigests: Map<string, Map<number, string>>;
+      matchDecks: Map<string, Map<number, { main_deck: string[]; sideboard: string[]; commander: string[] }>>;
+      intergameCommands: {
+        hold: (command: Omit<DraftIntergameCommand, "status" | "payloadDigest">) => DraftIntergameCommand;
+        snapshot: () => DraftIntergameCommand[];
+      };
+      timerContext: "pick" | "sideboard" | "playdraw" | null;
+      persistSessionStrict: () => Promise<void>;
+      perSeatWorkspaceSnapshots: Map<number, DraftWorkspaceState>;
+    };
+    privateHost.adapter = {
+      getViewForSeat: vi.fn(async () => ({
+        pool: [{
+          instance_id: "pool-card",
+          name: "Pool Card",
+          set_code: "TST",
+          collector_number: "1",
+          rarity: "common",
+          colors: [],
+          cmc: 1,
+          type_line: "Creature",
+        }],
+      } as unknown as DraftPlayerView)),
+    };
+    privateHost.bo3State.set("bo3-1", {
+      seatA: 0,
+      seatB: 1,
+      submittedA: false,
+      submittedB: false,
+      loserSeat: 0,
+      gameNumber: 2,
+      score: { p0_wins: 0, p1_wins: 1, draws: 0 },
+      decks: [],
+    });
+    privateHost.launchDigests.set("bo3-1", new Map([[0, "launch-digest"]]));
+    privateHost.matchDecks.set("bo3-1", new Map([[
+      0,
+      { main_deck: ["Pool Card"], sideboard: [], commander: [] },
+    ]]));
+    privateHost.intergameCommands.hold({
+      commandId: "held-1",
+      matchId: "bo3-1",
+      gameNumber: 2,
+      seat: 0,
+      payload: { type: "ChoosePlayDraw", playFirst: true },
+      launchPayload: { matchId: "bo3-1", seat: 0 },
+      launchDigest: "launch-digest",
+    });
+    privateHost.timerContext = "sideboard";
+    privateHost.persistSessionStrict = vi.fn(async () => {});
+    const authorityBefore = {
+      bo3: structuredClone([...privateHost.bo3State]),
+      launch: structuredClone([...privateHost.launchDigests]),
+      decks: structuredClone([...privateHost.matchDecks]),
+      commands: privateHost.intergameCommands.snapshot(),
+      timer: privateHost.timerContext,
+    };
+    const valid = (): DraftWorkspaceState => ({
+      schemaVersion: 1,
+      placements: {},
+      virtualBasics: [],
+    });
+
+    await host.updateHostWorkspace(valid());
+    expect(privateHost.perSeatWorkspaceSnapshots.get(0)?.placements).toHaveProperty("pool-card");
+    await expect(host.updateHostWorkspace({
+      ...valid(),
+      placements: { bad: { zone: "deck", row: 2, column: 0, order: 0 } },
+    })).rejects.toThrow("invalid row");
+    await host.updateHostWorkspace(valid());
+
+    expect(privateHost.bo3State).toEqual(new Map(authorityBefore.bo3));
+    expect(privateHost.launchDigests).toEqual(new Map(authorityBefore.launch));
+    expect(privateHost.matchDecks).toEqual(new Map(authorityBefore.decks));
+    expect(privateHost.intergameCommands.snapshot()).toEqual(authorityBefore.commands);
+    expect(privateHost.timerContext).toBe(authorityBefore.timer);
+    expect(privateHost.persistSessionStrict).toHaveBeenCalledTimes(2);
   });
 });

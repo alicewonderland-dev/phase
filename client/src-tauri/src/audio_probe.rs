@@ -27,7 +27,9 @@
 //! init, not worth a teardown path.
 
 use serde::Serialize;
+#[cfg(any(target_os = "linux", all(test, unix)))]
 use std::process::{Command, ExitStatus, Stdio};
+#[cfg(any(target_os = "linux", all(test, unix)))]
 use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
 
@@ -35,10 +37,14 @@ use tokio::sync::OnceCell;
 #[serde(rename_all = "snake_case")]
 pub enum AudioBootHealth {
     Healthy,
+    // This serialized verdict remains part of the command contract on mobile,
+    // even though only Linux can produce it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Wedged,
     Unknown,
 }
 
+#[cfg(target_os = "linux")]
 const PROBE_TIMEOUT: Duration = Duration::from_millis(3000);
 
 static VERDICT: OnceCell<AudioBootHealth> = OnceCell::const_new();
@@ -55,6 +61,7 @@ async fn resolve_verdict() -> AudioBootHealth {
 
 /// Start resolving the verdict in the background so the frontend's
 /// `audio_boot_health` invoke usually finds it already cached.
+#[cfg(desktop)]
 pub fn prewarm() {
     tauri::async_runtime::spawn(async {
         let _ = resolve_verdict().await;
@@ -138,6 +145,7 @@ fn write_silence_wav() -> Option<std::path::PathBuf> {
     Some(path)
 }
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
 enum ProbeOutcome {
     Passed,
     FailedFast,
@@ -148,6 +156,7 @@ enum ProbeOutcome {
     TimedOut(#[cfg_attr(not(test), allow(dead_code))] ExitStatus),
 }
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn run_single_probe(cmd: &mut Command, timeout: Duration) -> ProbeOutcome {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -183,6 +192,7 @@ fn run_single_probe(cmd: &mut Command, timeout: Duration) -> ProbeOutcome {
     }
 }
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn run_probe_ladder(ladder: Vec<Command>, timeout: Duration) -> AudioBootHealth {
     for mut cmd in ladder {
         match run_single_probe(&mut cmd, timeout) {

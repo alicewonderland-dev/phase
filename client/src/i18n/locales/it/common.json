@@ -5,6 +5,10 @@
     "close": "Chiudi",
     "closeNamed": "Chiudi {{name}}"
   },
+  "debug": {
+    "exportAuthoritative": "Esporta lo stato di gioco autorevole",
+    "exportAuthoritativeTitle": "Scarica lo stato gestito dal motore usato per diagnosticare e ripristinare questa partita"
+  },
   "quantityRef": {
     "highestNumber": "il numero più alto",
     "lowestNumber": "il numero più basso",
@@ -19,7 +23,8 @@
     "defaultEyebrow": "Strumento dello spazio di lavoro"
   },
   "pausedBanner": {
-    "message": "Partita in pausa — {{reason}}"
+    "message": "Partita in pausa — {{reason}}",
+    "resume": "Riprendi partita"
   },
   "fullscreen": {
     "enter": "Attiva schermo intero",
@@ -60,7 +65,6 @@
   "comboDetector": {
     "label": "Rilevatore di combo (sperimentale)",
     "title": "Rileva i loop infiniti: termina automaticamente i loop obbligatori e mostra le risorse ∞ (disattivato per impostazione predefinita)",
-    "on": "Attivo",
     "off": "Disattivato",
     "interactive": "Interattivo"
   },
@@ -78,12 +82,18 @@
     "clickModeButton": "Pulsante modalità clic",
     "shown": "Visibile",
     "hidden": "Nascosto",
-    "resume": "Riprendi",
+    "openGameLog": "Apri il registro di gioco",
+    "closeGameLog": "Chiudi il registro di gioco",
     "settings": "Impostazioni",
     "boardLayoutSplit": "Diviso",
     "boardLayoutLegacy": "Legacy",
     "switchToSplitView": "Passa alla vista tavolo diviso",
     "switchToLegacyView": "Passa alla vista legacy focalizzata",
+    "multiplayerSplitLayoutNudge": {
+      "message": "Vedi tutti gli avversari insieme con la vista tavolo diviso.",
+      "trySplit": "Prova la vista divisa",
+      "dismiss": "Non ora"
+    },
     "helpShortcuts": "Aiuto e scorciatoie",
     "showAiHand": "Mostra mano IA",
     "hideAiHand": "Nascondi mano IA",
@@ -97,6 +107,7 @@
   },
   "volume": {
     "deviceBlocked": "Audio non disponibile — il server audio di sistema non risponde. Riavvia l'app per riprovare.",
+    "mediaUnavailable": "Audio non disponibile — in questo sistema mancano i componenti multimediali necessari per riprodurre l'audio. Installa i pacchetti dei plugin GStreamer della tua distribuzione e riavvia l'app.",
     "mute": "Disattiva audio",
     "unmute": "Riattiva audio",
     "volume": "Volume"
@@ -289,7 +300,15 @@
     "back": "Indietro",
     "settings": "Impostazioni",
     "languageSettings": "Lingua ({{lang}}) — apri impostazioni",
-    "languageTitle": "Lingua: {{lang}}"
+    "languageTitle": "Lingua: {{lang}}",
+    "statusBanner": {
+      "dismiss": "Ignora questo messaggio",
+      "severity": {
+        "info": "Avviso",
+        "warning": "Attenzione",
+        "critical": "Importante"
+      }
+    }
   },
   "errorBoundary": {
     "heading": "Qualcosa è andato storto",

@@ -6,15 +6,17 @@ use engine::game::combat::{
 use engine::game::dungeon::DungeonProgress;
 use engine::game::game_object::{BackFaceData, GameObject, ProtectionStartSnapshot};
 use engine::game::printed_cards::intrinsic_copiable_values;
-use engine::types::ability::ThisWayCause;
+use engine::types::ability::{Effect, KeywordAction, ResolvedAbility, ThisWayCause};
 use engine::types::attribution::ObjectAttribution;
 use engine::types::card_type::CardType;
 use engine::types::definitions::Definitions;
 use engine::types::events::{GameEvent, PlayerActionKind};
 use engine::types::game_state::{
     AutoPassMode, LandPlayRecord, LiminalEntrant, LiminalEntry, LinkedExileSnapshot,
-    PendingConniveReentry, PersistedGameState, PriorityPassingMode, SpellCastRecord,
-    StackPaidSnapshot, TokenProjection, WaitingFor,
+    PendingConniveReentry, PersistedGameState, PriorityPassingMode, SpellCastRecord, StackEntry,
+    StackEntryKind, StackPaidSnapshot, StackResolutionAutoPassOverlay, StackResolutionBudget,
+    StackResolutionEntryFence, StackResolutionPolicy, StackResolutionSession, TokenProjection,
+    WaitingFor,
 };
 use engine::types::identifiers::{CardId, ObjectId, TrackedSetId};
 use engine::types::keywords::ProtectionTarget;
@@ -29,6 +31,7 @@ const HASH_SET: &str = "serialize_with=\"crate::types::deterministic_serde::hash
 const OPTION_HASH_SET: &str =
     "serialize_with=\"crate::types::deterministic_serde::option_hash_set\"";
 const HASH_MAP: &str = "serialize_with=\"crate::types::deterministic_serde::hash_map\"";
+const HASH_MAP_ENTRIES: &str = "with=\"crate::types::deterministic_serde::hash_map_entries\"";
 const OPTION_HASH_MAP: &str =
     "serialize_with=\"crate::types::deterministic_serde::option_hash_map\"";
 const VEC_HASH_MAP: &str = "serialize_with=\"crate::types::deterministic_serde::vec_hash_map\"";
@@ -50,7 +53,6 @@ enum Classification {
     Canonical(&'static str),
     SerdeSkip,
     DeserializeOnlyOrRuntime,
-    NonStringJsonMapKey,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -182,6 +184,7 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
         "triggers_fired_this_turn_per_opponent",
         "triggers_fired_this_game",
         "crew_activated_this_turn",
+        "crew_resolved_this_turn",
         "exerted_this_turn",
         "graveyard_cast_permissions_used",
         "graveyard_cast_permissions_used_per_type",
@@ -360,11 +363,16 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
         "im::HashMap<im::HashMap>",
         Classification::Canonical(IM_HASH_MAP_OF_IM_HASH_MAP),
     );
+    add_spec(
+        &mut specs,
+        game_state,
+        "GameState",
+        None,
+        "trigger_fire_counts_this_turn",
+        "HashMap",
+        Classification::Canonical(HASH_MAP_ENTRIES),
+    );
     for (field, adapter) in [
-        (
-            "trigger_fire_counts_this_turn",
-            "with=\"trigger_definition_ref_map\"",
-        ),
         ("activated_abilities_this_turn", "with=\"tuple_key_map\""),
         ("activated_abilities_this_game", "with=\"tuple_key_map\""),
         ("ability_resolutions_this_turn", "with=\"tuple_key_map\""),
@@ -598,7 +606,7 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
             None,
             "protection_start_exempt_attachments",
             "HashMap",
-            Classification::NonStringJsonMapKey,
+            Classification::Canonical(HASH_MAP_ENTRIES),
         ),
         (
             "src/game/game_object.rs",
@@ -1142,11 +1150,6 @@ fn serde_hash_owner_census_is_exhaustive_and_every_canonical_owner_names_its_ada
                 actual.serde
             ),
             Classification::DeserializeOnlyOrRuntime => {}
-            Classification::NonStringJsonMapKey => assert!(
-                !actual.serde.contains("deterministic_serde"),
-                "{id}: the non-string JSON key owner must not invent a generic wire adapter; actual serde={}",
-                actual.serde
-            ),
         }
     }
 
@@ -1172,6 +1175,7 @@ fn serde_hash_owner_census_is_exhaustive_and_every_canonical_owner_names_its_ada
 
 fn back_face(name: &str) -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
         name: name.to_string(),
         power: None,
         toughness: None,
@@ -1490,12 +1494,14 @@ fn build_all_direct_numeric_maps_state() -> GameState {
             PlayerId(0),
             AutoPassMode::UntilStackEmpty {
                 initial_stack_len: 1,
+                policy: StackResolutionPolicy::Committed,
             },
         ),
         (
             PlayerId(1),
             AutoPassMode::UntilStackEmpty {
                 initial_stack_len: 2,
+                policy: StackResolutionPolicy::Committed,
             },
         ),
     ]);
@@ -1878,7 +1884,12 @@ fn assert_waiting_round_trip_across_persistence_forms(state: GameState) {
         let restored: PersistedGameState =
             serde_json::from_str(&serialized).expect("persistence should restore");
         assert_eq!(
-            waiting_value(&restored.into_game_state().waiting_for),
+            waiting_value(
+                &restored
+                    .into_game_state()
+                    .expect("persisted test snapshot satisfies the checked restore contract")
+                    .waiting_for
+            ),
             expected
         );
     }
@@ -2162,7 +2173,9 @@ fn real_game_state_hash_owners_are_canonical_and_round_trip_across_all_persisten
             serde_json::to_string(&persisted).expect("persisted state should serialize");
         let restored: PersistedGameState =
             serde_json::from_str(&serialized).expect("persisted state should restore");
-        let restored = restored.into_game_state();
+        let restored = restored
+            .into_game_state()
+            .expect("persisted test snapshot satisfies the checked restore contract");
         assert_representative_membership(&restored);
         assert_eq!(
             serde_json::to_string(&restored).expect("restored state should reserialize"),
@@ -2171,8 +2184,118 @@ fn real_game_state_hash_owners_are_canonical_and_round_trip_across_all_persisten
     }
 }
 
+fn stack_resolution_session_fixture(budget: StackResolutionBudget) -> GameState {
+    let mut state = GameState::new(FormatConfig::standard(), 3, 42);
+    let activated = StackEntry {
+        id: ObjectId(9_001),
+        source_id: ObjectId(9_002),
+        controller: PlayerId(0),
+        kind: StackEntryKind::ActivatedAbility {
+            source_id: ObjectId(9_002),
+            ability: Box::new(ResolvedAbility::new(
+                Effect::NoOp,
+                Vec::new(),
+                ObjectId(9_002),
+                PlayerId(0),
+            )),
+        },
+    };
+    let keyword = StackEntry {
+        id: ObjectId(9_003),
+        source_id: ObjectId(9_004),
+        controller: PlayerId(2),
+        kind: StackEntryKind::KeywordAction {
+            action: KeywordAction::Equip {
+                equipment_id: ObjectId(9_004),
+                target_creature_id: ObjectId(9_005),
+            },
+        },
+    };
+    state.stack_resolution_session = Some(StackResolutionSession {
+        entries: vec![
+            StackResolutionEntryFence::capture(&activated),
+            StackResolutionEntryFence::capture(&keyword),
+        ],
+        cursor: 1,
+        representatives: BTreeSet::from([PlayerId(0), PlayerId(2)]),
+        verified_pass_representatives: BTreeSet::new(),
+        budget,
+        policy: StackResolutionPolicy::RecheckNoMeaningfulPriorityAction,
+        auto_pass_overlay: StackResolutionAutoPassOverlay {
+            baseline: BTreeMap::from([(
+                PlayerId(1),
+                AutoPassMode::UntilStackEmpty {
+                    initial_stack_len: 4,
+                    policy: StackResolutionPolicy::Committed,
+                },
+            )]),
+        },
+    });
+    state
+}
+
 #[test]
-fn populated_protection_tuple_map_keeps_its_existing_non_string_json_key_failure() {
+fn populated_stack_resolution_session_round_trips_deterministically_through_raw_and_trusted() {
+    for (budget_name, budget) in [
+        (
+            "limited",
+            StackResolutionBudget::from_legacy_max_resolutions(7),
+        ),
+        ("unlimited", StackResolutionBudget::Unlimited),
+    ] {
+        let state = stack_resolution_session_fixture(budget);
+        let session = state
+            .stack_resolution_session
+            .as_ref()
+            .expect("fixture persists a shared stack-resolution session");
+        assert_eq!(session.entries.len(), 2, "fixture contains nonempty fences");
+        assert_eq!(session.cursor, 1, "fixture exercises a nonzero cursor");
+        assert_eq!(
+            session.representatives,
+            BTreeSet::from([PlayerId(0), PlayerId(2)]),
+            "fixture uses multiple canonical representatives"
+        );
+        assert_eq!(
+            session.policy,
+            StackResolutionPolicy::RecheckNoMeaningfulPriorityAction
+        );
+        assert_eq!(
+            session.budget, budget,
+            "fixture exercises the {budget_name} cap"
+        );
+        assert!(!session.auto_pass_overlay.baseline.is_empty());
+
+        for (persistence_name, persisted) in [
+            ("raw", PersistedGameState::Raw(Box::new(state.clone()))),
+            ("trusted", PersistedGameState::capture(state.clone())),
+        ] {
+            let bytes = serde_json::to_string(&persisted).unwrap_or_else(|error| {
+                panic!("{budget_name} {persistence_name} serializes: {error}")
+            });
+            let restored: PersistedGameState =
+                serde_json::from_str(&bytes).unwrap_or_else(|error| {
+                    panic!("{budget_name} {persistence_name} deserializes: {error}")
+                });
+            assert_eq!(
+                serde_json::to_string(&restored).unwrap_or_else(|error| panic!(
+                    "{budget_name} {persistence_name} reserializes: {error}"
+                )),
+                bytes,
+                "{budget_name} {persistence_name} bytes stay deterministic after restore"
+            );
+            let restored = restored
+                .into_game_state()
+                .expect("persisted test snapshot satisfies the checked restore contract");
+            assert_eq!(
+                restored.stack_resolution_session, state.stack_resolution_session,
+                "{budget_name} {persistence_name} restores the full private session"
+            );
+        }
+    }
+}
+
+#[test]
+fn protection_tuple_map_round_trips_deterministically_through_all_persistence_forms() {
     let mut state = GameState::new(FormatConfig::standard(), 2, 42);
     let mut object = GameObject::new(
         ObjectId(1),
@@ -2181,17 +2304,122 @@ fn populated_protection_tuple_map_keeps_its_existing_non_string_json_key_failure
         "Protection Fixture".to_string(),
         Zone::Battlefield,
     );
-    object.protection_start_exempt_attachments.insert(
-        (0, 0, ObjectId(2)),
-        ProtectionStartSnapshot {
-            resolved_quality: ProtectionTarget::Color(ManaColor::White),
-            attachment_ids: vec![ObjectId(3)],
-        },
+    assert!(
+        serde_json::to_value(&object)
+            .expect("empty protection fixture serializes")
+            .get("protection_start_exempt_attachments")
+            .is_none(),
+        "the empty transient map remains omitted"
     );
-    assert_eq!(object.protection_start_exempt_attachments.len(), 1);
+
+    let lower_key = (0, 2, ObjectId(1));
+    let lower_snapshot = ProtectionStartSnapshot {
+        resolved_quality: ProtectionTarget::Color(ManaColor::White),
+        attachment_ids: vec![ObjectId(3), ObjectId(4)],
+    };
+    let upper_key = (1, 0, ObjectId(1));
+    let upper_snapshot = ProtectionStartSnapshot {
+        resolved_quality: ProtectionTarget::CardType("Artifact".to_string()),
+        attachment_ids: vec![ObjectId(5)],
+    };
+    object
+        .protection_start_exempt_attachments
+        .insert(upper_key, upper_snapshot.clone());
+    object
+        .protection_start_exempt_attachments
+        .insert(lower_key, lower_snapshot.clone());
+    assert_eq!(object.protection_start_exempt_attachments.len(), 2);
     state.objects.insert(ObjectId(1), object);
 
-    let error = serde_json::to_value(&state)
-        .expect_err("the existing tuple-key map has no nonempty JSON representation");
-    assert_eq!(error.to_string(), "key must be a string");
+    let mut opposite_insertion = state.clone();
+    let opposite_map = &mut opposite_insertion
+        .objects
+        .get_mut(&ObjectId(1))
+        .expect("fixture object exists")
+        .protection_start_exempt_attachments;
+    opposite_map.clear();
+    opposite_map.insert(lower_key, lower_snapshot);
+    opposite_map.insert(upper_key, upper_snapshot);
+
+    let bare_bytes = serde_json::to_string(&state).expect("populated bare state serializes");
+    assert_eq!(
+        serde_json::to_string(&opposite_insertion)
+            .expect("opposite-insertion bare state serializes"),
+        bare_bytes,
+        "hash insertion order must not affect canonical state bytes"
+    );
+    let bare_value: serde_json::Value =
+        serde_json::from_str(&bare_bytes).expect("bare state bytes are JSON");
+    assert_eq!(
+        bare_value["objects"]["1"]["protection_start_exempt_attachments"],
+        serde_json::json!([
+            [
+                [0, 2, 1],
+                {
+                    "resolved_quality": {"Color": "White"},
+                    "attachment_ids": [3, 4]
+                }
+            ],
+            [
+                [1, 0, 1],
+                {
+                    "resolved_quality": {"CardType": "Artifact"},
+                    "attachment_ids": [5]
+                }
+            ]
+        ]),
+        "the nonempty field is a typed-key-sorted sequence of exact key/value tuples"
+    );
+
+    let bare_restored: GameState =
+        serde_json::from_str(&bare_bytes).expect("bare state round trips");
+    assert_eq!(
+        bare_restored
+            .objects
+            .get(&ObjectId(1))
+            .expect("restored bare object exists")
+            .protection_start_exempt_attachments,
+        state
+            .objects
+            .get(&ObjectId(1))
+            .expect("source fixture object exists")
+            .protection_start_exempt_attachments
+    );
+    assert_eq!(
+        serde_json::to_string(&bare_restored).expect("restored bare state reserializes"),
+        bare_bytes,
+        "bare-state bytes remain stable after restore"
+    );
+
+    for (persistence_name, persisted) in [
+        ("raw", PersistedGameState::Raw(Box::new(state.clone()))),
+        ("trusted", PersistedGameState::capture(state.clone())),
+    ] {
+        let bytes = serde_json::to_string(&persisted)
+            .unwrap_or_else(|error| panic!("{persistence_name} state serializes: {error}"));
+        let restored: PersistedGameState = serde_json::from_str(&bytes)
+            .unwrap_or_else(|error| panic!("{persistence_name} state deserializes: {error}"));
+        assert_eq!(
+            serde_json::to_string(&restored)
+                .unwrap_or_else(|error| panic!("{persistence_name} state reserializes: {error}")),
+            bytes,
+            "{persistence_name} persistence bytes remain stable after restore"
+        );
+        let restored = restored
+            .into_game_state()
+            .unwrap_or_else(|error| panic!("{persistence_name} state finalizes: {error}"));
+        assert_eq!(
+            restored
+                .objects
+                .get(&ObjectId(1))
+                .expect("restored persisted object exists")
+                .protection_start_exempt_attachments,
+            state
+                .objects
+                .get(&ObjectId(1))
+                .expect("source fixture object exists")
+                .protection_start_exempt_attachments,
+            "{persistence_name} persistence restores every protection snapshot"
+        );
+    }
 }

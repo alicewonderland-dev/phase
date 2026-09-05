@@ -5,7 +5,7 @@ import { AdapterError, AdapterErrorCode } from "../../adapter/types";
 import { pressureMultiplier } from "../../utils/stackPressure";
 import { effectiveStackPressure } from "../../utils/stackThroughput";
 import { debugLog } from "../debugLog";
-import { dispatchAiActionProposal, dispatchResolveAll } from "../dispatch";
+import { dispatchAiActionProposal } from "../dispatch";
 import { attemptStateRehydrate, isEnginePanic, notifyEngineLost, routePanic } from "../engineRecovery";
 import type { OpponentController } from "./types";
 
@@ -82,11 +82,7 @@ export function createAIController(config: AIControllerConfig): AIController {
     gameSessionGeneration: number;
     waitingForFingerprint: string;
     playerId: number;
-    isPriority: boolean;
-    resolveAllConsentEpoch: number | null;
   }
-
-  let currentAttempt: AIAttempt | null = null;
 
   // Failure tracking on the same WaitingFor state to break infinite loops.
   // `MAX_CONSECUTIVE_FAILURES` gates the normal→fallback transition; the
@@ -178,11 +174,7 @@ export function createAIController(config: AIControllerConfig): AIController {
       gameSessionGeneration: store.gameSessionGeneration,
       waitingForFingerprint: waitingForFingerprint(waitingFor),
       playerId,
-      isPriority: waitingFor.type === "Priority",
-      resolveAllConsentEpoch:
-        waitingFor.type === "ResolveAllConsent" ? waitingFor.data.epoch : null,
     };
-    currentAttempt = attempt;
     pending = true;
     return attempt;
   }
@@ -196,19 +188,17 @@ export function createAIController(config: AIControllerConfig): AIController {
     if (!state || !waitingFor) return false;
     if (waitingForFingerprint(waitingFor) !== attempt.waitingForFingerprint) return false;
     if (authorizedAiPlayer(waitingFor, state) !== attempt.playerId) return false;
-    return !attempt.isPriority || !store.isResolvingAll;
+    return true;
   }
 
   function finishAttempt(attempt: AIAttempt): boolean {
     if (attempt.generation !== attemptGeneration) return false;
-    currentAttempt = null;
     pending = false;
     return true;
   }
 
   function invalidateAttempt(): void {
     attemptGeneration++;
-    currentAttempt = null;
     pending = false;
     if (timeoutId != null) {
       clearTimeout(timeoutId);
@@ -236,11 +226,6 @@ export function createAIController(config: AIControllerConfig): AIController {
     );
     const waitingPlayerId = authorizedAiPlayer(waitingFor, state);
     if (waitingPlayerId === null) return;
-
-    // Resolve All is an explicit, user-started owner of Priority passing. The
-    // AI only steps aside while that session is actually active; stack depth is
-    // never consent. Mandatory non-Priority decisions continue normally.
-    if (waitingFor.type === "Priority" && useGameStore.getState().isResolvingAll) return;
 
     // Reset failure counters when the WaitingFor state changes (type or player).
     // `consecutiveFailures` gates normal→fallback escalation; `totalFailures`
@@ -367,8 +352,7 @@ export function createAIController(config: AIControllerConfig): AIController {
           }
         }
         // Re-check the complete attempt identity after every await. A matching
-        // WaitingFor payload in a new game/session is still stale, as is a
-        // Priority action computed before Resolve All took ownership.
+        // WaitingFor payload in a new game/session is still stale.
         if (!isAttemptCurrent(attempt)) {
           const currentWaitingFor = useGameStore.getState().gameState?.waiting_for ?? null;
           debugLog(
@@ -397,21 +381,6 @@ export function createAIController(config: AIControllerConfig): AIController {
         // the authority boundary.
         if (!isAttemptCurrent(attempt)) return;
         const submission = await dispatchAiActionProposal(proposal);
-        const store = useGameStore.getState();
-        const waitingForAfterSubmission = store.gameState?.waiting_for ?? null;
-        if (
-          active &&
-          submission.status === "applied" &&
-          attempt.resolveAllConsentEpoch !== null &&
-          proposal.action.type === "RespondResolveAllConsent" &&
-          proposal.action.data.decision.type === "Grant" &&
-          proposal.action.data.epoch === attempt.resolveAllConsentEpoch &&
-          store.gameSessionGeneration === attempt.gameSessionGeneration &&
-          waitingForAfterSubmission?.type === "ResolveAllReady" &&
-          waitingForAfterSubmission.data.epoch === attempt.resolveAllConsentEpoch
-        ) {
-          void dispatchResolveAll(proposal.actor, config.seats);
-        }
         if (!isAttemptCurrent(attempt)) return;
         // The proposal boundary returns a tagged stale result without mutating
         // the store. That is a normal race, not a failed AI decision: leave
@@ -454,7 +423,6 @@ export function createAIController(config: AIControllerConfig): AIController {
     // default `playerId` elsewhere, not by this loop.
     let observedWaitingFor = useGameStore.getState().waitingFor;
     let observedSessionGeneration = useGameStore.getState().gameSessionGeneration;
-    let observedResolveAll = useGameStore.getState().isResolvingAll;
     unsubscribe = useGameStore.subscribe(
       (s) => s,
       () => {
@@ -462,31 +430,14 @@ export function createAIController(config: AIControllerConfig): AIController {
         const store = useGameStore.getState();
         const waitingForChanged = store.waitingFor !== observedWaitingFor;
         const sessionChanged = store.gameSessionGeneration !== observedSessionGeneration;
-        const resolveAllStarted = store.isResolvingAll && !observedResolveAll;
-        const resolveAllEnded = !store.isResolvingAll && observedResolveAll;
-
         observedWaitingFor = store.waitingFor;
         observedSessionGeneration = store.gameSessionGeneration;
-        observedResolveAll = store.isResolvingAll;
 
         if (waitingForChanged || sessionChanged) {
           invalidateAttempt();
           // A new snapshot gets a fresh failure budget even for an A→A
           // transition whose serialized WaitingFor payload is identical.
           lastWaitingForKey = null;
-        } else if (resolveAllStarted && currentAttempt?.isPriority) {
-          invalidateAttempt();
-        }
-
-        // Resolve All owns Priority while active. Mandatory non-Priority
-        // decisions continue, and ending Resolve All schedules exactly once.
-        if (
-          resolveAllEnded ||
-          waitingForChanged ||
-          sessionChanged ||
-          !store.isResolvingAll ||
-          store.gameState?.waiting_for?.type !== "Priority"
-        ) {
           checkAndSchedule();
         }
       },

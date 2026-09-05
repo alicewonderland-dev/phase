@@ -23,7 +23,7 @@ import {
 import type { AIDifficulty } from "../constants/ai";
 import { DEFAULT_AI_DIFFICULTY } from "../constants/ai";
 import type { DeckArchetype } from "../services/engineRuntime";
-import { detectInitialLanguage, SUPPORTED_LNGS, type SupportedLng } from "../i18n/resources";
+import { detectInitialLanguage, normalizeSupportedLng, type SupportedLng } from "../i18n/resources";
 
 /** Literal sentinel for "any deck" in AI deck selection. Mirrors `DeckChoice::Random`
  *  naming so the preference value is self-describing without a nullable field. */
@@ -62,6 +62,7 @@ export type CardSizePreference = "small" | "medium" | "large";
  *  "shift"  = the preview only appears while the Shift key is held (Tabletop
  *             Simulator style), letting the player read the board uninterrupted. */
 export type CardPreviewMode = "follow" | "side" | "shift";
+export type DraftCardPreviewMode = "none" | CardPreviewMode;
 /** Card-preview hover latency bounds (milliseconds). `0` = instant (the
  *  default — the preview appears the moment the cursor lands on a card). The
  *  upper bound keeps the slider meaningful; a delay longer than ~1s defeats the
@@ -72,7 +73,7 @@ export const CARD_PREVIEW_HOVER_DELAY_MIN = 0;
 export const CARD_PREVIEW_HOVER_DELAY_MAX = 1000;
 export const CARD_PREVIEW_HOVER_DELAY_STEP = 50;
 export type HudLayout = "inline" | "floating";
-export type LogDefaultState = "open" | "closed";
+export type LogPanelVisibility = "open" | "closed";
 export type BattlefieldCardDisplay = "art_crop" | "full_card";
 /** How the command zone (commander card, tax, emblems, commander damage) is laid
  *  out. "inline" = a bounded always-visible corner dock; "compact" = a collapsed
@@ -94,12 +95,19 @@ export type SpellPaymentMode = "auto" | "autoExceptSacrificialMana" | "manual";
  *  User-chosen so a player can keep the stack off whichever side of the
  *  battlefield they care about — e.g. dock left to free the right action rail. */
 export type StackDockSide = "left" | "right";
+/** Screen edge the game-log panel docks to. Kept separate from the resolving
+ * stack's dock because players may deliberately place the two panels apart. */
+export type LogDockSide = "left" | "right";
 /** Opponent HUD density in the multi-opponent rail. "comfortable" = the full
  *  two-row tab (name + life over the board-composition breakdown); "compact" =
  *  a single thin row (small avatar + name + life) that trades the breakdown for
  *  vertical real-estate. Player-toggleable from the rail. */
 export type OpponentHudDensity = "comfortable" | "compact";
-export type MultiplayerBoardLayout = "focused" | "split";
+/** The persisted board-layout preference. `auto` adapts at the view-model
+ * boundary; the explicit values always honor the player's selection. */
+export type MultiplayerBoardLayout = "auto" | "focused" | "split";
+/** A layout after viewport/table-size resolution, suitable for board chrome. */
+export type ResolvedMultiplayerBoardLayout = Exclude<MultiplayerBoardLayout, "auto">;
 /** "auto-wubrg" picks a random battlefield matching the dominant mana color.
  *  "random" picks a random battlefield each game regardless of color.
  *  "none" disables the background image.
@@ -270,7 +278,7 @@ function buildDefaultPreferences(): PreferencesState {
     cardSize: "medium",
     hudLayout: "inline",
     followActiveOpponent: true,
-    logDefaultState: "closed",
+    logPanelLastChoice: "open",
     boardBackground: "auto-wubrg",
     customBackgroundUrl: "",
     vfxQuality: "full",
@@ -289,6 +297,7 @@ function buildDefaultPreferences(): PreferencesState {
     battlefieldCardDisplay: "art_crop",
     collapsedFolderIds: [],
     lastSeenChangelogId: undefined,
+    dismissedStatusId: undefined,
     commandZoneDisplay: "auto",
     collapseLands: "auto",
     collapseSupport: "auto",
@@ -298,11 +307,15 @@ function buildDefaultPreferences(): PreferencesState {
     showKeywordStrip: true,
     battlefieldPeekOnHover: true,
     cardPreviewMode: "follow",
+    draftCardPreviewMode: "none",
+    draftDoubleClickConfirmPick: true,
     cardPreviewHoverDelayMs: 0,
     showCardPreviewFooter: true,
     stackDockSide: "right",
+    logDockSide: "right",
     opponentHudDensity: "comfortable",
-    multiplayerBoardLayout: "focused",
+    multiplayerBoardLayout: "auto",
+    multiplayerSplitLayoutNudgeDismissed: true,
     aiSeats: [defaultAiSeat()],
     cedhMode: false,
     aiArchetypeFilter: "Any",
@@ -330,7 +343,7 @@ interface PreferencesState {
   cardSize: CardSizePreference;
   hudLayout: HudLayout;
   followActiveOpponent: boolean;
-  logDefaultState: LogDefaultState;
+  logPanelLastChoice: LogPanelVisibility;
   boardBackground: BoardBackground;
   customBackgroundUrl: string;
   vfxQuality: VfxQuality;
@@ -361,6 +374,10 @@ interface PreferencesState {
    * silently seeds it to the current latest so they get no unread dot for
    * entries that predate their first visit. */
   lastSeenChangelogId?: number;
+  /** Id of the operator status message this player dismissed. Compared for
+   * EQUALITY, so a newly published message (which always carries a new id)
+   * re-shows even after the previous one was dismissed. */
+  dismissedStatusId?: number;
   /** Command-zone layout mode (inline dock / compact pile / auto-by-viewport). */
   commandZoneDisplay: CommandZoneDisplay;
   /** Whether the lands sub-row collapses into its summary tile (auto/on/off). */
@@ -382,6 +399,8 @@ interface PreferencesState {
   /** Desktop hover card-preview behavior — follow cursor, dock to the side, or
    *  only show while Shift is held. See {@link CardPreviewMode}. */
   cardPreviewMode: CardPreviewMode;
+  draftCardPreviewMode: DraftCardPreviewMode;
+  draftDoubleClickConfirmPick: boolean;
   /** Latency (ms) before the hover preview appears in the "follow"/"side"
    *  modes. `0` = instant (default). Ignored in "shift" mode, which is
    *  keypress-triggered. See {@link CARD_PREVIEW_HOVER_DELAY_MAX}. */
@@ -391,10 +410,14 @@ interface PreferencesState {
   showCardPreviewFooter: boolean;
   /** Screen edge the stack panel docks to and collapses toward. */
   stackDockSide: StackDockSide;
+  /** Screen edge the game-log panel docks to. */
+  logDockSide: LogDockSide;
   /** Density of the multi-opponent HUD rail (comfortable two-row vs compact thin row). */
   opponentHudDensity: OpponentHudDensity;
   /** Multiplayer board presentation: one focused opponent, or all opponent seats. */
   multiplayerBoardLayout: MultiplayerBoardLayout;
+  /** Whether the legacy-focused-layout split-view offer has been dismissed. */
+  multiplayerSplitLayoutNudgeDismissed: boolean;
   aiSeats: AiSeatPref[];
   /** Table-wide cEDH toggle. When true, every AI opponent plays at cEDH
    *  (bracket 5) regardless of its per-seat difficulty, and the AI/human deck
@@ -431,9 +454,11 @@ interface PreferencesActions {
   setHudLayout: (layout: HudLayout) => void;
   setFollowActiveOpponent: (enabled: boolean) => void;
   setStackDockSide: (side: StackDockSide) => void;
+  setLogDockSide: (side: LogDockSide) => void;
   setOpponentHudDensity: (density: OpponentHudDensity) => void;
   setMultiplayerBoardLayout: (layout: MultiplayerBoardLayout) => void;
-  setLogDefaultState: (state: LogDefaultState) => void;
+  setMultiplayerSplitLayoutNudgeDismissed: (dismissed: boolean) => void;
+  setLogPanelLastChoice: (state: LogPanelVisibility) => void;
   setBoardBackground: (bg: BoardBackground) => void;
   setCustomBackgroundUrl: (url: string) => void;
   setVfxQuality: (quality: VfxQuality) => void;
@@ -460,6 +485,7 @@ interface PreferencesActions {
   toggleFolderCollapsed: (id: string) => void;
   setCollapsedFolderIds: (ids: string[]) => void;
   setLastSeenChangelogId: (id: number) => void;
+  setDismissedStatusId: (id: number) => void;
   setCommandZoneDisplay: (display: CommandZoneDisplay) => void;
   setCollapseLands: (mode: ZoneCollapseMode) => void;
   setCollapseSupport: (mode: ZoneCollapseMode) => void;
@@ -469,6 +495,8 @@ interface PreferencesActions {
   setShowKeywordStrip: (show: boolean) => void;
   setBattlefieldPeekOnHover: (enabled: boolean) => void;
   setCardPreviewMode: (mode: CardPreviewMode) => void;
+  setDraftCardPreviewMode: (mode: DraftCardPreviewMode) => void;
+  setDraftDoubleClickConfirmPick: (enabled: boolean) => void;
   setCardPreviewHoverDelayMs: (ms: number) => void;
   setShowCardPreviewFooter: (show: boolean) => void;
   setAiSeatDifficulty: (index: number, difficulty: AIDifficulty) => void;
@@ -565,14 +593,18 @@ export const usePreferencesStore = create<PreferencesState & PreferencesActions>
       ...buildDefaultPreferences(),
 
       // Store owns the language; i18n/index.ts subscribes and mirrors it into i18next.
-      setLanguage: (lng) => set({ language: lng }),
+      setLanguage: (lng) =>
+        set((state) => ({ language: normalizeSupportedLng(lng, state.language) })),
       setCardSize: (size) => set({ cardSize: size }),
       setHudLayout: (layout) => set({ hudLayout: layout }),
       setFollowActiveOpponent: (enabled) => set({ followActiveOpponent: enabled }),
       setStackDockSide: (side) => set({ stackDockSide: side }),
+      setLogDockSide: (side) => set({ logDockSide: side }),
       setOpponentHudDensity: (density) => set({ opponentHudDensity: density }),
       setMultiplayerBoardLayout: (layout) => set({ multiplayerBoardLayout: layout }),
-      setLogDefaultState: (state) => set({ logDefaultState: state }),
+      setMultiplayerSplitLayoutNudgeDismissed: (dismissed) =>
+        set({ multiplayerSplitLayoutNudgeDismissed: dismissed }),
+      setLogPanelLastChoice: (state) => set({ logPanelLastChoice: state }),
       setBoardBackground: (bg) => set({ boardBackground: bg }),
       setCustomBackgroundUrl: (url) => set({ customBackgroundUrl: url.trim() }),
       setVfxQuality: (quality) => set({ vfxQuality: quality }),
@@ -618,6 +650,7 @@ export const usePreferencesStore = create<PreferencesState & PreferencesActions>
         })),
       setCollapsedFolderIds: (ids) => set({ collapsedFolderIds: ids }),
       setLastSeenChangelogId: (id) => set({ lastSeenChangelogId: id }),
+      setDismissedStatusId: (id) => set({ dismissedStatusId: id }),
       setCommandZoneDisplay: (display) => set({ commandZoneDisplay: display }),
       setCollapseLands: (mode) => set({ collapseLands: mode }),
       setCollapseSupport: (mode) => set({ collapseSupport: mode }),
@@ -627,6 +660,8 @@ export const usePreferencesStore = create<PreferencesState & PreferencesActions>
       setShowKeywordStrip: (show) => set({ showKeywordStrip: show }),
       setBattlefieldPeekOnHover: (enabled) => set({ battlefieldPeekOnHover: enabled }),
       setCardPreviewMode: (mode) => set({ cardPreviewMode: mode }),
+      setDraftCardPreviewMode: (mode) => set({ draftCardPreviewMode: mode }),
+      setDraftDoubleClickConfirmPick: (enabled) => set({ draftDoubleClickConfirmPick: enabled }),
       setCardPreviewHoverDelayMs: (ms) =>
         set({
           cardPreviewHoverDelayMs: clamp(
@@ -785,7 +820,7 @@ export const usePreferencesStore = create<PreferencesState & PreferencesActions>
     }),
     {
       name: "phase-preferences",
-      version: 29,
+      version: 34,
       // v0 → v1: flat aiDifficulty + aiDeckName become aiSeats[0].
       // v1 → v2: discrete animationSpeed/combatPacing enums become numeric
       //          animationSpeedMultiplier/combatPacingMultiplier.
@@ -825,8 +860,11 @@ export const usePreferencesStore = create<PreferencesState & PreferencesActions>
       // v19 → v20: Add collapseLands/collapseSupport; legacy stores default to
       //          "auto" (the prior threshold-driven collapse) via the shallow
       //          merge, so existing users see no behavior change.
-      // v20 → v21: Add multiplayerBoardLayout; legacy stores default to
-      //          "focused", preserving the current focused-opponent layout.
+      // v20 → v21: Add multiplayerBoardLayout; legacy stores are pinned to
+      //          "focused", preserving the layout they were already playing on.
+      //          Load-bearing now that the fresh-store default is "auto": this
+      //          block is what keeps the new default a NEW-user default rather
+      //          than a layout swap under existing players.
       // v21 → v22: Add telemetryEnabled; legacy stores default to `true` (opt-out,
       //          identity-free crash & usage telemetry) via the shallow merge —
       //          no explicit migration block needed (see flexLayout precedent).
@@ -848,6 +886,23 @@ export const usePreferencesStore = create<PreferencesState & PreferencesActions>
       // v28 → v29: Add the sacrificial-mana-aware automatic mode. Existing
       //          values remain valid; malformed persisted values normalize to
       //          the legacy automatic behavior below.
+      // v29 → v30: Add draftCardPreviewMode; legacy stores default to "none"
+      //          via the shallow merge.
+      // v30 → v31: Add draftDoubleClickConfirmPick; legacy stores default to
+      //          true via the shallow merge.
+      // v31 → v32: Add dismissedStatusId; legacy stores default to undefined
+      //          via the shallow merge, so no operator status message counts as
+      //          already dismissed for an existing user.
+      // v32 → v33: Add logDockSide; existing and malformed stores reset to the
+      //          prior fixed-right behavior.
+      // v33 → v34: Replace the configurable logDefaultState with logPanelLastChoice
+      //          — the game log now simply remembers how the user last left it and
+      //          there is no Gameplay control for it. Every existing store adopts
+      //          "open": for almost every store the old "closed" was the un-chosen
+      //          default rather than a deliberate choice, and closing the panel
+      //          once is now remembered. The legacy key is dropped so it cannot
+      //          linger in the persisted blob. Mobile never auto-opens regardless,
+      //          so this is a desktop-only behavior change.
       migrate: (persisted: unknown, version: number) => {
         if (!persisted || typeof persisted !== "object") return persisted;
         let migrated = persisted as Record<string, unknown>;
@@ -953,13 +1008,9 @@ export const usePreferencesStore = create<PreferencesState & PreferencesActions>
         }
 
         if (version < 9) {
-          const lng = (migrated as { language?: unknown }).language;
           migrated = {
             ...migrated,
-            language:
-              typeof lng === "string" && (SUPPORTED_LNGS as readonly string[]).includes(lng)
-                ? lng
-                : detectInitialLanguage(),
+            language: normalizeSupportedLng(migrated.language, detectInitialLanguage()),
           };
         }
 
@@ -995,6 +1046,9 @@ export const usePreferencesStore = create<PreferencesState & PreferencesActions>
           };
         }
 
+        // Pin, not merge: the fresh-store default is "auto", so letting a
+        // pre-v21 store fall through to the shallow merge would move existing
+        // players off the layout they have been using.
         if (version < 21) {
           migrated = { ...migrated, multiplayerBoardLayout: "focused" };
         }
@@ -1025,7 +1079,49 @@ export const usePreferencesStore = create<PreferencesState & PreferencesActions>
           };
         }
 
-        return migrated;
+        // v29 → v30: Existing focused-layout profiles are the conservative
+        // nudge cohort. The old store cannot distinguish a deliberate focused
+        // setting from the pre-split default, so offer without changing the
+        // raw preference; existing split profiles and all fresh v30 profiles
+        // remain dismissed.
+        if (version < 30) {
+          migrated = {
+            ...migrated,
+            multiplayerSplitLayoutNudgeDismissed:
+              migrated.multiplayerBoardLayout !== "focused",
+          };
+        }
+
+        if (version < 33) {
+          migrated = { ...migrated, logDockSide: "right" };
+        }
+
+        if (version < 34) {
+          const { logDefaultState: _legacyLogDefault, ...rest } = migrated;
+          void _legacyLogDefault;
+          migrated = { ...rest, logPanelLastChoice: "open" };
+        }
+
+        return {
+          ...migrated,
+          language: normalizeSupportedLng(migrated.language, detectInitialLanguage()),
+        };
+      },
+      // Persisted state is external input. Migration only runs when the schema
+      // version changes, so this boundary also protects current-version blobs
+      // restored from browser storage or a backup.
+      merge: (persisted, current) => {
+        const saved = persisted && typeof persisted === "object"
+          ? persisted as Partial<PreferencesState>
+          : {};
+        return {
+          ...current,
+          ...saved,
+          language: normalizeSupportedLng(saved.language, current.language),
+          logDockSide: saved.logDockSide === "left" || saved.logDockSide === "right"
+            ? saved.logDockSide
+            : "right",
+        };
       },
     },
   ),

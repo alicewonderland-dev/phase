@@ -510,6 +510,7 @@ impl EventObjectSnapshot {
             | TargetFilter::ScopedPlayer
             | TargetFilter::SpecificPlayer { .. }
             | TargetFilter::PlayerWhoChoseLabel { .. }
+            | TargetFilter::PlayerMatching { .. }
             | TargetFilter::Neighbor { .. }
             | TargetFilter::DefendingPlayer
             | TargetFilter::SourceChosenPlayer
@@ -534,6 +535,7 @@ impl EventObjectSnapshot {
             | TargetFilter::LastRevealed
             | TargetFilter::LastZoneChanged
             | TargetFilter::CostPaidObject
+            | TargetFilter::AmassedArmy
             | TargetFilter::ChosenCard
             | TargetFilter::TrackedSet { .. }
             | TargetFilter::ExiledCardByIndex { .. }
@@ -1041,6 +1043,21 @@ pub enum GameEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_id: Option<ObjectId>,
     },
+    /// CR 701.17a: a card was milled — the milling player put it from the top of
+    /// their library toward their graveyard. Emitted once per card (CR 603.2c),
+    /// and emitted even when a replacement rewrote the destination: CR 614.6 says
+    /// the modified event is what occurred, and CR 701.17c confirms the card is
+    /// still a milled card by letting an effect find it "in the zone it moved to
+    /// from the library". `to` is that post-replacement zone, which CR 701.17c
+    /// scopes on being public (CR 400.2) — the wire visibility filter reads it.
+    Milled {
+        /// CR 701.17a: the player whose library the card left.
+        player_id: PlayerId,
+        /// The milled card.
+        object_id: ObjectId,
+        /// CR 701.17c: the zone the card actually moved to from the library.
+        to: Zone,
+    },
     DamageCleared {
         object_id: ObjectId,
     },
@@ -1493,6 +1510,15 @@ pub enum GameEvent {
     /// CR 701.54: The Ring tempted a player.
     RingTemptsYou {
         player_id: PlayerId,
+        /// CR 701.54a + CR 701.54d: the Ring-bearer chosen as part of THIS
+        /// temptation (None when the player controlled no creatures, so no
+        /// choice happened). The temptation's actions complete before the
+        /// "whenever the Ring tempts you" event occurs, so the event carries
+        /// the completed choice and both CR 603.4 checks of a bearer-dependent
+        /// intervening-if read this immutable record, never the mutable
+        /// `state.ring_bearer` designation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chosen_bearer: Option<ObjectId>,
     },
     /// CR 309.4c: A player moved their venture marker into a dungeon room.
     RoomEntered {

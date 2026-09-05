@@ -909,6 +909,7 @@ mod tests {
         obj.base_power = Some(1);
         obj.base_toughness = Some(3);
         obj.back_face = Some(BackFaceData {
+            is_swap_snapshot: false,
             name: "Ral, Leyline Prodigy".to_string(),
             power: None,
             toughness: None,

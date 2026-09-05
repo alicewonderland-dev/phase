@@ -171,8 +171,9 @@ pub struct EntryMods {
 /// struct that also rides in `DeliveryCtx`.
 #[derive(Default)]
 pub struct ExileLinkSpec {
-    /// `Some(Duration::UntilHostLeavesPlay)` installs a return-on-source-leave
-    /// link; other durations / `None` fall back to `tracking`.
+    /// A host-lifetime duration — `Some(d)` with `d.ends_when_host_leaves_play()`
+    /// — installs a return-on-source-leave link; other durations / `None` fall
+    /// back to `tracking`.
     pub duration: Option<Duration>,
     /// Resolved controller for a monarch-bounded link. `Some` is captured when
     /// the originating ability resolves; `None` means that duration cannot
@@ -1195,7 +1196,12 @@ pub(crate) fn move_objects_simultaneously_then(
             );
             // Synchronous completion (the common single-redirect path): run the
             // cleanup now, and surface a pause it raises to the enclosing caller.
-            completion.map_or(BatchMoveResult::Done, |completion| {
+            completion.map_or(BatchMoveResult::Done, |mut completion| {
+                crate::types::game_state::settle_dig_delivery_outcome(
+                    &mut completion,
+                    state,
+                    &logical_zone_change_group,
+                );
                 run_batch_completion(state, completion, events)
             })
         }
@@ -1612,7 +1618,7 @@ pub(crate) fn drain_pending_batch_deliveries(state: &mut GameState, events: &mut
                     .expect("settled batch delivery frame must exist");
                 // CR 603.10a + CR 616.1: logical settlement has completed before
                 // the one post-batch cleanup can run.
-                if let Some(completion) = completion {
+                if let Some(mut completion) = completion {
                     // The parked/settled result is deliberately unused here: the
                     // drain's callers are state-mediated (engine_replacement
                     // re-reads `state.waiting_for` after the drain and gates
@@ -1621,6 +1627,11 @@ pub(crate) fn drain_pending_batch_deliveries(state: &mut GameState, events: &mut
                     // prompt + fresh BatchDelivery frame, not via
                     // this return value. Witnessed by the compound double-pause
                     // test (miss batch redirect, then hit-delivery redirect).
+                    crate::types::game_state::settle_dig_delivery_outcome(
+                        &mut completion,
+                        state,
+                        &logical_zone_change_group,
+                    );
                     let _ = run_batch_completion(state, completion, events);
                 }
             }
@@ -1795,7 +1806,7 @@ pub(crate) fn apply_zone_delivery_tail(
     if to == Zone::Exile {
         if let Some(source_id) = cause.or(source_id) {
             let kind = match duration {
-                Some(Duration::UntilHostLeavesPlay) => {
+                Some(d) if d.ends_when_host_leaves_play() => {
                     Some(ExileLinkKind::UntilSourceLeaves { return_zone: from })
                 }
                 Some(Duration::UntilOpponentBecomesMonarch) => {
@@ -1804,7 +1815,20 @@ pub(crate) fn apply_zone_delivery_tail(
                         controller,
                     })
                 }
-                _ if matches!(exile_tracking, ZoneDeliveryExileTracking::TrackBySource) => {
+                // CR 607.2b: track either when the caller already determined
+                // (via `should_track_exiled_by_source`, ability-chain-aware)
+                // that this exile must be linked, OR when the resolved source
+                // independently carries a "cards exiled with [this object]"
+                // ability — the auto-detect a bare replacement redirect (SBA
+                // death, `Effect::Destroy`, `Effect::Sacrifice`, none of which
+                // resolve through an ability chain) needs, since those callers
+                // have no `ResolvedAbility` to run the ability-level half of
+                // that check against.
+                _ if matches!(exile_tracking, ZoneDeliveryExileTracking::TrackBySource)
+                    || crate::game::exile_links::source_is_linked_exile_consumer(
+                        state, source_id,
+                    ) =>
+                {
                     Some(ExileLinkKind::TrackedBySource)
                 }
                 _ => None,
@@ -2027,6 +2051,7 @@ fn legal_aura_attachment_targets(
             enchant_filter,
             player.id,
             Some(controller),
+            Some(aura_id),
         ) {
             Some(TargetRef::Player(player.id))
         } else {
@@ -3753,7 +3778,11 @@ pub(crate) fn deliver_replaced_zone_change(
                 let payload = crate::game::effects::become_copy::PrecomputedCopyValues {
                     source_id: copy.source_id,
                     controller: copy.controller,
-                    duration_subject_id: copy.source_id,
+                    // CR 400.7 + CR 611.2b: this effect applies to the
+                    // entering permanent, not to the copied object (which can
+                    // be absent by the time this replacement is delivered,
+                    // e.g. Mystic Reflection's resolved source).
+                    duration_subject: ObjectIncarnationRef::from_object(&state.objects[&object_id]),
                     duration: copy.sacrifice_at.unwrap_or(Duration::Permanent),
                     values: *copy.values,
                     display_source: copy.display_source,
@@ -4279,7 +4308,24 @@ fn execute_zone_move_with_applied_terminal(
     // counters" replacement when a planeswalker or battle enters the
     // battlefield from any source (effect-driven entry — bounce-return,
     // reanimate, blink, etc.). Spell-cast entry is handled in stack.rs.
-    if dest_zone == Zone::Battlefield {
+    //
+    // CR 708.2a + CR 708.3: the INTRINSIC seeding below is skipped for a
+    // face-down entry — the object enters as the profile's body (a 2/2
+    // creature) with no loyalty/defense characteristic, so a manifested
+    // planeswalker card must not enter with loyalty counters (issue #7822).
+    // Only the intrinsic half is gated: an effect explicitly instructing entry
+    // counters on a face-down entrant (`effect_enter_with_counters` below) is
+    // a separate instruction whose counters are markers on the resulting
+    // object (CR 122.1) and must survive. The gate reads the proposed event,
+    // on which the profile was just stamped above.
+    let enters_face_down = matches!(
+        &proposed,
+        ProposedEvent::ZoneChange {
+            face_down_profile: Some(_),
+            ..
+        }
+    );
+    if dest_zone == Zone::Battlefield && !enters_face_down {
         if let Some(obj) = state
             .liminal_entries
             .get(&obj_id)
@@ -4319,6 +4365,11 @@ fn execute_zone_move_with_applied_terminal(
                 }
             }
         }
+    }
+    // CR 122.1 + CR 614.1c: effect-driven enter-with-counters apply to EVERY
+    // battlefield entry, face-down included — the explicit instruction is
+    // independent of the intrinsic loyalty/defense seeding gated above.
+    if dest_zone == Zone::Battlefield {
         // CR 122.1 + CR 614.1c: Seed effect-driven enter-with-counters from
         // `Effect::ChangeZone.enter_with_counters` (Darkness Crystal class:
         // "put target creature card ... onto the battlefield with two
@@ -6252,6 +6303,7 @@ mod effect_driven_transformed_entry_tests {
             };
             obj.base_card_types = obj.card_types.clone();
             obj.back_face = Some(BackFaceData {
+                is_swap_snapshot: false,
                 name: "MDFC Back".to_string(),
                 power: None,
                 toughness: None,

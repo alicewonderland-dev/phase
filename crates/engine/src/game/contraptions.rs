@@ -170,6 +170,8 @@ pub fn perform_contraption_upkeep_turn_based_action(
     state.waiting_for = WaitingFor::ChooseObjectsSelection {
         player,
         eligible,
+        min: 0,
+        max: None,
         trigger_event: None,
     };
     let _ = events;

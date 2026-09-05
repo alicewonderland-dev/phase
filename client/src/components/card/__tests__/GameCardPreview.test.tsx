@@ -18,6 +18,7 @@ import { GameCardPreview } from "../GameCardPreview.tsx";
 // assert the forwarded name without loading Scryfall assets. Mirrors the mocks
 // in CardPreview.test.tsx.
 vi.mock("../../../hooks/useCardImage.ts", () => ({
+  useCardBackImage: () => ({ src: "card-back.png", isLoading: false }),
   useCardImage: () => ({
     src: "card.png",
     isLoading: false,
@@ -68,6 +69,7 @@ afterEach(() => {
     mobileHandGesture: null,
     shiftHeld: false,
     altHeld: false,
+    previewSticky: false,
   });
   // GameCardPreview adds a third store; reset it so "shift" mode doesn't leak.
   usePreferencesStore.setState({ cardPreviewMode: "follow" });
@@ -91,6 +93,16 @@ describe("GameCardPreview", () => {
     expect(container.querySelector<HTMLElement>("[data-card-preview]")).toHaveStyle({
       right: "calc(env(safe-area-inset-right) + 1rem + var(--game-right-rail-offset, 0px))",
     });
+  });
+
+  it("keeps an explicit sticky preview visible in Hold Shift mode", () => {
+    inspect(battlefieldObject());
+    usePreferencesStore.setState({ cardPreviewMode: "shift" });
+    useUiStore.setState({ previewSticky: true });
+
+    render(<GameCardPreview />);
+
+    expect(screen.getAllByAltText("Pithing Needle").length).toBeGreaterThan(0);
   });
 
   it("anchors the preview to the hand card hovered through PlayerHand", async () => {
@@ -268,7 +280,7 @@ describe("GameCardPreview", () => {
 
     render(<GameCardPreview />);
 
-    expect(screen.getAllByAltText("Face-down card").length).toBeGreaterThan(0);
+    expect(screen.getAllByAltText("Card back").length).toBeGreaterThan(0);
     expect(screen.queryByAltText("Pithing Needle")).toBeNull();
   });
 
@@ -285,7 +297,7 @@ describe("GameCardPreview", () => {
 
     render(<GameCardPreview />);
 
-    expect(screen.getAllByAltText("Face-down card").length).toBeGreaterThan(0);
+    expect(screen.getAllByAltText("Card back").length).toBeGreaterThan(0);
     expect(screen.queryByAltText("Pithing Needle")).toBeNull();
   });
 

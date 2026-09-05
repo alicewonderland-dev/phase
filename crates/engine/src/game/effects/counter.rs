@@ -200,7 +200,11 @@ pub fn resolve(
                         }
                     };
                     if casting_variant.restores_front_face_after_stack_exit() {
-                        super::super::stack::restore_alternative_spell_normal_face(state, obj_id);
+                        super::super::stack::restore_alternative_spell_normal_face(
+                            state,
+                            obj_id,
+                            casting_variant,
+                        );
                     }
                     // CR 701.6a + CR 614.6: route the stack -> graveyard/exile
                     // move through the zone-change pipeline so `Moved` redirects
@@ -404,7 +408,11 @@ pub fn resolve_all(
                 Zone::Graveyard
             };
             if casting_variant.restores_front_face_after_stack_exit() {
-                super::super::stack::restore_alternative_spell_normal_face(state, obj_id);
+                super::super::stack::restore_alternative_spell_normal_face(
+                    state,
+                    obj_id,
+                    casting_variant,
+                );
             }
             // CR 701.6a + CR 614.6: route through the pipeline so graveyard
             // redirects (Rest in Peace / Leyline of the Void) fire — same
@@ -444,8 +452,10 @@ pub fn resolve_all(
 /// `CounterSourceRider::LosesAbilities` static.
 ///
 /// The effect targets the countered ability's source permanent and persists
-/// for the rider's `duration` (Tishana: `Duration::UntilHostLeavesPlay`, i.e.
-/// as long as the counter source remains on the battlefield — CR 611.2a).
+/// for the rider's `duration` (Tishana: `Duration::WhileHostOnBattlefield` —
+/// "for as long as this creature remains on the battlefield", a CR 611.2b
+/// state reading that a phase-out of the counter source also ends,
+/// CR 702.26f).
 fn apply_source_static(
     state: &mut GameState,
     counter_source_id: ObjectId,

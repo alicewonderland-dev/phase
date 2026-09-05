@@ -18,7 +18,7 @@ use crate::types::card_type::{CardType, CoreType};
 use crate::types::counter::{counter_map_serde, CounterType};
 use crate::types::definitions::Definitions;
 use crate::types::game_state::{
-    AttackDeclarationRecord, GameState, LKISnapshot, TriggerSourceContext,
+    AttackDeclarationRecord, CastOccurrence, GameState, LKISnapshot, TriggerSourceContext,
 };
 use crate::types::identifiers::{CardId, ObjectId, ObjectIdentityBinding, ObjectIncarnationRef};
 use crate::types::keywords::{Keyword, KeywordKind};
@@ -263,6 +263,13 @@ pub struct BackFaceData {
     /// so the engine can offer face-choice for MDFCs (CR 712.12).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout_kind: Option<LayoutKind>,
+    /// #7565: set when this stored face is a swap SNAPSHOT of the object's
+    /// other half (the live face is currently the alternative). Replaces the
+    /// old implicit contract "snapshot => layout_kind erased", which muted the
+    /// layout for every other consumer (cast-face prompt, MDFC land checks).
+    /// `false` for a still-unswapped printed back face.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_swap_snapshot: bool,
 }
 
 /// CR 719.3b: Tracks the solve state of a Case enchantment.
@@ -461,6 +468,17 @@ pub struct GameObject {
     /// `transformed` flag.
     #[serde(default)]
     pub modal_back_face: bool,
+    /// CR 601.2b + CR 712.11b / CR 709.3 (#7565): a cast-time face choice for
+    /// the CURRENT cast has been made — the cast pipeline's re-entries must
+    /// not re-prompt. Transient to the cast conversation: cleared on any zone
+    /// change that is not onto the stack, and when the cast is cancelled.
+    /// Deliberately NOT the old `back_face.layout_kind = None` erasure, which
+    /// poisoned every other `layout_kind` consumer (MDFC land playability,
+    /// split-cost handling, the recast prompt) for the object's lifetime:
+    /// `layout_kind` answers "what shape is this card", this flag answers
+    /// "is this cast's choice already made".
+    #[serde(default)]
+    pub cast_face_committed: bool,
 
     // Combat
     pub damage_marked: u32,
@@ -474,7 +492,11 @@ pub struct GameObject {
     /// CR 702.16p: Per [`StaticGateKey::def_index`] on this source and enchanted
     /// host, the controlled attachments matching that effect's resolved protection
     /// quality when it first started applying to that host.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        with = "crate::types::deterministic_serde::hash_map_entries"
+    )]
     pub protection_start_exempt_attachments:
         HashMap<ProtectionEffectHostKey, ProtectionStartSnapshot>,
     /// CR 702.95b-d: Soulbond pair relationship. Pairing is symmetric:
@@ -1100,10 +1122,9 @@ pub struct GameObject {
 
     /// CR 702.xxx: Prepared (Strixhaven) designation. Present only on a
     /// permanent whose printed-card layout is `CardLayout::Prepare(a, b)`.
-    /// While prepared, the controller may activate a synthesized priority-time
-    /// cast-offer that creates a token spell-copy of face `b` on the stack
-    /// (CR 707.10 copy semantics); casting unprepares (reminder text: "Doing
-    /// so unprepares it."). Cleared by `reset_for_battlefield_exit` (CR 400.7 —
+    /// While prepared, its linked face-`b` copy remains in exile and the
+    /// controller may cast it (CR 722.3c); becoming cast unprepares the source.
+    /// Cleared by `reset_for_battlefield_exit` (CR 400.7 —
     /// a permanent that leaves the battlefield becomes a new object with no
     /// memory of its previous existence). `Option<PreparedState>` over a bool
     /// per project idiom (no bool flags). Assign when WotC publishes SOS CR
@@ -1114,6 +1135,12 @@ pub struct GameObject {
         skip_serializing_if = "Option::is_none"
     )]
     pub prepared: Option<PreparedState>,
+
+    /// CR 722.3c: Back-link carried only by the prepare-spell copy created in
+    /// exile when a permanent becomes prepared. This lets the Prepare authority
+    /// retain, cast, and clean up that exact copy without name/card-id guesses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_copy_source: Option<ObjectId>,
 
     /// CR 702.171b: Saddled designation. A permanent stays saddled until the end
     /// of the turn or it leaves the battlefield. Not a copiable value — purely
@@ -1187,6 +1214,11 @@ pub struct GameObject {
     /// to evaluate conditions like "if you cast it from your hand".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cast_from_zone: Option<Zone>,
+
+    /// CR 601.2i + CR 707.10: Exact turn-journal coordinate of this cast while
+    /// it remains a spell on the stack. Cleared on every Stack exit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast_occurrence: Option<CastOccurrence>,
 
     /// CR 601.2a + CR 603.4: Transient field tracking the player who cast the
     /// spell that became this permanent. Paired with `cast_from_zone` for
@@ -1343,6 +1375,9 @@ fn _gameobject_partition_is_total(o: &GameObject) {
         transformed: _,
         transformation_count: _,
         modal_back_face: _,
+        // #7565: transient cast-conversation bookkeeping, same bucket as
+        // `modal_back_face` — not a copiable value.
+        cast_face_committed: _,
         damage_marked: _,
         dealt_deathtouch_damage: _,
         attached_to: _,
@@ -1470,6 +1505,7 @@ fn _gameobject_partition_is_total(o: &GameObject) {
         monstrous: _,
         harnessed: _,
         prepared: _,
+        prepared_copy_source: _,
         is_saddled: _,
         saddled_by: _,
         assigns_damage_from_toughness: _,
@@ -1482,6 +1518,9 @@ fn _gameobject_partition_is_total(o: &GameObject) {
         base_name_origin: _,
         class_level: _,
         cast_from_zone: _,
+        // COMPARED: finalized-cast provenance can affect resolution semantics while
+        // this object remains a spell on the stack (types/game_state.rs).
+        cast_occurrence: _,
         cast_controller: _,
         cast_spell_keywords: _,
         exile_from_stack_linked_source: _,
@@ -2012,6 +2051,37 @@ impl GameObject {
         }
     }
 
+    /// CR 708.4 + CR 702.37c / CR 702.168b: Whether the SPELL this object
+    /// represents is being cast FACE DOWN — a morph/megamorph/disguise card put
+    /// on the stack as a blank 2/2 creature spell for {3} — as opposed to merely
+    /// carrying `face_down = true`.
+    ///
+    /// Those differ, and the difference is why this must not read raw
+    /// `face_down`: CR 702.143a exiles a foretold card "from their hand face
+    /// down" and then lets its owner cast it — hideaway and other exile/library
+    /// concealment work the same way — so `face_down` is set while the card
+    /// waits in exile, yet nothing grants that cast the CR 708.4 permission to
+    /// be turned face down, and the spell goes on the stack face up. The
+    /// discriminator is
+    /// `face_down && back_face.is_some()`: `continue_cast_face_down` is the only
+    /// path that presents a spell with a blanked object, because it turns the
+    /// object face down through `apply_face_down_entry_profile`, which stashes
+    /// the real card in `back_face` (CR 708.2 copiable-value blank). A
+    /// foretold/hideaway object keeps `back_face = None` — its characteristics
+    /// are intact in exile, it is not blanked — and a DFC / adventure / transform
+    /// object carries `back_face` with `face_down = false`, so neither side
+    /// reads `true` here. Manifest and cloak objects are face-down permanents put
+    /// onto the battlefield by effects, never cast, so they never reach a spell
+    /// seam at all.
+    ///
+    /// Single authority for that question: the restricted-mana payment seam
+    /// (`build_spell_meta` → `SpellMeta::is_face_down`, CR 106.6) and the
+    /// spell-filter projection (`spell_cast_record_from_object_for`) both ask
+    /// here rather than each re-deriving it.
+    pub fn spell_is_cast_face_down(&self) -> bool {
+        self.face_down && self.back_face.is_some()
+    }
+
     /// CR 702.102b + CR 709.4d: Restore the combined card types and colors of
     /// a fused split spell after a characteristic reset. The fusion marker is
     /// cast-state, while the union is a derived stack characteristic and must
@@ -2248,6 +2318,7 @@ impl GameObject {
             transformed: false,
             transformation_count: 0,
             modal_back_face: false,
+            cast_face_committed: false,
             damage_marked: 0,
             dealt_deathtouch_damage: false,
             attached_to: None,
@@ -2366,6 +2437,7 @@ impl GameObject {
             monstrous: false,
             harnessed: false,
             prepared: None,
+            prepared_copy_source: None,
             is_saddled: false,
             saddled_by: Vec::new(),
             assigns_damage_from_toughness: false,
@@ -2378,6 +2450,7 @@ impl GameObject {
             base_name_origin: None,
             class_level: None,
             cast_from_zone: None,
+            cast_occurrence: None,
             cast_controller: None,
             cast_spell_keywords: Vec::new(),
             exile_from_stack_linked_source: None,
@@ -2509,6 +2582,7 @@ impl GameObject {
         // CR 400.7. A re-entering permanent has no memory of a prior prepared
         // state. Assign when WotC publishes SOS CR update.
         self.prepared = None;
+        self.prepared_copy_source = None;
         self.is_saddled = false;
         self.saddled_by.clear();
         self.paired_with = None;
@@ -2682,6 +2756,7 @@ impl GameObject {
         // re-entering permanent is a new object with no memory of its previous
         // prepared state. Assign when WotC publishes SOS CR update.
         self.prepared = None;
+        self.prepared_copy_source = None;
         // CR 107.3m: The paid-X value is tied to the spell-resolution that brought
         // this permanent to the battlefield. When the permanent leaves, the value
         // is no longer meaningful; a re-cast will re-populate it via `finalize_cast`.
@@ -2897,9 +2972,34 @@ impl GameObject {
         !super::coverage::unimplemented_mechanics(self).is_empty()
     }
 
-    /// Look up a stored choice by category.
+    /// CR 607.2d: the LINKED read — "the chosen color" as a linked
+    /// anaphoric reader means "what did this object's own supplier choose".
+    /// Oldest-since-entry (first match): `chosen_attributes` is cleared only
+    /// on leave-battlefield, so this is the object's FIRST recorded colour.
+    /// Sibling of `current_chosen_color` (newest) — see that doc for why the
+    /// two accessors read different ends of the same list.
     pub fn chosen_color(&self) -> Option<ManaColor> {
         self.chosen_attributes.iter().find_map(|a| match a {
+            ChosenAttribute::Color(c) => Some(*c),
+            _ => None,
+        })
+    }
+
+    /// CR 608.2d: "the current answer" — the most recently chosen
+    /// colour. Newest (last match), the `.rev()` idiom `chosen_card_name`
+    /// already uses. Called by ONE of `game/filter.rs`'s two `IsChosenColor`
+    /// arms; the other inlines the same `.rev()` scan because its `source` is a
+    /// `SourceContext` carrying its own `chosen_attributes`, not a `GameObject`,
+    /// so it cannot reach this accessor. Also read by
+    /// `game/effects/prevent_damage.rs`'s prevention-shield read, both of
+    /// which want the current answer rather than the historical (CR 607.2d)
+    /// one `chosen_color` returns. Drift guard: if this object can hold more
+    /// than one `ChosenAttribute::Color` (Wash Out / Prismatic Strands
+    /// recast, or a re-activated persisting chooser), `chosen_color` and
+    /// `current_chosen_color` can disagree — that disagreement is the whole
+    /// point of the split, not a bug.
+    pub fn current_chosen_color(&self) -> Option<ManaColor> {
+        self.chosen_attributes.iter().rev().find_map(|a| match a {
             ChosenAttribute::Color(c) => Some(*c),
             _ => None,
         })
@@ -4228,5 +4328,45 @@ mod tests {
             4,
             "a missing stash falls back to the baseline rather than panicking"
         );
+    }
+
+    #[test]
+    fn prepared_copy_source_serde_defaults_omits_and_round_trips() {
+        let mut object = GameObject::new(
+            ObjectId(1),
+            CardId(1),
+            PlayerId(0),
+            "Prepare copy".to_string(),
+            Zone::Exile,
+        );
+        let absent = serde_json::to_value(&object).unwrap();
+        assert!(absent.get("prepared_copy_source").is_none());
+
+        let legacy: GameObject = serde_json::from_value(absent).unwrap();
+        assert_eq!(legacy.prepared_copy_source, None);
+
+        object.prepared_copy_source = Some(ObjectId(77));
+        let canonical = serde_json::to_value(&object).unwrap();
+        assert_eq!(canonical["prepared_copy_source"], serde_json::json!(77));
+        let restored: GameObject = serde_json::from_value(canonical).unwrap();
+        assert_eq!(restored.prepared_copy_source, Some(ObjectId(77)));
+    }
+
+    #[test]
+    fn prepared_copy_source_is_non_copiable_zone_bookkeeping() {
+        let mut entering = GameObject::new(
+            ObjectId(1),
+            CardId(1),
+            PlayerId(0),
+            "Copied permanent".to_string(),
+            Zone::Battlefield,
+        );
+        entering.prepared_copy_source = Some(ObjectId(77));
+        entering.reset_for_battlefield_entry(1, 1);
+        assert_eq!(entering.prepared_copy_source, None);
+
+        entering.prepared_copy_source = Some(ObjectId(77));
+        entering.reset_for_battlefield_exit();
+        assert_eq!(entering.prepared_copy_source, None);
     }
 }

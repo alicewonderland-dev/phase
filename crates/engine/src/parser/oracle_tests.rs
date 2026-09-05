@@ -5,9 +5,10 @@ use crate::parser::oracle_ir::doc::{
     UnsupportedAbilityCategory, UnsupportedAbilityIr,
 };
 use crate::parser::oracle_ir::static_ir::StaticIr;
+use crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER;
 use crate::types::ability::{
     AdditionalCostOrigin, AdditionalCostPaymentSource, CountScope, CounterAdjustment, DoorLockOp,
-    SpellStackToGraveyardReplacement,
+    PlayerRelation, SpellStackToGraveyardReplacement,
 };
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::triggers::AttackTargetFilter;
@@ -349,6 +350,85 @@ fn ozai_document_ir_lowers_keyword_transform_and_unspent_mana_gate() {
         .contains(&ContinuousModification::AddKeyword {
             keyword: Keyword::Indestructible,
         }));
+}
+
+/// CR 702.8a + CR 601.3d + CR 611.3b: full-pipeline regression for Graveyard
+/// Shift's "This spell has flash as long as there are five or more mana
+/// values among cards in your graveyard." line. The generic static-line
+/// classifier's "has " arm (`STATIC_CONTAINS_PATTERNS`) would otherwise claim
+/// this line and lower it to an inert `StaticDefinition { affected: SelfRef,
+/// modifications: [AddKeyword(Flash)] }` — inert because
+/// `for_each_static_effect_source` only gathers continuous-effect sources
+/// from the battlefield and command zone, so a Hand-zone spell's own static
+/// never fires (a "supported but does nothing" misparse). Revert-
+/// discriminating: removing `oracle_classifier::is_self_conditional_flash_grant`
+/// (or its wiring into `should_defer_spell_to_effect`) makes `statics`
+/// non-empty and `casting_options` empty below.
+#[test]
+fn graveyard_shift_flash_permission_reaches_casting_options_not_statics() {
+    let types = ["Sorcery".to_string()];
+    let parsed = parse_oracle_text(
+        "This spell has flash as long as there are five or more mana values among cards in your graveyard.\nReturn target creature card from your graveyard to the battlefield.",
+        "Graveyard Shift",
+        &[],
+        &types,
+        &[],
+    );
+    assert!(
+        parsed.statics.is_empty(),
+        "the flash line must NOT lower to a continuous static (it would be inert in hand): {:?}",
+        parsed.statics
+    );
+    assert_eq!(
+        parsed.casting_options.len(),
+        1,
+        "the flash line must produce exactly one SpellCastingOption, got {:?}",
+        parsed.casting_options
+    );
+    let option = &parsed.casting_options[0];
+    assert!(matches!(
+        option.kind,
+        crate::types::ability::SpellCastingOptionKind::AsThoughHadFlash
+    ));
+    assert!(
+        option.condition.is_some(),
+        "the flash permission must carry the graveyard mana-value condition, not be unconditional"
+    );
+    // The reanimation effect itself must still parse (not swallowed).
+    assert_eq!(parsed.abilities.len(), 1);
+    assert!(
+        !matches!(
+            parsed.abilities[0].effect.as_ref(),
+            Effect::Unimplemented { .. }
+        ),
+        "the reanimation effect must parse, got {:?}",
+        parsed.abilities[0].effect
+    );
+}
+
+/// CR 702.34a: the self-flash prefix guard must leave "~ has flashback" on
+/// the static-keyword path. This is the positive receiving-path guard paired
+/// with `spell_self_has_flash_word_boundary_excludes_flashback`.
+#[test]
+fn self_flashback_reaches_typed_static_keyword() {
+    let types = ["Sorcery".to_string()];
+    let parsed = parse_oracle_text("~ has flashback {2}{u}.", "Some Spell", &[], &types, &[]);
+
+    assert!(parsed.casting_options.is_empty());
+    assert!(parsed.statics.iter().any(|static_def| {
+        static_def
+            .modifications
+            .contains(&ContinuousModification::AddKeyword {
+                keyword: Keyword::Flashback(FlashbackCost::Mana(ManaCost::Cost {
+                    generic: 2,
+                    shards: vec![ManaCostShard::Blue],
+                })),
+            })
+    }));
+    assert!(parsed
+        .abilities
+        .iter()
+        .all(|ability| { !matches!(ability.effect.as_ref(), Effect::Unimplemented { .. }) }));
 }
 
 #[test]
@@ -3815,7 +3895,7 @@ fn free_cast_window_clause_chains_rider_and_self_exile() {
             zones,
             graveyard_replacement,
         } => {
-            assert_eq!(*count, 2);
+            assert_eq!(*count, Some(2));
             assert_eq!(*max_total_mv, Some(6));
             assert_eq!(
                 graveyard_replacement.as_ref(),
@@ -3883,7 +3963,7 @@ fn free_cast_window_parses_single_zone_non_invoke_variant() {
         );
     };
 
-    assert_eq!(*count, 1);
+    assert_eq!(*count, Some(1));
     assert_eq!(*max_total_mv, None);
     assert_eq!(
         *filter,
@@ -6802,6 +6882,7 @@ fn devourer_of_destiny_opening_hand_reveal_creates_first_upkeep_dig() {
             phase: Phase::Upkeep,
             player: PlayerId(0),
             gate: crate::types::ability::TurnGate::None,
+            binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
         }
     );
 
@@ -13172,6 +13253,24 @@ fn heart_shaped_herb_activated_ability_grants_monarch_as_continuation() {
         "gated sub must remain the battlefield return, got {:?}",
         change_zone.effect,
     );
+    // CR 608.2c + CR 701.21a (issue #8077): "that card" must bind to the
+    // creature the optional Sacrifice EFFECT just chose (CostPaidObject —
+    // resolved via `effect_context_object`/`cost_paid_object` at runtime),
+    // never to `ParentTarget` (which has no chosen target to inherit here and
+    // silently defaults to the ability's OWN source, Heart-Shaped Herb
+    // itself, at resolution).
+    assert!(
+        matches!(
+            *change_zone.effect,
+            Effect::ChangeZone {
+                target: TargetFilter::CostPaidObject,
+                ..
+            }
+        ),
+        "return target must bind to the sacrificed creature (CostPaidObject), not ParentTarget \
+         (which returns the ability's own source instead) — got {:?}",
+        change_zone.effect,
+    );
     assert_eq!(
         change_zone.condition,
         Some(AbilityCondition::EffectOutcome {
@@ -13208,6 +13307,73 @@ fn heart_shaped_herb_activated_ability_grants_monarch_as_continuation() {
     assert!(
         !monarch_chain_has_unimplemented(&def),
         "no clause may fail closed to Unimplemented"
+    );
+}
+
+/// CR 608.2c: Chipper Chopper and Riveting Rigger have the same optional typed-sacrifice
+/// continuation: "If you do, put two +1/+1 counters on this creature". The
+/// sacrifice introduces a resolution-local object, but this-creature must
+/// remain the triggered ability's source rather than that sacrificed artifact.
+#[test]
+fn optional_artifact_sacrifice_keeps_counter_recipient_on_source() {
+    let def = parse_effect_chain(
+        "You may sacrifice another artifact. If you do, put two +1/+1 counters on this creature and it assembles a Contraption.",
+        AbilityKind::Spell,
+    );
+
+    assert!(
+        matches!(*def.effect, Effect::Sacrifice { .. }),
+        "the optional sacrifice must remain the head effect, got {:?}",
+        def.effect,
+    );
+    let counters = def
+        .sub_ability
+        .as_deref()
+        .expect("the successful sacrifice must continue to the counter effect");
+    assert!(
+        matches!(
+            *counters.effect,
+            Effect::PutCounter {
+                target: TargetFilter::SelfRef,
+                count: QuantityExpr::Fixed { value: 2 },
+                ..
+            }
+        ),
+        "the counter recipient must stay the source creature, got {:?}",
+        counters.effect,
+    );
+}
+
+/// CR 608.2c: Bloodcrazed Socialite's bare "it" is the attacking source, not the Blood
+/// token sacrificed by the preceding optional effect. This guards the
+/// `CostPaidObject` anchor from leaking into the bare-pronoun grammar.
+#[test]
+fn optional_blood_sacrifice_keeps_bare_pronoun_on_source() {
+    let def = parse_effect_chain(
+        "You may sacrifice a Blood token. If you do, it gets +2/+2 until end of turn.",
+        AbilityKind::Spell,
+    );
+
+    assert!(
+        matches!(*def.effect, Effect::Sacrifice { .. }),
+        "the optional sacrifice must remain the head effect, got {:?}",
+        def.effect,
+    );
+    let pump = def
+        .sub_ability
+        .as_deref()
+        .expect("the successful sacrifice must continue to the pump effect");
+    assert!(
+        matches!(
+            *pump.effect,
+            Effect::Pump {
+                target: TargetFilter::SelfRef,
+                power: PtValue::Fixed(2),
+                toughness: PtValue::Fixed(2),
+            }
+        ),
+        "the pump recipient must stay the source creature, got {:?}",
+        pump.effect,
     );
 }
 
@@ -13862,7 +14028,7 @@ fn enlightened_tutor_chain() {
 #[test]
 fn choice_partition_after_search_routes_chosen_and_rest() {
     use crate::parser::oracle_effect::parse_effect_chain;
-    use crate::types::ability::{AbilityKind, Chooser};
+    use crate::types::ability::{AbilityKind, ZoneChoiceChooser};
 
     let chain = parse_effect_chain(
             "Search your library for up to four cards with different names and reveal them. Target opponent chooses two of those cards. Put the chosen cards into your graveyard and the rest into your hand. Then shuffle.",
@@ -13877,7 +14043,7 @@ fn choice_partition_after_search_routes_chosen_and_rest() {
         &*choose.effect,
         Effect::ChooseFromZone {
             count: 2,
-            chooser: Chooser::Opponent,
+            chooser: ZoneChoiceChooser::Opponent,
             ..
         }
     ));
@@ -17026,6 +17192,33 @@ Artifacts you control have \"{T}: Add {U}. Spend this mana only to cast a spell 
     );
 }
 
+#[test]
+fn karolina_dean_mana_carries_cast_from_hand_prohibition() {
+    use crate::types::ability::{Effect, ManaSpendRestriction};
+    use crate::types::zones::Zone;
+
+    let parsed = super::parse_oracle_text(
+        "Flying\nAt the beginning of your first main phase, add {W}{U}{B}{R}{G}. This mana can't be spent to cast spells from your hand.",
+        "Karolina Dean, Runaway",
+        &["Flying".to_string()],
+        &["Legendary".to_string(), "Creature".to_string()],
+        &["Human".to_string(), "Citizen".to_string()],
+    );
+    let trigger = parsed.triggers.first().expect("first-main-phase trigger");
+    let execute = trigger.execute.as_deref().expect("mana effect");
+    assert!(
+        !has_unimplemented(execute),
+        "Karolina's production Oracle must have zero Unimplemented effects: {execute:#?}"
+    );
+    let Effect::Mana { restrictions, .. } = &*execute.effect else {
+        panic!("expected typed Mana effect, got {:?}", execute.effect);
+    };
+    assert_eq!(
+        restrictions,
+        &[ManaSpendRestriction::CannotCastSpellFromZone(Zone::Hand)]
+    );
+}
+
 /// Rosheen Meanderer / Elementalist's Palette / Nexos / Rosheen, Roaring
 /// Prophet. Runtime spend proof: `restricted_mana_x_cost_only.rs`.
 #[test]
@@ -18255,6 +18448,91 @@ fn drag_to_the_underworld_devotion_cost_reduction_and_destroy_parse() {
                 != Some("Swallow:DynamicQty")),
         "unexpected DynamicQty warning: {:?}",
         r.parse_warnings
+    );
+}
+
+/// CR 601.2f + CR 301.5 + CR 611.3a: Glamdring, Foe-hammer (verbatim Oracle
+/// text) — "Instant and sorcery spells you cast cost {X} less to cast, where
+/// X is equipped creature's power." + "Equip {2}". Unlike the self-spell
+/// devotion reduction above (`SelfRef`, applies to the card printing the
+/// ability), this is a board-wide reduction the Equipment grants to OTHER
+/// spells its controller casts (`affected` = cards you control), with X bound
+/// to a live `Aggregate` over the EQUIPPED creature's power rather than a
+/// snapshot. Zero `Unimplemented` effects end to end.
+#[test]
+fn glamdring_foe_hammer_equipped_power_cost_reduction_and_equip_parse() {
+    let r = parse(
+        "Instant and sorcery spells you cast cost {X} less to cast, where X is equipped creature's power.\n\
+         Equip {2}",
+        "Glamdring, Foe-hammer",
+        &[],
+        &["Artifact"],
+        &["Equipment"],
+    );
+
+    assert!(
+        !parsed_has_unimplemented(&r),
+        "Glamdring must parse with zero Unimplemented effects: {r:#?}"
+    );
+
+    assert_eq!(r.statics.len(), 1, "expected exactly one static ability");
+    let StaticMode::ModifyCost {
+        mode: CostModifyMode::Reduce,
+        amount: ManaCost::Cost { generic: 1, .. },
+        spell_filter: Some(TargetFilter::Or { ref filters }),
+        dynamic_count: Some(QuantityRef::PropertyAggregate(ref aggregate)),
+    } = &r.statics[0].mode
+    else {
+        panic!(
+            "expected ModifyCost{{Reduce, amount: generic 1, spell_filter: Or[Instant,Sorcery], \
+             dynamic_count: PropertyAggregate(Sum, Power, Objects(Typed(Creature, EquippedBy)))}}, got {:?}",
+            r.statics[0].mode
+        );
+    };
+    assert_eq!(aggregate.function(), AggregateFunction::Sum);
+    assert_eq!(aggregate.property(), ObjectProperty::Power);
+    let crate::types::ability::CardTypeSetSource::Objects {
+        filter: TargetFilter::Typed(ref tf),
+    } = aggregate.source()
+    else {
+        panic!(
+            "expected aggregate source Objects(Typed(Creature, EquippedBy)), got {:?}",
+            aggregate.source()
+        );
+    };
+    assert_eq!(filters.len(), 2, "expected Instant + Sorcery");
+    assert!(
+        filters.iter().any(|filter| {
+            matches!(filter, TargetFilter::Typed(tf)
+                if tf.type_filters == vec![TypeFilter::Instant])
+        }) && filters.iter().any(|filter| {
+            matches!(filter, TargetFilter::Typed(tf)
+                if tf.type_filters == vec![TypeFilter::Sorcery])
+        }),
+        "expected spell_filter = Or[Instant, Sorcery], got {filters:?}"
+    );
+    assert_eq!(tf.type_filters, vec![TypeFilter::Creature]);
+    assert_eq!(tf.properties, vec![FilterProp::EquippedBy]);
+    // Board-wide — NOT the self-spell SelfRef scope (contrast Drag to the
+    // Underworld above).
+    assert!(
+        matches!(
+            &r.statics[0].affected,
+            Some(TargetFilter::Typed(tf)) if tf.controller == Some(ControllerRef::You)
+        ),
+        "expected affected = cards you control, got {:?}",
+        r.statics[0].affected
+    );
+
+    // Equip {2} activated ability is untouched by the cost-reduction work.
+    let equip = r
+        .abilities
+        .iter()
+        .find(|a| a.ability_tag == Some(crate::types::ability::AbilityTag::Equip));
+    assert!(
+        equip.is_some(),
+        "expected an Equip-tagged activated ability, got {:?}",
+        r.abilities
     );
 }
 
@@ -20061,20 +20339,26 @@ fn assert_abzan_greatest_toughness_gate(condition: &AbilityCondition) {
         let FilterProp::PtComparison {
             stat: PtStat::Toughness,
             scope: PtValueScope::Current,
-            comparator: Comparator::GE,
+            comparator: Comparator::EQ,
             value:
                 QuantityExpr::Ref {
-                    qty:
-                        QuantityRef::Aggregate {
-                            function: AggregateFunction::Max,
-                            property: ObjectProperty::Toughness,
-                            filter: TargetFilter::Typed(population),
-                        },
+                    qty: QuantityRef::PropertyAggregate(aggregate),
                 },
         } = prop
         else {
             return false;
         };
+        let crate::types::ability::CardTypeSetSource::Objects {
+            filter: TargetFilter::Typed(population),
+        } = aggregate.source()
+        else {
+            return false;
+        };
+        if aggregate.function() != AggregateFunction::Max
+            || aggregate.property() != ObjectProperty::Toughness
+        {
+            return false;
+        }
         population.type_filters == vec![TypeFilter::Creature] && population.controller.is_none()
     });
     assert!(
@@ -20395,7 +20679,7 @@ fn untargeted_become_monarch_keeps_the_controller_default_cr_109_5() {
 
 /// CR 508.5: the rebind is gated on the trigger clause naming an attacked
 /// PLAYER. `Planeswalker` / `Battle` attack scopes name no player antecedent
-/// (a battle's anaphor would be its protector, CR 310.8d — a different
+/// (a battle's anaphor would be its protector, CR 310.9d — a different
 /// reference), so a `ScopedPlayer` anchor must survive unchanged there.
 ///
 /// There are two distinct noun sources, and each is asserted in the shape the
@@ -20613,15 +20897,8 @@ fn assert_controlled_creature_greatest_power_ability_gate(condition: &AbilityCon
 }
 
 fn assert_controlled_creature_greatest_power_trigger_gate(condition: &TriggerCondition) {
-    let TriggerCondition::QuantityComparison {
-        lhs: QuantityExpr::Ref {
-            qty: QuantityRef::ObjectCount { filter },
-        },
-        comparator: Comparator::GE,
-        rhs: QuantityExpr::Fixed { value: 1 },
-    } = condition
-    else {
-        panic!("expected ObjectCount >= 1 trigger condition, got {condition:?}");
+    let TriggerCondition::ControlsType { filter } = condition else {
+        panic!("expected controlled-type trigger condition, got {condition:?}");
     };
     assert_controlled_creature_greatest_power_filter(filter);
 }
@@ -20632,24 +20909,41 @@ fn assert_controlled_creature_greatest_power_filter(filter: &TargetFilter) {
     };
     assert_eq!(controlled.controller, Some(ControllerRef::You));
     assert_eq!(controlled.type_filters, vec![TypeFilter::Creature]);
+    assert_eq!(
+        controlled.properties.len(),
+        2,
+        "expected exactly battlefield scope plus aggregate membership: {controlled:?}"
+    );
+    assert!(controlled.properties.iter().any(|property| matches!(
+        property,
+        FilterProp::InZone {
+            zone: Zone::Battlefield
+        }
+    )));
     let has_battlefield_power_max = controlled.properties.iter().any(|prop| {
         let FilterProp::PtComparison {
             stat: PtStat::Power,
             scope: PtValueScope::Current,
-            comparator: Comparator::GE,
+            comparator: Comparator::EQ,
             value:
                 QuantityExpr::Ref {
-                    qty:
-                        QuantityRef::Aggregate {
-                            function: AggregateFunction::Max,
-                            property: ObjectProperty::Power,
-                            filter: TargetFilter::Typed(population),
-                        },
+                    qty: QuantityRef::PropertyAggregate(aggregate),
                 },
         } = prop
         else {
             return false;
         };
+        let crate::types::ability::CardTypeSetSource::Objects {
+            filter: TargetFilter::Typed(population),
+        } = aggregate.source()
+        else {
+            return false;
+        };
+        if aggregate.function() != AggregateFunction::Max
+            || aggregate.property() != ObjectProperty::Power
+        {
+            return false;
+        }
         population.type_filters == vec![TypeFilter::Creature]
             && population.properties.iter().any(|prop| {
                 matches!(
@@ -22036,6 +22330,56 @@ fn city_blessing_activation_restriction_does_not_emit_condition_warning() {
                 condition: Some(ParsedCondition::HasCityBlessing)
             }
         )));
+}
+
+/// CR 309.7 + CR 602.5b: Sarevok's Tome — "Activate only if you've completed a
+/// dungeon". The shared grammar already recognized the phrase as
+/// `StaticCondition::CompletedADungeon`, but the restriction converter rejected
+/// it for lack of a `ParsedCondition` peer, so the clause stayed in the ability
+/// text and surfaced as a stranded `Effect::Unimplemented { name: "activate" }`
+/// sub-ability — leaving the ability activatable with NO dungeon requirement,
+/// which is a permissive misreading of the printed card.
+///
+/// Asserts both halves: the gate is present as an activation restriction, AND
+/// no `Unimplemented` remnant is left behind anywhere in the chain (the bug
+/// produced the second without the first).
+#[test]
+fn completed_dungeon_activation_restriction_gates_the_ability() {
+    let oracle = "When this artifact enters, you take the initiative.
+{T}: Add {C}. If you have the initiative, add {C}{C} instead.
+{3}, {T}: Exile cards from the top of your library until you exile a nonland card. You may cast that card without paying its mana cost. Activate only if you've completed a dungeon.";
+    let parsed = parse(oracle, "Sarevok's Tome", &[], &["Artifact"], &["Book"]);
+
+    let gated = parsed
+        .abilities
+        .iter()
+        .find(|ability| matches!(*ability.effect, Effect::ExileFromTopUntil { .. }))
+        .expect("expected the exile-until activated ability");
+
+    assert!(
+        gated
+            .activation_restrictions
+            .iter()
+            .any(|restriction| matches!(
+                restriction,
+                ActivationRestriction::RequiresCondition {
+                    condition: Some(ParsedCondition::CompletedDungeon { specific: None })
+                }
+            )),
+        "dungeon gate missing: {:?}",
+        gated.activation_restrictions
+    );
+
+    // The consumed clause must leave no `Unimplemented` remnant in the chain.
+    let mut node = Some(gated);
+    while let Some(ability) = node {
+        assert!(
+            !matches!(*ability.effect, Effect::Unimplemented { .. }),
+            "stranded Unimplemented remnant: {:?}",
+            ability.effect
+        );
+        node = ability.sub_ability.as_deref();
+    }
 }
 
 /// CR 702.178a: "Max speed — [Ability]" means "As long as your speed is 4, this
@@ -26078,6 +26422,265 @@ fn unbound_delayed_graveyard_sweep_stays_honestly_unimplemented() {
     }
 }
 
+/// Carrier-coverage fixture for `demote_unenforceable_replacement_lifetimes`.
+///
+/// The wildcard-free `match`es in that pass guarantee no `Effect` or
+/// `ContinuousModification` variant is left UNMATCHED — a new variant is a
+/// compile error. They cannot guarantee that a matched variant is actually
+/// DESCENDED, because a nested struct field is field access, not a match arm
+/// (`types::ability_visit`'s module doc makes exactly this point about its own
+/// walk, and answers it with fixtures like
+/// `game::printed_cards::tests::walker_covers_every_nested_carrier`). This is
+/// that fixture for this pass.
+///
+/// It plants one refused rider in sixteen carriers — the ability-node chain
+/// links, the two `FlipCoin` payloads, `ChooseOneOf`, a trigger, a granted
+/// ability, a replacement payload, the four cost slots (CR 602.1a activation
+/// cost, CR 118.12 `unless_pay` on both an ability and a trigger, and
+/// `ReplacementMode::MayCost`) and the two decline branches — and asserts every
+/// one of the sixteen is demoted. Those positions are what the corpus census,
+/// the first version's misses and the revert probes identified; the walk
+/// descends more carriers than the fixture pins. The first version of this pass walked only `sub_ability` /
+/// `else_ability` and silently missed `mode_abilities` and `FlipCoin`'s
+/// win/lose payloads — two of the three positions a full-corpus census then
+/// found live `AddTargetReplacement` nodes at. Those two are the reason this
+/// fixture exists; the rest are here so the next omission is caught the first
+/// time.
+///
+/// Revert-probe: deleting one of those recursion lines drops the count below
+/// `CARRIERS` and reds the assertion, which prints the whole tree so the
+/// surviving rider is visible in it. (Measured: dropping the `mode_abilities`
+/// recursion gives 15 of 16; dropping the `def.cost` line gives 15 of 16 — that
+/// second probe turned NO test red before the cost slots were planted here.)
+#[test]
+fn demote_net_reaches_every_ability_carrier() {
+    use crate::types::ability::{
+        AbilityKind, ContinuousModification, Duration, Effect, ReplacementDefinition,
+        StaticDefinition, TargetFilter, TriggerDefinition,
+    };
+    use crate::types::replacements::ReplacementEvent;
+
+    /// One refused node: a bare untap rider under the PRESENCE wording, which
+    /// `replacement_install_is_refused` rejects (CR 611.2a).
+    fn refused() -> AbilityDefinition {
+        let mut def = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::AddTargetReplacement {
+                replacement: Box::new(ReplacementDefinition::new(ReplacementEvent::Untap)),
+                target: TargetFilter::Any,
+            },
+        );
+        def.duration = Some(Duration::WhileHostOnBattlefield);
+        def
+    }
+
+    fn holder(effect: Effect) -> AbilityDefinition {
+        AbilityDefinition::new(AbilityKind::Spell, effect)
+    }
+
+    // An empty parse is the cheapest honest empty tree — no `Default` derive
+    // exists on `ParsedAbilities`, and adding one for a fixture would widen the
+    // public surface.
+    let mut parsed = parse_oracle_text("", "Carrier Fixture", &[], &[], &[]);
+
+    // 1 — a bare top-level ability.
+    parsed.abilities.push(refused());
+
+    // 2, 3, 4 — the ability-node chain links.
+    let mut chain = holder(Effect::Unimplemented {
+        name: "carrier".to_string(),
+        description: None,
+    });
+    chain.sub_ability = Some(Box::new(refused()));
+    chain.else_ability = Some(Box::new(refused()));
+    chain.mode_abilities.push(refused());
+    parsed.abilities.push(chain);
+
+    // 5, 6 — FlipCoin's two payloads.
+    parsed.abilities.push(holder(Effect::FlipCoin {
+        win_effect: Some(Box::new(refused())),
+        lose_effect: Some(Box::new(refused())),
+        flipper: TargetFilter::Controller,
+    }));
+
+    // 7 — ChooseOneOf's branches.
+    parsed.abilities.push(holder(Effect::ChooseOneOf {
+        chooser: crate::types::ability::PlayerFilter::Controller,
+        branches: vec![refused()],
+    }));
+
+    // 8 — a trigger's payload.
+    let mut trigger = TriggerDefinition::new(crate::types::triggers::TriggerMode::Attacks);
+    trigger.execute = Some(Box::new(refused()));
+    parsed.triggers.push(trigger);
+
+    // 9 — a granted ability inside a static's modification.
+    let mut static_def = StaticDefinition::new(crate::types::statics::StaticMode::Continuous);
+    static_def
+        .modifications
+        .push(ContinuousModification::GrantAbility {
+            definition: Box::new(refused()),
+        });
+    parsed.statics.push(static_def);
+
+    // 10 — a replacement's payload.
+    let mut replacement = ReplacementDefinition::new(ReplacementEvent::Moved);
+    replacement.execute = Some(Box::new(refused()));
+    parsed.replacements.push(replacement);
+
+    // 11-14 — the COST axis. CR 602.1a's activation cost and CR 118.12's
+    // "unless … pays" cost both hold an `AbilityCost`, and `AbilityCost::EffectCost`
+    // carries a full `Effect` — which is how a nested ability chain reaches a
+    // cost (Mijo, the Bull prints one today). `types::ability_visit` descends all
+    // four; a revert probe that dropped the `def.cost` line alone turned NO test
+    // red before these four existed.
+    fn refused_cost() -> crate::types::ability::AbilityCost {
+        crate::types::ability::AbilityCost::EffectCost {
+            effect: Box::new(Effect::FlipCoin {
+                win_effect: Some(Box::new(refused())),
+                lose_effect: None,
+                flipper: TargetFilter::Controller,
+            }),
+        }
+    }
+    fn refused_unless_pay() -> crate::types::ability::UnlessPayModifier {
+        crate::types::ability::UnlessPayModifier {
+            cost: refused_cost(),
+            payer: TargetFilter::Controller,
+        }
+    }
+
+    // 11 — an ability's own activation cost.
+    let mut costed = holder(Effect::Unimplemented {
+        name: "cost carrier".to_string(),
+        description: None,
+    });
+    costed.cost = Some(refused_cost());
+    // 12 — that same ability's "unless … pays" cost.
+    costed.unless_pay = Some(refused_unless_pay());
+    parsed.abilities.push(costed);
+
+    // 13 — a trigger's "unless … pays" cost.
+    let mut unless_trigger = TriggerDefinition::new(crate::types::triggers::TriggerMode::Attacks);
+    unless_trigger.unless_pay = Some(refused_unless_pay());
+    parsed.triggers.push(unless_trigger);
+
+    // 14, 15 — `ReplacementMode::MayCost`'s cost AND its decline branch.
+    let mut may_cost = ReplacementDefinition::new(ReplacementEvent::Moved);
+    may_cost.mode = crate::types::ability::ReplacementMode::MayCost {
+        cost: refused_cost(),
+        decline: Some(Box::new(refused())),
+    };
+    parsed.replacements.push(may_cost);
+
+    // 16 — `ReplacementMode::Optional`'s decline branch.
+    let mut optional = ReplacementDefinition::new(ReplacementEvent::Moved);
+    optional.mode = crate::types::ability::ReplacementMode::Optional {
+        decline: Some(Box::new(refused())),
+    };
+    parsed.replacements.push(optional);
+
+    const CARRIERS: usize = 16;
+
+    demote_unenforceable_replacement_lifetimes(&mut parsed);
+
+    let serialized = serde_json::to_string(&parsed).unwrap();
+    let demoted = serialized
+        .matches("unenforceable_replacement_lifetime")
+        .count();
+    assert_eq!(
+        demoted, CARRIERS,
+        "every planted carrier must be demoted; {demoted} of {CARRIERS} were. \
+         A carrier the walk does not descend leaves its rider installed with a \
+         lifetime the engine cannot end (CR 611.2a). Tree: {serialized}"
+    );
+    assert!(
+        !serialized.contains("AddTargetReplacement"),
+        "no refused rider may survive anywhere in the tree"
+    );
+}
+
+/// CR 611.2a + CR 611.2b: an untap rider whose stated host lifetime the install
+/// seam cannot enforce must fail the LINE, not resolve into nothing.
+///
+/// This is the production-pipeline half of the refusal: Oracle text in, parsed
+/// abilities out. The engine half — that the resolver raises a hard
+/// `EffectError` if such a shape reaches it anyway — is
+/// `game::effects::tap_untap::tests::host_duration_on_non_untap_replacement_fails_closed`.
+///
+/// The three wordings are NOT interchangeable. Only "for as long as you control
+/// ~" is enforceable here, by `ReplacementCondition::ControllerControlsSource`,
+/// which ends on a control change. "for as long as ~ remains on the
+/// battlefield" and "until ~ leaves the battlefield" both SURVIVE a control
+/// change while the source stays on the battlefield, so that gate would end
+/// them early — shorter than printed, which CR 611.2a forbids exactly as much
+/// as longer.
+///
+/// The two unsupported cases are Spider-Woman's PRINTED text with its duration
+/// clause swapped, and nothing else. That construction is the finding: no
+/// printed card carries those two wordings on this path today, but the grammar
+/// lowers them to it, so the corpus being clean is an accident of printing
+/// rather than a guard. The first case is the real printed text and pins that
+/// this net did not simply swallow the class.
+#[test]
+fn unenforceable_untap_rider_lifetime_stays_honestly_unimplemented() {
+    const PRINTED: &str = "Flash\nWhen Spider-Woman enters, tap target creature an opponent controls. That creature can't become untapped for as long as you control Spider-Woman.";
+    const PRESENCE: &str = "Flash\nWhen Spider-Woman enters, tap target creature an opponent controls. That creature can't become untapped for as long as Spider-Woman remains on the battlefield.";
+    const EVENT_DEADLINE: &str = "Flash\nWhen Spider-Woman enters, tap target creature an opponent controls. That creature can't become untapped until Spider-Woman leaves the battlefield.";
+
+    const KEY: &str = "unenforceable_replacement_lifetime";
+
+    // The enforceable wording keeps its typed replacement …
+    let printed = parse_oracle_text(PRINTED, "Spider-Woman, Secret Agent", &[], &[], &[]);
+    assert!(
+        !unimplemented_keys(&printed).iter().any(|k| k == KEY),
+        "the CONTROL wording is enforceable and must survive the net; keys={:?}",
+        unimplemented_keys(&printed),
+    );
+    // … and it is genuinely still the replacement path, not a silently
+    // reshaped one — otherwise the negative above could pass vacuously.
+    assert!(
+        serde_json::to_string(&printed)
+            .unwrap()
+            .contains("AddTargetReplacement"),
+        "the CONTROL wording must still lower to AddTargetReplacement"
+    );
+
+    // The PRINTED member of the same class, on the prevention seam rather than
+    // the rider seam: Old Fat Spider Can't See Me chapter II states the presence
+    // wording on a `PreventDamage` clause. Before the refusal it resolved
+    // successfully and installed nothing, while the card reported as supported.
+    let saga = parse_oracle_text(
+        "(As this Saga enters and after your draw step, add a lore counter. \
+         Sacrifice after IV.)\nI — Target creature you control gains hexproof for \
+         as long as this Saga remains on the battlefield.\nII — Prevent all damage \
+         that would be dealt by up to one target creature for as long as this Saga \
+         remains on the battlefield.\nIII, IV — Draw a card.",
+        "Old Fat Spider Can't See Me",
+        &[],
+        &["Enchantment".to_string()],
+        &["Saga".to_string()],
+    );
+    assert!(
+        unimplemented_keys(&saga).iter().any(|k| k == KEY),
+        "the printed prevention member of this class must lower to an honest \
+         `{KEY}` marker; keys={:?}",
+        unimplemented_keys(&saga),
+    );
+
+    // … while the two unenforceable wordings fail the line honestly.
+    for (label, text) in [("presence", PRESENCE), ("event deadline", EVENT_DEADLINE)] {
+        let parsed = parse_oracle_text(text, "Spider-Woman, Secret Agent", &[], &[], &[]);
+        assert!(
+            unimplemented_keys(&parsed).iter().any(|k| k == KEY),
+            "the {label} wording has no enforceable lifetime at this seam and must \
+             lower to an honest `{KEY}` marker instead of an installed-then-dropped \
+             replacement; keys={:?}",
+            unimplemented_keys(&parsed),
+        );
+    }
+}
+
 /// The honesty net is narrow: a delayed recall/sweep that DOES bind its objects
 /// must be left alone. Both negatives carry a positive reach-guard — each card
 /// parses with zero `Unimplemented` of any kind — so neither assertion can pass
@@ -26107,4 +26710,1853 @@ fn bound_delayed_recalls_are_not_demoted() {
             "{name} is expected to parse with zero Unimplemented; keys={keys:?}",
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Namor, Atlantean King — the attacked-player predicate (CR 603.2) and the
+// "attacking that player" defending-player anaphor (CR 508.5).
+// ---------------------------------------------------------------------------
+
+/// Namor, Atlantean King — verbatim Scryfall Oracle text (oracle id
+/// 171a0a09-4aee-466c-aebd-3b0d4c1f51b4).
+const NAMOR_ORACLE: &str = "Flying\nWhenever you cast a noncreature spell, create a 1/1 blue Merfolk creature token.\nWhenever Namor attacks a player who has more life than you, other creatures you control attacking that player get +2/+0 until end of turn.";
+
+fn parse_namor() -> ParsedAbilities {
+    parse(
+        NAMOR_ORACLE,
+        "Namor, Atlantean King",
+        &[Keyword::Flying],
+        &["Creature"],
+        &["Mutant", "Merfolk", "Noble"],
+    )
+}
+
+fn namor_attack_trigger(parsed: &ParsedAbilities) -> &TriggerDefinition {
+    parsed
+        .triggers
+        .iter()
+        .find(|t| t.mode == TriggerMode::Attacks)
+        .expect("Namor must have an Attacks trigger")
+}
+
+fn target_filter_has_defending_player_anaphor(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(typed) => typed.properties.contains(&FilterProp::Attacking {
+            defender: Some(ControllerRef::DefendingPlayer),
+        }),
+        TargetFilter::Not { filter } => target_filter_has_defending_player_anaphor(filter),
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => filters
+            .iter()
+            .any(target_filter_has_defending_player_anaphor),
+        _ => false,
+    }
+}
+
+/// V2 — Namor's effect body must scope the pump to the co-attackers on the
+/// attacked player, not to `TargetFilter::Any`.
+///
+/// Revert-failing: without `parse_attacking_defender_anaphor`,
+/// `parse_type_phrase` leaves "attacking that player" unconsumed,
+/// `parse_subject_application`'s rest-empty gate fails, and the clause falls
+/// through to `parse_numeric_imperative_ast`, which emits the documented
+/// `Effect::Pump { target: TargetFilter::Any }` sentinel — a board-wide pump
+/// that hits both players' permanents, lands included.
+#[test]
+fn namor_pump_scopes_to_other_attackers_of_the_defending_player() {
+    let result = parse_namor();
+
+    // Positive reach-guard: the card parses with zero Unimplemented, so the
+    // assertions below cannot pass vacuously via a total parse failure.
+    assert!(
+        !parsed_has_unimplemented(&result),
+        "Namor must parse with zero Unimplemented effects: {result:#?}"
+    );
+
+    let attack = namor_attack_trigger(&result);
+    let execute = attack
+        .execute
+        .as_ref()
+        .expect("attack trigger should have an execute body");
+    assert_eq!(execute.duration, Some(Duration::UntilEndOfTurn));
+
+    let Effect::PumpAll {
+        power,
+        toughness,
+        target,
+    } = &*execute.effect
+    else {
+        panic!(
+            "expected a class-scoped PumpAll, got {:?} — a `Pump {{ target: Any }}` here means the \
+             \"attacking that player\" suffix was dropped and the board-wide sentinel shipped",
+            execute.effect
+        );
+    };
+    assert_eq!(*power, PtValue::Fixed(2));
+    assert_eq!(*toughness, PtValue::Fixed(0));
+
+    let TargetFilter::Typed(typed) = target else {
+        panic!("expected a Typed pump filter, got {target:?}");
+    };
+    assert_eq!(typed.controller, Some(ControllerRef::You));
+    assert!(
+        typed.type_filters.contains(&TypeFilter::Creature),
+        "type_filters={:?}",
+        typed.type_filters
+    );
+    assert!(
+        typed.properties.contains(&FilterProp::Attacking {
+            defender: Some(ControllerRef::DefendingPlayer),
+        }),
+        "pump filter must carry the CR 508.5 defending-player anaphor, got {:?}",
+        typed.properties
+    );
+    assert!(
+        typed.properties.contains(&FilterProp::Another),
+        "\"other creatures\" must exclude Namor itself, got {:?}",
+        typed.properties
+    );
+}
+
+/// V10 — the anaphor covers the CLASS, not just Namor: both printed cards that
+/// place "attacking that player" in a genuine TARGET filter must now carry the
+/// CR 508.5 property. Echoing Assault additionally exercises an EXCLUDED
+/// position in its second sentence, so one card proves both halves.
+#[test]
+fn attacking_that_player_target_filters_carry_the_defending_player_anaphor() {
+    // Verbatim Oracle text (MTGJSON); a paraphrase can take a different parser
+    // branch and go green while the real card stays broken.
+    let ordruun = parse(
+        "Mentor (Whenever this creature attacks, put a +1/+1 counter on target attacking creature with lesser power.)\nWhenever you attack a player, target creature that's attacking that player gains first strike until end of turn.",
+        "Ordruun Mentor",
+        &[Keyword::Mentor],
+        &["Creature"],
+        &["Minotaur", "Soldier"],
+    );
+    assert!(
+        ordruun
+            .triggers
+            .iter()
+            .filter_map(|t| t.execute.as_deref())
+            .any(definition_chain_has_defending_player_anaphor),
+        "Ordruun Mentor's target filter must scope to the attacked player: {ordruun:#?}"
+    );
+
+    let echoing = parse(
+        "Creature tokens you control have menace.\nWhenever you attack a player, choose target nontoken creature that's attacking that player. Create a token that's a copy of that creature, except it's 1/1. The token enters tapped and attacking that player. Sacrifice it at the beginning of the next end step.",
+        "Echoing Assault",
+        &[],
+        &["Enchantment"],
+        &[],
+    );
+    assert!(
+        echoing
+            .triggers
+            .iter()
+            .filter_map(|t| t.execute.as_deref())
+            .any(definition_chain_has_defending_player_anaphor),
+        "Echoing Assault's target filter must scope to the attacked player: {echoing:#?}"
+    );
+}
+
+fn definition_chain_has_defending_player_anaphor(def: &AbilityDefinition) -> bool {
+    def.effect
+        .target_filter()
+        .is_some_and(target_filter_has_defending_player_anaphor)
+        || def
+            .sub_ability
+            .as_deref()
+            .is_some_and(definition_chain_has_defending_player_anaphor)
+        || def
+            .else_ability
+            .as_deref()
+            .is_some_and(definition_chain_has_defending_player_anaphor)
+}
+
+/// V9 — the anaphor must not steal the token-spec / battlefield-entry /
+/// continuation / copy-token members of the 52-card "attacking that player"
+/// corpus. Many of them terminate with a bare "." right after the phrase, which
+/// SATISFIES the clause boundary, so the boundary guard is not what protects
+/// them — the excluded positions never route the phrase through
+/// `parse_type_phrase`'s suffix chain at all.
+#[test]
+fn excluded_attacking_that_player_positions_are_not_stolen() {
+    // Inline token spec, bare "." terminator. Verbatim Oracle text (MTGJSON) —
+    // the real card wraps the token spec in a "for each opponent" distributive,
+    // which a paraphrase without it would not exercise.
+    let ainok = parse(
+        "Whenever you attack with this creature and/or your commander, for each opponent, create a 1/1 red Goblin creature token that's tapped and attacking that player.\n\
+         Sacrifice this creature: Creature tokens you control gain indestructible until end of turn.",
+        "Ainok Strike Leader",
+        &[],
+        &["Creature"],
+        &["Dog", "Warrior"],
+    );
+    assert!(
+        !parsed_has_unimplemented(&ainok),
+        "reach guard: Ainok Strike Leader must parse: {ainok:#?}"
+    );
+    assert!(
+        ainok
+            .triggers
+            .iter()
+            .filter_map(|t| t.execute.as_deref())
+            .any(|d| matches!(
+                &*d.effect,
+                Effect::Token {
+                    enters_attacking: true,
+                    tapped: true,
+                    ..
+                }
+            )),
+        "inline token specs must still lower to an attacking token: {ainok:#?}"
+    );
+    assert!(
+        !ainok
+            .triggers
+            .iter()
+            .filter_map(|t| t.execute.as_deref())
+            .any(definition_chain_has_defending_player_anaphor),
+        "a token spec's entry flag must not become a target-filter suffix: {ainok:#?}"
+    );
+
+    // Battlefield-entry tail. Verbatim Oracle text (MTGJSON), including the
+    // "Soldier, Warrior, or Wizard" restriction and both trailing sentences —
+    // the paraphrase this row used to carry dropped all three.
+    let vast_scrier = parse(
+        "Flying\n\
+         Whenever The Vast Scrier attacks a player, you may put a Soldier, Warrior, or Wizard creature card from your hand onto the battlefield tapped and attacking that player. If it has any \"Whenever this creature attacks\" triggers, those trigger. If you don't put a card onto the battlefield this way, scry 2.",
+        "The Vast Scrier",
+        &[Keyword::Flying],
+        &["Creature"],
+        &["Human", "Cleric"],
+    );
+    // Positive reach-guard: the battlefield-entry tail was consumed as ENTRY
+    // FLAGS on the `ChangeZone`, which is the whole point of the exclusion.
+    let entry = vast_scrier
+        .triggers
+        .iter()
+        .filter_map(|t| t.execute.as_deref())
+        .find(|d| matches!(&*d.effect, Effect::ChangeZone { .. }))
+        .unwrap_or_else(|| {
+            panic!("The Vast Scrier keeps its battlefield-entry effect: {vast_scrier:#?}")
+        });
+    let Effect::ChangeZone {
+        enter_tapped,
+        enters_attacking,
+        target,
+        ..
+    } = &*entry.effect
+    else {
+        unreachable!("matched above");
+    };
+    assert!(
+        matches!(enter_tapped, crate::types::zones::EtbTapState::Tapped) && *enters_attacking,
+        "\"tapped and attacking that player\" must land as entry flags: {entry:#?}"
+    );
+    assert!(
+        !target_filter_has_defending_player_anaphor(target),
+        "battlefield-entry tails must not become filter suffixes: {entry:#?}"
+    );
+    // The two trailing sentences the engine cannot model stay honestly RED
+    // (`Effect::Unimplemented`), so this row is not asserting coverage the card
+    // does not have.
+    assert!(
+        parsed_has_unimplemented(&vast_scrier),
+        "the \"those trigger\" rider is unmodelled and must remain honestly red: {vast_scrier:#?}"
+    );
+
+    // Predicative state-change sentence — a copula, not a filter suffix.
+    // Verbatim Oracle text (MTGJSON): the real card is a Creature with an ETB
+    // trigger, so its content lands in `triggers`, not `abilities`.
+    let portal = parse(
+        "Flash\n\
+         When this creature enters during the declare attackers step, choose target player and any number of target attacking creatures their opponents control. Those creatures are now attacking that player.",
+        "Portal Manipulator",
+        &[Keyword::Flash],
+        &["Creature"],
+        &["Human", "Wizard"],
+    );
+    // Positive reach-guard: the sentence really did reach the parser and
+    // produced a live trigger with a body. Without this the negative below
+    // passes for the wrong reason on a total parse failure.
+    let portal_chain: Vec<&AbilityDefinition> = portal
+        .triggers
+        .iter()
+        .filter_map(|t| t.execute.as_deref())
+        .collect();
+    assert!(
+        !portal_chain.is_empty(),
+        "reach guard: Portal Manipulator's ETB trigger must parse to a body: {portal:#?}"
+    );
+    // The negative, over BOTH axes and through the full sub/else chain (the
+    // shallow `abilities`-only, top-level-effect-only traversal this row used to
+    // carry could not see a `sub_ability`).
+    assert!(
+        !portal_chain
+            .iter()
+            .copied()
+            .any(definition_chain_has_defending_player_anaphor)
+            && !portal
+                .abilities
+                .iter()
+                .any(definition_chain_has_defending_player_anaphor),
+        "predicative state-change sentences must not become filter suffixes: {portal:#?}"
+    );
+    // And the sentence the engine cannot model stays honestly RED rather than
+    // silently degrading into a wrong filter.
+    assert!(
+        portal_chain
+            .iter()
+            .copied()
+            .any(def_chain_has_unimplemented),
+        "the unmodelled copula sentence must remain honestly red: {portal:#?}"
+    );
+}
+
+/// V1 — Namor's *event clause* must carry the attacked-player predicate on
+/// `valid_target` (CR 603.2, checked once at declaration) and NOT on `condition`
+/// (CR 603.4, re-checked at resolution). Namor's text has no "if", so the
+/// relative clause is part of the trigger event, not an intervening-if.
+///
+/// Revert-failing: before the fix `parse_attack_target`'s remainder was
+/// discarded, leaving `valid_target: None` — the trigger fired on every player
+/// attack regardless of life totals.
+#[test]
+fn namor_attack_trigger_binds_the_more_life_predicate_to_the_event_clause() {
+    let result = parse_namor();
+    assert!(
+        !parsed_has_unimplemented(&result),
+        "Namor must parse with zero Unimplemented effects: {result:#?}"
+    );
+
+    let attack = namor_attack_trigger(&result);
+    assert_eq!(
+        attack.attack_target_filter,
+        Some(AttackTargetFilter::Player),
+        "base attacked-player scope must survive the relative clause"
+    );
+    assert_eq!(attack.valid_card, Some(TargetFilter::SelfRef));
+
+    assert_eq!(
+        attack.valid_target,
+        Some(TargetFilter::PlayerMatching {
+            player: Box::new(PlayerFilter::PlayerAttribute {
+                relation: PlayerRelation::All,
+                attr: Box::new(QuantityRef::LifeTotal {
+                    player: PlayerScope::ScopedPlayer,
+                }),
+                comparator: Comparator::GT,
+                value: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::LifeTotal {
+                        player: PlayerScope::Controller,
+                    },
+                }),
+            }),
+        }),
+        "\"who has more life than you\" belongs on the CR 603.2 event channel"
+    );
+
+    // CR 603.4 does not apply: no "if" immediately follows the trigger event, so
+    // the predicate must NOT be re-checked at resolution.
+    assert_eq!(
+        attack.condition, None,
+        "a CR 603.2 event clause must not become a CR 603.4 intervening-if"
+    );
+}
+
+/// Class coverage for the "who controls N or more <type>" axis (Owlbear Cub).
+/// Without the numeric-threshold arm this card would fall to the fail-closed
+/// guard and land honestly RED; with it, the predicate is modelled. Verbatim
+/// Oracle text (MTGJSON).
+#[test]
+fn owlbear_cub_attacked_player_land_threshold_predicate_is_bound() {
+    let parsed = parse(
+        "Mama's Coming — Whenever this creature attacks a player who controls eight or more lands, look at the top eight cards of your library. You may put a creature card from among them onto the battlefield tapped and attacking that player. Put the rest on the bottom of your library in a random order.",
+        "Owlbear Cub",
+        &[],
+        &["Creature"],
+        &["Owlbear"],
+    );
+    let attack = parsed
+        .triggers
+        .iter()
+        .find(|t| t.mode == TriggerMode::Attacks)
+        .expect("Owlbear Cub keeps its attack trigger");
+    let Some(TargetFilter::PlayerMatching { player }) = &attack.valid_target else {
+        panic!(
+            "Owlbear Cub's land-count predicate must bind to valid_target, got {:?}",
+            attack.valid_target
+        );
+    };
+    let PlayerFilter::ControlsCount {
+        relation,
+        filter,
+        comparator,
+        count,
+    } = player.as_ref()
+    else {
+        panic!("expected a ControlsCount predicate, got {player:?}");
+    };
+    assert_eq!(*relation, PlayerRelation::All);
+    assert_eq!(*comparator, Comparator::GE);
+    assert_eq!(**count, QuantityExpr::Fixed { value: 8 });
+    let TargetFilter::Typed(typed) = filter else {
+        panic!("expected a typed land filter, got {filter:?}");
+    };
+    assert!(typed.type_filters.contains(&TypeFilter::Land));
+    assert_eq!(attack.condition, None);
+}
+
+/// V11 — consume-on-success: a `who`-headed clause the predicate grammar cannot
+/// model must fall to `Effect::Unimplemented`, never silently leave the broad
+/// `Player` scope behind (that is precisely the bug being fixed).
+///
+/// This is the direct regression test for the guard's SLICE: every
+/// `parse_attack_target` tag carries a leading space, so a guard aimed at the
+/// raw remainder could never fire. The comma control proves the post-noun
+/// fallback binding does not mis-fire when no space follows the noun.
+#[test]
+fn unmodelled_attacked_player_predicate_fails_closed() {
+    let declined = parse(
+        "Whenever ~ attacks a player who has drawn three cards this turn, draw a card.",
+        "Fail Closed Test",
+        &[],
+        &["Creature"],
+        &[],
+    );
+    // The honest-red marker for an unparsed trigger EVENT is
+    // `TriggerMode::Unknown` (which `game::coverage` counts as a gap), not an
+    // `Unimplemented` effect — the body ("draw a card") parses fine; it is the
+    // event clause that could not be modelled.
+    assert!(
+        declined
+            .triggers
+            .iter()
+            .all(|t| matches!(t.mode, TriggerMode::Unknown(_))),
+        "an unmodelled `who` predicate must fail closed to TriggerMode::Unknown, got {declined:#?}"
+    );
+    assert!(
+        !declined.triggers.iter().any(|t| t.attack_target_filter
+            == Some(AttackTargetFilter::Player)
+            && t.valid_target.is_none()),
+        "declining must not leave a broad attacked-player scope behind: {:?}",
+        declined.triggers
+    );
+
+    // Paired positive reach-guard: the same sentence shape with a MODELLED
+    // predicate parses, so the negative above cannot pass vacuously.
+    let accepted = parse(
+        "Whenever ~ attacks a player who has more life than you, draw a card.",
+        "Fail Closed Reach Guard",
+        &[],
+        &["Creature"],
+        &[],
+    );
+    assert!(
+        !parsed_has_unimplemented(&accepted),
+        "the modelled predicate must still parse: {accepted:#?}"
+    );
+    assert!(
+        matches!(
+            accepted
+                .triggers
+                .iter()
+                .find(|t| t.mode == TriggerMode::Attacks)
+                .and_then(|t| t.valid_target.as_ref()),
+            Some(TargetFilter::PlayerMatching { .. })
+        ),
+        "reach guard must bind the predicate: {:?}",
+        accepted.triggers
+    );
+
+    // Comma control: no relative clause at all, so the post-noun fallback
+    // binding must leave the plain attacked-player scope untouched.
+    let comma = parse(
+        "Whenever ~ attacks a player, draw a card.",
+        "Comma Control",
+        &[],
+        &["Creature"],
+        &[],
+    );
+    let plain = comma
+        .triggers
+        .iter()
+        .find(|t| t.mode == TriggerMode::Attacks)
+        .expect("plain attack trigger");
+    assert_eq!(plain.attack_target_filter, Some(AttackTargetFilter::Player));
+    assert_eq!(plain.valid_target, None);
+    assert!(!parsed_has_unimplemented(&comma));
+}
+
+/// V8 — sibling grammar is not stolen. A `with `-headed tail modifies the
+/// ATTACK, not the attacked player, so it must not become a `PlayerMatching`
+/// predicate. The Vast Scrier additionally proves a bare `attacks a player`
+/// clause with an "attacking that player" BODY keeps its plain event scope.
+#[test]
+fn attack_trigger_tails_that_are_not_player_predicates_are_untouched() {
+    // Real cards carry their VERBATIM MTGJSON Oracle text; the one synthetic row
+    // is named as such because it probes a grammar fragment (Goad's reminder
+    // clause) rather than standing in for a printed card.
+    for (name, text, keywords, subtypes) in [
+        (
+            "Akiri, Fearless Voyager",
+            "Whenever you attack a player with one or more equipped creatures, draw a card.\n\
+             {W}: You may unattach an Equipment from a creature you control. If you do, tap that creature and it gains indestructible until end of turn.",
+            &[][..],
+            &["Kor", "Warrior"][..],
+        ),
+        (
+            "Goad Reminder (synthetic grammar probe)",
+            "Whenever ~ attacks a player other than you if able, draw a card.",
+            &[][..],
+            &[][..],
+        ),
+        (
+            "The Vast Scrier",
+            "Flying\n\
+             Whenever The Vast Scrier attacks a player, you may put a Soldier, Warrior, or Wizard creature card from your hand onto the battlefield tapped and attacking that player. If it has any \"Whenever this creature attacks\" triggers, those trigger. If you don't put a card onto the battlefield this way, scry 2.",
+            &[Keyword::Flying][..],
+            &["Human", "Cleric"][..],
+        ),
+    ] {
+        let parsed = parse(text, name, keywords, &["Creature"], subtypes);
+        // Positive reach-guard: the attack sentence reached the attack-trigger
+        // parser and produced a live trigger with a body. A total parse failure
+        // (or a `TriggerMode::Unknown` decline) would make the negative below
+        // pass for the wrong reason.
+        assert!(
+            parsed.triggers.iter().any(|t| matches!(
+                t.mode,
+                TriggerMode::Attacks | TriggerMode::YouAttack
+            ) && t.execute.is_some()),
+            "{name}: reach guard — the attack trigger must parse: {parsed:#?}"
+        );
+        for trigger in &parsed.triggers {
+            assert!(
+                !matches!(
+                    trigger.valid_target,
+                    Some(TargetFilter::PlayerMatching { .. })
+                ),
+                "{name}: non-`who` tails are not player predicates, got {:?}",
+                trigger.valid_target
+            );
+        }
+    }
+}
+
+/// V11b — CR 608.2c consume-on-success on the REMAINDER. An arm that models
+/// only a PREFIX of the relative clause must decline, exactly like an arm that
+/// cannot match at all: binding the prefix would leave an UNDER-restricted
+/// `valid_target` and silently drop the rest of the printed restriction, which
+/// is the same silent-drop failure mode this change was written to eliminate.
+///
+/// Revert-failing: delete the `peek_clause_terminator` filter in
+/// `oracle_trigger`'s predicate hook (and/or the one inside
+/// `parse_has_more_life_than_you`) and both rows below bind
+/// `PlayerMatching { PlayerAttribute { .. } }` while the conjunct / trailing
+/// verb vanishes.
+#[test]
+fn attacked_player_predicate_requires_a_clause_boundary() {
+    for (name, text) in [
+        // Conjunct the predicate grammar cannot model: the life half alone is a
+        // strictly weaker restriction than the printed text.
+        (
+            "Partial Predicate Conjunct",
+            "Whenever ~ attacks a player who has more life than you and controls a Forest, draw a card.",
+        ),
+        // A different phrasing whose PREFIX coincides with the modelled one.
+        // "…more life than you do" is the corpus's other comparative form
+        // (Keeper of the Flame / Keeper of the Light), so this is a real
+        // grammar collision, not an invented one.
+        (
+            "Partial Predicate Trailing Verb",
+            "Whenever ~ attacks a player who has more life than you do, draw a card.",
+        ),
+    ] {
+        let parsed = parse(text, name, &[], &["Creature"], &[]);
+        assert!(
+            parsed
+                .triggers
+                .iter()
+                .all(|t| matches!(t.mode, TriggerMode::Unknown(_))),
+            "{name}: a partially-modelled `who` clause must fail closed to \
+             TriggerMode::Unknown, got {parsed:#?}"
+        );
+        assert!(
+            !parsed.triggers.iter().any(|t| matches!(
+                t.valid_target,
+                Some(TargetFilter::PlayerMatching { .. })
+            )),
+            "{name}: binding the PREFIX is an under-restricted scope, not coverage: {:?}",
+            parsed.triggers
+        );
+        assert!(
+            !parsed.triggers.iter().any(|t| t.attack_target_filter
+                == Some(AttackTargetFilter::Player)
+                && t.valid_target.is_none()),
+            "{name}: declining must not leave a broad attacked-player scope behind: {:?}",
+            parsed.triggers
+        );
+    }
+
+    // Paired positive reach-guard: the clause that DOES end at a boundary still
+    // binds, so the negatives above cannot pass vacuously.
+    let accepted = parse(
+        "Whenever ~ attacks a player who has more life than you, draw a card.",
+        "Boundary Reach Guard",
+        &[],
+        &["Creature"],
+        &[],
+    );
+    assert!(
+        matches!(
+            accepted
+                .triggers
+                .iter()
+                .find(|t| t.mode == TriggerMode::Attacks)
+                .and_then(|t| t.valid_target.as_ref()),
+            Some(TargetFilter::PlayerMatching { .. })
+        ),
+        "reach guard must still bind the boundary-terminated predicate: {:?}",
+        accepted.triggers
+    );
+}
+
+/// V17 — Loot Dispute is untouched, not silently absorbed. `parse_attack_target`
+/// has no `" the player"` arm, so the definite-article base noun never produces
+/// an attacked-player scope and the fail-closed guard's precondition is never
+/// met; `PlayerFilter` also has no initiative-designation variant.
+///
+/// TRIPWIRE: adding `" the player"` to `parse_attack_target` later must
+/// consciously decide whether Loot Dispute flips to honestly RED.
+#[test]
+fn loot_dispute_initiative_predicate_is_unchanged() {
+    let parsed = parse(
+        "Whenever you attack the player who has the initiative, create a Treasure token.",
+        "Loot Dispute",
+        &[],
+        &["Artifact"],
+        &[],
+    );
+    assert!(
+        !parsed.triggers.is_empty(),
+        "Loot Dispute must retain an honest trigger gap rather than disappear: {parsed:#?}"
+    );
+    for trigger in &parsed.triggers {
+        assert_eq!(trigger.attack_target_filter, None);
+        assert_eq!(trigger.valid_target, None);
+    }
+}
+
+/// CR 508.3e vs CR 508.3d — the attacked-player OBJECT of a "you attack"
+/// trigger is what separates the two rules, and it must land on
+/// `attack_target_filter` for the whole class rather than for one card.
+///
+/// Two independent things ride on this one field, so the row asserts the field
+/// rather than any single card's downstream behaviour:
+///
+/// 1. **Restriction (CR 508.3e).** "It won't trigger ... if a creature attacks
+///    a planeswalker or a battle." With `None`, a planeswalker-only declaration
+///    fires the trigger.
+/// 2. **Per-firing binding (CR 508.3e).** The engine splits the declaration
+///    into one firing per attacked player only when this field names a player;
+///    that is what makes "that player" resolve per firing instead of collapsing
+///    to the batch-global defender.
+///
+/// The bare "you attack" row is the discriminating negative: CR 508.3d fires
+/// once for the whole declaration against any defender, so a change that set
+/// the filter unconditionally would both over-restrict it and silently multiply
+/// how many times it fires.
+#[test]
+fn you_attack_trigger_binds_its_attacked_player_object() {
+    use crate::types::triggers::AttackTargetFilter;
+
+    // Every printed "Whenever you attack a player" card, verbatim trigger line.
+    // One card would prove nothing about the arm; the class is the unit.
+    let attacks_a_player: &[(&str, &str, &[&str])] = &[
+        (
+            "Ordruun Mentor",
+            "Whenever you attack a player, target creature that's attacking that player gains first strike until end of turn.",
+            &["Creature"],
+        ),
+        (
+            "Echoing Assault",
+            "Whenever you attack a player, choose target nontoken creature that's attacking that player. Create a token that's a copy of that creature, except it's 1/1.",
+            &["Enchantment"],
+        ),
+        (
+            "Horizon Explorer",
+            "Whenever you attack a player, create a Lander token.",
+            &["Creature"],
+        ),
+        (
+            "Soaring Lightbringer",
+            "Whenever you attack a player, create a 1/1 white Glimmer enchantment creature token that's tapped and attacking that player.",
+            &["Creature"],
+        ),
+        (
+            "Karazikar, the Eye Tyrant",
+            "Whenever you attack a player, tap target creature that player controls and goad it.",
+            &["Creature"],
+        ),
+        (
+            "Seifer, Balamb Rival",
+            "Whenever you attack a player, goad target creature that player controls.",
+            &["Creature"],
+        ),
+        (
+            "Long-Range Sensor",
+            "Whenever you attack a player, put a charge counter on this artifact.",
+            &["Artifact"],
+        ),
+    ];
+    for (name, text, types) in attacks_a_player {
+        let parsed = parse(text, name, &[], types, &[]);
+        let trigger = parsed
+            .triggers
+            .iter()
+            .find(|t| t.mode == TriggerMode::YouAttack)
+            .unwrap_or_else(|| panic!("{name} keeps its YouAttack trigger: {parsed:#?}"));
+        assert_eq!(
+            trigger.attack_target_filter,
+            Some(AttackTargetFilter::Player),
+            "{name}: CR 508.3e names [another player], so the attacked-player \
+             object must bind — without it the trigger fires on a \
+             planeswalker-only attack and cannot split per attacked player"
+        );
+    }
+
+    // CR 508.3d: a bare "you attack" names no object — any defender, one firing.
+    let bare = parse(
+        "Whenever you attack, draw a card.",
+        "BareYouAttack",
+        &[],
+        &["Creature"],
+        &[],
+    );
+    let bare_trigger = bare
+        .triggers
+        .iter()
+        .find(|t| t.mode == TriggerMode::YouAttack)
+        .expect("bare \"you attack\" stays a YouAttack trigger");
+    assert_eq!(
+        bare_trigger.attack_target_filter, None,
+        "CR 508.3d: a bare \"you attack\" must NOT gain an attacked-player \
+         object — that would both restrict it to player attacks and multiply \
+         its firings per attacked player"
+    );
+
+    // A trailing qualifier is a different, unmodelled grammar. Declining leaves
+    // the pre-existing shape rather than claiming the CR 508.3e restriction
+    // while dropping the qualifier's meaning.
+    let qualified = parse(
+        "Whenever you attack a player with one or more equipped creatures, draw a card.",
+        "Akiri, Fearless Voyager",
+        &[],
+        &["Creature"],
+        &[],
+    );
+    // Positive reach-guard: `.all()` over an empty iterator is vacuously true,
+    // so a parse regression that drops the trigger entirely would pass the
+    // assertion below for the wrong reason.
+    let qualified_you_attack: Vec<_> = qualified
+        .triggers
+        .iter()
+        .filter(|t| t.mode == TriggerMode::YouAttack)
+        .collect();
+    assert!(
+        !qualified_you_attack.is_empty(),
+        "the qualified phrase must still produce a YouAttack trigger — an empty \
+         set would make the next assertion vacuous: {qualified:#?}"
+    );
+    assert!(
+        qualified_you_attack
+            .iter()
+            .all(|t| t.attack_target_filter.is_none()),
+        "a qualified attacked-player phrase must not be read as the bare \
+         CR 508.3e object: {qualified:#?}"
+    );
+}
+
+/// CR 201.5a: `render_modification_descriptions`'s `GrantReplacement` arm must
+/// reach the nested `ReplacementDefinition`'s description, the same as its
+/// `GrantAbility`/`GrantTrigger`/`GrantStaticAbility` siblings. The production
+/// `GrantReplacement` producer (`leave_battlefield_exile_replacement`) never
+/// carries a description today, so this is a direct unit test of the render
+/// function itself rather than an end-to-end parse, proving the net is
+/// complete for the day a producer does attach one (or a self-referencing
+/// granted "would leave the battlefield" rider is added).
+///
+/// Revert-to-red: removing the `GrantReplacement` arm (falling through to the
+/// wildcard `_ => {}`) leaves the raw placeholder character in the nested
+/// definition's description, so the `assert_eq!` below prints the escaped
+/// `\u{e0002}` where the granting card's printed name belongs.
+#[test]
+fn render_modification_descriptions_reaches_grant_replacement() {
+    let mut replacement = ReplacementDefinition::new(ReplacementEvent::Moved);
+    replacement.description = Some(format!(
+        "If {GRANTING_SELF_PLACEHOLDER} would leave the battlefield, exile it instead."
+    ));
+    let mut modification = ContinuousModification::GrantReplacement {
+        replacement: Box::new(replacement),
+    };
+    render_modification_descriptions(&mut modification, "Ghoulcaller's Bell");
+    let ContinuousModification::GrantReplacement { replacement } = &modification else {
+        panic!("expected GrantReplacement to survive rendering unchanged in shape");
+    };
+    assert_eq!(
+        replacement.description.as_deref(),
+        Some("If Ghoulcaller's Bell would leave the battlefield, exile it instead."),
+        "the render loop must render the granter marker as the granting card's \
+         printed name in a granted replacement's description"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CR 201.5a — the display-render net's standing completeness instruments.
+// ---------------------------------------------------------------------------
+
+/// The brace-matched BODY of the declaration `header` opens: the text between
+/// the first `{` at or after `header`'s start and its matching `}`.
+///
+/// One rule serves both call shapes — an enum header that already ends in the
+/// brace (`"pub enum Effect {"`) and a function header that does not
+/// (`"fn render_effect_descriptions("`, whose signature carries no brace).
+///
+/// Test-only source lexing, in the `src/source_census.rs` family: it reads Rust
+/// SOURCE TEXT for a census, never Oracle text for parsing dispatch. The comment
+/// policy is not ours — callers pass text already through
+/// `source_census::code_lines`, so a header quoted in a doc comment cannot be
+/// what `find` lands on.
+fn census_body<'a>(src: &'a str, header: &str) -> &'a str {
+    let start = src
+        .find(header)
+        .unwrap_or_else(|| panic!("census: `{header}` not found in the scanned source"));
+    let open = start
+        + src[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("census: no opening brace after `{header}`"));
+    let mut depth = 0usize;
+    for (offset, ch) in src[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[open + 1..open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("census: unbalanced braces after `{header}`");
+}
+
+/// The variant (or field) names declared at depth 0 of a `census_body` slice.
+///
+/// Splits on depth-0 commas, drops `#[..]` attributes, and takes the leading
+/// identifier of each part. Struct-like, tuple-like, and unit variants all yield
+/// exactly their name.
+fn census_variant_names(body: &str) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+    let mut current = String::new();
+    for ch in body.chars() {
+        match ch {
+            '{' | '(' | '[' => depth += 1,
+            '}' | ')' | ']' => depth -= 1,
+            _ => {}
+        }
+        if ch == ',' && depth == 0 {
+            parts.push(std::mem::take(&mut current));
+        } else {
+            current.push(ch);
+        }
+    }
+    parts.push(current);
+
+    let mut names = Vec::new();
+    for part in parts {
+        // Drop attributes so `#[serde(default)] Foo` yields `Foo`, not `serde`.
+        let mut without_attrs = String::new();
+        let mut rest = part.as_str();
+        while let Some(hash) = rest.find("#[") {
+            without_attrs.push_str(&rest[..hash]);
+            let mut depth = 0i32;
+            let mut end = None;
+            for (offset, ch) in rest[hash..].char_indices() {
+                match ch {
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(hash + offset + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match end {
+                Some(e) => rest = &rest[e..],
+                None => {
+                    rest = "";
+                    break;
+                }
+            }
+        }
+        without_attrs.push_str(rest);
+
+        let trimmed = without_attrs.trim_start();
+        let ident: String = trimmed
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !ident.is_empty() && trimmed.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+            names.push(ident);
+        }
+    }
+    names
+}
+
+/// CR 201.5a — STANDING CENSUS for the display-render net's carrier set.
+///
+/// `render_effect_descriptions` (`parser/oracle.rs`) ends in `_ => {}` on
+/// purpose: a wildcard-free match would duplicate `types::ability_visit`'s
+/// ~206-name leaf list, the duplication CLAUDE.md forbids. This census restores
+/// the decision-forcing property the wildcard gives up, in the shape
+/// `src/source_census.rs` documents ("a producer added or deleted without
+/// adjudication is a counted event"), and routes through that module's
+/// comment-stripping authority rather than bringing its own policy.
+///
+/// MEASURED: adding an `Effect` variant with an `AbilityDefinition` payload
+/// breaks 20 wildcard-free matches elsewhere in the crate and NONE of them is
+/// the render net; this census is what fails.
+///
+/// THREE PINS, for the three ways the descend set can silently rot:
+///
+/// 1. `EFFECT_VARIANT_PIN` — a new `Effect` VARIANT.
+/// 2. `PAYLOAD_ENUM_PINS` — a new variant on an INTERMEDIATE PAYLOAD ENUM. Each
+///    of these five enums has exactly ONE description-reaching variant today, so
+///    the net's arms destructure that one variant and every sibling falls
+///    through the outer `_ => {}` — silently, since neither the `Effect`-variant
+///    pin nor the planted-marker fixture can see it. `types::ability_visit` has
+///    the same shape for `VoteSubject`/`CounterSourceRider` and only DISCLOSES
+///    it in prose; pinning is chosen here instead because the cost is one table
+///    row per enum rather than a leaf-name list, and because prose disclosure is
+///    exactly what let four carriers escape a careful manual enumeration.
+///    `DelayedTriggerCondition` is deliberately ABSENT from the table:
+///    `render_delayed_condition_descriptions`'s match is wildcard-free, so a new
+///    variant there is a COMPILE ERROR — strictly stronger than a pin.
+/// 3. `RENDER_DESCEND` — the net's own arm set, scanned out of its body, so
+///    deleting an arm reds independently of any behavioral fixture.
+///
+/// `ModalChoice` is deliberately ABSENT from all three. It is a STRUCT reached by
+/// FIELD (`ParsedAbilities::modal`, `AbilityDefinition::modal`), not an `Effect`
+/// variant and not a payload ENUM, so no mechanism here can see it — a new field
+/// on it is drift class (c). `parser::oracle::render_modal_descriptions`
+/// destructures it EXHAUSTIVELY instead, making that addition a COMPILE ERROR,
+/// which is strictly stronger than a pin — the same trade
+/// `render_delayed_condition_descriptions`' wildcard-free match makes.
+///
+/// Regenerate the descend set (the derivation rule is FIELD TYPES followed
+/// transitively into named types, with `AbilityCost` blocked as a separate
+/// axis — unblocked it makes 184 of 232 variants carriers via
+/// `TargetFilter -> TypedFilter -> FilterProp -> Keyword -> AbilityCost`) with
+/// the closure script in the plan's carrier-enumeration section.
+///
+/// Revert-to-red (a): add any `Effect` variant -> the count pin fails, naming
+/// the classification decision. (b): add a variant to any of the five payload
+/// enums -> that row fails, naming the outer-wildcard hole. (c): delete any arm
+/// from `render_effect_descriptions` -> the descend-set equality fails, naming
+/// it.
+#[test]
+fn render_net_effect_carrier_census() {
+    const EFFECT_VARIANT_PIN: usize = 233;
+    /// `(enum header, pinned variant count, the ONE variant the net destructures)`.
+    const PAYLOAD_ENUM_PINS: &[(&str, usize, &str)] = &[
+        ("pub enum CastingPermission {", 8, "ExileWithAltCost"),
+        ("pub enum ExiledSpellRider {", 2, "ReturnTo"),
+        ("pub enum CounterSourceRider {", 2, "LosesAbilities"),
+        ("pub enum VoteSubject {", 2, "Objects"),
+    ];
+    const RENDER_DESCEND: &[&str] = &[
+        "AddPendingEntersModifications",
+        "AddTargetReplacement",
+        "BecomeCopy",
+        "ChooseOneOf",
+        "CopySpell",
+        "CopyTokenOf",
+        "Counter",
+        "CreateDelayedTrigger",
+        "CreateDrawReplacement",
+        "CreateEmblem",
+        "CreatePlaneswalkReplacement",
+        "EachPlayerCopyChosen",
+        "ExileResolvingSpellInsteadOfGraveyard",
+        "FlipCoin",
+        "FlipCoinUntilLose",
+        "FlipCoins",
+        "GenericEffect",
+        "GrantCastingPermission",
+        "Mana",
+        "ReturnAsAura",
+        "RevealFromHand",
+        "RollDie",
+        "SeparateIntoPiles",
+        "Token",
+        "Unimplemented",
+        "Vote",
+    ];
+
+    let ability_src = crate::source_census::code_lines(include_str!("../types/ability.rs"));
+    let variants = census_variant_names(census_body(&ability_src, "pub enum Effect {"));
+    assert!(
+        variants.len() > 200 && variants.iter().any(|v| v == "GenericEffect"),
+        "reach-guard: the scan found `pub enum Effect`'s body (n={}), not an \
+         empty or wrong region",
+        variants.len()
+    );
+    assert_eq!(
+        variants.len(),
+        EFFECT_VARIANT_PIN,
+        "`Effect` gained or lost a variant. Decide whether any of its FIELD TYPES \
+         transitively reaches a `description` string; if so add a descend arm to \
+         `render_effect_descriptions` (parser/oracle.rs) and list it in \
+         RENDER_DESCEND, then bump this pin."
+    );
+
+    let mana_src = crate::source_census::code_lines(include_str!("../types/mana.rs"));
+    for (header, pin, destructured) in PAYLOAD_ENUM_PINS.iter().copied().chain([(
+        "pub enum ManaSpellGrant {",
+        4usize,
+        "TriggerOnSpend",
+    )]) {
+        let src = if header.contains("ManaSpellGrant") {
+            &mana_src
+        } else {
+            &ability_src
+        };
+        let payload = census_variant_names(census_body(src, header));
+        assert!(
+            payload.iter().any(|v| v == destructured),
+            "reach-guard: the scan found `{header}`'s body, which must contain the \
+             one variant the render net destructures ({destructured}); got {payload:?}"
+        );
+        assert_eq!(
+            payload.len(),
+            pin,
+            "`{header}` gained or lost a variant. `render_effect_descriptions` \
+             destructures only `{destructured}` from this enum, and every sibling \
+             falls through its outer `_ => {{}}` UNSEEN — neither the `Effect` \
+             variant pin nor the planted-marker fixture catches that. Decide \
+             whether the new variant reaches a `description`; if so give it its \
+             own arm, then bump this pin."
+        );
+    }
+
+    let oracle_src = crate::source_census::code_lines(include_str!("oracle.rs"));
+    let net = census_body(&oracle_src, "fn render_effect_descriptions(");
+    let mut arms: Vec<String> = Vec::new();
+    for (i, _) in net.match_indices("Effect::") {
+        let name: String = net[i + "Effect::".len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() && !arms.contains(&name) {
+            arms.push(name);
+        }
+    }
+    arms.sort();
+    assert!(
+        !arms.is_empty(),
+        "reach-guard: the arm scan found the net's body"
+    );
+    let mut pinned: Vec<String> = RENDER_DESCEND.iter().map(|s| s.to_string()).collect();
+    pinned.sort();
+    assert_eq!(arms, pinned, "render_effect_descriptions' descend arms");
+    for name in RENDER_DESCEND {
+        assert!(
+            variants.iter().any(|v| v == name),
+            "{name} is pinned as a descend arm but is not an `Effect` variant"
+        );
+    }
+}
+
+/// CR 201.5a — CARRIER-SHAPED completeness fixture for the display-render net,
+/// written in `types::ability_visit`'s planted-marker idiom (that module's doc
+/// names this fixture beside
+/// `game::printed_cards::tests::walker_covers_every_nested_carrier` and
+/// `ai_support::targeted_exchange::tests::predicate_sees_a_fight_in_every_nested_carrier`,
+/// and instructs contributors to extend all three).
+///
+/// This is the complement `render_net_effect_carrier_census` cannot be: a new
+/// description-bearing FIELD on an existing carrier's payload is field access,
+/// not a variant, so no count pin can see it. Planting a marker in every carrier
+/// the net claims to descend is what does.
+///
+/// Every one of `render_effect_descriptions`' 26 descend arms is planted, plus
+/// both `DelayedTriggerCondition` sub-arms (`WheneverEvent`, and `WhenNextEvent`
+/// including its `or_trigger`), plus the structural recursions
+/// `sub_ability` / `else_ability` / `mode_abilities` / trigger `execute` /
+/// static `modifications` / replacement `execute`, plus both
+/// `ModalChoice::mode_descriptions` carriers (CR 700.2) — `ParsedAbilities::modal`
+/// and `AbilityDefinition::modal`. The modal pair is the one planted site that is
+/// NOT a field named `description`, which is precisely why it escaped the net
+/// until it was measured leaking; see [`modal_mode_description_renders_the_granter`]
+/// for the production-parse half of the same property.
+///
+/// Assertion order is deliberate: the pre-run reach-guards prove the tree really
+/// carries the markers (so a green is never a green-on-nothing), then (a) the
+/// serde oracle proves no marker survives anywhere at any depth, and (b) every
+/// tag reads `"<tag> sacrifice Probeblade"` — (b) is (a)'s positive reach-guard
+/// AND it NAMES the carrier that failed, which (a) alone cannot.
+///
+/// Revert-to-red: delete any single arm from `render_effect_descriptions` (or
+/// `render_delayed_condition_descriptions`) and (b) fails naming that carrier's
+/// tag, with (a) failing on the surviving raw marker.
+#[test]
+fn render_net_reaches_every_nested_description_carrier() {
+    use crate::types::ability::{
+        CastingPermission, CopyChooseScope, CopyRetargetPermission, CounterSourceRider,
+        DelayedTriggerCondition, DieResultBranch, Duration, ExiledSpellRider, ManaProduction,
+        ModalChoice, PermissionGrantee, PtValue, VoteSubject, VoteTally, VoteVisibility,
+        VoterScope,
+    };
+    use crate::types::mana::ManaSpellGrant;
+
+    const NAME: &str = "Probeblade";
+    // Every planted description is `<tag> sacrifice <MARKER>`; after the net runs
+    // it must read `<tag> sacrifice Probeblade`.
+    fn planted(tag: &str) -> String {
+        format!("{tag} sacrifice {GRANTING_SELF_PLACEHOLDER}")
+    }
+    fn rendered(tag: &str) -> String {
+        format!("{tag} sacrifice {NAME}")
+    }
+    /// A leaf `AbilityDefinition` whose own `description` carries the tag.
+    fn ability(tag: &str) -> AbilityDefinition {
+        let mut def = AbilityDefinition::new(AbilityKind::Spell, Effect::Investigate);
+        def.description = Some(planted(tag));
+        def
+    }
+    /// A leaf `StaticDefinition` whose own `description` carries the tag.
+    fn static_def(tag: &str) -> StaticDefinition {
+        let mut st = StaticDefinition::new(StaticMode::Continuous);
+        st.description = Some(planted(tag));
+        st
+    }
+    /// A leaf `TriggerDefinition` whose own `description` carries the tag.
+    fn trigger_def(tag: &str) -> TriggerDefinition {
+        let mut tr = TriggerDefinition::new(TriggerMode::ChangesZone);
+        tr.description = Some(planted(tag));
+        tr
+    }
+    /// A leaf `ReplacementDefinition` whose own `description` carries the tag.
+    fn replacement_def(tag: &str) -> ReplacementDefinition {
+        let mut rep = ReplacementDefinition::new(ReplacementEvent::Moved);
+        rep.description = Some(planted(tag));
+        rep
+    }
+    /// A `ContinuousModification` that nests a tagged ability.
+    fn granted(tag: &str) -> ContinuousModification {
+        ContinuousModification::GrantAbility {
+            definition: Box::new(ability(tag)),
+        }
+    }
+    /// Wrap a carrier effect in an otherwise description-free ability, so the
+    /// only marker it contributes is the nested one under test.
+    fn carrier(effect: Effect) -> AbilityDefinition {
+        AbilityDefinition::new(AbilityKind::Spell, effect)
+    }
+
+    let mut tags: Vec<&str> = Vec::new();
+    // `ParsedAbilities` has no `Default`; start from the real production
+    // constructor on empty Oracle text so the tree under test is the same shape
+    // production builds, then plant into it.
+    let mut parsed = parse("", NAME, &[], &[], &[]);
+    assert!(
+        parsed.abilities.is_empty()
+            && parsed.triggers.is_empty()
+            && parsed.statics.is_empty()
+            && parsed.replacements.is_empty()
+            && parsed.modal.is_none(),
+        "reach-guard: empty Oracle text must yield an empty tree to plant into"
+    );
+
+    // ---- structural recursions on the four top-level vectors ----------------
+    let mut root = ability("ability_desc");
+    *root.effect = Effect::unimplemented("probe", planted("unimplemented"));
+    root.sub_ability = Some(Box::new(ability("sub_ability")));
+    root.else_ability = Some(Box::new(ability("else_ability")));
+    root.mode_abilities.push(ability("mode_ability"));
+    parsed.abilities.push(root);
+    tags.extend([
+        "ability_desc",
+        "unimplemented",
+        "sub_ability",
+        "else_ability",
+        "mode_ability",
+    ]);
+
+    let mut root_trigger = trigger_def("trigger_desc");
+    root_trigger.execute = Some(Box::new(ability("trigger_execute")));
+    parsed.triggers.push(root_trigger);
+    tags.extend(["trigger_desc", "trigger_execute"]);
+
+    let mut root_static = static_def("static_desc");
+    root_static
+        .modifications
+        .push(granted("static_modification"));
+    parsed.statics.push(root_static);
+    tags.extend(["static_desc", "static_modification"]);
+
+    let mut root_replacement = replacement_def("replacement_desc");
+    root_replacement.execute = Some(Box::new(ability("replacement_execute")));
+    parsed.replacements.push(root_replacement);
+    tags.extend(["replacement_desc", "replacement_execute"]);
+
+    // CR 700.2: the two `ModalChoice` carriers. `mode_descriptions` is a plain
+    // `Vec<String>` rather than a `description` field, so neither the serde
+    // oracle's sibling carriers nor any census pin plants it — it has to be
+    // planted here, at both sites a `ModalChoice` hangs off the parse tree.
+    parsed.modal = Some(ModalChoice {
+        mode_descriptions: vec![planted("parsed_modal_mode")],
+        ..ModalChoice::default()
+    });
+    tags.push("parsed_modal_mode");
+
+    let mut modal_host = carrier(Effect::Investigate);
+    modal_host.modal = Some(ModalChoice {
+        mode_descriptions: vec![planted("ability_modal_mode")],
+        ..ModalChoice::default()
+    });
+    parsed.abilities.push(modal_host);
+    tags.push("ability_modal_mode");
+
+    // ---- one planted site per `render_effect_descriptions` descend arm ------
+    parsed
+        .abilities
+        .push(carrier(Effect::AddPendingEntersModifications {
+            modifications: vec![granted("add_pending_enters")],
+        }));
+    tags.push("add_pending_enters");
+
+    let mut atr = replacement_def("add_target_replacement");
+    atr.execute = Some(Box::new(ability("add_target_replacement_execute")));
+    parsed.abilities.push(carrier(Effect::AddTargetReplacement {
+        replacement: Box::new(atr),
+        target: TargetFilter::Any,
+    }));
+    tags.extend(["add_target_replacement", "add_target_replacement_execute"]);
+
+    parsed.abilities.push(carrier(Effect::BecomeCopy {
+        target: TargetFilter::Any,
+        recipient: TargetFilter::SelfRef,
+        duration: None,
+        mana_value_limit: None,
+        additional_modifications: vec![granted("become_copy")],
+    }));
+    tags.push("become_copy");
+
+    parsed.abilities.push(carrier(Effect::CopySpell {
+        target: TargetFilter::Any,
+        retarget: CopyRetargetPermission::MayChooseNewTargets,
+        copier: None,
+        additional_modifications: vec![granted("copy_spell")],
+        starting_loyalty_from_casualty_sacrifice: false,
+    }));
+    tags.push("copy_spell");
+
+    parsed.abilities.push(carrier(Effect::CopyTokenOf {
+        target: TargetFilter::Any,
+        owner: TargetFilter::Controller,
+        source_filter: None,
+        enters_attacking: false,
+        tapped: false,
+        count: QuantityExpr::Fixed { value: 1 },
+        extra_keywords: vec![],
+        additional_modifications: vec![granted("copy_token_of")],
+    }));
+    tags.push("copy_token_of");
+
+    parsed.abilities.push(carrier(Effect::ChooseOneOf {
+        chooser: PlayerFilter::Controller,
+        branches: vec![ability("choose_one_of")],
+    }));
+    tags.push("choose_one_of");
+
+    let mut counter_static = static_def("counter_rider");
+    counter_static
+        .modifications
+        .push(granted("counter_rider_mod"));
+    parsed.abilities.push(carrier(Effect::Counter {
+        target: TargetFilter::Any,
+        source_rider: Some(CounterSourceRider::LosesAbilities {
+            static_def: Box::new(counter_static),
+            duration: Box::new(Duration::UntilHostLeavesPlay),
+        }),
+        countered_spell_zone: None,
+    }));
+    tags.extend(["counter_rider", "counter_rider_mod"]);
+
+    // CR 603.7a: both `condition` sub-arms that nest a `TriggerDefinition`.
+    parsed.abilities.push(carrier(Effect::CreateDelayedTrigger {
+        condition: DelayedTriggerCondition::WheneverEvent {
+            trigger: Box::new(trigger_def("delayed_whenever")),
+            expiry: crate::types::ability::WheneverEventExpiry::default(),
+        },
+        effect: Box::new(ability("delayed_effect")),
+        uses_tracked_set: false,
+    }));
+    tags.extend(["delayed_whenever", "delayed_effect"]);
+
+    parsed.abilities.push(carrier(Effect::CreateDelayedTrigger {
+        condition: DelayedTriggerCondition::WhenNextEvent {
+            trigger: Box::new(trigger_def("delayed_when_next")),
+            or_trigger: Some(Box::new(trigger_def("delayed_or_trigger"))),
+            lifetime: crate::types::ability::DelayedTriggerLifetime::default(),
+        },
+        effect: Box::new(ability("delayed_when_next_effect")),
+        uses_tracked_set: false,
+    }));
+    tags.extend([
+        "delayed_when_next",
+        "delayed_or_trigger",
+        "delayed_when_next_effect",
+    ]);
+
+    parsed
+        .abilities
+        .push(carrier(Effect::CreateDrawReplacement {
+            replacement_effect: Box::new(Effect::unimplemented(
+                "probe",
+                planted("create_draw_replacement"),
+            )),
+        }));
+    tags.push("create_draw_replacement");
+
+    parsed
+        .abilities
+        .push(carrier(Effect::CreatePlaneswalkReplacement {
+            replacement_effect: Box::new(Effect::unimplemented(
+                "probe",
+                planted("create_planeswalk_replacement"),
+            )),
+        }));
+    tags.push("create_planeswalk_replacement");
+
+    parsed.abilities.push(carrier(Effect::CreateEmblem {
+        statics: vec![static_def("emblem_static")],
+        triggers: vec![trigger_def("emblem_trigger")],
+    }));
+    tags.extend(["emblem_static", "emblem_trigger"]);
+
+    parsed.abilities.push(carrier(Effect::EachPlayerCopyChosen {
+        choose_filter: TargetFilter::Any,
+        min: 1,
+        max: 1,
+        copy_modifications: vec![granted("each_player_copy_chosen")],
+        scale: None,
+        choose_scope: CopyChooseScope::Chooser,
+    }));
+    tags.push("each_player_copy_chosen");
+
+    // CR 614.1 + CR 603.7a: the exile-instead rider's own delayed condition.
+    parsed
+        .abilities
+        .push(carrier(Effect::ExileResolvingSpellInsteadOfGraveyard {
+            on_exile: Some(ExiledSpellRider::ReturnTo {
+                destination: Zone::Hand,
+                timing: DelayedTriggerCondition::WheneverEvent {
+                    trigger: Box::new(trigger_def("exiled_spell_rider")),
+                    expiry: crate::types::ability::WheneverEventExpiry::default(),
+                },
+            }),
+        }));
+    tags.push("exiled_spell_rider");
+
+    parsed.abilities.push(carrier(Effect::FlipCoin {
+        win_effect: Some(Box::new(ability("flip_coin_win"))),
+        lose_effect: Some(Box::new(ability("flip_coin_lose"))),
+        flipper: TargetFilter::Controller,
+    }));
+    tags.extend(["flip_coin_win", "flip_coin_lose"]);
+
+    parsed.abilities.push(carrier(Effect::FlipCoins {
+        count: QuantityExpr::Fixed { value: 2 },
+        win_effect: Some(Box::new(ability("flip_coins_win"))),
+        lose_effect: Some(Box::new(ability("flip_coins_lose"))),
+        flipper: TargetFilter::Controller,
+    }));
+    tags.extend(["flip_coins_win", "flip_coins_lose"]);
+
+    parsed.abilities.push(carrier(Effect::FlipCoinUntilLose {
+        win_effect: Box::new(ability("flip_until_lose")),
+    }));
+    tags.push("flip_until_lose");
+
+    let mut generic_static = static_def("generic_effect");
+    generic_static
+        .modifications
+        .push(granted("generic_effect_mod"));
+    parsed.abilities.push(carrier(Effect::GenericEffect {
+        static_abilities: vec![generic_static],
+        duration: None,
+        target: None,
+        end_cost: None,
+    }));
+    tags.extend(["generic_effect", "generic_effect_mod"]);
+
+    // CR 611.2: the exile-with-alt-cost permission's enters-with modifications.
+    parsed
+        .abilities
+        .push(carrier(Effect::GrantCastingPermission {
+            permission: CastingPermission::ExileWithAltCost {
+                source_id: None,
+                cost: crate::types::mana::ManaCost::default(),
+                cost_provenance: Default::default(),
+                cast_transformed: false,
+                constraint: None,
+                granted_to: None,
+                resolution_cleanup: None,
+                duration: None,
+                graveyard_replacement: None,
+                enters_with_counter: None,
+                enters_with_modifications: vec![granted("grant_casting_permission")],
+                mana_spend_permission: None,
+            },
+            target: TargetFilter::Any,
+            grantee: PermissionGrantee::AbilityController,
+        }));
+    tags.push("grant_casting_permission");
+
+    // CR 106.6 + CR 603.3: the mana-spend grant's reflexive triggered ability.
+    parsed.abilities.push(carrier(Effect::Mana {
+        produced: ManaProduction::Colorless {
+            count: QuantityExpr::Fixed { value: 1 },
+        },
+        restrictions: vec![],
+        grants: vec![ManaSpellGrant::TriggerOnSpend {
+            filter: TargetFilter::Any,
+            ability: Box::new(ability("mana_trigger_on_spend")),
+        }],
+        expiry: None,
+        target: None,
+    }));
+    tags.push("mana_trigger_on_spend");
+
+    parsed.abilities.push(carrier(Effect::ReturnAsAura {
+        enchant_filter: TargetFilter::Any,
+        grants: vec![granted("return_as_aura")],
+    }));
+    tags.push("return_as_aura");
+
+    parsed.abilities.push(carrier(Effect::RevealFromHand {
+        filter: TargetFilter::Any,
+        on_decline: Some(Box::new(ability("reveal_on_decline"))),
+    }));
+    tags.push("reveal_on_decline");
+
+    parsed.abilities.push(carrier(Effect::RollDie {
+        count: QuantityExpr::Fixed { value: 1 },
+        sides: 6,
+        results: vec![DieResultBranch {
+            min: 1,
+            max: 6,
+            effect: Box::new(ability("roll_die")),
+        }],
+        modifier: None,
+    }));
+    tags.push("roll_die");
+
+    parsed.abilities.push(carrier(Effect::SeparateIntoPiles {
+        partition_subject: VoterScope::EachOpponent,
+        object_filter: TargetFilter::Any,
+        chooser: PlayerScope::Controller,
+        chosen_pile_effect: Box::new(ability("piles_chosen")),
+        pile_source: crate::types::ability::PileSource::Battlefield,
+        unchosen_pile_effect: Some(Box::new(ability("piles_unchosen"))),
+    }));
+    tags.extend(["piles_chosen", "piles_unchosen"]);
+
+    let mut token_static = static_def("token_static");
+    token_static.modifications.push(granted("token_static_mod"));
+    parsed.abilities.push(carrier(Effect::Token {
+        name: "Probe".to_string(),
+        power: PtValue::Fixed(1),
+        toughness: PtValue::Fixed(1),
+        types: vec!["Creature".to_string()],
+        colors: vec![],
+        keywords: vec![],
+        tapped: false,
+        count: QuantityExpr::Fixed { value: 1 },
+        owner: TargetFilter::Controller,
+        attach_to: None,
+        enters_attacking: false,
+        supertypes: vec![],
+        static_abilities: vec![token_static],
+        enter_with_counters: vec![],
+    }));
+    tags.extend(["token_static", "token_static_mod"]);
+
+    parsed.abilities.push(carrier(Effect::Vote {
+        choices: vec!["x".to_string()],
+        per_choice_effect: vec![Box::new(ability("vote_per_choice"))],
+        starting_with: ControllerRef::You,
+        voter_scope: VoterScope::AllPlayers,
+        tally_mode: VoteTally::PerVote,
+        subject: VoteSubject::Objects {
+            candidate_filter: TargetFilter::Any,
+            outcome_template: Box::new(ability("vote_outcome_template")),
+        },
+        visibility: VoteVisibility::Open,
+    }));
+    tags.extend(["vote_per_choice", "vote_outcome_template"]);
+
+    // ---- PRE-RUN REACH-GUARDS ----------------------------------------------
+    // Without these the whole test could pass on an empty or mis-shaped tree.
+    let before = serde_json::to_string(&parsed).expect("ParsedAbilities serializes");
+    assert!(
+        before.contains(GRANTING_SELF_PLACEHOLDER),
+        "reach-guard: the hand-built tree must carry raw markers before the net runs"
+    );
+    for tag in &tags {
+        assert!(
+            before.contains(&planted(tag)),
+            "reach-guard: planted site `{tag}` is missing from the tree, so the \
+             post-run assertion for it would be vacuous"
+        );
+    }
+
+    render_granting_self_descriptions(&mut parsed, NAME);
+
+    // ---- (a) the serde ORACLE: no marker survives anywhere, at any depth ----
+    let after = serde_json::to_string(&parsed).expect("ParsedAbilities serializes");
+    assert!(
+        !after.contains(GRANTING_SELF_PLACEHOLDER),
+        "a raw CR 201.5a marker survived the render net; see the per-tag \
+         assertions below for which carrier"
+    );
+    // ---- (b) the POSITIVE reach-guard for (a), which NAMES the carrier ------
+    for tag in &tags {
+        assert!(
+            after.contains(&rendered(tag)),
+            "carrier `{tag}` was not reached by `render_effect_descriptions` / \
+             `render_delayed_condition_descriptions` — its planted description \
+             did not render to the granting card's printed name"
+        );
+    }
+}
+
+/// CR 611.2 + CR 201.5a — carrier fixture for `Effect::GenericEffect`, a
+/// resolution-time grant onto a target. This route is a PRE-EXISTING PARSER
+/// LEAK at BASE_SHA: `try_parse_gain_quoted_ability` sets the description
+/// directly and never went through `parse_quoted_ability`'s old sanitizer, so
+/// the parser would emit a raw U+E0002 into `client/public/card-data.json` for
+/// any card with this shape. MEASURED: no card in the current corpus parses to
+/// that shape — a scan of the exported `card-data.json` finds zero U+E0002,
+/// raw or escaped, on either side of the change — so the leak is LATENT IN
+/// THE PARSER, not shipped. The `GenericEffect | Token` arm is what closes it;
+/// the arm is load-bearing for this fixture regardless of corpus coverage.
+///
+/// Revert-to-red: delete the `GenericEffect | Token` arm from
+/// `render_effect_descriptions` — the outer description reverts to
+/// `gain "{T}, Sacrifice \u{e0002}: Draw a card."`.
+#[test]
+fn resolution_time_grant_renders_the_granter_in_both_descriptions() {
+    let parsed = parse(
+        "Target creature gains \"{T}, Sacrifice Probeblade: Draw a card.\" until end of turn.",
+        "Probeblade",
+        &[],
+        &[],
+        &[],
+    );
+    let json = serde_json::to_string(&parsed).expect("ParsedAbilities serializes");
+    // POSITIVE REACH-GUARD: the typed channel must have consumed the marker as
+    // `TargetFilter::GrantingObject`, or the negative below is vacuous — an
+    // unmasked parse would carry no marker to leak in the first place.
+    assert!(
+        json.contains("GrantingObject"),
+        "reach-guard: the granter self-reference must reach the typed channel: {json}"
+    );
+    assert!(
+        !json.contains(GRANTING_SELF_PLACEHOLDER),
+        "a raw CR 201.5a marker survived into a resolution-time grant's descriptions"
+    );
+
+    let Effect::GenericEffect {
+        static_abilities, ..
+    } = parsed.abilities[0].effect.as_ref()
+    else {
+        panic!(
+            "expected a GenericEffect resolution-time grant, got {:?}",
+            parsed.abilities[0].effect
+        );
+    };
+    assert_eq!(
+        static_abilities[0].description.as_deref(),
+        Some("gain \"{T}, Sacrifice Probeblade: Draw a card.\""),
+        "the outer granting static's display description must name the granter"
+    );
+    let ContinuousModification::GrantAbility { definition } = &static_abilities[0].modifications[0]
+    else {
+        panic!(
+            "expected a GrantAbility modification, got {:?}",
+            static_abilities[0].modifications[0]
+        );
+    };
+    assert_eq!(
+        definition.description.as_deref(),
+        Some("{T}, Sacrifice Probeblade: Draw a card."),
+        "CR 201.5a: the granted body's own description must name the GRANTER, \
+         not collapse to the host token `~`"
+    );
+}
+
+/// CR 111.1 + CR 201.5a — carrier fixture for `Effect::Token`. A created token's
+/// own quoted body is a granted body whose granter is the CREATING card, so the
+/// marker must render there too. This is the measured regression risk: the
+/// `Token` half of the `GenericEffect | Token` arm is what keeps it from
+/// leaking.
+///
+/// Revert-to-red: delete that arm — the token static's description reverts to
+/// `Sacrifice \u{e0002}: Draw a card.`.
+#[test]
+fn token_body_grant_renders_the_granter() {
+    let parsed = parse(
+        "Create a 1/1 white Soldier creature token with \"Sacrifice Probeblade: Draw a card.\"",
+        "Probeblade",
+        &[],
+        &[],
+        &[],
+    );
+    let json = serde_json::to_string(&parsed).expect("ParsedAbilities serializes");
+    // POSITIVE REACH-GUARD, as above.
+    assert!(
+        json.contains("GrantingObject"),
+        "reach-guard: the granter self-reference must reach the typed channel: {json}"
+    );
+    assert!(
+        !json.contains(GRANTING_SELF_PLACEHOLDER),
+        "a raw CR 201.5a marker survived into a created token's granted body"
+    );
+    assert!(
+        json.contains("Sacrifice Probeblade"),
+        "CR 201.5a: the token's granted body must name the creating card: {json}"
+    );
+}
+
+/// CR 700.2 + CR 201.5a — carrier fixture for `ModalChoice::mode_descriptions`,
+/// the one player-facing description surface the net's four top-level vectors
+/// do NOT reach.
+///
+/// `mode_descriptions` is built from each mode's RAW line (`oracle_modal.rs`
+/// copies `mode.raw`), and that raw line is already MASKED, because `parse`
+/// normalizes card-name self-references BEFORE it splits lines. So the marker
+/// rides straight into a display string that no `description` field owns. It is
+/// player-facing for real: `game::interaction` projects `mode_descriptions` into
+/// the mode-choice prompt and the client renders it verbatim, so an unrendered
+/// marker would show as an invisible private-use character exactly where the
+/// granter's printed name belongs.
+///
+/// Revert-to-red: delete the `render_modal_descriptions` call from
+/// `render_granting_self_descriptions` — `mode_descriptions[0]` reverts to
+/// `Target creature gains "Sacrifice \u{e0002}: Draw a card." until end of turn.`
+#[test]
+fn modal_mode_description_renders_the_granter() {
+    let parsed = parse(
+        "Choose one —\n\
+         • Target creature gains \"Sacrifice Probeblade: Draw a card.\" until end of turn.\n\
+         • Draw a card.",
+        "Probeblade",
+        &[],
+        &[],
+        &[],
+    );
+    let json = serde_json::to_string(&parsed).expect("ParsedAbilities serializes");
+    // POSITIVE REACH-GUARD: the masker must actually have fired on this text and
+    // the typed channel must have consumed the marker as `GrantingObject`. An
+    // unmasked parse carries no marker at all, which would make the negative
+    // below pass on nothing.
+    assert!(
+        json.contains("GrantingObject"),
+        "reach-guard: the granter self-reference must reach the typed channel: {json}"
+    );
+    let modal = parsed
+        .modal
+        .as_ref()
+        .expect("reach-guard: the modal header must parse into `ParsedAbilities::modal`");
+    assert_eq!(
+        modal.mode_descriptions.first().map(String::as_str),
+        Some("Target creature gains \"Sacrifice Probeblade: Draw a card.\" until end of turn."),
+        "CR 201.5a: a mode's player-facing description must name the GRANTER"
+    );
+    assert!(
+        !json.contains(GRANTING_SELF_PLACEHOLDER),
+        "a raw CR 201.5a marker survived into a modal spell's mode descriptions"
+    );
+}
+
+/// CR 118 + CR 201.5a — the `AbilityCost` axis is the render net's NAMED
+/// BOUNDARY, and no production parse shape crosses it. Two halves.
+///
+/// **(i) The boundary itself.** A marker hand-planted in
+/// `AbilityCost::Unimplemented.description` SURVIVES the net. That is the
+/// current, deliberate contract, not a bug to fix here: `AbilityCost` is blocked
+/// as a traversal edge because unblocking it makes 184 of `Effect`'s 232
+/// variants "carriers" via `TargetFilter -> TypedFilter -> FilterProp ->
+/// Keyword -> AbilityCost` — the cost axis is reachable from nearly every
+/// `TargetFilter` in the tree, not a sidecar on `def.cost`. Precedent:
+/// `types::ability_visit`'s module doc keeps the effect walk and the cost walk
+/// separate for the same type-level reason. **If this half ever reds, the net
+/// grew a cost walk and point 5 of its traversal contract must be rewritten —
+/// it does NOT mean this test is wrong.**
+///
+/// **(ii) No production shape reaches it.** A granted body engineered to defeat
+/// cost parsing still leaks nothing, WITH `GrantingObject` present as the
+/// positive reach-guard. (The `unless you discard a card` shape was measured
+/// `reach=false` and would make this negative vacuous, so it is deliberately not
+/// the fixture here.)
+#[test]
+fn granted_cost_axis_is_not_walked_and_no_parse_shape_reaches_it() {
+    // (i) BOUNDARY.
+    let mut boundary = parse("", "Probeblade", &[], &[], &[]);
+    let mut def = AbilityDefinition::new(AbilityKind::Activated, Effect::Investigate);
+    def.cost = Some(AbilityCost::Unimplemented {
+        description: format!("sacrifice {GRANTING_SELF_PLACEHOLDER}"),
+    });
+    boundary.abilities.push(def);
+    render_granting_self_descriptions(&mut boundary, "Probeblade");
+    let boundary_json = serde_json::to_string(&boundary).expect("ParsedAbilities serializes");
+    assert!(
+        boundary_json.contains(GRANTING_SELF_PLACEHOLDER),
+        "the `AbilityCost` axis is the net's declared boundary — a marker on \
+         `def.cost` must SURVIVE. A red here means the net grew a cost walk; \
+         update traversal-contract point 5 in `render_granting_self_descriptions`'s \
+         doc rather than this assertion."
+    );
+
+    // (ii) PRODUCTION.
+    let parsed = parse(
+        "Equipped creature has \"{T}, Sacrifice Probeblade, Pay 3 life, Remove a fervor counter: Draw a card.\"",
+        "Probeblade",
+        &[],
+        &[],
+        &["Equipment"],
+    );
+    let json = serde_json::to_string(&parsed).expect("ParsedAbilities serializes");
+    // POSITIVE REACH-GUARD: without this the negative below would pass on any
+    // parse that never masked a granter reference at all.
+    assert!(
+        json.contains("GrantingObject"),
+        "reach-guard: the granter self-reference must reach the typed channel \
+         for this cost-hostile shape: {json}"
+    );
+    assert!(
+        !json.contains(GRANTING_SELF_PLACEHOLDER),
+        "no production parse shape may plant a marker on the excluded \
+         `AbilityCost` axis: {json}"
+    );
+}
+
+/// CR 603.2 + CR 608.2c: Cyclops Gladiator (verbatim MTGJSON Oracle text) —
+/// the "if you do" continuation's damage-back amount must keep reading the
+/// TARGET creature's power (`ObjectScope::EventSource`, the "that creature"
+/// established by the first sentence), never the attacking Cyclops's own
+/// power.
+///
+/// Regression guard for a `parse_effect_chain_ir` chunk-subject bug: a
+/// `prior_typed_referent` rebind (added for Galion, Elvenking's Butler's bare
+/// possessive-pronoun base-P/T grammar, "Its base power and toughness become
+/// equal to ~'s power and toughness") originally cleared `chunk_subject` for
+/// EVERY later chunk following any prior sibling clause with a typed target —
+/// not just the base-P/T-set clause shape it was built for. Cyclops
+/// Gladiator's first sentence ("you may have it deal damage ... to target
+/// creature defending player controls") introduces exactly such a typed
+/// target, so its second sentence ("If you do, that creature deals damage
+/// equal to its power to this creature") fell into the same over-broad
+/// rebind: `if_you_do_object_anchor` only recognizes a `GenericEffect`
+/// predecessor (Galion's shape), not `Effect::DealDamage`, so it returns
+/// `None` here and control reached the (then-unconstrained) rebind, clearing
+/// `ctx.subject` to `None` and silently flipping the damage-back amount's
+/// possessive "its power" from the target's power (`EventSource`) to the
+/// Cyclops's own power (`Source`) — a real rules regression, not just a
+/// cosmetic parse-tree diff. The fix scopes the rebind to the bare
+/// possessive-pronoun base-P/T-set clause shape only
+/// (`subject::is_bare_pronoun_base_pt_possessive_clause`), so this unrelated
+/// `DealDamage` chunk now falls through to the original `ctx.subject.clone()`
+/// path unchanged.
+#[test]
+fn cyclops_gladiator_if_you_do_damage_back_reads_targets_power_not_sources() {
+    let result = parse(
+        "Whenever this creature attacks, you may have it deal damage equal to its power to target creature defending player controls. If you do, that creature deals damage equal to its power to this creature.",
+        "Cyclops Gladiator",
+        &[],
+        &["Creature"],
+        &["Cyclops", "Warrior"],
+    );
+
+    assert!(
+        !parsed_has_unimplemented(&result),
+        "Cyclops Gladiator must parse with zero Unimplemented effects: {result:#?}"
+    );
+    assert_eq!(result.triggers.len(), 1, "triggers={:?}", result.triggers);
+    let attack = &result.triggers[0];
+    assert_eq!(attack.mode, TriggerMode::Attacks);
+
+    let first = attack
+        .execute
+        .as_ref()
+        .expect("attack trigger must have an execute body");
+    let Effect::DealDamage {
+        amount: first_amount,
+        target: first_target,
+        ..
+    } = first.effect.as_ref()
+    else {
+        panic!(
+            "expected the first sentence to be DealDamage, got {:?}",
+            first.effect
+        );
+    };
+    assert_eq!(
+        *first_amount,
+        QuantityExpr::Ref {
+            qty: QuantityRef::Power {
+                scope: ObjectScope::Source,
+            },
+        },
+        "the first sentence's 'its power' is the attacking Cyclops's OWN power"
+    );
+    assert!(
+        matches!(first_target, TargetFilter::Typed(_)),
+        "the first sentence targets a creature the defending player controls, got {first_target:?}"
+    );
+
+    let if_you_do = first
+        .sub_ability
+        .as_ref()
+        .expect("the 'if you do' continuation must chain after the optional damage clause");
+    let Effect::DealDamage {
+        amount: back_amount,
+        ..
+    } = if_you_do.effect.as_ref()
+    else {
+        panic!(
+            "expected the 'if you do' continuation to be DealDamage, got {:?}",
+            if_you_do.effect
+        );
+    };
+    assert_eq!(
+        *back_amount,
+        QuantityExpr::Ref {
+            qty: QuantityRef::Power {
+                scope: ObjectScope::EventSource,
+            },
+        },
+        "the damage-back amount must read the TARGET creature's ('that \
+         creature', the first sentence's chosen recipient) power, not the \
+         attacking Cyclops's own power — got {back_amount:?}"
+    );
 }

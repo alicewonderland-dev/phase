@@ -37,6 +37,8 @@ import { AI_DECK_RANDOM, usePreferencesStore } from "../stores/preferencesStore"
 import { effectiveAiDifficulty } from "../services/cedhLock";
 import { createGameLoopController } from "../game/controllers/gameLoopController";
 import { dispatchAction, processRemoteUpdate } from "../game/dispatch";
+import { resyncFromAdapterSafely } from "../game/staleStateWatchdog";
+import { debugLog } from "../game/debugLog";
 import { clearPromptOverlayState } from "../game/sessionCleanup";
 import { useGameplayPreferencesSync } from "../hooks/useGameplayPreferencesSync";
 import { hostRoom, joinRoom } from "../network/connection";
@@ -79,8 +81,8 @@ import { useMultiplayerDraftStore } from "../stores/multiplayerDraftStore";
 import {
   assignRandomAvatars,
   avatarCardNameForName,
-  fetchAvatarArtUrl,
 } from "../services/playerAvatars";
+import type { PlayerAvatarIdentity } from "../services/playerAvatars";
 
 /** Build per-seat AI controller bindings for a game about to start. Reads
  *  the session-scoped `aiSeats` snapshot from `ActiveGameMeta` (written at
@@ -107,36 +109,27 @@ export function isDeckRejectedError(error: unknown): error is AdapterError {
   return error instanceof AdapterError && error.code === AdapterErrorCode.DECK_REJECTED;
 }
 
-let avatarGeneration = 0;
-
 function setupRandomAvatars(playerCount: number, seed: string, preservePlayerNames = false) {
-  const generation = ++avatarGeneration;
   const avatars = assignRandomAvatars(playerCount, seed);
   const names = new Map<number, string>();
+  const playerAvatars = new Map<number, PlayerAvatarIdentity>();
   names.set(0, "You");
-  for (let i = 1; i < avatars.length; i++) {
-    names.set(i, avatars[i].name);
+  for (const [playerId, avatar] of avatars.entries()) {
+    if (playerId > 0) names.set(playerId, avatar.name);
+    playerAvatars.set(playerId, { kind: "card", cardName: avatar.cardName });
   }
   useMultiplayerStore.setState(
-    preservePlayerNames ? { playerAvatars: new Map() } : { playerNames: names, playerAvatars: new Map() },
+    preservePlayerNames ? { playerAvatars } : { playerNames: names, playerAvatars },
   );
-  for (let i = 0; i < avatars.length; i++) {
-    fetchAvatarArtUrl(avatars[i].cardName).then((url) => {
-      if (!url || avatarGeneration !== generation) return;
-      const next = new Map(useMultiplayerStore.getState().playerAvatars);
-      next.set(i, url);
-      useMultiplayerStore.setState({ playerAvatars: next });
-    });
-  }
 }
 
 function setupCommanderAvatars(
   gameState: { objects: Record<number, { name: string; owner: number; is_commander?: boolean }> },
   preservePlayerNames = false,
 ) {
-  const generation = ++avatarGeneration;
   const names = new Map<number, string>();
   const commanderNames = new Map<number, string>();
+  const playerAvatars = new Map<number, PlayerAvatarIdentity>();
 
   for (const obj of Object.values(gameState.objects)) {
     if (!obj?.is_commander) continue;
@@ -146,24 +139,15 @@ function setupCommanderAvatars(
 
   for (const [playerId, cardName] of commanderNames) {
     names.set(playerId, cardName.split(",")[0].split(" //")[0]);
+    playerAvatars.set(playerId, { kind: "card", cardName });
   }
 
   useMultiplayerStore.setState(
-    preservePlayerNames ? { playerAvatars: new Map() } : { playerNames: names, playerAvatars: new Map() },
+    preservePlayerNames ? { playerAvatars } : { playerNames: names, playerAvatars },
   );
-
-  for (const [playerId, cardName] of commanderNames) {
-    fetchAvatarArtUrl(cardName).then((url) => {
-      if (!url || avatarGeneration !== generation) return;
-      const next = new Map(useMultiplayerStore.getState().playerAvatars);
-      next.set(playerId, url);
-      useMultiplayerStore.setState({ playerAvatars: next });
-    });
-  }
 }
 
 function setupDraftMatchAvatars(seed: string) {
-  const generation = ++avatarGeneration;
   const matchPairing = useMultiplayerDraftStore.getState().matchPairing;
   const randomAvatars = assignRandomAvatars(2, seed);
   const names = new Map<number, string>();
@@ -179,25 +163,43 @@ function setupDraftMatchAvatars(seed: string) {
   names.set(localPlayerId, "You");
   names.set(opponentPlayerId, opponentName);
 
-  useMultiplayerStore.setState({
-    activePlayerId: localPlayerId,
-    playerNames: names,
-    playerAvatars: new Map(),
-  });
-
   const avatarCards = new Map<number, string | undefined>([
     [localPlayerId, randomAvatars[localPlayerId]?.cardName ?? randomAvatars[0]?.cardName],
     [opponentPlayerId, avatarCardNameForName(opponentName) ?? randomAvatars[opponentPlayerId]?.cardName],
   ]);
+  const playerAvatars = new Map<number, PlayerAvatarIdentity>();
   for (const [playerId, cardName] of avatarCards) {
     if (!cardName) continue;
-    fetchAvatarArtUrl(cardName).then((url) => {
-      if (!url || avatarGeneration !== generation) return;
-      const next = new Map(useMultiplayerStore.getState().playerAvatars);
-      next.set(playerId, url);
-      useMultiplayerStore.setState({ playerAvatars: next });
-    });
+    playerAvatars.set(playerId, { kind: "card", cardName });
   }
+  useMultiplayerStore.setState({
+    activePlayerId: localPlayerId,
+    playerNames: names,
+    playerAvatars,
+  });
+}
+
+/**
+ * Drop this client's wire-assigned seat when a game session tears down.
+ *
+ * `activePlayerId` is written only from a wire (`playerIdentity`, P2P
+ * `game_setup`, `setupDraftMatchAvatars`) and had no clear, so it outlived the
+ * game that assigned it. Two consecutive wire-assigned games therefore shared
+ * one value: until the second game's assignment arrived, `resolveLocalSeat`
+ * handed out the FIRST game's seat. `SeatSource` does not cover this — it is
+ * keyed on mode (`"seat-zero"` makes a solo game ignore the field), not on
+ * session, so online → online reads the stale seat.
+ *
+ * Safe against a remount (React StrictMode double-mounts in dev) because every
+ * wire-assigned mode re-establishes the seat when its effect re-runs:
+ * draft-match re-runs `setupDraftMatchAvatars`, and a fresh WS/P2P-guest
+ * adapter re-emits `playerIdentity` from `GameStarted` / `reconnect_ack`. The
+ * P2P HOST is the one path with no re-emit (it emits only from its game-start
+ * flow) — it is unaffected because the host is always seat 0, which is exactly
+ * what `resolveLocalSeat` falls back to.
+ */
+function clearWireAssignedSeat(): void {
+  useMultiplayerStore.getState().setActivePlayerId(null);
 }
 
 function playerNamesRecordToMap(playerNames: Record<number, string>): Map<number, string> {
@@ -545,6 +547,12 @@ export interface GameProviderProps {
   roomName?: string;
   source?: string;
   draftId?: string;
+  /**
+   * The lobby authority this join or spectate was launched from, carried by
+   * the route (`/game?...&server=`). Absent for flows with no explicit
+   * origin, which fall back to the hosting server via `detectServerUrl()`.
+   */
+  serverUrl?: string;
   onWsEvent?: (event: WsAdapterEvent) => void;
   onP2PEvent?: (event: P2PAdapterEvent) => void;
   onReady?: () => void;
@@ -572,6 +580,7 @@ export function GameProvider({
   roomName,
   source,
   draftId,
+  serverUrl: originUrl,
   onWsEvent,
   onP2PEvent,
   onReady,
@@ -734,6 +743,7 @@ export function GameProvider({
       return () => {
         audioManager.setContext("menu");
         clearPromptOverlayState();
+        clearWireAssignedSeat();
       };
     }
 
@@ -768,7 +778,10 @@ export function GameProvider({
             }
           }
           if (event.type === "stateChanged") {
-            processRemoteUpdate(event.snapshot, event.events, event.logEntries);
+            processRemoteUpdate(event.snapshot, event.events, event.logEntries).catch((err) => {
+              debugLog(`p2p remote update failed: ${err instanceof Error ? err.message : String(err)}`);
+              resyncFromAdapterSafely("delivery rejected");
+            });
           }
           if (event.type === "guestConnected") {
             notifyOpponentJoined(tRef.current);
@@ -795,9 +808,12 @@ export function GameProvider({
 
         try {
           if (mode === "p2p-host") {
-            const activeHost = useMultiplayerStore.getState().getActiveP2PHost();
-            if (activeHost?.gameId === gameId) {
-              const adapter = activeHost.adapter;
+            // Browser P2P hosts always own seat zero. Do this before claiming
+            // a pre-game adapter: its one-shot identity event may already have
+            // fired while the lobby was starting the game.
+            useMultiplayerStore.getState().setActivePlayerId(0);
+            const adapter = useMultiplayerStore.getState().takeActiveP2PHost(gameId);
+            if (adapter) {
               p2pAdapter = adapter;
               wireP2PEvents(adapter);
               await resumeP2PHost(gameId, adapter);
@@ -988,7 +1004,12 @@ export function GameProvider({
             }
             // Dial target: `conn.peer` is the actual current host peer id;
             // reconnect reuses it rather than reconstructing a prefix.
-            const { conn, peer } = await joinRoom(code, signal, 10_000);
+            // No timeout override: `joinRoom`'s 30s default is sized for a
+            // relayed ICE negotiation. A 10s budget aborted TURN-relayed joins
+            // mid-negotiation, and it bought nothing for a mistyped code —
+            // that path rejects immediately on `peer-unavailable`, never on the
+            // timeout.
+            const { conn, peer } = await joinRoom(code, signal);
             hostPeerHandle = peer;
             signal.throwIfAborted();
             const adapter = new P2PGuestAdapter(
@@ -1063,6 +1084,7 @@ export function GameProvider({
         if (p2pAdapter) p2pAdapter.dispose();
         audioManager.setContext("menu");
         clearPromptOverlayState();
+        clearWireAssignedSeat();
         reset();
       };
     }
@@ -1196,7 +1218,15 @@ export function GameProvider({
             return;
           }
         }
-        const serverUrl = import.meta.env.VITE_WS_URL ?? await detectServerUrl();
+        // Origin precedence: an explicit build override wins; then the
+        // server a resumable session was recorded on (that server holds the
+        // session); then the origin the route carried; and only with none of
+        // those, this client's hosting server.
+        const serverUrl =
+          import.meta.env.VITE_WS_URL
+          ?? reconnectSession?.serverUrl
+          ?? originUrl
+          ?? await detectServerUrl();
         if (cancelled) return;
 
         wsAdapter = new WebSocketAdapter(
@@ -1241,7 +1271,10 @@ export function GameProvider({
             if (needAdapter) {
               useGameStore.setState({ adapter: wsAdapter });
             }
-            processRemoteUpdate(event.snapshot, event.events, event.logEntries, event.rewindTargets);
+            processRemoteUpdate(event.snapshot, event.events, event.logEntries, event.rewindTargets).catch((err) => {
+              debugLog(`remote update failed: ${err instanceof Error ? err.message : String(err)}`);
+              resyncFromAdapterSafely("delivery rejected");
+            });
             useMultiplayerStore.getState().setConnectionStatus("connected");
             const wsState = event.snapshot.state;
             if (
@@ -1353,6 +1386,7 @@ export function GameProvider({
         useMultiplayerStore.getState().setSpectators([]);
         audioManager.setContext("menu");
         clearPromptOverlayState();
+        clearWireAssignedSeat();
         reset();
       };
     }
@@ -1463,6 +1497,11 @@ export function GameProvider({
           player: ExpandedDeck;
           opponent: ExpandedDeck;
           ai_decks: ExpandedDeck[];
+          // CR 903.13f(3): every set the draft contained, written by
+          // `podCommanderDeckPayload`.  Stated here because the payload
+          // carries it; it is passed through opaquely to the engine, so this
+          // annotation documents the contract rather than changing behaviour.
+          draft_set_codes?: string[] | null;
         };
         try {
           await initGame(gameId, adapter, deckList, formatConfig, playerCount, matchConfig, firstPlayer);
@@ -1677,7 +1716,10 @@ export function GameProvider({
               if (!useGameStore.getState().adapter && adapter) {
                 useGameStore.setState({ adapter });
               }
-              processRemoteUpdate(event.snapshot, event.events, event.logEntries, event.rewindTargets);
+              processRemoteUpdate(event.snapshot, event.events, event.logEntries, event.rewindTargets).catch((err) => {
+                debugLog(`remote update failed: ${err instanceof Error ? err.message : String(err)}`);
+                resyncFromAdapterSafely("delivery rejected");
+              });
             }
             if (event.type === "gameOver") {
               useGameStore.setState({
@@ -1873,7 +1915,7 @@ export function GameProvider({
         scheduleStoreReset(reset);
       }
     };
-  }, [gameId, mode, difficulty, joinCode, formatConfig, playerCount, matchConfig, firstPlayer, useBroker, roomName, source, draftId]);
+  }, [gameId, mode, difficulty, joinCode, formatConfig, playerCount, matchConfig, firstPlayer, useBroker, roomName, source, draftId, originUrl]);
 
   return (
     <GameDispatchContext.Provider value={dispatchAction}>

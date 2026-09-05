@@ -409,16 +409,26 @@ fn try_parse_contracted_subject_additive_type_clause(
     text: &str,
     ctx: &mut ParseContext,
 ) -> Option<ClauseAst> {
-    type VE<'a> = OracleError<'a>;
-
     let lower = text.to_lowercase();
-    let (_, (subject_text, prefix_len)) = alt((
-        value(("it", "it's ".len()), tag::<_, _, VE>("it's ")),
-        value(("it", "it’s ".len()), tag::<_, _, VE>("it’s ")),
-    ))
-    .parse(lower.as_str())
-    .ok()?;
-    let rest_original = &text[prefix_len..];
+    let ((pronoun, article), descriptor) = nom_on_lower(text, &lower, |input| {
+        let (input, pronoun) = alt((
+            value(ContractedSubjectPronoun::It, tag("it")),
+            value(ContractedSubjectPronoun::He, tag("he")),
+            value(ContractedSubjectPronoun::She, tag("she")),
+        ))
+        .parse(input)?;
+        let (input, _) = alt((tag("'"), tag("’"))).parse(input)?;
+        let (input, _) = tag("s ").parse(input)?;
+        let (input, article) =
+            alt((value("an ", tag("an ")), value("a ", tag("a ")))).parse(input)?;
+        Ok((input, (pronoun, article)))
+    })?;
+    let subject_text = match pronoun {
+        ContractedSubjectPronoun::It => "it",
+        ContractedSubjectPronoun::He => "he",
+        ContractedSubjectPronoun::She => "she",
+    };
+    let rest_original = format!("{article}{descriptor}");
     let predicate = format!("is {rest_original}");
     let application = additive_type_subject_application(subject_text, ctx)?;
 
@@ -473,21 +483,23 @@ fn try_parse_contracted_subject_additive_type_clause(
 
     // CR 205.1b: additive form first — "it's a [type] in addition to its other
     // types" retains prior types (AddType/AddSubtype only).
-    if let Some(clause) = build_additive_type_continuous_clause(&application, &predicate) {
-        return Some(ClauseAst::SubjectPredicate {
-            subject: Box::new(SubjectPhraseAst {
-                affected: Some(application.affected),
-                target: application.target,
-                multi_target: application.multi_target,
-                inherits_parent: application.inherits_parent,
-                is_optional: application.is_optional,
-            }),
-            predicate: Box::new(PredicateAst::Continuous {
-                effect: clause.effect,
-                duration: clause.duration,
-                sub_ability: clause.sub_ability,
-            }),
-        });
+    if has_in_addition_to_other_types(&predicate) {
+        if let Some(clause) = build_additive_type_continuous_clause(&application, &predicate) {
+            return Some(ClauseAst::SubjectPredicate {
+                subject: Box::new(SubjectPhraseAst {
+                    affected: Some(application.affected),
+                    target: application.target,
+                    multi_target: application.multi_target,
+                    inherits_parent: application.inherits_parent,
+                    is_optional: application.is_optional,
+                }),
+                predicate: Box::new(PredicateAst::Continuous {
+                    effect: clause.effect,
+                    duration: clause.duration,
+                    sub_ability: clause.sub_ability,
+                }),
+            });
+        }
     }
 
     // CR 205.1a + CR 613.1d: non-additive animation — "it's a 3/3 Robot artifact
@@ -509,14 +521,53 @@ fn try_parse_contracted_subject_additive_type_clause(
     // animating the wrong object. The additive "… in addition to its other
     // types" form above is unaffected (it is a type *addition* and stays on the
     // referenced subject regardless).
-    if !matches!(
-        static_affected_for_application(&application),
-        TargetFilter::ParentTarget
-    ) {
+    let affected = static_affected_for_application(&application);
+    let binds_honestly = match pronoun {
+        ContractedSubjectPronoun::It => matches!(affected, TargetFilter::ParentTarget),
+        ContractedSubjectPronoun::He | ContractedSubjectPronoun::She => {
+            matches!(affected, TargetFilter::SelfRef)
+        }
+    };
+    if !binds_honestly {
         return None;
     }
     let become_predicate = format!("becomes {rest_original}");
-    let clause = build_become_clause(application.clone(), &become_predicate, ctx)?;
+    let mut clause = build_become_clause(application.clone(), &become_predicate, ctx)?;
+    // CR 205.1a: an explicit gendered contracted copula is a type-setting
+    // instruction, not an additive animation shorthand. Preserve supertypes
+    // such as Legendary, but replace the core card-type set ("She's a land" ->
+    // Land, not Creature Land). The context-sensitive `it's` branch keeps the
+    // established antecedent-bound animation semantics (Sauron, Dino Devotee).
+    // Explicit "in addition" returned above for every pronoun.
+    if matches!(
+        pronoun,
+        ContractedSubjectPronoun::He | ContractedSubjectPronoun::She
+    ) {
+        if let Effect::GenericEffect {
+            static_abilities, ..
+        } = &mut clause.effect
+        {
+            for definition in static_abilities {
+                let mut core_types = Vec::new();
+                let mut first_core_type_index = None;
+                for (index, modification) in definition.modifications.iter().enumerate() {
+                    if let ContinuousModification::AddType { core_type } = modification {
+                        first_core_type_index.get_or_insert(index);
+                        core_types.push(*core_type);
+                    }
+                }
+                if let Some(index) = first_core_type_index {
+                    definition.modifications.retain(|modification| {
+                        !matches!(modification, ContinuousModification::AddType { .. })
+                    });
+                    definition.modifications.insert(
+                        index.min(definition.modifications.len()),
+                        ContinuousModification::SetCardTypes { core_types },
+                    );
+                }
+            }
+        }
+    }
     Some(ClauseAst::SubjectPredicate {
         subject: Box::new(SubjectPhraseAst {
             affected: Some(application.affected),
@@ -531,6 +582,13 @@ fn try_parse_contracted_subject_additive_type_clause(
             sub_ability: clause.sub_ability,
         }),
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContractedSubjectPronoun {
+    It,
+    He,
+    She,
 }
 
 fn try_parse_subject_continuous_clause(
@@ -944,7 +1002,7 @@ fn parse_base_pt_axes(input: &str) -> OracleResult<'_, BasePtSetAxes> {
     ))
 }
 
-/// CR 208.1 + CR 613.4b: The dynamic-or-fixed value side of a "base power …
+/// CR 208.4a + CR 613.4b: The dynamic-or-fixed value side of a "base power …
 /// become[s] <value>" clause, resolved into per-axis layer-7b modifications.
 enum BasePtSetValue {
     /// Fixed "N/M" — `SetPower`/`SetToughness`.
@@ -959,19 +1017,22 @@ enum BasePtSetValue {
     },
 }
 
-/// CR 208.1: Parse the value following the "become[s] " copula of a base-P/T-set
+/// CR 208.4a + CR 613.4b: Parse the value following the "become[s] " copula of a base-P/T-set
 /// clause. Tries the fixed "N/M" form first (so "6/6" is not mis-routed through
-/// the quantity grammar), then the dynamic "[each] equal to <quantity>" form,
-/// which routes through the shared CDA quantity grammar so every recognized
-/// count/aggregate/possessive-power phrase composes ("the number of Towns you
-/// control", "~'s power", …).
+/// the quantity grammar), then a paired "<X>'s power and toughness" referent
+/// (splitting into independent per-axis quantities reading the same object —
+/// Galion, Elvenking's Butler: "Its base power and toughness become equal to
+/// ~'s power and toughness"), then the single-quantity dynamic "[each] equal to
+/// <quantity>" form, which routes through the shared CDA quantity grammar so
+/// every recognized count/aggregate/possessive-power phrase composes ("the
+/// number of Towns you control", "~'s power", …).
 fn parse_base_pt_set_value(remainder: &str) -> Option<(BasePtSetValue, &str)> {
     if let Some((power, toughness, after_pt)) =
         super::animation::parse_fixed_become_pt_prefix(remainder)
     {
         return Some((BasePtSetValue::Fixed { power, toughness }, after_pt));
     }
-    // CR 208.1: "[each] equal to <quantity>" dynamic value. "each equal to" and
+    // CR 208.4a + CR 613.4b: "[each] equal to <quantity>" dynamic value. "each equal to" and
     // "equal to" are the two surface forms (each/each-not are not independent
     // axes here — the optional "each " is the only variation).
     let lower = remainder.to_lowercase();
@@ -983,12 +1044,20 @@ fn parse_base_pt_set_value(remainder: &str) -> Option<(BasePtSetValue, &str)> {
         value((), tag::<_, _, OracleError<'_>>("equal to ")).parse(i)
     })?;
     let tail = after_copula.trim().trim_end_matches('.').trim();
+    // CR 208.4a + CR 613.4b: a paired referent ("<X>'s power and toughness" / "the power and
+    // toughness of <X>") splits into independent per-axis quantities reading
+    // the same object — shares the transitive "change ... to" frame's building
+    // block (`parse_pt_pair_referent`) rather than re-deriving the
+    // possessive/inverted-genitive referent grammar for the copula frame.
+    if let Some((power, toughness)) = parse_pt_pair_referent(tail) {
+        return Some((BasePtSetValue::SplitDynamic { power, toughness }, ""));
+    }
     let expr = oracle_quantity::parse_cda_quantity(tail)
         .or_else(|| oracle_quantity::parse_event_context_quantity(tail))?;
     Some((BasePtSetValue::Dynamic(expr), ""))
 }
 
-/// CR 208.1 + CR 613.4b: Parse the copula that separates a base-P/T subject from
+/// CR 208.4a + CR 613.4b: Parse the copula that separates a base-P/T subject from
 /// its value. The intransitive "become[s] " form and the transitive
 /// "change … to " form (Riptide Mangler, Shape Stealer, Halfdane) share one
 /// downstream value/emission path; `is_change` selects the token so the two
@@ -1001,7 +1070,7 @@ fn parse_base_pt_copula(input: &str, is_change: bool) -> OracleResult<'_, ()> {
     }
 }
 
-/// CR 208.1 + CR 613.4b: value side of the transitive "change <subject>'s base
+/// CR 208.4a + CR 613.4b: value side of the transitive "change <subject>'s base
 /// power [and toughness] to <value>" frame. Unlike the "become[s] equal to"
 /// copula, the "change … to" frame introduces the value with a bare " to ", so
 /// the value is a fixed "N/M" (Brine Hag), a paired "<X>'s power and toughness"
@@ -1022,7 +1091,7 @@ fn parse_change_base_pt_value(remainder: &str) -> Option<(BasePtSetValue, &str)>
     Some((BasePtSetValue::Dynamic(expr), ""))
 }
 
-/// CR 208.1: Resolve a paired "<X>'s power and toughness" / "the power and
+/// CR 208.4a + CR 613.4b: Resolve a paired "<X>'s power and toughness" / "the power and
 /// toughness of <X>" referent into its two single-axis quantities, both reading
 /// the same object `X` (its power feeds base power, its toughness feeds base
 /// toughness). Rather than duplicate the referent-scope grammar (event-context
@@ -1098,7 +1167,7 @@ fn parse_base_pt_axis_quantity(tail: &str) -> Option<QuantityExpr> {
     })
 }
 
-/// CR 208.1 + CR 608.2c: "<power-expr> and its base toughness becomes <toughness-expr>"
+/// CR 208.4a + CR 613.4b + CR 608.2c: "<power-expr> and its base toughness becomes <toughness-expr>"
 /// when power and toughness each carry independent dynamic quantities (Amplifire).
 fn parse_split_base_pt_dynamic_values(
     remainder: &str,
@@ -1266,11 +1335,30 @@ fn try_parse_subject_base_pt_set_clause_ast(
                     parse_base_pt_axes,
                 )
                     .map(|(subject, _, axes)| (subject, axes)),
+                // CR 608.2c: bare possessive pronoun "its base power [and
+                // toughness]" (Galion, Elvenking's Butler: "Its base power and
+                // toughness become equal to ~'s power and toughness"). Unlike
+                // the named-possessor forms above, "its" already IS the
+                // possessive marker — there is no separate "'s" suffix to
+                // anchor on — so it needs its own arm rather than a
+                // `take_until("'s base ")` scan. The synthetic subject text
+                // "it" is handed to the shared bare-pronoun resolver in
+                // `parse_subject_application`, which already threads
+                // `ParentTarget` (a referent introduced earlier in the same
+                // effect chain, e.g. a preceding "choose ... target creature")
+                // vs. `TriggeringSource`/`SelfRef` — the same resolution "it
+                // connives" and "it gets +1/+1 until end of turn" use
+                // elsewhere.
+                preceded(tag::<_, _, VE>("its "), parse_base_pt_axes).map(|axes| ("it", axes)),
             ))
             .parse(parse_lower)
             .ok()?;
             let (rest_lower, ()) = parse_base_pt_copula(rest_lower, is_change).ok()?;
-            let subject = parse_body[..subject_lower.len()].trim();
+            let subject = if subject_lower == "it" {
+                "it"
+            } else {
+                parse_body[..subject_lower.len()].trim()
+            };
             let remainder = &parse_body[parse_body.len() - rest_lower.len()..];
             (subject, axes, remainder, None)
         };
@@ -1294,7 +1382,7 @@ fn try_parse_subject_base_pt_set_clause_ast(
     let application = target_application.or_else(|| parse_subject_application(subject, ctx))?;
     let affected = static_affected_for_application(&application);
 
-    // CR 208.1 + CR 613.4b: emit per-axis layer-7b set modifications. Fixed
+    // CR 208.4a + CR 613.4b: emit per-axis layer-7b set modifications. Fixed
     // values stay `SetPower`/`SetToughness`; dynamic values use the
     // `SetPowerDynamic`/`SetToughnessDynamic` variants the layer system
     // re-evaluates each tick.
@@ -1359,6 +1447,52 @@ fn try_parse_subject_base_pt_set_clause_ast(
             sub_ability: None,
         }),
     })
+}
+
+/// CR 613.4b + CR 608.2c: Does this chunk's text open with the bare
+/// possessive-pronoun base-P/T-set grammar ("its base power [and toughness]
+/// become[s] ..." or the transitive "[you may] change its base power [and
+/// toughness] to ...") — the class Galion, Elvenking's Butler's "Its base
+/// power and toughness become equal to ~'s power and toughness" belongs to?
+///
+/// This mirrors ONLY the bare-pronoun arm of `try_parse_subject_base_pt_set_clause_ast`
+/// (`preceded(tag("its "), parse_base_pt_axes)` + `parse_base_pt_copula`), reusing
+/// those exact combinators so the gate can never drift from the grammar it exists
+/// to scope. It deliberately does NOT match the named-possessor ("~'s base
+/// power ...") or inverted-genitive ("the base power ... of ~") forms — those
+/// bind a *named* subject, not the bare pronoun "it", so they never reach the
+/// `parse_subject_application` bare-"it" branch this gate exists to constrain.
+///
+/// Call site: `parse_effect_chain_ir`'s `prior_typed_referent` chunk-subject
+/// rebind (oracle_effect/mod.rs) must fire ONLY for this class of clause — an
+/// earlier sibling's chosen typed target outranking a trigger's watched-source
+/// default is correct here because CR 608.2c reads "its" as referring to
+/// the target just chosen two words earlier, but the same rebind applied to an
+/// unrelated clause shape (`DealDamage`, `CantUntap`, `Discard`, `GiveControl`,
+/// `Shuffle`, ...) would silently reassign THEIR bare "it"/"its" subject too,
+/// with no card-by-card proof that rebinding is correct for those classes.
+pub(super) fn is_bare_pronoun_base_pt_possessive_clause(text: &str) -> bool {
+    type VE<'a> = OracleError<'a>;
+    let (body, _) = strip_leading_duration(text);
+    let lower = body.to_lowercase();
+    let parse_lower = match alt((
+        tag::<_, _, VE>("you may change "),
+        tag::<_, _, VE>("change "),
+    ))
+    .parse(lower.as_str())
+    {
+        Ok((rest, _)) => rest,
+        Err(_) => lower.as_str(),
+    };
+    let Ok((rest, _axes)) =
+        preceded(tag::<_, _, VE>("its "), parse_base_pt_axes).parse(parse_lower)
+    else {
+        return false;
+    };
+    // Either copula surface form (intransitive "become[s]" or transitive " to ")
+    // counts — the gate only needs to recognize the subject/axes shape, not
+    // which verb frame introduced it.
+    parse_base_pt_copula(rest, false).is_ok() || parse_base_pt_copula(rest, true).is_ok()
 }
 
 /// Strip a leading duration phrase ("Until end of turn, " / "This turn, ") off a
@@ -1934,9 +2068,20 @@ fn try_parse_subject_restriction_clause(
         // CR 605.1a: "unless they're mana abilities" exemption rides on the mode.
         let exemption = parse_cant_be_activated_exemption_in_text(&lower);
         // CR 611.2b + CR 110.5: "for as long as it remains tapped" (Braided Net)
-        // ties the prohibition to the target's tap state; without the suffix
-        // (Dovin Baan, Xathrid Gorgon) it keeps the default end-of-turn duration.
-        let duration = tapped_bound_prohibition_duration(&lower).or(Some(Duration::UntilEndOfTurn));
+        // ties the prohibition to the target's tap state. Without that suffix the
+        // window is UNSTATED here, and it must stay `None`.
+        //
+        // CR 611.2a: this value lands on BOTH the
+        // embedded `GenericEffect.duration` and the clause CARRIER below, so an
+        // injected `UntilEndOfTurn` default made both indistinguishable from a
+        // printed window and `with_clause_chain_duration` / `apply_duration_to_effect`
+        // declined to distribute the enclosing sentence's window into either.
+        // Measured: Dovin Baan, Edifice of Authority and Mythos of Vadrok print
+        // "until your next turn" on the head and had this prohibition end a full turn
+        // early. Emitting verbatim lets the head window reach it; the resolver
+        // (`game/effects/effect.rs`) remains the single authority for the fallback
+        // when nothing is printed anywhere.
+        let duration = tapped_bound_prohibition_duration(&lower);
         let mode = StaticMode::CantBeActivated {
             who: ProhibitionScope::AllPlayers,
             source_filter: TargetFilter::SelfRef,
@@ -2336,7 +2481,7 @@ pub(super) fn chosen_player_anaphor_filter(scope: Option<&ControllerRef>) -> Opt
 /// player-attached Aura/Curse (`relative_player_scope == EnchantedPlayer`), a
 /// bare `Player` anaphor rebinds to the attack event's defender, while an
 /// `AttackingPlayer` anaphor always names the attacker
-/// (CR 506.2 / CR 603.7c) and must keep its event-context filter. Carrying the
+/// (CR 506.2) and must keep its event-context filter. Carrying the
 /// distinction as a typed discriminant lets the enchanted-player guard branch on
 /// the parsed kind instead of re-matching the subject's text label.
 #[derive(Clone, Copy)]
@@ -2745,7 +2890,7 @@ pub(super) fn parse_subject_application(
             ),
             tag::<_, _, OracleError<'_>>("that attacking player may"),
         ),
-        // CR 603.7c: "the attacking player" on a DamageReceived trigger — the
+        // CR 506.2 + CR 109.4: "the attacking player" on a DamageReceived trigger — the
         // controller of the creature that dealt combat damage (Contested Game
         // Ball). Longest-match before "the player".
         value(
@@ -3143,6 +3288,19 @@ pub(super) fn parse_subject_application(
     // `parent_target_available` records that a previous chunk introduced a real
     // typed object referent. Standalone clause parsing leaves it false, so
     // "it connives" remains self-referential instead of inventing ParentTarget.
+    //
+    // `ctx.subject` is deliberately authoritative over `parent_target_available`
+    // here: the chunk-loop caller (`oracle_effect/mod.rs`) already resolves the
+    // precedence between a sibling clause's chosen typed target and the
+    // trigger's own watched subject BEFORE this function is reached — it clears
+    // `ctx.subject` to `None` for exactly the case where a sibling clause's
+    // target should win (Galion, Elvenking's Butler's "choose ... target
+    // creature ... Its base power ..."), while leaving `ctx.subject` populated
+    // (e.g. via an "if you do" anchor to the source) when that anchor is
+    // itself the correct nearest antecedent (The Irencrag's "you may have ~
+    // become ... . If you do, it gains ..." — "it" must stay bound to ~, not
+    // be reinterpreted as some unrelated typed referent). See
+    // `chunk_subject`/`prior_typed_referent` in `parse_effect_chain_ir`.
     if lower == "it" {
         if ctx.subject.is_none() && ctx.parent_target_available {
             return Some(SubjectApplication {
@@ -3226,7 +3384,7 @@ pub(super) fn parse_subject_application(
         let original_rest = &subject[consumed..];
         let (filter, rem) = parse_type_phrase(original_rest);
         if rem.trim().is_empty() && !matches!(filter, TargetFilter::Any) {
-            // CR 603.7c + CR 608.2c: Inside a trigger effect, "that [type]" is an
+            // CR 608.2k + CR 608.2c: Inside a trigger effect, "that [type]" is an
             // anaphoric back-reference to the triggering event's subject object (the
             // land that was tapped, the creature that was blocked, etc.) — NOT a
             // broadcast over all matching permanents. Set `target: TriggeringSource`
@@ -3644,7 +3802,7 @@ fn resolve_they_pronoun(ctx: &mut ParseContext) -> TargetFilter {
     ) {
         return TargetFilter::DefendingPlayer;
     }
-    // CR 603.7c + CR 120.3 + CR 506.2: A "deals [combat] damage to a player" or
+    // CR 120.3 + CR 506.2: A "deals [combat] damage to a player" or
     // "attacks a player" trigger introduces the damaged/attacked player as the
     // event referent (the parser stamps `relative_player_scope = TargetPlayer`).
     // "They" inside such an effect ("they lose half their life") refers to that
@@ -3660,6 +3818,28 @@ fn resolve_they_pronoun(ctx: &mut ParseContext) -> TargetFilter {
     // scope (Gluntch's "choose a player. They put two +1/+1 counters …").
     if let Some(filter) = chosen_player_anaphor_filter(ctx.relative_player_scope.as_ref()) {
         return filter;
+    }
+    // CR 608.2c: after a multi-target declaration, a bare "They" can name the
+    // unique earlier player slot even when a later object slot intervenes.
+    // Bind by the declared slot's typed player shape, never by card text or
+    // position alone; zero or multiple player slots remain ambiguous and fall
+    // through to the established pronoun rules below.
+    let mut declared_player_slot = None;
+    for (index, slot) in ctx.declared_target_slots.iter().enumerate() {
+        let is_player = match slot {
+            TargetFilter::Player | TargetFilter::Opponent => true,
+            filter => filter.is_player_scope(),
+        };
+        if is_player {
+            if declared_player_slot.is_some() {
+                declared_player_slot = None;
+                break;
+            }
+            declared_player_slot = Some(index);
+        }
+    }
+    if let Some(index) = declared_player_slot {
+        return TargetFilter::ParentTargetSlot { index };
     }
     match &ctx.subject {
         // Player-type trigger subject: no type_filters, has controller ref
@@ -4887,7 +5067,10 @@ fn build_become_clause(
     }
     let modifications = if let Some(name) = name_override {
         let mut with_name = Vec::with_capacity(modifications.len() + 1);
-        with_name.push(ContinuousModification::SetName { name });
+        // CR 612.8 + CR 613.1c: a resolving non-copy effect that assigns a
+        // name is a text-changing effect in Layer 3. Copy exceptions continue
+        // to use `SetName` in the copy-effect payload.
+        with_name.push(ContinuousModification::SetTextName { name });
         with_name.extend(modifications);
         with_name
     } else {
@@ -4923,11 +5106,17 @@ fn build_become_clause(
 /// abilities" yields the name `"Fenric"` (not `"Fenric and loses all
 /// abilities"`); the residual `"and loses all abilities"` is recovered
 /// independently by `parse_continuous_modifications` on the full predicate.
-/// CR 201.4: an effect-assigned name is a single token-or-phrase, not the rest
-/// of the clause.
 fn strip_become_name_override(text: &str) -> (String, Option<String>) {
     let lower = text.to_lowercase();
-    let tp = TextPair::new(text, &lower);
+    let masked_lower = nom_primitives::mask_double_quoted_spans_preserving_len(&lower);
+    // The masked view is deliberately not byte-for-byte lowercase text, but it
+    // preserves byte length. Construct the lockstep slices directly so quoted
+    // `named` tokens stay invisible while all original-text slicing remains
+    // aligned.
+    let tp = TextPair {
+        original: text,
+        lower: masked_lower.as_ref(),
+    };
     let Some((before, after)) = tp.split_around(" named ") else {
         return (text.to_string(), None);
     };
@@ -6409,11 +6598,25 @@ pub(super) fn try_parse_each_source_deals_damage(
         )));
     }
 
-    // Require a usable non-player object-class source. Player-shaped subjects
-    // ("each player", "each opponent") and anaphoric "each of those …"
-    // (`ParentTarget`) fall through to their own handling.
+    // Require a usable non-player object-class source. The one context-set
+    // exception is an exact pairwise relation: "each of those ... to the
+    // other" reads the previously announced object pair through ParentTarget.
+    // Only `TwoTargets` publishes this two-slot registry; a single multi-target
+    // producer therefore fails closed without typed per-member provenance.
     let sources = parse_subject_application(subject, ctx)?.affected;
-    if !is_object_class_source(&sources) {
+    let pairwise_filters = match (&sources, ctx.declared_target_slots.as_slice()) {
+        (TargetFilter::ParentTarget, [first, second])
+            if has_pairwise_other_recipient(&predicate_lower)
+                && matches!(first, TargetFilter::Typed(typed)
+                    if !typed.type_filters.is_empty() || !typed.properties.is_empty())
+                && matches!(second, TargetFilter::Typed(typed)
+                    if !typed.type_filters.is_empty() || !typed.properties.is_empty()) =>
+        {
+            Some([Box::new(first.clone()), Box::new(second.clone())])
+        }
+        _ => None,
+    };
+    if !is_object_class_source(&sources) && pairwise_filters.is_none() {
         return None;
     }
 
@@ -6452,7 +6655,9 @@ pub(super) fn try_parse_each_source_deals_damage(
 
     // CR 109.4 + CR 120.3a: "its controller" is a per-source recipient. Every other
     // recipient is the shared announced/context target produced above.
-    let recipient = if recipient_phrase.is_some_and(is_its_controller_recipient) {
+    let recipient = if let Some(source_filters) = pairwise_filters {
+        EachDamageRecipient::OtherBatchSource { source_filters }
+    } else if recipient_phrase.is_some_and(is_its_controller_recipient) {
         EachDamageRecipient::EachController
     } else {
         EachDamageRecipient::Shared(target)
@@ -6495,6 +6700,29 @@ fn subject_sources_tapped_this_way(subject_lower: &str) -> bool {
 fn is_its_controller_recipient(recipient_phrase: &str) -> bool {
     all_consuming(tag::<_, _, OracleError<'_>>("its controller"))
         .parse(recipient_phrase)
+        .is_ok()
+}
+
+/// CR 120.3: exact pairwise recipient phrase used after a two-object anaphoric
+/// source set. Full consumption keeps "the other player/permanent" out.
+fn is_the_other_recipient(recipient_phrase: &str) -> bool {
+    all_consuming(tag::<_, _, OracleError<'_>>("the other"))
+        .parse(recipient_phrase)
+        .is_ok()
+}
+
+/// CR 120.3: recognize the pairwise recipient in both fixed damage
+/// ("deals N damage to the other") and characteristic damage ("deals damage
+/// equal to its toughness to the other"). The latter has no `" damage to "`
+/// delimiter, so Pattern 2 consumes the suffix last and requires EOF.
+fn has_pairwise_other_recipient(predicate_lower: &str) -> bool {
+    damage_recipient_phrase(predicate_lower).is_some_and(is_the_other_recipient)
+        || all_consuming((
+            take_until::<_, _, OracleError<'_>>(" to the other"),
+            tag(" to the other"),
+            opt(tag(".")),
+        ))
+        .parse(predicate_lower)
         .is_ok()
 }
 
@@ -6691,7 +6919,7 @@ pub(crate) fn starts_with_subject_prefix(lower: &str) -> bool {
             value((), tag("target ")),
             value((), tag("that ")),
             value((), tag("the chosen ")),
-            // CR 506.2 + CR 603.7c: "the attacking player" as a control-handoff
+            // CR 506.2 + CR 109.4: "the attacking player" as a control-handoff
             // subject on a DamageReceived trigger (Contested Game Ball) — the
             // controller of the creature that dealt combat damage. Longest-match
             // before the bare "the player " arm.
@@ -6735,6 +6963,11 @@ pub(crate) fn starts_with_subject_prefix(lower: &str) -> bool {
 /// Also used by `gap_analysis` to classify unimplemented effect text.
 pub(crate) const PREDICATE_VERBS: &[&str] = &[
     "add",
+    // CR 701.47a: Amass — "its controller amasses Goblins X" (Azog, Moria's
+    // Ruin). Subject-shifted amass clauses route through the
+    // PredicateAst::ImperativeFallback arm in `lower_subject_predicate_ast`,
+    // mirroring "manifest" below.
+    "amass",
     "attack",
     "become",
     "block",
@@ -6910,8 +7143,34 @@ mod tests {
     use crate::types::ability::{
         AbilityKind, BasicLandType, ContinuousModification, ControllerRef, Effect, TypeFilter,
     };
-    use crate::types::card_type::Supertype;
+    use crate::types::card_type::{CoreType, Supertype};
     use crate::types::statics::BlockExceptionKind;
+
+    #[test]
+    fn they_ignores_controllerless_empty_typed_target_slot() {
+        let mut only_empty = ParseContext {
+            declared_target_slots: vec![TargetFilter::Typed(TypedFilter::default())],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_they_pronoun(&mut only_empty),
+            TargetFilter::ParentTarget,
+            "an empty object filter must not masquerade as a player slot"
+        );
+
+        let mut with_opponent = ParseContext {
+            declared_target_slots: vec![
+                TargetFilter::Typed(TypedFilter::default()),
+                TargetFilter::Opponent,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_they_pronoun(&mut with_opponent),
+            TargetFilter::ParentTargetSlot { index: 1 },
+            "the sole genuine player slot must remain unambiguous"
+        );
+    }
 
     /// CR 105.3 + CR 106.1a: "becomes that color" (Foraging Wickermaw) maps to the
     /// same `AddChosenColor` reader as "the chosen color" (Puca's Eye) — only the
@@ -7274,6 +7533,48 @@ mod tests {
         assert!(matches!(sources, TargetFilter::Typed(_)), "got {sources:?}");
         assert_eq!(amount, QuantityExpr::Fixed { value: 1 });
         assert_eq!(recipient, EachDamageRecipient::EachController);
+    }
+
+    #[test]
+    fn each_of_those_deals_to_the_other_is_pairwise_damage() {
+        let text = "each of those creatures deals damage equal to its toughness to the other";
+        let mut ctx = ParseContext {
+            declared_target_slots: vec![
+                TargetFilter::Typed(TypedFilter::creature()),
+                TargetFilter::Typed(TypedFilter::creature()),
+            ],
+            ..Default::default()
+        };
+        let effect = try_parse_each_source_deals_damage(text, &mut ctx)
+            .expect("declared object pair parses")
+            .effect;
+        let Effect::EachSourceDealsDamage {
+            sources,
+            amount,
+            recipient,
+        } = effect
+        else {
+            panic!("expected pairwise EachSourceDealsDamage, got {effect:?}");
+        };
+        assert_eq!(sources, TargetFilter::ParentTarget);
+        assert!(crate::game::quantity::quantity_expr_contains_scope(
+            &amount,
+            ObjectScope::BatchSource,
+        ));
+        assert!(matches!(
+            recipient,
+            EachDamageRecipient::OtherBatchSource { source_filters }
+                if source_filters.iter().all(|filter| matches!(
+                    filter.as_ref(),
+                    TargetFilter::Typed(typed)
+                        if typed.type_filters.contains(&TypeFilter::Creature)
+                ))
+        ));
+        assert!(!is_the_other_recipient("the other player"));
+        assert!(!has_pairwise_other_recipient(
+            "deals damage equal to its toughness to the other player"
+        ));
+        assert!(try_parse_each_source_deals_damage(text, &mut ParseContext::default()).is_none());
     }
 
     #[test]
@@ -7766,7 +8067,7 @@ mod tests {
         );
     }
 
-    // CR 201.4: a "named X" effect-assigned name terminates at the first
+    // A "named X" outer assigned name terminates at the first
     // conjunction — "becomes … named Fenric and loses all abilities" yields
     // name "Fenric", not "Fenric and loses all abilities". The residual "loses
     // all abilities" is recovered independently as RemoveAllAbilities. Building
@@ -7789,6 +8090,104 @@ mod tests {
     fn become_named_plain_captures_full_name() {
         let (_, name) = strip_become_name_override("becomes a creature named Serra Angel");
         assert_eq!(name.as_deref(), Some("Serra Angel"));
+    }
+
+    fn clause_modifications(text: &str, ctx: &mut ParseContext) -> Vec<ContinuousModification> {
+        let ability = crate::parser::oracle_effect::parse_effect_chain_with_context(
+            text,
+            AbilityKind::Spell,
+            ctx,
+        );
+        let Effect::GenericEffect {
+            static_abilities, ..
+        } = ability.effect.as_ref()
+        else {
+            panic!(
+                "expected GenericEffect for {text:?}, got {:?}",
+                ability.effect
+            );
+        };
+        static_abilities[0].modifications.clone()
+    }
+
+    #[test]
+    fn gendered_contracted_copulas_bind_self_and_preserve_original_name_case() {
+        for text in ["She's a land named Moon", "She’s a land named Moon"] {
+            let modifications = clause_modifications(text, &mut ParseContext::default());
+            assert!(
+                modifications.iter().any(|modification| matches!(
+                    modification,
+                    ContinuousModification::SetCardTypes { core_types }
+                        if core_types == &vec![CoreType::Land]
+                )),
+                "missing land replacement in {modifications:?}"
+            );
+            assert!(modifications.iter().any(|modification| matches!(
+                modification,
+                ContinuousModification::SetTextName { name } if name == "Moon"
+            )));
+            assert!(!modifications.iter().any(|modification| matches!(
+                modification,
+                ContinuousModification::SetName { .. }
+            )));
+        }
+
+        let fang = clause_modifications(
+            "He's a Spirit in addition to his other types",
+            &mut ParseContext::default(),
+        );
+        assert!(fang.iter().any(|modification| matches!(
+            modification,
+            ContinuousModification::AddSubtype { subtype } if subtype == "Spirit"
+        )));
+        assert!(!fang.iter().any(|modification| matches!(
+            modification,
+            ContinuousModification::SetCardTypes { .. }
+        )));
+    }
+
+    #[test]
+    fn outer_assigned_names_are_text_changes_but_quoted_named_is_opaque() {
+        for (text, expected_name) in [
+            (
+                "It becomes a legendary 0/0 Elemental creature with haste named Vitu-Ghazi",
+                "Vitu-Ghazi",
+            ),
+            (
+                "it becomes a legendary creature named Mileva, the Stalwart, it has base power and toughness 5/5",
+                "Mileva, the Stalwart",
+            ),
+            (
+                "Target nontoken creature becomes a 6/6 legendary Horror creature named Fenric and loses all abilities",
+                "Fenric",
+            ),
+            (
+                "have The Irencrag become a legendary Equipment artifact named Everflame, Heroes' Legacy",
+                "Everflame, Heroes' Legacy",
+            ),
+        ] {
+            let mut ctx = ParseContext {
+                card_name: Some("The Irencrag".to_string()),
+                ..Default::default()
+            };
+            let modifications = clause_modifications(text, &mut ctx);
+            assert!(modifications.iter().any(|modification| matches!(
+                modification,
+                ContinuousModification::SetTextName { name } if name == expected_name
+            )), "missing SetTextName({expected_name:?}) in {modifications:?}");
+            assert!(!modifications.iter().any(|modification| matches!(
+                modification,
+                ContinuousModification::SetName { .. }
+            )), "non-copy outer name must not use SetName: {modifications:?}");
+        }
+
+        let (_, name) = strip_become_name_override(
+            "become 0/0 Elemental creatures with reach, haste, and \"When this creature leaves the battlefield, conjure a card named Forest onto the battlefield tapped.\" They're still lands",
+        );
+        assert_eq!(
+            name, None,
+            "quoted named token is not an outer assigned name"
+        );
     }
 
     /// CR 608.2c: the additive-"also" strip is a building block — it removes the
@@ -8143,10 +8542,14 @@ mod tests {
         assert!(
             modifications.iter().any(|modification| matches!(
                 modification,
-                ContinuousModification::SetName { name } if name == "Everflame, Heroes' Legacy"
+                // allow-noncombinator: semantic test assertion on the exact parsed assigned name, not parser dispatch
+                ContinuousModification::SetTextName { name } if name == "Everflame, Heroes' Legacy"
             )),
-            "expected SetName in {modifications:?}",
+            "expected SetTextName in {modifications:?}",
         );
+        assert!(!modifications
+            .iter()
+            .any(|modification| matches!(modification, ContinuousModification::SetName { .. })));
         assert!(
             modifications.iter().any(|modification| matches!(
                 modification,
@@ -8906,7 +9309,7 @@ mod tests {
     #[test]
     fn parse_subject_that_attacking_player_trigger_context_is_triggering_player() {
         // Issue #1325: "that attacking player" is synonymous with the attack
-        // event's declaring player (CR 506.2 + CR 603.7c).
+        // event's declaring player (CR 506.2).
         let mut ctx = ParseContext {
             subject: Some(TargetFilter::Player),
             relative_player_scope: Some(ControllerRef::DefendingPlayer),
@@ -9800,6 +10203,94 @@ mod tests {
         assert!(!mods
             .iter()
             .any(|m| matches!(m, ContinuousModification::AddKeyword { .. })));
+    }
+
+    #[test]
+    fn base_pt_set_clause_pronoun_its_subject_resolves_to_parent_target() {
+        // Galion, Elvenking's Butler: "Its base power and toughness become
+        // equal to ~'s power and toughness" — the bare possessive pronoun
+        // "Its" (as opposed to a named possessor like "~'s base power...")
+        // must resolve through the shared bare-pronoun anaphor to the object
+        // introduced earlier in the same effect chain (CR 608.2c: "choose up
+        // to one other target creature you control"), not fall back to
+        // SelfRef.
+        let mut ctx = ParseContext {
+            parent_target_available: true,
+            ..Default::default()
+        };
+        let ast = try_parse_subject_base_pt_set_clause_ast(
+            "Its base power and toughness become equal to ~'s power and toughness",
+            &mut ctx,
+        )
+        .unwrap_or_else(|| panic!("pronoun-subject clause did not parse"));
+        let ClauseAst::SubjectPredicate { subject, predicate } = ast else {
+            panic!("expected SubjectPredicate");
+        };
+        assert_eq!(
+            subject.affected,
+            Some(TargetFilter::ParentTarget),
+            "'Its' must resolve to ParentTarget when a prior clause introduced \
+             a typed referent, got {:?}",
+            subject.affected
+        );
+        let PredicateAst::Continuous { effect, .. } = *predicate else {
+            panic!("expected Continuous predicate");
+        };
+        let Effect::GenericEffect {
+            static_abilities, ..
+        } = effect
+        else {
+            panic!("expected GenericEffect");
+        };
+        let mods = &static_abilities[0].modifications;
+        assert!(
+            mods.iter().any(|m| matches!(
+                m,
+                ContinuousModification::SetPowerDynamic {
+                    value: QuantityExpr::Ref {
+                        qty: QuantityRef::Power {
+                            scope: crate::types::ability::ObjectScope::Source
+                        }
+                    }
+                }
+            )),
+            "expected SetPowerDynamic(Power{{Source}}), got {mods:?}"
+        );
+        assert!(
+            mods.iter().any(|m| matches!(
+                m,
+                ContinuousModification::SetToughnessDynamic {
+                    value: QuantityExpr::Ref {
+                        qty: QuantityRef::Toughness {
+                            scope: crate::types::ability::ObjectScope::Source
+                        }
+                    }
+                }
+            )),
+            "expected SetToughnessDynamic(Toughness{{Source}}), got {mods:?}"
+        );
+    }
+
+    #[test]
+    fn base_pt_set_clause_copula_paired_referent_dual_axis() {
+        // The intransitive "become[s] equal to <X>'s power and toughness"
+        // paired referent (as opposed to the transitive "change ... to" frame
+        // already covered by `change_base_pt_to_paired_referent_dual_axis`)
+        // splits into independent per-axis quantities reading the same
+        // object.
+        let (mods, _) = base_pt_set_mods(
+            "~'s base power and toughness become equal to that creature's power and toughness",
+        );
+        assert!(
+            mods.iter()
+                .any(|m| matches!(m, ContinuousModification::SetPowerDynamic { .. })),
+            "expected SetPowerDynamic, got {mods:?}",
+        );
+        assert!(
+            mods.iter()
+                .any(|m| matches!(m, ContinuousModification::SetToughnessDynamic { .. })),
+            "expected SetToughnessDynamic, got {mods:?}",
+        );
     }
 
     // -----------------------------------------------------------------------

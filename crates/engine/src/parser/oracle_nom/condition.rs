@@ -7,9 +7,9 @@ use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::bytes::complete::take_until;
 use nom::character::complete::multispace1;
-use nom::combinator::{eof, map, opt, peek, value, verify};
+use nom::combinator::{cut, eof, map, opt, peek, value, verify};
 use nom::multi::many0;
-use nom::sequence::{preceded, terminated};
+use nom::sequence::{delimited, preceded, terminated};
 use nom::Parser;
 
 use super::bridge::nom_on_lower;
@@ -17,19 +17,21 @@ use super::error::{oracle_err, OracleError, OracleResult};
 use super::primitives::{
     parse_article, parse_color, parse_keyword_name, parse_mana_cost, parse_number,
     parse_object_recipient_pronoun, parse_property_keyword, parse_superlative_adjective,
+    scan_at_word_boundaries,
 };
 use super::quantity as nom_quantity;
+use super::target as nom_target;
 use crate::parser::oracle_target::{
     cast_capable_zones_except, parse_shared_quality, parse_type_phrase, parse_zone_suffix,
-    parse_zone_word, peek_zone_boundary,
+    parse_zone_word, peek_zone_boundary, superlative_property_filter_prop,
 };
 use crate::parser::oracle_util::parse_subtype;
 use crate::types::ability::{
-    AbilityCondition, AggregateFunction, CastManaObjectScope, CastManaSpentMetric,
-    CommanderOwnership, Comparator, ControllerRef, CountScope, DamageChannel, DamageGroupKey,
-    DamageKindFilter, FilterProp, ObjectProperty, ObjectScope, PlayerFilter, PlayerRelation,
-    PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef, SharedQuality, StaticCondition,
-    TargetFilter, TypeFilter, TypedFilter, ZoneRef,
+    AbilityCondition, AggregateFunction, CardTypeSetSource, CastManaObjectScope,
+    CastManaSpentMetric, CommanderOwnership, Comparator, ControllerRef, CountScope, DamageChannel,
+    DamageGroupKey, DamageKindFilter, FilterProp, ObjectProperty, ObjectScope, PlayerFilter,
+    PlayerRelation, PlayerScope, PropertyAggregate, QuantityExpr, QuantityRef, SharedQuality,
+    SharedQualityRelation, StaticCondition, TargetFilter, TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::events::PlayerActionKind;
@@ -175,7 +177,7 @@ fn parse_state_presence_conditions(input: &str) -> OracleResult<'_, StaticCondit
         // wins over the fixed-N "its power is N or greater" combinator inside
         // that group (which only matches numeric thresholds).
         parse_subject_property_superlative_comparison,
-        // CR 608.2c: Effect-resolution gates like Abzan Beastmaster's "if you
+        // CR 603.4 + CR 608.2a: Intervening-if gates like Abzan Beastmaster's "if you
         // control the creature with the greatest toughness or tied for the
         // greatest toughness" are player-control predicates over an implicit
         // creature aggregate population.
@@ -274,9 +276,98 @@ fn parse_remaining_state_presence_conditions(input: &str) -> OracleResult<'_, St
         parse_quantity_quantity_comparison,
         parse_zone_conditions,
         parse_there_are_counters_on_source,
+        // CR 105.2 + CR 611.3a: "<color> is the most common color among all
+        // permanents [or is tied for most common]" (Invasion Djinn cycle).
+        parse_color_is_most_common_among_permanents_condition,
         parse_remaining_state_presence_conditions_tail,
     ))
     .parse(input)
+}
+
+/// CR 105.2 + CR 611.3a: "<color> is the most common color among all
+/// permanents[ or is tied for most common]" — the Invasion Djinn cycle (Sulam
+/// Djinn, Goham Djinn, Ruham Djinn, Zanam Djinn, Halam Djinn): "This creature
+/// gets -2/-2 as long as [color] is the most common color among all
+/// permanents or is tied for most common."
+///
+/// Maps to a `StaticCondition::And` of two `QuantityComparison`s over the
+/// battlefield-wide count of permanents with the named color
+/// (`QuantityRef::ObjectCount`) and the largest per-color count across every
+/// color (`QuantityRef::ObjectCountBySharedQuality` grouped by
+/// `SharedQuality::Color`). `Comparator::GE` already admits ties, so the
+/// optional "or is tied for most common" tail is redundant text discarded
+/// here — both phrasings collapse to the same comparison, mirroring how
+/// `parse_shares_most_common_color_condition` treats Heroic Defiance's
+/// analogous "or a color tied for most common" tail.
+///
+/// The second conjunct (`max_bucket >= 1`) is required for correctness, not
+/// stylistic symmetry: when every battlefield permanent is colorless, no
+/// color bucket exists and `ObjectCountBySharedQuality`'s `Max` aggregate
+/// (CR 109.3 defines color as a characteristic, but does not itself define
+/// this grouped aggregate or its empty-population behavior) returns `0` for
+/// an empty bucket set — coinciding with the named color's own `0` count and
+/// making a bare `named_count >= max_bucket` comparison vacuously true. That
+/// would wrongly treat "no color exists" as "this color is most common".
+/// Requiring `max_bucket >= 1` alongside `named_count >= max_bucket` forces
+/// `named_count >= 1` too, so the pair is only satisfiable when a real
+/// colored population exists and the named color is (tied for) its largest
+/// bucket — matching how `eval_shares_color_with_most_common_color`
+/// (`game::conditions`) explicitly returns `false` when there is no colored
+/// permanent for the analogous Heroic Defiance condition.
+/// Deliberately composed from existing generic `QuantityRef` building blocks
+/// rather than a new `StaticCondition` variant — the named-color population
+/// and the "most common among all colors" aggregate are both already-typed
+/// axes, so no new leaf is needed.
+fn parse_color_is_most_common_among_permanents_condition(
+    input: &str,
+) -> OracleResult<'_, StaticCondition> {
+    let (rest, color) = parse_color(input)?;
+    let (rest, _) = tag(" is the most common color among all permanents").parse(rest)?;
+    let (rest, _) = opt(tag(" or is tied for most common")).parse(rest)?;
+
+    let all_permanents = TargetFilter::Typed(TypedFilter {
+        type_filters: vec![TypeFilter::Permanent],
+        controller: None,
+        properties: Vec::new(),
+    });
+    let colored_permanents = TargetFilter::Typed(TypedFilter {
+        type_filters: vec![TypeFilter::Permanent],
+        controller: None,
+        properties: vec![FilterProp::HasColor { color }],
+    });
+    let max_color_bucket = || QuantityExpr::Ref {
+        qty: QuantityRef::ObjectCountBySharedQuality {
+            filter: all_permanents.clone(),
+            quality: SharedQuality::Color,
+            aggregate: AggregateFunction::Max,
+        },
+    };
+
+    Ok((
+        rest,
+        StaticCondition::And {
+            conditions: vec![
+                // A most-common-color bucket must actually exist — false when
+                // every permanent is colorless (no bucket reaches size 1).
+                StaticCondition::QuantityComparison {
+                    lhs: max_color_bucket(),
+                    comparator: Comparator::GE,
+                    rhs: QuantityExpr::Fixed { value: 1 },
+                },
+                // The named color's count must be at least as large as the
+                // largest bucket — i.e. it leads or ties for most common.
+                StaticCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: QuantityRef::ObjectCount {
+                            filter: colored_permanents,
+                        },
+                    },
+                    comparator: Comparator::GE,
+                    rhs: max_color_bucket(),
+                },
+            ],
+        },
+    ))
 }
 
 /// Keeps the remaining state-presence grammar below nom's tuple-arity limit
@@ -1138,6 +1229,11 @@ fn parse_control_named_condition_action_lead(
         value((), tag("return ")),
         value((), tag("discard ")),
         value((), tag("choose ")),
+        // Die-roll result tables commonly follow an intervening-if named-count
+        // condition (for example Name Sticker Goblin). Treat the verb as an
+        // effect lead so the preceding card name is not extended through the
+        // comma into the trigger's execute clause.
+        value((), tag("roll ")),
     ))
     .parse(input)
 }
@@ -1462,7 +1558,8 @@ pub(crate) fn parse_attached_subject_target_filter(input: &str) -> OracleResult<
 }
 
 /// CR 508.1a + CR 509.1a + CR 611.3a: Parse "enchanted/equipped creature is
-/// attacking|blocking" into the attached-subject's `TargetFilter` plus the
+/// attacking alone|attacking|blocking" into the attached-subject's
+/// `TargetFilter` plus the
 /// combat-state `FilterProp`. Unlike `parse_attached_subject_is_filter` (which
 /// folds a STATIC characteristic — color/type/supertype — into the subject
 /// filter), combat state is re-evaluated each layer cycle (CR 611.3a), so the
@@ -1479,6 +1576,7 @@ pub(crate) fn parse_attached_subject_combat_state(
     let (rest, subject) = parse_attached_condition_subject(input)?;
     let (rest, _) = tag("is ").parse(rest)?;
     let (rest, prop) = alt((
+        value(FilterProp::AttackingAlone, tag("attacking alone")),
         value(FilterProp::Attacking { defender: None }, tag("attacking")),
         value(FilterProp::Blocking, tag("blocking")),
     ))
@@ -2119,7 +2217,13 @@ fn parse_source_enchanted_by_aura_count(input: &str) -> OracleResult<'_, StaticC
         map(parse_ge_threshold, |n| (Comparator::GE, n)),
     ))
     .parse(rest)?;
-    let (rest, _) = alt((tag("Auras"), tag("Aura"))).parse(rest.trim_start())?;
+    // `parse_inner_condition` is a LOWERCASE-input combinator — its production
+    // entry point (`oracle_static::shared::parse_static_condition`) calls it
+    // with `&text.to_lowercase()`. Capitalized `tag("Aura")` here made this arm
+    // unreachable in a real parse, so Timber Paladin's three tiered gates all
+    // fell to `StaticCondition::Unrecognized`, which `game/layers.rs` evaluates
+    // as always-true — every tier applied and the 10/10 tier won on timestamp.
+    let (rest, _) = alt((tag("auras"), tag("aura"))).parse(rest.trim_start())?;
     let aura_filter = TargetFilter::Typed(TypedFilter {
         type_filters: vec![
             TypeFilter::Enchantment,
@@ -3080,75 +3184,89 @@ fn parse_optional_tied_for_tail(
     Ok((rest, relaxed))
 }
 
-/// CR 608.2c + CR 109.4: Parse a player-control superlative gate such as
+/// CR 109.2 + CR 109.4 + CR 603.4 + CR 608.2a: Parse a player-control superlative gate such as
 /// "you control the creature with the greatest toughness or tied for the
-/// greatest toughness" or "you control a creature with the greatest power
-/// among creatures on the battlefield". This is not source-relative: the
-/// player controls at least one creature whose P/T is tied for the table-wide
-/// maximum/minimum.
+/// greatest toughness" or "you control an artifact with the greatest mana
+/// value". An unqualified type noun denotes a battlefield permanent, and the
+/// player controls at least one candidate whose property equals the aggregate
+/// over the implicit candidate population or an explicit `among` population.
 fn parse_you_control_superlative_object_condition(
     input: &str,
 ) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = tag("you control ").parse(input)?;
-    let (rest, _) = alt((tag("the "), tag("a "))).parse(rest)?;
-    let (rest, object_filter) = value(
-        TargetFilter::Typed(TypedFilter::creature()),
-        tag("creature"),
+    let (rest, _) = alt((value((), tag("the ")), parse_article)).parse(rest)?;
+    let (rest, candidate_text) = terminated(
+        verify(take_until(" with the "), |candidate: &&str| {
+            !candidate.is_empty()
+        }),
+        tag(" with the "),
     )
     .parse(rest)?;
-    let (rest, _) = tag(" with the ").parse(rest)?;
     let (rest, aggregate) = parse_superlative_adjective(rest)?;
     let (rest, _) = tag(" ").parse(rest)?;
     let (rest, property) = parse_property_keyword(rest)?;
-    let (rest, _) = parse_optional_tied_for_tail(rest, aggregate, property)?;
-    let comparator = match aggregate {
-        AggregateFunction::Max => Comparator::GE,
-        AggregateFunction::Min => Comparator::LE,
-        AggregateFunction::Sum => return Err(oracle_err(rest)),
-    };
-    let (rest, population_filter) =
-        if let Ok((among_rest, _)) = tag::<_, _, OracleError<'_>>(" among ").parse(rest) {
-            let (filter, remainder) = parse_type_phrase(among_rest);
-            if matches!(filter, TargetFilter::Any) {
-                return Err(oracle_err(remainder));
-            }
-            let consumed = among_rest.len() - remainder.len();
-            (&among_rest[consumed..], filter)
-        } else {
-            (rest, object_filter.clone())
-        };
+
+    // The adjective/property pair commits this production. Before that point,
+    // unrelated supported `you control` phrases must remain available to the
+    // ordinary control-condition parser. After it, every malformed candidate,
+    // tie tail, population, or leaf boundary is a hard failure so `alt` cannot
+    // reinterpret a partially consumed superlative as a weaker condition.
+    let (rest, (object_filter, population_filter)) = cut(|rest| {
+        // CR 109.2 + CR 109.4: `you control` describes a battlefield permanent,
+        // not an off-battlefield "card" or a stack "spell". `parse_type_phrase`
+        // intentionally consumes those terminal nouns in other contexts, so
+        // reject them before delegating the candidate noun phrase.
+        if scan_at_word_boundaries(candidate_text, |word| {
+            verify(nom_target::parse_type_filter_word, |type_filter| {
+                matches!(type_filter, TypeFilter::Card)
+            })
+            .parse(word)
+        })
+        .is_some()
+        {
+            return Err(oracle_err(candidate_text));
+        }
+
+        let (object_filter, candidate_remainder) = parse_type_phrase(candidate_text);
+        if matches!(object_filter, TargetFilter::Any) || !candidate_remainder.is_empty() {
+            return Err(oracle_err(candidate_remainder));
+        }
+        if object_filter
+            .extract_zones()
+            .iter()
+            .any(|zone| *zone != Zone::Battlefield)
+        {
+            return Err(oracle_err(candidate_text));
+        }
+
+        let (rest, _) = parse_optional_tied_for_tail(rest, aggregate, property)?;
+        let (rest, population_filter) =
+            if let Ok((among_rest, _)) = tag::<_, _, OracleError<'_>>(" among ").parse(rest) {
+                let (filter, remainder) = parse_type_phrase(among_rest);
+                if matches!(filter, TargetFilter::Any) {
+                    return Err(oracle_err(remainder));
+                }
+                (remainder, filter)
+            } else {
+                (rest, object_filter.clone())
+            };
+
+        let (rest, _) =
+            peek(alt((eof, tag("."), tag(","), tag(" and "), tag(" or ")))).parse(rest)?;
+        Ok((rest, (object_filter, population_filter)))
+    })
+    .parse(rest)?;
     let (rest, _) = opt(tag(".")).parse(rest)?;
 
-    let stat = match property {
-        ObjectProperty::Power => PtStat::Power,
-        ObjectProperty::Toughness => PtStat::Toughness,
-        ObjectProperty::ManaValue | ObjectProperty::ManaSymbolCount(_) => {
-            return Err(oracle_err(rest));
-        }
-    };
     let controlled_filter = add_filter_property(
-        inject_controller_you(object_filter.clone()),
-        FilterProp::PtComparison {
-            stat,
-            scope: PtValueScope::Current,
-            comparator,
-            value: QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: aggregate,
-                    property,
-                    filter: population_filter,
-                },
-            },
-        },
+        inject_controller_you(object_filter),
+        superlative_property_filter_prop(aggregate, property, population_filter),
     );
     Ok((
         rest,
-        make_quantity_ge(
-            QuantityRef::ObjectCount {
-                filter: controlled_filter,
-            },
-            1,
-        ),
+        StaticCondition::IsPresent {
+            filter: Some(controlled_filter),
+        },
     ))
 }
 
@@ -3185,11 +3303,16 @@ fn build_superlative_comparison(
         lhs: QuantityExpr::Ref { qty: lhs_qty },
         comparator,
         rhs: QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate {
-                function: aggregate,
-                property,
-                filter: aggregate_filter,
-            },
+            qty: QuantityRef::PropertyAggregate(
+                PropertyAggregate::new(
+                    aggregate,
+                    property,
+                    CardTypeSetSource::Objects {
+                        filter: aggregate_filter,
+                    },
+                )
+                .expect("object property aggregate is valid"),
+            ),
         },
     }
 }
@@ -3246,11 +3369,14 @@ pub(crate) fn parse_spell_target_has_superlative(
             lhs: QuantityExpr::Ref { qty: lhs_qty },
             comparator,
             rhs: QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: aggregate,
-                    property,
-                    filter,
-                },
+                qty: QuantityRef::PropertyAggregate(
+                    PropertyAggregate::new(
+                        aggregate,
+                        property,
+                        CardTypeSetSource::Objects { filter },
+                    )
+                    .expect("object property aggregate is valid"),
+                ),
             },
         },
     ))
@@ -3706,7 +3832,7 @@ fn parse_parent_target_referent(input: &str) -> OracleResult<'_, ParentTargetRef
 /// `parse_that_player_has_conditions` so any single-player subject ("that
 /// player", "target player") composes with these life-total tails.
 ///
-/// CR 119 (Life), CR 603.4 (intervening-if), CR 603.7c ("that player" anaphora
+/// CR 119 (Life), CR 603.4 (intervening-if), CR 120.3 ("that player" anaphora
 /// binds to the player event-context for damage triggers).
 fn parse_life_predicate(rest: &str, player: PlayerScope) -> Option<(&str, StaticCondition)> {
     // CR 119: "no life" → LifeTotal EQ 0 (defensive, mirrors hand-size's
@@ -3987,56 +4113,184 @@ fn parse_control_count_ge_distinct_quality(input: &str) -> OracleResult<'_, Stat
     ))
 }
 
-/// CR 201.2 + CR 109.3: Parse "you control N or more [type] with the same name
-/// as one another"
-/// → `QuantityComparison(ObjectCountBySharedQuality[Name, Max] >= N)`.
+/// Lift a GROUP shared-quality marker out of a filter produced by
+/// `parse_type_phrase`, returning its quality and removing the property.
 ///
-/// The same-quality mirror of `parse_control_count_ge_distinct_quality`. Both read
-/// "you control " + a GE threshold + a type phrase + a shared-characteristic
-/// suffix; they differ only on the RELATION over that characteristic (`different`
-/// → count the distinct values; `the same` → group by value and take the largest
-/// group). `aggregate: Max` is what makes "three or more lands with the same name"
-/// mean "some ONE name is shared by at least three of your lands" rather than
-/// "you have at least three lands in total".
+/// `FilterProp::SharesQuality { reference: None }` is a GROUP-SELECTION
+/// constraint on a chosen candidate set: CR 601.2c is where the player
+/// "announces their choice of an appropriate object or player for each target
+/// the spell requires", and CR 608.2b is where the engine re-checks that choice
+/// on resolution — which is exactly where `game::effects::mod`'s group
+/// validator runs it. `game::filter::filter_prop_uses_object_population`
+/// documents the marker as "candidate-local, validated at resolution time, not
+/// whole-board membership", and `game::filter::evaluate_shares_quality`
+/// accordingly answers TRUE for every object when the reference is absent.
 ///
-/// Name is the only quality printed with this relation today (Endless Atlas,
-/// Sceptre of Eternal Glory); the `alt` is the extension point for the rest of
-/// `SharedQuality` when a card prints one.
+/// That contract makes it INERT inside a whole-board count: a
+/// `QuantityRef::ObjectCount` over such a filter counts every matching object
+/// and silently drops the shared-quality constraint. The counting authority for
+/// "N objects that share quality Q" is
+/// `QuantityRef::ObjectCountBySharedQuality` with `AggregateFunction::Max`.
+///
+/// The rules supply the VOCABULARY the quality axis ranges over, and nothing
+/// more: CR 109.3 enumerates an object's characteristics (and closes with "Any
+/// other information about an object isn't a characteristic"), and CR 205.3m
+/// enumerates the creature types `SharedQuality::CreatureType` reads. The
+/// aggregate semantic — "some ONE value of the characteristic is shared by at
+/// least N objects" — is `AggregateFunction::Max` over
+/// `game::filter::object_shared_quality_values_public`'s buckets. That is an
+/// engine representation fact and is deliberately left UNATTRIBUTED: neither
+/// 109.3 nor 205.3m says anything about a value being shared by at least N
+/// objects. The group/count layer split likewise carries no CR number of its
+/// own. This function moves the constraint from the filter to that authority.
+///
+/// Declines, leaving the filter untouched, for:
+///   * `reference: Some(..)` — that IS a per-object predicate and
+///     `ObjectCount` is correct for it;
+///   * `SharedQualityRelation::DoesNotShare` — no aggregate form exists;
+///   * a non-`Typed` filter — an `Or`/`And` of counted populations is not one
+///     bucketed count.
+///
+/// In each case the caller's `alt` falls through to `parse_control_count_ge`
+/// and the row keeps exactly the shape it has today. A refusal cannot be raised
+/// from here instead: three transitive callers disagree about what a refusal
+/// means, and two of them (`static_helpers::try_parse_cost_modification` and
+/// `oracle_trigger::try_extract_intervening`) turn one into an UNCONDITIONAL
+/// static or an unhoisted intervening-if — strictly worse than the shape they
+/// would refuse.
+fn take_group_shared_quality(filter: &mut TargetFilter) -> Option<SharedQuality> {
+    let TargetFilter::Typed(tf) = filter else {
+        return None;
+    };
+    let idx = tf.properties.iter().position(|prop| {
+        matches!(
+            prop,
+            FilterProp::SharesQuality {
+                reference: None,
+                relation: SharedQualityRelation::Shares,
+                ..
+            }
+        )
+    })?;
+    // `position` matched this variant at `idx` on the line above and `remove`
+    // cannot change it, so this arm is unreachable. It must PANIC rather than
+    // return `None`: the property has already been removed by the time we get
+    // here, so a silent decline would hand the caller's `alt` fall-through a
+    // filter with a dropped constraint.
+    let FilterProp::SharesQuality { quality, .. } = tf.properties.remove(idx) else {
+        unreachable!(
+            "`position` matched FilterProp::SharesQuality at index {idx}; \
+             `Vec::remove` returns that same element"
+        )
+    };
+    Some(quality)
+}
+
+/// CR 201.2a + CR 109.3: Parse "<scope> control(s) N or more [type] that share a
+/// [quality]" and "<scope> control(s) N or more [type] with the same [quality]
+/// [as one another]"
+/// → `QuantityComparison(ObjectCountBySharedQuality[quality, Max] >= N)`.
+///
+/// The same-quality mirror of `parse_control_count_ge_distinct_quality`. Both
+/// read a controller prefix + a GE threshold + a type phrase + a
+/// shared-characteristic constraint, and differ on the RELATION over that
+/// characteristic (`different` → count the distinct values; `the same` / `share
+/// a` → group by value and take the largest group). They now also differ on
+/// SCOPE: this function is parameterized on `parse_control_scope_prefix` while
+/// the distinct-quality sibling still hard-codes `tag("you control ")`. That
+/// asymmetry is deliberate — no card prints "defending player controls N or
+/// more … with different …", so widening the sibling would add an unexercised
+/// path with no corpus evidence behind it. Widen it when such a card prints.
+///
+/// `aggregate: Max` is what makes "three or more lands with the same name" mean
+/// "some ONE name is shared by at least three of your lands" rather than "you
+/// have at least three lands in total".
+///
+/// **Two printings, one predicate.** English prints this constraint either as a
+/// relative clause ("three or more creatures **that share a creature type**",
+/// Graxiplon, Littjara Kinseekers, Synchronized Eviction) or as a postmodifier
+/// ("three or more lands **with the same name**", Endless Atlas, Sceptre of
+/// Eternal Glory, Mechanized Production, Chrome Replicator). The two reach this
+/// function differently and so are two branches, not two parsers:
+///
+///   * **Branch A (relative clause)** — `parse_type_phrase` has ALREADY consumed
+///     the clause through `oracle_target::parse_that_clause_suffix`, leaving a
+///     `FilterProp::SharesQuality` group marker on the filter and an empty
+///     remainder. `take_group_shared_quality` lifts the marker onto this
+///     counting authority rather than re-parsing the text, so
+///     `oracle_target::parse_shared_quality_clause` stays the single authority
+///     for that vocabulary.
+///   * **Branch B (postmodifier)** — not a `that …` clause, so
+///     `parse_type_phrase` leaves it in the remainder and the quality noun is
+///     delegated to the same shared authority, `parse_shared_quality`.
+///
+/// The controller scope is parameterized on `parse_control_scope_prefix`, so
+/// all three of `you` / `your opponents` / `defending player` are covered by one
+/// path. CR 508.5 + CR 508.5a resolve the defending-player anchor per attacking
+/// creature; CR 509.1b is the rule that makes an evasion ability a blocking
+/// restriction, which is the form the defending-player scope is printed in
+/// today (Graxiplon).
+///
+/// Branch B's quality vocabulary widens from `name` alone to the full
+/// `parse_shared_quality` set as a consequence of that DRY substitution.
+/// `game::filter::shared_quality_values` matches every `SharedQuality` variant
+/// exhaustively, so nothing is accepted here that cannot be evaluated; `name`
+/// is simply the only one printed with this relation today.
+///
+/// ORDERING: this arm must precede the plain `parse_control_count_ge` arm in
+/// `parse_control_conditions` — see the ordering warning there, which is the
+/// authority on why.
 fn parse_control_count_ge_shared_quality(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (rest, _) = tag("you control ").parse(input)?;
+    let (rest, ctrl) = parse_control_scope_prefix(input)?;
     let (rest, n) = parse_ge_threshold(rest)?;
     let type_text = rest.trim_end_matches('.');
-    let (filter, remainder) = parse_type_phrase(type_text);
+    let (mut filter, remainder) = parse_type_phrase(type_text);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
             nom::error::ErrorKind::Fail,
         )));
     }
-    let trimmed = remainder.trim_start();
-    let (after_suffix, quality) = preceded(
-        tag("with the same "),
-        terminated(
-            alt((value(SharedQuality::Name, tag("name")),)),
-            opt(tag(" as one another")),
-        ),
-    )
-    .parse(trimmed)?;
-    let filter = inject_controller_you(filter);
-    let consumed = after_suffix.as_ptr() as usize - input.as_ptr() as usize;
-    Ok((
-        &input[consumed..],
-        StaticCondition::QuantityComparison {
-            lhs: QuantityExpr::Ref {
-                qty: QuantityRef::ObjectCountBySharedQuality {
+    // Branch A — relative-clause printing.
+    if let Some(quality) = take_group_shared_quality(&mut filter) {
+        let filter = inject_controller(filter, ctrl);
+        // `remainder` is empty here but still points into `input`, so the
+        // pointer arithmetic re-includes any `.` that `trim_end_matches`
+        // dropped. Same idiom as `parse_control_count_ge`.
+        let consumed = remainder.as_ptr() as usize - input.as_ptr() as usize;
+        return Ok((
+            &input[consumed..],
+            make_quantity_ge(
+                QuantityRef::ObjectCountBySharedQuality {
                     filter,
                     quality,
                     aggregate: AggregateFunction::Max,
                 },
+                n,
+            ),
+        ));
+    }
+    // Branch B — postmodifier printing. `parse_shared_quality` tries the plural
+    // `names` before the singular `name`, so on "name as one another" the
+    // singular arm wins and the `opt` consumes the tail.
+    let trimmed = remainder.trim_start();
+    let (after_suffix, quality) = preceded(
+        tag("with the same "),
+        terminated(parse_shared_quality, opt(tag(" as one another"))),
+    )
+    .parse(trimmed)?;
+    let filter = inject_controller(filter, ctrl);
+    let consumed = after_suffix.as_ptr() as usize - input.as_ptr() as usize;
+    Ok((
+        &input[consumed..],
+        make_quantity_ge(
+            QuantityRef::ObjectCountBySharedQuality {
+                filter,
+                quality,
+                aggregate: AggregateFunction::Max,
             },
-            comparator: Comparator::GE,
-            rhs: QuantityExpr::Fixed { value: n as i32 },
-        },
+            n,
+        ),
     ))
 }
 
@@ -4107,28 +4361,68 @@ fn controlled_battlefield_subtype_filter(subtype: String) -> TargetFilter {
 
 /// Parse the leading controller-scope phrase of a "control N or more" count
 /// condition, returning the `ControllerRef` the count is scoped to:
-/// "you control " → `You`, "your opponents control " → `Opponent`.
+/// "you control " → `You`, "your opponents control " → `Opponent`,
+/// "defending player controls " → `DefendingPlayer`.
 ///
-/// CR 109.3: object control is a per-player property; this is the single axis
-/// that distinguishes the self-scoped ("you control three or more creatures")
-/// and opponent-scoped ("your opponents control three or more creatures",
-/// Lashwhip Predator) forms of the same `ObjectCount >= N` threshold.
+/// CR 109.2 + CR 109.3: object control is a per-player property, and a
+/// description that names a card type without naming a zone means a permanent
+/// on the battlefield — which is why every leaf here is paired with
+/// `inject_controller`'s `InZone { Battlefield }`. This is the single axis that
+/// distinguishes the self-scoped ("you control three or more creatures"),
+/// opponent-scoped ("your opponents control three or more creatures", Lashwhip
+/// Predator) and combat-scoped ("defending player controls three or more
+/// artifacts", Ayesha Tanaka, Armorer) forms of the same `ObjectCount >= N`
+/// threshold.
+///
+/// The `defending player` leaf is the only one whose resolution depends on
+/// combat state; outside combat it answers `None`, which the filter door
+/// renders as a zero count. For a `CantBeBlocked` static the anchor binds — the
+/// source is already in `combat.attackers` when CR 509.1b's blocking-restriction
+/// check runs — but for a `CantAttack` static it does NOT, because the
+/// declaration is validated before the candidate is recorded as an attacker.
+/// See `issue_8183_static_gate_fail_open.rs`'s Dandân test, which pins that gap.
 fn parse_control_scope_prefix(input: &str) -> OracleResult<'_, ControllerRef> {
     alt((
         value(ControllerRef::You, tag("you control ")),
         value(ControllerRef::Opponent, tag("your opponents control ")),
+        // CR 508.5 + CR 508.5a: the combat-context leaf of the same
+        // control-subject axis. The defending player is determined per
+        // attacking creature and resolved at read time by the shared
+        // `combat` anchor authority, so the count is scoped exactly like the
+        // `you` / `your opponents` forms with no new condition variant.
+        // CR 509.1b: a restriction may be created by an evasion ability —
+        // Ayesha Tanaka, Armorer, "…can't be blocked as long as defending
+        // player controls three or more artifacts".
+        value(
+            ControllerRef::DefendingPlayer,
+            tag("defending player controls "),
+        ),
     ))
     .parse(input)
 }
 
-/// Canonical combinator: "you control / your opponents control N or more [type]"
-/// → QuantityComparison.
+/// Canonical combinator: "you control / your opponents control / defending
+/// player controls N or more [type]" → QuantityComparison.
 ///
-/// Single authority for this pattern — called from `oracle_static.rs` and
-/// `oracle_trigger.rs` to avoid three-way duplication. The controller scope is
-/// parameterized on the `you control` / `your opponents control` axis
-/// (`parse_control_scope_prefix`) so both forms share one parse path.
+/// Single authority for this pattern. It has no direct external caller; it is
+/// reached only as an arm of `parse_control_conditions`, which is what
+/// `oracle_static/evasion.rs`'s rule-static `unless` rider calls and what the
+/// `parse_condition` / `parse_inner_condition` dispatch chain reaches. The
+/// controller scope is parameterized on the `you control` / `your opponents
+/// control` / `defending player controls` axis (`parse_control_scope_prefix`)
+/// so all three forms share one parse path.
 /// Returns the remainder after the type phrase (may be non-empty for trailing text).
+///
+/// ORDERING CONSTRAINT — do not disturb. `parse_control_scope_prefix` is
+/// consumed here and by `parse_control_count_ge_shared_quality`, and BOTH
+/// require `parse_ge_threshold` (a numeral or `at least N`) immediately after
+/// the prefix. The incumbent `defending player controls a/an <type>` rows
+/// present an ARTICLE, not a numeral, so they fail `parse_ge_threshold`, this
+/// arm declines, and they fall through to `parse_defending_player_controls`
+/// exactly as before. **Do NOT route `parse_you_control_a` / `_no` /
+/// `_dont_control_a` / `parse_control_count_le` / `_eq` through
+/// `parse_control_scope_prefix`** — that would move every one of those rows
+/// onto this production.
 pub fn parse_control_count_ge(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, ctrl) = parse_control_scope_prefix(input)?;
     let (rest, n) = parse_ge_threshold(rest)?;
@@ -4581,7 +4875,12 @@ fn parse_control_count_le(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, n) = parse_number(rest)?;
     let rest = rest.trim_start();
     let (rest, _) = tag("or fewer ").parse(rest)?;
-    let type_text = rest.trim_end_matches('.');
+    // A named-count condition may be followed by an execute clause. Preserve
+    // the comma-prefixed clause as the condition remainder before handing the
+    // typed, named phrase to `parse_type_phrase`; otherwise that parser treats
+    // the effect text as part of the literal card name.
+    let (condition_remainder, type_text) = parse_control_named_final_name(rest)?;
+    let type_text = type_text.trim_end_matches('.');
     let (filter, remainder) = parse_type_phrase(type_text);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
@@ -4590,9 +4889,14 @@ fn parse_control_count_le(input: &str) -> OracleResult<'_, StaticCondition> {
         )));
     }
     let filter = inject_controller_you(filter);
-    let consumed = remainder.as_ptr() as usize - input.as_ptr() as usize;
+    let remainder = if remainder.trim().is_empty() {
+        condition_remainder
+    } else {
+        let consumed = remainder.as_ptr() as usize - input.as_ptr() as usize;
+        &input[consumed..]
+    };
     Ok((
-        &input[consumed..],
+        remainder,
         make_quantity_comparison(QuantityRef::ObjectCount { filter }, Comparator::LE, n),
     ))
 }
@@ -4701,6 +5005,7 @@ fn parse_a_player_controls_no(input: &str) -> OracleResult<'_, StaticCondition> 
             QuantityRef::ControlledByEachPlayer {
                 filter,
                 aggregate: AggregateFunction::Min,
+                relation: PlayerRelation::All,
             },
             Comparator::EQ,
             0,
@@ -4825,11 +5130,14 @@ fn parse_filter_have_total_property(input: &str) -> OracleResult<'_, StaticCondi
         rest,
         StaticCondition::QuantityComparison {
             lhs: QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: AggregateFunction::Sum,
-                    property,
-                    filter,
-                },
+                qty: QuantityRef::PropertyAggregate(
+                    PropertyAggregate::new(
+                        AggregateFunction::Sum,
+                        property,
+                        CardTypeSetSource::Objects { filter },
+                    )
+                    .expect("object property aggregate is valid"),
+                ),
             },
             comparator,
             rhs: QuantityExpr::Fixed { value: n as i32 },
@@ -6475,6 +6783,7 @@ fn parse_played_a_land_this_turn(input: &str) -> OracleResult<'_, StaticConditio
 
 fn parse_creature_died_this_turn_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
     alt((
+        parse_creatures_died_this_turn_threshold,
         parse_died_under_your_control_this_turn,
         // "a creature died this turn" (Morbid) → zone-change count >= 1
         value(
@@ -6491,6 +6800,19 @@ fn parse_creature_died_this_turn_conditions(input: &str) -> OracleResult<'_, Sta
         parse_filtered_creature_died_this_turn,
     ))
     .parse(input)
+}
+
+/// CR 603.4 + CR 700.4: "N or more/fewer creatures died this turn" compares
+/// the requested threshold with the number of creature battlefield-to-graveyard
+/// moves recorded this turn. The shared threshold grammar also covers the
+/// equivalent "at least N" wording and keeps the comparator axis typed.
+fn parse_creatures_died_this_turn_threshold(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, (threshold, comparator)) = parse_amount_threshold(input)?;
+    let (rest, _) = tag(" creatures died this turn").parse(rest)?;
+    Ok((
+        rest,
+        make_quantity_comparison(creatures_died_this_turn_ref(), comparator, threshold),
+    ))
 }
 
 /// "a <type-phrase> died this turn" — the filtered Morbid gate without a
@@ -6606,19 +6928,79 @@ fn parse_source_qualified_mana_spent_threshold(input: &str) -> OracleResult<'_, 
     ))
 }
 
-/// CR 601.2h + CR 603.4: Intervening-if comparing mana spent on the triggering
-/// spell against this creature's power and/or toughness.
+/// CR 601.2h + CR 603.4: Intervening-if comparing the mana spent on a cast
+/// spell against the source's own power and/or toughness. Which spell that is
+/// comes from the subject's anaphora, not from a default.
 ///
-/// Recognizes "the amount of mana you spent is [comparator] this creature's
-/// power or toughness" (SOS Increment reminder text). The natural-language
+/// Two surface forms of the same sentence:
+///   * "the amount of mana you spent is …" — the SOS Increment reminder text,
+///     whose subject is always the triggering spell.
+///   * "the amount of mana spent to cast <anaphora> is …" — the printed
+///     wording that predates the keyword (Liberator, Urza's Battlethopter).
+///     Which spell that names is read through the shared
+///     `parse_mana_spent_self_subject` authority every mana-spent sibling in
+///     this module already consults, so "that spell" is not re-decided here.
+///     CR 400.7d is what
+///     licenses the self-anaphora arm of that authority: a permanent's ability
+///     may reference "what mana was spent to pay" the costs of the spell it
+///     was.
+///
+/// The object is "[comparator] <subject>'s power or toughness". The natural-language
 /// "or" means *either* threshold — `A > (P or T)` is satisfied when `A > P`
-/// **or** `A > T`. The "this creature's" subject, including the normalized
-/// "~'s" self-reference form, carries Increment's implicit source-is-creature
-/// intervening-if; "this permanent's" stays as a plain P/T comparison for
-/// non-Increment siblings.
+/// **or** `A > T`.
+///
+/// Whether a source-is-creature conjunct is added is decided by the SUBJECT,
+/// because the object phrase cannot decide it. `oracle_util::normalize_card_name_refs`
+/// rewrites BOTH a card's own printed name and "this creature" to `~` — the
+/// name via `replace_all_words`, the phrase via `SELF_REF_TYPE_PHRASES` — so
+/// `~'s` arrives from Increment's reminder and from Liberator, Urza's
+/// Battlethopter alike. The subject keeps them apart:
+///
+///   * "the amount of mana you spent" is the printed REMINDER of Increment. The
+///     reminder drops the clause CR 702.191a's rules text carries ("'Increment'
+///     means 'Whenever you cast a spell, IF THIS PERMANENT IS A CREATURE AND the
+///     amount of mana spent to cast that spell is greater than this creature's
+///     power …'"), so reinstating it here is that keyword clause. It gates.
+///   * "the amount of mana spent to cast &lt;anaphora&gt;" is a card spelling the
+///     sentence out itself. Liberator prints no creature clause and must not be
+///     given one. CR 208.3 ("A noncreature permanent has no power or
+///     toughness…") with CR 107.2 ("If anything needs to use a number that can't
+///     be determined … it uses 0 instead") says such a permanent compares
+///     against 0 — the ability still triggers. This engine reports a
+///     noncreature's power as its printed value instead, an engine-level CR
+///     208.3 gap tracked separately, not a parser one.
+///
+/// The explicit "this creature's" / "this permanent's" object arms are kept and
+/// stay pinned, but no production path was found that reaches this parser with
+/// either phrase intact — normalization rewrites both unconditionally.
+///
+/// One divergence, deliberate and unreachable today: the subject anaphora is
+/// read by `parse_mana_spent_self_subject`, which maps "this spell"/"it" to
+/// `SelfObject`, while `try_extract_mana_spent_comparison_condition`
+/// (`oracle_trigger.rs`) states the opposite for its own sentence in the same
+/// position. Neither ever ACCEPTS the other's input — that one requires a
+/// `" its mana value"` tail this one cannot produce, and it already sees and
+/// rejects Liberator's clause — and no corpus face writes this sentence with a
+/// self-anaphora. Consulting the shared authority is still the right call:
+/// re-deciding the mapping here is exactly the hand-typed list this parser
+/// avoids elsewhere.
 fn parse_mana_spent_vs_source_pt(input: &str) -> OracleResult<'_, StaticCondition> {
-    // Subject: "the amount of mana you spent is "
-    let (rest, _) = tag("the amount of mana you spent is ").parse(input)?;
+    // Subject, and with it the spell whose payment is measured.
+    let (rest, (scope, is_increment_reminder)) = alt((
+        value(
+            (CastManaObjectScope::TriggeringSpell, true),
+            tag("the amount of mana you spent is "),
+        ),
+        map(
+            delimited(
+                tag("the amount of mana spent to cast "),
+                nom_quantity::parse_mana_spent_self_subject,
+                tag(" is "),
+            ),
+            |scope| (scope, false),
+        ),
+    ))
+    .parse(input)?;
     // Comparator: "greater than " / "less than " / "equal to "
     let (rest, comparator) = alt((
         value(Comparator::GT, tag("greater than ")),
@@ -6630,7 +7012,13 @@ fn parse_mana_spent_vs_source_pt(input: &str) -> OracleResult<'_, StaticConditio
     let (rest, requires_creature_source) = alt((
         value(true, tag("this creature's ")),
         value(false, tag("this permanent's ")),
-        value(true, tag("~'s ")),
+        // `oracle_util::normalize_card_name_refs` collapses BOTH "this creature"
+        // and the card's own printed name to `~`, so this arm alone cannot tell
+        // Increment's reminder from a card that writes its own name. The subject
+        // can: the reminder's subject reaches a card only from the Increment
+        // keyword, a spelled-out subject is the card writing its own sentence,
+        // and only the keyword carries CR 702.191a's creature clause.
+        value(is_increment_reminder, tag("~'s ")),
     ))
     .parse(rest)?;
     let (rest, first) = alt((
@@ -6670,9 +7058,10 @@ fn parse_mana_spent_vs_source_pt(input: &str) -> OracleResult<'_, StaticConditio
 
     let lhs = QuantityExpr::Ref {
         qty: QuantityRef::ManaSpentToCast {
-            // "the amount of mana you spent" is the triggering-spell intervening-if
-            // (SOS Increment); the trigger event is in scope at evaluation time.
-            scope: CastManaObjectScope::TriggeringSpell,
+            // The subject above already decided this: the reminder text's
+            // "you spent" is the triggering spell, the printed form's anaphora
+            // says so itself. The trigger event is in scope at evaluation time.
+            scope,
             metric: crate::types::ability::CastManaSpentMetric::Total,
         },
     };
@@ -8146,6 +8535,11 @@ fn parse_there_are_conditions_with_quantity(
         (None, Some(_)) => Comparator::GE,
         (None, None) => Comparator::EQ,
     };
+    match parse_filtered_zone_card_count(rest) {
+        Ok((rest, qty)) => return Ok((rest, make_quantity_comparison(qty, comparator, n))),
+        Err(nom::Err::Error(_)) => {}
+        Err(error @ (nom::Err::Failure(_) | nom::Err::Incomplete(_))) => return Err(error),
+    }
     if let Ok((rest_after_type, type_text)) =
         take_until::<_, _, OracleError<'_>>(" cards total in ").parse(rest)
     {
@@ -8174,6 +8568,101 @@ fn parse_there_are_conditions_with_quantity(
             n,
         ),
     ))
+}
+
+/// CR 109.2a + CR 400.1: A card description with a named zone counts matching
+/// cards in that zone, so this preserves the parsed filter rather than flattening
+/// it into a lexical noun or a card-type list.
+///
+/// The type phrase and locative zone are deliberately parsed by their separate
+/// authorities. `parse_type_phrase` owns the complete noun phrase, while
+/// `parse_scoped_zone_count_ref` owns the player/zone scope after `in `.
+fn parse_filtered_zone_card_count(input: &str) -> OracleResult<'_, QuantityRef> {
+    let (rest_after_noun, noun) = take_until(" in ").parse(input)?;
+    let (after_cards, _) = terminated(take_until("cards"), tag("cards")).parse(noun)?;
+    if !after_cards.is_empty() {
+        return Err(oracle_err(input));
+    }
+    let (filter, remainder) = parse_type_phrase(noun);
+    if !remainder.trim().is_empty() || !is_admissible_zone_card_count_filter(&filter) {
+        return Err(oracle_err(input));
+    }
+    let (rest, _) = tag(" in ").parse(rest_after_noun)?;
+    let (rest, (zone, scope)) = cut(preceded(
+        peek(alt((tag("your "), tag("all graveyards")))),
+        parse_scoped_zone_count_ref,
+    ))
+    .parse(rest)?;
+    Ok((
+        rest,
+        QuantityRef::ZoneCardCount {
+            zone,
+            card_types: Vec::new(),
+            filter: Some(filter),
+            scope,
+        },
+    ))
+}
+
+/// Limits the filtered zone-count bridge to card descriptions whose semantics
+/// remain valid in every counted zone. All other filter forms deliberately fall
+/// through to the legacy quantity grammar instead of being partially accepted.
+fn is_admissible_zone_card_count_filter(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(TypedFilter {
+            type_filters,
+            controller,
+            properties,
+        }) => {
+            controller.is_none()
+                && !type_filters.is_empty()
+                && !type_filters.iter().any(type_filter_contains_any)
+                && !properties.is_empty()
+                && properties
+                    .iter()
+                    .all(is_admissible_zone_card_count_property)
+        }
+        TargetFilter::Or { filters } => {
+            !filters.is_empty() && filters.iter().all(is_admissible_zone_card_count_filter)
+        }
+        _ => false,
+    }
+}
+
+/// `TypeFilter::Any` would make this bridge a broad unfiltered count. Descend
+/// through its recursive variants so nested `Any` filters cannot bypass that
+/// boundary.
+fn type_filter_contains_any(filter: &TypeFilter) -> bool {
+    match filter {
+        TypeFilter::Any => true,
+        TypeFilter::Non(filter) => type_filter_contains_any(filter),
+        TypeFilter::AnyOf(filters) => filters.iter().any(type_filter_contains_any),
+        TypeFilter::Creature
+        | TypeFilter::Land
+        | TypeFilter::Artifact
+        | TypeFilter::Enchantment
+        | TypeFilter::Instant
+        | TypeFilter::Sorcery
+        | TypeFilter::Planeswalker
+        | TypeFilter::Battle
+        | TypeFilter::Kindred
+        | TypeFilter::Permanent
+        | TypeFilter::Card
+        | TypeFilter::Subtype(_) => false,
+    }
+}
+
+/// Only static card-description properties can be evaluated meaningfully in a
+/// named card zone. The default is intentionally reject-by-default so a future
+/// property cannot widen this parser without an explicit admissibility decision.
+fn is_admissible_zone_card_count_property(property: &FilterProp) -> bool {
+    matches!(
+        property,
+        FilterProp::Historic
+            | FilterProp::NotHistoric
+            | FilterProp::HasSupertype { .. }
+            | FilterProp::NotSupertype { .. }
+    )
 }
 
 /// Self-referential source alternatives shared by the "exiled with [source]"
@@ -9629,9 +10118,50 @@ pub fn parse_you_put_onto_battlefield_this_way_clause(
     Ok((rest, (filter, false)))
 }
 
-/// CR 603.12 + CR 701.9a: Parse "you discard [quantifier] [type] card[s] this
-/// way" — the active-voice reflexive gate created by a preceding "discard a
-/// card" instruction in the same ability (Talion's Messenger: "draw a card,
+/// CR 608.2c + CR 701.25a: Parse "you put [quantifier] [type] into your
+/// graveyard this way" — the active-voice reflexive gate created by a
+/// preceding "surveil N" instruction (Chandra, Chill of Compliance prints
+/// "Surveil 1." followed by "If you put a noncreature, nonland card into
+/// your graveyard this way, put that card into your hand."; Enlightened
+/// Confidant shares the shape).
+///
+/// CR 701.25a: to surveil, each looked-at card is EITHER put into the
+/// graveyard OR left on top of the library — a genuine choice, unlike
+/// discard/sacrifice/exile, whose destination is inherent to the verb. So
+/// (like the `parse_you_put_onto_battlefield_this_way_clause` sibling right
+/// above) this clause is DESTINATION-BOUND: a redirect that sends the card
+/// elsewhere as it moves (Rest in Peace / Leyline of the Void: "would be put
+/// into a graveyard from anywhere → exile instead") defeats it — the caller
+/// must pair the returned filter with `destination: Some(Zone::Graveyard)`,
+/// not `None`. The surveil choice's library → graveyard move publishes the
+/// moved card into `state.last_zone_changed_ids`, mirroring the
+/// `parse_you_discard_this_way_clause` / `parse_you_sacrifice_this_way_clause`
+/// siblings below; only the verb and destination differ.
+pub fn parse_you_put_into_graveyard_this_way_clause(
+    input: &str,
+) -> OracleResult<'_, (TargetFilter, bool)> {
+    let (rest, _) = tag("you put ").parse(input)?;
+    let (rest, _) = alt((
+        value((), tag::<_, _, OracleError<'_>>("at least one ")),
+        value((), tag("one or more ")),
+        parse_article,
+    ))
+    .parse(rest)?;
+    let (filter, after_filter) = parse_type_phrase(rest);
+    if matches!(filter, TargetFilter::Any) {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    }
+    let after_filter = after_filter.trim_start();
+    let (rest, _) = tag("into your graveyard this way").parse(after_filter)?;
+    Ok((rest, (filter, false)))
+}
+
+/// CR 701.9a: Parse "you discard [quantifier] [type] card[s] this way" — the
+/// active-voice condition following a preceding "discard a card" instruction
+/// in the same ability (Talion's Messenger: "draw a card,
 /// then discard a card. When you discard a card this way, put a +1/+1 counter
 /// on target Faerie you control"; The Ancient One: "Draw a card, then discard
 /// a card. When you discard a card this way, target player mills cards equal to
@@ -9669,9 +10199,9 @@ pub fn parse_you_discard_this_way_clause(input: &str) -> OracleResult<'_, (Targe
     Ok((rest, (filter, false)))
 }
 
-/// CR 603.12 + CR 701.21a: Parse "you sacrifice [quantifier] [type] this way" —
-/// the active-voice reflexive gate created by a preceding "sacrifice [quantifier]
-/// [type]" instruction in the same ability (Nyssa of Traken: "sacrifice any
+/// CR 701.21a: Parse "you sacrifice [quantifier] [type] this way" — the
+/// active-voice condition following a preceding "sacrifice [quantifier] [type]"
+/// instruction in the same ability (Nyssa of Traken: "sacrifice any
 /// number of artifacts. When you sacrifice one or more artifacts this way, tap
 /// up to that many target creatures and draw that many cards").
 ///
@@ -10146,8 +10676,8 @@ pub(crate) fn match_when_you_do(i: &str) -> OracleResult<'_, ()> {
 mod tests {
     use super::*;
     use crate::types::ability::{
-        CardTypeSetSource, CountScope, RoundingMode, TriggerCondition, TypeFilter, TypedFilter,
-        ZoneRef,
+        CardTypeSetSource, ControllerRef, CountScope, PtStat, PtValueScope, RoundingMode,
+        TargetFilter, TriggerCondition, TypeFilter, TypedFilter, ZoneRef,
     };
     use crate::types::card_type::Supertype;
     use crate::types::mana::{ManaColor, ManaCost};
@@ -10201,7 +10731,7 @@ mod tests {
         assert_eq!(cond, StaticCondition::SourceIsSaddled);
     }
 
-    /// CR 603.12 + CR 701.21a: the active-voice reflexive sacrifice gate
+    /// CR 701.21a: the active-voice sacrifice condition
     /// ("you sacrifice [quantifier] [type] this way") parses to its filter for
     /// every quantifier form, mirroring the discard/put combinators.
     #[test]
@@ -10302,6 +10832,292 @@ mod tests {
                 tf.properties
             );
         }
+    }
+
+    /// Destructure an `ObjectCountBySharedQuality >= N` comparison over a
+    /// `Typed` filter for the group-share rows below, panicking with the
+    /// offending input rather than on an opaque match failure.
+    ///
+    /// Also asserts THE repair property shared by every row here: no GROUP
+    /// `FilterProp::SharesQuality { reference: None, relation: Shares }` is left
+    /// on the filter. That marker is a group-selection constraint that
+    /// `game::filter::evaluate_shares_quality` answers TRUE for every object, so
+    /// a filter that still carries it inside a count silently drops the
+    /// constraint — the shipped defect this lift repairs.
+    fn expect_group_shared_count(
+        text: &str,
+        cond: StaticCondition,
+    ) -> (TypedFilter, SharedQuality, AggregateFunction, i32) {
+        let StaticCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty:
+                        QuantityRef::ObjectCountBySharedQuality {
+                            filter,
+                            quality,
+                            aggregate,
+                        },
+                },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value },
+        } = cond
+        else {
+            panic!("expected ObjectCountBySharedQuality >= N for {text:?}, got {cond:?}");
+        };
+        let TargetFilter::Typed(tf) = filter else {
+            panic!("expected Typed filter for {text:?}, got {filter:?}");
+        };
+        assert!(
+            tf.properties.contains(&FilterProp::InZone {
+                zone: Zone::Battlefield,
+            }),
+            "inject_controller must add InZone{{Battlefield}} for {text:?}, got {:?}",
+            tf.properties
+        );
+        assert!(
+            !tf.properties.iter().any(|prop| matches!(
+                prop,
+                FilterProp::SharesQuality {
+                    reference: None,
+                    relation: SharedQualityRelation::Shares,
+                    ..
+                }
+            )),
+            "the group SharesQuality marker must be LIFTED out of the filter for \
+             {text:?}, not merely accompanied by the count; got {:?}",
+            tf.properties
+        );
+        (tf, quality, aggregate, value)
+    }
+
+    /// CR 508.5 + CR 509.1b: "defending player controls N or more [type]" — the
+    /// combat-scoped leaf of the control-count axis (Ayesha Tanaka, Armorer:
+    /// "…can't be blocked as long as defending player controls three or more
+    /// artifacts").
+    ///
+    /// The input is exactly what `parse_compound_cant_be_blocked_condition`
+    /// hands over after the `~ ` subject and the trailing `.` are stripped, so
+    /// it must NOT carry a trailing period.
+    ///
+    /// Revert-failing: remove the `defending player controls ` arm from
+    /// `parse_control_scope_prefix` and the prefix is rejected, the whole
+    /// condition fails to parse, and the `unwrap_or_else` panics.
+    #[test]
+    fn parse_defending_player_control_count_ge_artifacts() {
+        let text = "as long as defending player controls three or more artifacts";
+        let (rest, cond) =
+            parse_condition(text).unwrap_or_else(|e| panic!("failed to parse {text:?}: {e:?}"));
+        assert_eq!(rest, "", "unconsumed remainder for {text:?}");
+        let StaticCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount { filter },
+                },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 3 },
+        } = cond
+        else {
+            panic!("expected ObjectCount >= 3 for {text:?}, got {cond:?}");
+        };
+        let TargetFilter::Typed(tf) = filter else {
+            panic!("expected Typed filter for {text:?}, got {filter:?}");
+        };
+        assert_eq!(tf.type_filters, vec![TypeFilter::Artifact]);
+        assert_eq!(
+            tf.controller,
+            Some(ControllerRef::DefendingPlayer),
+            "the count must be scoped to the defending player, not the source's \
+             controller"
+        );
+        assert!(
+            tf.properties.contains(&FilterProp::InZone {
+                zone: Zone::Battlefield,
+            }),
+            "inject_controller must add InZone{{Battlefield}}, got {:?}",
+            tf.properties
+        );
+    }
+
+    /// CR 508.5 + CR 509.1b + CR 205.3m: Graxiplon's printed gate — the
+    /// defending-player scope crossed with the RELATIVE-CLAUSE printing of the
+    /// group-share count, entered through `unless ` (which supplies the `Not`).
+    ///
+    /// Revert-failing twice over: remove the `defending player controls ` arm
+    /// and the parse fails outright; revert the Branch A lift and
+    /// `parse_control_count_ge_shared_quality` declines (its Branch B needs
+    /// `tag("with the same ")` on the empty remainder the consumed relative
+    /// clause leaves), so `parse_control_count_ge` lands the INERT `ObjectCount`
+    /// and both the destructure and the residual-marker assertion fire.
+    #[test]
+    fn parse_defending_player_control_count_ge_group_shared_creature_type() {
+        let text =
+            "unless defending player controls three or more creatures that share a creature type";
+        let (rest, cond) =
+            parse_condition(text).unwrap_or_else(|e| panic!("failed to parse {text:?}: {e:?}"));
+        assert_eq!(rest, "", "unconsumed remainder for {text:?}");
+        let StaticCondition::Not { condition } = cond else {
+            panic!("`unless` must supply the negation for {text:?}, got {cond:?}");
+        };
+        let (tf, quality, aggregate, value) = expect_group_shared_count(text, *condition);
+        assert_eq!(value, 3);
+        assert_eq!(quality, SharedQuality::CreatureType);
+        assert_eq!(aggregate, AggregateFunction::Max);
+        assert_eq!(tf.type_filters, vec![TypeFilter::Creature]);
+        assert_eq!(tf.controller, Some(ControllerRef::DefendingPlayer));
+    }
+
+    /// CR 205.3m + CR 603.4 + CR 601.2f: "you control <threshold> creatures
+    /// that share a creature type" — the RELATIVE-CLAUSE printing on the `you`
+    /// scope. Two rules because the two inputs take two routes: the first is a
+    /// triggered ability's intervening-if (CR 603.4), the second is a
+    /// cost-reduction static read during cost determination (CR 601.2f).
+    ///
+    /// These are the two SHIPPED rows this change repairs: Littjara Kinseekers
+    /// (`three or more`, reaching the runtime through
+    /// `oracle_trigger::try_extract_intervening`) and Synchronized Eviction
+    /// (`at least two`, through `static_helpers::try_parse_cost_modification`).
+    /// On main both land `QuantityRef::ObjectCount` over a filter that still
+    /// carries the group `SharesQuality` marker, and
+    /// `game::filter::evaluate_shares_quality` answers TRUE for every object
+    /// when `reference` is `None` — so the count is the plain creature count and
+    /// the gate fires on ANY three (respectively two) creatures.
+    ///
+    /// The second input is also the only row in this file that exercises
+    /// `parse_ge_threshold`'s `at least N` arm.
+    ///
+    /// Revert-failing: revert Branch A and `parse_control_count_ge` lands the
+    /// inert `ObjectCount`, firing both the destructure and the residual-marker
+    /// assertion. Reverting the `defending player controls ` leaf does NOT move
+    /// these rows — the `you control ` arm is untouched by it — which is what
+    /// makes this the exclusive discriminator for the lift.
+    #[test]
+    fn parse_you_control_count_ge_group_shared_creature_type() {
+        for (text, expected_n) in [
+            // Littjara Kinseekers' intervening-if, after `~` normalization.
+            (
+                "if you control three or more creatures that share a creature type",
+                3,
+            ),
+            // Synchronized Eviction's cost-reduction gate.
+            (
+                "if you control at least two creatures that share a creature type",
+                2,
+            ),
+        ] {
+            let (rest, cond) =
+                parse_condition(text).unwrap_or_else(|e| panic!("failed to parse {text:?}: {e:?}"));
+            assert_eq!(rest, "", "unconsumed remainder for {text:?}");
+            let (tf, quality, aggregate, value) = expect_group_shared_count(text, cond);
+            assert_eq!(value, expected_n, "threshold for {text:?}");
+            assert_eq!(quality, SharedQuality::CreatureType, "quality for {text:?}");
+            assert_eq!(aggregate, AggregateFunction::Max, "aggregate for {text:?}");
+            assert_eq!(tf.type_filters, vec![TypeFilter::Creature]);
+            assert_eq!(
+                tf.controller,
+                Some(ControllerRef::You),
+                "scope for {text:?}"
+            );
+        }
+    }
+
+    /// REGRESSION GUARD for the four incumbent Branch B (postmodifier) rows the
+    /// rewritten `parse_control_count_ge_shared_quality` must not move: Endless
+    /// Atlas and Sceptre of Eternal Glory (activated-ability conditions),
+    /// Mechanized Production and Chrome Replicator (trigger intervening-ifs).
+    ///
+    /// Chrome Replicator is the only one with a compound type phrase and a
+    /// non-zone `FilterProp` sitting where a `SharesQuality` marker would sit,
+    /// and its route (`try_extract_intervening`) drops the whole intervening-if
+    /// on a decline — so a Branch B regression there is SILENT and the ETB
+    /// creates its token unconditionally.
+    ///
+    /// Goes RED on any breakage of Branch B, of the `parse_shared_quality`
+    /// substitution, or of the `inject_controller_you` → `inject_controller(ctrl)`
+    /// swap. Reverting either unit wholesale restores the incumbent Branch B, so
+    /// these rows guard regressions INSIDE the rewrite rather than discriminating
+    /// a revert.
+    #[test]
+    fn parse_control_count_ge_shared_name_postmodifier_rows_are_unchanged() {
+        for (text, expected_n, expected_types, expects_non_token) in [
+            // Endless Atlas / Sceptre of Eternal Glory.
+            (
+                "as long as you control three or more lands with the same name",
+                3,
+                vec![TypeFilter::Land],
+                false,
+            ),
+            // Mechanized Production — the ` as one another` tail and the `if `
+            // entry rather than `as long as `.
+            (
+                "if you control eight or more artifacts with the same name as one another",
+                8,
+                vec![TypeFilter::Artifact],
+                false,
+            ),
+            // Chrome Replicator.
+            (
+                "if you control two or more nonland, nontoken permanents with the same name as one another",
+                2,
+                vec![TypeFilter::Permanent, TypeFilter::Non(Box::new(TypeFilter::Land))],
+                true,
+            ),
+        ] {
+            let (rest, cond) =
+                parse_condition(text).unwrap_or_else(|e| panic!("failed to parse {text:?}: {e:?}"));
+            assert_eq!(rest, "", "unconsumed remainder for {text:?}");
+            let (tf, quality, aggregate, value) = expect_group_shared_count(text, cond);
+            assert_eq!(value, expected_n, "threshold for {text:?}");
+            assert_eq!(quality, SharedQuality::Name, "quality for {text:?}");
+            assert_eq!(aggregate, AggregateFunction::Max, "aggregate for {text:?}");
+            assert_eq!(tf.type_filters, expected_types, "types for {text:?}");
+            assert_eq!(tf.controller, Some(ControllerRef::You), "scope for {text:?}");
+            assert_eq!(
+                tf.properties.contains(&FilterProp::NonToken),
+                expects_non_token,
+                "NonToken property for {text:?}, got {:?}",
+                tf.properties
+            );
+        }
+    }
+
+    /// HOSTILE FIXTURE — Bursting Beebles: "can't be blocked as long as
+    /// defending player controls two or more nonland permanents that share an
+    /// artist."
+    ///
+    /// CR 109.3 enumerates an object's characteristics and closes with "Any
+    /// other information about an object isn't a characteristic." Artist is not
+    /// among them, `GameObject` carries no artist field, and `SharedQuality`
+    /// correctly has no `Artist` arm. So `parse_shared_quality_clause` never
+    /// consumes the clause, this arm leaves it in the remainder, and the
+    /// caller's emptiness check refuses — the gate stays
+    /// `StaticCondition::Unrecognized` and `coverage.rs` keeps reporting the
+    /// gap honestly.
+    ///
+    /// **If this ever goes RED the fix is NOT to relax the test.** A consumed
+    /// remainder here means some route accepted a gate BROADER than printed
+    /// (Beebles would become unblockable on any two nonland permanents) while
+    /// coverage went green — a silent, coverage-invisible regression.
+    ///
+    /// Revert-failing: the `defending player controls ` leaf of
+    /// `parse_control_scope_prefix` ONLY, and it fails as a PANIC rather than an
+    /// assertion — without that leaf nothing parses this prefix, `parse_condition`
+    /// returns `Err`, and the row dies at the `unwrap_or_else`. Reverting the
+    /// Branch B `parse_shared_quality` substitution leaves this row GREEN,
+    /// because `artist` is outside that vocabulary either way. Neither is the
+    /// guard this row exists for: its guard is that the remainder stays
+    /// `" that share an artist"`, which goes RED the moment any route learns to
+    /// consume the clause.
+    #[test]
+    fn share_an_artist_is_not_consumed_and_stays_an_honest_gap() {
+        let text =
+            "as long as defending player controls two or more nonland permanents that share an artist";
+        let (rest, _cond) =
+            parse_condition(text).unwrap_or_else(|e| panic!("failed to parse {text:?}: {e:?}"));
+        assert_eq!(
+            rest, " that share an artist",
+            "the artist clause must be left UNCONSUMED so the caller's \
+             emptiness check refuses the whole gate"
+        );
     }
 
     #[test]
@@ -10658,7 +11474,7 @@ mod tests {
         }
     }
 
-    /// CR 119 + CR 603.4 + CR 603.7c: "if that player has N or less life"
+    /// CR 119 + CR 603.4 + CR 120.3: "if that player has N or less life"
     /// intervening-if predicate on a combat-damage trigger. Canonical card:
     /// Ezio Auditore da Firenze. "That player" resolves to the damaged
     /// player (the event-context player), not the source's controller.
@@ -11553,6 +12369,71 @@ mod tests {
         }
     }
 
+    /// CR 122.1 + CR 611.3a: Hundred-Battle Veteran's "there are three or more
+    /// different kinds of counters among creatures you control" must type as a
+    /// `QuantityComparison` over `DistinctCounterKindsAmong`, not fall back to
+    /// `StaticCondition::Unrecognized` (which `game/layers.rs` evaluates as
+    /// unconditionally true, making the P/T boost silently always-on). Registers
+    /// `parse_distinct_counter_kinds_among_tail` in `parse_quantity_ref`'s bare-
+    /// suffix `alt()` — the same dual-registration treatment already given to
+    /// `parse_distinct_colors_among_tail` (Puca's Eye).
+    #[test]
+    fn parse_inner_condition_distinct_counter_kinds_among_ge_3() {
+        let text =
+            "there are three or more different kinds of counters among creatures you control";
+        let (rest, cond) = parse_inner_condition(text)
+            .unwrap_or_else(|e| panic!("failed to parse {text:?}: {e:?}"));
+        assert_eq!(rest, "", "unconsumed remainder for {text:?}");
+        let StaticCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty: QuantityRef::DistinctCounterKindsAmong { filter },
+                },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 3 },
+        } = cond
+        else {
+            panic!("expected DistinctCounterKindsAmong >= 3 comparison for {text:?}, got {cond:?}");
+        };
+        let TargetFilter::Typed(tf) = filter else {
+            panic!("expected Typed filter for {text:?}, got {filter:?}");
+        };
+        assert!(
+            tf.type_filters.contains(&TypeFilter::Creature),
+            "population must be creatures for {text:?}, got {:?}",
+            tf.type_filters
+        );
+        assert_eq!(
+            tf.controller,
+            Some(ControllerRef::You),
+            "population must be scoped to creatures you control for {text:?}"
+        );
+    }
+
+    /// Sibling boundary test: "there are two or more ..." must produce a
+    /// distinct GE-2 comparison, proving the numeral is threaded through and
+    /// not hardcoded to 3 by the new bare-suffix registration.
+    #[test]
+    fn parse_inner_condition_distinct_counter_kinds_among_ge_2_boundary() {
+        let text = "there are two or more different kinds of counters among creatures you control";
+        let (rest, cond) = parse_inner_condition(text)
+            .unwrap_or_else(|e| panic!("failed to parse {text:?}: {e:?}"));
+        assert_eq!(rest, "");
+        assert!(
+            matches!(
+                cond,
+                StaticCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: QuantityRef::DistinctCounterKindsAmong { .. }
+                    },
+                    comparator: Comparator::GE,
+                    rhs: QuantityExpr::Fixed { value: 2 },
+                }
+            ),
+            "expected DistinctCounterKindsAmong >= 2, got {cond:?}"
+        );
+    }
+
     /// Kavu Runner / Skittish Kavu: "... as long as no opponent controls a white
     /// or blue creature" must parse to a negated opponent presence (not the
     /// `Unrecognized` fallthrough it used to).
@@ -11948,6 +12829,35 @@ mod tests {
             assert_eq!(name, "throne of empires");
             assert_eq!(rest, tail);
         }
+    }
+
+    /// CR 201.2 + CR 603.4: the quoted-card named-count condition on Name
+    /// Sticker Goblin must leave its die-roll clause for trigger effect parsing.
+    #[test]
+    fn control_named_count_stops_before_roll_die_effect() {
+        let (rest, condition) = parse_control_count_le(
+            "you control 9 or fewer creatures named \"name sticker\" goblin, roll a 20-sided die",
+        )
+        .expect("named count must parse");
+        assert_eq!(rest, ", roll a 20-sided die");
+        let StaticCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount { filter },
+                },
+            comparator: Comparator::LE,
+            rhs: QuantityExpr::Fixed { value: 9 },
+        } = condition
+        else {
+            panic!("expected a <= 9 object count, got {condition:?}");
+        };
+        let TargetFilter::Typed(filter) = filter else {
+            panic!("expected a typed creature filter, got {filter:?}");
+        };
+        assert!(filter.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::Named { name } if name == "\"name sticker\" goblin"
+        )));
     }
 
     #[test]
@@ -12677,6 +13587,7 @@ mod tests {
                             QuantityRef::ControlledByEachPlayer {
                                 filter,
                                 aggregate: AggregateFunction::Min,
+                                relation: PlayerRelation::All,
                             },
                     },
                 comparator: Comparator::EQ,
@@ -13191,7 +14102,7 @@ mod tests {
 
     #[test]
     fn test_source_enchanted_by_plural_aura_count() {
-        let (rest, c) = parse_inner_condition("~ is enchanted by 3 or more Auras").unwrap();
+        let (rest, c) = parse_inner_condition("~ is enchanted by 3 or more auras").unwrap();
         assert_eq!(rest, "");
         let StaticCondition::QuantityComparison {
             comparator, rhs, ..
@@ -13205,7 +14116,7 @@ mod tests {
 
     #[test]
     fn test_source_enchanted_by_exactly_one_aura() {
-        let (rest, c) = parse_inner_condition("~ is enchanted by exactly one Aura").unwrap();
+        let (rest, c) = parse_inner_condition("~ is enchanted by exactly one aura").unwrap();
         assert_eq!(rest, "");
         let StaticCondition::QuantityComparison {
             comparator, rhs, ..
@@ -13219,7 +14130,7 @@ mod tests {
 
     #[test]
     fn test_source_enchanted_by_exactly_two_auras() {
-        let (rest, c) = parse_inner_condition("~ is enchanted by exactly two Auras").unwrap();
+        let (rest, c) = parse_inner_condition("~ is enchanted by exactly two auras").unwrap();
         assert_eq!(rest, "");
         let StaticCondition::QuantityComparison {
             comparator, rhs, ..
@@ -13387,7 +14298,7 @@ mod tests {
     // (it is tried earlier in the `alt()` and requires `tag("is enchanted by ")`).
     #[test]
     fn test_source_is_enchanted_does_not_steal_aura_count() {
-        let (rest, c) = parse_inner_condition("~ is enchanted by exactly two Auras").unwrap();
+        let (rest, c) = parse_inner_condition("~ is enchanted by exactly two auras").unwrap();
         assert_eq!(rest, "");
         let StaticCondition::QuantityComparison {
             comparator, rhs, ..
@@ -13890,25 +14801,276 @@ mod tests {
             parse_inner_condition("there are fewer than six creature cards in your graveyard")
                 .unwrap();
         assert_eq!(rest, "");
-        match c {
+        assert_eq!(
+            c,
             StaticCondition::QuantityComparison {
-                lhs:
-                    QuantityExpr::Ref {
-                        qty:
-                            QuantityRef::ZoneCardCount {
-                                zone: ZoneRef::Graveyard,
-                                card_types,
-                                filter: None,
-                                scope: CountScope::Controller,
-                            },
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Creature],
+                        filter: None,
+                        scope: CountScope::Controller,
                     },
+                },
                 comparator: Comparator::LT,
                 rhs: QuantityExpr::Fixed { value: 6 },
-            } => {
-                assert_eq!(card_types, vec![TypeFilter::Creature]);
             }
-            other => panic!("expected ZoneCardCount Creature LT 6, got {other:?}"),
+        );
+    }
+
+    #[test]
+    fn filtered_zone_card_counts_preserve_filter_scope_and_comparator_axes() {
+        let typed = |type_filters, properties| {
+            TargetFilter::Typed(TypedFilter {
+                type_filters,
+                controller: None,
+                properties,
+            })
+        };
+        let cases = [
+            (
+                "there are four or more historic cards in your graveyard",
+                Comparator::GE,
+                4,
+                typed(vec![TypeFilter::Card], vec![FilterProp::Historic]),
+                CountScope::Controller,
+            ),
+            (
+                "there are two nonhistoric cards in all graveyards",
+                Comparator::EQ,
+                2,
+                typed(vec![TypeFilter::Card], vec![FilterProp::NotHistoric]),
+                CountScope::All,
+            ),
+            (
+                "there are three legendary creature cards in your graveyard",
+                Comparator::EQ,
+                3,
+                typed(
+                    vec![TypeFilter::Creature],
+                    vec![FilterProp::HasSupertype {
+                        value: Supertype::Legendary,
+                    }],
+                ),
+                CountScope::Controller,
+            ),
+            (
+                "there are two nonbasic land cards in all graveyards",
+                Comparator::EQ,
+                2,
+                typed(
+                    vec![TypeFilter::Land],
+                    vec![FilterProp::NotSupertype {
+                        value: Supertype::Basic,
+                    }],
+                ),
+                CountScope::All,
+            ),
+            (
+                "there are three or more legendary creature or nonbasic land cards in all graveyards",
+                Comparator::GE,
+                3,
+                TargetFilter::Or {
+                    filters: vec![
+                        typed(
+                            vec![TypeFilter::Creature],
+                            vec![FilterProp::HasSupertype {
+                                value: Supertype::Legendary,
+                            }],
+                        ),
+                        typed(
+                            vec![TypeFilter::Land],
+                            vec![
+                                FilterProp::NotSupertype {
+                                    value: Supertype::Basic,
+                                },
+                                FilterProp::HasSupertype {
+                                    value: Supertype::Legendary,
+                                },
+                            ],
+                        ),
+                    ],
+                },
+                CountScope::All,
+            ),
+        ];
+
+        for (text, comparator, threshold, filter, scope) in cases {
+            let (rest, condition) = parse_inner_condition(text)
+                .unwrap_or_else(|error| panic!("must parse {text:?}: {error:?}"));
+            assert_eq!(rest, "", "unconsumed remainder for {text:?}");
+            assert_eq!(
+                condition,
+                StaticCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: QuantityRef::ZoneCardCount {
+                            zone: ZoneRef::Graveyard,
+                            card_types: Vec::new(),
+                            filter: Some(filter),
+                            scope,
+                        },
+                    },
+                    comparator,
+                    rhs: QuantityExpr::Fixed { value: threshold },
+                },
+                "exact AST for {text:?}",
+            );
         }
+    }
+
+    #[test]
+    fn filtered_zone_card_count_reach_guards_preserve_legacy_and_boundaries() {
+        let (rest, cards_total) =
+            parse_inner_condition("there are three creature cards total in your graveyard")
+                .expect("cards-total legacy path must remain reachable");
+        assert_eq!(rest, "");
+        assert_eq!(
+            cards_total,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Creature],
+                        filter: None,
+                        scope: CountScope::Controller,
+                    },
+                },
+                comparator: Comparator::EQ,
+                rhs: QuantityExpr::Fixed { value: 3 },
+            }
+        );
+
+        let (rest, instant_or_sorcery) = parse_inner_condition(
+            "there are three or more instant or sorcery cards in your graveyard",
+        )
+        .expect("property-free type disjunction must retain its legacy count path");
+        assert_eq!(rest, "");
+        assert_eq!(
+            instant_or_sorcery,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Instant, TypeFilter::Sorcery],
+                        filter: None,
+                        scope: CountScope::Controller,
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 3 },
+            }
+        );
+
+        let (rest, card_types_among) = parse_inner_condition(
+            "there are four or more card types among cards in your graveyard",
+        )
+        .expect("card-types-among legacy path must remain reachable");
+        assert_eq!(rest, "");
+        assert_eq!(
+            card_types_among,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::DistinctCardTypes {
+                        source: CardTypeSetSource::Zone {
+                            zone: ZoneRef::Graveyard,
+                            scope: CountScope::Controller,
+                        },
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 4 },
+            }
+        );
+
+        let (rest, bare_cards) = parse_inner_condition("there are four cards in your graveyard")
+            .expect("bare cards must retain their canonical quantity path");
+        assert_eq!(rest, "");
+        assert_eq!(
+            bare_cards,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::GraveyardSize {
+                        player: PlayerScope::Controller,
+                    },
+                },
+                comparator: Comparator::EQ,
+                rhs: QuantityExpr::Fixed { value: 4 },
+            }
+        );
+
+        let (rest, battlefield_count) =
+            parse_inner_condition("there are seven or more lands on the battlefield")
+                .expect("battlefield count fallback must remain reachable");
+        assert_eq!(rest, "");
+        assert_eq!(
+            battlefield_count,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(TypedFilter {
+                            type_filters: vec![TypeFilter::Land],
+                            controller: None,
+                            properties: vec![FilterProp::InZone {
+                                zone: Zone::Battlefield,
+                            }],
+                        }),
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 7 },
+            }
+        );
+
+        let (_, plural_historic) =
+            parse_filtered_zone_card_count("historic cards in your graveyard")
+                .expect("positive reach guard for rejected filtered-count forms");
+        assert!(matches!(plural_historic, QuantityRef::ZoneCardCount { .. }));
+        assert!(matches!(
+            parse_filtered_zone_card_count("historic card in your graveyard"),
+            Err(nom::Err::Error(_))
+        ));
+        for text in [
+            "creature cards in your graveyard",
+            "Lesson cards in your graveyard",
+            "instant or sorcery cards in your graveyard",
+        ] {
+            assert!(
+                matches!(
+                    parse_filtered_zone_card_count(text),
+                    Err(nom::Err::Error(_))
+                ),
+                "property-free filter must fall through to the legacy count parser for {text:?}"
+            );
+        }
+        assert!(matches!(
+            parse_filtered_zone_card_count("artifact cards you control in your graveyard"),
+            Err(nom::Err::Error(_))
+        ));
+        assert!(matches!(
+            parse_filtered_zone_card_count("tapped creature cards in your graveyard"),
+            Err(nom::Err::Error(_))
+        ));
+
+        for text in [
+            "there are five historic cards in an opponent's graveyard",
+            "there are five historic cards in each player's graveyard",
+            "there are five historic cards in graveyard",
+        ] {
+            assert!(
+                matches!(parse_inner_condition(text), Err(nom::Err::Failure(_))),
+                "unsupported filtered-count scope must commit as Failure for {text:?}"
+            );
+        }
+
+        let (rest, _) =
+            parse_inner_condition("there are four or more historic cards in your graveyard total")
+                .expect("unconsumed tail must remain visible to the caller");
+        assert_eq!(rest, " total");
+        let (rest, _) = parse_inner_condition(
+            "there are four or more historic cards in your graveyard, draw a card",
+        )
+        .expect("comma boundary must remain visible to the caller");
+        assert_eq!(rest, ", draw a card");
     }
 
     /// CR 107.1 + CR 611.3a: "there are fewer than N cards ..." with the plain
@@ -13944,17 +15106,21 @@ mod tests {
             parse_inner_condition("there are more than two creature cards in your graveyard")
                 .unwrap();
         assert_eq!(rest, "");
-        match c {
+        assert_eq!(
+            c,
             StaticCondition::QuantityComparison {
-                lhs:
-                    QuantityExpr::Ref {
-                        qty: QuantityRef::ZoneCardCount { .. },
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Creature],
+                        filter: None,
+                        scope: CountScope::Controller,
                     },
+                },
                 comparator: Comparator::GT,
                 rhs: QuantityExpr::Fixed { value: 2 },
-            } => {}
-            other => panic!("expected ZoneCardCount GT 2, got {other:?}"),
-        }
+            }
+        );
     }
 
     /// CR 107.1: suffix regression — the "or more" (GE) suffix axis still parses
@@ -14045,6 +15211,38 @@ mod tests {
         }
     }
 
+    /// CR 202.3 + CR 611.3a: the mana-value-diversity sibling of Delirium — SNC's
+    /// "there are five or more mana values among cards in your graveyard" (Aven
+    /// Heartstabber, Snooping Newsie, Syndicate Infiltrator, Graveyard Shift, and
+    /// their Alchemy variants). Unlike Delirium's `DistinctCardTypes`, this counts
+    /// distinct mana VALUES via the generic `ObjectCountDistinct` axis.
+    #[test]
+    fn test_there_are_mana_values_graveyard_diversity() {
+        let (rest, c) = parse_inner_condition(
+            "there are five or more mana values among cards in your graveyard",
+        )
+        .unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::ObjectCountDistinct { filter, qualities },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 5 },
+            } => {
+                assert_eq!(qualities, vec![SharedQuality::ManaValue]);
+                assert_eq!(filter.extract_in_zone(), Some(Zone::Graveyard));
+                let TargetFilter::Typed(filter) = filter else {
+                    panic!("expected Typed graveyard filter");
+                };
+                assert_eq!(filter.controller, Some(ControllerRef::You));
+            }
+            other => panic!("expected ObjectCountDistinct[ManaValue] GE 5, got {other:?}"),
+        }
+    }
+
     #[test]
     fn there_are_zone_threshold_stops_before_counter_effect_clause() {
         let (rest, c) = parse_inner_condition(
@@ -14126,25 +15324,21 @@ mod tests {
             parse_inner_condition("there are three or more Lesson cards in your graveyard")
                 .unwrap();
         assert_eq!(rest, "");
-        match c {
+        assert_eq!(
+            c,
             StaticCondition::QuantityComparison {
-                lhs:
-                    QuantityExpr::Ref {
-                        qty:
-                            QuantityRef::ZoneCardCount {
-                                zone: crate::types::ability::ZoneRef::Graveyard,
-                                card_types,
-                                scope: crate::types::ability::CountScope::Controller,
-                                filter: None,
-                            },
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Subtype("Lesson".to_string())],
+                        filter: None,
+                        scope: CountScope::Controller,
                     },
+                },
                 comparator: Comparator::GE,
                 rhs: QuantityExpr::Fixed { value: 3 },
-            } => {
-                assert_eq!(card_types, vec![TypeFilter::Subtype("Lesson".to_string())]);
             }
-            other => panic!("expected Lesson graveyard count GE 3, got {other:?}"),
-        }
+        );
     }
 
     #[test]
@@ -14447,6 +15641,48 @@ mod tests {
         assert!(angel
             .type_filters
             .contains(&TypeFilter::Subtype("Angel".to_string())));
+    }
+
+    #[test]
+    fn attached_subject_combat_state_parses_attacking_alone_before_attacking() {
+        let (rest, (filter, prop)) =
+            parse_attached_subject_combat_state("enchanted creature is attacking alone")
+                .expect("attached attacking-alone condition must parse");
+        assert_eq!(rest, "");
+        assert_eq!(prop, FilterProp::AttackingAlone);
+        assert_eq!(
+            filter,
+            TargetFilter::Typed(TypedFilter::creature().properties(vec![FilterProp::EnchantedBy]))
+        );
+    }
+
+    #[test]
+    fn attached_subject_combat_state_preserves_equipped_and_broad_attacking_forms() {
+        let (rest, (filter, prop)) =
+            parse_attached_subject_combat_state("equipped creature is attacking alone")
+                .expect("equipped attacking-alone condition must parse");
+        assert_eq!(rest, "");
+        assert_eq!(prop, FilterProp::AttackingAlone);
+        assert_eq!(
+            filter,
+            TargetFilter::Typed(TypedFilter::creature().properties(vec![FilterProp::EquippedBy]))
+        );
+
+        let (rest, (_, prop)) =
+            parse_attached_subject_combat_state("enchanted creature is attacking")
+                .expect("existing broad attacking condition must still parse");
+        assert_eq!(rest, "");
+        assert_eq!(prop, FilterProp::Attacking { defender: None });
+    }
+
+    #[test]
+    fn attached_subject_combat_state_leaves_hostile_trailing_text_for_caller() {
+        let (rest, (_, prop)) = parse_attached_subject_combat_state(
+            "enchanted creature is attacking alone during your turn",
+        )
+        .expect("the building block should parse its exact predicate");
+        assert_eq!(prop, FilterProp::AttackingAlone);
+        assert_eq!(rest, " during your turn");
     }
 
     // -- Anaphoric "it" recipient conditions (CR 611.3a) --
@@ -17262,6 +18498,29 @@ mod tests {
     }
 
     #[test]
+    fn creature_death_threshold_uses_zone_change_count_and_typed_comparator() {
+        for (text, comparator, threshold) in [
+            ("three or more creatures died this turn", Comparator::GE, 3),
+            ("two or fewer creatures died this turn", Comparator::LE, 2),
+            ("at least five creatures died this turn", Comparator::GE, 5),
+        ] {
+            let (rest, condition) = parse_inner_condition(text).unwrap();
+            assert_eq!(rest, "", "{text}");
+            assert_eq!(
+                condition,
+                StaticCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: creatures_died_this_turn_ref(),
+                    },
+                    comparator,
+                    rhs: QuantityExpr::Fixed { value: threshold },
+                },
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn test_source_you_controlled_dealt_damage_threshold_this_turn() {
         let (rest, c) =
             parse_inner_condition("a source you controlled dealt 5 or more damage this turn")
@@ -17612,6 +18871,70 @@ mod tests {
             }
             other => panic!("expected And, got {other:?}"),
         }
+    }
+
+    /// CR 601.2h + CR 603.4: the PRINTED wording of the same sentence, which
+    /// predates the Increment keyword (Liberator, Urza's Battlethopter:
+    /// "Whenever you cast a spell, if the amount of mana spent to cast that
+    /// spell is greater than Liberator's power, ..."). Before the subject was
+    /// widened this fell through and the whole intervening-if was dropped, so
+    /// every spell cast added a counter regardless of what was paid.
+    #[test]
+    fn test_parse_condition_printed_mana_spent_vs_self_power() {
+        let (rest, c) = parse_condition(
+            "if the amount of mana spent to cast that spell is greater than ~'s power",
+        )
+        .unwrap();
+        assert_eq!(rest, "");
+        // A bare comparison: single property, so no `Or`; and no
+        // source-is-creature conjunct, because the SUBJECT is not Increment's
+        // reminder wording. Its twin
+        // `test_parse_condition_mana_spent_vs_normalized_self_pt_has_creature_gate`
+        // feeds the SAME object phrase, `~'s power`, and does get the conjunct —
+        // which is the proof that the object cannot be what decides it. The
+        // scope likewise comes from "that spell", not from a default.
+        assert_eq!(
+            c,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ManaSpentToCast {
+                        scope: crate::types::ability::CastManaObjectScope::TriggeringSpell,
+                        metric: crate::types::ability::CastManaSpentMetric::Total,
+                    },
+                },
+                comparator: Comparator::GT,
+                rhs: QuantityExpr::Ref {
+                    qty: QuantityRef::Power {
+                        scope: crate::types::ability::ObjectScope::Source,
+                    },
+                },
+            }
+        );
+    }
+
+    /// CR 400.7d: the printed form reads its scope from the anaphora — "this
+    /// spell" resolves to `CastManaObjectScope::SelfObject`, the ability's own
+    /// source object, not to the triggering spell. Pins that the shared subject
+    /// authority is consulted rather than re-decided here.
+    #[test]
+    fn test_printed_mana_spent_subject_selects_scope() {
+        let (rest, c) = parse_condition(
+            "if the amount of mana spent to cast this spell is greater than ~'s toughness",
+        )
+        .unwrap();
+        assert_eq!(rest, "");
+        let StaticCondition::QuantityComparison { lhs, .. } = &c else {
+            panic!("expected a bare comparison, got {c:?}");
+        };
+        assert_eq!(
+            *lhs,
+            QuantityExpr::Ref {
+                qty: QuantityRef::ManaSpentToCast {
+                    scope: crate::types::ability::CastManaObjectScope::SelfObject,
+                    metric: crate::types::ability::CastManaSpentMetric::Total,
+                },
+            }
+        );
     }
 
     /// Single-property form ("greater than this creature's power") parses as
@@ -18172,6 +19495,14 @@ mod tests {
         ));
     }
 
+    /// CR 702.191a: the reminder-text subject identifies the Increment keyword,
+    /// whose rules text prints "if this permanent is a creature and".
+    /// Normalization has already turned "this creature's" into "~'s" by the time
+    /// the parser sees it, so the gate has to survive that rewrite.
+    /// `test_parse_condition_printed_mana_spent_vs_self_power` is its twin: the
+    /// spelled-out subject gets no gate. CR 702.191a's own rules text words the
+    /// subject exactly that way — what separates the two is that no oracle face
+    /// gives that keyword any subject but its reminder's.
     #[test]
     fn test_parse_condition_mana_spent_vs_normalized_self_pt_has_creature_gate() {
         let (rest, c) =
@@ -19483,15 +20814,13 @@ mod tests {
                 );
                 match lhs {
                     QuantityExpr::Ref {
-                        qty:
-                            QuantityRef::Aggregate {
-                                function,
-                                property,
-                                filter,
-                            },
+                        qty: QuantityRef::PropertyAggregate(aggregate),
                     } => {
-                        assert_eq!(function, AggregateFunction::Sum);
-                        assert_eq!(property, expected_property.0);
+                        assert_eq!(aggregate.function(), AggregateFunction::Sum);
+                        assert_eq!(aggregate.property(), expected_property.0);
+                        let CardTypeSetSource::Objects { filter } = aggregate.source() else {
+                            panic!("expected object source, got {:?}", aggregate.source());
+                        };
                         match filter {
                             TargetFilter::Typed(t) => {
                                 assert_eq!(t.controller, Some(ControllerRef::You));
@@ -19657,15 +20986,13 @@ mod tests {
                 );
                 match rhs {
                     QuantityExpr::Ref {
-                        qty:
-                            QuantityRef::Aggregate {
-                                function,
-                                property,
-                                filter,
-                            },
+                        qty: QuantityRef::PropertyAggregate(aggregate),
                     } => {
-                        assert_eq!(function, AggregateFunction::Max);
-                        assert_eq!(property, ObjectProperty::Power);
+                        assert_eq!(aggregate.function(), AggregateFunction::Max);
+                        assert_eq!(aggregate.property(), ObjectProperty::Power);
+                        let CardTypeSetSource::Objects { filter } = aggregate.source() else {
+                            panic!("expected object source, got {:?}", aggregate.source());
+                        };
                         match filter {
                             TargetFilter::Typed(tf) => {
                                 assert_eq!(tf.type_filters, vec![TypeFilter::Creature]);
@@ -19695,12 +21022,12 @@ mod tests {
                 comparator,
                 rhs:
                     QuantityExpr::Ref {
-                        qty: QuantityRef::Aggregate { function, .. },
+                        qty: QuantityRef::PropertyAggregate(aggregate),
                     },
                 ..
             } => {
                 assert_eq!(comparator, Comparator::LT);
-                assert_eq!(function, AggregateFunction::Min);
+                assert_eq!(aggregate.function(), AggregateFunction::Min);
             }
             other => panic!("expected QuantityComparison with Aggregate, got {other:?}"),
         }
@@ -19725,15 +21052,12 @@ mod tests {
                     },
                 rhs:
                     QuantityExpr::Ref {
-                        qty:
-                            QuantityRef::Aggregate {
-                                function, property, ..
-                            },
+                        qty: QuantityRef::PropertyAggregate(aggregate),
                     },
             } => {
                 assert_eq!(comparator, Comparator::GE);
-                assert_eq!(function, AggregateFunction::Max);
-                assert_eq!(property, ObjectProperty::Toughness);
+                assert_eq!(aggregate.function(), AggregateFunction::Max);
+                assert_eq!(aggregate.property(), ObjectProperty::Toughness);
             }
             other => panic!("expected QuantityComparison, got {other:?}"),
         }
@@ -19751,12 +21075,12 @@ mod tests {
                 comparator,
                 rhs:
                     QuantityExpr::Ref {
-                        qty: QuantityRef::Aggregate { function, .. },
+                        qty: QuantityRef::PropertyAggregate(aggregate),
                     },
                 ..
             } => {
                 assert_eq!(comparator, Comparator::GT);
-                assert_eq!(function, AggregateFunction::Max);
+                assert_eq!(aggregate.function(), AggregateFunction::Max);
             }
             other => panic!("expected QuantityComparison, got {other:?}"),
         }
@@ -19894,7 +21218,214 @@ mod tests {
         }
     }
 
-    /// CR 608.2c: Abzan Beastmaster's resolve-time gate is an existential
+    /// CR 109.2 + CR 109.4 + CR 608.2c: Padeem's intervening-if is an
+    /// existential controlled-artifact check against the table-wide greatest
+    /// artifact mana value. Candidate membership is exact equality to the Max,
+    /// so tied artifacts qualify without widening the predicate to GE.
+    #[test]
+    fn parse_inner_condition_you_control_artifact_with_greatest_mana_value() {
+        let (rest, condition) = parse_inner_condition(
+            "you control the artifact with the greatest mana value or tied for the greatest mana value.",
+        )
+        .unwrap();
+        assert!(rest.is_empty(), "must fully consume, leftover: {rest:?}");
+
+        let StaticCondition::IsPresent {
+            filter: Some(TargetFilter::Typed(candidate)),
+        } = condition
+        else {
+            panic!("expected controlled artifact presence gate, got {condition:?}");
+        };
+        assert_eq!(candidate.controller, Some(ControllerRef::You));
+        assert_eq!(candidate.type_filters, vec![TypeFilter::Artifact]);
+        assert_eq!(candidate.properties.len(), 2);
+        assert!(candidate.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::InZone {
+                zone: Zone::Battlefield
+            }
+        )));
+
+        let Some(FilterProp::Cmc {
+            comparator: Comparator::EQ,
+            value:
+                QuantityExpr::Ref {
+                    qty: QuantityRef::PropertyAggregate(aggregate),
+                },
+        }) = candidate
+            .properties
+            .iter()
+            .find(|property| matches!(property, FilterProp::Cmc { .. }))
+        else {
+            panic!(
+                "expected exact mana-value membership in the artifact maximum, got {:?}",
+                candidate.properties
+            );
+        };
+        assert_eq!(aggregate.function(), AggregateFunction::Max);
+        assert_eq!(aggregate.property(), ObjectProperty::ManaValue);
+        let CardTypeSetSource::Objects {
+            filter: TargetFilter::Typed(population),
+        } = aggregate.source()
+        else {
+            panic!("expected an artifact object population, got {aggregate:?}");
+        };
+        assert_eq!(population.type_filters, vec![TypeFilter::Artifact]);
+        assert!(
+            population.controller.is_none(),
+            "implicit ranked population must be table-wide"
+        );
+    }
+
+    /// The Min mirror uses the same exact-membership building block: an
+    /// artifact qualifies iff its mana value equals the least artifact mana
+    /// value, including ties.
+    #[test]
+    fn parse_inner_condition_you_control_artifact_with_least_mana_value() {
+        let (rest, condition) = parse_inner_condition(
+            "you control an artifact with the least mana value or tied for the least mana value.",
+        )
+        .unwrap();
+        assert!(rest.is_empty(), "must fully consume, leftover: {rest:?}");
+
+        let StaticCondition::IsPresent {
+            filter: Some(TargetFilter::Typed(candidate)),
+        } = condition
+        else {
+            panic!("expected controlled artifact presence gate, got {condition:?}");
+        };
+        let Some(FilterProp::Cmc {
+            comparator: Comparator::EQ,
+            value:
+                QuantityExpr::Ref {
+                    qty: QuantityRef::PropertyAggregate(aggregate),
+                },
+        }) = candidate
+            .properties
+            .iter()
+            .find(|property| matches!(property, FilterProp::Cmc { .. }))
+        else {
+            panic!("expected exact membership in the artifact minimum, got {candidate:?}");
+        };
+        assert_eq!(aggregate.function(), AggregateFunction::Min);
+        assert_eq!(aggregate.property(), ObjectProperty::ManaValue);
+        let CardTypeSetSource::Objects {
+            filter: TargetFilter::Typed(population),
+        } = aggregate.source()
+        else {
+            panic!("expected an artifact object population, got {aggregate:?}");
+        };
+        assert_eq!(candidate.controller, Some(ControllerRef::You));
+        assert_eq!(candidate.type_filters, vec![TypeFilter::Artifact]);
+        assert_eq!(candidate.properties.len(), 2);
+        assert!(candidate.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::InZone {
+                zone: Zone::Battlefield
+            }
+        )));
+        assert_eq!(population.type_filters, vec![TypeFilter::Artifact]);
+        assert!(population.controller.is_none());
+    }
+
+    /// CR 109.2 + CR 109.4: controlled-permanent superlatives must reject
+    /// off-battlefield/stack nouns at any word boundary, explicit
+    /// non-battlefield zones, and any genuine type-phrase tail.
+    #[test]
+    fn parse_inner_condition_you_control_superlative_rejects_nonpermanent_nouns_and_leftovers() {
+        for (text, reason) in [
+            (
+                "you control an artifact card with the greatest mana value.",
+                "terminal `card`",
+            ),
+            (
+                "you control a creature card in your graveyard with the greatest power.",
+                "zone-qualified `card`",
+            ),
+            (
+                "you control an artifact spell on the stack with the greatest mana value.",
+                "zone-qualified `spell`",
+            ),
+            (
+                "you control a creature in your graveyard with the greatest power.",
+                "explicit non-battlefield zone",
+            ),
+        ] {
+            assert!(
+                matches!(parse_inner_condition(text), Err(nom::Err::Failure(_))),
+                "{reason} must not be accepted in a `you control` permanent predicate"
+            );
+        }
+        assert!(
+            matches!(
+                parse_inner_condition(
+                    "you control an artifact relic with the greatest mana value."
+                ),
+                Err(nom::Err::Failure(_))
+            ),
+            "an unparsed candidate-noun tail must fail closed"
+        );
+    }
+
+    /// Before the superlative adjective/property commits the specialized
+    /// production, ordinary controlled-object conditions still fall through to
+    /// the established control-condition grammar.
+    #[test]
+    fn parse_inner_condition_you_control_superlative_keeps_supported_fallbacks() {
+        let (rest, plain) = parse_inner_condition("you control an artifact").unwrap();
+        assert!(rest.is_empty());
+        assert!(matches!(
+            plain,
+            StaticCondition::IsPresent { filter: Some(_) }
+        ));
+
+        let (rest, qualified) =
+            parse_inner_condition("you control a creature with flying").unwrap();
+        assert!(rest.is_empty());
+        let StaticCondition::IsPresent {
+            filter: Some(TargetFilter::Typed(filter)),
+        } = qualified
+        else {
+            panic!("expected controlled-creature presence gate, got {qualified:?}");
+        };
+        assert_eq!(filter.controller, Some(ControllerRef::You));
+        assert!(filter.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::WithKeyword {
+                value: Keyword::Flying
+            }
+        )));
+    }
+
+    /// CR 109.2: an explicit battlefield candidate remains a permanent, and
+    /// forbidden-noun scanning must not treat a subtype such as Spellshaper as
+    /// the standalone word "spell".
+    #[test]
+    fn parse_inner_condition_you_control_superlative_accepts_explicit_battlefield_candidate() {
+        let (rest, condition) = parse_inner_condition(
+            "you control a spellshaper creature on the battlefield with the greatest power.",
+        )
+        .unwrap();
+        assert!(rest.is_empty());
+        let StaticCondition::IsPresent {
+            filter: Some(TargetFilter::Typed(filter)),
+        } = condition
+        else {
+            panic!("expected controlled permanent superlative, got {condition:?}");
+        };
+        assert_eq!(filter.controller, Some(ControllerRef::You));
+        assert!(filter
+            .type_filters
+            .contains(&TypeFilter::Subtype("Spellshaper".to_string())));
+        assert!(filter.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::InZone {
+                zone: Zone::Battlefield
+            }
+        )));
+    }
+
+    /// CR 603.4 + CR 608.2a: Abzan Beastmaster's resolve-time gate is an existential
     /// controlled-creature check against the table-wide greatest toughness.
     #[test]
     fn parse_inner_condition_you_control_creature_tied_for_greatest_toughness() {
@@ -19904,38 +21435,41 @@ mod tests {
         .unwrap();
         assert!(rest.is_empty(), "must fully consume, leftover: {rest:?}");
         match c {
-            StaticCondition::QuantityComparison {
-                lhs:
-                    QuantityExpr::Ref {
-                        qty:
-                            QuantityRef::ObjectCount {
-                                filter: TargetFilter::Typed(tf),
-                            },
-                    },
-                comparator,
-                rhs: QuantityExpr::Fixed { value: 1 },
+            StaticCondition::IsPresent {
+                filter: Some(TargetFilter::Typed(tf)),
             } => {
-                assert_eq!(comparator, Comparator::GE);
                 assert_eq!(tf.controller, Some(ControllerRef::You));
                 assert_eq!(tf.type_filters, vec![TypeFilter::Creature]);
+                assert!(tf.properties.iter().any(|property| matches!(
+                    property,
+                    FilterProp::InZone {
+                        zone: Zone::Battlefield
+                    }
+                )));
                 let has_table_wide_toughness_max = tf.properties.iter().any(|prop| {
                     let FilterProp::PtComparison {
                         stat: PtStat::Toughness,
                         scope: PtValueScope::Current,
-                        comparator: Comparator::GE,
+                        comparator: Comparator::EQ,
                         value:
                             QuantityExpr::Ref {
-                                qty:
-                                    QuantityRef::Aggregate {
-                                        function: AggregateFunction::Max,
-                                        property: ObjectProperty::Toughness,
-                                        filter: TargetFilter::Typed(population),
-                                    },
+                                qty: QuantityRef::PropertyAggregate(aggregate),
                             },
                     } = prop
                     else {
                         return false;
                     };
+                    let CardTypeSetSource::Objects {
+                        filter: TargetFilter::Typed(population),
+                    } = aggregate.source()
+                    else {
+                        return false;
+                    };
+                    if aggregate.function() != AggregateFunction::Max
+                        || aggregate.property() != ObjectProperty::Toughness
+                    {
+                        return false;
+                    }
                     population.type_filters == vec![TypeFilter::Creature]
                         && population.controller.is_none()
                 });
@@ -19945,7 +21479,7 @@ mod tests {
                     tf.properties
                 );
             }
-            other => panic!("expected controlled creature ObjectCount gate, got {other:?}"),
+            other => panic!("expected controlled creature presence gate, got {other:?}"),
         }
     }
 
@@ -19960,38 +21494,41 @@ mod tests {
         .unwrap();
         assert!(rest.is_empty(), "must fully consume, leftover: {rest:?}");
         match c {
-            StaticCondition::QuantityComparison {
-                lhs:
-                    QuantityExpr::Ref {
-                        qty:
-                            QuantityRef::ObjectCount {
-                                filter: TargetFilter::Typed(tf),
-                            },
-                    },
-                comparator,
-                rhs: QuantityExpr::Fixed { value: 1 },
+            StaticCondition::IsPresent {
+                filter: Some(TargetFilter::Typed(tf)),
             } => {
-                assert_eq!(comparator, Comparator::GE);
                 assert_eq!(tf.controller, Some(ControllerRef::You));
                 assert_eq!(tf.type_filters, vec![TypeFilter::Creature]);
+                assert!(tf.properties.iter().any(|property| matches!(
+                    property,
+                    FilterProp::InZone {
+                        zone: Zone::Battlefield
+                    }
+                )));
                 let has_battlefield_power_max = tf.properties.iter().any(|prop| {
                     let FilterProp::PtComparison {
                         stat: PtStat::Power,
                         scope: PtValueScope::Current,
-                        comparator: Comparator::GE,
+                        comparator: Comparator::EQ,
                         value:
                             QuantityExpr::Ref {
-                                qty:
-                                    QuantityRef::Aggregate {
-                                        function: AggregateFunction::Max,
-                                        property: ObjectProperty::Power,
-                                        filter: TargetFilter::Typed(population),
-                                    },
+                                qty: QuantityRef::PropertyAggregate(aggregate),
                             },
                     } = prop
                     else {
                         return false;
                     };
+                    let CardTypeSetSource::Objects {
+                        filter: TargetFilter::Typed(population),
+                    } = aggregate.source()
+                    else {
+                        return false;
+                    };
+                    if aggregate.function() != AggregateFunction::Max
+                        || aggregate.property() != ObjectProperty::Power
+                    {
+                        return false;
+                    }
                     population.type_filters == vec![TypeFilter::Creature]
                         && population.properties.iter().any(|prop| {
                             matches!(
@@ -20008,8 +21545,26 @@ mod tests {
                     tf.properties
                 );
             }
-            other => panic!("expected controlled creature ObjectCount gate, got {other:?}"),
+            other => panic!("expected controlled creature presence gate, got {other:?}"),
         }
+    }
+
+    /// A superlative condition embedded before an effect clause keeps the
+    /// comma for the trigger/effect composer while still producing the fully
+    /// typed controlled-candidate predicate.
+    #[test]
+    fn parse_inner_condition_you_control_superlative_preserves_comma_boundary() {
+        let (rest, condition) = parse_inner_condition(
+            "you control a creature with the greatest power among creatures on the battlefield, create a token",
+        )
+        .unwrap();
+        assert_eq!(rest, ", create a token");
+        assert!(matches!(
+            condition,
+            StaticCondition::IsPresent {
+                filter: Some(TargetFilter::Typed(_))
+            }
+        ));
     }
 
     /// CR 702: "a creature you control has <keyword>" — subject-first

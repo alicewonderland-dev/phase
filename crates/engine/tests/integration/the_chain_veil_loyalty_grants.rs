@@ -153,6 +153,7 @@ fn make_grant_ability(controller: PlayerId, source: ObjectId) -> ResolvedAbility
         scoped_player: None,
         target_chooser: None,
         source_id: source,
+        cast_occurrence: None,
         source_incarnation: None,
         trigger_source: None,
         trigger_definition_ref: None,

@@ -36,7 +36,8 @@ use crate::types::zones::Zone;
 use super::conditions::ability_condition_to_static_condition;
 use super::lower::{
     append_remember_card_to_standalone_exiled_choice, apply_where_x_ability_expression,
-    apply_where_x_to_latest_def, attach_any_color_mana_rider_to_previous_play_from_exile,
+    apply_where_x_to_latest_def, attach_alt_ability_cost_to_previous_play_from_exile,
+    attach_any_color_mana_rider_to_previous_play_from_exile,
     attach_cast_cost_raise_to_previous_play_from_exile,
     attach_graveyard_redirect_rider_to_prior_cast_from_zone,
     attach_graveyard_redirect_rider_to_prior_free_cast_from_zones,
@@ -57,13 +58,14 @@ use super::lower::{
     parse_controlled_by_different_players_target_constraint,
     parse_same_zone_owner_target_constraint, parse_total_mana_value_target_constraint,
     patch_choose_from_zone_counter_continuation_target, patch_population_head_tap_anaphor,
-    patch_self_ref_head_tap_anaphor, relink_gated_token_referent_consumers,
-    resolve_populated_token_anaphors, resolve_populated_unsuspect_anaphors,
-    resolve_those_tokens_anaphors, rewire_result_anchored_subchain,
-    rewrite_counter_instead_target_from_antecedent, rewrite_else_event_context_to_stable,
-    rewrite_else_parent_target_to_self_ref, rewrite_player_anaphor_targets_in_definition,
-    rewrite_those_tokens_from_antecedent, rewrite_two_target_counter_chain,
-    target_choice_timing_for_clause, thread_chosen_damage_source_into_oneshot_effects,
+    patch_self_ref_head_tap_anaphor, rebind_zone_changed_this_way_pronoun_to_moved_object,
+    relink_gated_token_referent_consumers, resolve_populated_token_anaphors,
+    resolve_populated_unsuspect_anaphors, resolve_those_tokens_anaphors,
+    rewire_result_anchored_subchain, rewrite_counter_instead_target_from_antecedent,
+    rewrite_else_event_context_to_stable, rewrite_else_parent_target_to_self_ref,
+    rewrite_player_anaphor_targets_in_definition, rewrite_those_tokens_from_antecedent,
+    rewrite_two_target_counter_chain, target_choice_timing_for_clause,
+    thread_chosen_damage_source_into_oneshot_effects,
 };
 use super::sequence::{apply_clause_continuation, def_bears_retargetable_copy};
 use super::{
@@ -75,15 +77,17 @@ use super::{
     def_is_damage_dealer, def_is_dig_look, def_is_dig_or_mill, def_is_generic_effect_head,
     def_is_keyword_counter_placement, def_is_perpetual_keyword_grant,
     demote_unbindable_batch_aggregate, draw_object_count_filter, fold_cast_copy_of_card_defs,
-    has_explicit_player_target, inject_chosen_color_choice_grant, mark_uses_tracked_set,
+    has_explicit_player_target, inject_chosen_color_choice_grant,
+    inject_printed_color_choice_filter, mark_uses_tracked_set, nearest_publisher_is_self_move,
     parse_spell_graveyard_replacement_rider,
     parse_spells_cast_this_way_graveyard_replacement_rider,
     publishes_aggregate_set_from_resolution, publishes_exiled_cause_at_resolution,
     publishes_tracked_set_from_resolution, rebind_tracked_aggregate_to_chain_set,
     resolve_difference_anaphor_in_ability, retarget_counter_additional_cost_to_target,
     rewrite_grant_parent_to_filter, rewrite_parent_targets_to_tracked_set, rewrite_rounding_mode,
-    rewrite_that_type_mana_instead, stamp_delayed_returns, try_fold_token_repeat_into_count,
-    wire_optional_cast_decline_fallback,
+    rewrite_singular_battlefield_recall_to_self, rewrite_that_type_mana_instead,
+    singular_battlefield_recall, stamp_delayed_returns, try_fold_token_repeat_into_count,
+    wire_optional_cast_decline_fallback, PrintedColorCarrier, PrintedColorCarrierScope,
 };
 
 /// CR 601.2c: True when the assembled head chose one or more players at
@@ -1756,7 +1760,21 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                 // def; emit no sibling. `modifier` selects which field/aspect.
                 match modifier {
                     PriorModifier::AltCost(cost) => {
-                        attach_alt_cost_to_prior_cast_from_zone(&mut defs, cost.clone());
+                        // CR 118.9 + CR 119.4: Xander's Pact / Nashi fold the
+                        // rider onto a preceding `CastFromZone` (their whole
+                        // grant is spell-only). Inside Information's preceding
+                        // grant is a plain "you may play those cards" —
+                        // `GrantCastingPermission { PlayFromExile }` — which
+                        // also authorizes land plays, so when no `CastFromZone`
+                        // is in scope, fall back to folding the cost onto that
+                        // grant's `alt_ability_cost` instead (land plays stay
+                        // unaffected — the field is spell-cast-only).
+                        if !attach_alt_cost_to_prior_cast_from_zone(&mut defs, cost.clone()) {
+                            attach_alt_ability_cost_to_previous_play_from_exile(
+                                &mut defs,
+                                cost.clone(),
+                            );
+                        }
                     }
                     PriorModifier::ManaRetention(expiry) => {
                         attach_mana_retention_to_prior_mana(&mut defs, *expiry);
@@ -2385,6 +2403,30 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                 ..
             }
         );
+        // CR 608.2g + CR 608.2c: the resolution-scoped BATCH window
+        // (`CastFromZoneDriver::ResolutionWindow` — "you may cast any number
+        // of spells … from among them without paying their mana costs")
+        // becomes a `CastOfferKind::FreeCastWindow` at resolution
+        // (`cast_from_zone::resolve`). That offer's own accept/decline —
+        // including declining every cast — IS the printed "may", so wrapping
+        // it in a generic `OptionalEffectChoice` prompts the controller twice
+        // for one choice. This mirrors the chunk-level reconciliation in
+        // `oracle_effect/mod.rs`; it is repeated here because a subject-phrase
+        // "may" ("… then THEY MAY cast a spell from among those cards" —
+        // Itazura, Lingering Wick) reaches `def.optional` through
+        // `clause_ir.parsed.optional` below, not through the chunk-level flag.
+        // Unlike `is_lingering_cast_from_zone` this needs no `duration`/
+        // `constraint`/`alt_ability_cost` guard: a `ResolutionWindow` driver is
+        // only assigned to the durationless free-cast batch grammar, and its
+        // frozen CR 608.2h per-spell ceiling is carried by the window's own
+        // bounds rather than by an immediate accept/decline branch.
+        let is_resolution_window_cast_from_zone = matches!(
+            &clause_ir.parsed.effect,
+            Effect::CastFromZone {
+                driver: CastFromZoneDriver::ResolutionWindow { .. },
+                ..
+            }
+        );
         // CR 107.1b/c + CR 117.1d: Join Forces' "each player may pay any
         // amount of mana" is NOT an OptionalEffectChoice — the "may" only
         // means each player may pay zero. PayAmountChoice (min=0) handles
@@ -2420,6 +2462,7 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                 Effect::GrantCastingPermission { .. }
             )
             && !is_lingering_cast_from_zone
+            && !is_resolution_window_cast_from_zone
             && !is_join_forces_pay_any_amount_mana_cost
             && !is_pay_to_end_effect_termination
         {
@@ -2433,6 +2476,7 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                 Effect::GrantCastingPermission { .. }
             )
             && !is_lingering_cast_from_zone
+            && !is_resolution_window_cast_from_zone
             && !is_join_forces_pay_any_amount_mana_cost
             && !is_pay_to_end_effect_termination
         {
@@ -2771,12 +2815,33 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                     let cast_anaphor_is_exiled = defs
                         .iter()
                         .any(|d| publishes_exiled_cause_at_resolution(&d.effect));
+                    // CR 608.2c + CR 400.7j: singular self-recall after a
+                    // self-move antecedent binds to the source object; plural
+                    // and mass-publisher recalls keep the chain tracked set.
+                    let singular_self_recall = singular_battlefield_recall(&source_text_lower)
+                        && nearest_publisher_is_self_move(&defs);
                     for current in &mut current_defs {
                         mark_uses_tracked_set(current);
-                        rewrite_parent_targets_to_tracked_set(
-                            &mut current.effect,
-                            cast_anaphor_is_exiled,
-                        );
+                        // Per-def branch: only a battlefield-recall-shaped leg
+                        // enters the carve-out; sibling defs of the same clause
+                        // keep today's tracked-set rewrite.
+                        if singular_self_recall
+                            && matches!(
+                                &*current.effect,
+                                Effect::ChangeZone {
+                                    target: TargetFilter::ParentTarget,
+                                    destination: Zone::Battlefield,
+                                    ..
+                                }
+                            )
+                        {
+                            rewrite_singular_battlefield_recall_to_self(&mut current.effect);
+                        } else {
+                            rewrite_parent_targets_to_tracked_set(
+                                &mut current.effect,
+                                cast_anaphor_is_exiled,
+                            );
+                        }
                     }
                 }
             } else if contains_explicit_tracked_set_pronoun(&source_text_lower) {
@@ -3204,10 +3269,119 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     // (max(N − X, 0)). Must run after where-X binding has populated the
     // prevention node's `amount_dynamic`, which happens during IR lowering above.
     fold_deal_damage_then_prevent_into_computed_amount(&mut result);
+    // CR 105.4 + CR 608.2c: supply a colour choice for a clause that printed its
+    // own ("of the color of your choice") on an object filter. Gated on DECLARED
+    // per-clause provenance, never on a shape scan. Runs BEFORE the keyword-grant
+    // injector so that injector's `Effect::Choose{Color}` recursion guard
+    // (`child_under_color_choice`) sees this wrap and cannot double-prompt.
+    //
+    // The "a clause the parser refused must not raise a prompt for semantics it
+    // did not model" guard lives HERE, on the clause that DECLARED the
+    // provenance, not on the chain head the wrap lands on: a head != carrier
+    // chain (head refused, a LATER clause printed the qualifier) would otherwise
+    // lose its chooser while still stamping `FilterProp::IsChosenColor` — a
+    // fail-closed match-NOTHING filter with no `Effect::Unimplemented` and no
+    // parse warning.
+    //
+    // CR 607.1c + CR 607.2d: EVERY surviving carrier is collected, in printed
+    // order — never just the first. Each printed "of the color of your choice"
+    // is its own choice linked to its own filter (CR 607.2d is the "choose a
+    // [value]" / "the chosen [value]" linkage; CR 607.1c is the half that covers
+    // two such occurrences inside ONE ability, which is the chain shape here),
+    // so a first-wins `find_map` over a chain that printed the qualifier TWICE
+    // would bind both stamped filters to one `ChosenAttribute::Color` and
+    // silently discard the second answer. The arity contract — and the honest
+    // `Effect::unimplemented` refusal the multi-carrier case now produces
+    // instead — is the single authority on
+    // `inject_printed_color_choice_filter`, so this call site deliberately does
+    // NOT pre-filter: the empty and non-colour cases are decided there too,
+    // never twice.
+    //
+    // The fragment is built from the SAME filtered clause set as the choices,
+    // so a refusal's description names exactly the clauses whose printed choices
+    // could not be modelled.
+    //
+    // CENSUS, re-measured 2026-08-29 against the pool whose tracked vintage
+    // sidecar `crates/engine/data/mtgjson-vintage` reads 2026-08-28: the printed
+    // form appears on 4 card faces (Avacyn, Guardian Angel / Prismatic Strands /
+    // Root Greevil / Wash Out) and NO ability line prints it twice — Avacyn's
+    // two occurrences sit in two SEPARATE activated abilities, i.e. two chains
+    // carrying one occurrence each. Nothing rests on that any more; it says only
+    // that the refusal arm is not taken by today's pool. Re-measure rather than
+    // trusting the constant:
+    //
+    //   jq -r '.data | to_entries[] | .value[]
+    //          | select((.text // "") | test("of the color of your choice"))
+    //          | (.faceName // .name)' data/mtgjson/AtomicCards.json | sort -u
+    //
+    // The full census, including why Avacyn's two printed occurrences do not
+    // violate "twice in one chain", is on `inject_printed_color_choice_filter`.
+    // CR 608.2c SCOPE: the wrap can only ever land on the chain HEAD, so the
+    // injector also needs to know whether the head IS the carrier's own node.
+    // That is decided here, where the clause list is still visible, and it is
+    // deliberately NOT derived from the carrier's clause INDEX: an index rule
+    // would assume "index 0 ⇒ the head node is clause 0's node", which the
+    // assembly folds falsify — `collapse_ephemeral_color_choice_mana` OVERWRITES
+    // `def.effect` with its sub-ability's effect, and
+    // `fold_deal_damage_then_prevent_into_computed_amount` splices a node out and
+    // renumbers everything behind it, so a head node whose ORIGIN clause is not
+    // clause 0 is constructible. `SoleClause` needs neither assumption: with
+    // exactly one surviving clause, every node in the assembled tree is that
+    // clause's own subtree, so no fold can move the wrap outside the carrying
+    // clause. The property is one-directional and that is what makes it safe —
+    // a non-sole carrier always REFUSES, and a sole carrier always has
+    // head == carrier.
+    //
+    // The clause count is taken over the SAME filtered set the carriers come
+    // from, so the `Unimplemented` guard's subject and the provenance's subject
+    // stay the same clause: a chain whose head the parser refused and whose only
+    // surviving clause printed the qualifier is a sole-clause carrier, not a
+    // later-clause one (pinned by `V-UNIMPL`).
+    let surviving: Vec<_> = ir
+        .clauses
+        .iter()
+        .filter(|clause| !matches!(clause.parsed.effect, Effect::Unimplemented { .. }))
+        .collect();
+    let sole_surviving_clause = surviving.len() == 1;
+    let printed_color_carriers: Vec<(PrintedColorCarrier, &str)> = surviving
+        .iter()
+        .enumerate()
+        .filter_map(|(index, clause)| {
+            clause.printed_color_choice.clone().map(|choice| {
+                let scope = if sole_surviving_clause {
+                    PrintedColorCarrierScope::SoleClause
+                } else if index == 0 {
+                    PrintedColorCarrierScope::ChainHeadOfMany
+                } else {
+                    PrintedColorCarrierScope::LaterClause
+                };
+                (
+                    PrintedColorCarrier { choice, scope },
+                    clause.source.fragment().unwrap_or_default(),
+                )
+            })
+        })
+        .collect();
+    let carriers: Vec<PrintedColorCarrier> = printed_color_carriers
+        .iter()
+        .map(|(carrier, _)| carrier.clone())
+        .collect();
+    let fragment = printed_color_carriers
+        .iter()
+        .map(|(_, source)| *source)
+        .collect::<Vec<_>>()
+        .join(" ");
+    inject_printed_color_choice_filter(&mut result, &carriers, &fragment);
     // CR 105.4 + CR 702.16: inject a color choice ahead of a "gains
     // protection/hexproof from the color of your choice" grant so the source
     // carries a chosen color for the layer applier to bake in.
-    inject_chosen_color_choice_grant(&mut result, false);
+    //
+    // CR 607.2d: unless a LINKED ability elsewhere on this object already makes
+    // that choice, in which case the grant reads the linked answer and must not
+    // make a second one. That fact is cross-item, so it cannot be seen from
+    // inside one chain — it arrives as `ir.injected_color_choice`, stamped before
+    // lowering from `LinkedChoiceKind::LinkedColorChoice`.
+    inject_chosen_color_choice_grant(&mut result, false, ir.injected_color_choice);
     rewrite_that_type_mana_instead(&mut result);
 
     fold_token_it_has_grants_into_token_statics(&mut result);
@@ -3238,6 +3412,14 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     // attaching object.
     rewire_result_anchored_subchain(&mut result);
     fold_enters_this_way_counter_rider(&mut result);
+    // CR 608.2c + CR 701.9a + CR 701.21a: a discard/sacrifice-this-way gated
+    // sub-ability's bare "it" pronoun parses to the generic `ParentTarget`
+    // fallback, but there is no declared parent target to fall back on
+    // (unlike the battlefield-entry/into-hand "this way" siblings
+    // `fold_enters_this_way_counter_rider` folds above) — rebind it to the
+    // moved object instead, and do so before `oracle_trigger::lower_trigger_ir`
+    // can otherwise blindly lift that same `ParentTarget` to `TriggeringSource`.
+    rebind_zone_changed_this_way_pronoun_to_moved_object(&mut result);
     // CR 603.7a + CR 608.2c + CR 702.170c: fold the exile-instead "If you do,
     // ..." continuation (Feather's return-to-hand, Lilah's become-plotted) onto
     // the exile-resolving carrier's typed `on_exile` rider so the consequence is
@@ -3423,18 +3605,23 @@ fn normalize_linked_exile_cast_pair(
     }
     // CR 608.2c + CR 701.13a: Jodah, the Unifier — the head-aware companion
     // gate. `prev` is `ExileFromTopUntil { NextMatches }`; `chain` is its
-    // optional `CastFromZone { ParentTarget }` with the bottom cleanup already
-    // nested beneath it. Rewrite that cleanup to the linked exile set and make
-    // it the decline branch, preserving the hit in exile when the cast is
-    // declined.
-    if chain.optional {
-        if let Some(cleanup) = chain.sub_ability.as_deref().cloned() {
-            if is_exile_until_cast_bottom_cleanup(&prev.effect, &chain.effect, &cleanup.effect) {
-                if let Some(cleanup_mut) = chain.sub_ability.as_deref_mut() {
-                    normalize_exile_until_cast_bottom_cleanup(&mut cleanup_mut.effect);
+    // `CastFromZone { ParentTarget }` with the bottom cleanup already nested
+    // beneath it. Rewrite that cleanup to the linked exile set, preserving the
+    // hit in exile.
+    if let Some(cleanup) = chain.sub_ability.as_deref().cloned() {
+        if is_exile_until_cast_bottom_cleanup(&prev.effect, &chain.effect, &cleanup.effect) {
+            if let Some(cleanup_mut) = chain.sub_ability.as_deref_mut() {
+                // The "the rest of those exiled cards" rewrite is a property of
+                // the WORDING, so it runs for a standing permission too.
+                normalize_exile_until_cast_bottom_cleanup(&mut cleanup_mut.effect);
+                // CR 608.2d: only a resolution-time offer has a decline branch. A
+                // lingering permission (The Day of the Doctor) is never declined as
+                // the ability resolves, so an else branch there would publish a
+                // second, unreachable copy of the cleanup to the chain scanners.
+                if chain.optional {
                     chain.else_ability = Some(Box::new(cleanup_mut.clone()));
-                    return true;
                 }
+                return true;
             }
         }
     }
@@ -3489,7 +3676,7 @@ mod arena_tests {
     use super::*;
     use crate::parser::oracle_effect::parse_effect_chain_ir;
     use crate::parser::oracle_ir::ast::parsed_clause;
-    use crate::parser::oracle_ir::effect_chain::{ClauseIr, ClauseIrBuilder};
+    use crate::parser::oracle_ir::effect_chain::{ClauseIr, ClauseIrBuilder, InjectedColorChoice};
     use crate::parser::oracle_nom::context::ParseContext;
     use crate::types::ability::{DelayedTriggerCondition, ReplacementDefinition};
     use crate::types::phase::Phase;
@@ -3700,6 +3887,7 @@ mod arena_tests {
             actor: None,
             in_trigger: false,
             repeat_until: None,
+            injected_color_choice: InjectedColorChoice::Permitted,
         }
     }
 

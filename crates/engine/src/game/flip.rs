@@ -435,6 +435,7 @@ mod tests {
         obj.base_color = vec![ManaColor::White];
 
         obj.back_face = Some(BackFaceData {
+            is_swap_snapshot: false,
             name: "Kenzo the Hardhearted".to_string(),
             power: Some(3),
             toughness: Some(4),

@@ -272,6 +272,12 @@ describe("AttachmentFan mode 2 — the permanent's own legal actions", () => {
     expect(dispatchAction).not.toHaveBeenCalled();
   });
 
+  it("identifies fanned cards for contextual errors", () => {
+    seed({ legalActionsByObject: { [String(FREED_ID)]: [FREED_TAP] } });
+
+    expect(fanCard("Freed from the Real")).toHaveAttribute("data-object-id", String(FREED_ID));
+  });
+
   // V2 — a lone benign action auto-dispatches rather than opening a one-option
   // modal. PAIR-ONLY (§7.1): POINTER sweep row `C4 lone benign ability`; its
   // always-side mutant is `alwaysChoose`.
@@ -391,6 +397,22 @@ describe("AttachmentFan mode 2 — the permanent's own legal actions", () => {
     });
     expect(dispatchAction).not.toHaveBeenCalled();
     expect(useUiStore.getState().pendingAbilityChoice).toBeNull();
+  });
+
+  it("leaves the fan open when the centralized interaction dispatcher rejects", async () => {
+    const rejection = new Error("Engine error: invalid attachment choice");
+    vi.mocked(dispatchInteraction).mockRejectedValue(rejection);
+    seed({
+      legalActionsByObject: {},
+      viewerInteraction: projection([FREED_ID], { published: [FREED_ID] }),
+    });
+
+    fireEvent.click(fanCard("Freed from the Real"));
+    await expect(vi.mocked(dispatchInteraction).mock.results[0]?.value).rejects.toBe(rejection);
+    await Promise.resolve();
+
+    expect(useUiStore.getState().attachmentFanHostId).toBe(HOST_ID);
+    expect(document.querySelector("[data-attachment-fan]")).not.toBeNull();
   });
 
   // V9 — MULTI-AUTHORITY HOSTILE FIXTURE. Both sources are live at once: an

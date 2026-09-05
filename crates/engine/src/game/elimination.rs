@@ -2,14 +2,16 @@ use std::collections::HashSet;
 
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    ActiveSearchDecisionAuthority, CollectEvidenceResume, DeferredLifeCostResume, GameState,
-    PendingCast, PendingCostMoveResume, WaitingFor,
+    ActiveSearchDecisionAuthority, CollectEvidenceResume, CostResume, DeferredLifeCostResume,
+    GameState, PayCostKind, PendingCast, PendingCostMoveResume, PendingSacrificeCostCompletion,
+    WaitingFor,
 };
 use crate::types::identifiers::ObjectIncarnationRef;
 use crate::types::match_config::MatchPhase;
 use crate::types::player::PlayerId;
+use crate::types::resolution::OptionalEffectFrame;
 use crate::types::resolved_commands::{
-    ResolvedPlayerLeaveCommand, ResolvedPlayerLeaveReplayInvariantError,
+    ResolvedPlayerLeaveCommand, ResolvedPlayerLeaveReplayInvariantError, RulesExecutionNodeRef,
 };
 use crate::types::zones::Zone;
 
@@ -71,10 +73,11 @@ fn abandon_pending_spell_casts(
             PendingCostMoveResume::Cast {
                 pending: Some(pending),
                 ..
-            }
-            | PendingCostMoveResume::SacrificeForCost { pending, .. } => {
-                is_abandoned_spell(state, departing_player, spell_ids, pending)
-            }
+            } => is_abandoned_spell(state, departing_player, spell_ids, pending),
+            PendingCostMoveResume::SacrificeForCost {
+                pending: Some(pending),
+                ..
+            } => is_abandoned_spell(state, departing_player, spell_ids, pending),
             PendingCostMoveResume::CollectEvidencePayment { resume, .. } => matches!(
                 resume.as_ref(),
                 CollectEvidenceResume::Casting { pending_cast, .. }
@@ -84,6 +87,7 @@ fn abandon_pending_spell_casts(
                 is_abandoned_spell(state, departing_player, spell_ids, pending)
             }
             PendingCostMoveResume::Cast { pending: None, .. }
+            | PendingCostMoveResume::SacrificeForCost { pending: None, .. }
             | PendingCostMoveResume::WardSacrificePayment { .. }
             | PendingCostMoveResume::ReplacementMayCost { .. }
             | PendingCostMoveResume::Foretell { .. }
@@ -108,6 +112,66 @@ fn abandon_pending_spell_casts(
     {
         state.pending_discard_for_cost = None;
     }
+}
+
+/// Preserve the completed prefix of a replacement-paused resolution sacrifice
+/// before abandoning its unresolved current move. The deferred event ledger and
+/// departure records are settled exactly once; the returned frame still owns
+/// the optional branch's resolution context.
+/// CR 800.4f + CR 118.3: a departed payer cannot finish a resolving optional
+/// sacrifice payment. Park the canonical decline until after CR 800.4a has
+/// removed every leaving player and reverted their control effects, so the
+/// living controller's remaining instructions observe the final topology.
+/// Controller departure is instead owned by
+/// `abandon_source_bound_resolution_prompt` below.
+fn stage_resolution_optional_sacrifice_decline_for_departing_payer(
+    state: &mut GameState,
+    leaving_set: &HashSet<PlayerId>,
+    events: &mut [GameEvent],
+) -> Option<OptionalEffectFrame> {
+    let selecting_payer = match &state.waiting_for {
+        WaitingFor::PayCost {
+            player,
+            kind: PayCostKind::Sacrifice,
+            resume: CostResume::Resolution,
+            ..
+        } => Some(*player),
+        _ => None,
+    };
+    let selecting_controller = selecting_payer
+        .and_then(|_| state.active_optional_effect_frame())
+        .map(|frame| frame.ability.controller);
+    let parked = match state.pending_cost_move_resume.as_ref() {
+        Some(PendingCostMoveResume::SacrificeForCost {
+            player,
+            pending: None,
+            completion: PendingSacrificeCostCompletion::ResolutionOptionalPayment { frame, .. },
+            ..
+        }) => Some((*player, frame.ability.controller)),
+        _ => None,
+    };
+    let payer = selecting_payer.or_else(|| parked.map(|(payer, _)| payer));
+    let controller = selecting_controller.or_else(|| parked.map(|(_, controller)| controller));
+    let payer = payer?;
+    if !leaving_set.contains(&payer)
+        || controller.is_some_and(|controller| leaving_set.contains(&controller))
+    {
+        return None;
+    }
+
+    let frame = if selecting_payer.is_some() {
+        state
+            .take_active_optional_effect_frame()
+            .expect("elimination cannot stage a buried optional payment frame")
+            .expect("elimination cannot stage a missing optional payment frame")
+    } else {
+        super::casting_costs::take_and_settle_parked_resolution_optional_sacrifice(state, events)
+            .expect("parked optional sacrifice payment must own its resume cursor")
+    };
+    state.waiting_for = WaitingFor::Priority {
+        player: players::next_player(state, payer),
+    };
+    Some(frame)
 }
 
 /// Eliminate a player from the game per CR 800.4.
@@ -138,6 +202,12 @@ pub fn eliminate_players_simultaneously(
 ) {
     let mut eliminated_any = false;
     let mut leaving_set = HashSet::new();
+    // CR 733: the CR 800.4a stack step is batch-scoped over the whole
+    // `leaving_set` (below), so each player's own leave node is collected here
+    // — in elimination order, never via the `HashSet` — for
+    // `remove_stack_objects_controlled_by_leaving_players` to re-install around
+    // that player's own sweep.
+    let mut leave_nodes: Vec<(PlayerId, RulesExecutionNodeRef)> = Vec::new();
 
     for &player in players_to_eliminate {
         if !players::is_alive(state, player) {
@@ -152,6 +222,25 @@ pub fn eliminate_players_simultaneously(
             }
         }
     }
+
+    // CR 800.4a: elimination can remove frozen stack entries and a session's
+    // canonical representative. Restore the pre-overlay preferences before
+    // `do_eliminate` removes the departing player's own state, so teardown
+    // cannot later resurrect an eliminated seat's auto-pass preference.
+    if !leaving_set.is_empty() {
+        // CR 117.4 + CR 800.4a: an unmaterialized Resolve All run captures an
+        // exact auto-pass baseline. Restore it while every departing seat's
+        // preference is still present; the established elimination cleanup then
+        // removes only the entries that belong to players leaving the game.
+        super::turn_control::invalidate_resolve_all_consent_for_topology_change(state);
+        super::engine::take_and_restore_stack_resolution_session(state);
+    }
+    let staged_optional_sacrifice_decline =
+        stage_resolution_optional_sacrifice_decline_for_departing_payer(
+            state,
+            &leaving_set,
+            events,
+        );
 
     let interrupted_ordinary_search = state
         .pending_scoped_library_search
@@ -194,13 +283,16 @@ pub fn eliminate_players_simultaneously(
             continue;
         }
 
-        do_eliminate(state, player, &leaving_set, events);
+        leave_nodes.push((player, do_eliminate(state, player, &leaving_set, events)));
         eliminated_any = true;
 
         if super::topology::has_two_headed_giant_shared_resources(state) {
             for teammate in players::teammates(state, player) {
                 if players::is_alive(state, teammate) {
-                    do_eliminate(state, teammate, &leaving_set, events);
+                    leave_nodes.push((
+                        teammate,
+                        do_eliminate(state, teammate, &leaving_set, events),
+                    ));
                 }
             }
         }
@@ -215,6 +307,86 @@ pub fn eliminate_players_simultaneously(
     // the full `leaving_set` — the retain+sweep scope is what makes a co-leaver's
     // steal of a survivor's object revert instead of being over-exiled.
     end_control_effects_for_leaving_players(state, &leaving_set, events);
+
+    // CR 800.4a, third and fourth steps, in the rule's own order: "Then, if that
+    // player controlled any objects on the stack not represented by cards, those
+    // objects cease to exist. Then, if there are any objects still controlled by
+    // that player, those objects are exiled." Both run AFTER the first two steps
+    // — the owned-object exiles inside `do_eliminate` and the control-effect end
+    // directly above — which is why this cannot live in `do_eliminate`.
+    remove_stack_objects_controlled_by_leaving_players(state, &leave_nodes, events);
+
+    // CR 800.4a + CR 101.4: A player that leaves during an APNAP unless poll
+    // neither answers nor remains an eligible future chooser. Preserve the
+    // aggregate for the surviving seats, advancing past a departed current
+    // prompt instead of leaving a serialized choice owned by a non-player.
+    if let Some(mut pending) = state.pending_player_scope_unless_payment.take() {
+        let original_controller = pending
+            .pending_effect
+            .original_controller
+            .unwrap_or(pending.pending_effect.controller);
+        if leaving_set.contains(&original_controller) {
+            // CR 800.4a: The resolving instruction leaves with its original
+            // controller. A previously-recorded decline cannot create tokens
+            // for a player no longer in the game, and its per-payer prompt
+            // must not outlive the abandoned aggregate.
+            let aggregate_prompt_is_live = match &state.waiting_for {
+                WaitingFor::UnlessPayment { pending_effect, .. }
+                | WaitingFor::WardSacrificeChoice { pending_effect, .. } => {
+                    pending_effect.source_id == pending.pending_effect.source_id
+                }
+                WaitingFor::ReplacementChoice { .. } => state
+                    .pending_replacement
+                    .as_ref()
+                    .and_then(|replacement| replacement.sacrifice_provenance.as_ref())
+                    .is_some_and(|provenance| provenance.player_id == pending.current_player),
+                _ => false,
+            };
+            if aggregate_prompt_is_live {
+                // The only parked replacement at this point belongs to the
+                // aggregate's current payer. Once its controller leaves, the
+                // aggregate cannot resume through that payer's choice.
+                state.pending_replacement = None;
+                state.replacement_may_cost_paused = false;
+                super::replacement::abandon_post_replacement_continuation(state);
+                state.waiting_for = WaitingFor::Priority {
+                    player: players::next_player(state, original_controller),
+                };
+            }
+        } else {
+            pending
+                .remaining_players
+                .retain(|player| !leaving_set.contains(player));
+            if leaving_set.contains(&pending.current_player) {
+                if let Some((next, rest)) = pending.remaining_players.split_first() {
+                    pending.current_player = *next;
+                    pending.remaining_players = rest.to_vec();
+                    state.waiting_for = WaitingFor::UnlessPayment {
+                        player: pending.current_player,
+                        cost: pending.cost.clone(),
+                        pending_effect: pending.pending_effect.clone(),
+                        trigger_event: None,
+                        effect_description: None,
+                        remaining: Vec::new(),
+                    };
+                    state.pending_player_scope_unless_payment = Some(pending);
+                } else {
+                    // The departed prompt contributes no new decline, but earlier
+                    // surviving decliners still owe the source controller one
+                    // aggregate token batch. Reinstall then settle through the
+                    // regular terminal-payment authority so `waiting_for` cannot
+                    // retain this eliminated player's stale prompt.
+                    state.pending_player_scope_unless_payment = Some(pending);
+                    crate::game::engine_payment_choices::settle_eliminated_player_scope_token_unless_payment(
+                        state, events,
+                    )
+                    .expect("eliminated final payer must settle a token-unless aggregate");
+                }
+            } else {
+                state.pending_player_scope_unless_payment = Some(pending);
+            }
+        }
+    }
 
     // CR 704.3 + CR 104.4a: a SINGLE game-over check after all simultaneous
     // eliminations — so a finish where every remaining player lost at once
@@ -234,6 +406,9 @@ pub fn eliminate_players_simultaneously(
     prune_deferred_triggers_for_eliminated_players(state);
 
     if let Some(winner) = game_over_winner {
+        if staged_optional_sacrifice_decline.is_some() {
+            finish_abandoned_source_bound_resolution_carrier(state);
+        }
         // Terminal: drop trigger scaffolding the client would otherwise show as
         // a stuck stack / ordering prompt.
         let mut terminal_firings = state
@@ -268,6 +443,12 @@ pub fn eliminate_players_simultaneously(
         }
         state.waiting_for = WaitingFor::GameOver { winner };
     } else {
+        if let Some(frame) = staged_optional_sacrifice_decline {
+            state.push_optional_effect_frame(frame);
+            super::engine_payment_choices::handle_optional_effect_choice(state, false, events)
+                .expect("departed optional sacrifice payer must follow the canonical decline path");
+        }
+
         // CR 603.3b: If prune collapsed an ordering pass into
         // `deferred_triggers` while `waiting_for` is Priority, dispatch now so
         // combat auto-advance does not skip them (issue #1350).
@@ -345,8 +526,8 @@ pub fn eliminate_players_simultaneously(
         // CR 800.4a: A live trigger-construction batch can carry a priority
         // recipient who is not the prompt's controller, so neither cursor-
         // clearing site above fires when that recipient alone leaves. Priority
-        // passes to the next player in turn order who is still in the game
-        // (`docs/MagicCompRules.txt:6424`), so the carried recipient is
+        // passes to the next player in turn order who is still in the game,
+        // so the carried recipient is
         // re-pointed rather than stranded — the same authority and remedy the
         // `waiting_for` re-point directly above uses for a dead acting player.
         if let Some(recipient) = state.pending_trigger_construction_priority_recipient {
@@ -735,13 +916,140 @@ fn abandon_pending_zone_change_member_for_player_left(
     }
 }
 
+/// CR 800.4a (third and fourth steps): remove every stack object a leaving
+/// player still controls, once the first two steps have settled.
+///
+/// ORDER IS THE WHOLE POINT. CR 800.4a is written as four sequential steps and
+/// the engine now maps 1:1 onto them:
+///   1. objects OWNED by a leaver leave the game  →
+///      `exile_owned_objects_on_player_left_game`, inside `do_eliminate`.
+///   2. effects giving a leaver control of anything END  →
+///      `end_control_effects_for_leaving_players`, immediately above this call.
+///   3. objects on the stack NOT represented by cards, controlled by a leaver,
+///      cease to exist  →  the ability entries this loop removes.
+///   4. anything STILL controlled by a leaver is exiled  →  the card-backed
+///      entries this loop removes and then routes to Exile.
+///
+/// Because steps 1 and 2 have already run, `stack::stack_object_controller` IS
+/// the rule's "still controlled by that player" answer, and it is correct in
+/// BOTH directions — which `entry.controller` was not:
+///   * the leaver is the THIEF: their control effect ended in step 2, the
+///     object reverted to its by-default controller, the predicate is false,
+///     and the spell stays on the stack (CR 800.4a says revert, not remove).
+///   * the leaver is the CASTER of a card a SURVIVOR owns, and another survivor
+///     stole it: the surviving thief's control effect did NOT end, so the
+///     predicate is false and the spell keeps resolving for the thief. Keying
+///     on `entry.controller` removed it — MEASURED.
+///
+/// For an ability entry (no `state.objects` row) `stack_object_controller`
+/// degrades to `entry.controller` (CR 113.8), so one predicate serves both
+/// steps.
+///
+/// CR 733: each removal is journaled under the departing player's OWN leave
+/// node, re-installed here around that player's sweep, so relocating the sweep
+/// out of `do_eliminate` does not re-attribute the removals to whatever rules
+/// work happens to be live. Iterated in elimination order over `leave_nodes`
+/// (never over the `HashSet`) so the journal is replay-deterministic.
+fn remove_stack_objects_controlled_by_leaving_players(
+    state: &mut GameState,
+    leave_nodes: &[(PlayerId, RulesExecutionNodeRef)],
+    events: &mut Vec<GameEvent>,
+) {
+    for (player, leave_node) in leave_nodes.iter().copied() {
+        let enclosing_node = state.active_rules_execution_node.replace(leave_node);
+
+        // Removed by position through the shared stack-removal authority rather
+        // than by `retain`: a `retain` would drop several entries in one
+        // unjournalable mutation, while removing by position records each entry
+        // with the index it occupied at the moment IT was removed, so a replay
+        // reproduces both the count and the surviving entries' relative order.
+        let mut abandoned_spell_ids = Vec::new();
+        while let Some(idx) = state
+            .stack
+            .iter()
+            .position(|entry| super::stack::stack_object_controller(state, entry) == player)
+        {
+            let removed = super::stack::remove_nonresolving_stack_entry_at(
+                state,
+                idx,
+                super::lifecycle::DelayedTerminalDisposition::Eliminated,
+            )
+            .expect("position yielded a live stack index");
+            if matches!(
+                removed.entry.kind,
+                crate::types::game_state::StackEntryKind::Spell { .. }
+            ) {
+                abandoned_spell_ids.push(removed.entry.id);
+            }
+        }
+        abandon_pending_spell_casts(state, player, &abandoned_spell_ids);
+
+        // CR 800.4a fourth step: a CARD-represented stack object is EXILED, not
+        // merely un-stacked. A leaver-OWNED spell already left in step 1 (which
+        // removed its entry through `remove_from_zone`'s Stack arm), so what
+        // reaches here is the survivor-owned card the leaver was still
+        // controlling. Routed through the same player-left-game authority step 1
+        // uses, so the pending-zone-change retirement and the exempt
+        // `PlayerLeftGame` cause are identical on both legs.
+        for id in abandoned_spell_ids {
+            if state
+                .objects
+                .get(&id)
+                .is_some_and(|obj| obj.zone == Zone::Stack)
+            {
+                move_object_for_player_left_game(state, id, player, events);
+            }
+        }
+
+        state.active_rules_execution_node = enclosing_node;
+    }
+
+    // CR 800.4a: A paused triggered ability on the stack is "an object on the
+    // stack not represented by a card" and ceases to exist when its controller
+    // leaves the game. The sweep in `remove_stack_objects_controlled_by_leaving_players`
+    // drops that entry, but a trigger paused mid-target-selection (e.g.
+    // Lathiel's end-step trigger awaiting `WaitingFor::DistributeAmong`) also
+    // leaves a live cursor in `state.pending_trigger` / `pending_trigger_entry`
+    // pointing at that now-gone entry. Left dangling, the next surviving
+    // player's action drives `begin_pending_trigger_target_selection` (which
+    // gates on `pending_trigger`) back into target selection for a dead entry
+    // id, panicking in `mutate_pending_trigger_entry`. Clear the cursor only
+    // when the entry it tracks is no longer on the stack, mirroring the early
+    // `abandon_pending_spell_casts` teardown above.
+    if state
+        .pending_trigger_entry
+        .is_some_and(|entry_id| !state.stack.iter().any(|entry| entry.id == entry_id))
+    {
+        if let Some(firing) = state.pending_trigger_firing.take() {
+            crate::game::lifecycle::record_delayed_terminal(
+                firing,
+                crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
+            );
+        }
+        state.pending_trigger_entry = None;
+        state.pending_trigger = None;
+        state.pending_trigger_event_batch.clear();
+        // CR 117.3c: The batch this recipient was scheduled for has ceased with
+        // its tracked entry. Clear it with the cursors — unconditionally, not
+        // only when the departing player happens to be the recipient — so the
+        // next construction cannot consume a stale carrier and mis-route its
+        // terminal priority.
+        state.pending_trigger_construction_priority_recipient = None;
+    }
+}
+
 /// Perform the actual elimination of a single player (CR 800.4).
+///
+/// Returns the CR 733 leave node opened for this player's departure, so the
+/// batch-scoped CR 800.4a stack step
+/// (`remove_stack_objects_controlled_by_leaving_players`) can re-install it
+/// around that same player's later, relocated sweep.
 fn do_eliminate(
     state: &mut GameState,
     player: PlayerId,
     leaving_set: &HashSet<PlayerId>,
     events: &mut Vec<GameEvent>,
-) {
+) -> RulesExecutionNodeRef {
     let planar_handoff =
         crate::game::planechase::prepare_player_left_game_handoff(state, player, leaving_set);
 
@@ -767,38 +1075,11 @@ fn do_eliminate(
     // cast-abandonment teardown can replace its prompt with priority.
     let leaving_is_latched_chooser = state.waiting_for.acting_player() == Some(player);
 
-    abandon_source_bound_resolution_prompt(state, player);
+    abandon_source_bound_resolution_prompt(state, player, events);
     retire_pending_zone_change_contexts_owned_by(state, player);
     abandon_change_zone_family_for_controller(state, player);
 
     crate::game::planechase::preserve_phenomenon_stack_abilities_for_handoff(state, planar_handoff);
-
-    // CR 800.4a: Remove spells they control from the stack, one at a time
-    // through the shared stack-removal authority — the same shape as the
-    // scheduled-control release below. A `retain` would drop several entries in
-    // one unjournalable mutation; removing by position instead records each
-    // entry with the index it occupied at the moment IT was removed, so a replay
-    // reproduces both the count and the surviving entries' relative order.
-    let mut abandoned_spell_ids = Vec::new();
-    while let Some(idx) = state
-        .stack
-        .iter()
-        .position(|entry| entry.controller == player)
-    {
-        let removed = super::stack::remove_nonresolving_stack_entry_at(
-            state,
-            idx,
-            super::lifecycle::DelayedTerminalDisposition::Eliminated,
-        )
-        .expect("position yielded a live stack index");
-        if matches!(
-            removed.entry.kind,
-            crate::types::game_state::StackEntryKind::Spell { .. }
-        ) {
-            abandoned_spell_ids.push(removed.entry.id);
-        }
-    }
-    abandon_pending_spell_casts(state, player, &abandoned_spell_ids);
 
     // CR 800.4a + CR 800.4b: A control-another-player effect (CR 723, e.g.
     // Mindslaver / Secret of Bloodbending) ends when EITHER party leaves the
@@ -826,11 +1107,6 @@ fn do_eliminate(
         state.active_combat_phase_control = None;
         super::turn_control::recompute_active_player_control(state);
     }
-
-    // A consent run freezes canonical representatives and submitters. Player
-    // elimination changes that topology, so discard the run rather than
-    // allowing a stale prompt or Ready state to authorize anyone.
-    super::turn_control::invalidate_resolve_all_consent(state);
 
     // CR 800.4a + CR 800.4b: a departing searcher/zone owner invalidates its
     // live session, while a departing latched controller ends only that
@@ -961,39 +1237,6 @@ fn do_eliminate(
         grants.retain(|(_, grant)| grant.grantee != player && grant.controller != player);
     }
 
-    // CR 800.4a: A paused triggered ability on the stack is "an object on the
-    // stack not represented by a card" and ceases to exist when its controller
-    // leaves the game. The stack retain above drops that entry, but a trigger
-    // paused mid-target-selection (e.g. Lathiel's end-step trigger awaiting
-    // `WaitingFor::DistributeAmong`) also leaves a live cursor in
-    // `state.pending_trigger` / `pending_trigger_entry` pointing at that now-gone
-    // entry. Left dangling, the next surviving player's action drives
-    // `begin_pending_trigger_target_selection` (which gates on `pending_trigger`)
-    // back into target selection for a dead entry id, panicking in
-    // `mutate_pending_trigger_entry`. Clear the cursor only when the entry it
-    // tracks is no longer on the stack, mirroring the early
-    // `abandon_pending_spell_casts` teardown above.
-    if state
-        .pending_trigger_entry
-        .is_some_and(|entry_id| !state.stack.iter().any(|entry| entry.id == entry_id))
-    {
-        if let Some(firing) = state.pending_trigger_firing.take() {
-            crate::game::lifecycle::record_delayed_terminal(
-                firing,
-                crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
-            );
-        }
-        state.pending_trigger_entry = None;
-        state.pending_trigger = None;
-        state.pending_trigger_event_batch.clear();
-        // CR 117.3c: The batch this recipient was scheduled for has ceased with
-        // its tracked entry. Clear it with the cursors — unconditionally, not
-        // only when the departing player happens to be the recipient — so the
-        // next construction cannot consume a stale carrier and mis-route its
-        // terminal priority.
-        state.pending_trigger_construction_priority_recipient = None;
-    }
-
     // CR 800.4a + CR 616.1 + CR 704.4: Abandon a parked replacement choice this
     // leaving player was answering. A CR 616.1 replacement-order (or optional
     // MayCost / MayCost sub-choice re-park) is held in `state.pending_replacement`
@@ -1092,9 +1335,33 @@ fn do_eliminate(
     // guard — cleared only for the LEAVING player's own resolution (mirroring the
     // cast-abandonment controller key above) so a living player's paused resolution
     // survives an opponent's departure.
+    //
+    // KEYED ON `cast_controller`, NOT `controller`. `PendingSpellResolution.
+    // controller` became the LIVE controller when a spell's controller became a
+    // derived value (CR 608.2c re-stamp in `stack::resolve_top`), so for a spell
+    // stolen mid-resolution — Perplexing Chimera pausing on an as-enters choice —
+    // it names the thief, not the caster. This frame is torn down for the
+    // player whose CAST it is, because that is the frame's owner — a question
+    // that does not change when a mid-resolution steal changes who controls the
+    // eventual permanent. The relocated CR 800.4a stack sweep
+    // (`remove_stack_objects_controlled_by_leaving_players`) answers a
+    // different question (who controls the object NOW) at a different time
+    // (after control effects end), so the two are deliberately no longer
+    // mirrors of each other.
+    //
+    // Honest note: a Gonti-class spell (owner != caster) paused mid-resolution
+    // and then stolen by a survivor still has this frame torn down on the
+    // CASTER's departure, even though the survivor now controls the eventual
+    // permanent. This is an UNTOUCHED PRE-EXISTING behavior, not a gap this
+    // change introduces — closing it would require answering the same
+    // live-vs-owner disposition question for `resolving_stack_entry` that U1/U2
+    // answer for the stack and zone-exit seams, which sits outside this
+    // change's scope.
+    // `cast_controller` is `Some` at every production construction; the
+    // `unwrap_or` preserves the prior reading for hand-built fixtures.
     if state
         .active_spell_resolution()
-        .is_some_and(|psr| psr.controller == player)
+        .is_some_and(|psr| psr.cast_controller.unwrap_or(psr.controller) == player)
     {
         let _ = state.take_active_spell_resolution();
     }
@@ -1217,6 +1484,7 @@ fn do_eliminate(
     // The leave node covers this sweep only. Restoring the enclosing scope keeps
     // a later, unrelated command from being attributed to the departure.
     state.active_rules_execution_node = enclosing_node;
+    leave_node
 }
 
 /// CR 800.4 + CR 104.3a: Installs one already-resolved player departure verbatim.
@@ -1270,59 +1538,86 @@ fn retire_pending_zone_change_contexts_owned_by(state: &mut GameState, player: P
 /// CR 800.4a: A response prompt owned by a player who left cannot retain a
 /// resolution context for a later same-ID object. The prompt, its deferred
 /// continuation, and the resolution-scoped re-latch form one atomic family.
-fn abandon_source_bound_resolution_prompt(state: &mut GameState, player: PlayerId) {
-    let abandon = match &state.waiting_for {
-        WaitingFor::NamedChoice {
-            free_entry: None,
-            player: chooser,
-            source,
-            persist_player,
+fn abandon_source_bound_resolution_prompt(
+    state: &mut GameState,
+    player: PlayerId,
+    events: &mut [GameEvent],
+) {
+    let selecting_resolution_sacrifice = matches!(
+        &state.waiting_for,
+        WaitingFor::PayCost {
+            kind: PayCostKind::Sacrifice,
+            resume: CostResume::Resolution,
             ..
-        } => {
-            *chooser == player
-                || *persist_player == Some(player)
-                || source
-                    .as_ref()
-                    .is_some_and(|source| source.prompt.controller == player)
         }
-        WaitingFor::OpponentGuess {
-            player: guesser,
-            source,
-            owner,
+    ) && state
+        .active_optional_effect_frame()
+        .is_some_and(|frame| frame.ability.controller == player);
+    let parked_resolution_sacrifice = matches!(
+        state.pending_cost_move_resume.as_ref(),
+        Some(PendingCostMoveResume::SacrificeForCost {
+            pending: None,
+            completion: PendingSacrificeCostCompletion::ResolutionOptionalPayment { frame, .. },
             ..
-        } => {
-            *guesser == player
-                || source.prompt.controller == player
-                || owner
-                    .as_ref()
-                    .is_some_and(|owner| owner.context.lki.controller == player)
-        }
-        _ => false,
-    };
+        }) if frame.ability.controller == player
+    );
+    let abandon = selecting_resolution_sacrifice
+        || parked_resolution_sacrifice
+        || match &state.waiting_for {
+            WaitingFor::NamedChoice {
+                free_entry: None,
+                player: chooser,
+                source,
+                persist_player,
+                ..
+            } => {
+                *chooser == player
+                    || *persist_player == Some(player)
+                    || source
+                        .as_ref()
+                        .is_some_and(|source| source.prompt.controller == player)
+            }
+            WaitingFor::OpponentGuess {
+                player: guesser,
+                source,
+                owner,
+                ..
+            } => {
+                *guesser == player
+                    || source.prompt.controller == player
+                    || owner
+                        .as_ref()
+                        .is_some_and(|owner| owner.context.lki.controller == player)
+            }
+            _ => false,
+        };
     if !abandon {
         return;
     }
 
-    let _ = state
-        .clear_active_ability_continuation()
-        .expect("elimination cannot clear a buried ability continuation");
-    crate::game::stack::finish_resolving_stack_entry(
-        state,
-        crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
-    );
-    state.resolution_source_relatch = None;
-    state.deferred_entry_events.clear();
-    // The prompt and its ability continuation are abandoned, so no realization point will ever be
-    // reached for a token battlefield entry parked by this resolution. Leaving the `Option` live
-    // would let a later token's park trip the fail-loud overwrite assert, and would let the
-    // action-boundary convergence write a CR 400.7 row and run a CR 603.6a trigger pass for a
-    // resolution that no longer exists. If the token itself survives the abandonment its entry row
-    // is lost — the same loss the `deferred_entry_events.clear()` above already accepts for that
-    // entry's trigger replay.
-    state.pending_token_battlefield_entry = None;
+    if selecting_resolution_sacrifice {
+        let _ = state
+            .take_active_optional_effect_frame()
+            .expect("elimination cannot consume a buried optional payment frame");
+    }
+    if parked_resolution_sacrifice {
+        let _ = super::casting_costs::take_and_settle_parked_resolution_optional_sacrifice(
+            state, events,
+        )
+        .expect("parked optional sacrifice payment must own its resume cursor");
+    }
+
+    finish_abandoned_source_bound_resolution_carrier(state);
     state.waiting_for = WaitingFor::Priority {
         player: players::next_player(state, player),
     };
+}
+
+fn finish_abandoned_source_bound_resolution_carrier(state: &mut GameState) {
+    crate::game::stack::abandon_active_resolution_carrier(
+        state,
+        crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
+    );
 }
 
 /// CR 800.4a: A paused ChangeZone iteration is a single resolving family's
@@ -1344,18 +1639,10 @@ fn abandon_change_zone_family_for_controller(state: &mut GameState, player: Play
     let _ = state
         .take_active_change_zone_frame()
         .expect("elimination cannot consume a buried ChangeZone frame");
-    let _ = state
-        .clear_active_ability_continuation()
-        .expect("elimination cannot clear a buried ability continuation");
-    crate::game::stack::finish_resolving_stack_entry(
+    crate::game::stack::abandon_active_resolution_carrier(
         state,
         crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
     );
-    state.resolution_source_relatch = None;
-    state.deferred_entry_events.clear();
-    // Same reasoning as `abandon_source_bound_resolution_prompt`: the owning resolution is gone,
-    // so a parked token battlefield entry has no realization point left.
-    state.pending_token_battlefield_entry = None;
     state.waiting_for = WaitingFor::Priority {
         player: players::next_player(state, player),
     };
@@ -1447,7 +1734,10 @@ mod tests {
         PendingReplacement, PendingSpellResolution, PendingZoneChangeDelivery, PromptSourceBinding,
         ResolutionSourceRelatch, StackEntry, StackEntryKind,
     };
-    use crate::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef};
+    use crate::types::identifiers::{
+        CardId, DelayedTriggerInstanceId, DelayedTriggerOrigin, DelayedTriggerToken, ObjectId,
+        ObjectIncarnationRef, TriggerFiring,
+    };
     use crate::types::mana::ManaCost;
     use crate::types::proposed_event::{CounterPlacement, ProposedEvent};
     use crate::types::replacements::ReplacementEvent;
@@ -1500,6 +1790,60 @@ mod tests {
             )),
             state,
         )
+    }
+
+    fn install_receipt_eligible_resolution_sacrifice(
+        state: &mut GameState,
+        source_id: ObjectId,
+        controller: PlayerId,
+        payer: PlayerId,
+        origin: DelayedTriggerOrigin,
+    ) {
+        let ability = ResolvedAbility::new(Effect::NoOp, Vec::new(), source_id, controller);
+        crate::game::stack::begin_resolving_stack_entry(
+            state,
+            StackEntry {
+                id: ObjectId(90_000),
+                source_id,
+                controller,
+                kind: StackEntryKind::TriggeredAbility {
+                    source_id,
+                    ability: Box::new(ability.clone()),
+                    condition: None,
+                    trigger_event: None,
+                    description: Some("receipt-eligible optional sacrifice".to_string()),
+                    source_name: "Receipt source".to_string(),
+                    subject_match_count: None,
+                    die_result: None,
+                    provenance: None,
+                },
+            },
+            Some(TriggerFiring::ReceiptEligible(origin)),
+        );
+        let continuation = PendingContinuation::new(
+            Box::new(ResolvedAbility::new(
+                Effect::NoOp,
+                Vec::new(),
+                source_id,
+                controller,
+            )),
+            state,
+        );
+        state.park_ability_continuation(continuation);
+        state.push_optional_effect_frame(OptionalEffectFrame {
+            ability: Box::new(ability),
+            trigger_event: None,
+            trigger_events: Vec::new(),
+            trigger_match_count: None,
+        });
+        state.waiting_for = WaitingFor::PayCost {
+            player: payer,
+            kind: PayCostKind::Sacrifice,
+            choices: Vec::new(),
+            count: 1,
+            min_count: 0,
+            resume: CostResume::Resolution,
+        };
     }
 
     fn pending_search_found_batch(
@@ -1804,6 +2148,8 @@ mod tests {
             player: PlayerId(0),
             candidate_count: 1,
             candidates: Vec::new(),
+            kind: Default::default(),
+            last_applied_decides: false,
         };
         state.push_batch_delivery(crate::types::game_state::PendingBatchDeliveries {
             logical_zone_change_group: group,
@@ -1869,6 +2215,8 @@ mod tests {
             player: PlayerId(0),
             candidate_count: 1,
             candidates: Vec::new(),
+            kind: Default::default(),
+            last_applied_decides: false,
         };
         state.push_change_zone_iteration(pending_change_zone_iteration(
             group,
@@ -1942,6 +2290,86 @@ mod tests {
                 player: PlayerId(2)
             }
         ));
+    }
+
+    #[test]
+    fn controller_exit_terminalizes_receipt_eligible_resolution_as_eliminated() {
+        let mut state = setup_three_player();
+        let source = create_object(
+            &mut state,
+            CardId(702),
+            PlayerId(0),
+            "Receipt source".to_string(),
+            Zone::Battlefield,
+        );
+        let origin = DelayedTriggerOrigin {
+            token: DelayedTriggerToken(702),
+            instance: DelayedTriggerInstanceId(702),
+            source_id: source,
+        };
+        install_receipt_eligible_resolution_sacrifice(
+            &mut state,
+            source,
+            PlayerId(0),
+            PlayerId(1),
+            origin,
+        );
+
+        let lifecycle = crate::game::lifecycle::enter_action_frame();
+        eliminate_player(&mut state, PlayerId(0), &mut Vec::new());
+        let facts = lifecycle
+            .take_outer_facts()
+            .expect("outer elimination owns lifecycle facts");
+
+        assert_eq!(
+            facts.receipt_terminal_disposition(origin),
+            Some(crate::game::lifecycle::DelayedTerminalDisposition::Eliminated)
+        );
+        assert!(state.resolving_stack_entry.is_none());
+        assert!(state.resolving_trigger_firing.is_none());
+    }
+
+    #[test]
+    fn terminal_payer_exit_terminalizes_staged_receipt_as_eliminated() {
+        let mut state = setup_two_player();
+        let source = create_object(
+            &mut state,
+            CardId(703),
+            PlayerId(0),
+            "Receipt source".to_string(),
+            Zone::Battlefield,
+        );
+        let origin = DelayedTriggerOrigin {
+            token: DelayedTriggerToken(703),
+            instance: DelayedTriggerInstanceId(703),
+            source_id: source,
+        };
+        install_receipt_eligible_resolution_sacrifice(
+            &mut state,
+            source,
+            PlayerId(0),
+            PlayerId(1),
+            origin,
+        );
+
+        let lifecycle = crate::game::lifecycle::enter_action_frame();
+        eliminate_player(&mut state, PlayerId(1), &mut Vec::new());
+        let facts = lifecycle
+            .take_outer_facts()
+            .expect("outer elimination owns lifecycle facts");
+
+        assert_eq!(
+            facts.receipt_terminal_disposition(origin),
+            Some(crate::game::lifecycle::DelayedTerminalDisposition::Eliminated)
+        );
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::GameOver {
+                winner: Some(PlayerId(0))
+            }
+        ));
+        assert!(state.resolving_stack_entry.is_none());
+        assert!(state.resolving_trigger_firing.is_none());
     }
 
     #[test]
@@ -2685,6 +3113,8 @@ mod tests {
             player: PlayerId(2),
             candidate_count: 1,
             candidates: vec![],
+            kind: Default::default(),
+            last_applied_decides: false,
         };
         // Coupled continuation slots the resume drain would clear on a normal answer.
         state.replacement_may_cost_paused = true;
@@ -2822,6 +3252,8 @@ mod tests {
             player: PlayerId(0),
             candidate_count: 1,
             candidates: Vec::new(),
+            kind: Default::default(),
+            last_applied_decides: false,
         };
         state.push_connive_reentry(PendingConniveReentry {
             conniver: state
@@ -2873,6 +3305,8 @@ mod tests {
             player: PlayerId(0),
             candidate_count: 1,
             candidates: Vec::new(),
+            kind: Default::default(),
+            last_applied_decides: false,
         };
         state.push_batch_delivery(pending_search_found_zone_delivery(found));
         assert!(state.active_batch_delivery().is_some());
@@ -2915,6 +3349,8 @@ mod tests {
             player: PlayerId(0),
             candidate_count: 1,
             candidates: vec![],
+            kind: Default::default(),
+            last_applied_decides: false,
         };
         let parked_found = ObjectId(77);
         state.pending_search_found_batch =
@@ -2987,6 +3423,8 @@ mod tests {
             player: PlayerId(0),
             candidate_count: 1,
             candidates: Vec::new(),
+            kind: Default::default(),
+            last_applied_decides: false,
         };
         let source = create_object(
             &mut state,
@@ -3085,6 +3523,64 @@ mod tests {
         assert!(
             state.active_spell_resolution().is_none(),
             "the leaving controller's active spell frame must be torn down"
+        );
+    }
+
+    /// CR 800.4a (final review) — the active-spell-resolution teardown must key
+    /// on the CASTER, not on the live controller.
+    ///
+    /// `PendingSpellResolution.controller` became the LIVE controller once a
+    /// spell's controller became a derived value, so for a spell stolen
+    /// mid-resolution (Perplexing Chimera pausing on an as-enters choice) it
+    /// names the thief. The sibling row above cannot catch the difference: its
+    /// fixture leaves `cast_controller: None`, so both readings coincide. This
+    /// row sets them to DIFFERENT players, which is the only shape that
+    /// discriminates.
+    ///
+    /// REVERT-FAILING: keying on `psr.controller` tears the frame down when the
+    /// THIEF leaves (CR 800.4a says the control effect merely ends and the
+    /// spell reverts to its caster and keeps resolving) and leaves it dangling
+    /// when the CASTER leaves.
+    #[test]
+    fn elimination_keys_the_active_spell_frame_on_the_caster_not_the_thief() {
+        let mut state = setup_three_player();
+        let caster = PlayerId(0);
+        let thief = PlayerId(1);
+        let spell = create_object(
+            &mut state,
+            CardId(8),
+            caster,
+            "Stolen paused permanent".into(),
+            Zone::Stack,
+        );
+        state.push_spell_resolution(PendingSpellResolution {
+            object_id: spell,
+            // Stolen: the live controller is the thief...
+            controller: thief,
+            casting_variant: CastingVariant::Normal,
+            cast_from_zone: None,
+            // ...but the caster is who the CR 800.4a teardown is keyed to.
+            cast_controller: Some(caster),
+            cast_timing_permission: None,
+            spell_targets: vec![],
+            actual_mana_spent: 0,
+            kickers_paid: vec![],
+            additional_cost_payment_count: 0,
+            additional_cost_payments: vec![],
+            convoked_creatures: vec![],
+        });
+
+        eliminate_player(&mut state, thief, &mut Vec::new());
+        assert!(
+            state.active_spell_resolution().is_some(),
+            "the THIEF leaving must not tear down the frame — CR 800.4a ends the control \
+             effect and the spell reverts to its caster and keeps resolving"
+        );
+
+        eliminate_player(&mut state, caster, &mut Vec::new());
+        assert!(
+            state.active_spell_resolution().is_none(),
+            "the CASTER leaving must tear the frame down, or it dangles past the object"
         );
     }
 

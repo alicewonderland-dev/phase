@@ -654,17 +654,30 @@ fn cmp_payload(a: &GameAction, b: &GameAction) -> Ordering {
             };
             cmp_val(a0, b0)
         }
+        GameAction::ChooseResolutionOptionalPaymentBranch { choice: a0 } => {
+            let GameAction::ChooseResolutionOptionalPaymentBranch { choice: b0 } = b else {
+                unreachable!("cmp_payload: same-variant invariant");
+            };
+            cmp_val(a0, b0)
+        }
         GameAction::RespondToSpliceOffer { card: a0 } => {
             let GameAction::RespondToSpliceOffer { card: b0 } = b else {
                 unreachable!("cmp_payload: same-variant invariant");
             };
             cmp_val(a0, b0)
         }
-        GameAction::DecideOptionalEffectAndRemember { choice: a0 } => {
-            let GameAction::DecideOptionalEffectAndRemember { choice: b0 } = b else {
+        GameAction::DecideOptionalEffectAndRemember {
+            choice: a0,
+            scope: a1,
+        } => {
+            let GameAction::DecideOptionalEffectAndRemember {
+                choice: b0,
+                scope: b1,
+            } = b
+            else {
                 unreachable!("cmp_payload: same-variant invariant");
             };
-            cmp_val(a0, b0)
+            cmp_val(a0, b0).then_with(|| cmp_val(a1, b1))
         }
         GameAction::PayUnlessCost { pay: a0 } => {
             let GameAction::PayUnlessCost { pay: b0 } = b else {
@@ -811,14 +824,16 @@ fn cmp_payload(a: &GameAction, b: &GameAction) -> Ordering {
         }
         GameAction::BeginResolveAll {
             max_resolutions: a0,
+            scope: a1,
         } => {
             let GameAction::BeginResolveAll {
                 max_resolutions: b0,
+                scope: b1,
             } = b
             else {
                 unreachable!("cmp_payload: same-variant invariant");
             };
-            cmp_val(a0, b0)
+            cmp_val(a0, b0).then_with(|| cmp_val(a1, b1))
         }
         GameAction::RespondResolveAllConsent {
             epoch: a0,
@@ -1698,10 +1713,13 @@ mod tests {
         DecisionGroupKey, DecisionKind, DecisionTemplate, IterationCount, ReplayMode,
     };
     use crate::game::combat::AttackTarget;
+    use crate::types::actions::ResolveAllScope;
     use crate::types::actions::{
         MayTriggerAutoChoiceOp, PrecastCopyShortcutResponse, ResolveAllConsentDecision,
     };
-    use crate::types::game_state::{EndEffectGroupId, MayTriggerAutoChoiceKey, MayTriggerOrigin};
+    use crate::types::game_state::{
+        EndEffectGroupId, MayTriggerAutoChoiceKey, MayTriggerAutoChoiceSelector, MayTriggerOrigin,
+    };
     use crate::types::identifiers::ObjectId;
     use crate::types::mana::{ManaCost, ManaCostShard};
     use crate::types::player::PlayerId;
@@ -1714,8 +1732,14 @@ mod tests {
     #[test]
     fn newer_action_variants_compare_their_payloads() {
         assert_distinct_order(
-            GameAction::BeginResolveAll { max_resolutions: 1 },
-            GameAction::BeginResolveAll { max_resolutions: 2 },
+            GameAction::BeginResolveAll {
+                max_resolutions: 1,
+                scope: ResolveAllScope::Own,
+            },
+            GameAction::BeginResolveAll {
+                max_resolutions: 2,
+                scope: ResolveAllScope::Own,
+            },
         );
         assert_distinct_order(
             GameAction::RespondResolveAllConsent {
@@ -1800,20 +1824,20 @@ mod tests {
         assert_distinct_order(
             GameAction::SetMayTriggerAutoChoice {
                 op: MayTriggerAutoChoiceOp::Remove {
-                    key: MayTriggerAutoChoiceKey {
+                    selector: MayTriggerAutoChoiceSelector::exact(MayTriggerAutoChoiceKey {
                         player: PlayerId(0),
                         source_id: ObjectId(1),
                         origin: MayTriggerOrigin::Printed { trigger_index: 0 },
-                    },
+                    }),
                 },
             },
             GameAction::SetMayTriggerAutoChoice {
                 op: MayTriggerAutoChoiceOp::Remove {
-                    key: MayTriggerAutoChoiceKey {
+                    selector: MayTriggerAutoChoiceSelector::exact(MayTriggerAutoChoiceKey {
                         player: PlayerId(0),
                         source_id: ObjectId(2),
                         origin: MayTriggerOrigin::Printed { trigger_index: 0 },
-                    },
+                    }),
                 },
             },
         );
@@ -1861,8 +1885,14 @@ mod tests {
             },
         );
         assert_distinct_order(
-            GameAction::BeginResolveAll { max_resolutions: 1 },
-            GameAction::BeginResolveAll { max_resolutions: 2 },
+            GameAction::BeginResolveAll {
+                max_resolutions: 1,
+                scope: ResolveAllScope::Own,
+            },
+            GameAction::BeginResolveAll {
+                max_resolutions: 2,
+                scope: ResolveAllScope::Own,
+            },
         );
         assert_distinct_order(
             GameAction::RespondResolveAllConsent {

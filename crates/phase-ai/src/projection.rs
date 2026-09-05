@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 
 use engine::ai_support::{
-    classify_payment_continuation, legal_actions, witness_payment_continuation,
-    PaymentContinuationState,
+    classify_payment_continuation, legal_actions, witness_payment_continuations,
+    PaymentContinuationBatchStatus, PaymentContinuationState,
 };
 use engine::game::combat::AttackTarget;
 use engine::game::engine::{apply_for_simulation, EngineError};
@@ -48,6 +48,7 @@ pub enum BailReason {
     MulliganOrSideboardEncountered,
     NoLegalAction { waiting_for: String },
     NoLegalManaPayment,
+    IncompleteManaPaymentWitness,
     EngineRejected(EngineError),
 }
 
@@ -405,11 +406,29 @@ fn resolve_choice(
         PaymentContinuationState::Affiliated(_) => {
             let mut actions = actions;
             actions.sort_by(|left, right| left.cmp_stable(right));
+            let batch = witness_payment_continuations(state, &actions);
+            let status = batch.status;
             let accepted = actions
                 .into_iter()
-                .find_map(|action| witness_payment_continuation(state, &action))
-                .ok_or(BailReason::NoLegalManaPayment)?;
-            return Ok((acting, accepted.action, true, Some(accepted.state)));
+                .zip(batch.successors)
+                .find_map(|(action, successor)| successor.map(|successor| (action, successor)));
+            let accepted = match (status, accepted) {
+                (_, Some(accepted)) => accepted,
+                (PaymentContinuationBatchStatus::Complete, None) => {
+                    return Err(BailReason::NoLegalManaPayment);
+                }
+                (PaymentContinuationBatchStatus::Indeterminate(_), None) => {
+                    return Err(BailReason::IncompleteManaPaymentWitness);
+                }
+                (
+                    PaymentContinuationBatchStatus::NotAffiliated
+                    | PaymentContinuationBatchStatus::UnsupportedAffiliated(_),
+                    None,
+                ) => {
+                    return Err(BailReason::NoLegalManaPayment);
+                }
+            };
+            return Ok((acting, accepted.0, true, Some(accepted.1.state)));
         }
     }
 
@@ -515,7 +534,8 @@ fn resolve_choice(
             .cloned()
             .ok_or(BailReason::NoLegalManaPayment)?,
 
-        WaitingFor::OptionalEffectChoice { .. }
+        WaitingFor::ResolutionOptionalPaymentChoice { .. }
+        | WaitingFor::OptionalEffectChoice { .. }
         | WaitingFor::OpponentMayChoice { .. }
         | WaitingFor::OptionalCostChoice { .. }
         | WaitingFor::TributeChoice { .. }
@@ -1230,6 +1250,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolution_optional_payment_projection_roundtrips_issued_action() {
+        use engine::game::effects::resolve_ability_chain;
+        use engine::types::ability::{
+            AbilityCost, CardSelectionMode, DiscardSelfScope, Effect, QuantityExpr,
+            ResolvedAbility, TargetFilter,
+        };
+
+        let mut scenario = GameScenario::new();
+        let source = scenario.add_creature(P0, "Payment Source", 1, 1).id();
+        scenario.add_card_to_hand(P0, "Payment Card");
+        let mut runner = scenario.build();
+        let mut ability = ResolvedAbility::new(
+            Effect::PayCost {
+                cost: AbilityCost::OneOf {
+                    costs: vec![AbilityCost::Discard {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        filter: None,
+                        selection: CardSelectionMode::Chosen,
+                        self_scope: DiscardSelfScope::FromHand,
+                    }],
+                },
+                scale: None,
+                payer: TargetFilter::Controller,
+            },
+            vec![],
+            source,
+            P0,
+        );
+        ability.optional = true;
+        resolve_ability_chain(runner.state_mut(), &ability, &mut Vec::new(), 0).unwrap();
+
+        let original = runner.state().clone();
+        let (actor, action, is_policy_choice, _successor) =
+            resolve_choice(&original, P0, PlayerId(1))
+                .expect("projection consumes the issued domain");
+        assert_eq!(
+            action,
+            GameAction::ChooseResolutionOptionalPaymentBranch {
+                choice: engine::types::ResolutionOptionalPaymentChoice::Decline,
+            }
+        );
+        let json = serde_json::to_value(&action).unwrap();
+        assert_eq!(serde_json::from_value::<GameAction>(json).unwrap(), action);
+        assert_eq!(
+            crate::decision_kind::classify(&original.waiting_for, &action),
+            crate::policies::DecisionKind::ActivateAbility
+        );
+        assert!(is_policy_choice);
+        let mut projected = original.clone();
+        engine::game::engine::apply(&mut projected, actor, action)
+            .expect("projection action re-applies through the production reducer");
+        assert!(!matches!(
+            projected.waiting_for,
+            WaitingFor::ResolutionOptionalPaymentChoice { .. }
+        ));
+    }
+
     fn precast_offer_state() -> GameState {
         use std::path::Path;
 
@@ -1480,7 +1558,7 @@ mod tests {
                     "an affiliated payment window must return a witnessed successor, got {action:?}"
                 );
             }
-            Err(BailReason::NoLegalManaPayment) => {}
+            Err(BailReason::NoLegalManaPayment | BailReason::IncompleteManaPaymentWitness) => {}
             other => panic!("expected the payment-witness branch, got {other:?}"),
         }
     }

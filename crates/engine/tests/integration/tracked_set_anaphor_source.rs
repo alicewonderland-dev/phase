@@ -26,7 +26,8 @@ use engine::game::quantity::resolve_quantity;
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::parser::parse_oracle_text;
 use engine::types::ability::{
-    AggregateFunction, Effect, ObjectProperty, QuantityExpr, QuantityRef, TrackedAnaphorSource,
+    AggregateFunction, CardTypeSetSource, Effect, ObjectProperty, QuantityExpr, QuantityRef,
+    TrackedAnaphorSource,
 };
 use engine::types::events::GameEvent;
 use engine::types::phase::Phase;
@@ -60,16 +61,13 @@ fn aggregates(
     ) {
         match value {
             serde_json::Value::Object(map) => {
-                if map.get("type").and_then(|t| t.as_str()) == Some("TrackedSetAggregate") {
+                if map.get("type").and_then(|t| t.as_str()) == Some("PropertyAggregate") {
                     let qty: QuantityRef = serde_json::from_value(value.clone())
-                        .expect("TrackedSetAggregate round-trips");
-                    if let QuantityRef::TrackedSetAggregate {
-                        function,
-                        property,
-                        source,
-                    } = qty
-                    {
-                        out.push((function, property, source));
+                        .expect("PropertyAggregate round-trips");
+                    if let QuantityRef::PropertyAggregate(aggregate) = qty {
+                        if let CardTypeSetSource::TrackedSet { set, .. } = aggregate.source() {
+                            out.push((aggregate.function(), aggregate.property(), *set));
+                        }
                     }
                 }
                 for v in map.values() {
@@ -332,18 +330,30 @@ fn witch_king_state_is_red_under_the_chain_set_binding() {
     }];
 
     let batch = QuantityExpr::Ref {
-        qty: QuantityRef::TrackedSetAggregate {
-            function: AggregateFunction::Sum,
-            property: ObjectProperty::Power,
-            source: TrackedAnaphorSource::TriggeringBatch,
-        },
+        qty: QuantityRef::PropertyAggregate(
+            engine::types::ability::PropertyAggregate::new(
+                AggregateFunction::Sum,
+                ObjectProperty::Power,
+                engine::types::ability::CardTypeSetSource::TrackedSet {
+                    set: TrackedAnaphorSource::TriggeringBatch,
+                    caused_by: None,
+                },
+            )
+            .expect("statically valid property aggregate"),
+        ),
     };
     let chain = QuantityExpr::Ref {
-        qty: QuantityRef::TrackedSetAggregate {
-            function: AggregateFunction::Sum,
-            property: ObjectProperty::Power,
-            source: TrackedAnaphorSource::ChainSet,
-        },
+        qty: QuantityRef::PropertyAggregate(
+            engine::types::ability::PropertyAggregate::new(
+                AggregateFunction::Sum,
+                ObjectProperty::Power,
+                engine::types::ability::CardTypeSetSource::TrackedSet {
+                    set: TrackedAnaphorSource::ChainSet,
+                    caused_by: None,
+                },
+            )
+            .expect("statically valid property aggregate"),
+        ),
     };
 
     assert_eq!(
@@ -399,18 +409,30 @@ fn kylox_state_is_red_under_the_triggering_batch_binding() {
         .insert(set_id, vec![fodder_a, fodder_b]);
 
     let chain = QuantityExpr::Ref {
-        qty: QuantityRef::TrackedSetAggregate {
-            function: AggregateFunction::Sum,
-            property: ObjectProperty::Power,
-            source: TrackedAnaphorSource::ChainSet,
-        },
+        qty: QuantityRef::PropertyAggregate(
+            engine::types::ability::PropertyAggregate::new(
+                AggregateFunction::Sum,
+                ObjectProperty::Power,
+                engine::types::ability::CardTypeSetSource::TrackedSet {
+                    set: TrackedAnaphorSource::ChainSet,
+                    caused_by: None,
+                },
+            )
+            .expect("statically valid property aggregate"),
+        ),
     };
     let batch = QuantityExpr::Ref {
-        qty: QuantityRef::TrackedSetAggregate {
-            function: AggregateFunction::Sum,
-            property: ObjectProperty::Power,
-            source: TrackedAnaphorSource::TriggeringBatch,
-        },
+        qty: QuantityRef::PropertyAggregate(
+            engine::types::ability::PropertyAggregate::new(
+                AggregateFunction::Sum,
+                ObjectProperty::Power,
+                engine::types::ability::CardTypeSetSource::TrackedSet {
+                    set: TrackedAnaphorSource::TriggeringBatch,
+                    caused_by: None,
+                },
+            )
+            .expect("statically valid property aggregate"),
+        ),
     };
 
     assert_eq!(

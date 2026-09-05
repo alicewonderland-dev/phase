@@ -538,6 +538,9 @@ fn inspect_successor(
         | WaitingFor::ModeChoice { .. }
         | WaitingFor::AbilityModeChoice { .. }
         | WaitingFor::OptionalEffectChoice { .. } => TargetedExchangeVerdict::Indeterminate,
+        WaitingFor::ResolutionOptionalPaymentChoice { .. } => {
+            TargetedExchangeVerdict::Indeterminate
+        }
         _ => TargetedExchangeVerdict::Indeterminate,
     }
 }

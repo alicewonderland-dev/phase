@@ -3,7 +3,7 @@ import type React from "react";
 import { memo, useCallback, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 
-import type { AbilityBlockKind, GameObject, Keyword } from "../../adapter/types.ts";
+import type { GameObject, Keyword } from "../../adapter/types.ts";
 import { cardImageLookup, tokenFiltersForObject } from "../../services/cardImageLookup.ts";
 import { useCanActForWaitingState, usePlayerId } from "../../hooks/usePlayerId.ts";
 import { dispatchAction } from "../../game/dispatch.ts";
@@ -19,6 +19,7 @@ import { useGameStore } from "../../stores/gameStore.ts";
 import { renderDescription } from "../../utils/description.ts";
 import { usePreferencesStore } from "../../stores/preferencesStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
+import { ABILITY_BLOCK_REASON_KEY } from "../../viewmodel/abilityBlockReason.ts";
 import { buildGrantedKeywordSources, buildPTSources } from "../../viewmodel/attribution.ts";
 import { COUNTER_COLORS, computePTDisplay, counterIconClass, formatCounterType, toRoman } from "../../viewmodel/cardProps.ts";
 import { getCardDisplayColors } from "../card/cardFrame.ts";
@@ -75,17 +76,6 @@ const ATTACHMENT_STACK_STEP_PX = 22;
 const HOVERED_CARD_Z_INDEX = 60;
 const HOVERED_ATTACHMENT_HOST_Z_INDEX = 80;
 const EMPTY_KEYWORD_BADGES: Keyword[] = [];
-
-/**
- * CR 602.5: Maps an engine `AbilityBlockKind` to its i18n reason key. Pure
- * display formatting — no game logic. Exhaustive so a new kind is a compile
- * error until a key is added.
- */
-const ABILITY_BLOCK_REASON_KEY: Record<AbilityBlockKind, string> = {
-  CantBeActivated: "abilityBlock.cantBeActivated",
-  CantActivateDuring: "abilityBlock.cantActivateDuring",
-  Prohibited: "abilityBlock.prohibited",
-};
 
 // CR 602.5: display-only badge summarizing which of this permanent's activated
 // abilities are currently blocked, and why. Reads the engine-provided
@@ -603,7 +593,10 @@ export const PermanentCard = memo(function PermanentCard({
   // read as tokens via their distinct generic-token art and are excluded.
   // CR 708.2: a face-down permanent has no characteristics other than those
   // its face-down rule grants, so never surface "Copy" on it — that would leak
-  // that it's a token-copy (matches the `!face_down` guard on the keyword strip).
+  // that it's a token-copy. Deliberately NOT symmetric with the keyword strip
+  // below, which does render for face-down permanents: the keywords it shows
+  // are public (the face-down rules' own ward, or an external grant), whereas
+  // being a copy is exactly the hidden fact.
   // Two independent ways a permanent is a copy, unioned so the badge covers the
   // whole class rather than only the token half (issue #5932):
   //   - a token minted as a copy (`is_token` + card art), and
@@ -642,7 +635,12 @@ export const PermanentCard = memo(function PermanentCard({
     if (longPressFired.current) { longPressFired.current = false; return; }
     if (useUiStore.getState().debugInteractionMode) {
       e.stopPropagation();
-      useUiStore.getState().openDebugContextMenu({ objectId, x: e.clientX, y: e.clientY });
+      useUiStore.getState().openDebugContextMenu({
+        objectId,
+        x: e.clientX,
+        y: e.clientY,
+        surface: "game",
+      });
       return;
     }
     if (onPrimaryClickOverride) {
@@ -1036,8 +1034,30 @@ export const PermanentCard = memo(function PermanentCard({
           (after the art-crop/full-card ternary) so it appears in BOTH display
           modes, and — being at the overflow-visible level, outside the rounded
           overflow-hidden art wrapper — the half-off-card portion isn't clipped.
-          Badge size scales off the active card width var. */}
-      {showKeywordStrip && battlefieldKeywordBadges.length > 0 && !obj.face_down && (
+          Badge size scales off the active card width var.
+
+          Face-down permanents render the strip too. CR 708.2 + CR 708.2a: a
+          face-down permanent has "no characteristics other than those listed by
+          the ability or rules that allowed" it to be face down, and the plain
+          default carries "no text" — so none of the hidden card's own abilities.
+          The engine strips them into `back_face` and reseeds the face-down
+          profile every layer pass, so what is left in this list is public
+          either way: the face-down rules' OWN grant (cloak enters with ward {2},
+          CR 701.58a; disguise likewise, CR 702.168a) or an external effect (an Aura's menace, a
+          lord's flying). A cloaked or disguised permanent therefore shows a
+          ward badge — that is the mechanic, not the hidden card. Suppressing
+          the strip here hid a keyword the blocker prompt already announced
+          ("needs 2") and that the rules make public. The engine owns and
+          documents the contract on `battlefield_keyword_badges` itself and pins
+          both halves (`face_down_keyword_badges_carry_only_granted_keywords`,
+          `a_face_down_profile_ward_is_badged_like_any_public_keyword`).
+
+          Known gap: `KeywordStrip` styles printed vs granted off
+          `base_keywords`, which `visibility.rs` clears for observers of a
+          face-down permanent — so the same ward reads as printed to its
+          controller and as granted to everyone else. Cosmetic only, and in the
+          safe direction; not addressed here. */}
+      {showKeywordStrip && battlefieldKeywordBadges.length > 0 && (
         <KeywordStrip
           keywords={battlefieldKeywordBadges}
           baseKeywords={obj.base_keywords}

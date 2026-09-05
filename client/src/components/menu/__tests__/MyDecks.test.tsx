@@ -1,20 +1,30 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { MyDecks } from "../MyDecks";
 import {
   RANDOM_DECK_SELECTION,
+  createFolder,
+  saveFeedSubscriptions,
   saveDeckOrigins,
+  setDeckFolder,
   STORAGE_KEY_PREFIX,
 } from "../../../constants/storage";
 import type { ParsedDeck } from "../../../services/deckParser";
 import { evaluateDeckCompatibilityBatch } from "../../../services/deckCompatibility";
+import { setCachedFeed } from "../../../services/feedPersistence";
 import { loadPreconDeckMap } from "../../../hooks/useDecks";
+import { useConnectivityStore } from "../../../stores/connectivityStore";
+import * as feedService from "../../../services/feedService";
 
-vi.mock("../../../hooks/useCardImage", () => ({
-  useCardImage: () => ({ src: null, isLoading: false }),
+const { useCardImage, useSetSymbol, advanceSetSource } = vi.hoisted(() => ({
+  useCardImage: vi.fn(),
+  useSetSymbol: vi.fn(),
+  advanceSetSource: vi.fn(),
 }));
+
+vi.mock("../../../hooks/useCardImage", () => ({ useCardImage }));
 
 vi.mock("../../../hooks/useBracketEstimate", () => ({
   useBracketEstimate: () => ({ estimate: null, loading: false, unsupported: false }),
@@ -25,7 +35,7 @@ vi.mock("../../../adapter/wasm-adapter", () => ({
 }));
 
 vi.mock("../../../hooks/useSetSymbols", () => ({
-  useSetSymbol: (setCode: string | undefined) => setCode ? `https://img.example/${setCode}.svg` : null,
+  useSetSymbol,
 }));
 
 vi.mock("../../../services/deckCompatibility", () => ({
@@ -46,6 +56,13 @@ describe("MyDecks", () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
+    useConnectivityStore.setState({ forcedOffline: false, browserOnline: true });
+    useCardImage.mockReturnValue({ src: null, isLoading: false });
+    useSetSymbol.mockImplementation((setCode: string | undefined) => ({
+      src: setCode ? `visual-pack://set/${setCode.toLowerCase()}` : null,
+      isLoading: false,
+      advanceFailedSource: advanceSetSource,
+    }));
     vi.mocked(loadPreconDeckMap).mockResolvedValue({});
     vi.stubGlobal("IntersectionObserver", class {
       private readonly callback: IntersectionObserverCallback;
@@ -66,7 +83,70 @@ describe("MyDecks", () => {
 
   afterEach(() => {
     cleanup();
+    useConnectivityStore.setState({ forcedOffline: false, browserOnline: true });
     vi.unstubAllGlobals();
+  });
+
+  it("keeps cached subscriptions usable while offline and re-enables refresh on reconnect", async () => {
+    const feedDeck = {
+      name: "Offline Feed Deck",
+      colors: ["U"],
+      main: [{ name: "Island", count: 60 }],
+      sideboard: [],
+    };
+    saveDeck("Offline Feed Deck", { main: feedDeck.main, sideboard: [] });
+    saveDeckOrigins({ "Offline Feed Deck": "offline-feed" });
+    await setCachedFeed("offline-feed", {
+      id: "offline-feed",
+      name: "Offline Feed",
+      version: 1,
+      updated: "2026-01-01T00:00:00Z",
+      decks: [feedDeck],
+    });
+    saveFeedSubscriptions([{
+      sourceId: "offline-feed",
+      url: "https://example.com/offline-feed.json",
+      type: "remote",
+      subscribedAt: 1,
+      lastRefreshedAt: 1,
+      lastVersion: 1,
+    }]);
+    const refreshAllFeeds = vi.spyOn(feedService, "refreshAllFeeds");
+    const onEditDeck = vi.fn();
+    vi.mocked(evaluateDeckCompatibilityBatch).mockResolvedValue({});
+    const user = userEvent.setup();
+    render(
+      <MyDecks
+        mode="manage"
+        activeDeckName={null}
+        onCreateDeck={vi.fn()}
+        onEditDeck={onEditDeck}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Subscriptions" }));
+    expect(await screen.findByText("Offline Feed")).toBeInTheDocument();
+    expect(screen.getByText("Offline Feed Deck")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh All" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Manage Feeds" })).toBeEnabled();
+
+    act(() => useConnectivityStore.getState().setForcedOffline(true));
+
+    expect(screen.getByText(/Feed updates are unavailable while offline/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh All" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Manage Feeds" })).toBeEnabled();
+    await user.click(screen.getByText("Offline Feed Deck"));
+    expect(onEditDeck).toHaveBeenCalledWith("Offline Feed Deck");
+    vi.stubGlobal("prompt", vi.fn(() => "Offline Feed Copy"));
+    await user.click(screen.getByRole("button", { name: "Copy to My Decks" }));
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Offline Feed Copy")).not.toBeNull();
+    expect(feedService.getDeckFeedOrigin("Offline Feed Copy")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Refresh All" }));
+    expect(refreshAllFeeds).not.toHaveBeenCalled();
+
+    act(() => useConnectivityStore.getState().setForcedOffline(false));
+
+    expect(screen.getByRole("button", { name: "Refresh All" })).toBeEnabled();
   });
 
   it("checks commander selection context and can reveal incompatible decks on demand", async () => {
@@ -90,6 +170,7 @@ describe("MyDecks", () => {
         selected_format_compatible: true,
         selected_format_reasons: [],
         color_identity: ["U"],
+        color_distribution: [],
       },
       "Off Format": {
         standard: { compatible: true, reasons: [] },
@@ -99,6 +180,7 @@ describe("MyDecks", () => {
         selected_format_compatible: false,
         selected_format_reasons: ["Not Commander legal"],
         color_identity: ["R"],
+        color_distribution: [],
       },
     });
 
@@ -139,6 +221,7 @@ describe("MyDecks", () => {
         selected_format_compatible: true,
         selected_format_reasons: [],
         color_identity: ["U"],
+        color_distribution: [],
       },
       "Deck Beta": {
         standard: { compatible: false, reasons: [] },
@@ -148,6 +231,7 @@ describe("MyDecks", () => {
         selected_format_compatible: true,
         selected_format_reasons: [],
         color_identity: ["R"],
+        color_distribution: [],
       },
     });
 
@@ -178,6 +262,7 @@ describe("MyDecks", () => {
         selected_format_compatible: null,
         selected_format_reasons: [],
         color_identity: ["U"],
+        color_distribution: [],
       },
     });
 
@@ -219,6 +304,7 @@ describe("MyDecks", () => {
         selected_format_compatible: options?.selectedFormat === "PauperCommander" ? true : null,
         selected_format_reasons: [],
         color_identity: ["U", "G"],
+        color_distribution: [],
       },
       "Not PDH": {
         standard: { compatible: true, reasons: [] },
@@ -228,6 +314,7 @@ describe("MyDecks", () => {
         selected_format_compatible: options?.selectedFormat === "PauperCommander" ? false : null,
         selected_format_reasons: [],
         color_identity: ["R"],
+        color_distribution: [],
       },
     }));
 
@@ -277,6 +364,41 @@ describe("MyDecks", () => {
     expect(await screen.findByRole("button", { name: "Import Deck" })).toBeInTheDocument();
   });
 
+  it("moves focus to deck search after deleting a folder in selection mode", async () => {
+    saveDeck("Filed Deck", {
+      main: [{ name: "Island", count: 60 }],
+      sideboard: [],
+    });
+    const folder = createFolder("Archive");
+    expect(folder).not.toBeNull();
+    setDeckFolder("Filed Deck", folder!.id);
+    vi.mocked(evaluateDeckCompatibilityBatch).mockResolvedValue({});
+
+    render(
+      <MyDecks
+        mode="select"
+        activeDeckName={null}
+        onSelectDeck={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("Archive")).toBeInTheDocument();
+    const folderTrigger = screen.getByRole("button", { name: "Folder options" });
+    fireEvent.click(folderTrigger);
+    const deleteItem = screen.getByRole("menuitem", { name: "Delete" });
+    deleteItem.focus();
+    fireEvent.click(deleteItem);
+
+    const confirmation = await screen.findByRole("alertdialog", {
+      name: "Delete",
+    });
+    fireEvent.click(within(confirmation).getByRole("button", { name: "Delete" }));
+
+    await waitFor(() => expect(confirmation).not.toBeInTheDocument());
+    expect(screen.queryByText("Archive")).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox")).toHaveFocus();
+  });
+
   it("uses trusted feed format metadata before background coverage filters unknown saved decks", async () => {
     saveDeck("Known Standard", { main: [{ name: "Island", count: 60 }], sideboard: [] });
     saveDeck("Unknown User Deck", { main: [{ name: "Mountain", count: 60 }], sideboard: [] });
@@ -291,6 +413,7 @@ describe("MyDecks", () => {
         selected_format_compatible: options?.selectedFormat === "Standard" ? false : null,
         selected_format_reasons: options?.selectedFormat === "Standard" ? ["Not Standard legal"] : [],
         color_identity: ["R"],
+        color_distribution: [],
       },
     }));
 
@@ -326,6 +449,7 @@ describe("MyDecks", () => {
         selected_format_compatible: null,
         selected_format_reasons: [],
         color_identity: ["U"],
+        color_distribution: [],
       },
     });
     const onSelectDeck = vi.fn();
@@ -348,6 +472,12 @@ describe("MyDecks", () => {
   });
 
   it("shows legal precons in a newest-first load-more section and saves one when selected", async () => {
+    const setSymbolResult = {
+      src: "visual-pack://set/sos" as string | null,
+      isLoading: false,
+      advanceFailedSource: advanceSetSource,
+    };
+    useSetSymbol.mockReturnValue(setSymbolResult);
     vi.mocked(loadPreconDeckMap).mockResolvedValue({
       ...Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`deck-${i}`, {
         code: `P${i}`,
@@ -379,23 +509,46 @@ describe("MyDecks", () => {
         selected_format_compatible: true,
         selected_format_reasons: [],
         color_identity: ["U"],
+        color_distribution: [],
       }]));
     });
     const onSelectDeck = vi.fn();
     const onEditDeck = vi.fn();
+    let activeDeckName: string | null = null;
 
-    render(
+    const renderDecks = () => (
       <MyDecks
         mode="select"
         selectedFormat="Commander"
-        activeDeckName={null}
+        activeDeckName={activeDeckName}
         onSelectDeck={onSelectDeck}
         onEditDeck={onEditDeck}
-      />,
+      />
     );
+    const { rerender } = render(renderDecks());
 
     expect(await screen.findByText("Secrets of Strixhaven (SOS)")).toBeInTheDocument();
-    expect(screen.getByAltText("SOS set icon")).toBeInTheDocument();
+    const installed = screen.getByAltText("SOS set icon");
+    expect(installed).toHaveAttribute("src", "visual-pack://set/sos");
+    fireEvent.error(installed);
+    expect(advanceSetSource).toHaveBeenCalledWith("visual-pack://set/sos");
+
+    setSymbolResult.src = "https://svgs.scryfall.io/sets/sos.svg";
+    activeDeckName = "[Pre-built] Secrets of Strixhaven (SOS)";
+    rerender(renderDecks());
+    const remote = screen.getByAltText("SOS set icon");
+    expect(remote).toHaveAttribute("src", "https://svgs.scryfall.io/sets/sos.svg");
+    fireEvent.error(remote);
+    expect(advanceSetSource).toHaveBeenLastCalledWith(
+      "https://svgs.scryfall.io/sets/sos.svg",
+    );
+
+    setSymbolResult.src = null;
+    activeDeckName = null;
+    rerender(renderDecks());
+    expect(screen.queryByAltText("SOS set icon")).not.toBeInTheDocument();
+    expect(screen.getByTitle("SOS")).toHaveTextContent("SOS");
+
     expect(screen.queryByText("Precon 0 (P0)")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Load More" }));
     expect(await screen.findByText("Precon 0 (P0)")).toBeInTheDocument();
@@ -409,6 +562,51 @@ describe("MyDecks", () => {
     expect(onSelectDeck).toHaveBeenCalledWith("[Pre-built] Secrets of Strixhaven (SOS)");
     expect(localStorage.getItem(`${STORAGE_KEY_PREFIX}[Pre-built] Secrets of Strixhaven (SOS)`)).toBeTruthy();
     expect(loadPreconDeckMap).toHaveBeenCalled();
+  });
+
+  it("does not fall through to saved-deck art for a basic-only precon override", async () => {
+    let resolvePrecons: (
+      value: Awaited<ReturnType<typeof loadPreconDeckMap>>,
+    ) => void = () => {};
+    vi.mocked(loadPreconDeckMap).mockReturnValue(new Promise((resolve) => {
+      resolvePrecons = resolve;
+    }));
+
+    render(
+      <MyDecks
+        mode="select"
+        selectedFormat="Commander"
+        activeDeckName={null}
+        onSelectDeck={vi.fn()}
+      />,
+    );
+
+    // The catalog already captured its saved-deck-name snapshot. Adding this
+    // same-name deck now creates the exact hostile condition: a precon tile
+    // exists, but an incorrect representative branch could still consult
+    // local storage after finding no non-basic precon card.
+    saveDeck("Basics Only (BAS)", {
+      main: [{ name: "Saved Fallback", count: 1 }],
+      sideboard: [],
+    });
+    resolvePrecons({
+      basics: {
+        code: "BAS",
+        name: "Basics Only",
+        type: "Commander Deck",
+        releaseDate: "2026-02-01",
+        coveragePct: 100,
+        mainBoard: [{ name: "Forest", count: 100 }],
+        sideBoard: [],
+      },
+    });
+
+    expect(await screen.findByText("Basics Only (BAS)")).toBeInTheDocument();
+    expect(useCardImage).toHaveBeenCalledWith("", {
+      size: "art_crop",
+      sourcePrinting: undefined,
+    });
+    expect(useCardImage).not.toHaveBeenCalledWith("Saved Fallback", expect.anything());
   });
 
   it("filters selection decks by source and precon set", async () => {
@@ -490,6 +688,7 @@ describe("MyDecks", () => {
         selected_format_compatible: false,
         selected_format_reasons: ["Not Standard legal"],
         color_identity: ["R"],
+        color_distribution: [],
       },
     });
     const onSelectDeck = vi.fn();
@@ -532,5 +731,56 @@ describe("MyDecks", () => {
       expect.any(Array),
       expect.objectContaining({ summaryOnly: true }),
     );
+  });
+
+  it("preserves saved cover printing identity and advances the installed art crop", async () => {
+    const advanceFailedSource = vi.fn();
+    useCardImage.mockReturnValue({
+      src: "visual-pack://installed/deck-art",
+      isLoading: false,
+      advanceFailedSource,
+    });
+    saveDeck("Printed Deck", {
+      main: [
+        { name: "Island", count: 20 },
+        {
+          name: "Opt",
+          count: 4,
+          sourcePrinting: { setCode: "DAR", collectorNumber: "60" },
+        },
+      ],
+      sideboard: [],
+    });
+    vi.mocked(evaluateDeckCompatibilityBatch).mockResolvedValue({
+      "Printed Deck": {
+        standard: { compatible: true, reasons: [] },
+        commander: { compatible: false, reasons: [] },
+        bo3_ready: false,
+        unknown_cards: [],
+        selected_format_compatible: true,
+        selected_format_reasons: [],
+        color_identity: ["U"],
+        color_distribution: [],
+      },
+    });
+
+    const { container } = render(
+      <MyDecks
+        mode="select"
+        selectedFormat="Standard"
+        activeDeckName={null}
+        onSelectDeck={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("Printed Deck")).toBeInTheDocument();
+    expect(useCardImage).toHaveBeenCalledWith("Opt", {
+      size: "art_crop",
+      sourcePrinting: { setCode: "DAR", collectorNumber: "60" },
+    });
+    const image = container.querySelector('img[src="visual-pack://installed/deck-art"]');
+    expect(image).not.toBeNull();
+    fireEvent.error(image!);
+    expect(advanceFailedSource).toHaveBeenCalledWith("visual-pack://installed/deck-art");
   });
 });

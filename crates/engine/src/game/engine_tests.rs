@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use super::*;
@@ -14,12 +15,14 @@ use crate::types::ability::{
 use crate::types::card_type::CardType;
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::CounterType;
-use crate::types::events::PlayerActionKind;
+use crate::types::events::{GameEvent, PlayerActionKind};
 use crate::types::format::FormatConfig;
 use crate::types::game_state::{
-    CastPaymentMode, CastingVariant, PendingCast, ProductionOverride, TargetSelectionProgress,
+    ActionResult, CastPaymentMode, CastingVariant, PendingCast, ProductionOverride,
+    TargetSelectionProgress, WaitingFor,
 };
 use crate::types::identifiers::{CardId, ObjectId, TriggerFiring};
+use crate::types::log::{GameLogEntry, LogCategory, LogSegment};
 use crate::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use crate::types::statics::{CastFrequency, StaticMode};
 use crate::types::TriggerMode;
@@ -75,6 +78,153 @@ fn no_op_stack_entry(id: u64, controller: PlayerId) -> StackEntry {
             )),
         },
     }
+}
+
+fn restored_automation_log_entry(seq: u32) -> GameLogEntry {
+    GameLogEntry {
+        seq,
+        turn: 1,
+        phase: Phase::PreCombatMain,
+        category: LogCategory::Stack,
+        segments: vec![LogSegment::Text("automated stack resolution".to_string())],
+        presentation: Default::default(),
+    }
+}
+
+fn restored_automation_action_result(
+    events: Vec<GameEvent>,
+    log_entries: Vec<GameLogEntry>,
+) -> ActionResult {
+    ActionResult {
+        events,
+        waiting_for: WaitingFor::Priority { player: P0 },
+        log_entries,
+    }
+}
+
+#[test]
+fn restored_stack_automation_presentation_bounds_transport_but_retains_full_engine_events() {
+    let event_count = 2_001_u64;
+    let mut events: Vec<_> = (0..event_count - 1)
+        .map(|id| GameEvent::StackResolved {
+            object_id: ObjectId(id),
+        })
+        .collect();
+    events.push(GameEvent::GameOver { winner: Some(P0) });
+    let log_count = MAX_RESTORED_STACK_AUTOMATION_LOG_ENTRIES as u32 + 7;
+    let logs: Vec<_> = (0..log_count).map(restored_automation_log_entry).collect();
+    let mut full_result = restored_automation_action_result(events, logs);
+    full_result.waiting_for = WaitingFor::GameOver { winner: Some(P0) };
+    let resumed = RestoredStackAutomationResume::from_completed(
+        RestoredStackAutomationResult::Progressed(full_result),
+    );
+
+    assert_eq!(
+        resumed.action_result().events.len(),
+        event_count as usize,
+        "the engine keeps every event needed for lifecycle bookkeeping"
+    );
+    assert!(matches!(
+        resumed.action_result().events.last(),
+        Some(GameEvent::GameOver { winner: Some(P0) })
+    ));
+    assert!(matches!(
+        resumed.action_result().waiting_for,
+        WaitingFor::GameOver { winner: Some(P0) }
+    ));
+    assert_eq!(
+        resumed.presentation.outcome,
+        RestoredStackAutomationOutcome::Progressed
+    );
+    assert_eq!(
+        resumed.presentation.automated_resolution_count,
+        event_count as u32 - 1
+    );
+    assert_eq!(resumed.presentation.omitted_event_count, event_count as u32);
+    assert_eq!(
+        resumed.presentation.log_entries.len(),
+        MAX_RESTORED_STACK_AUTOMATION_LOG_ENTRIES
+    );
+    assert_eq!(
+        resumed
+            .presentation
+            .log_entries
+            .first()
+            .expect("bounded tail is non-empty")
+            .seq,
+        log_count - MAX_RESTORED_STACK_AUTOMATION_LOG_ENTRIES as u32
+    );
+    assert_eq!(
+        resumed
+            .presentation
+            .log_entries
+            .last()
+            .expect("bounded tail is non-empty")
+            .seq,
+        log_count - 1
+    );
+
+    let wire = serde_json::to_value(&resumed).expect("presentation serializes");
+    assert!(
+        wire.get("result").is_none(),
+        "the unbounded internal result must never serialize"
+    );
+    assert_eq!(
+        wire["presentation"]["omittedEventCount"],
+        serde_json::json!(event_count),
+        "the transport gets an explicit lossless count instead of the event burst"
+    );
+}
+
+#[test]
+fn restored_stack_automation_presentation_distinguishes_noop_progress_and_repair() {
+    let noop = RestoredStackAutomationResume::from_completed(RestoredStackAutomationResult::Noop(
+        restored_automation_action_result(Vec::new(), Vec::new()),
+    ));
+    let progressed = RestoredStackAutomationResume::from_completed(
+        RestoredStackAutomationResult::Progressed(restored_automation_action_result(
+            vec![
+                GameEvent::PriorityPassed { player_id: P0 },
+                GameEvent::StackResolved {
+                    object_id: ObjectId(1),
+                },
+            ],
+            vec![restored_automation_log_entry(1)],
+        )),
+    );
+    let repair = RestoredStackAutomationResume::from_completed(
+        RestoredStackAutomationResult::ZeroResolutionRepair(restored_automation_action_result(
+            vec![GameEvent::PriorityPassed { player_id: P0 }],
+            Vec::new(),
+        )),
+    );
+
+    assert_eq!(
+        noop.presentation.outcome,
+        RestoredStackAutomationOutcome::Noop
+    );
+    assert_eq!(noop.presentation.automated_resolution_count, 0);
+    assert_eq!(noop.presentation.omitted_event_count, 0);
+
+    assert_eq!(
+        progressed.presentation.outcome,
+        RestoredStackAutomationOutcome::Progressed
+    );
+    assert_eq!(progressed.presentation.automated_resolution_count, 1);
+    assert_eq!(progressed.presentation.omitted_event_count, 2);
+    assert_eq!(progressed.presentation.log_entries.len(), 1);
+    assert_eq!(
+        progressed.action_result().events.len(),
+        2,
+        "small results still retain their normal engine event slice"
+    );
+
+    assert_eq!(
+        repair.presentation.outcome,
+        RestoredStackAutomationOutcome::ZeroResolutionRepair
+    );
+    assert_eq!(repair.presentation.automated_resolution_count, 0);
+    assert_eq!(repair.presentation.omitted_event_count, 1);
 }
 
 #[test]
@@ -286,6 +436,8 @@ fn choose_new_targets_all_allows_unchanged_illegal_target() {
         stack_entry_index: 0,
         scope: RetargetScope::All,
         current_targets: vec![unchanged.clone()],
+        slots: vec![],
+        slot_pools: vec![],
         legal_new_targets: vec![legal_alternative],
     };
 
@@ -1636,6 +1788,7 @@ fn broadside_bombardiers_boast_activates_after_attacking_and_requires_sacrifice(
 
 fn room_back_face(name: &str) -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
         name: name.to_string(),
         power: None,
         toughness: None,
@@ -2597,6 +2750,371 @@ fn a_materialized_duplicate_of_a_room_keeps_both_halves() {
     );
 }
 
+/// CR 601.2b + CR 709.3 (#7565): the cast-time face choice belongs to ONE
+/// cast. Casting a split Room, resolving it, and returning it to hand must
+/// offer the face choice AGAIN on the next cast. Before the fix the
+/// `ChooseModalFace` handler erased `back_face.layout_kind`, so every later
+/// cast silently auto-picked the front face — and every other layout_kind
+/// consumer (MDFC land playability, split handling) went blind with it.
+#[test]
+fn a_recast_split_room_offers_the_face_choice_again() {
+    use crate::game::stack;
+
+    let mut state = setup_game_at_main_phase();
+    let room = create_object(
+        &mut state,
+        CardId(903),
+        PlayerId(0),
+        "Moldering Gym".to_string(),
+        Zone::Hand,
+    );
+    {
+        let obj = state.objects.get_mut(&room).unwrap();
+        obj.card_types.core_types.push(CoreType::Enchantment);
+        obj.card_types.subtypes.push("Room".to_string());
+        obj.mana_cost = ManaCost::generic(0);
+        let mut back = room_back_face("Weight Room");
+        back.card_types.core_types.push(CoreType::Enchantment);
+        back.card_types.subtypes.push("Room".to_string());
+        obj.back_face = Some(back);
+    }
+
+    let first = apply_as_current(
+        &mut state,
+        GameAction::CastSpell {
+            object_id: room,
+            card_id: CardId(903),
+            targets: vec![],
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(first.waiting_for, WaitingFor::ModalFaceChoice { .. }),
+        "first cast must offer the face choice, got {:?}",
+        first.waiting_for
+    );
+    let after_choice =
+        apply_as_current(&mut state, GameAction::ChooseModalFace { back_face: false }).unwrap();
+    assert!(
+        !matches!(after_choice.waiting_for, WaitingFor::ModalFaceChoice { .. }),
+        "the SAME cast must not re-prompt after the choice"
+    );
+    assert!(
+        state.stack.iter().any(|entry| entry.source_id == room),
+        "the chosen face must be on the stack"
+    );
+    let mut events = Vec::new();
+    stack::resolve_top(&mut state, &mut events);
+    assert_eq!(
+        state.objects[&room].zone,
+        Zone::Battlefield,
+        "the Room must resolve onto the battlefield"
+    );
+
+    // Bounce it (Rescue class) and cast again.
+    crate::game::zones::move_to_zone(&mut state, room, Zone::Hand, &mut events);
+    let second = apply_as_current(
+        &mut state,
+        GameAction::CastSpell {
+            object_id: room,
+            card_id: CardId(903),
+            targets: vec![],
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(second.waiting_for, WaitingFor::ModalFaceChoice { .. }),
+        "the SECOND cast must offer the face choice again (#7565), got {:?}",
+        second.waiting_for
+    );
+}
+
+/// CR 601.2b + CR 709.3 (#7565): the BACK-half round trip. Casting the back
+/// half chooses that half before it reaches the stack; leaving the battlefield
+/// restores the front face. The per-cast commitment ends with that cast, so a
+/// later cast must offer its face choice again. `swap_object_faces` preserves
+/// the split layout marker across the first cast's face swap.
+#[test]
+fn a_room_recast_after_a_back_half_round_trip_offers_the_choice_again() {
+    use crate::game::stack;
+
+    let mut state = setup_game_at_main_phase();
+    let room = create_object(
+        &mut state,
+        CardId(904),
+        PlayerId(0),
+        "Moldering Gym".to_string(),
+        Zone::Hand,
+    );
+    {
+        let obj = state.objects.get_mut(&room).unwrap();
+        obj.card_types.core_types.push(CoreType::Enchantment);
+        obj.card_types.subtypes.push("Room".to_string());
+        obj.mana_cost = ManaCost::generic(0);
+        let mut back = room_back_face("Weight Room");
+        back.card_types.core_types.push(CoreType::Enchantment);
+        back.card_types.subtypes.push("Room".to_string());
+        back.mana_cost = ManaCost::generic(0);
+        obj.back_face = Some(back);
+    }
+
+    let first = apply_as_current(
+        &mut state,
+        GameAction::CastSpell {
+            object_id: room,
+            card_id: CardId(904),
+            targets: vec![],
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(first.waiting_for, WaitingFor::ModalFaceChoice { .. }),
+        "first cast must offer the face choice, got {:?}",
+        first.waiting_for
+    );
+    // Cast the BACK half — this swaps the faces.
+    apply_as_current(&mut state, GameAction::ChooseModalFace { back_face: true }).unwrap();
+    assert!(
+        state.stack.iter().any(|entry| entry.source_id == room),
+        "the back half must be on the stack"
+    );
+    let mut events = Vec::new();
+    stack::resolve_top(&mut state, &mut events);
+    assert_eq!(state.objects[&room].zone, Zone::Battlefield);
+    assert_eq!(
+        state.objects[&room].name, "Weight Room",
+        "the back half resolved onto the battlefield"
+    );
+
+    // Bounce — the zone-exit revert swaps the faces back via snapshots.
+    crate::game::zones::move_to_zone(&mut state, room, Zone::Hand, &mut events);
+    assert_eq!(
+        state.objects[&room].name, "Moldering Gym",
+        "in hand the front face shows again"
+    );
+
+    let second = apply_as_current(
+        &mut state,
+        GameAction::CastSpell {
+            object_id: room,
+            card_id: CardId(904),
+            targets: vec![],
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(second.waiting_for, WaitingFor::ModalFaceChoice { .. }),
+        "after a BACK-half round trip the next cast must offer the choice again \\
+         (#7565 round 2), got {:?}",
+        second.waiting_for
+    );
+}
+
+/// Shared fixture for the off-hand recast tests: a zero-cost split Room in
+/// `zone` with both halves printed, so the only cast gate under test is the
+/// per-cast face choice itself.
+fn split_room_in_zone(state: &mut GameState, card_id: CardId, zone: Zone) -> ObjectId {
+    let room = create_object(
+        state,
+        card_id,
+        PlayerId(0),
+        "Moldering Gym".to_string(),
+        zone,
+    );
+    let obj = state.objects.get_mut(&room).unwrap();
+    obj.card_types.core_types.push(CoreType::Enchantment);
+    obj.card_types.subtypes.push("Room".to_string());
+    obj.mana_cost = ManaCost::generic(0);
+    let mut back = room_back_face("Weight Room");
+    back.card_types.core_types.push(CoreType::Enchantment);
+    back.card_types.subtypes.push("Room".to_string());
+    obj.back_face = Some(back);
+    room
+}
+
+/// Drives one full front-half cast of `room` and pins the per-cast choice
+/// contract (CR 601.2b + CR 709.3, #7565): the cast prompts, the SAME cast
+/// never re-prompts after the choice, and the chosen face resolves onto the
+/// battlefield.
+fn cast_room_choosing_front(state: &mut GameState, room: ObjectId, card_id: CardId, label: &str) {
+    use crate::game::stack;
+
+    let first = apply_as_current(
+        state,
+        GameAction::CastSpell {
+            object_id: room,
+            card_id,
+            targets: vec![],
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(first.waiting_for, WaitingFor::ModalFaceChoice { .. }),
+        "the {label} cast must offer the face choice, got {:?}",
+        first.waiting_for
+    );
+    let after_choice =
+        apply_as_current(state, GameAction::ChooseModalFace { back_face: false }).unwrap();
+    assert!(
+        !matches!(after_choice.waiting_for, WaitingFor::ModalFaceChoice { .. }),
+        "the SAME {label} cast must not re-prompt after the choice"
+    );
+    assert!(
+        state.stack.iter().any(|entry| entry.source_id == room),
+        "the chosen face must be on the stack for the {label} cast"
+    );
+    let mut events = Vec::new();
+    stack::resolve_top(state, &mut events);
+    assert_eq!(
+        state.objects[&room].zone,
+        Zone::Battlefield,
+        "the Room must resolve onto the battlefield for the {label} cast"
+    );
+}
+
+/// CR 601.2a + CR 709.3 (#7565): the per-cast face choice is zone-agnostic.
+/// A split Room cast out of the GRAVEYARD under a static graveyard-cast
+/// permission (Conduit class) must announce its half per CR 601.2b on every
+/// cast: the initial cast prompts, that cast never re-prompts, and the next
+/// cast from the graveyard prompts afresh.
+#[test]
+fn a_room_cast_from_the_graveyard_offers_the_face_choice_per_cast() {
+    use crate::types::ability::CardPlayMode;
+
+    let mut state = setup_game_at_main_phase();
+    let permission_source = create_object(
+        &mut state,
+        CardId(905),
+        PlayerId(0),
+        "Graveyard Conduit".to_string(),
+        Zone::Battlefield,
+    );
+    state
+        .objects
+        .get_mut(&permission_source)
+        .unwrap()
+        .static_definitions
+        .push(
+            // CR 601.2a: graveyard cast via static permission;
+            // `Unlimited` (Conduit class) so the recast needs no new turn.
+            StaticDefinition::new(StaticMode::GraveyardCastPermission {
+                frequency: CastFrequency::Unlimited,
+                play_mode: CardPlayMode::Cast,
+                graveyard_destination_replacement: None,
+                extra_cost: None,
+                enters_with_counter: None,
+            })
+            .affected(TargetFilter::Any),
+        );
+    let room = split_room_in_zone(&mut state, CardId(906), Zone::Graveyard);
+
+    cast_room_choosing_front(&mut state, room, CardId(906), "graveyard");
+
+    // Destroyed back into the graveyard; the same permission backs the recast.
+    let mut events = Vec::new();
+    crate::game::zones::move_to_zone(&mut state, room, Zone::Graveyard, &mut events);
+    let second = apply_as_current(
+        &mut state,
+        GameAction::CastSpell {
+            object_id: room,
+            card_id: CardId(906),
+            targets: vec![],
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(second.waiting_for, WaitingFor::ModalFaceChoice { .. }),
+        "the SECOND graveyard cast must offer the face choice again (#7565), got {:?}",
+        second.waiting_for
+    );
+}
+
+/// CR 601.2a + CR 709.3 (#7565): the EXILE leg of the recast class. A split
+/// Room cast out of exile under a persistent static exile-cast permission
+/// (The Matrix of Time class, pay-normal-cost) must announce its half per
+/// CR 601.2b on every cast: the initial cast prompts, that cast never
+/// re-prompts, and a later cast after the source re-exiles it prompts afresh.
+#[test]
+fn a_room_cast_from_exile_offers_the_face_choice_per_cast() {
+    use crate::types::ability::CardPlayMode;
+    use crate::types::game_state::{ExileLink, ExileLinkKind};
+    use crate::types::statics::{ExileCardPool, ExileCastCost, ExileCastTiming};
+
+    let mut state = setup_game_at_main_phase();
+    let permission_source = create_object(
+        &mut state,
+        CardId(907),
+        PlayerId(0),
+        "Exile Conduit".to_string(),
+        Zone::Battlefield,
+    );
+    state
+        .objects
+        .get_mut(&permission_source)
+        .unwrap()
+        .static_definitions
+        .push(
+            // CR 601.2a: exile cast via static permission; the
+            // persistent pool + `Unlimited` keep the recast in the same turn.
+            StaticDefinition::new(StaticMode::ExileCastPermission {
+                frequency: CastFrequency::Unlimited,
+                play_mode: CardPlayMode::Cast,
+                cost: ExileCastCost::PayNormalCost,
+                pool: ExileCardPool::Persistent,
+                timing: ExileCastTiming::AnyTime,
+                mana_spend_permission: None,
+                grants_flash: false,
+                extra_cost: None,
+                enters_with_counter: None,
+            })
+            .affected(TargetFilter::Any),
+        );
+    let room = split_room_in_zone(&mut state, CardId(908), Zone::Exile);
+    state.exile_links.push(ExileLink {
+        exiled_id: room,
+        source_id: permission_source,
+        kind: ExileLinkKind::TrackedBySource,
+    });
+
+    cast_room_choosing_front(&mut state, room, CardId(908), "exile");
+
+    // The source exiles it again. Leaving exile for the stack dropped the
+    // old link (CR 400.7: the `move_to_zone` exit path retains
+    // `exile_links` away), so the fresh exile event installs a fresh link.
+    let mut events = Vec::new();
+    crate::game::zones::move_to_zone(&mut state, room, Zone::Exile, &mut events);
+    assert!(
+        !state.exile_links.iter().any(|link| link.exiled_id == room),
+        "leaving exile must have dropped the stale link"
+    );
+    state.exile_links.push(ExileLink {
+        exiled_id: room,
+        source_id: permission_source,
+        kind: ExileLinkKind::TrackedBySource,
+    });
+    let second = apply_as_current(
+        &mut state,
+        GameAction::CastSpell {
+            object_id: room,
+            card_id: CardId(908),
+            targets: vec![],
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(second.waiting_for, WaitingFor::ModalFaceChoice { .. }),
+        "the SECOND exile cast must offer the face choice again (#7565), got {:?}",
+        second.waiting_for
+    );
+}
+
 /// CR 106.6 + CR 116.2m + CR 709.5e: Smoky Lounge produces {R}{R} restricted
 /// to "cast Room spells and unlock doors". The door-unlock half lowers to
 /// `OnlyForSpecialAction(UnlockDoor)`; paying a Room's unlock cost routes
@@ -3157,6 +3675,191 @@ fn cancel_auto_pass_routes_by_actor() {
     );
 }
 
+#[test]
+fn cancelling_a_session_representative_restores_the_pre_overlay_preferences() {
+    use crate::types::game_state::{
+        AutoPassMode, StackResolutionAutoPassOverlay, StackResolutionBudget,
+        StackResolutionEntryFence, StackResolutionPolicy, StackResolutionSession, TurnBoundary,
+    };
+
+    let mut state = setup_game_at_main_phase();
+    let entry = no_op_stack_entry(7_777, PlayerId(0));
+    state.stack.push_back(entry.clone());
+    state.auto_pass.insert(
+        PlayerId(0),
+        AutoPassMode::UntilStackEmpty {
+            initial_stack_len: 1,
+            policy: StackResolutionPolicy::Committed,
+        },
+    );
+    let baseline = BTreeMap::from([(
+        PlayerId(1),
+        AutoPassMode::UntilTurnBoundary {
+            until: TurnBoundary::MyNextTurnStart,
+        },
+    )]);
+    state.stack_resolution_session = Some(StackResolutionSession {
+        entries: vec![StackResolutionEntryFence::capture(&entry)],
+        cursor: 0,
+        representatives: [PlayerId(0)].into_iter().collect(),
+        verified_pass_representatives: BTreeSet::new(),
+        budget: StackResolutionBudget::Unlimited,
+        policy: StackResolutionPolicy::Committed,
+        auto_pass_overlay: StackResolutionAutoPassOverlay {
+            baseline: baseline.clone(),
+        },
+    });
+
+    apply(&mut state, PlayerId(0), GameAction::CancelAutoPass)
+        .expect("the representative may cancel its own session");
+
+    assert!(state.stack_resolution_session.is_none());
+    assert_eq!(
+        state.auto_pass,
+        baseline.into_iter().collect::<HashMap<_, _>>()
+    );
+}
+
+#[test]
+fn representative_replacement_recaptures_the_restored_baseline() {
+    use crate::types::game_state::{
+        AutoPassMode, AutoPassRequest, StackResolutionAutoPassOverlay, StackResolutionBudget,
+        StackResolutionEntryFence, StackResolutionPolicy, StackResolutionSession, TurnBoundary,
+    };
+
+    let mut state = setup_game_at_main_phase();
+    let entry = no_op_stack_entry(7_779, PlayerId(0));
+    state.stack.push_back(entry.clone());
+    let baseline = BTreeMap::from([(
+        PlayerId(1),
+        AutoPassMode::UntilTurnBoundary {
+            until: TurnBoundary::MyNextTurnStart,
+        },
+    )]);
+    state.auto_pass.insert(
+        PlayerId(0),
+        AutoPassMode::UntilStackEmpty {
+            initial_stack_len: 1,
+            policy: StackResolutionPolicy::Committed,
+        },
+    );
+    state.stack_resolution_session = Some(StackResolutionSession {
+        entries: vec![StackResolutionEntryFence::capture(&entry)],
+        cursor: 0,
+        representatives: [PlayerId(0)].into_iter().collect(),
+        verified_pass_representatives: BTreeSet::new(),
+        budget: StackResolutionBudget::Unlimited,
+        policy: StackResolutionPolicy::Committed,
+        auto_pass_overlay: StackResolutionAutoPassOverlay {
+            baseline: baseline.clone(),
+        },
+    });
+
+    let response_id = create_object(
+        &mut state,
+        CardId(7_780),
+        PlayerId(1),
+        "Priority Response".to_string(),
+        Zone::Battlefield,
+    );
+    let response = state
+        .objects
+        .get_mut(&response_id)
+        .expect("the response permanent was just created");
+    response.card_types.core_types.push(CoreType::Artifact);
+    Arc::make_mut(&mut response.abilities).push(AbilityDefinition::new(
+        AbilityKind::Activated,
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        },
+    ));
+
+    apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .expect("the representative may replace its live session");
+
+    assert_eq!(
+        state
+            .stack_resolution_session
+            .as_ref()
+            .expect("replacement installs a fresh session")
+            .auto_pass_overlay
+            .baseline,
+        baseline,
+        "replacement must not capture the previous overlay as its new baseline"
+    );
+    apply(&mut state, PlayerId(0), GameAction::CancelAutoPass)
+        .expect("the representative may cancel the replacement");
+    assert_eq!(
+        state.auto_pass,
+        baseline.into_iter().collect::<HashMap<_, _>>()
+    );
+}
+
+#[test]
+fn elimination_restores_session_baseline_before_departing_preferences_are_cleaned() {
+    use crate::types::game_state::{
+        AutoPassMode, StackResolutionAutoPassOverlay, StackResolutionBudget,
+        StackResolutionEntryFence, StackResolutionPolicy, StackResolutionSession, TurnBoundary,
+    };
+
+    let mut state = setup_game_at_main_phase();
+    let entry = no_op_stack_entry(7_778, PlayerId(0));
+    state.stack.push_back(entry.clone());
+    state.auto_pass.insert(
+        PlayerId(0),
+        AutoPassMode::UntilStackEmpty {
+            initial_stack_len: 1,
+            policy: StackResolutionPolicy::Committed,
+        },
+    );
+    let baseline = BTreeMap::from([
+        (
+            PlayerId(0),
+            AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+            },
+        ),
+        (
+            PlayerId(1),
+            AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::MyNextTurnStart,
+            },
+        ),
+    ]);
+    state.stack_resolution_session = Some(StackResolutionSession {
+        entries: vec![StackResolutionEntryFence::capture(&entry)],
+        cursor: 0,
+        representatives: [PlayerId(0)].into_iter().collect(),
+        verified_pass_representatives: BTreeSet::new(),
+        budget: StackResolutionBudget::Unlimited,
+        policy: StackResolutionPolicy::Committed,
+        auto_pass_overlay: StackResolutionAutoPassOverlay {
+            baseline: baseline.clone(),
+        },
+    });
+
+    let mut events = Vec::new();
+    crate::game::elimination::eliminate_player(&mut state, PlayerId(0), &mut events);
+
+    assert!(state.stack_resolution_session.is_none());
+    assert!(
+        !state.auto_pass.contains_key(&PlayerId(0)),
+        "the departing seat is cleaned only after the baseline is restored"
+    );
+    assert_eq!(
+        state.auto_pass.get(&PlayerId(1)),
+        baseline.get(&PlayerId(1)),
+        "the survivor's pre-overlay preference is retained"
+    );
+}
+
 /// Actor-scoped preference mutations must not advance an already-active
 /// auto-pass session. Before admission moved into `apply`, server-core returned
 /// directly for these six actions; routing through the shared boundary must
@@ -3273,7 +3976,7 @@ fn actor_scoped_preferences_do_not_advance_active_auto_pass() {
                 state
                     .may_trigger_auto_choices
                     .iter()
-                    .all(|record| record.key.player != PlayerId(1)),
+                    .all(|record| record.selector.player() != PlayerId(1)),
                 "SetMayTriggerAutoChoice::ClearAll must clear the actor's choices"
             ),
             GameAction::SetTriggerOrderTemplate { .. } => assert!(
@@ -3541,7 +4244,9 @@ fn set_may_trigger_auto_choice_remove_revokes_actor_choice() {
         &mut state,
         PlayerId(0),
         GameAction::SetMayTriggerAutoChoice {
-            op: MayTriggerAutoChoiceOp::Remove { key },
+            op: MayTriggerAutoChoiceOp::Remove {
+                selector: crate::types::game_state::MayTriggerAutoChoiceSelector::exact(key),
+            },
         },
     )
     .expect("SetMayTriggerAutoChoice is legal in any state");
@@ -3586,7 +4291,7 @@ fn set_may_trigger_auto_choice_clear_all_is_actor_scoped() {
         "ClearAll drops only the acting player's auto-choices"
     );
     assert_eq!(
-        state.may_trigger_auto_choices[0].key.player,
+        state.may_trigger_auto_choices[0].selector.player(),
         PlayerId(1),
         "another player's auto-choice survives an actor's ClearAll"
     );
@@ -3622,7 +4327,9 @@ fn set_may_trigger_auto_choice_remove_cannot_target_another_player() {
         PlayerId(1),
         GameAction::SetMayTriggerAutoChoice {
             op: MayTriggerAutoChoiceOp::Remove {
-                key: p0_key.clone(),
+                selector: crate::types::game_state::MayTriggerAutoChoiceSelector::exact(
+                    p0_key.clone(),
+                ),
             },
         },
     )
@@ -3696,8 +4403,9 @@ fn set_trigger_order_template_clear_all_is_actor_scoped() {
     );
 }
 
-/// CR 117.3d: an `UntilEndOfTurn` auto-pass session normally ends (Finish) when
-/// an opponent-controlled trigger tops the stack, so the player can respond.
+/// CR 117.3d: an `UntilEndOfTurn` auto-pass session pauses (Break) when an
+/// opponent-controlled trigger tops the stack, so the player can respond while
+/// retaining the session for after the stack entry resolves.
 /// A matching yield keeps the session auto-passing (Pass) through that trigger;
 /// a non-yielded opponent trigger still Finishes.
 #[test]
@@ -3712,13 +4420,13 @@ fn until_end_of_turn_yielded_opponent_top_passes_not_finishes() {
     let source = ObjectId(500);
     push_token_trigger(&mut state, source, PlayerId(1), Some(4), Some(CardId(77)));
 
-    // Without a yield: the opponent trigger ends the session.
+    // Without a yield: the opponent trigger pauses the session.
     assert!(
         matches!(
             priority_auto_pass_decision(&state, PlayerId(0)),
-            AutoPassDecision::Finish
+            AutoPassDecision::Break
         ),
-        "reach-guard: an un-yielded opponent top finishes the session"
+        "reach-guard: an un-yielded opponent top pauses the session"
     );
 
     // With a matching yield: keep auto-passing through it.
@@ -3738,7 +4446,7 @@ fn until_end_of_turn_yielded_opponent_top_passes_not_finishes() {
         "CR 117.3d: a matching yield keeps the UntilEndOfTurn session passing"
     );
 
-    // A different, non-yielded opponent trigger still finishes.
+    // A different, non-yielded opponent trigger still pauses.
     state.stack.clear();
     push_token_trigger(
         &mut state,
@@ -3750,9 +4458,9 @@ fn until_end_of_turn_yielded_opponent_top_passes_not_finishes() {
     assert!(
         matches!(
             priority_auto_pass_decision(&state, PlayerId(0)),
-            AutoPassDecision::Finish
+            AutoPassDecision::Break
         ),
-        "a non-yielded opponent trigger still finishes the session"
+        "a non-yielded opponent trigger still pauses the session"
     );
 }
 
@@ -4759,7 +5467,7 @@ fn new_game_creates_two_player_state() {
 }
 
 /// CR 117.1c + CR 503.2: After Untap (no priority), the active player
-/// receives priority during their Upkeep step. CR 103.7a skips the
+/// receives priority during their Upkeep step. CR 103.8a skips the
 /// first-turn Draw step entirely, so passing both priorities through
 /// Upkeep lands at PreCombatMain.
 #[test]
@@ -4777,7 +5485,7 @@ fn start_game_pauses_at_first_turn_upkeep_priority() {
         }
     ));
 
-    // Both players pass through Upkeep → CR 103.7a skips Draw → PreCombatMain.
+    // Both players pass through Upkeep → CR 103.8a skips Draw → PreCombatMain.
     apply_as_current(&mut state, GameAction::PassPriority).unwrap();
     let result = apply_as_current(&mut state, GameAction::PassPriority).unwrap();
     assert_eq!(state.phase, Phase::PreCombatMain);
@@ -4807,6 +5515,39 @@ fn start_game_skips_draw_on_first_turn() {
     // Card should still be in library (draw skipped on turn 1)
     assert!(state.players[0].library.contains(&id));
     assert!(!state.players[0].hand.contains(&id));
+}
+
+// CR 103.8 + CR 500: the starting player TAKES their first turn, so it must
+// count toward `turns_taken` like every other turn. Turn 1 is established
+// inline by the game-start path rather than by `turns::start_next_turn`, so
+// before this was fixed the starting player stayed permanently one turn behind
+// every other seat — `QuantityRef::TurnsTaken` read low for exactly the player
+// who had taken the most turns.
+#[test]
+fn start_game_counts_the_starting_players_first_turn() {
+    for starting_player in [PlayerId(0), PlayerId(1)] {
+        let mut state = new_game(42);
+        start_game_with_starting_player(&mut state, starting_player);
+
+        assert_eq!(
+            state.players[starting_player.0 as usize].turns_taken, 1,
+            "the starting player's own first turn counts"
+        );
+        for player in state.players.iter() {
+            if player.id != starting_player {
+                assert_eq!(
+                    player.turns_taken, 0,
+                    "a player who has not had a turn yet counts none"
+                );
+            }
+        }
+    }
+
+    // `start_game_skip_mulligan` establishes turn 1 through the same inline
+    // path and must agree.
+    let mut state = new_game(42);
+    start_game_skip_mulligan(&mut state);
+    assert_eq!(state.players[0].turns_taken, 1);
 }
 
 #[test]
@@ -4852,7 +5593,7 @@ fn integration_full_turn_cycle() {
     let mut state = new_game(42);
 
     // Start game (turn 1, player 0) — engine pauses at Upkeep priority per
-    // CR 117.1c. CR 103.7a skips the first-turn Draw step entirely.
+    // CR 117.1c. CR 103.8a skips the first-turn Draw step entirely.
     // (Libraries are empty, which is fine because the first-turn player
     // never draws and we stop the test before turn 2's draw step.)
     let _result = start_game_with_starting_player(&mut state, PlayerId(0));
@@ -4962,7 +5703,7 @@ fn integration_play_land_then_pass() {
 
     // CR 305.3 + CR 117.1c: lands are sorcery-speed, so pass Upkeep
     // priority (both players) to reach PreCombatMain before playing.
-    // CR 103.7a skips first-turn Draw so two passes is enough.
+    // CR 103.8a skips first-turn Draw so two passes is enough.
     apply_as_current(&mut state, GameAction::PassPriority).unwrap();
     apply_as_current(&mut state, GameAction::PassPriority).unwrap();
     assert_eq!(state.phase, Phase::PreCombatMain);
@@ -6786,7 +7527,7 @@ fn full_turn_integration_with_mulligan() {
     ));
     assert_eq!(state.phase, Phase::Upkeep);
 
-    // Drain Upkeep priority (turn 1 skips Draw per CR 103.7a) to reach Main.
+    // Drain Upkeep priority (turn 1 skips Draw per CR 103.8a) to reach Main.
     apply_as_current(&mut state, GameAction::PassPriority).unwrap();
     apply_as_current(&mut state, GameAction::PassPriority).unwrap();
     assert_eq!(state.phase, Phase::PreCombatMain);
@@ -10298,7 +11039,7 @@ fn reorder_hand_rejects_non_permutation() {
     // Wrong length.
     let err = apply(&mut state, p0, GameAction::ReorderHand { order: vec![a] })
         .expect_err("wrong length must error");
-    assert!(matches!(err, EngineError::InvalidAction(_)));
+    assert!(matches!(err, EngineError::StaleAction));
     assert_eq!(
         state, before,
         "a reducer rejection must restore transient boundary state as well as the hand"
@@ -10314,7 +11055,7 @@ fn reorder_hand_rejects_non_permutation() {
         },
     )
     .expect_err("stranger id must error");
-    assert!(matches!(err, EngineError::InvalidAction(_)));
+    assert!(matches!(err, EngineError::StaleAction));
     assert_eq!(
         state, before,
         "each rejected reducer attempt must leave the complete state unchanged"
@@ -11789,56 +12530,172 @@ fn morph_casts_face_down_under_multiple_name_prohibitions() {
     );
 }
 
-/// LOW-2 (CR 732.2a / CR 111.10): `derived_fodder_class` is the single-new-object gate that
-/// guarantees the boundary Tokens mint's per-cycle fodder count k ≡ 1. It returns `Some(class)`
-/// for a period that reproduced EXACTLY one new battlefield object, and `None` for a period that
-/// reproduced two+ (a non-certifiable multi-fodder shape ⇒ no `Tokens` stash ⇒ no k·N undercount).
-/// This is the structural proof behind the k≡1 annotation at the boundary mint and on the
-/// `PersistentAxisMaterialization::Tokens` variant.
+/// Two new battlefield objects created identically (`name`, types, P/T, controller, zone), plus
+/// the `before` frame they are diffed against. The shared fixture of rows A-1 / A-2 / A-2b: every
+/// row starts from a HOMOGENEOUS pair and applies at most ONE post-construction mutation, so the
+/// field it moves is the only thing that can explain its verdict.
 ///
-/// REVERT-FAILING assertion: delete `if new_ids.next().is_some() { return None }` in
-/// `derived_fodder_class` (engine.rs) ⇒ the two-new-object case returns `Some(first)` ⇒ the
-/// `is_none()` assert below flips to FAIL. Non-vacuity: the paired one-new-object `Some` case is
-/// the positive reach-guard (the gate genuinely admits the k≡1 shape).
-#[test]
-fn derived_fodder_class_is_single_new_object_gate() {
+/// `create_object`'s name argument writes BOTH `name` and `base_name` (`game_object.rs`), so it
+/// can never be the discriminating knob — moving it moves `object_content_eq`'s `name` conjunct
+/// AND `CopiableValues.name` at once. Every row below mutates a field directly instead.
+fn fodder_multiset_frames(
+    mutate: impl FnOnce(&mut GameState, ObjectId, ObjectId),
+) -> (GameState, GameState) {
     let before = GameState::new_two_player(7);
-
-    // One new battlefield object across the period ⇒ Some(class) (the k≡1 certifiable shape).
-    let mut after_one = before.clone();
-    let saproling = create_object(
-        &mut after_one,
+    let mut after = before.clone();
+    let a = create_object(
+        &mut after,
         CardId(1),
         PlayerId(0),
         "Saproling".to_string(),
         Zone::Battlefield,
     );
-    let class = derived_fodder_class(&before, &after_one);
-    assert!(
-        class.as_ref().is_some_and(|o| o.id == saproling),
-        "reach-guard: one new battlefield object ⇒ the reproduced fodder class; got {class:?}"
-    );
-
-    // Two new battlefield objects across the period ⇒ None: a multi-fodder period is not this
-    // shape, so no `Tokens` stash is registered and the k>1 undercount is unreachable.
-    let mut after_two = before.clone();
-    create_object(
-        &mut after_two,
+    let b = create_object(
+        &mut after,
         CardId(1),
         PlayerId(0),
         "Saproling".to_string(),
         Zone::Battlefield,
     );
-    create_object(
-        &mut after_two,
-        CardId(2),
+    mutate(&mut after, a, b);
+    // Reach-guard, holding under EVERY revert probe: the fixture genuinely produced two new
+    // battlefield entries. Without it a fixture bug that created zero new objects would make
+    // every `is_none()` row below pass for the wrong reason.
+    assert_eq!(
+        after.battlefield.len(),
+        before.battlefield.len() + 2,
+        "reach-guard: the fixture must produce exactly two new battlefield objects"
+    );
+    (before, after)
+}
+
+/// CR 732.2a / CR 111.3 / CR 707.2: `derived_fodder_class` is the ONE-CLASS gate that gives the
+/// boundary `Tokens` mint its per-cycle fodder count k. It returns `Some((class, k))` for a period
+/// whose new battlefield objects are all one homogeneous class, and `None` otherwise (a
+/// heterogeneous multi-fodder shape ⇒ no `Tokens` stash ⇒ no mint from an unrepresentative profile).
+///
+/// HOMOGENEITY IS A CONJUNCTION and each conjunct has its own row: `fodder_content_eq` (A-2) and
+/// `intrinsic_copiable_values` (A-2b). A-1 is the positive; A-2c is the fail-closed reconciliation.
+///
+/// REVERT-FAILING assertions: **A-1** restore `if new_ids.next().is_some() { return None }` ⇒ k=2
+/// returns `None`; **A-2** delete the `fodder_content_eq` conjunct ⇒ the counter-differing pair
+/// returns `Some((class, 2))` (`CopiableValues` carries no counters field, so the other conjunct
+/// cannot red it); **A-2b** delete the `intrinsic_copiable_values` conjunct ⇒ the
+/// `base_card_types`-differing pair returns `Some((class, 2))`; **A-2c** delete the `.then_some`
+/// reconciliation ⇒ the torn frame returns `Some((class, 1))`. Each ⇒ FAILS.
+#[test]
+fn derived_fodder_class_is_one_class_multiset_gate() {
+    // A-1 (positive) — a homogeneous k=2 period classifies AND reports k.
+    let (before, after) = fodder_multiset_frames(|_, _, _| {});
+    let derived = derived_fodder_class(&before, &after);
+    assert!(
+        derived.is_some(),
+        "A-1: a homogeneous two-object period is a certifiable fodder multiset; got {derived:?}"
+    );
+    let (class, k) = derived.expect("asserted Some above");
+    assert_eq!(
+        k, 2,
+        "A-1: the reported per-cycle count IS the member count"
+    );
+    assert_eq!(
+        class.name, "Saproling",
+        "A-1: the class is the reproduced fodder, not an unrelated object"
+    );
+
+    // A-1 reach-guard: the k≡1 shape still classifies, with k == 1.
+    let single_before = GameState::new_two_player(7);
+    let mut single_after = single_before.clone();
+    let lone = create_object(
+        &mut single_after,
+        CardId(1),
         PlayerId(0),
         "Saproling".to_string(),
         Zone::Battlefield,
     );
     assert!(
-        derived_fodder_class(&before, &after_two).is_none(),
-        "single-new-object gate: two new battlefield objects ⇒ None (delete the second-`next` \
-         guard and this flips to Some)"
+        derived_fodder_class(&single_before, &single_after)
+            .is_some_and(|(o, k)| o.id == lone && k == 1),
+        "A-1 reach-guard: one new battlefield object ⇒ that class with k == 1"
+    );
+
+    // A-2 (matched negative, MUTABLE axis) — a counter difference makes the multiset
+    // heterogeneous under `fodder_content_eq` (`object_content_eq` compares `counters`).
+    // CR 707.2: "Other effects …, status, counters, and stickers are
+    // not copied", so `CopiableValues` has no counters field and this moves EXACTLY one conjunct.
+    // `CounterType::Stun` is deliberate: `is_monotone_loop_resource()` is false for it, so
+    // `project_object_for_loop`'s `retain` cannot strip it if projection is ever reordered ahead
+    // of this derivation.
+    let (before, after) = fodder_multiset_frames(|state, _a, b| {
+        state
+            .objects
+            .get_mut(&b)
+            .expect("fixture object b exists")
+            .counters
+            .insert(CounterType::Stun, 1);
+    });
+    assert!(
+        derived_fodder_class(&before, &after).is_none(),
+        "A-2: a counter-differing pair is NOT one fodder class (delete the `fodder_content_eq` \
+         conjunct and this flips to Some)"
+    );
+
+    // A-2b (matched negative, COPIABLE axis) — the pair the OLD, content-only predicate would
+    // have accepted. `intrinsic_copiable_values` folds `obj.base_card_types` into
+    // `CopiableValues.card_types` (`printed_cards.rs`), and `object_content_eq` compares NEITHER
+    // `card_types` NOR `base_card_types` — asserted below rather than claimed.
+    let (before, after) = fodder_multiset_frames(|state, _a, b| {
+        state
+            .objects
+            .get_mut(&b)
+            .expect("fixture object b exists")
+            .base_card_types = CardType {
+            supertypes: vec![],
+            core_types: vec![CoreType::Artifact],
+            subtypes: vec![],
+        };
+    });
+    {
+        let a_obj = after
+            .objects
+            .values()
+            .find(|o| o.base_card_types.core_types != vec![CoreType::Artifact])
+            .expect("the unmutated member");
+        let b_obj = after
+            .objects
+            .values()
+            .find(|o| o.base_card_types.core_types == vec![CoreType::Artifact])
+            .expect("the mutated member");
+        assert!(
+            crate::analysis::resource::fodder_content_eq(a_obj, b_obj),
+            "A-2b non-vacuity: the PRE-EXISTING content predicate cannot tell these two apart — \
+             so only the `CopiableValues` conjunct can refuse them"
+        );
+    }
+    assert!(
+        derived_fodder_class(&before, &after).is_none(),
+        "A-2b: members differing on what the MINT copies are not one class (delete the \
+         `intrinsic_copiable_values` conjunct and this flips to Some)"
+    );
+
+    // A-2c (fail-closed reconciliation) — a torn frame: a battlefield id with no `objects` entry
+    // is skipped by the `filter_map`, and must not be silently dropped from k.
+    let torn_before = GameState::new_two_player(7);
+    let mut torn_after = torn_before.clone();
+    create_object(
+        &mut torn_after,
+        CardId(1),
+        PlayerId(0),
+        "Saproling".to_string(),
+        Zone::Battlefield,
+    );
+    torn_after.battlefield.push_back(ObjectId(999_999));
+    assert!(
+        !torn_after.objects.contains_key(&ObjectId(999_999)),
+        "A-2c reach-guard: the torn id must genuinely have no `objects` entry"
+    );
+    assert!(
+        derived_fodder_class(&torn_before, &torn_after).is_none(),
+        "A-2c: a torn frame is refused, not under-counted (delete the `.then_some` \
+         reconciliation and this returns Some((class, 1)))"
     );
 }

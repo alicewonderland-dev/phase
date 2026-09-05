@@ -1,14 +1,21 @@
 import { act } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { EngineAdapter, GameEvent, GameState } from "../../adapter/types";
+import type { ActionRejection, EngineAdapter, GameEvent, GameState } from "../../adapter/types";
+import { actionRejectionError } from "../../adapter/types";
+import { useAppNotificationStore } from "../../stores/appToastStore";
 import { buildEngineAdapterMock } from "../../test/factories/engineAdapterFactory";
 import {
   buildGameState,
   buildStackEntry,
 } from "../../test/factories/gameStateFactory";
 import type { GameMode } from "../gameStore";
-import { hasRemoteHumans, isAuthorityRemote, useGameStore } from "../gameStore";
+import {
+  canExportAuthoritativeState,
+  hasRemoteHumans,
+  isAuthorityRemote,
+  useGameStore,
+} from "../gameStore";
 
 describe("game mode classification", () => {
   // The two questions the old `isMultiplayerMode` answered with one bit:
@@ -52,6 +59,20 @@ describe("game mode classification", () => {
     expect(isAuthorityRemote("local")).toBe(false);
   });
 
+  it.each(["ai", "local", "native-ai", "p2p-host"] as GameMode[])(
+    "allows authoritative bug reports when %s owns the state",
+    (mode) => {
+      expect(canExportAuthoritativeState(mode)).toBe(true);
+    },
+  );
+
+  it.each(["online", "p2p-join", "draft-match", "spectate"] as GameMode[])(
+    "blocks authoritative bug reports when %s only has a redacted view",
+    (mode) => {
+      expect(canExportAuthoritativeState(mode)).toBe(false);
+    },
+  );
+
   it("answers false to both for the pre-game null mode", () => {
     expect(isAuthorityRemote(null)).toBe(false);
     expect(hasRemoteHumans(null)).toBe(false);
@@ -68,6 +89,7 @@ describe("gameStore", () => {
         waitingFor: null,
         stateHistory: [],
       });
+      useAppNotificationStore.setState({ notification: null, expiresAt: 0 });
     });
   });
 
@@ -126,6 +148,55 @@ describe("gameStore", () => {
     expect(store.gameState).toEqual(state2);
     expect(store.events).toEqual(events);
     expect(adapter.submitAction).toHaveBeenCalledWith({ type: "PassPriority" }, 0);
+  });
+
+  it("surfaces a direct structured rejection at the first rendered related object", async () => {
+    const state = buildGameState();
+    const adapter = buildEngineAdapterMock(state);
+    await act(() => useGameStore.getState().initGame("test-id", adapter));
+    const first = document.createElement("div");
+    first.dataset.objectId = "200";
+    first.getBoundingClientRect = () => ({
+      x: -20, y: 10, top: 10, right: 20, bottom: 50, left: -20, width: 40, height: 40,
+      toJSON: () => ({}),
+    });
+    const second = document.createElement("div");
+    second.dataset.objectId = "201";
+    document.body.append(first, second);
+    const rejection: ActionRejection = {
+      code: "invalid_action",
+      disposition: "invalid",
+      message: "Engine error: ObjectId(200) must be blocked by 2 or more creatures",
+      related_object_ids: [200, 201],
+    };
+    adapter.submitAction.mockRejectedValue(actionRejectionError(rejection));
+
+    await expect(useGameStore.getState().dispatch({ type: "PassPriority" })).rejects.toMatchObject({
+      rejection,
+    });
+
+    expect(useAppNotificationStore.getState().notification).toEqual({
+      title: "Action failed",
+      description: rejection.message,
+      anchor: { x: 192, y: 62, placement: "below" },
+    });
+    first.remove();
+    second.remove();
+  });
+
+  it("silently drops a stale structured rejection from the direct dispatcher", async () => {
+    const state = buildGameState();
+    const adapter = buildEngineAdapterMock(state);
+    await act(() => useGameStore.getState().initGame("test-id", adapter));
+    adapter.submitAction.mockRejectedValue(actionRejectionError({
+      code: "stale_action",
+      disposition: "stale",
+      message: "This action is no longer current",
+      related_object_ids: [200],
+    }));
+
+    await expect(useGameStore.getState().dispatch({ type: "PassPriority" })).resolves.toEqual([]);
+    expect(useAppNotificationStore.getState().notification).toBeNull();
   });
 
   it("dispatch pushes to stateHistory for undoable actions", async () => {

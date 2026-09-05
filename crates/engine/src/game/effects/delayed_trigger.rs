@@ -143,13 +143,42 @@ pub fn resolve(
         }
     }
 
-    // CR 505.1 + CR 603.7a: "your next <phase>" binds the trigger to the
-    // ability's controller. The parser emits a placeholder `PlayerId(0)` in
-    // `AtNextPhaseForPlayer.player` because compile-time AST has no access to
-    // runtime player ids; rewrite here to the actual controller at resolve
-    // time. Mirrors the `bind_contextual_filter_to_condition` pattern above.
-    if let DelayedTriggerCondition::AtNextPhaseForPlayer { player, gate, .. } = &mut condition {
-        *player = ability.controller;
+    // CR 505.1 / CR 608.2c + CR 603.7a: "your next <phase>" binds the trigger
+    // to the ability's controller; "that player's next <phase>" binds it to a
+    // chained effect's target's OWNER (CR 400.3) instead — The Eternal
+    // Wanderer's +1 exiles up to one target ARTIFACT OR CREATURE that may
+    // belong to any player, so the delayed return must fire on ITS owner's
+    // next end step, not unconditionally on the ability's controller's. The
+    // parser emits a placeholder `PlayerId(0)` in `AtNextPhaseForPlayer.player`
+    // because compile-time AST has no access to runtime player ids; `binding`
+    // says which live player to rewrite it to. Mirrors the
+    // `bind_contextual_filter_to_condition` pattern above.
+    if let DelayedTriggerCondition::AtNextPhaseForPlayer {
+        player,
+        gate,
+        binding,
+        ..
+    } = &mut condition
+    {
+        *player = match binding {
+            crate::types::ability::DelayedTriggerPlayerBinding::Controller => ability.controller,
+            // CR 608.2c + CR 400.3: resolve "that player" from the first
+            // object among the parent effect's chosen targets — the exiled
+            // permanent's owner, invariant across the zone change that just
+            // moved it (CR 400.3 only relocates library/graveyard/hand
+            // destinations to the owner's own zone; it does not change who
+            // the owner IS). Falls back to the ability's controller if the
+            // parent target is somehow gone (e.g. a malformed chain with no
+            // object target) rather than leaving a stale sentinel PlayerId.
+            crate::types::ability::DelayedTriggerPlayerBinding::ParentTargetOwner => ability
+                .targets
+                .iter()
+                .find_map(|target| match target {
+                    TargetRef::Object(id) => state.objects.get(id).map(|obj| obj.owner),
+                    TargetRef::Player(_) => None,
+                })
+                .unwrap_or(ability.controller),
+        };
         // CR 513.2 + CR 603.7a: the "on your next turn" floor only becomes
         // concrete at creation. Stamp the symbolic parse-time gate to the actual
         // creation turn so the matcher skips the current turn's matching phase.
@@ -164,9 +193,20 @@ pub fn resolve(
     // "create … Warrior tokens … sacrifice them at the beginning of the next
     // end step" inner chain (Token → CreateDelayedTrigger{Sacrifice}) never
     // reached runtime when registered inside a WheneverEvent delayed trigger.
+    // CR 603.7c + CR 608.2c: A forward-result continuation can temporarily
+    // rebind `source_id` so an immediate SelfRef rider addresses the moved
+    // object. A delayed trigger remains owned by the trigger source, which the
+    // captured trigger provenance preserves across that local rebind.
+    let delayed_source_id = ability
+        .context
+        .forwarded_result_context
+        .as_ref()
+        .and(ability.trigger_source.as_ref())
+        .map(|source| source.identity.reference.object_id)
+        .unwrap_or(ability.source_id);
     let mut delayed_ability = crate::game::ability_utils::build_resolved_from_def(
         &effect_def,
-        ability.source_id,
+        delayed_source_id,
         ability.controller,
     );
 
@@ -210,7 +250,7 @@ pub fn resolve(
     // the creation-time fallback because their later phase event has no object
     // subject.
     //
-    // CR 603.7c: Computed ONCE here and reused for the creation-snapshot gate, the
+    // CR 603.7b: Computed ONCE here and reused for the creation-snapshot gate, the
     // `DelayedTrigger.one_shot` field. `condition`'s variant is not reassigned
     // between them.
     let one_shot = !matches!(
@@ -268,16 +308,22 @@ pub fn resolve(
         let targets = parent_target_snapshot(state, ability);
         let pins =
             if ability_pins_object_anaphor(&delayed_ability) && !condition_expects_referent_move {
-                targets
-                    .iter()
-                    .filter_map(|target| match target {
-                        TargetRef::Object(id) => state
-                            .objects
-                            .get(id)
-                            .map(crate::types::identifiers::ObjectIncarnationRef::from_object),
-                        TargetRef::Player(_) => None,
+                ability
+                    .context
+                    .forwarded_result_context
+                    .as_ref()
+                    .map(|context| context.object_incarnations.clone())
+                    .unwrap_or_else(|| {
+                        targets
+                            .iter()
+                            .filter_map(|target| match target {
+                                TargetRef::Object(id) => state.objects.get(id).map(
+                                    crate::types::identifiers::ObjectIncarnationRef::from_object,
+                                ),
+                                TargetRef::Player(_) => None,
+                            })
+                            .collect()
                     })
-                    .collect()
             } else {
                 Vec::new()
             };
@@ -369,7 +415,7 @@ pub fn resolve(
     // incarnation; a later re-entry must not be restamped when the trigger fires.
     delayed_ability.set_source_incarnation_recursive(source.map(|object| object.incarnation));
 
-    // CR 603.7c: Most delayed triggers fire once and are removed.
+    // CR 603.7b: Most delayed triggers fire once and are removed.
     // WheneverEvent triggers fire each time and persist until end-of-turn cleanup.
     // `one_shot` was computed once above (single source of truth) and is reused here.
     crate::game::triggers::install_delayed_trigger(
@@ -378,7 +424,7 @@ pub fn resolve(
             condition,
             ability: Box::new(delayed_ability),
             controller: ability.controller,
-            source_id: ability.source_id,
+            source_id: delayed_source_id,
             one_shot,
             provenance: crate::types::identifiers::DelayedInstallIdentity::LegacyDelayed,
         },
@@ -432,6 +478,13 @@ fn condition_uses_creation_time_provenance(condition: &DelayedTriggerCondition) 
 /// root chain and the node's own targets are empty do we fall back to the
 /// triggering source (unchanged).
 fn parent_target_snapshot(state: &GameState, ability: &ResolvedAbility) -> Vec<TargetRef> {
+    // CR 608.2c: A forward-result producer is a more recent antecedent than
+    // root-chain slots, node-local targets, or trigger-event fallback. Preserve
+    // the raw order for `ParentTargetSlot`; `Some([])` is a real zero-result and
+    // must not fall through to any older antecedent.
+    if let Some(context) = &ability.context.forwarded_result_context {
+        return context.targets.clone();
+    }
     let root_chain = crate::game::targeting::parent_chain_targets_from_root(state, ability);
     if !root_chain.is_empty() {
         return root_chain;
@@ -491,6 +544,9 @@ fn chain_declares_chooseable_target_slots(ability: &ResolvedAbility) -> bool {
 fn triggering_source_destination_zone(state: &GameState) -> Option<Zone> {
     match state.current_trigger_event.as_ref()? {
         GameEvent::ZoneChanged { to, .. } => Some(*to),
+        // CR 701.17c: the milled card is in "the zone it moved to from the
+        // library" — the destination this snapshot asks for.
+        GameEvent::Milled { to, .. } => Some(*to),
         _ => None,
     }
 }
@@ -1299,6 +1355,48 @@ mod tests {
     use crate::types::player::PlayerId;
     use crate::types::triggers::{PlaneswalkRole, TriggerMode};
 
+    /// V15 — CR 701.17c: a delayed trigger snapshotting a mill's
+    /// `TriggeringSource` asks where the card is, and the answer is "the zone it
+    /// moved to from the library". The match ends in `_ => None`, so the compiler
+    /// never asks for this arm and a mill would abstain.
+    #[test]
+    fn triggering_source_destination_zone_answers_for_a_milled_event() {
+        let mut state = GameState::new_two_player(42);
+
+        state.current_trigger_event = Some(GameEvent::Milled {
+            player_id: PlayerId(1),
+            object_id: ObjectId(7),
+            to: Zone::Exile,
+        });
+        assert_eq!(
+            triggering_source_destination_zone(&state),
+            Some(Zone::Exile)
+        );
+
+        // Live control: the zone-change event this arm sits beside still answers,
+        // and an event with no zone still abstains — so a blanket `Some` fails.
+        state.current_trigger_event = Some(GameEvent::ZoneChanged {
+            object_id: ObjectId(7),
+            from: Some(Zone::Library),
+            to: Zone::Graveyard,
+            record: Box::new(crate::types::game_state::ZoneChangeRecord::test_minimal(
+                ObjectId(7),
+                Some(Zone::Library),
+                Zone::Graveyard,
+            )),
+        });
+        assert_eq!(
+            triggering_source_destination_zone(&state),
+            Some(Zone::Graveyard)
+        );
+
+        state.current_trigger_event = Some(GameEvent::PermanentTapped {
+            object_id: ObjectId(7),
+            caused_by: None,
+        });
+        assert_eq!(triggering_source_destination_zone(&state), None);
+    }
+
     /// T5 (s25 site 1) — CR 603.7c + CR 608.2c: `concrete_parent_target_filter`
     /// binds a `ParentTargetSlot { index }` delayed-condition filter to the
     /// concrete parent object at that one declared slot (not the first). Pre-fix
@@ -1413,6 +1511,7 @@ mod tests {
                 phase: Phase::End,
                 player: PlayerId(0),
                 gate: Default::default(),
+                binding: Default::default(),
             }
         ));
         for condition in [
@@ -2831,6 +2930,7 @@ mod tests {
                     phase: Phase::PreCombatMain,
                     player: PlayerId(0),
                     gate: crate::types::ability::TurnGate::None,
+                    binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
                 },
                 effect: Box::new(effect_def),
                 uses_tracked_set: false,
@@ -2849,6 +2949,7 @@ mod tests {
                 phase: Phase::PreCombatMain,
                 player: PlayerId(1),
                 gate: crate::types::ability::TurnGate::None,
+                binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
             },
             "placeholder player must be rewritten to ability.controller"
         );
@@ -2878,6 +2979,7 @@ mod tests {
                     phase: Phase::End,
                     player: PlayerId(0),
                     gate: TurnGate::AfterCreationTurn,
+                    binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
                 },
                 effect: Box::new(effect_def),
                 uses_tracked_set: false,
@@ -2896,6 +2998,7 @@ mod tests {
                 phase: Phase::End,
                 player: PlayerId(0),
                 gate: TurnGate::After(5),
+                binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
             },
             "AfterCreationTurn must be stamped to After(state.turn_number)"
         );
@@ -2919,6 +3022,7 @@ mod tests {
                     phase: Phase::End,
                     player: PlayerId(0),
                     gate: crate::types::ability::TurnGate::None,
+                    binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
                 },
                 effect: Box::new(effect_def),
                 uses_tracked_set: false,
@@ -2974,6 +3078,7 @@ mod tests {
                     phase: Phase::End,
                     player: PlayerId(0),
                     gate: crate::types::ability::TurnGate::None,
+                    binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
                 },
                 effect: Box::new(inner_def),
                 uses_tracked_set: false,
@@ -3047,6 +3152,7 @@ mod tests {
                     phase: Phase::PreCombatMain,
                     player: PlayerId(0),
                     gate: crate::types::ability::TurnGate::None,
+                    binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
                 },
                 effect: Box::new(delayed_inner),
                 uses_tracked_set: false,
@@ -3152,6 +3258,7 @@ mod tests {
                     phase: Phase::PreCombatMain,
                     player: PlayerId(0),
                     gate: crate::types::ability::TurnGate::None,
+                    binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
                 },
                 effect: Box::new(delayed_inner),
                 uses_tracked_set: false,
@@ -3210,6 +3317,7 @@ mod tests {
                     phase: Phase::PreCombatMain,
                     player: PlayerId(0),
                     gate: crate::types::ability::TurnGate::None,
+                    binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
                 },
                 effect: Box::new(delayed_inner),
                 uses_tracked_set: false,
@@ -3262,6 +3370,7 @@ mod tests {
                     phase: Phase::PreCombatMain,
                     player: PlayerId(0),
                     gate: crate::types::ability::TurnGate::None,
+                    binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
                 },
                 effect: Box::new(delayed_inner),
                 uses_tracked_set: false,
@@ -3321,6 +3430,7 @@ mod tests {
                     phase: Phase::PreCombatMain,
                     player: PlayerId(0),
                     gate: crate::types::ability::TurnGate::None,
+                    binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
                 },
                 effect: Box::new(delayed_inner),
                 uses_tracked_set: false,
@@ -3369,6 +3479,7 @@ mod tests {
                     phase: Phase::PreCombatMain,
                     player: PlayerId(0),
                     gate: crate::types::ability::TurnGate::None,
+                    binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
                 },
                 effect: Box::new(delayed_inner),
                 uses_tracked_set: false,
@@ -3425,6 +3536,7 @@ mod tests {
                     phase: Phase::PreCombatMain,
                     player: PlayerId(0),
                     gate: crate::types::ability::TurnGate::None,
+                    binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
                 },
                 effect: Box::new(delayed_inner),
                 uses_tracked_set: false,
@@ -3476,6 +3588,7 @@ mod tests {
                     phase: Phase::PreCombatMain,
                     player: PlayerId(0),
                     gate: crate::types::ability::TurnGate::None,
+                    binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
                 },
                 effect: Box::new(delayed_inner),
                 uses_tracked_set: false,
@@ -3537,6 +3650,7 @@ mod tests {
                     phase: Phase::PreCombatMain,
                     player: PlayerId(0),
                     gate: crate::types::ability::TurnGate::None,
+                    binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
                 },
                 effect: Box::new(delayed_inner),
                 uses_tracked_set: false,
@@ -3956,6 +4070,7 @@ mod tests {
                 phase: Phase::Upkeep,
                 player: PlayerId(0),
                 gate: Default::default(),
+                binding: Default::default(),
             }
         ));
 

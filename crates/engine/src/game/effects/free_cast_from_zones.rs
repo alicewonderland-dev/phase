@@ -9,7 +9,9 @@ use crate::types::zones::Zone;
 /// CR 608.2g + CR 601.2 + CR 118.9: Open an interactive free-cast window.
 ///
 /// The controller may cast up to `count` spells matching `filter` from their
-/// own graveyard and/or hand (`zones`), each without paying its mana cost,
+/// own graveyard and/or hand (`zones`) — or ANY NUMBER of them when `count` is
+/// `None`, the unbounded "any number of spells" form whose only bound is
+/// candidate exhaustion — each without paying its mana cost,
 /// casting them one at a time during this resolution (CR 608.2g). When
 /// `max_total_mv` is `Some(n)`, the *running total* mana value of the spells
 /// cast this way must not exceed `n` (CR 202.3); the engine handler shrinks the
@@ -92,7 +94,12 @@ pub fn resolve(
     // legal casts, so skip the pause entirely and let the continuation (Exile ~)
     // run. The handler's decline path produces the same outcome, but short-
     // circuiting here avoids a no-op prompt.
-    if candidates.is_empty() || count == 0 {
+    //
+    // `count == Some(0)` is the printed-zero case only. `None` is the unbounded
+    // "any number of spells" form and must NOT short-circuit: its
+    // bound is the candidate list, which the emptiness check above already
+    // covers.
+    if candidates.is_empty() || count == Some(0) {
         return Ok(());
     }
 
@@ -153,7 +160,7 @@ pub(crate) fn eligible_candidates(
             let zone_ids = match zone {
                 Zone::Graveyard => &player.graveyard,
                 Zone::Hand => &player.hand,
-                // CR 400.10a + CR 608.2g: Exile is a shared zone — the whole pile
+                // CR 400.1 + CR 608.2g: Exile is a shared zone — the whole pile
                 // is scanned and the `filter` (e.g. `ExiledBySource` +
                 // `Not(InTrackedSet)`) narrows it to this resolution's linked set
                 // regardless of who owns the exiled cards (Plargg and Nassari
@@ -529,7 +536,7 @@ mod tests {
         );
         let ability = ResolvedAbility::new(
             Effect::FreeCastFromZones {
-                count: 2,
+                count: Some(2),
                 max_total_mv: Some(6),
                 filter: instant_sorcery_filter(),
                 zones: vec![Zone::Graveyard, Zone::Hand],
@@ -575,7 +582,7 @@ mod tests {
         );
         let ability = ResolvedAbility::new(
             Effect::FreeCastFromZones {
-                count: 2,
+                count: Some(2),
                 max_total_mv: Some(6),
                 filter: instant_sorcery_filter(),
                 zones: vec![Zone::Graveyard, Zone::Hand],
@@ -601,7 +608,7 @@ mod tests {
             } => {
                 assert_eq!(*player, PlayerId(0));
                 assert_eq!(candidates, &vec![instant]);
-                assert_eq!(*remaining_casts, 2);
+                assert_eq!(*remaining_casts, Some(2));
                 assert_eq!(*remaining_mv_budget, Some(6));
                 assert_eq!(
                     graveyard_replacement.as_ref(),

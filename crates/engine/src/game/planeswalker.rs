@@ -834,6 +834,10 @@ mod tests {
         // turn for every planeswalker regardless of controller. The reset is
         // global, so it fires on the very first `start_next_turn` (which makes
         // PlayerId(1) the active player) — not two turns later.
+        state.stack.clear();
+        state.waiting_for = WaitingFor::Priority {
+            player: state.priority_player,
+        };
         crate::game::turns::start_next_turn(&mut state, &mut events);
         assert_eq!(state.objects[&pw].loyalty_activations_this_turn, 0);
     }

@@ -23,7 +23,7 @@ import { useDeckCardData } from "../../hooks/useDeckCardData";
 import type { CardSearchFilters } from "./CardSearch";
 import { hasSearchCriteria } from "./searchFilters";
 import type { GroupMode } from "./deckGrouping";
-import type { GameFormat } from "../../adapter/types";
+import type { DeckSizeRule, GameFormat } from "../../adapter/types";
 import { DECK_CONSTRUCTION_FORMATS, formatMetadata } from "../../data/formatRegistry";
 import type { CommanderBracket } from "../../types/bracket";
 import { getPreconBracket } from "../../data/preconBrackets";
@@ -203,7 +203,7 @@ export function useDeckBuilder({
   }, [currentDeck, deckKey, format, formatConfig?.uses_commander]);
 
   const isCommander = formatConfig?.command_zone ?? false;
-  const expectedDeckSize = formatConfig?.deck_size ?? 60;
+  const deckSizeRule: DeckSizeRule = formatConfig?.deck_size ?? { type: "Minimum", data: 60 };
 
   useEffect(() => {
     if (!isCommander) {
@@ -371,13 +371,18 @@ export function useDeckBuilder({
   );
   useEffect(() => {
     const names = copyLimitKey ? copyLimitKey.split("|") : [];
-    if (names.length === 0) {
+    // The engine resolves the ceiling from the whole `FormatConfig`, so an
+    // unresolved config (unknown format) leaves the map empty rather than
+    // guessing a default client-side.
+    if (names.length === 0 || !formatConfig) {
       setCopyLimits(new Map());
       return;
     }
     let cancelled = false;
     Promise.all(
-      names.map(async (name) => [name, await maxDeckCopies(name, format)] as const),
+      names.map(
+        async (name) => [name, await maxDeckCopies(name, formatConfig)] as const,
+      ),
     )
       .then((results) => {
         if (!cancelled) setCopyLimits(new Map(results));
@@ -390,7 +395,7 @@ export function useDeckBuilder({
     return () => {
       cancelled = true;
     };
-  }, [copyLimitKey, format]);
+  }, [copyLimitKey, formatConfig]);
 
   const canIncrement = useCallback(
     (name: string) => {
@@ -645,9 +650,17 @@ export function useDeckBuilder({
         let isPartnerAdd = false;
         if (commanders.length === 1) {
           try {
-            isPartnerAdd = (await commanderPartnerCandidates(commanders[0], [cardName])).includes(
-              cardName,
-            );
+            // CR 903.13f(3): an EMPTY list = constructed play, which grants no
+            // extra partner ability — so every existing caller keeps today's
+            // behaviour and a constructed Commander deck is unaffected.
+            // Discharged in phase 8 where it belongs: the DRAFT deckbuilder
+            // (`LimitedDeckBuilder`) passes the engine-latched
+            // `DraftPlayerView.draft_set_codes`. This call is constructed play,
+            // which has no draft behind it, so `[]` is the rules-correct
+            // argument here and must stay.
+            isPartnerAdd = (
+              await commanderPartnerCandidates(commanders[0], [cardName], [])
+            ).includes(cardName);
           } catch {
             return;
           }
@@ -661,9 +674,21 @@ export function useDeckBuilder({
 
         setCommanders(nextCommanders);
         setDeck((prev) => {
-          // Remove the new commander from main, then re-introduce any displaced
-          // commanders so they remain in the deck for the user to re-pick.
-          const filtered = prev.main.filter((e) => e.name !== cardName);
+          // CR 903.3: the designation is "an attribute of the card itself" —
+          // a label on ONE card, not a removal of every copy. Take one copy
+          // and leave the rest, using the count-aware shape this same file
+          // already uses in `moveOneMainCardToSpecialSlot` below. Then
+          // re-introduce any displaced commanders so they remain in the deck
+          // for the user to re-pick.
+          const selected = prev.main.find((entry) => entry.name === cardName);
+          const filtered =
+            selected?.count === 1
+              ? prev.main.filter((entry) => entry.name !== cardName)
+              : prev.main.map((entry) =>
+                  entry.name === cardName
+                    ? { ...entry, count: entry.count - 1 }
+                    : entry,
+                );
           const restored = displaced.reduce<DeckEntry[]>((acc, name) => {
             const existing = acc.find((e) => e.name === name);
             if (existing) {
@@ -692,10 +717,13 @@ export function useDeckBuilder({
   const handleRemoveCommander = useCallback((cardName: string) => {
     setDirty(true);
     setCommanders((prev) => prev.filter((n) => n !== cardName));
-    // Add back to main deck
+    // CR 903.3: the exact inverse of `handleSetCommander`'s decrement. Routed
+    // through the merge this file already uses so a card still present in main
+    // gains a copy rather than gaining a DUPLICATE ROW; designate-then-remove
+    // therefore returns the deck to its exact prior multiset, for any count.
     setDeck((prev) => ({
       ...prev,
-      main: [...prev.main, { count: 1, name: cardName }],
+      main: deduplicateEntries([...prev.main, { count: 1, name: cardName }]),
     }));
   }, []);
 
@@ -757,18 +785,17 @@ export function useDeckBuilder({
     });
   }, []);
 
-  // Compute CMC and color arrays for ManaCurve
+  // Card metadata supplies CMCs; the engine supplies color identities.
   const cmcValues: number[] = [];
-  const colorValues: string[] = [];
   for (const entry of deck.main) {
     const card = cardDataCache.get(entry.name);
     if (card) {
       for (let i = 0; i < entry.count; i++) {
         cmcValues.push(card.cmc);
-        colorValues.push(card.color_identity?.join("") ?? "");
       }
     }
   }
+  const colorDistribution = compatibility?.color_distribution ?? [];
 
   const cardCounts = new Map(deck.main.map((entry) => [entry.name, entry.count]));
   for (const commander of commanders) {
@@ -817,11 +844,11 @@ export function useDeckBuilder({
     // Derived
     currentDeck,
     isCommander,
-    expectedDeckSize,
+    deckSizeRule,
     estimate,
     auditEmptyReason,
     cmcValues,
-    colorValues,
+    colorDistribution,
     cardCounts,
     warnings,
     // Handlers

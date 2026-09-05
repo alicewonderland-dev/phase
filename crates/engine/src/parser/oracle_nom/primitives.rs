@@ -25,6 +25,29 @@ pub fn parse_number(input: &str) -> OracleResult<'_, u32> {
     alt((parse_digit_number, parse_english_number)).parse(input)
 }
 
+/// CR 702.8a: Flash is a static ability that functions in every zone from
+/// which its card could be played.
+///
+/// Parse the shared self-spell flash prefix, preserving the remaining condition
+/// text for the caller. The boundary guard keeps `flashback` on its own parser
+/// path rather than treating its `flash` prefix as a flash grant.
+pub(crate) fn parse_self_spell_has_flash_prefix(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        (
+            alt((tag::<_, _, OracleError<'_>>("~"), tag("this spell"))),
+            terminated(
+                tag(" has flash"),
+                peek(alt((
+                    value((), eof),
+                    value((), satisfy(|c: char| !c.is_alphanumeric())),
+                ))),
+            ),
+        ),
+    )
+    .parse(input)
+}
+
 /// Parse one or more ASCII digits into a u32, accepting English
 /// thousands-separator commas ("1,000", "1,000,000").
 ///
@@ -540,8 +563,8 @@ pub fn parse_counter_type_typed(input: &str) -> OracleResult<'_, CounterType> {
 /// a real counter type before classifying a disjunctive list as a counter
 /// choice.
 ///
-/// CR 122.1b: keyword counters (docs/MagicCompRules.txt:1180).
-/// CR 122.1: named counters (docs/MagicCompRules.txt:1176).
+/// CR 122.1b: keyword counters.
+/// CR 122.1: named counters.
 pub(crate) fn parse_strict_counter_type(input: &str) -> OracleResult<'_, CounterType> {
     alt((
         map(parse_pt_modifier, |(power, toughness)| {
@@ -1003,6 +1026,31 @@ pub fn parse_phrase_fragment(input: &str) -> OracleResult<'_, &str> {
         input,
         nom::error::ErrorKind::Fail,
     )))
+}
+
+/// CR 608.2c consume-on-success: a subordinate clause has genuinely ENDED here.
+///
+/// A relative-clause combinator that succeeds while leaving unconsumed words
+/// behind has not modelled the sentence — it has modelled a PREFIX of it, and
+/// the caller that discards that remainder silently drops the rest of the
+/// restriction. ("attacks a player who has more life than you AND CONTROLS A
+/// FOREST" binding only the life half is strictly wrong; "…more life than YOU
+/// HAVE" is a different phrasing entirely.) The honest answer for both is to
+/// decline the clause, not to bind an under-restricted filter.
+///
+/// The clause ends when the remainder is exhausted, or when the next character
+/// opens a new clause (`,`) or ends the sentence (`.`). Non-consuming (`peek`),
+/// so callers use it purely as a guard. Object-axis sibling:
+/// `oracle_target::parse_attacking_status_clause_boundary`, which adds
+/// conjunction/conditional lookahead specific to that suffix chain.
+pub fn peek_clause_terminator(input: &str) -> OracleResult<'_, ()> {
+    peek(alt((
+        value((), tag(",")),
+        value((), tag(".")),
+        // `space0` makes this cover both "" and a trailing-whitespace tail.
+        value((), (space0, eof)),
+    )))
+    .parse(input)
 }
 
 // ── Word-boundary scanning primitives ─────────────────────────────────

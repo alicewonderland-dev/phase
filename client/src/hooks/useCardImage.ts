@@ -1,26 +1,48 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
+  CARD_BACK_URL,
   fetchCardImageAsset,
   fetchCardImageAssetByOracleId,
-  fetchTokenImageByRef,
+  fetchTokenImageAssetByRef,
   fetchTokenImageUrl,
+  deriveImageUrl,
   findPrintingById,
   getCardPrintings,
   isCardImageFlipLayoutSync,
   isCardImageRotatedSync,
   isLocaleArtReady,
+  imageUrlSize,
   loadLocaleArt,
-  pickOldestPrinting,
   resolveFaceIndexSync,
   resolveOracleIdSync,
   resolvePrintingImageUrl,
 } from "../services/scryfall.ts";
 import type { ImageSize, PrintingEntry, TokenSearchFilters } from "../services/scryfall.ts";
 import type { CardImageAsset } from "../services/scryfall.ts";
+import { applyChain } from "../services/artSelection.ts";
 import type { TokenImageRef } from "../adapter/types.ts";
+import {
+  cardBackCandidate,
+  cardCandidateGroups,
+  semanticCardCandidateGroups,
+  tokenCandidateGroups,
+} from "../services/visualPacks/candidateKeys.ts";
+import type { VisualVariant } from "../services/visualPacks/candidateKeys.ts";
+import type { VisualCandidateGroup } from "../services/visualPacks/repository.ts";
+import { visualPackRepository } from "../services/visualPacks/repository.ts";
+import type {
+  CandidateKey,
+  CardImageSource,
+  ImageRungs,
+  VisualImageRung,
+} from "../services/visualPacks/types.ts";
+import { packId } from "../services/visualPacks/types.ts";
+import { useEffectiveOffline } from "../stores/connectivityStore.ts";
 import { usePreferencesStore, registerStrategyCacheClearFn } from "../stores/preferencesStore.ts";
 import type { ArtChainEntry } from "../stores/preferencesStore.ts";
+import { useFixedVisualImage } from "./useFixedVisualImage.ts";
+import { nextImageSourceIndex } from "./imageSourceLadder.ts";
 
 export interface SourcePrinting {
   setCode: string;
@@ -60,12 +82,199 @@ interface UseCardImageResult {
   /** True for Kamigawa-style flip cards (`layout: "flip"`), whose alternate half
    *  is the same image rotated 180°. The preview uses this to enable Ctrl-spin. */
   isFlip: boolean;
+  source?: CardImageSource | null;
+  rungs?: ImageRungs;
+  advanceFailedSource?(failedSrc: string): void;
+}
+
+export interface UseCardBackImageResult {
+  src: string | null;
+  isLoading: boolean;
+  source?: CardImageSource | null;
+  advanceFailedSource?(failedSrc: string): void;
 }
 
 interface MemoryCacheEntry {
   promise: Promise<CardImageAsset | null> | null;
   refCount: number;
   asset: CardImageAsset | null;
+}
+
+interface RemoteContinuation {
+  generation: string;
+  promise: Promise<void> | null;
+  settled: boolean;
+  start: (() => Promise<void>) | null;
+}
+
+function remoteRungs(src: string, size: ImageSize): ImageRungs | undefined {
+  return size === "art_crop" || imageUrlSize(src) === null
+    ? undefined
+    : { small: deriveImageUrl(src, "small"), normal: deriveImageUrl(src, "normal") };
+}
+
+function remoteAsset(
+  src: string,
+  size: ImageSize,
+  semantic: CardImageAsset["semantic"],
+  isRotated: boolean,
+): CardImageAsset {
+  const rungs = remoteRungs(src, size);
+  return { src, isRotated, rungs, source: { kind: "remote", src, rungs }, semantic };
+}
+
+function metadataRepositoryGroups(
+  asset: CardImageAsset,
+  size: ImageSize,
+  cardName: string,
+  faceName: string,
+  language: string,
+  isToken: boolean,
+  tokenImageRef: TokenImageRef | null,
+) {
+  if (isToken && size === "art_crop") return [];
+  const requestedRung: VisualImageRung | "large" = size;
+  try {
+    const build = (rung: VisualImageRung | "large") => isToken
+      ? tokenCandidateGroups({
+          scryfallId: tokenImageRef?.scryfall_id || undefined,
+          oracleId: tokenImageRef?.scryfall_oracle_id || undefined,
+          faceName: tokenImageRef?.face_name || undefined,
+          presetId: tokenImageRef?.preset_id || undefined,
+          faceIndex: asset.semantic.faceIndex,
+          rung: rung === "art_crop" ? "normal" : rung,
+        })
+      : cardCandidateGroups({
+          language: language === "en" ? undefined : language,
+          englishPrintingId: asset.semantic.englishPrintingId,
+          oracleId: asset.semantic.oracleId,
+          localizedAliases: [cardName, faceName].filter(Boolean),
+          englishAliases: [cardName, faceName].filter(Boolean),
+          oracleAliases: [cardName, faceName].filter(Boolean),
+          faceIndex: asset.semantic.faceIndex,
+          variant: size === "art_crop" ? "art_crop" : "full_card",
+          rung,
+        });
+    const requested = build(requestedRung);
+    if (size === "art_crop") {
+      return requested.map((group) => ({ requested: group.keys }));
+    }
+    const small = build("small");
+    const normal = build("normal");
+    return requested.map((group, index) => ({
+      requested: group.keys,
+      small: small[index]?.keys,
+      normal: normal[index]?.keys,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function localCandidateGroups(
+  size: ImageSize,
+  language: string,
+  cardName: string,
+  faceName: string,
+  resolvedOracleId: string,
+  resolvedFaceIndex: number,
+  isToken: boolean,
+  tokenImageRef: TokenImageRef | null,
+  explicitPrintingId: string,
+  sourcePrinting: SourcePrinting | undefined,
+): VisualCandidateGroup[] {
+  if (isToken && size === "art_crop") return [];
+  const requestedRung: VisualImageRung | "large" = size;
+  const variant: VisualVariant = size === "art_crop" ? "art_crop" : "full_card";
+  const groupsWithRungs = (
+    build: (rung: VisualImageRung | "large") => Array<{ keys: CandidateKey[] }>,
+    options?: Pick<VisualCandidateGroup, "packId" | "requireUnambiguousAsset">,
+  ): VisualCandidateGroup[] => {
+    try {
+      const requested = build(requestedRung);
+      if (size === "art_crop") {
+        return requested.map((group) => ({ requested: group.keys, ...options }));
+      }
+      const small = build("small");
+      const normal = build("normal");
+      return requested.map((group, index) => ({
+        requested: group.keys,
+        small: small[index]?.keys,
+        normal: normal[index]?.keys,
+        ...options,
+      }));
+    } catch {
+      return [];
+    }
+  };
+  const exactCardGroups = (printingId: string, includeLocalized = true) => groupsWithRungs((rung) =>
+    cardCandidateGroups({
+      language: includeLocalized && language !== "en" ? language : undefined,
+      englishPrintingId: printingId,
+      faceIndex: resolvedFaceIndex,
+      variant,
+      rung,
+    }));
+  if (isToken) {
+    const exact = tokenImageRef?.scryfall_id ? exactCardGroups(tokenImageRef.scryfall_id, false) : [];
+    const reference = groupsWithRungs((rung) => tokenCandidateGroups({
+      scryfallId: tokenImageRef?.scryfall_id || undefined,
+      oracleId: tokenImageRef?.scryfall_oracle_id || undefined,
+      faceName: tokenImageRef?.face_name || undefined,
+      faceIndex: resolvedFaceIndex,
+      rung: rung === "art_crop" ? "normal" : rung,
+    }).slice(0, 1));
+    const preset = tokenImageRef?.preset_id
+      ? groupsWithRungs((rung) => tokenCandidateGroups({
+          presetId: tokenImageRef.preset_id,
+          faceIndex: resolvedFaceIndex,
+          rung: rung === "art_crop" ? "normal" : rung,
+        }).slice(-1))
+      : [];
+    const tokenFaceName = tokenImageRef?.face_name || faceName || cardName;
+    const tokenOracleId = tokenImageRef?.scryfall_oracle_id;
+    const oracle = tokenOracleId
+      ? groupsWithRungs((rung) => semanticCardCandidateGroups({
+          cardName: tokenFaceName,
+          faceName: tokenFaceName,
+          variant: "full_card",
+          oracleId: tokenOracleId.toLowerCase(),
+        rung,
+      }).slice(0, 1), { requireUnambiguousAsset: true })
+      : [];
+    const name = tokenFaceName
+      ? groupsWithRungs((rung) => semanticCardCandidateGroups({
+          cardName: tokenFaceName,
+          faceName: tokenFaceName,
+          variant: "full_card",
+          rung,
+        }).slice(-1), { requireUnambiguousAsset: true })
+      : [];
+    return [...exact, ...reference, ...preset, ...oracle, ...name];
+  }
+
+  const exact = explicitPrintingId ? exactCardGroups(explicitPrintingId) : [];
+  const semanticIntent = { cardName, faceName: faceName || cardName, variant };
+  const source = sourcePrinting?.setCode && sourcePrinting.collectorNumber
+    ? groupsWithRungs((rung) => semanticCardCandidateGroups({
+        ...semanticIntent,
+        sourceSetCode: sourcePrinting.setCode,
+        sourceCollectorNumber: sourcePrinting.collectorNumber,
+        rung,
+      }).slice(0, 1), { packId: packId("deck_library") })
+    : [];
+  const oracle = resolvedOracleId
+    ? groupsWithRungs((rung) => semanticCardCandidateGroups({
+        ...semanticIntent,
+        oracleId: resolvedOracleId.toLowerCase(),
+        rung,
+      }).slice(0, 1), { packId: packId("deck_library") })
+    : [];
+  const name = groupsWithRungs((rung) => semanticCardCandidateGroups({
+    ...semanticIntent,
+    rung,
+  }).slice(-1), { packId: packId("deck_library") });
+  return [...exact, ...source, ...oracle, ...name];
 }
 
 const imageRequestCache = new Map<string, MemoryCacheEntry>();
@@ -183,39 +392,6 @@ export function useLocaleArt(): string {
   return localeArtCacheKey(language);
 }
 
-function applyChainEntry(
-  entry: ArtChainEntry,
-  printings: PrintingEntry[],
-  source?: SourcePrinting,
-): PrintingEntry | null {
-  switch (entry.type) {
-    case "set":
-      return printings.find((p) => p.set === entry.setCode) ?? null;
-    case "newest":
-      return printings[0];
-    case "oldest":
-      return pickOldestPrinting(printings);
-    case "prefer_borderless":
-      return printings.find((p) => p.border_color === "borderless") ?? null;
-    case "prefer_extended":
-      return printings.find((p) => p.frame_effects.includes("extendedart")) ?? null;
-    case "source_printing": {
-      if (!source) return null;
-      const setLower = source.setCode.toLowerCase();
-      return printings.find((p) => p.set === setLower && p.collector_number === source.collectorNumber) ?? null;
-    }
-  }
-}
-
-function applyChain(chain: ArtChainEntry[], printings: PrintingEntry[], source?: SourcePrinting): PrintingEntry | null {
-  if (printings.length === 0) return null;
-  for (const entry of chain) {
-    const match = applyChainEntry(entry, printings, source);
-    if (match) return match;
-  }
-  return null;
-}
-
 function resolveStrategyInBackground(oracleId: string, chain: ArtChainEntry[]): void {
   if (strategyInflight.has(oracleId)) return;
   if (printingsNegativeCache.has(oracleId)) return;
@@ -318,16 +494,27 @@ function imageRequestKey(
   tokenImageRefKey: string,
   oracleId: string,
   faceName: string,
+  resolvedOracleId: string,
+  resolvedFaceIndex: number,
   // `imageRequestCache` stores the FINAL resolved URL, which differs per
   // language once localized art is applied — so the art locale belongs in the
   // key. The printing-selection caches (`strategyCacheMap`, `printingsCacheMap`)
   // stay language-neutral on purpose: which printing wins is a function of the
   // user's art preferences, not of their language.
   artLocaleKey: string,
+  repositoryRevision: string,
+  sourcePrinting: SourcePrinting | undefined,
+  explicitPrintingId: string,
+  artChainKey: string,
+  effectiveOffline: boolean,
+  artCacheTick: number,
 ): string {
   return [
     oracleId || cardName,
+    cardName,
     oracleId ? faceName : String(faceIndex),
+    resolvedOracleId,
+    String(resolvedFaceIndex),
     size,
     isToken ? "token" : "card",
     filterPower ?? "",
@@ -337,6 +524,12 @@ function imageRequestKey(
     String(filterHasAbilities),
     tokenImageRefKey,
     artLocaleKey,
+    repositoryRevision,
+    sourcePrinting ? `${sourcePrinting.setCode.toLowerCase()}:${sourcePrinting.collectorNumber}` : "",
+    explicitPrintingId,
+    artChainKey,
+    String(effectiveOffline),
+    String(artCacheTick),
   ].join("|");
 }
 
@@ -363,6 +556,7 @@ async function acquireCachedImageSrc(
   tokenImageRef: TokenImageRef | null,
   oracleId: string,
   faceName: string,
+  sourcePrinting: SourcePrinting | undefined,
 ): Promise<CardImageAsset | null> {
   const existing = imageRequestCache.get(key);
   if (existing) {
@@ -379,12 +573,15 @@ async function acquireCachedImageSrc(
   imageRequestCache.set(key, entry);
 
   entry.promise = (async () => {
-    let asset: CardImageAsset | null;
+    let asset: CardImageAsset;
     if (isToken) {
       let remoteSrc: string | null = null;
+      let resolvedFaceIndex = faceIndex;
       if (tokenImageRef) {
         try {
-          remoteSrc = await fetchTokenImageByRef(tokenImageRef, size);
+          const tokenAsset = await fetchTokenImageAssetByRef(tokenImageRef, size);
+          remoteSrc = tokenAsset?.src ?? null;
+          resolvedFaceIndex = tokenAsset?.faceIndex ?? resolvedFaceIndex;
         } catch {
           remoteSrc = null;
         }
@@ -396,11 +593,34 @@ async function acquireCachedImageSrc(
         subtypes: filterSubtypes ? filterSubtypes.split(",") : undefined,
         hasAbilities: filterHasAbilities ?? undefined,
       });
-      asset = { src: remoteSrc, isRotated: false };
+      asset = remoteAsset(
+        remoteSrc,
+        size,
+        {
+          oracleId: tokenImageRef?.scryfall_oracle_id?.toLowerCase() || undefined,
+          faceIndex: resolvedFaceIndex,
+          alias: cardName.toLowerCase().normalize("NFC"),
+        },
+        false,
+      );
     } else if (oracleId) {
       asset = await fetchCardImageAssetByOracleId(oracleId, faceName, size);
     } else {
       asset = await fetchCardImageAsset(cardName, faceIndex, size);
+    }
+    if (sourcePrinting && asset.semantic.oracleId) {
+      const printings = await getCardPrintings(asset.semantic.oracleId);
+      printingsCacheMap.set(asset.semantic.oracleId, printings);
+      const source = printings.find((printing) =>
+        printing.set === sourcePrinting.setCode.toLowerCase()
+        && printing.collector_number === sourcePrinting.collectorNumber);
+      const sourceUrl = source && resolvePrintingImageUrl(source, asset.semantic.faceIndex, size);
+      if (sourceUrl) {
+        asset = remoteAsset(sourceUrl, size, {
+          ...asset.semantic,
+          englishPrintingId: source.id.toLowerCase(),
+        }, asset.isRotated);
+      }
     }
     entry.asset = asset;
     entry.promise = null;
@@ -430,12 +650,13 @@ export function useCardImage(
         tokenImageRef.scryfall_id,
         tokenImageRef.scryfall_oracle_id ?? "",
         tokenImageRef.face_name ?? "",
+        tokenImageRef.preset_id ?? "",
       ].join(":")
     : "";
-  // Stabilize the token ref's identity to tokenImageRefKey. fetchTokenImageByRef
-  // reads only scryfall_id / scryfall_oracle_id / face_name — all captured by the
-  // key (preset_id is intentionally excluded; it doesn't affect image lookup) —
-  // so a caller passing a fresh inline {scryfall_id,...} object on every render
+  // Stabilize the token ref's identity to tokenImageRefKey. fetchTokenImageAssetByRef
+  // reads the Scryfall identity while the visual-pack candidate also reads the
+  // preset identity. All four axes are captured by the key, so a caller passing
+  // a fresh inline {scryfall_id,...} object on every render
   // would otherwise re-fire the image-load effect (release + refetch the cached
   // src) for an unchanged image. exhaustive-deps can't see that the key fully
   // captures the object, so the disable is scoped to this one line rather than
@@ -456,6 +677,11 @@ export function useCardImage(
   const faceName = options?.faceName ?? "";
   const scryfallId = options?.scryfallId ?? "";
   const sourcePrinting = options?.sourcePrinting;
+  const sourcePrintingKey = sourcePrinting
+    ? `${sourcePrinting.setCode.toLowerCase()}:${sourcePrinting.collectorNumber}`
+    : "";
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const stableSourcePrinting = useMemo(() => sourcePrinting, [sourcePrintingKey]);
   const filterPower = tokenFilters?.power ?? null;
   const filterToughness = tokenFilters?.toughness ?? null;
   const filterSubtypes = tokenFilters?.subtypes?.join(",") ?? "";
@@ -464,6 +690,7 @@ export function useCardImage(
 
   const artOverrides = usePreferencesStore((s) => s.artOverrides);
   const artChain = usePreferencesStore((s) => s.artChain);
+  const effectiveOffline = useEffectiveOffline();
   // Card art follows the UI language: the printing the user chose is kept, and
   // only its image is swapped for the same printing in their language. Cards
   // with no localized sibling keep their English art.
@@ -475,7 +702,22 @@ export function useCardImage(
   const [isFlip, setIsFlip] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [stateRequestKey, setStateRequestKey] = useState<string | null>(null);
-  const [, setArtCacheTick] = useState(0);
+  const [sources, setSources] = useState<CardImageSource[]>([]);
+  const [sourceIndex, setSourceIndex] = useState(0);
+  const [repositoryRevision, setRepositoryRevision] = useState(
+    visualPackRepository.currentRevision(),
+  );
+  const failedSources = useRef<{ generation: string; values: Set<string> }>({
+    generation: "",
+    values: new Set(),
+  });
+  const [artCacheTick, setArtCacheTick] = useState(0);
+  const remoteContinuation = useRef<RemoteContinuation>({
+    generation: "",
+    promise: null,
+    settled: true,
+    start: null,
+  });
 
   const resolvedOracleId = oracleId || resolveOracleIdSync(cardName) || "";
 
@@ -504,19 +746,9 @@ export function useCardImage(
     return () => artCacheEvents.removeEventListener("update", handler);
   }, []);
 
-  // Kick the locale-art load from an effect, not from render. It writes
-  // module-global state (`desiredArtLang`, which decides whose fetch may
-  // install itself), and under concurrent rendering React may start a render
-  // and discard it — so a render-phase call can let a language that was never
-  // committed win that race. Running after commit means only the committed
-  // language is ever requested.
-  //
-  // Deliberately placed after the subscription effect above: effects run in
-  // source order, so the `update` listener is registered before any dispatch
-  // this load can trigger, even when `loadLocaleArt` resolves from cache.
-  useEffect(() => {
-    loadLocaleArtInBackground(language);
-  }, [language]);
+  useEffect(() => visualPackRepository.subscribe(() => {
+    setRepositoryRevision(visualPackRepository.currentRevision());
+  }), []);
 
   // The printings/art-strategy path indexes faces numerically, but for a
   // DFC/MDFC the reliable signal is the engine's `faceName` (an MDFC cast as its
@@ -526,35 +758,10 @@ export function useCardImage(
   const resolvedFaceIndex =
     resolveFaceIndexSync(resolvedOracleId, faceName) ?? faceIndex;
 
-  let overrideUrl: string | null = null;
-  if (!isToken && resolvedOracleId) {
-    if (scryfallId) {
-      overrideUrl = resolveOverrideUrl(resolvedOracleId, scryfallId, resolvedFaceIndex, size);
-    } else if (artOverrides[resolvedOracleId]) {
-      overrideUrl = resolveOverrideUrl(resolvedOracleId, artOverrides[resolvedOracleId].scryfallId, resolvedFaceIndex, size);
-    } else if (artChain.length > 0) {
-      if (sourcePrinting && artChain.some((e) => e.type === "source_printing")) {
-        const printings = printingsCacheMap.get(resolvedOracleId);
-        if (printings) {
-          const winner = applyChain(artChain, printings, sourcePrinting);
-          if (winner) {
-            overrideUrl = resolvePrintingImageUrl(winner, resolvedFaceIndex, size);
-          }
-        } else {
-          resolveStrategyInBackground(resolvedOracleId, artChain);
-        }
-      } else {
-        const cached = strategyCacheMap.get(resolvedOracleId);
-        if (cached) {
-          overrideUrl = resolvePrintingImageUrl(cached, resolvedFaceIndex, size);
-        } else {
-          resolveStrategyInBackground(resolvedOracleId, artChain);
-        }
-      }
-    } else if (sourcePrinting) {
-      overrideUrl = resolveSourcePrintingUrl(resolvedOracleId, sourcePrinting, resolvedFaceIndex, size);
-    }
-  }
+  const explicitPrintingId = !isToken
+    ? scryfallId || (resolvedOracleId ? artOverrides[resolvedOracleId]?.scryfallId ?? "" : "")
+    : "";
+  const artChainKey = JSON.stringify(artChain);
 
   const requestKey = imageRequestKey(
     cardName,
@@ -569,83 +776,200 @@ export function useCardImage(
     tokenImageRefKey,
     oracleId,
     faceName,
+    resolvedOracleId,
+    resolvedFaceIndex,
     artLocaleKey,
+    repositoryRevision,
+    stableSourcePrinting,
+    explicitPrintingId,
+    artChainKey,
+    effectiveOffline,
+    artCacheTick,
   );
 
   useEffect(() => {
-    if (overrideUrl) {
-      setStateRequestKey(requestKey);
-      setSrc(overrideUrl);
-      setIsRotated(isCardImageRotatedSync(resolvedOracleId, cardName));
-      setIsFlip(isCardImageFlipLayoutSync(resolvedOracleId, cardName));
-      setIsLoading(false);
-      return;
-    }
-
-    // A face-down marker request carries NO name and NO oracle id — only the
-    // `tokenImageRef` names the printing. Bailing on the empty name here was
-    // what kept the #7535 markers from ever loading at runtime (#7549): the
-    // ref-driven fetch below never ran.
-    if (!cardName && !oracleId && !resolvableTokenImageRef) {
-      setStateRequestKey(requestKey);
-      setSrc(null);
-      setIsRotated(false);
-      setIsFlip(false);
-      setIsLoading(false);
-      return;
-    }
-
     let cancelled = false;
+    let acquiredRemoteCache = false;
+    failedSources.current = { generation: requestKey, values: new Set() };
+    setStateRequestKey(requestKey);
+    setSrc(null);
+    setSources([]);
+    setSourceIndex(0);
+    setIsLoading(true);
 
-    async function loadImage() {
-      const cachedEntry = imageRequestCache.get(requestKey);
-      setStateRequestKey(requestKey);
-      if (cachedEntry && !cachedEntry.promise) {
-        setSrc(cachedEntry.asset?.src ?? null);
-        setIsRotated(cachedEntry.asset?.isRotated ?? false);
-        setIsFlip(isCardImageFlipLayoutSync(resolvedOracleId, cardName));
-        setIsLoading(false);
-      } else {
-        setIsLoading(true);
-        setSrc(null);
-      }
+    const fallback: CardImageSource[] = [{ kind: "fallback", src: null }];
+    const canResolveRemotely = Boolean(cardName || oracleId || resolvableTokenImageRef);
+    const publish = (
+      nextSources: CardImageSource[],
+      imageAsset?: CardImageAsset,
+      settled = true,
+    ) => {
+      if (cancelled) return;
+      setSources(nextSources);
+      setSourceIndex(0);
+      setSrc(nextSources[0]?.src ?? null);
+      setIsRotated(imageAsset?.isRotated ?? isCardImageRotatedSync(resolvedOracleId, cardName));
+      setIsFlip(isCardImageFlipLayoutSync(resolvedOracleId, cardName));
+      setIsLoading(!settled);
+    };
 
-      try {
-        const imageAsset = await acquireCachedImageSrc(
-          requestKey,
-          cardName,
+    const continuation: RemoteContinuation = {
+      generation: requestKey,
+      promise: null,
+      settled: effectiveOffline,
+      start: null,
+    };
+    remoteContinuation.current = continuation;
+
+    const selectedRemoteOverride = (): CardImageAsset | null => {
+      if (isToken || !resolvedOracleId) return null;
+      let overrideUrl: string | null = null;
+      let overridePrintingId = "";
+      if (scryfallId) {
+        overrideUrl = resolveOverrideUrl(resolvedOracleId, scryfallId, resolvedFaceIndex, size);
+        overridePrintingId = scryfallId;
+      } else if (explicitPrintingId) {
+        overrideUrl = resolveOverrideUrl(
+          resolvedOracleId,
+          explicitPrintingId,
+          resolvedFaceIndex,
           size,
-          faceIndex,
-          isToken,
-          filterPower,
-          filterToughness,
-          filterColors,
-          filterSubtypes,
-          filterHasAbilities,
-          stableTokenImageRef,
-          oracleId,
-          faceName,
         );
-        if (!cancelled) {
-          setSrc(imageAsset?.src || null);
-          setIsRotated(imageAsset?.isRotated ?? false);
-          setIsFlip(isCardImageFlipLayoutSync(resolvedOracleId, cardName));
-          setIsLoading(false);
+        overridePrintingId = explicitPrintingId;
+      } else if (artChain.length > 0) {
+        if (stableSourcePrinting && artChain.some((entry) => entry.type === "source_printing")) {
+          const printings = printingsCacheMap.get(resolvedOracleId);
+          if (printings) {
+            const winner = applyChain(artChain, printings, stableSourcePrinting);
+            if (winner) {
+              overrideUrl = resolvePrintingImageUrl(winner, resolvedFaceIndex, size);
+              overridePrintingId = winner.id;
+            }
+          } else {
+            resolveStrategyInBackground(resolvedOracleId, artChain);
+          }
+        } else {
+          const cached = strategyCacheMap.get(resolvedOracleId);
+          if (cached) {
+            overrideUrl = resolvePrintingImageUrl(cached, resolvedFaceIndex, size);
+            overridePrintingId = cached.id;
+          } else {
+            resolveStrategyInBackground(resolvedOracleId, artChain);
+          }
         }
-      } catch {
-        if (!cancelled) {
-          setIsRotated(false);
-          setIsFlip(false);
-          setIsLoading(false);
-        }
+      } else if (stableSourcePrinting) {
+        overrideUrl = resolveSourcePrintingUrl(resolvedOracleId, stableSourcePrinting, resolvedFaceIndex, size);
+        const source = printingsCacheMap.get(resolvedOracleId)?.find((printing) =>
+          printing.set === stableSourcePrinting.setCode.toLowerCase()
+          && printing.collector_number === stableSourcePrinting.collectorNumber);
+        overridePrintingId = source?.id ?? "";
       }
+      return overrideUrl
+        ? remoteAsset(
+            overrideUrl,
+            size,
+            {
+              oracleId: resolvedOracleId.toLowerCase(),
+              englishPrintingId: overridePrintingId.toLowerCase() || undefined,
+              faceIndex: resolvedFaceIndex,
+              alias: cardName.toLowerCase().normalize("NFC"),
+            },
+            isCardImageRotatedSync(resolvedOracleId, cardName),
+          )
+        : null;
+    };
+
+    continuation.start = () => {
+      if (continuation.promise) return continuation.promise;
+      if (!cancelled) setIsLoading(true);
+      continuation.promise = (async () => {
+        if (effectiveOffline || !canResolveRemotely) {
+          continuation.settled = true;
+          return;
+        }
+        loadLocaleArtInBackground(language);
+        try {
+          let imageAsset = selectedRemoteOverride();
+          if (!imageAsset) {
+            acquiredRemoteCache = true;
+            imageAsset = await acquireCachedImageSrc(
+              requestKey,
+              cardName,
+              size,
+              faceIndex,
+              isToken,
+              filterPower,
+              filterToughness,
+              filterColors,
+              filterSubtypes,
+              filterHasAbilities,
+              stableTokenImageRef,
+              oracleId,
+              faceName,
+              artChain.length === 0 ? stableSourcePrinting : undefined,
+            );
+          }
+          if (!imageAsset) {
+            publish(fallback);
+            return;
+          }
+          const result = await visualPackRepository.resolve({
+            groups: metadataRepositoryGroups(
+              imageAsset,
+              size,
+              cardName,
+              faceName,
+              language,
+              isToken,
+              stableTokenImageRef,
+            ),
+            rung: size,
+            allowRemote: true,
+            remote: { src: imageAsset.src, rungs: imageAsset.rungs },
+          });
+          const viable = result.sources.filter((source) =>
+            source.src === null || !failedSources.current.values.has(source.src));
+          publish(viable.length > 0 ? viable : fallback, imageAsset);
+        } catch {
+          publish(fallback);
+        } finally {
+          continuation.settled = true;
+        }
+      })();
+      return continuation.promise;
+    };
+
+    async function resolveLocal(): Promise<void> {
+      const groups = localCandidateGroups(
+        size,
+        language,
+        cardName,
+        faceName,
+        resolvedOracleId,
+        resolvedFaceIndex,
+        isToken,
+        stableTokenImageRef,
+        explicitPrintingId,
+        stableSourcePrinting,
+      );
+      const result = await visualPackRepository.resolve({
+        groups,
+        rung: size,
+        allowRemote: false,
+      }).catch(() => ({ sources: fallback }));
+      if (cancelled) return;
+      const installed = result.sources.some((source) => source.kind === "installed");
+      const settled = installed || effectiveOffline || !canResolveRemotely;
+      publish(result.sources, undefined, settled);
+      if (settled) return;
+      void continuation.start?.();
     }
 
-    loadImage();
+    void resolveLocal();
 
     return () => {
       cancelled = true;
-      releaseCachedImageSrc(requestKey);
+      if (acquiredRemoteCache) releaseCachedImageSrc(requestKey);
     };
   }, [
     cardName,
@@ -660,41 +984,73 @@ export function useCardImage(
     stableTokenImageRef,
     tokenImageRefKey,
     isToken,
+    language,
     oracleId,
-    overrideUrl,
+    explicitPrintingId,
+    effectiveOffline,
     requestKey,
     resolvedOracleId,
+    resolvedFaceIndex,
     size,
+    scryfallId,
+    stableSourcePrinting,
+    artChain,
   ]);
+
+  const activeSource = sources[sourceIndex] ?? null;
+  const advanceFailedSource = useCallback((failedSrc: string) => {
+    if (failedSources.current.generation !== requestKey) return;
+    const nextIndex = nextImageSourceIndex(
+      sources,
+      sourceIndex,
+      failedSources.current.values,
+      failedSrc,
+    );
+    if (nextIndex === null) return;
+    const next = sources[nextIndex];
+    const continuation = remoteContinuation.current;
+    if (
+      next?.kind === "fallback"
+      && continuation.generation === requestKey
+      && !continuation.settled
+    ) {
+      setSourceIndex(nextIndex);
+      setSrc(null);
+      void continuation.start?.();
+      return;
+    }
+    setSourceIndex(nextIndex);
+    setSrc(next?.src ?? null);
+  }, [requestKey, sourceIndex, sources]);
 
   // Effects reset the state after render, so a component reused for a new card
   // would otherwise expose the previous card's src for one frame. Hand previews
   // intentionally keep one mounted component while scrubbing; gate the result
-  // by request identity and synchronously reuse the hand card's cached asset
-  // when available.
+  // by request identity until the new generation's local or remote stage
+  // publishes its own source.
   if (stateRequestKey !== requestKey) {
-    if (overrideUrl) {
-      return {
-        src: overrideUrl,
-        isLoading: false,
-        isRotated: isCardImageRotatedSync(resolvedOracleId, cardName),
-        isFlip: isCardImageFlipLayoutSync(resolvedOracleId, cardName),
-      };
-    }
-    if (!cardName && !oracleId && !resolvableTokenImageRef) {
-      return { src: null, isLoading: false, isRotated: false, isFlip: false };
-    }
-    const cachedEntry = imageRequestCache.get(requestKey);
-    if (cachedEntry && !cachedEntry.promise) {
-      return {
-        src: cachedEntry.asset?.src ?? null,
-        isLoading: false,
-        isRotated: cachedEntry.asset?.isRotated ?? false,
-        isFlip: isCardImageFlipLayoutSync(resolvedOracleId, cardName),
-      };
-    }
-    return { src: null, isLoading: true, isRotated: false, isFlip: false };
+    return {
+      src: null, isLoading: true, isRotated: false, isFlip: false,
+      source: null, advanceFailedSource,
+    };
   }
 
-  return { src, isLoading, isRotated, isFlip };
+  return {
+    src,
+    isLoading,
+    isRotated,
+    isFlip,
+    source: activeSource,
+    rungs: activeSource?.kind === "fallback" ? undefined : activeSource?.rungs,
+    advanceFailedSource,
+  };
+}
+
+/**
+ * Resolve the one public fixed card-back identity without accepting any card
+ * or object identity from the caller. Hidden-information surfaces use this
+ * closed hook instead of submitting a blank or private face to useCardImage.
+ */
+export function useCardBackImage(): UseCardBackImageResult {
+  return useFixedVisualImage(cardBackCandidate(), CARD_BACK_URL);
 }

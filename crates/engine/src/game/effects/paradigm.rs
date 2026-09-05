@@ -158,11 +158,11 @@ pub fn cast_paradigm_copy(
     use crate::types::game_state::{CastingVariant, StackEntry, StackEntryKind};
     use crate::types::zones::Zone;
 
-    let (src_clone, card_id) = {
+    let (src_clone, card_id, origin_zone) = {
         let Some(src_obj) = state.objects.get(&source_id) else {
             return Err(format!("paradigm source {source_id:?} not found"));
         };
-        (src_obj.clone(), src_obj.card_id)
+        (src_obj.clone(), src_obj.card_id, src_obj.zone)
     };
     // Verify this is an exiled paradigm source owned by the acting player.
     let has_link = state.exile_links.iter().any(|link| {
@@ -172,6 +172,8 @@ pub fn cast_paradigm_copy(
     if !has_link {
         return Err("no ParadigmSource link for this source/player".to_string());
     }
+    crate::game::ledger::validate_spell_cast_recording(state, controller)
+        .map_err(crate::game::effects::cast_copy_of_card::cast_copy_spell_cast_ledger_error)?;
     // CR 608.2 + CR 707.10: Mirror the normal cast path — a spell's on-resolve
     // chain is the union of every `AbilityKind::Spell` entry (each with its own
     // `sub_ability` tail) folded by `combined_spell_ability_def`. Taking only
@@ -193,6 +195,8 @@ pub fn cast_paradigm_copy(
     copy_obj.is_token = true;
     copy_obj.tapped = false;
     copy_obj.prepared = None;
+    copy_obj.prepared_copy_source = None;
+    copy_obj.cast_from_zone = Some(origin_zone);
     // CR 707.10: the paradigm copy is put on the stack without paying mana —
     // reset the cast-payment stamps inherited from the exiled source's cast.
     copy_obj.clear_cast_payment_stamps();
@@ -203,7 +207,8 @@ pub fn cast_paradigm_copy(
     // definition preserving sub-ability chains, optional flags, and duration
     // metadata. `build_resolved_from_def` is the authoritative constructor
     // used by normal casting (see `ability_utils`).
-    let resolved = build_resolved_from_def(&ability_def, copy_id, controller);
+    let mut resolved = build_resolved_from_def(&ability_def, copy_id, controller);
+    resolved.context.cast_from_zone = Some(origin_zone);
 
     // CR 707.10: the copy-onto-stack authority emits `StackPushed`.
     crate::game::stack::push_copy_to_stack(
@@ -222,6 +227,27 @@ pub fn cast_paradigm_copy(
         None,
         events,
     );
+
+    // CR 702.192a + CR 601.2i: accepting the Paradigm offer casts the
+    // synthesized copy, so mint and stamp its cast occurrence before any
+    // target-selection pause can expose the stack object.
+    let copy = state.objects[&copy_id].clone();
+    let occurrence = crate::game::restrictions::record_spell_cast_from_zone(
+        state,
+        controller,
+        &copy,
+        origin_zone,
+        CastingVariant::Normal,
+    )
+    .map_err(crate::game::effects::cast_copy_of_card::cast_copy_spell_cast_ledger_error)?;
+    crate::game::casting_costs::stamp_cast_occurrence_on_stack_spell(state, copy_id, occurrence)
+        .map_err(|error| error.to_string())?;
+    events.push(GameEvent::SpellCast {
+        card_id,
+        controller,
+        object_id: copy_id,
+        cast_mana_value: Some(state.objects[&copy_id].spell_mana_value()),
+    });
 
     Ok(copy_id)
 }

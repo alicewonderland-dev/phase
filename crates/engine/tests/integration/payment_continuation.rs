@@ -2,7 +2,10 @@
 
 use engine::ai_support::{
     classify_payment_continuation, legal_actions, witness_payment_continuation,
-    PaymentContinuationRoot, PaymentContinuationState,
+    witness_payment_continuations, witness_payment_continuations_with_counters,
+    PaymentContinuationBatchStatus, PaymentContinuationIndeterminate, PaymentContinuationRoot,
+    PaymentContinuationState, PaymentContinuationWitnessCounters,
+    PAYMENT_CONTINUATION_MAX_REDUCER_ATTEMPTS,
 };
 use engine::game::engine::apply_as_current_for_simulation;
 use engine::game::scenario::{GameScenario, P0};
@@ -11,6 +14,7 @@ use engine::types::ability::{
 };
 use engine::types::actions::GameAction;
 use engine::types::game_state::{CastPaymentMode, ManaChoice, StackEntryKind, WaitingFor};
+use engine::types::keywords::Keyword;
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use std::sync::Arc;
@@ -103,6 +107,45 @@ fn flexible_mana_payment_state() -> engine::types::game_state::GameState {
     runner.state().clone()
 }
 
+/// Reach a live Improvise carrier where four artifact taps and finalization are
+/// required to pay the whole generic cost.
+fn four_artifact_improvise_payment_state() -> engine::types::game_state::GameState {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Improvise Witness", true, DRAW_ORACLE)
+        .with_mana_cost(ManaCost::generic(4))
+        .with_keyword(Keyword::Improvise)
+        .id();
+    scenario
+        .add_creature(P0, "First Artifact", 1, 1)
+        .as_artifact();
+    scenario
+        .add_creature(P0, "Second Artifact", 1, 1)
+        .as_artifact();
+    scenario
+        .add_creature(P0, "Third Artifact", 1, 1)
+        .as_artifact();
+    scenario
+        .add_creature(P0, "Fourth Artifact", 1, 1)
+        .as_artifact();
+    let mut runner = scenario.build();
+    let card_id = runner.state().objects[&spell].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: spell,
+            card_id,
+            targets: Vec::new(),
+            payment_mode: CastPaymentMode::Manual,
+        })
+        .expect("manual Improvise cast reaches the live mana-payment carrier");
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::ManaPayment { .. }
+    ));
+    runner.state().clone()
+}
+
 #[test]
 fn witnessed_manual_payment_requires_real_spell_finalization() {
     let state = manual_spell_payment_state();
@@ -175,6 +218,52 @@ fn cancellation_is_never_a_payment_witness() {
 }
 
 #[test]
+fn partial_improvise_search_retains_a_four_tap_payment_certificate() {
+    let state = four_artifact_improvise_payment_state();
+    let taps: Vec<_> = legal_actions(&state)
+        .into_iter()
+        .filter(|action| matches!(action, GameAction::TapForConvoke { .. }))
+        .collect();
+    assert_eq!(
+        taps.len(),
+        4,
+        "the live Improvise carrier exposes all four artifacts"
+    );
+
+    let batch = witness_payment_continuations(&state, &taps);
+    assert_eq!(
+        batch.status,
+        PaymentContinuationBatchStatus::Indeterminate(
+            PaymentContinuationIndeterminate::PartialDirectPaymentSearch
+        ),
+        "direct payment roots deliberately bypass unrelated roots after retaining a proof"
+    );
+    assert!(
+        batch.successors.iter().any(Option::is_some),
+        "a four-tap Improvise path followed by finalization must retain its certificate"
+    );
+    assert!(
+        witness_payment_continuation(&state, &taps[0]).is_some(),
+        "the singleton compatibility API must preserve an indeterminate batch's positive certificate"
+    );
+}
+
+#[test]
+fn missing_payment_finalization_baseline_is_indeterminate_not_no_payment() {
+    let mut state = manual_spell_payment_state();
+    state.stack.clear();
+
+    let batch = witness_payment_continuations(&state, &[GameAction::CancelCast]);
+    assert_eq!(
+        batch.status,
+        PaymentContinuationBatchStatus::Indeterminate(
+            PaymentContinuationIndeterminate::MissingFinalizationBaseline
+        )
+    );
+    assert!(batch.successors.iter().all(Option::is_none));
+}
+
+#[test]
 fn flexible_mana_witness_keeps_every_completing_product() {
     let state = flexible_mana_payment_state();
     let mut actions = legal_actions(&state);
@@ -208,10 +297,9 @@ fn flexible_mana_witness_keeps_every_completing_product() {
             .expect("every generated colour product remains reducer-legal");
     }
 
-    let accepted: Vec<_> = actions
-        .iter()
-        .filter_map(|action| witness_payment_continuation(&state, action))
-        .collect();
+    let batch = witness_payment_continuations(&state, &actions);
+    assert_eq!(batch.status, PaymentContinuationBatchStatus::Complete);
+    let accepted: Vec<_> = batch.successors.into_iter().flatten().collect();
     assert_eq!(
         accepted
             .iter()
@@ -219,5 +307,54 @@ fn flexible_mana_witness_keeps_every_completing_product() {
             .collect::<Vec<_>>(),
         expected[..3].iter().collect::<Vec<_>>(),
         "only the products that leave blue available complete the exact root"
+    );
+}
+
+#[test]
+fn payment_batch_over_capacity_returns_no_partial_certificate_without_applying_roots() {
+    let state = flexible_mana_payment_state();
+    let root = legal_actions(&state)
+        .into_iter()
+        .next()
+        .expect("live color prompt issues a root action");
+    let actions = vec![root; 65];
+    let mut counters = PaymentContinuationWitnessCounters::default();
+    let batch = witness_payment_continuations_with_counters(&state, &actions, &mut counters);
+
+    assert_eq!(
+        batch.status,
+        PaymentContinuationBatchStatus::Indeterminate(
+            PaymentContinuationIndeterminate::OverRootCapacity
+        )
+    );
+    assert!(batch.successors.iter().all(Option::is_none));
+    assert_eq!(counters.root_applies, 0);
+    assert_eq!(counters.total_attempts, 0);
+}
+
+#[test]
+fn payment_batch_reserves_continuation_budget_after_a_full_root_wave() {
+    let state = flexible_mana_payment_state();
+    let root = legal_actions(&state)
+        .into_iter()
+        .next()
+        .expect("live color prompt issues a root action");
+    let actions = vec![root; 64];
+    let mut counters = PaymentContinuationWitnessCounters::default();
+    let batch = witness_payment_continuations_with_counters(&state, &actions, &mut counters);
+
+    assert_eq!(batch.status, PaymentContinuationBatchStatus::Complete);
+    assert!(
+        batch.successors.iter().all(Option::is_some),
+        "every equivalent root needs the reducer's next payment/finalization step"
+    );
+    assert_eq!(counters.root_applies, 64);
+    assert!(
+        counters.continuation_applies >= 64,
+        "the full root wave must leave enough shared budget to advance every root"
+    );
+    assert!(
+        counters.total_attempts <= PAYMENT_CONTINUATION_MAX_REDUCER_ATTEMPTS,
+        "all root and continuation work remains under the single decision bound"
     );
 }

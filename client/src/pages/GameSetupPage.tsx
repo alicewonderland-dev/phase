@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useLocation, useNavigate, useSearchParams } from "react-router";
 
@@ -17,9 +17,10 @@ import { FormatPicker } from "../components/menu/FormatPicker";
 import { MenuParticles } from "../components/menu/MenuParticles";
 import { MenuPanel, MenuShell } from "../components/menu/MenuShell";
 import { MyDecks, StatusBadge } from "../components/menu/MyDecks";
+import { IntegerField } from "../components/ui/IntegerField";
 import { ModalPanelShell } from "../components/ui/ModalPanelShell";
 import {
-  getRepresentativeCard,
+  getRepresentativeDeckVisual,
   getDeckCardCount,
   getDeckColorIdentityPips,
 } from "../components/menu/deckHelpers";
@@ -83,6 +84,7 @@ export function GameSetupPage() {
   // Format picker modal -- opened by the hero chip below the title. Mobile
   // gets a full-screen sheet via <ModalPanelShell>; desktop centers it.
   const [formatPickerOpen, setFormatPickerOpen] = useState(false);
+  const formatPickerTriggerRef = useRef<HTMLButtonElement>(null);
 
   // Format & config state
   const [selectedFormat, setSelectedFormat] = useState<GameFormat | null>(null);
@@ -202,7 +204,7 @@ export function GameSetupPage() {
     // The native server owns a fresh AI session and v1 deliberately has no
     // resume contract. Preserve the existing pointer only for the WASM route.
     if (!canAttemptNativeEngine(prefs.nativeEngineEnabled) || firstPlayer !== "random") {
-      saveActiveGame({ id: gameId, mode: "ai", difficulty: headDifficulty, aiSeats });
+      saveActiveGame({ id: gameId, mode: "ai", difficulty: headDifficulty, aiSeats, formatConfig });
     }
     useGameStore.setState({ gameId });
     const firstParam = firstPlayer !== "random" ? `&first=${firstPlayer}` : "";
@@ -210,8 +212,14 @@ export function GameSetupPage() {
     // GamePage projects it onto the local MatchConfig. Omitted = Off (engine default).
     const loopMode = loopDetectionModeToQuery(loopDetection);
     const loopParam = loopMode ? `&loop=${loopMode}` : "";
+    // The URL carries the format NAME only, so the edited config (starting
+    // life) has to ride along out-of-band or GamePage re-derives it from
+    // `FORMAT_DEFAULTS` and silently discards the edit. Router state — the
+    // same channel `useBroker` uses — rather than a URL param, because the
+    // native-engine route above deliberately writes no resume pointer.
     navigate(
       `/game/${gameId}?mode=ai&difficulty=${headDifficulty}&format=${formatConfig.format}&players=${playerCount}&match=${matchType.toLowerCase()}${loopParam}${firstParam}`,
+      { state: { formatConfig } },
     );
   };
 
@@ -243,15 +251,18 @@ export function GameSetupPage() {
     !randomDeckSelected &&
     cedhMode &&
     !isDeckCedhLegal(humanDeckBracket);
-  const representativeCard = useMemo(
-    () => (activeDeckName && !isRandomDeckSelection(activeDeckName) ? getRepresentativeCard(activeDeckName) : null),
+  const representativeVisual = useMemo(
+    () => (activeDeckName && !isRandomDeckSelection(activeDeckName) ? getRepresentativeDeckVisual(activeDeckName) : null),
     [activeDeckName],
   );
   const deckCardCount = useMemo(
     () => (activeDeckName && !isRandomDeckSelection(activeDeckName) ? getDeckCardCount(activeDeckName) : 0),
     [activeDeckName],
   );
-  const { src: deckArtSrc } = useCardImage(representativeCard ?? "", { size: "art_crop" });
+  const { src: deckArtSrc, advanceFailedSource: advanceFailedDeckArtSource } = useCardImage(
+    representativeVisual?.name ?? "",
+    { size: "art_crop", sourcePrinting: representativeVisual?.sourcePrinting },
+  );
   const colorPips = getDeckColorIdentityPips(selectedCompat?.color_identity ?? null);
 
   return (
@@ -273,6 +284,7 @@ export function GameSetupPage() {
           return (
             <div className="flex justify-center">
               <button
+                ref={formatPickerTriggerRef}
                 type="button"
                 onClick={() => setFormatPickerOpen(true)}
                 aria-haspopup="dialog"
@@ -384,7 +396,12 @@ export function GameSetupPage() {
                 <div>
                   <div className="aspect-[5/3] overflow-hidden rounded-xl bg-gray-800">
                     {deckArtSrc ? (
-                      <img src={deckArtSrc} alt="" className="h-full w-full object-cover" />
+                      <img
+                        src={deckArtSrc}
+                        alt=""
+                        className="h-full w-full object-cover"
+                        onError={() => advanceFailedDeckArtSource?.(deckArtSrc)}
+                      />
                     ) : (
                       <div className="h-full w-full animate-pulse bg-gray-800" />
                     )}
@@ -473,11 +490,11 @@ export function GameSetupPage() {
                 <div className="flex flex-col gap-3">
                   <label className="flex items-center justify-between">
                     <span className="text-xs text-slate-400">{t("gameSetup.config.startingLife")}</span>
-                    <input
-                      type="number"
+                    <IntegerField
                       value={formatConfig.starting_life}
-                      onChange={(e) =>
-                        setFormatConfig({ ...formatConfig, starting_life: Number(e.target.value) })
+                      min={1}
+                      onCommit={(starting_life) =>
+                        setFormatConfig({ ...formatConfig, starting_life })
                       }
                       className="w-16 rounded-lg border border-gray-700 bg-gray-800/60 px-2 py-1 text-right text-sm text-white"
                     />
@@ -540,7 +557,7 @@ export function GameSetupPage() {
                     <span className="text-xs text-slate-400" title={t("common:comboDetector.title")}>
                       {t("common:comboDetector.label")}
                     </span>
-                    <div className="grid grid-cols-3 gap-1 rounded-[10px] border border-gray-700 bg-gray-950/70 p-1">
+                    <div className="grid grid-cols-2 gap-1 rounded-[10px] border border-gray-700 bg-gray-950/70 p-1">
                       <button
                         type="button"
                         onClick={() => setLoopDetection({ type: "Off" })}
@@ -551,17 +568,6 @@ export function GameSetupPage() {
                         }`}
                       >
                         {t("common:comboDetector.off")}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setLoopDetection({ type: "On" })}
-                        className={`rounded-[7px] px-3 py-1.5 text-xs font-medium transition-colors ${
-                          loopDetection.type === "On"
-                            ? "bg-indigo-600 text-white"
-                            : "bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-gray-200"
-                        }`}
-                      >
-                        {t("common:comboDetector.on")}
                       </button>
                       <button
                         type="button"
@@ -649,6 +655,7 @@ export function GameSetupPage() {
         title={t("gameSetup.formatPicker.title")}
         subtitle={t("gameSetup.formatPicker.subtitle")}
         onClose={() => setFormatPickerOpen(false)}
+        returnFocusRef={formatPickerTriggerRef}
         maxWidthClassName="max-w-3xl"
         bodyClassName="overflow-y-auto px-4 pt-4 lg:px-6 lg:pt-6"
       >

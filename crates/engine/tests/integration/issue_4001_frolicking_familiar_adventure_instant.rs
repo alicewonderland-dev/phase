@@ -26,6 +26,7 @@ fn add_mana(runner: &mut GameRunner, player: PlayerId, color: ManaType, count: u
 
 fn blow_off_steam_back_face() -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
         name: "Blow Off Steam".to_string(),
         power: None,
         toughness: None,

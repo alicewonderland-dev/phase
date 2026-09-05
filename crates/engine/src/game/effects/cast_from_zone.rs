@@ -12,6 +12,12 @@ use crate::types::statics::CastFrequency;
 use crate::types::zones::{EtbTapState, Zone};
 use std::collections::HashSet;
 
+pub(crate) fn stack_spell_copy_cast_ledger_error(
+    error: crate::types::resolved_commands::ResolvedLedgerEditReplayInvariantError,
+) -> EffectError {
+    EffectError::InvalidParam(format!("failed to record stack spell copy cast: {error}"))
+}
+
 /// CR 400.1/400.2: Recursively extract a filter's own `controller` axis,
 /// looking through the composed forms (`Not`/`And`/`Or`) a real card's target
 /// filter may be built from rather than only matching a bare `Typed`. `And`/
@@ -115,6 +121,36 @@ fn tracked_set_cast_candidates(
         .into_iter()
         .filter(|obj_id| crate::game::filter::matches_target_filter(state, *obj_id, &bound, &ctx))
         .collect()
+}
+
+/// CR 607.2a + CR 608.2g: restrict the linked cast reference to members
+/// published by this resolving instruction.
+///
+/// Return the live source-linked exile members of the active resolution's
+/// tracked set, preserving publication order and exact current membership.
+fn resolution_window_linked_batch_candidates(
+    state: &GameState,
+    source_id: ObjectId,
+) -> Option<Vec<ObjectId>> {
+    let members = state
+        .chain_tracked_set_id
+        .and_then(|id| state.tracked_object_sets.get(&id))?;
+    let linked = crate::game::players::linked_exile_cards_for_source(state, source_id);
+    let mut seen = HashSet::new();
+    Some(
+        members
+            .iter()
+            .copied()
+            .filter(|id| {
+                seen.insert(*id)
+                    && state
+                        .objects
+                        .get(id)
+                        .is_some_and(|object| object.zone == Zone::Exile)
+                    && linked.iter().any(|link| link.exiled_id == *id)
+            })
+            .collect(),
+    )
 }
 
 /// CR 400.1/400.2 + CR 109.4: Eligible hand-pick pool for a private-zone
@@ -337,6 +373,7 @@ fn open_private_zone_cast_selection(
         conditional_enter_with_counters: vec![],
         count_param: 0,
         library_position: None,
+        mass_library_order: None,
         is_cost_payment: false,
         enters_modified_if: None,
         duration: None,
@@ -459,7 +496,43 @@ pub fn resolve(
     // would drop every target not in `last_revealed_ids`. The remap therefore
     // only applies on the empty-target fallback below.
     let mut used_last_revealed_library_fallback = false;
-    if target_ids.is_empty() && target_filter.references_exiled_by_source() {
+    if target_filter.references_exiled_by_source()
+        && matches!(
+            driver,
+            crate::types::ability::CastFromZoneDriver::ResolutionWindow { .. }
+        )
+    {
+        let exact_bound_batch = !target_ids.is_empty()
+            && ability.targets.len() == ability.target_incarnations.len()
+            && ability
+                .targets
+                .iter()
+                .zip(&ability.target_incarnations)
+                .all(
+                    |(target, pin)| matches!(target, TargetRef::Object(id) if *id == pin.object_id),
+                );
+        // A paused producer such as ForEachCategory publishes its exact
+        // resolution batch through the active chain set before this parked
+        // cast continuation resumes. Consume that set instead of reopening the
+        // source-wide exile ledger; permanent sources may retain older links.
+        // An incarnation-pinned target batch was already bound at the consumer
+        // seam and can span several player-scope publishes or follow a later
+        // producer barrier, so it remains the stronger exact authority.
+        if !exact_bound_batch {
+            if let Some(active_batch) =
+                resolution_window_linked_batch_candidates(state, ability.source_id)
+            {
+                target_ids = active_batch;
+            }
+        }
+    }
+    if target_ids.is_empty()
+        && target_filter.references_exiled_by_source()
+        && !matches!(
+            driver,
+            crate::types::ability::CastFromZoneDriver::ResolutionWindow { .. }
+        )
+    {
         let linked = crate::game::players::linked_exile_cards_for_source(state, ability.source_id);
         let current_linked_ids: Vec<_> = state
             .last_zone_changed_ids
@@ -497,7 +570,13 @@ pub fn resolve(
         // the Deep) leave the looked-at cards in the library. `Dig { keep_count:
         // 0 }` publishes them via `last_revealed_ids`, not exile links, but the
         // parser still binds the cast step to `ExiledBySource`.
-        if target_ids.is_empty() && !state.last_revealed_ids.is_empty() {
+        if target_ids.is_empty()
+            && !matches!(
+                driver,
+                crate::types::ability::CastFromZoneDriver::ResolutionWindow { .. }
+            )
+            && !state.last_revealed_ids.is_empty()
+        {
             used_last_revealed_library_fallback = true;
             target_ids =
                 crate::game::filter::last_revealed_library_ids_matching(state, target_filter, &ctx);
@@ -590,6 +669,42 @@ pub fn resolve(
             Zone::Library,
             events,
         );
+    }
+
+    // CR 608.2g + CR 202.3: the "… from among them" BATCH form. The
+    // referent set was produced by an earlier instruction of this same
+    // resolution and the casts happen inside it — "the currently resolving spell
+    // or ability continues to resolve, which may include casting other spells
+    // this way", and "no other spells can normally be cast … during resolution"
+    // (CR 608.2g). There is therefore no later priority window in which a
+    // lingering permission could be exercised, which is exactly what every
+    // published ruling for this class says ("you can't wait to cast them later
+    // in the turn"). Route it to the interactive free-cast window instead of
+    // `grant_lingering_permissions`.
+    //
+    // Placed ABOVE `driver_free_cast` / `immediate_graveyard_free_cast`: those
+    // gates fire on a SINGLE resolved target with no driver requirement, so a
+    // batch that happens to have exactly one legal member would otherwise be
+    // cast unconditionally instead of being offered through the window (and the
+    // window's cast-count/budget bounds would be skipped).
+    //
+    // An EMPTY batch is deliberately excluded: the instruction produced nothing
+    // to cast, and the established empty-target tail below (the hand /
+    // `LastRevealed` selection fallbacks and the "No targets resolved" exit,
+    // which emits `EffectKind::CastFromZone`) stays the single authority for
+    // that case.
+    if let Some(bounds) = driver.window_bounds() {
+        if without_paying && alt_ability_cost.is_none() && !target_ids.is_empty() {
+            return open_resolution_cast_window(
+                state,
+                ability,
+                target_filter,
+                constraint.as_ref(),
+                bounds,
+                target_ids,
+                events,
+            );
+        }
     }
 
     // CR 310.12b + CR 608.2c: "exile it, then you may cast it transformed" —
@@ -798,7 +913,15 @@ pub fn resolve(
     {
         let mut window = ability.clone();
         window.effect = Effect::FreeCastFromZones {
-            count: target_ids.len().try_into().unwrap_or(u8::MAX),
+            // CR 608.2c: one cast per surviving pair, as printed ("for each
+            // opponent, you may cast up to one target instant or sorcery card
+            // from that player's graveyard"). `u8::try_from(..).ok()`
+            // is not a lossy truncation here: a pool that does not fit a `u8`
+            // maps to `None`, the unbounded form, whose only bound is the pool
+            // itself — exactly the intended "cast one from each opponent"
+            // semantics. The old `unwrap_or(u8::MAX)` would instead have capped
+            // such a fanout at 255 casts.
+            count: u8::try_from(target_ids.len()).ok(),
             max_total_mv: None,
             filter: target_filter.clone(),
             zones: vec![Zone::Graveyard],
@@ -851,6 +974,120 @@ pub fn resolve(
     }
 
     Ok(())
+}
+
+/// CR 400.1 + CR 601.2a: The zones a resolution-scoped batch window may cast
+/// from. CR 601.2a moves the card "from where it is to the stack", and a batch
+/// produced by an exile / mill / reveal step lands in one of these four (exile
+/// and the stack-adjacent private zones of CR 400.1). A batch member that has
+/// already left one of them contributes no candidate, so the window's zone set
+/// is derived from the surviving members rather than assumed.
+const RESOLUTION_WINDOW_ORIGIN_ZONES: [Zone; 4] =
+    [Zone::Exile, Zone::Graveyard, Zone::Library, Zone::Hand];
+
+/// CR 608.2g + CR 202.3 + CR 608.2h: Convert a resolution-scoped
+/// `CastFromZone` batch grant into the interactive free-cast window
+/// (`Effect::FreeCastFromZones`) over exactly `pool`.
+///
+/// `pool` is THIS resolution's batch: the ids the chain seam forwarded from the
+/// exile/mill/reveal step, already narrowed by the clause's own type gate in the
+/// caller. Handing them to the window as its `member_pool` is what confines the
+/// offer to the current resolution (CR 607.2a) — `TargetFilter::ExiledBySource`
+/// alone reads the source's cumulative live linked-exile ledger, so a card a
+/// PREVIOUS resolution of the same source left in exile would otherwise be
+/// re-offered. For the same reason the anaphor leg is DISCHARGED from the
+/// window's filter: it has already been satisfied by the pool, and re-evaluating
+/// it inside a triggered ability reads the trigger's pre-exile
+/// `linked_exile_snapshot` and would drop every member (the identical hazard the
+/// caller's type-gate pass documents).
+///
+/// CR 608.2h: the per-spell mana-value ceiling ("mana value X or less" — Kotis,
+/// Epic Experiment, Villainous Wealth) is information the effect requires, so it
+/// is resolved ONCE here, while the trigger context that supplies X is still
+/// live, and applied to the pool. It cannot ride on the window as a live
+/// predicate: the window re-offers after each cast, by which time the trigger
+/// context is gone and a dynamic `X` would re-resolve to 0. Evaluation goes
+/// through `cast_permission_constraint_allows_cast`, the same authority the
+/// lingering-permission path uses, so the two never diverge.
+fn open_resolution_cast_window(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    target_filter: &TargetFilter,
+    constraint: Option<&CastPermissionConstraint>,
+    bounds: crate::types::ability::ResolutionCastWindow,
+    pool: Vec<ObjectId>,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EffectError> {
+    // CR 608.2h: freeze the dynamic per-spell ceiling now, then apply it.
+    let frozen = freeze_cast_permission_constraint(state, ability, constraint.cloned());
+    let mut pool: Vec<ObjectId> = pool
+        .into_iter()
+        .filter(|id| {
+            state.objects.get(id).is_some_and(|obj| {
+                RESOLUTION_WINDOW_ORIGIN_ZONES.contains(&obj.zone)
+                    && crate::game::casting::cast_permission_constraint_allows_cast(
+                        state, obj, &frozen, None,
+                    )
+            })
+        })
+        .collect();
+    // CR 607.2a: `publish`-style forwarding can repeat an id; a duplicated pool
+    // member would offer the same card twice and consume two casts of the bound.
+    let mut seen = HashSet::new();
+    pool.retain(|id| seen.insert(*id));
+
+    let zones: Vec<Zone> = RESOLUTION_WINDOW_ORIGIN_ZONES
+        .into_iter()
+        .filter(|zone| {
+            pool.iter()
+                .any(|id| state.objects.get(id).is_some_and(|obj| obj.zone == *zone))
+        })
+        .collect();
+
+    // CR 608.2c: the controller follows the instruction as printed. "any number
+    // of spells" states no cap, so the batch itself is the bound; "up to two" /
+    // a singular "a spell" carry their own. Both forms share
+    // `Effect::FreeCastFromZones::count`'s encoding (`None` = unbounded), so the
+    // parsed bound passes straight through.
+    //
+    // This used to substitute `pool.len()` for the unbounded case and clamp it
+    // with `unwrap_or(u8::MAX)`, which silently capped an unbounded window over
+    // a 256+ card pool at 255 casts. No printed instruction states such a cap,
+    // and CR 608.2g supplies none either; the window's real bound is candidate
+    // exhaustion, which `eligible_candidates` enforces on every re-offer.
+    let count = bounds.max_casts;
+
+    // The anaphor leg is discharged (see the doc comment); what remains is the
+    // clause's own type gate, which `eligible_candidates` re-applies to the pool.
+    let window_filter = if target_filter.references_exiled_by_source() {
+        target_filter
+            .without_exile_anaphor()
+            .unwrap_or(TargetFilter::Any)
+    } else {
+        target_filter.clone()
+    };
+
+    let graveyard_replacement = cast_from_zone_graveyard_destination(ability);
+    let mut window = ability.clone();
+    window.effect = Effect::FreeCastFromZones {
+        count,
+        max_total_mv: bounds.max_total_mv,
+        filter: window_filter,
+        zones,
+        graveyard_replacement: graveyard_replacement.clone(),
+    };
+    // CR 614.1a: the stack-to-graveyard redirect rider is stored as a sequential
+    // `ParentTarget` sub-ability but is consumed as per-cast window metadata.
+    // Retaining it would run a second destination move after the window. Every
+    // OTHER sub-ability is a real trailing instruction of the same resolution
+    // (Epic Experiment's "then put all cards exiled this way that weren't cast
+    // into your graveyard", Collected Conjuring's bottom-the-rest) and must
+    // survive — `resolve_ability_chain` parks it as the window's continuation.
+    if graveyard_replacement.is_some() {
+        window.sub_ability = None;
+    }
+    window.targets = pool.into_iter().map(TargetRef::Object).collect();
+    super::free_cast_from_zones::resolve(state, &window, events)
 }
 
 /// CR 608.2g + CR 601.2a: After a resolution-time hand pick for a free
@@ -1040,12 +1277,6 @@ fn cast_stack_spell_copy_during_resolution(
     copy_id: ObjectId,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    events.push(GameEvent::EffectResolved {
-        kind: EffectKind::CastFromZone,
-        source_id: ability.source_id,
-        subject: None,
-    });
-
     let Some(obj) = state.objects.get(&copy_id).cloned() else {
         return Err(EffectError::InvalidParam(format!(
             "stack spell copy {copy_id:?} not found"
@@ -1056,6 +1287,16 @@ fn cast_stack_spell_copy_during_resolution(
             "ParentTarget {copy_id:?} is not a stack spell copy"
         )));
     }
+    crate::game::ledger::validate_spell_cast_recording(state, ability.controller)
+        .map_err(stack_spell_copy_cast_ledger_error)?;
+    crate::game::casting_costs::validate_cast_occurrence_stack_spell_carrier(state, copy_id)
+        .map_err(|error| EffectError::InvalidParam(error.to_string()))?;
+
+    events.push(GameEvent::EffectResolved {
+        kind: EffectKind::CastFromZone,
+        source_id: ability.source_id,
+        subject: None,
+    });
 
     // CR 113.2c + CR 601.2i + CR 608.2g: this copy is now being CAST, so
     // snapshot its effective spell keywords before recording SpellCast. This
@@ -1075,13 +1316,16 @@ fn cast_stack_spell_copy_during_resolution(
         object_id: copy_id,
         cast_mana_value: Some(obj.spell_mana_value()),
     });
-    crate::game::restrictions::record_spell_cast_from_zone(
+    let occurrence = crate::game::restrictions::record_spell_cast_from_zone(
         state,
         ability.controller,
         &obj,
         origin,
         CastingVariant::Normal,
-    );
+    )
+    .map_err(stack_spell_copy_cast_ledger_error)?;
+    crate::game::casting_costs::stamp_cast_occurrence_on_stack_spell(state, copy_id, occurrence)
+        .map_err(|error| EffectError::InvalidParam(error.to_string()))?;
 
     if crate::game::effects::prepare::open_copy_target_selection(
         state,
@@ -1391,6 +1635,8 @@ fn record_lingering_permissions(
     // object (The Tomb of Aclazotz).
     let enters_with_modifications = cast_from_zone_enters_with_modifications(ability);
 
+    // CR 611.2b: set when a host-bound lifetime was attached below.
+    let mut needs_lifetime_check = false;
     for &obj_id in target_ids {
         // CR 601.2a: Targeted graveyard grants (Emry, Lurker in the Loch) and
         // resolution-time hand picks (Electrodominance) keep the card in its
@@ -1417,11 +1663,71 @@ fn record_lingering_permissions(
             // attack trigger's cast permission must be scoped to Jeleva's
             // controller, not to each card's owner.
             let granted_to = Some(ability.controller);
+            // CR 611.2a: the stated lifetime of the grant. Computed ONCE here
+            // so both alternative-cost forms below receive the same value: the
+            // non-mana cost (CR 118.9) changes how the spell is paid for, never
+            // how long the permission lasts, and a lifetime that survives only
+            // one of the two branches is the defect this shares with the
+            // land-play companion further down.
+            //
+            // CR 611.2a: An *in-place* grant on a card left in the hand or
+            // graveyard (Emry, Sunforger searching to hand, Electrodominance)
+            // is a continuous effect from this ability's resolution; it must
+            // expire at cleanup if the cast is declined, since the card never
+            // leaves a zone that would trigger permission cleanup. Exile-origin
+            // grants keep `None` — they are pruned on leaving exile instead
+            // (`zones::apply_zone_exit_cleanup`).
+            // The same question `grant_permission::resolve` asks, asked the same
+            // way: "does this grant sit on a card in EXILE?" — the only zone
+            // `zones::apply_zone_exit_cleanup` clears permissions from. Written
+            // out rather than derived as `!in_place` so the two sites cannot
+            // drift apart the moment a fourth origin zone appears.
+            let exile_resident = matches!(current_zone, Some(Zone::Exile));
+            let in_place = matches!(current_zone, Some(Zone::Graveyard | Zone::Hand));
+            let enforceable = |d: &Duration| {
+                crate::game::layers::casting_permission_duration_is_enforceable(d, exile_resident)
+            };
+            let granted_duration = match duration.clone() {
+                // The stated lifetime, when some pass can end it for THIS grant.
+                Some(d) if enforceable(&d) => Some(d),
+                // CR 611.2a: an in-place stated lifetime nothing can enforce
+                // falls back to the cleanup-step default rather than being kept
+                // unbounded. Resourceful Collector states "for as long as it's
+                // in your graveyard"; no pass evaluates that condition and the
+                // card never leaves exile, so keeping it would turn a
+                // permission that expired at end of turn into one that never
+                // expires — the exact defect this repair exists to remove. The
+                // printed condition stays unmodeled either way; this only
+                // refuses to make it worse.
+                Some(_) if in_place => Some(Duration::UntilEndOfTurn),
+                // Exile-resident with a lifetime nothing can end: refuse the
+                // grant rather than attaching it unbounded. Same guard as
+                // `grant_permission::resolve`; both sites ask the one authority
+                // so a shape cannot be enforceable at one and not the other.
+                Some(d) => {
+                    debug_assert!(
+                        false,
+                        "cast-from-zone grant carries an unenforceable duration: {d:?}"
+                    );
+                    continue;
+                }
+                // CR 611.2a: the durationless in-place default, stated once
+                // above this match.
+                None => in_place.then_some(Duration::UntilEndOfTurn),
+            };
             let permission = if let Some(cost) = alt_ability_cost.clone() {
                 CastingPermission::ExileWithAltAbilityCost {
                     cost,
                     constraint: constraint.clone(),
                     granted_to,
+                    duration: granted_duration.clone(),
+                    // CR 611.2a + CR 400.7: same host identity as the
+                    // `ExileWithAltCost` sibling — without it a
+                    // `WhileControllingHost` / `UntilHostLeavesPlay` lifetime
+                    // has nothing to compare the departed object against and is
+                    // unenforceable (Nashi, Moon Sage's Scion — the card that
+                    // reaches this variant today).
+                    source_id: Some(ability.source_id),
                 }
             } else {
                 let cost = if without_paying {
@@ -1431,6 +1737,15 @@ fn record_lingering_permissions(
                 };
                 CastingPermission::ExileWithAltCost {
                     cost,
+                    // CR 118.9a: "without paying" substitutes the printed cost
+                    // (alternative); otherwise this grant restates the card's
+                    // own cost for a NORMAL cast — a normal-cost route that may
+                    // authorize the face-down cast (CR 702.168b).
+                    cost_provenance: if without_paying {
+                        crate::types::ability::ExileGrantCostProvenance::Alternative
+                    } else {
+                        crate::types::ability::ExileGrantCostProvenance::NormalCost
+                    },
                     cast_transformed,
                     constraint: constraint.clone(),
                     granted_to,
@@ -1453,10 +1768,13 @@ fn record_lingering_permissions(
                     // Default both in-place origins to UntilEndOfTurn when the
                     // parser carried no explicit duration. (Exile-origin grants
                     // keep `None` — they are pruned on leaving exile instead.)
-                    duration: duration.clone().or_else(|| {
-                        matches!(current_zone, Some(Zone::Graveyard | Zone::Hand))
-                            .then_some(Duration::UntilEndOfTurn)
-                    }),
+                    duration: granted_duration.clone(),
+                    // CR 611.2a + CR 400.7: record WHICH permanent's presence
+                    // bounds the duration above. The land-play companion built
+                    // below already carries `source_id`; without the same
+                    // identity here the cast half of one `CastFromZone` would
+                    // outlive its host while the land half expired.
+                    source_id: Some(ability.source_id),
                     graveyard_replacement: graveyard_replacement.clone(),
                     enters_with_counter: enters_with_counter.clone(),
                     enters_with_modifications: enters_with_modifications.clone(),
@@ -1468,8 +1786,25 @@ fn record_lingering_permissions(
                     mana_spend_permission,
                 }
             };
+            // CR 611.2b: a host-bound lifetime must be evaluated once now —
+            // its duration may ALREADY be over (the host left, or changed
+            // controller, before this ability resolved), in which case
+            // CR 611.2b says the effect does nothing. Attaching a permission to
+            // a card in exile changes no characteristic and so would not dirty
+            // the layers on its own, and `prune_lapsed_host_bound_casting_permissions`
+            // runs inside `evaluate_layers`, which a flush reaches only when the
+            // layers are dirty. Marking here is what connects the two, and it
+            // keeps the pass off the hot path for every flush that grants
+            // nothing.
+            let host_bound = permission
+                .lifetime()
+                .duration
+                .is_some_and(Duration::ends_when_host_leaves_play);
             if !obj.casting_permissions.contains(&permission) {
                 obj.casting_permissions.push(permission);
+                if host_bound {
+                    needs_lifetime_check = true;
+                }
             }
 
             // CR 305.1: A `CastFromZone` in `mode: Play` must also authorize
@@ -1481,13 +1816,18 @@ fn record_lingering_permissions(
             {
                 // CR 305.1: lands are played (not cast) but still require
                 // face-down exile look/play authority.
-                let play_duration = duration.clone().unwrap_or_else(|| {
-                    matches!(current_zone, Some(Zone::Graveyard | Zone::Hand))
-                        .then_some(Duration::UntilEndOfTurn)
-                        .unwrap_or(Duration::Permanent)
-                });
+                // The SAME value the cast half received, not the raw parsed
+                // duration: the land companion must not be the one branch that
+                // keeps a lifetime nothing can enforce. `PlayFromExile.duration`
+                // is not optional, so the exile-origin `None` becomes
+                // `Permanent` here — pruned on leaving exile
+                // (`zones::apply_zone_exit_cleanup`), which is what it meant
+                // before this field was plumbed through.
+                let play_duration = granted_duration.clone().unwrap_or(Duration::Permanent);
 
                 let play_permission = CastingPermission::PlayFromExile {
+                    provenance: crate::types::ability::PlayFromExileProvenance::LandLookCompanion,
+                    mode: crate::types::ability::CardPlayMode::Play,
                     duration: play_duration,
                     granted_to: ability.controller,
                     frequency: CastFrequency::Unlimited,
@@ -1499,6 +1839,7 @@ fn record_lingering_permissions(
                     single_use_group: None,
                     single_use: false,
                     cast_cost_raise: None,
+                    alt_ability_cost: None,
                     land_enter_tapped: EtbTapState::Unspecified,
                 };
 
@@ -1507,6 +1848,9 @@ fn record_lingering_permissions(
                 }
             }
         }
+    }
+    if needs_lifetime_check {
+        state.layers_dirty.mark_full();
     }
     Ok(())
 }
@@ -1547,12 +1891,13 @@ mod tests {
     use crate::game::zones::create_object;
     use crate::types::ability::{
         CardPlayMode, CastFromZoneDriver, CastPermissionConstraint, Comparator, ControllerRef,
-        Effect, FilterProp, QuantityExpr, TargetFilter, TypeFilter, TypedFilter,
+        Effect, FilterProp, QuantityExpr, ResolutionCastWindow, TargetFilter, TypeFilter,
+        TypedFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;
     use crate::types::game_state::{ExileLink, ExileLinkKind, WaitingFor};
-    use crate::types::identifiers::{CardId, ObjectId};
+    use crate::types::identifiers::{CardId, ObjectId, TrackedSetId};
     use crate::types::player::PlayerId;
 
     fn make_test_state() -> GameState {
@@ -2029,6 +2374,8 @@ mod tests {
         let mut events = Vec::new();
         copy_spell::resolve(&mut state, &copy_ability, &mut events).unwrap();
         let copy_id = state.stack.back().expect("copy on stack").id;
+        assert_eq!(state.objects[&copy_id].cast_occurrence, None);
+        assert!(state.spells_cast_this_turn_by_player.is_empty());
 
         let cast_ability = ResolvedAbility::new(
             Effect::CastFromZone {
@@ -2064,6 +2411,24 @@ mod tests {
             }),
             "CastFromZone must complete the copy cast with SpellCast"
         );
+        let occurrence = state.objects[&copy_id]
+            .cast_occurrence
+            .expect("the newly cast stack copy receives a fresh coordinate");
+        assert_eq!(occurrence.caster, PlayerId(0));
+        assert_eq!(occurrence.turn_journal_index, 0);
+        assert_eq!(
+            state
+                .stack
+                .iter()
+                .find(|entry| entry.id == copy_id)
+                .and_then(StackEntry::ability)
+                .and_then(|ability| ability.cast_occurrence),
+            Some(occurrence)
+        );
+        assert_eq!(
+            state.spells_cast_this_turn_by_player[&PlayerId(0)][0].spell_object_id,
+            Some(copy_id)
+        );
         assert!(
             matches!(
                 state.waiting_for,
@@ -2094,6 +2459,87 @@ mod tests {
             }),
             "copy spell must remain on the stack after targeting"
         );
+    }
+
+    #[test]
+    fn spell_cast_writer_error_mappings_are_explicit_and_non_panicking_for_stack_copy() {
+        use crate::types::game_state::{StackEntry, StackEntryKind};
+        use crate::types::resolved_commands::{ResolvedLedgerEdit, ResolvedRulesCommand};
+
+        let mut state = make_test_state();
+        state.waiting_for = WaitingFor::ResolveAllReady { epoch: 42 };
+        let copy_id = create_object(
+            &mut state,
+            CardId(68_655),
+            PlayerId(0),
+            "Overflow Stack Copy".to_string(),
+            Zone::Stack,
+        );
+        state.objects.get_mut(&copy_id).unwrap().is_copy = true;
+        state.stack.push_back(StackEntry {
+            id: copy_id,
+            source_id: copy_id,
+            controller: PlayerId(0),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(68_655),
+                ability: None,
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        });
+        state.spells_cast_this_game.insert(PlayerId(0), u32::MAX);
+        let cast = ResolvedAbility::new(
+            Effect::CastFromZone {
+                target: TargetFilter::ParentTarget,
+                without_paying_mana_cost: true,
+                mode: CardPlayMode::Cast,
+                cast_transformed: false,
+                alt_ability_cost: None,
+                constraint: None,
+                duration: None,
+                driver: CastFromZoneDriver::DuringResolution,
+                mana_spend_permission: None,
+            },
+            vec![TargetRef::Object(copy_id)],
+            ObjectId(68_656),
+            PlayerId(0),
+        );
+        let object_before = serde_json::to_value(&state.objects[&copy_id]).unwrap();
+        let stack_before = state.stack.clone();
+        let next_object_id_before = state.next_object_id;
+        let journal_len_before = state.resolved_rules_journal.entries().len();
+        let mut events = Vec::new();
+
+        let error = resolve(&mut state, &cast, &mut events)
+            .expect_err("the real stack-copy writer must propagate ledger overflow");
+        assert!(matches!(
+            error,
+            EffectError::InvalidParam(ref message)
+                if message == "failed to record stack spell copy cast: resolved ledger command overflows a counter"
+        ));
+        assert_eq!(
+            serde_json::to_value(&state.objects[&copy_id]).unwrap(),
+            object_before
+        );
+        assert_eq!(state.stack, stack_before);
+        assert_eq!(state.next_object_id, next_object_id_before);
+        assert!(events.is_empty());
+        assert!(state.spells_cast_this_turn_by_player.is_empty());
+        assert_eq!(
+            state.resolved_rules_journal.entries().len(),
+            journal_len_before
+        );
+        assert!(!state.resolved_rules_journal.entries().iter().any(|entry| {
+            matches!(
+                entry.command.as_ref(),
+                Some(ResolvedRulesCommand::LedgerEdit(command))
+                    if matches!(command.edit, ResolvedLedgerEdit::SpellCast { .. })
+            )
+        }));
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::ResolveAllReady { epoch: 42 }
+        ));
     }
 
     /// CR 310.12b (#2876): Siege defeat — "exile it, then you may cast it
@@ -2380,6 +2826,68 @@ mod tests {
             state.objects[&creature].casting_permissions.is_empty(),
             "composed filter must preserve the typed restriction"
         );
+    }
+
+    #[test]
+    fn resolution_window_replaces_forwarded_targets_with_active_linked_batch() {
+        let mut state = make_test_state();
+        let source = create_object(
+            &mut state,
+            CardId(999),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let stale = add_card_to_exile(&mut state, PlayerId(1), CardId(303));
+        let current = add_card_to_exile(&mut state, PlayerId(1), CardId(304));
+        for exiled_id in [stale, current] {
+            state.exile_links.push(ExileLink {
+                exiled_id,
+                source_id: source,
+                kind: ExileLinkKind::TrackedBySource,
+            });
+        }
+        let active_set = TrackedSetId(1);
+        state.tracked_object_sets.insert(active_set, vec![current]);
+        state.chain_tracked_set_id = Some(active_set);
+
+        let ability = ResolvedAbility::new(
+            Effect::CastFromZone {
+                target: TargetFilter::ExiledBySource,
+                without_paying_mana_cost: true,
+                mode: CardPlayMode::Cast,
+                cast_transformed: false,
+                alt_ability_cost: None,
+                constraint: None,
+                duration: None,
+                driver: CastFromZoneDriver::ResolutionWindow {
+                    bounds: ResolutionCastWindow::default(),
+                },
+                mana_spend_permission: None,
+            },
+            vec![TargetRef::Object(stale), TargetRef::Object(current)],
+            source,
+            PlayerId(0),
+        );
+
+        let mut events = vec![];
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        match &state.waiting_for {
+            WaitingFor::CastOffer {
+                kind:
+                    crate::types::game_state::CastOfferKind::FreeCastWindow {
+                        candidates,
+                        member_pool,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(candidates, &vec![current]);
+                assert_eq!(member_pool, &vec![current]);
+            }
+            other => panic!("expected active-batch cast offer, got {other:?}"),
+        }
     }
 
     /// Issue #2019 — Kiora, Sovereign of the Deep: look-then-cast chains leave
@@ -2786,6 +3294,89 @@ mod tests {
             "hand-origin in-place grant must default to UntilEndOfTurn so a \
              declined offer expires at cleanup; got {:?}",
             state.objects[&cheap].casting_permissions
+        );
+    }
+
+    /// CR 611.2a + CR 305.1: both halves of one in-place grant consume the same
+    /// enforceable-duration decision — the cast permission and the land-play
+    /// companion.
+    ///
+    /// The companion is the half that computed the decision a second time, and
+    /// the two answers differ on exactly one input: a stated duration that no
+    /// pass can end for THIS grant. `ForAsLongAs` off an exile resident is that
+    /// input — `zones::apply_zone_exit_cleanup` is its only authority and never
+    /// fires for a card that stays in the graveyard, which is why
+    /// `casting_permission_duration_is_enforceable` refuses it here. The cast
+    /// half falls back to the cleanup-step default; the companion used to keep
+    /// the raw `ForAsLongAs` and never expire.
+    ///
+    /// Resourceful Collector prints this shape ("for as long as it's in your
+    /// graveyard"). Whether its grant runs is not established — the node sits
+    /// under an `Effect::Unimplemented` head — so the regression drives the
+    /// production entry point (`grant_lingering_permissions`) with the shape the
+    /// parser produces rather than through that card.
+    #[test]
+    fn the_land_companion_takes_the_same_enforceable_duration_as_the_cast_half() {
+        let mut state = make_test_state();
+        let card = add_card_to_graveyard(&mut state, PlayerId(0), CardId(515));
+        let ability = ResolvedAbility::new(
+            Effect::CastFromZone {
+                target: TargetFilter::Any,
+                without_paying_mana_cost: true,
+                mode: CardPlayMode::Play,
+                cast_transformed: false,
+                alt_ability_cost: None,
+                constraint: None,
+                duration: Some(Duration::ForAsLongAs {
+                    condition: crate::types::ability::StaticCondition::RecipientMatchesFilter {
+                        filter: TargetFilter::Any,
+                    },
+                }),
+                driver: CastFromZoneDriver::LingeringPermission,
+                mana_spend_permission: None,
+            },
+            vec![],
+            ObjectId(999),
+            PlayerId(0),
+        );
+
+        let mut events = vec![];
+        grant_lingering_permissions(&mut state, &ability, &[card], &mut events).unwrap();
+
+        let permissions = state.objects[&card].casting_permissions.clone();
+        // Reach guard: the CR 305.1 companion branch really ran, so the
+        // assertion below is about its value and not about its absence.
+        assert!(
+            permissions.iter().any(|p| matches!(
+                p,
+                CastingPermission::PlayFromExile {
+                    provenance: crate::types::ability::PlayFromExileProvenance::LandLookCompanion,
+                    ..
+                }
+            )),
+            "a mode: Play grant must build the land companion; got {permissions:?}"
+        );
+        assert!(
+            permissions.iter().any(|p| matches!(
+                p,
+                CastingPermission::PlayFromExile {
+                    provenance: crate::types::ability::PlayFromExileProvenance::LandLookCompanion,
+                    duration: Duration::UntilEndOfTurn,
+                    ..
+                }
+            )),
+            "the land companion must take the enforceable fallback, not the raw \
+             ForAsLongAs nothing can end; got {permissions:?}"
+        );
+        assert!(
+            permissions.iter().any(|p| matches!(
+                p,
+                CastingPermission::ExileWithAltCost {
+                    duration: Some(Duration::UntilEndOfTurn),
+                    ..
+                }
+            )),
+            "the cast half must carry the same value as the companion; got {permissions:?}"
         );
     }
 

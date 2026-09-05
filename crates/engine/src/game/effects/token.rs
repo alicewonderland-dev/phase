@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -18,9 +19,9 @@ use crate::types::card_type::{CardType, CoreType, Supertype};
 use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    DelayedTrigger, GameState, LiminalEntry, LiminalTokenAbilityInjection, PendingCopyTokenBatch,
-    PendingCounterAddition, PendingCounterPostAction, PendingEffectResolutionEvent,
-    PendingTokenBattlefieldEntry, TokenEntryEventEmission, WaitingFor,
+    DelayedTrigger, GameState, LiminalEntry, LiminalTokenAbilityInjection, PendingCounterAddition,
+    PendingCounterPostAction, PendingEffectResolutionEvent, PendingTokenBattlefieldEntry,
+    TokenEntryEventEmission, WaitingFor,
 };
 use crate::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef, TrackedSetId};
 use crate::types::keywords::{Keyword, WardCost};
@@ -157,7 +158,7 @@ fn materialize_catalog_token_payload(
     materialized.source = TokenAbilitySource::CatalogRulesText;
     materialized.rules_text = Some(rules_text.to_string());
     let (static_definitions, modifications, unparsed_lines) =
-        catalog_rules_text_abilities(rules_text);
+        catalog_rules_text_abilities(rules_text, &preset.body.display_name);
     materialized.static_definitions = static_definitions;
     materialized.unparsed_rules_text_lines = unparsed_lines;
 
@@ -2418,6 +2419,7 @@ pub(crate) fn realize_settled_token_battlefield_entry(
 /// `characteristics` / `script_name` / `static_abilities` / `tapped` /
 /// `source_id` / `controller` are INERT: they set object fields directly or
 /// feed the ETB probe and emit no creation-time event beyond the ETB pair.
+#[cfg(test)]
 pub(crate) fn spec_emits_only_etb_pair(spec: &TokenSpec) -> bool {
     spec.enter_with_counters.is_empty() // no CounterAdded event / AddCounter replacement
         && !spec.enters_attacking // no combat-state mutation (CR 508.4)
@@ -2433,6 +2435,7 @@ pub(crate) fn spec_emits_only_etb_pair(spec: &TokenSpec) -> bool {
 /// `EnterBattlefield(None)`, one narrow `EnterBattlefield(Some(ct))` per core
 /// type, and `TokenCreated`. Kept in lockstep with the deriver so the §2.3a gate
 /// reasons about exactly the events siblings would observe.
+#[cfg(test)]
 fn produced_token_emitted_keys(
     produced_core_types: &[CoreType],
 ) -> Vec<crate::types::triggers::TriggerEventKey> {
@@ -2474,6 +2477,7 @@ fn produced_token_emitted_keys(
 ///
 /// Conservatively rejects any trigger routed to unclassified (catch-all/dynamic
 /// modes fire on everything, so they always observe siblings).
+#[cfg(test)]
 pub(crate) fn produced_token_is_non_observer(
     triggers: &[TriggerDefinition],
     produced_core_types: &[CoreType],
@@ -2494,6 +2498,7 @@ pub(crate) fn produced_token_is_non_observer(
 /// (Doubling Season's mandatory Double) are fine and stay per-token (§5.2) —
 /// they never produce `NeedsChoice`. Reuses the live pipeline's exact decision
 /// functions, side-effect-free (`&GameState`, no `apply_single_replacement`).
+#[cfg(test)]
 fn token_creation_needs_choice(
     state: &GameState,
     spec: &TokenSpec,
@@ -2529,6 +2534,7 @@ fn token_creation_needs_choice(
 /// type predicate the disjointness check can reason about (negation,
 /// subtype-only, broad `Permanent`/`Card`/`Any`) — the caller then conserves by
 /// refusing the batch.
+#[cfg(test)]
 fn type_filter_core_types(filter: &TypeFilter) -> Option<Vec<CoreType>> {
     match filter {
         TypeFilter::Creature => Some(vec![CoreType::Creature]),
@@ -2559,6 +2565,7 @@ fn type_filter_core_types(filter: &TypeFilter) -> Option<Vec<CoreType>> {
 
 /// CR 205: The concrete `CoreType` set a `TargetFilter` counts, when it is a
 /// single-`TypeFilter` `Typed` filter. Any other shape yields `None`.
+#[cfg(test)]
 fn target_filter_counted_core_types(filter: &TargetFilter) -> Option<Vec<CoreType>> {
     match filter {
         TargetFilter::Typed(TypedFilter { type_filters, .. }) => {
@@ -2578,6 +2585,7 @@ fn target_filter_counted_core_types(filter: &TargetFilter) -> Option<Vec<CoreTyp
 /// quantity inside a `QuantityCheck` is provably disjoint from `token_core_types`.
 /// Any other condition shape (or an un-provable filter) returns `false` →
 /// conserve.
+#[cfg(test)]
 fn condition_invariant_for_token(
     condition: &crate::types::ability::AbilityCondition,
     token_core_types: &[CoreType],
@@ -2668,6 +2676,7 @@ pub(crate) fn token_effect_is_source_independent(ability: &ResolvedAbility) -> b
 /// `run_source_ids` are the per-entry source object ids of the contiguous run
 /// (resolution order, top-down), needed only by the met-copy prefix path to
 /// gather each entry's `SelfRef` copy source. The base-token path ignores them.
+#[cfg(test)]
 pub(crate) fn try_resolve_batch(
     state: &GameState,
     ability: &ResolvedAbility,
@@ -2745,6 +2754,13 @@ pub(crate) fn try_resolve_batch(
     Some(super::BatchPlan::token(spec, run_len))
 }
 
+/// Token handler-owned admission for the stack's clone-and-proof runner.
+/// This is deliberately read-only; `resolve` remains the sole production
+/// authority for creating each token.
+pub(crate) fn supports_sequential_batch_proof(ability: &ResolvedAbility) -> bool {
+    token_effect_is_source_independent(ability)
+}
+
 /// CR 608.2c + CR 707.2: A met `ConditionInstead` whose swapped effect is a
 /// bare `CopyTokenOf { target: SelfRef, … }` copies the run's own source object
 /// per entry. When a contiguous prefix of the run's copy sources share
@@ -2756,6 +2772,7 @@ pub(crate) fn try_resolve_batch(
 /// `sub` is the override sub-ability (its effect is the swapped `CopyTokenOf`);
 /// `inner` is the already-fired `ConditionInstead` condition. `run_source_ids`
 /// are the per-entry source ids (top-down resolution order).
+#[cfg(test)]
 fn try_resolve_copy_batch(
     state: &GameState,
     ability: &ResolvedAbility,
@@ -2839,35 +2856,8 @@ fn try_resolve_copy_batch(
         return None;
     }
 
-    // 6. Build the count-aware copy-token batch directly. This uses the same
-    //    replacement/apply primitive as `CopyTokenOf`, but avoids re-resolving the
-    //    self target and recomputing identical copiable values once per stack
-    //    entry.
-    let top_source_id = *run_source_ids.first()?;
-    let top_source = state.objects.get(&top_source_id)?;
-    let copy_batch = PendingCopyTokenBatch {
-        owner,
-        count: prefix_len,
-        copy: Box::new(CopyTokenSpec {
-            values: Box::new(prefix_values.clone()),
-            display_source: top_source.display_source,
-            printed_ref: top_source.printed_ref.clone(),
-            token_image_ref: top_source.token_image_ref.clone(),
-            extra_keywords: extra_keywords.clone(),
-            additional_modifications: additional_modifications.clone(),
-            tapped: false,
-            enters_attacking: false,
-            sacrifice_at: ability.duration.clone(),
-            source_id: ability.source_id,
-            controller: ability.controller,
-        }),
-    };
-
-    // 7. Hand back the copy-prefix batch.
+    // 6. Retain only the read-only probe facts needed by legacy observer tests.
     Some(super::BatchPlan::copy_token(
-        copy_batch,
-        EffectKind::from(&sub.effect),
-        ability.source_id,
         probe_spec,
         prefix_values.mana_cost.mana_value(),
         prefix_len,
@@ -2879,6 +2869,7 @@ fn try_resolve_copy_batch(
 /// `CounterAdded` and may pause for replacement choices, so the copy-prefix
 /// batch may only collapse values whose creation still emits exactly the ETB
 /// pair.
+#[cfg(test)]
 fn copy_token_values_emit_only_etb_pair(values: &crate::types::ability::CopiableValues) -> bool {
     crate::game::printed_cards::intrinsic_face_counters(values.loyalty, None).is_empty()
         && crate::game::printed_cards::self_etb_counter_replacements(
@@ -2892,6 +2883,7 @@ fn copy_token_values_emit_only_etb_pair(values: &crate::types::ability::Copiable
 /// only the copiable values (CR 707.2): token art comes from the live source at
 /// resolution time (`token_copy::resolve`), so no `PrintedCardRef` is threaded
 /// through the probe.
+#[cfg(test)]
 pub(crate) fn copy_probe_spec(
     ability: &ResolvedAbility,
     values: &crate::types::ability::CopiableValues,
@@ -2944,6 +2936,7 @@ pub(crate) fn copy_probe_spec_for(
 /// passing spec injects no triggers. Collected explicitly (defense in depth):
 /// if a future spec ever carries a Role subtype while passing the gate, its
 /// triggers are surfaced here for classification.
+#[cfg(test)]
 fn base_token_trigger_defs(spec: &TokenSpec) -> Vec<TriggerDefinition> {
     let mut out: Vec<TriggerDefinition> = Vec::new();
     if spec.characteristics.subtypes.iter().any(|s| s == "Role") {
@@ -3282,6 +3275,7 @@ fn classify_attach_host_authority(filter: &TargetFilter) -> AttachHostAuthority 
         | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::Opponent
         | TargetFilter::PlayerWhoChoseLabel { .. }
+        | TargetFilter::PlayerMatching { .. }
         | TargetFilter::Neighbor { .. }
         | TargetFilter::ScopedPlayer
         | TargetFilter::TriggeringSpellController
@@ -3313,6 +3307,7 @@ fn classify_attach_host_authority(filter: &TargetFilter) -> AttachHostAuthority 
         | TargetFilter::None
         | TargetFilter::GrantingObject
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::ChosenDamageSource { .. }
         | TargetFilter::TrackedSet { .. }
@@ -3784,6 +3779,8 @@ fn junk_ability() -> AbilityDefinition {
         AbilityKind::Activated,
         Effect::GrantCastingPermission {
             permission: CastingPermission::PlayFromExile {
+                provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                mode: crate::types::ability::CardPlayMode::Play,
                 duration: Duration::UntilEndOfTurn,
                 granted_to: PlayerId(0),
                 frequency: CastFrequency::Unlimited,
@@ -3795,6 +3792,7 @@ fn junk_ability() -> AbilityDefinition {
                 single_use_group: None,
                 single_use: false,
                 cast_cost_raise: None,
+                alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             },
             target: TargetFilter::TrackedSet {
@@ -3861,6 +3859,7 @@ fn incubator_phyrexian_back_face() -> BackFaceData {
         // no parse to have gone wrong.
         parse_warnings: vec![],
         layout_kind: None,
+        is_swap_snapshot: false,
     }
 }
 
@@ -3893,6 +3892,28 @@ fn shard_ability() -> AbilityDefinition {
     })
 }
 
+/// CR 111.10 (Reality Fracture): Heartwood — "{T}: Add {R} or {G}." A
+/// two-color-choice mana rock, structurally identical to Treasure/Gold's
+/// `ManaProduction::AnyOneColor` choice restricted to the token's own printed
+/// colors, with Powerstone's plain-tap (no sacrifice) cost shape.
+fn heartwood_ability() -> AbilityDefinition {
+    AbilityDefinition::new(
+        AbilityKind::Activated,
+        Effect::Mana {
+            produced: ManaProduction::AnyOneColor {
+                count: QuantityExpr::Fixed { value: 1 },
+                color_options: vec![ManaColor::Red, ManaColor::Green],
+                contribution: ManaContribution::Base,
+            },
+            restrictions: vec![],
+            grants: vec![],
+            expiry: None,
+            target: None,
+        },
+    )
+    .cost(AbilityCost::Tap)
+}
+
 /// CR 111.10: Predefined token abilities keyed by subtype.
 /// Returns ability definitions to inject for the given subtype, or empty if none.
 pub fn predefined_token_abilities(subtype: &str) -> Vec<AbilityDefinition> {
@@ -3910,6 +3931,7 @@ pub fn predefined_token_abilities(subtype: &str) -> Vec<AbilityDefinition> {
         "Junk" => vec![junk_ability()],
         "Incubator" => vec![incubator_ability()],
         "Shard" => vec![shard_ability()],
+        "Heartwood" => vec![heartwood_ability()],
         _ => vec![],
     }
 }
@@ -4364,11 +4386,19 @@ fn apply_token_ability_payload(obj: &mut GameObject, materialized: TokenAbilityM
 
 fn catalog_rules_text_abilities(
     rules_text: &str,
+    card_name: &str,
 ) -> (
     Vec<StaticDefinition>,
     Vec<ContinuousModification>,
     Vec<String>,
 ) {
+    // CR 201.5 + CR 201.5a: A card's Oracle text uses its name to refer to
+    // itself, and a granted ability that refers to its granter by name refers
+    // only to that specific granter. Token catalog rules text is parsed
+    // independently of `parse_oracle_ir`'s single entry point, so it needs its
+    // own `normalize_card_name_refs` pass here, mirroring `parse_oracle_ir`'s
+    // call in `oracle.rs`.
+    let rules_text = crate::parser::oracle_util::normalize_card_name_refs(rules_text, card_name);
     let mut static_definitions = Vec::new();
     let mut modifications = Vec::new();
     let mut unparsed_lines = Vec::new();
@@ -4392,6 +4422,18 @@ fn catalog_rules_text_abilities(
                     .map(normalized_token_static_definition),
             );
         }
+    }
+    // CR 201.5a: render every residual `GRANTING_SELF_PLACEHOLDER` left in the
+    // parsed statics'/modifications' display `description`s as the granting
+    // object's PRINTED name, mirroring `render_granting_self_descriptions`'s
+    // whole-tree net in `oracle.rs` for this independent parse entry point.
+    // This entry point is a predefined token's own rules text, so `card_name`
+    // is the token's printed name (e.g. "Rock").
+    for def in &mut static_definitions {
+        crate::parser::oracle::render_static_descriptions(def, card_name);
+    }
+    for modification in &mut modifications {
+        crate::parser::oracle::render_modification_descriptions(modification, card_name);
     }
     (static_definitions, modifications, unparsed_lines)
 }
@@ -8448,6 +8490,7 @@ mod tests {
              This creature can't block.\n\
              {T}: Add {G}.\n\
              When this creature dies, you gain 1 life.",
+            "Test Card",
         );
         assert!(unparsed_lines.is_empty());
 
@@ -8480,6 +8523,102 @@ mod tests {
                 ContinuousModification::GrantTrigger { .. }
             )),
             "trigger rules text must route to GrantTrigger, got {modifications:?}"
+        );
+    }
+
+    /// Revert-to-red: removing the `card_name` threading in
+    /// `catalog_rules_text_abilities` reverts this to `TriggerMode::Unknown`
+    /// with the raw text, since the bare "galactus attacks..." subject
+    /// matches no recognized pattern and falls through to the terminal
+    /// fallback.
+    #[test]
+    fn catalog_galactus_preset_trigger_subject_normalizes() {
+        let (_statics, modifications, _unparsed_lines) = catalog_rules_text_abilities(
+            "Flying, trample\nWhenever Galactus attacks, destroy target land.",
+            "Galactus",
+        );
+
+        assert!(
+            modifications.iter().any(|modification| matches!(
+                modification,
+                ContinuousModification::GrantTrigger { trigger }
+                    if trigger.mode == TriggerMode::Attacks
+                        && trigger.valid_card == Some(TargetFilter::SelfRef)
+            )),
+            "card-name subject in an attack trigger must normalize to a \
+             self-referential TriggerMode::Attacks, got {modifications:?}"
+        );
+    }
+
+    /// Revert-to-red: without normalization, no `StaticDefinition` is
+    /// produced for this line at all (`parse_self_color_subject`'s `alt()`
+    /// doesn't match the bare name "Mechtitan"), and the CDA silently
+    /// vanishes into an inert `GrantAbility` instead.
+    #[test]
+    fn catalog_mechtitan_preset_cda_subject_normalizes() {
+        let (static_definitions, _modifications, _unparsed_lines) = catalog_rules_text_abilities(
+            "Mechtitan is all colors.\nFlying, vigilance, trample, lifelink, haste",
+            "Mechtitan",
+        );
+
+        assert!(
+            static_definitions.iter().any(|def| {
+                def.characteristic_defining
+                    && def.affected == Some(TargetFilter::SelfRef)
+                    && def.modifications.iter().any(|modification| matches!(
+                        modification,
+                        ContinuousModification::SetColor { colors }
+                            if colors.len() == 5
+                    ))
+            }),
+            "card-name subject in a CDA color-setting static must normalize to a \
+             self-referential characteristic-defining SetColor{{all 5 colors}}, got {static_definitions:?}"
+        );
+    }
+
+    /// Revert-to-red: without normalization, the effect's target is
+    /// `TargetFilter::Any` (the unconsumed literal name falls through
+    /// `parse_target`'s terminal fallback), meaning the token would copy
+    /// any legal target instead of itself.
+    #[test]
+    fn catalog_council_of_reeds_preset_copy_effect_normalizes() {
+        let (_statics, modifications, _unparsed_lines) = catalog_rules_text_abilities(
+            "The \"legend rule\" doesn't apply to creatures you control.\n\
+             At the beginning of combat on your turn, if you've cast a noncreature \
+             spell this turn, create a token that's a copy of Council of Reeds.\n\
+             (This token's mana cost is {2}{U}.)",
+            "Council of Reeds",
+        );
+
+        fn ability_has_self_copy(def: &AbilityDefinition) -> bool {
+            matches!(
+                *def.effect,
+                Effect::CopyTokenOf {
+                    target: TargetFilter::SelfRef,
+                    ..
+                }
+            ) || def
+                .sub_ability
+                .as_deref()
+                .is_some_and(ability_has_self_copy)
+                || def
+                    .else_ability
+                    .as_deref()
+                    .is_some_and(ability_has_self_copy)
+                || def.mode_abilities.iter().any(ability_has_self_copy)
+        }
+
+        assert!(
+            modifications.iter().any(|modification| matches!(
+                modification,
+                ContinuousModification::GrantTrigger { trigger }
+                    if trigger
+                        .execute
+                        .as_deref()
+                        .is_some_and(ability_has_self_copy)
+            )),
+            "card-name copy-of subject must normalize to a self-referential \
+             CopyTokenOf, got {modifications:?}"
         );
     }
 
@@ -8740,6 +8879,362 @@ mod tests {
         assert!(equip
             .activation_restrictions
             .contains(&ActivationRestriction::AsSorcery));
+    }
+
+    /// CR 201.5a end-to-end proof: Toggo's Rock grants the equipped creature
+    /// "{1}, {T}, Sacrifice Rock: This creature deals 2 damage to any
+    /// target." Rock (the card literally named in the cost) must be the
+    /// object sacrificed — not the host it's equipped to — and the scrub
+    /// pass (Step 1) must have removed the raw placeholder character from
+    /// the granted ability's description before it ever reaches the host.
+    ///
+    /// Revert-to-red: reverting the `card_name` threading in
+    /// `catalog_rules_text_abilities` (Step 2) does NOT bind the sacrifice
+    /// cost to the host. Verified empirically (temporarily disabling the
+    /// `normalize_card_name_refs` call and printing the resulting cost): it
+    /// produces a generic, UNBOUND
+    /// `AbilityCost::Sacrifice(SacrificeCost { target: Typed(TypedFilter {
+    /// type_filters: [], controller: None, properties: [] }), .. })` that
+    /// matches any permanent, not a host-bound `SelfRef`. Because that filter
+    /// is unconstrained, `pay_with(&[rock_id])` below still succeeds even
+    /// under the reverted code (Rock trivially satisfies "any permanent"),
+    /// and the runtime activate/pay/resolve assertions still pass — they
+    /// exercise that the grant-and-activate mechanism works end-to-end (a
+    /// real but separate property), not the granter-binding regression
+    /// itself. The pre-activation `TargetFilter` equality assertion
+    /// immediately below is the one check in this test that is actually
+    /// load-bearing for this regression.
+    ///
+    /// For the display assertions: `parse_quoted_ability`
+    /// (`oracle_static/grammar.rs`) no longer sanitizes the granter marker at
+    /// all — the old `sanitize_granting_placeholder` collapse to the host token
+    /// `~` is exactly the defect, and it is deleted. So BOTH halves of this
+    /// entry point (the granted *activated* ability here and the granted
+    /// *trigger* in
+    /// `catalog_synthetic_equipment_grant_trigger_renders_the_granter_name`)
+    /// now depend on `catalog_rules_text_abilities`' two `render_*` loops. That
+    /// makes the revert-to-red STRONGER than before, not weaker: deleting those
+    /// two loops leaves the raw marker in this ability's description and reds
+    /// the `assert_eq!` below.
+    ///
+    /// This is also the CLIENT-PARITY fixture. Rock is the one class member
+    /// whose printed body carries BOTH a CR 201.5a granter reference (the
+    /// sacrifice cost) and a CR 201.5b host reference (the damage source), so it
+    /// is the only shipped fixture that can discriminate a correct sentinel
+    /// render from a naive blanket `~`-replace.
+    #[test]
+    fn catalog_toggo_rock_sacrifice_cost_binds_to_rock_not_host() {
+        use crate::game::scenario::{GameScenario, P0, P1};
+        use crate::types::mana::{ManaType, ManaUnit};
+
+        fn sacrifice_target(cost: &AbilityCost) -> Option<&TargetFilter> {
+            match cost {
+                AbilityCost::Sacrifice(sac) => Some(&sac.target),
+                AbilityCost::Composite { costs } | AbilityCost::OneOf { costs } => {
+                    costs.iter().find_map(sacrifice_target)
+                }
+                _ => None,
+            }
+        }
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.with_mana_pool(
+            P0,
+            vec![ManaUnit::new(ManaType::White, ObjectId(0), false, vec![])],
+        );
+        let host = scenario.add_creature(P0, "Bearer", 2, 2).id();
+
+        let mut runner = scenario.build();
+        let rock_id = build_catalog_token(
+            runner.state_mut(),
+            "Rock",
+            "1657233e-c9e1-54ff-aa5a-6e2e2846be42",
+        );
+        {
+            let st = runner.state_mut();
+            st.objects.get_mut(&rock_id).unwrap().attached_to = Some(AttachTarget::Object(host));
+            st.layers_dirty.mark_full();
+        }
+        crate::game::layers::evaluate_layers(runner.state_mut());
+
+        let idx = runner.state().objects[&host]
+            .abilities
+            .iter()
+            .position(|a| a.cost.as_ref().and_then(sacrifice_target).is_some())
+            .expect("host must carry Rock's granted sacrifice-cost ability after evaluate_layers");
+
+        assert_eq!(
+            runner.state().objects[&host].abilities[idx]
+                .cost
+                .as_ref()
+                .and_then(sacrifice_target),
+            Some(&TargetFilter::SpecificObject { id: rock_id }),
+            "CR 201.5a: the sacrifice cost must target Rock (the granting object), not the host"
+        );
+        assert!(
+            !runner.state().objects[&host].abilities[idx]
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains(crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER),
+            "granted ability description must not leak the raw placeholder char"
+        );
+
+        // These display assertions MUST run before the activate below: the
+        // activation sacrifices Rock, the grant ends, and `objects[&host]
+        // .abilities` is empty afterwards (measured: index out of bounds).
+        //
+        // CR 201.5a: the COST half names the granting object (Rock); CR 201.5b:
+        // the EFFECT half stays the host token `~`.
+        let desc = runner.state().objects[&host].abilities[idx]
+            .description
+            .clone()
+            .expect("the granted ability carries a display description");
+        assert_eq!(
+            desc, "{1}, {T}, Sacrifice Rock: ~ deals 2 damage to any target.",
+            "CR 201.5a: the sacrifice cost must name Rock, and CR 201.5b: the \
+             damage source must stay the host token"
+        );
+        // CLIENT PARITY: what `renderDescription(desc, object.name)` produces on
+        // the host. The host's name must appear ONLY in the effect half.
+        let rendered = desc.replace('~', "Bearer");
+        assert_eq!(
+            rendered, "{1}, {T}, Sacrifice Rock: Bearer deals 2 damage to any target.",
+            "CR 201.5b: only the host reference may render as the host's name — a \
+             blanket `~`-replace produces `Sacrifice Bearer: Bearer deals 2 damage`"
+        );
+
+        let outcome = runner
+            .activate(host, idx)
+            .target_player(P1)
+            .pay_with(&[rock_id])
+            .resolve();
+
+        // CR 111.7 + CR 704.5d: Rock is a token, so once it's sacrificed off the
+        // battlefield it ceases to exist as a state-based action and is purged
+        // from `state.objects` entirely — it never sits observably in the
+        // graveyard the way a card-backed permanent would (contrast
+        // `deconstruction_hammer_sacrifice_hits_the_equipment_not_the_host`,
+        // whose Hammer is a real card and persists at `zone_of == Graveyard`).
+        assert!(
+            !outcome.state().objects.contains_key(&rock_id),
+            "Rock (the object actually named in the cost) must be sacrificed and, \
+             being a token, cease to exist"
+        );
+        assert_eq!(
+            outcome.zone_of(host),
+            Zone::Battlefield,
+            "the equipped creature survives"
+        );
+    }
+
+    /// CR 201.5a: proves the two `render_static_descriptions` /
+    /// `render_modification_descriptions` loops at the end of
+    /// `catalog_rules_text_abilities` actually do something, on the granted
+    /// *trigger* route. That route is parsed via `parse_static_line_multi` →
+    /// `classify_quoted_inner`'s `GrantTrigger` branch and never touches
+    /// `parse_quoted_ability` at all, so this entry point's two loops are its
+    /// only display authority.
+    ///
+    /// (Rock's test above now depends on the same two loops: `parse_quoted_ability`
+    /// no longer sanitizes anything — the old `sanitize_granting_placeholder`
+    /// collapse to `~` is the defect and is deleted.)
+    ///
+    /// Revert-to-red: commenting out the two render loops (while leaving
+    /// `normalize_card_name_refs` intact) leaves the raw
+    /// `GRANTING_SELF_PLACEHOLDER` char in the granted trigger's
+    /// `description` and drops the granter's printed name, flipping BOTH
+    /// assertions below to failures.
+    #[test]
+    fn catalog_synthetic_equipment_grant_trigger_renders_the_granter_name() {
+        let (static_definitions, _modifications, unparsed_lines) = catalog_rules_text_abilities(
+            "Equipped creature has \"Whenever this creature attacks, sacrifice Ember Golem.\"",
+            "Ember Golem",
+        );
+        assert!(
+            unparsed_lines.is_empty(),
+            "line must fully parse, got unparsed: {unparsed_lines:?}"
+        );
+
+        fn find_grant_trigger(def: &StaticDefinition) -> Option<&TriggerDefinition> {
+            def.modifications.iter().find_map(|m| match m {
+                ContinuousModification::GrantTrigger { trigger } => Some(trigger.as_ref()),
+                _ => None,
+            })
+        }
+
+        let trigger = static_definitions
+            .iter()
+            .find_map(find_grant_trigger)
+            .unwrap_or_else(|| {
+                panic!(
+                    "quoted \"Whenever ...\" body must parse to a GrantTrigger, \
+                     got {static_definitions:?}"
+                )
+            });
+
+        let sacrifices_granter = trigger.execute.as_deref().is_some_and(|def| {
+            matches!(
+                *def.effect,
+                Effect::Sacrifice {
+                    target: TargetFilter::GrantingObject,
+                    ..
+                }
+            )
+        });
+        assert!(
+            sacrifices_granter,
+            "the granted trigger's sacrifice effect must target the GRANTING object \
+             (the equipment itself), got {trigger:?}"
+        );
+
+        // NOTE: check the actual `description` fields directly, NOT a
+        // `{:?}`-formatted dump of the tree — `Debug` escapes the raw private-use
+        // char to the literal text `\u{e0002}`, so searching a Debug string for
+        // the real character is always false regardless of whether scrubbing ran.
+        let placeholder = crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER;
+        let leaked = static_definitions.iter().any(|def| {
+            def.description
+                .as_deref()
+                .is_some_and(|d| d.contains(placeholder))
+                || def.modifications.iter().any(|m| match m {
+                    ContinuousModification::GrantTrigger { trigger } => trigger
+                        .description
+                        .as_deref()
+                        .is_some_and(|d| d.contains(placeholder)),
+                    _ => false,
+                })
+        });
+        assert!(
+            !leaked,
+            "the render loops must remove the raw placeholder char from the \
+             granted trigger's description, got {static_definitions:#?}"
+        );
+
+        // POSITIVE half: removal alone would also be satisfied by the old
+        // collapse to `~`. CR 201.5a requires the GRANTER's printed name.
+        assert!(
+            trigger
+                .description
+                .as_deref()
+                .is_some_and(|d| d.contains("Ember Golem")),
+            "CR 201.5a: the granted trigger's description must name the granting \
+             object, got {:?}",
+            trigger.description
+        );
+    }
+
+    /// CR 201.5a — corpus leak guard for the SECOND parse entry point.
+    ///
+    /// The card-level corpus guard lives in
+    /// `tests/integration/granted_ability_self_binding.rs` and runs over
+    /// `client/public/card-data.json`'s 16 class members. Rock is not in that
+    /// export (it is a predefined token, materialized through
+    /// `catalog_rules_text_abilities`), and that function is a private `fn`, so
+    /// this arm of the corpus property has to live here.
+    ///
+    /// `serde_json` rather than `format!("{:?}")` is deliberate: `Debug` escapes
+    /// the raw private-use char to the literal text `\u{e0002}`, so a `Debug`
+    /// search for the real character is always false and the guard would be
+    /// vacuous. `serde_json` emits it raw, at every depth.
+    ///
+    /// Revert-to-red: delete the two `render_*` loops at the end of
+    /// `catalog_rules_text_abilities` — the raw marker survives into the
+    /// serialized statics and `contains("Sacrifice Rock")` fails.
+    #[test]
+    fn catalog_rules_text_abilities_never_leaks_the_placeholder() {
+        let (static_definitions, modifications, unparsed_lines) = catalog_rules_text_abilities(
+            "Equipped creature has \"{1}, {T}, Sacrifice Rock: This creature deals 2 damage to any target.\"\nEquip {1}",
+            "Rock",
+        );
+        assert!(
+            unparsed_lines.is_empty(),
+            "Rock's rules text must fully parse, got unparsed: {unparsed_lines:?}"
+        );
+        let json = serde_json::to_string(&(&static_definitions, &modifications))
+            .expect("the parsed token abilities serialize");
+        // POSITIVE REACH-GUARD: the typed channel must have consumed the marker,
+        // or the negative below would pass on a parse that never masked at all.
+        assert!(
+            json.contains("GrantingObject"),
+            "reach-guard: the granter self-reference must reach the typed channel: {json}"
+        );
+        assert!(
+            !json.contains(crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER),
+            "no raw CR 201.5a marker may survive the token catalog parse entry point"
+        );
+        assert!(
+            json.contains("Sacrifice Rock"),
+            "CR 201.5a: the granted body must name the granting token: {json}"
+        );
+    }
+
+    /// CR 201.5a — the MEASURED BOUNDARY for this entry point's one un-rendered
+    /// output. `catalog_rules_text_abilities` renders the marker out of the
+    /// parsed statics' and modifications' display descriptions, but the third
+    /// value it returns — `unparsed_lines`, which becomes
+    /// `TokenAbilityMaterialization::unparsed_rules_text_lines` and feeds
+    /// coverage gap text — is taken VERBATIM from the SAME masked text and is
+    /// deliberately not rendered (it is a diagnostic surface, not a player-facing
+    /// one, and rendering it would hide the raw line the gap report is about).
+    ///
+    /// That is only safe if no catalog preset can put a marker there, and this
+    /// test is the MEASUREMENT of that, not a claim about it: it runs the real
+    /// entry point over every preset in `data/known-tokens.toml`. Result at the
+    /// time of writing: of 2,869 presets, exactly ONE ("Rock") plants a marker at
+    /// all — the masker only fires on a quoted granter self-reference in a
+    /// verb-object position — and both of Rock's lines parse, so its unparsed
+    /// vector is empty.
+    ///
+    /// The `masked` reach-guard is what keeps the negative honest: without it a
+    /// green would also be produced by a corpus (or a masker) that stopped
+    /// planting markers entirely, which is the vacuous pass this property is
+    /// most exposed to.
+    ///
+    /// Revert-to-red: add a preset whose rules text both masks and fails to
+    /// parse, or widen `GRANTER_SELF_REF_VERB_PREFIXES` so a preset masks in a
+    /// position no static/quoted-inner parser handles.
+    #[test]
+    fn no_catalog_preset_leaks_the_placeholder_into_unparsed_lines() {
+        use crate::parser::oracle_util::{normalize_card_name_refs, GRANTING_SELF_PLACEHOLDER};
+
+        let mut masked = Vec::new();
+        for preset in crate::game::token_presets::known_token_presets() {
+            let Some(rules_text) = preset.rules_text.as_deref().filter(|t| !t.is_empty()) else {
+                continue;
+            };
+            let name = preset.body.display_name.as_str();
+            // allow-noncombinator: marker presence check on an already-normalized
+            // display string; not parsing dispatch.
+            if normalize_card_name_refs(rules_text, name).contains(GRANTING_SELF_PLACEHOLDER) {
+                masked.push(name);
+            }
+            let (_statics, _modifications, unparsed_lines) =
+                catalog_rules_text_abilities(rules_text, name);
+            for line in &unparsed_lines {
+                assert!(
+                    // allow-noncombinator: marker leak check on a diagnostic
+                    // display line; not parsing dispatch.
+                    !line.contains(GRANTING_SELF_PLACEHOLDER),
+                    "CR 201.5a: preset `{name}` left a raw granter marker in an \
+                     UNPARSED rules-text line ({line:?}), which flows into \
+                     `unparsed_rules_text_lines` un-rendered. This axis is \
+                     documented as measured-unreachable in \
+                     `parser::oracle::render_granting_self_descriptions`' traversal \
+                     contract; that documentation is now false and the axis needs \
+                     a render pass or a scope decision."
+                );
+            }
+        }
+        // POSITIVE REACH-GUARD for the negative above.
+        assert_eq!(
+            masked,
+            vec!["Rock"],
+            "reach-guard: the token catalog's masked-preset set is what makes the \
+             un-rendered `unparsed_lines` axis measurably safe. If this changed, \
+             re-measure that axis rather than editing this expectation."
+        );
     }
 
     #[test]

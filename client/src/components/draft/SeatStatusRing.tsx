@@ -41,10 +41,12 @@ function SeatBadge({ seat, isLocal }: SeatBadgeProps) {
       ? "border-emerald-400/40"
       : PICK_STATUS_BORDER[seat.pick_status];
   const faceUpNames = seat.face_up_draft_cards.map((card) => card.name).join(", ");
+  const activePackCount = seat.active_pack_count;
 
   return (
     <div
-      className={`flex min-w-0 flex-col items-start gap-1 rounded-[12px] border bg-black/18 px-2 py-1 backdrop-blur-md ${borderColor}`}
+      data-seat-badge
+      className={`relative flex h-full min-h-[40px] w-full min-w-[15ch] flex-col items-start rounded-[8px] border bg-black/18 px-1.5 py-0.5 pr-7 backdrop-blur-md ${borderColor}`}
     >
       <div className="flex min-w-0 items-center gap-1.5">
         <div
@@ -58,7 +60,7 @@ function SeatBadge({ seat, isLocal }: SeatBadgeProps) {
           }
         />
         <span
-          className={`truncate text-xs ${
+          className={`truncate ${
             showDisconnected ? "text-white/40 line-through" : "text-white/70"
           }`}
         >
@@ -74,6 +76,60 @@ function SeatBadge({ seat, isLocal }: SeatBadgeProps) {
           {t("seat.faceUpDraftCards", { cards: faceUpNames })}
         </span>
       )}
+      <span className="sr-only">{t("seat.activePackCount", { count: activePackCount, player: seat.display_name || t("seat.label", { number: seat.seat_index + 1 }) })}</span>
+      <span className="absolute right-0.5 top-1/2 h-7 w-7 -translate-y-1/2" aria-hidden="true">
+        <img src="/icons/packs.svg" alt="" className={`h-full w-full object-contain ${activePackCount === 0 ? "opacity-35 grayscale" : ""}`} />
+        <span className="absolute inset-0 flex items-center justify-center font-mono text-xs font-bold tabular-nums text-jade [-webkit-text-stroke:1px_rgb(2_6_23_/_0.95)] [paint-order:stroke_fill]">{activePackCount}</span>
+      </span>
+    </div>
+  );
+}
+
+interface SeatStatusRingLayoutProps {
+  seats: SeatPublicView[];
+  passDirection: "Left" | "Right" | undefined;
+  localSeat: number | null;
+  passDirectionLabel: string;
+}
+
+export function SeatStatusRingLayout({
+  seats,
+  passDirection,
+  localSeat,
+  passDirectionLabel,
+}: SeatStatusRingLayoutProps) {
+  const arrow = passDirection === "Right" ? "←" : "→";
+  const arrowElement = (
+    <span
+      aria-hidden="true"
+      data-pass-arrow
+      className="flex w-4 shrink-0 items-center justify-center text-sm text-white/40"
+    >
+      {arrow}
+    </span>
+  );
+
+  return (
+    <div
+      data-seat-status-ring
+      data-pass-direction={passDirection ?? "Left"}
+      className="mb-2 grid grid-cols-[repeat(auto-fit,minmax(calc(15ch+3.5rem),1fr))] gap-1 text-xs"
+    >
+      <span className="sr-only">{passDirectionLabel}</span>
+      {seats.map((seat) => (
+        <div
+          key={seat.seat_index}
+          data-seat-pass-unit
+          className="flex min-w-0 items-stretch gap-1.5"
+        >
+          {passDirection === "Right" && arrowElement}
+          <SeatBadge
+            seat={seat}
+            isLocal={seat.seat_index === localSeat}
+          />
+          {passDirection !== "Right" && arrowElement}
+        </div>
+      ))}
     </div>
   );
 }
@@ -89,37 +145,14 @@ export function SeatStatusRing() {
 
   if (seats.length === 0) return null;
 
-  // Top row: seats 0-3, Bottom row: seats 4-7. On phones each row uses two
-  // columns so public face-up card names remain readable.
-  const topRow = seats.slice(0, 4);
-  const bottomRow = seats.slice(4, 8);
-
   return (
-    <div className="flex flex-col gap-2 mb-4">
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-        {topRow.map((seat) => (
-          <SeatBadge
-            key={seat.seat_index}
-            seat={seat}
-            isLocal={seat.seat_index === localSeat}
-          />
-        ))}
-      </div>
-      {/* Pass direction indicator */}
-      <div className="flex justify-center text-white/40 text-sm">
-        {passDirection === "Left"
-          ? t("seat.passingLeft")
-          : t("seat.passingRight")}
-      </div>
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-        {bottomRow.map((seat) => (
-          <SeatBadge
-            key={seat.seat_index}
-            seat={seat}
-            isLocal={seat.seat_index === localSeat}
-          />
-        ))}
-      </div>
-    </div>
+    <SeatStatusRingLayout
+      seats={seats}
+      passDirection={passDirection}
+      localSeat={localSeat}
+      passDirectionLabel={passDirection === "Right"
+        ? t("seat.passingRight")
+        : t("seat.passingLeft")}
+    />
   );
 }

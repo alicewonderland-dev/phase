@@ -3,9 +3,16 @@
     "badge": "Blockiert",
     "cantBeActivated": "Diese Fähigkeit kann nicht aktiviert werden",
     "cantActivateDuring": "Kann derzeit nicht aktiviert werden",
-    "prohibited": "Das Aktivieren dieser Fähigkeit ist verboten"
+    "prohibited": "Das Aktivieren dieser Fähigkeit ist verboten",
+    "costNotPayableNow": "Du kannst diese Kosten gerade nicht bezahlen"
   },
-  "manaSourceSelection": { "title": "Manaquelle wählen", "description": "Diese Manafähigkeit erfordert das Opfern einer bleibenden Karte.", "sacrifice": "Opfern", "back": "Zurück zur Manabezahlung", "unknownSource": "Manaquelle" },
+  "manaSourceSelection": {
+    "title": "Manaquelle wählen",
+    "description": "Diese Manafähigkeit erfordert das Opfern einer bleibenden Karte.",
+    "sacrifice": "Opfern",
+    "back": "Zurück zur Manabezahlung",
+    "unknownSource": "Manaquelle"
+  },
   "comboShortcut": {
     "declareTitle": "Loop Shortcut",
     "declareSubtitle": "You control a loop with a determined outcome. Take the shortcut to resolve it.",
@@ -21,10 +28,27 @@
     "convokeInfo_one": "Auto-taps up to 1 creature for convoke each iteration.",
     "convokeInfo_other": "Auto-taps up to {{count}} creatures for convoke each iteration.",
     "countAria": "Number of iterations",
+    "countDecreaseAria": "Anzahl der Wiederholungen verringern",
+    "countIncreaseAria": "Anzahl der Wiederholungen erhöhen",
     "previewTitle_one": "Repeating once produces:",
     "previewTitle_other": "Repeating {{count}} times produces:",
     "previewEntry": "{{amount}} {{resource}}",
     "previewEntryPlayer": "{{amount}} {{resource}} — {{player}}",
+    "allocationTitle": "Verteile die Wiederholungen auf die Ziele:",
+    "allocationAria": "Wiederholungen für {{subject}}",
+    "allocationDecreaseAria": "Wiederholungen für {{subject}} verringern",
+    "allocationIncreaseAria": "Wiederholungen für {{subject}} erhöhen",
+    "allocationSum": "{{allocated}} von {{total}} Wiederholungen verteilt.",
+    "evenSplit": "Auf die gleichmäßige Verteilung zurücksetzen",
+    "customDistribution": "Eigene Verteilung — die Engine hat für diese Aufteilung keine Vorschau berechnet.",
+    "announceTitle": "Wähle das Ziel, das jede Wiederholung ansagt:",
+    "announce": "Ansagen",
+    "announceAria": "{{subject}} ansagen",
+    "mayTitle": "Optionale Fähigkeit {{group}} — diese Wahl in jeder Iteration wiederholen?",
+    "mayTake": "Nutzen",
+    "mayDecline": "Ablehnen",
+    "mayTakeAria": "Optionale Fähigkeit {{group}} nutzen",
+    "mayDeclineAria": "Optionale Fähigkeit {{group}} ablehnen",
     "winKind": {
       "LethalDamage": "This loop deals lethal damage.",
       "PoisonLoss": "This loop gives lethal poison counters.",
@@ -32,6 +56,13 @@
       "ImmediateWin": "This loop wins the game.",
       "ExtraTurns": "This loop takes infinite extra turns.",
       "Advantage": "This loop generates unbounded advantage."
+    },
+    "respondDeclaredTitle": "Vorgeschlagene Deklaration:",
+    "respondAllocationEntry": "{{subject}} — ×{{repetitions}}",
+    "respondOrderEntry": "{{position}}. {{subject}}",
+    "respondDecision": {
+      "take": "{{subject}} — in jeder Iteration genutzt",
+      "decline": "{{subject}} — in jeder Iteration abgelehnt"
     }
   },
   "precastShortcut": {
@@ -44,10 +75,25 @@
     "respondSubtitle": "Accept the verified route or stop at one of your issued boundaries.",
     "shortenAtBreakpoint": "Stop at boundary {{breakpointId}}"
   },
-  "resolutionProgress": {
-    "label": "Auflösen {{resolved}} / {{total}}",
-    "collapse": "Auflösungsfortschritt einklappen",
-    "expand": "Auflösungsfortschritt ausklappen"
+  "restoredAutomation": {
+    "dismiss": "Schließen",
+    "noop": {
+      "title": "Gespeichertes Spiel geladen",
+      "summary_one": "Keine Stapelautomatisierung zum Fortsetzen erforderlich.",
+      "summary_other": "Keine Stapelautomatisierung zum Fortsetzen erforderlich."
+    },
+    "progressed": {
+      "title": "Stapelautomatisierung fortgesetzt",
+      "summary_one": "Die Engine hat {{count}} automatisierte Auflösung abgeschlossen.",
+      "summary_other": "Die Engine hat {{count}} automatisierte Auflösungen abgeschlossen.",
+      "omitted_one": "{{count}} Zwischenereignis wurde ausgelassen.",
+      "omitted_other": "{{count}} Zwischenereignisse wurden ausgelassen."
+    },
+    "zeroResolutionRepair": {
+      "title": "Stapelautomatisierung repariert",
+      "summary_one": "Die gespeicherte Automatisierung wurde vor der Fortsetzung sicher repariert.",
+      "summary_other": "Die gespeicherte Automatisierung wurde vor der Fortsetzung sicher repariert."
+    }
   },
   "resolveAllConsent": {
     "eyebrow": "Alles auflösen",
@@ -63,6 +109,9 @@
     "tokenPowerPlaceholder": "Power",
     "tokenToughnessPlaceholder": "Toughness",
     "sourceDefinedPtRequired": "Enter power and toughness for this source-defined token."
+  },
+  "debugLibrary": {
+    "openActions": "Debug-Aktionen für {{name}} öffnen"
   },
   "nextUp": {
     "label": "Nächster",
@@ -460,8 +509,9 @@
     "cityBlessingTooltip": "Segen der Stadt — kontrolliert zehn oder mehr bleibende Karten (Aufstieg)",
     "enduringStory": "Bleibende Geschichte",
     "enduringStoryTooltip": "Bleibende Geschichte — erhalten, wenn du eine Storied bleibende Karte und drei oder mehr Artefakte, legendäre bleibende Karten und/oder Sagen kontrollierst; bleibt für den Rest der Partie bestehen",
-    "dungeonAriaLabel": "Wagt sich in {{name}} vor, Raum {{room}}",
-    "dungeonTooltip": "Wagt sich in {{name}} vor — Raum {{room}}",
+    "dungeonAriaLabel": "Wagt sich in {{name}} vor, {{roomName}}, Raum {{room}} von {{total}}",
+    "dungeonRoomTooltip": "{{roomName}} — Raum {{room}} von {{total}}",
+    "dungeonTooltip": "Wagt sich in {{name}} vor",
     "poisonAriaLabel_one": "{{count}} Giftmarke",
     "poisonAriaLabel_other": "{{count}} Giftmarken",
     "poisonTooltip": "Giftmarken: {{count}}\nEin Spieler mit zehn oder mehr Giftmarken verliert das Spiel.",
@@ -508,6 +558,8 @@
     "unboundedConditionalYouTooltip": "Unbegrenzt: {{resource}} (∞) — Auflösung steht aus; dies kann unbegrenzt bleiben, und andernfalls nennst du die Anzahl",
     "unboundedMixedTooltip": "Unbegrenzt: {{resource}} (∞) — ein Teil dieser Gruppe hat eine ausstehende Auflösung; ein Teil bleibt unbegrenzt",
     "unboundedConditionalGlyph": "∞→?",
+    "boundedLoopGlyph": "≤{{bound}}×",
+    "boundedLoopTooltip": "{{resource}} aus einer erkannten Schleife, mit höchstens {{bound}} Wiederholungen",
     "unboundedManaPoolMarker": "Unbegrenztes Mana (∞)",
     "unboundedMana": "Mana",
     "unboundedLife": "Leben",
@@ -541,6 +593,7 @@
     "onlyForSpellWithColorCount": "Nur zum Wirken von Zaubersprüchen ausgeben, die eine Anforderung an die Anzahl der Farben erfüllen",
     "onlyForSpellColor": "Nur zum Wirken von Zaubersprüchen der gewählten Farbe ausgeben",
     "onlyForSpellFromZone": "Nur zum Wirken von Zaubersprüchen aus einer erlaubten Zone ausgeben",
+    "cannotCastSpellFromZone": "Kann nicht zum Wirken von Zaubersprüchen aus der genannten Zone ausgegeben werden",
     "onlyForFaceDownSpell": "Nur zum Wirken verdeckter Zaubersprüche ausgeben",
     "onlyForActivation": "Nur zum Aktivieren von Fähigkeiten ausgeben",
     "onlyForXCosts": "Nur für Kosten ausgeben, die {X} enthalten",
@@ -599,6 +652,8 @@
     "chooseXInputAria": "X-Wert eingeben",
     "decreaseX": "X-Wert verringern",
     "increaseX": "X-Wert erhöhen",
+    "maximum": "Maximum",
+    "setXToMaximum": "X auf Maximum setzen",
     "minMax": "min {{min}} / max {{max}}",
     "maxOnly": "max {{max}}",
     "amountOutOfRange": "Gib eine ganze Zahl zwischen {{min}} und {{max}} ein",
@@ -654,7 +709,9 @@
   },
   "storm": {
     "copies_one": "Sturm: {{count}} Kopie",
-    "copies_other": "Sturm: {{count}} Kopien"
+    "copies_other": "Sturm: {{count}} Kopien",
+    "count_one": "Sturmzähler: {{count}} Kopie",
+    "count_other": "Sturmzähler: {{count}} Kopien"
   },
   "opponentHud": {
     "ally": "Verbündeter",
@@ -771,19 +828,34 @@
     "tapUntappedCreatures_one": "Tappe {{count}} ungetappte Kreatur",
     "tapUntappedCreatures_other": "Tappe {{count}} ungetappte Kreaturen",
     "chooseTargetOf": "Wähle Ziel {{current}} von {{total}}",
+    "slotProgress": "Ziel {{current}} von {{total}}",
+    "choosePlayerTarget": "Wähle: {{name}}",
+    "expandDescription": "Vollständige Beschreibung anzeigen",
+    "collapseDescription": "Weniger anzeigen",
+    "descriptionDisclosure": "{{action}}: {{description}}",
     "chooseTarget": "Wähle ein Ziel",
     "triggerDamageAmount": "This trigger: {{amount}} damage",
     "noLegalTargets": "Keine legalen Ziele verfügbar",
-    "modeContext": "{{mode}} — {{prompt}}",
-    "upToOne": "bis zu eine {{target}}",
-    "one": "eine {{target}}",
-    "nounPlayer": "Spieler",
-    "nounNonlandPermanent": "bleibende Nichtländer-Karte",
-    "nounSpell": "Spruch",
-    "nounCreature": "Kreatur",
-    "nounPlaneswalker": "Planeswalker",
-    "nounTargetPermanent": "bleibende Karte als Ziel",
-    "nounTarget": "Ziel",
+    "one": {
+      "player": "einen Spieler",
+      "spell": "einen Zauberspruch",
+      "creature": "eine Kreatur",
+      "planeswalker": "einen Planeswalker",
+      "nonlandPermanent": "ein Nichtland-Permanent",
+      "targetPermanent": "ein Permanent deiner Wahl",
+      "target": "ein Ziel",
+      "orPlayer": "{{noun}} oder einen Spieler"
+    },
+    "upToOne": {
+      "player": "bis zu einen Spieler",
+      "spell": "bis zu einen Zauberspruch",
+      "creature": "bis zu eine Kreatur",
+      "planeswalker": "bis zu einen Planeswalker",
+      "nonlandPermanent": "bis zu ein Nichtland-Permanent",
+      "targetPermanent": "bis zu ein Permanent deiner Wahl",
+      "target": "bis zu ein Ziel",
+      "orPlayer": "{{noun}} oder einen Spieler"
+    },
     "confirmTap": "Tappen bestätigen ({{selected}}/{{count}})",
     "keepCurrentTargets": "Aktuelle Ziele behalten",
     "skip": "Überspringen",
@@ -801,6 +873,8 @@
   },
   "log": {
     "title": "Spielprotokoll",
+    "dockLeft": "Spielprotokoll links andocken",
+    "dockRight": "Spielprotokoll rechts andocken",
     "noEvents": "Noch keine Ereignisse",
     "closeLog": "Spielprotokoll schließen",
     "verbosityFull": "vollständig",
@@ -1083,7 +1157,10 @@
       "subtitlePreparedCopy": "Den vorbereiteten Zauberspruch wirken?",
       "subtitleActivate": "Diese Fähigkeit aktivieren?",
       "subtitlePlay": "Wähle, wie du diese Karte spielst",
-      "subtitleChoose": "Wähle eine zu aktivierende Fähigkeit"
+      "subtitleChoose": "Wähle eine zu aktivierende Fähigkeit",
+      "unlockThisDoor": "Diese Tür entriegeln",
+      "unlockHalf": "{{name}} entriegeln",
+      "unlockHalfWithCost": "{{name}} ({{cost}}) entriegeln"
     },
     "manaRestrictions": {
       "tapForMana": "Für Mana tappen",
@@ -1105,6 +1182,7 @@
       "onlyForSpellWithColorCount": "Nur für Zaubersprüche mit {{comparator}} {{count}} Farben.",
       "onlyForSpellColor": "Nur für Zaubersprüche der Farbe {{color}}.",
       "onlyForSpellFromZone": "Nur für Zaubersprüche {{polarity}} {{zone}}.",
+      "cannotCastSpellFromZone": "Kann nicht für Zaubersprüche aus {{zone}} ausgegeben werden.",
       "onlyForFaceDownSpell": "Nur für verdeckte Zaubersprüche.",
       "onlyForAny": "Nur für eine dieser Verwendungen: {{restrictions}}",
       "onlyForSpecialAction": "Nur für die Sonderaktion {{action}}.",
@@ -1594,6 +1672,9 @@
       "selectAll": "Alle auswählen",
       "invert": "Umkehren",
       "clear": "Leeren",
+      "searchLabel": "Filter",
+      "searchPlaceholder": "Kartenname",
+      "searchCardsAria": "Karten nach Namen filtern",
       "sortLabel": "Sortieren",
       "groupLabel": "Gruppieren",
       "optNone": "Keine",
@@ -1695,6 +1776,12 @@
     "untapSubset": {
       "title": "Choose permanents to untap",
       "subtitle": "Untap up to {{count}} of these permanents."
+    },
+    "rippleBottom": {
+      "title": "Order the rest on the bottom",
+      "subtitle_one": "Put {{count}} revealed card on the bottom of your library",
+      "subtitle_other": "Put {{count}} revealed cards on the bottom of your library, in any order",
+      "hint": "Drag to reorder · position 1 ends up on top of this pile"
     }
   },
   "specializeColor": {
@@ -1922,6 +2009,7 @@
     "title": "Wirke einen Zauberspruch kostenlos",
     "subtitle": "Wähle einen Zauberspruch, den du ohne Bezahlung seiner Manakosten wirken möchtest ({{remaining}} übrig). Verbleibender Gesamtmanawert: {{budget}}.",
     "subtitleNoBudget": "Wähle einen Zauberspruch, den du ohne Bezahlung seiner Manakosten wirken möchtest ({{remaining}} übrig).",
+    "remainingAny": "beliebig viele",
     "castNamed": "{{name}} wirken",
     "castSuffix": "(ohne seine Manakosten zu bezahlen)",
     "done": "Fertig",
@@ -2018,6 +2106,7 @@
     "diagnostic": "Diagnose: {{reason}}",
     "showDetails": "Details anzeigen",
     "exportGameState": "Spielzustand exportieren",
+    "exportClientSnapshot": "Client-Snapshot exportieren",
     "exported": "Exportiert",
     "exportFailed": "Export fehlgeschlagen",
     "copyDiagnostic": "Diagnose kopieren",
@@ -2122,7 +2211,28 @@
     "title": "{{name}} - Optionaler Effekt",
     "yes": "Ja",
     "no": "Nein",
-    "dontAskAgain": "Dieses Spiel nicht mehr fragen"
+    "dontAskAgain": "Dieses Spiel nicht mehr fragen",
+    "dontAskAgainForSameCard": "Auf jede Kopie dieser Karte anwenden"
+  },
+  "resolutionOptionalPayment": {
+    "title": "Optionale Zahlung wählen",
+    "pay": "{{cost}} bezahlen",
+    "decline": "Ablehnen",
+    "cost": {
+      "card": "Karte",
+      "cards": "Karten",
+      "filteredCard": "{{types}}-Karte",
+      "filteredCards": "{{types}}-Karten",
+      "nonType": "Nicht-{{type}}",
+      "orSeparator": " oder ",
+      "zoneBattlefield": "dem Schlachtfeld",
+      "zoneGraveyard": "deinem Friedhof",
+      "zoneLibrary": "deiner Bibliothek",
+      "zoneExile": "dem Exil",
+      "zoneHand": "deiner Hand",
+      "discard": "Wirf {{count}} {{cards}} ab",
+      "exile": "Schicke {{count}} {{cards}} aus {{zone}} ins Exil"
+    }
   },
   "topOrBottom": {
     "cardFallback": "Card",
@@ -2169,8 +2279,21 @@
   "replacement": {
     "eyebrow": "Auflösungsreihenfolge",
     "title": "Ersatzeffekte",
-    "subtitle": "Wähle, welcher Ersatzeffekt zuerst angewendet wird.",
-    "candidateFallback": "Ersatzeffekt {{number}}"
+    "orderSubtitle": "Diese Effekte ändern alle, wie dieses Ereignis abläuft. Ziehe, um die Reihenfolge festzulegen — der zuletzt angewendete Effekt ist der wirksame (CR 616.1).",
+    "appliedFirst": "Zuerst angewendet (wird überschrieben)",
+    "appliedLast": "Zuletzt angewendet — dieser gilt",
+    "resultLabel": "Ergebnis: {{outcome}}",
+    "confirmOrder": "Reihenfolge bestätigen",
+    "dragHint": "Zum Umsortieren ziehen oder die Pfeile benutzen.",
+    "chooseSubtitle": "Wähle, welcher Ersatzeffekt angewendet wird.",
+    "candidateFallback": "Ersatzeffekt {{number}}",
+    "orderSubtitleComposing": "Diese Effekte ändern alle, wie dieses Ereignis geschieht. Ziehe, um die Reihenfolge festzulegen — jeder wird angewendet, die Reihenfolge ändert das Ergebnis (CR 616.1).",
+    "appliedEarlier": "Früher angewendet",
+    "appliedLater": "Später angewendet",
+    "composesNote": "Jeder Effekt wird angewendet — die Reihenfolge ändert ihre Kombination.",
+    "moveUpNamed": "{{name}} nach vorne verschieben",
+    "moveDownNamed": "{{name}} nach hinten verschieben",
+    "positionAnnounce": "Position {{position}} von {{total}}"
   },
   "retargetChoice": {
     "title": "Ziel ändern",
@@ -2249,7 +2372,15 @@
   },
   "outsideGame": {
     "fromExile": "Aus dem Exil",
-    "fromSideboard": "Aus dem Sideboard"
+    "fromSideboard": "Aus dem Sideboard",
+    "fromBoosterPack": "Aus einem {{setCode}}-Booster"
+  },
+  "boosterPack": {
+    "title": "{{setCode}}-Booster",
+    "subtitleExact_one": "Wähle {{count}} Karte zum Behalten – der Rest wird aus dem Spiel entfernt",
+    "subtitleExact_other": "Wähle {{count}} Karten zum Behalten – der Rest wird aus dem Spiel entfernt",
+    "subtitleUpTo_one": "Wähle bis zu {{count}} Karte zum Behalten – der Rest wird aus dem Spiel entfernt",
+    "subtitleUpTo_other": "Wähle bis zu {{count}} Karten zum Behalten – der Rest wird aus dem Spiel entfernt"
   },
   "phaseName": {
     "Untap": "Enttappen",
@@ -2390,5 +2521,14 @@
       "priority": "Priority",
       "thinking": "Thinking"
     }
+  },
+  "rippleReveal": {
+    "eyebrow": "Ripple",
+    "title": "Reveal the top of your library?",
+    "subtitle_one": "You may reveal the top {{count}} card. Same-named cards can be cast free; the rest go to the bottom.",
+    "subtitle_other": "You may reveal the top {{count}} cards. Same-named cards can be cast free; the rest go to the bottom.",
+    "reveal_one": "Reveal {{count}} card",
+    "reveal_other": "Reveal {{count}} cards",
+    "decline": "Don't reveal"
   }
 }

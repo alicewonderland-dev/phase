@@ -1,22 +1,25 @@
 use rand::Rng;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use thiserror::Error;
 
 use crate::types::ability::{DurationEvent, EffectKind, KeywordAction, TargetRef};
 #[cfg(test)]
 use crate::types::ability::{EffectScope, TapStateChange};
+use crate::types::action_rejection::{ActionRejection, ActionRejectionCode};
 use crate::types::actions::{
     DebugAction, GameAction, MayTriggerAutoChoiceOp, PriorityYieldOp, ResolveAllConsentDecision,
-    TriggerOrderTemplateOp,
+    ResolveAllScope, TriggerOrderTemplateOp,
 };
 use crate::types::events::{BendingType, ContestRound, GameEvent, ManaTapState};
 use crate::types::game_state::{
     ActionResult, AssistState, AutoMayChoice, AutoPassMode, AutoPassRequest, CastOfferKind,
     CastingVariant, ConvokeMode, CostResume, GameState, LandPlayRecord, LoopDetectionMode,
     ManaAbilityResume, MayTriggerAutoChoiceKey, PayCostKind, PendingCostMoveResume,
-    PendingCounterPostAction, PendingEffectResolved, ResolveAllConsentParticipant,
-    ResolveAllConsentRun, ResolveAllPrioritySnapshot, RetargetScope, StackEntry, StackEntryKind,
-    WaitingFor,
+    PendingCounterPostAction, PendingEffectResolved, PersistedRestoreError, PriorityPassingMode,
+    ResolveAllConsentParticipant, ResolveAllConsentRun, ResolveAllPrioritySnapshot, RetargetScope,
+    RetargetSlotAddress, StackEntry, StackEntryKind, StackResolutionAutoPassOverlay,
+    StackResolutionBudget, StackResolutionEntryFence, StackResolutionPolicy,
+    StackResolutionSession, WaitingFor,
 };
 use crate::types::identifiers::{CardId, DelayedTriggerOrigin, ObjectId, ObjectIncarnationRef};
 use crate::types::match_config::MatchType;
@@ -76,10 +79,13 @@ use super::zone_pipeline::{self, ZoneMoveRequest, ZoneMoveResult};
 use super::zones;
 
 pub use super::engine_resolve_batch::{
-    pending_resolve_all_ready_requester, recover_orphaned_resolve_all, resolve_all_fast_forward,
-    resolve_all_ready_access, resolve_all_ready_prefix, resolve_all_ready_prefix_with,
+    classify_restored_stack_automation, pending_resolve_all_ready_requester,
+    recover_orphaned_resolve_all, resolve_all_fast_forward, resolve_all_ready_access,
+    resolve_all_ready_prefix, resolve_all_ready_prefix_with, resume_restored_stack_automation,
     ResolveAllCallbackDecision, ResolveAllContinuation, ResolveAllFastForwardResult,
-    ResolveAllReadyAccess,
+    ResolveAllReadyAccess, RestoredStackAutomation, RestoredStackAutomationOutcome,
+    RestoredStackAutomationPresentation, RestoredStackAutomationResult,
+    RestoredStackAutomationResume, MAX_RESTORED_STACK_AUTOMATION_LOG_ENTRIES,
 };
 
 #[derive(Debug, Clone, Error)]
@@ -90,8 +96,26 @@ pub enum EngineError {
     WrongPlayer,
     #[error("Not your priority")]
     NotYourPriority,
+    #[error("Action is stale")]
+    StaleAction,
     #[error("Action not allowed: {0}")]
     ActionNotAllowed(String),
+}
+
+/// Converts an engine error into stable client-facing metadata without ever
+/// copying its diagnostic payload into the serialized response.
+pub(crate) fn action_rejection_for_engine_error(
+    error: &EngineError,
+    related_object_ids: Vec<ObjectId>,
+) -> ActionRejection {
+    let code = match error {
+        EngineError::InvalidAction(_) => ActionRejectionCode::InvalidAction,
+        EngineError::WrongPlayer => ActionRejectionCode::WrongPlayer,
+        EngineError::NotYourPriority => ActionRejectionCode::NotYourPriority,
+        EngineError::StaleAction => ActionRejectionCode::StaleAction,
+        EngineError::ActionNotAllowed(_) => ActionRejectionCode::ActionNotAllowed,
+    };
+    ActionRejection::from_code(code, related_object_ids)
 }
 
 /// The three non-interchangeable authorities carried by a live Priority
@@ -863,6 +887,111 @@ pub fn apply(
     apply_action_boundary(state, actor, action, PublicFinalizeMode::Immediate)
 }
 
+/// Applies an action while returning stable, safe rejection metadata instead
+/// of a diagnostic engine error. The legacy [`apply`] API remains the raw
+/// engine-error authority for callers that need internal diagnostics.
+pub fn apply_with_rejection(
+    state: &mut GameState,
+    actor: PlayerId,
+    action: GameAction,
+) -> Result<ActionResult, ActionRejection> {
+    let related_object_ids = action.related_object_ids();
+    if matches!(&action, GameAction::Debug(_)) {
+        if let Some(rejection) =
+            explicit_debug_permission_rejection(state, actor, related_object_ids.clone())
+        {
+            return Err(rejection);
+        }
+    }
+    apply(state, actor, action).map_err(|error| {
+        super::visibility::filter_action_rejection_for_viewer(
+            state,
+            actor,
+            &action_rejection_for_engine_error(&error, related_object_ids),
+        )
+    })
+}
+
+/// Checks a debug action without exposing diagnostic preflight errors.
+pub fn preflight_debug_action_with_rejection(
+    state: &GameState,
+    actor: PlayerId,
+    action: &DebugAction,
+) -> Result<(), ActionRejection> {
+    let related_object_ids = GameAction::Debug(action.clone()).related_object_ids();
+    if let Some(rejection) =
+        explicit_debug_permission_rejection(state, actor, related_object_ids.clone())
+    {
+        return Err(rejection);
+    }
+    preflight_debug_action(state, actor, action).map_err(|error| {
+        super::visibility::filter_action_rejection_for_viewer(
+            state,
+            actor,
+            &action_rejection_for_engine_error(&error, related_object_ids),
+        )
+    })
+}
+
+/// Returns the viewer-filtered permission rejection for a debug action when
+/// debug mode is enabled. Disabled debug mode continues through the ordinary
+/// preflight path so it remains an invalid action rather than an authorization
+/// failure.
+pub(crate) fn explicit_debug_permission_rejection(
+    state: &GameState,
+    actor: PlayerId,
+    related_object_ids: Vec<ObjectId>,
+) -> Option<ActionRejection> {
+    if !state.debug_mode {
+        return None;
+    }
+
+    require_explicit_debug_permission(state, actor)
+        .err()
+        .map(|rejection| {
+            super::visibility::filter_action_rejection_for_viewer(
+                state,
+                actor,
+                &ActionRejection::from_code(rejection.code, related_object_ids),
+            )
+        })
+}
+
+/// Checks the transport-level explicit debug permission policy without
+/// evaluating whether a particular debug action is otherwise valid.
+///
+/// An empty permission set leaves debug authority unrestricted; once the set
+/// has members, only listed players have explicit debug permission.
+pub fn require_explicit_debug_permission(
+    state: &GameState,
+    actor: PlayerId,
+) -> Result<(), ActionRejection> {
+    if state.debug_permitted.is_empty() || state.debug_permitted.contains(&actor) {
+        Ok(())
+    } else {
+        Err(ActionRejection::new(
+            ActionRejectionCode::DebugPermissionDenied,
+        ))
+    }
+}
+
+/// Runs a Ready Resolve All batch only for an admitted requester.
+pub fn resolve_all_ready_prefix_with_rejection(
+    state: &mut GameState,
+    requester: PlayerId,
+) -> Result<ResolveAllFastForwardResult, ActionRejection> {
+    if !matches!(
+        resolve_all_ready_access(state, requester),
+        ResolveAllReadyAccess::Admitted
+    ) {
+        return Err(ActionRejection::from_code(
+            ActionRejectionCode::ResolveAllNotReady,
+            vec![],
+        ));
+    }
+    Ok(resolve_all_ready_prefix(state, requester))
+}
+
 /// Explicit-actor simulation apply: [`apply`] for throwaway forward-projection
 /// clones the caller never renders (the AI velocity-policy `project_to`
 /// look-ahead). Identical rules resolution to [`apply`], but in
@@ -897,6 +1026,190 @@ pub fn apply_interaction(
         action,
         PublicFinalizeMode::Immediate,
     )
+}
+
+/// Applies an interaction-materialized action while returning stable, safe
+/// rejection metadata. The interaction projection remains the only authority
+/// that may materialize the action; this wrapper only preserves its actor and
+/// semantic-owner boundary when converting a reducer failure for the client.
+pub fn apply_interaction_with_rejection(
+    state: &mut GameState,
+    authenticated_actor: PlayerId,
+    semantic_owner: PlayerId,
+    action: GameAction,
+) -> Result<ActionResult, ActionRejection> {
+    let related_object_ids = action.related_object_ids();
+    apply_interaction(state, authenticated_actor, semantic_owner, action).map_err(|error| {
+        super::visibility::filter_action_rejection_for_viewer(
+            state,
+            authenticated_actor,
+            &action_rejection_for_engine_error(&error, related_object_ids),
+        )
+    })
+}
+
+/// Applies an AI-selected priority pass after re-validating the exact current
+/// engine-issued decision contract. A verified pass is the only AI action that
+/// may start (or continue) a retained `RecheckNoMeaningfulPriorityAction`
+/// session; ordinary `PassPriority` remains an ordinary player pass.
+///
+/// The retained session is intentionally stack-local: it fences the stack as
+/// it exists now and may reuse only the verified representative's own pass at
+/// later priority windows. It never infers a pass for an unverified
+/// representative and never authorizes a new stack entry.
+/// The priority player for whom `action` is a verified AI stack-continuation
+/// pass, or `None` when it is not one.
+///
+/// **Single authority for that classification.** Both AI dispatch routers
+/// (`phase_ai::auto_play::run_ai_actions_with_limit` and engine-wasm's
+/// `submit_ai_action_proposal`) pick their reducer boundary with this function,
+/// and [`apply_verified_ai_priority_pass`] gates on the very same call — so the
+/// routers and the callee cannot disagree about what this boundary accepts.
+/// Returning the window's `PlayerId` rather than a bool is what lets the callee
+/// consume the classification it is gated by instead of re-deriving it.
+///
+/// CR 601.2a + CR 601.2h: `GameAction::PassPriority` is overloaded by prompt. At
+/// `WaitingFor::Priority` it passes priority; at `WaitingFor::ManaPayment` the
+/// reducer routes the SAME variant to `casting_costs::finalize_mana_payment` —
+/// there it means "pay the total cost" (CR 601.2h). Announcing a spell puts it
+/// on the stack (CR 601.2a), so a nonempty stack is true throughout every cast
+/// and cannot separate the two meanings on its own; the prompt is what does.
+pub fn verified_ai_stack_pass_player(state: &GameState, action: &GameAction) -> Option<PlayerId> {
+    if !matches!(action, GameAction::PassPriority) || state.stack.is_empty() {
+        return None;
+    }
+    match state.waiting_for {
+        WaitingFor::Priority { player } => Some(player),
+        _ => None,
+    }
+}
+
+pub fn apply_verified_ai_priority_pass(
+    state: &mut GameState,
+    authenticated_actor: PlayerId,
+    contract: &crate::ai_support::AiDecisionContract,
+    action: GameAction,
+) -> Result<ActionResult, EngineError> {
+    if action != GameAction::PassPriority
+        || authenticated_actor != contract.authorized_actor
+        || !contract.permits(state, authenticated_actor, &action)
+    {
+        return Err(EngineError::ActionNotAllowed(
+            "AI priority pass no longer matches its issued decision contract".to_string(),
+        ));
+    }
+    // The routers select this boundary with the same call, so a mismatch here
+    // is impossible by construction rather than by convention.
+    let Some(player) = verified_ai_stack_pass_player(state, &action) else {
+        return Err(EngineError::ActionNotAllowed(
+            "AI stack continuation requires a live priority window over a nonempty stack"
+                .to_string(),
+        ));
+    };
+    if player != contract.semantic_owner {
+        return Err(EngineError::ActionNotAllowed(
+            "AI stack continuation requires the issued nonempty priority window".to_string(),
+        ));
+    }
+
+    let representative = super::topology::priority_pass_representative(state, player);
+    let inserted_verified_representative = if let Some(session) =
+        state.stack_resolution_session.as_ref()
+    {
+        let current_representatives = super::topology::canonical_priority_representatives(
+            state,
+            session.representatives.iter().copied(),
+        );
+        let current_entry_matches = session.entries.get(session.cursor).is_some_and(|fence| {
+            state
+                .stack
+                .back()
+                .is_some_and(|entry| fence.matches_captured_entry(entry))
+        });
+        if session.policy != StackResolutionPolicy::RecheckNoMeaningfulPriorityAction
+            || current_representatives != session.representatives
+            || !session.representatives.contains(&representative)
+            || !current_entry_matches
+        {
+            return Err(EngineError::ActionNotAllowed(
+                "AI priority pass cannot replace the active stack-resolution session".to_string(),
+            ));
+        }
+        state
+            .stack_resolution_session
+            .as_mut()
+            .expect("the validated active session remains installed")
+            .verified_pass_representatives
+            .insert(representative)
+    } else {
+        // The shared session is installed before the ordinary action boundary
+        // so its explicit-pass seam can enforce the one-entry limit. A rejected
+        // action boundary intentionally preserves its ownerless-replacement
+        // repair, so roll back only the newly installed private overlay rather
+        // than restoring the entire pre-boundary game state.
+        let auto_pass_before_install = state.auto_pass.clone();
+        let baseline = state
+            .auto_pass
+            .iter()
+            .map(|(&player, &auto_pass)| (player, auto_pass))
+            .collect();
+        install_stack_resolution_session(
+            state,
+            super::topology::priority_pass_participants(state)
+                .into_iter()
+                .collect(),
+            StackResolutionBudget::Unlimited,
+            StackResolutionPolicy::RecheckNoMeaningfulPriorityAction,
+            baseline,
+        );
+        state
+            .stack_resolution_session
+            .as_mut()
+            .expect("the newly installed session exists")
+            .verified_pass_representatives
+            .insert(representative);
+        return match apply_interaction(state, authenticated_actor, contract.semantic_owner, action)
+        {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                state.auto_pass = auto_pass_before_install;
+                state.stack_resolution_session = None;
+                Err(error)
+            }
+        };
+    };
+
+    match apply_interaction(state, authenticated_actor, contract.semantic_owner, action) {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            if inserted_verified_representative {
+                if let Some(session) = state.stack_resolution_session.as_mut() {
+                    session
+                        .verified_pass_representatives
+                        .remove(&representative);
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Applies a verified AI priority pass while returning the same stable rejection
+/// metadata as other interaction-materialized actions.
+pub fn apply_verified_ai_priority_pass_with_rejection(
+    state: &mut GameState,
+    authenticated_actor: PlayerId,
+    contract: &crate::ai_support::AiDecisionContract,
+    action: GameAction,
+) -> Result<ActionResult, ActionRejection> {
+    let related_object_ids = action.related_object_ids();
+    apply_verified_ai_priority_pass(state, authenticated_actor, contract, action).map_err(|error| {
+        super::visibility::filter_action_rejection_for_viewer(
+            state,
+            authenticated_actor,
+            &action_rejection_for_engine_error(&error, related_object_ids),
+        )
+    })
 }
 
 pub(crate) fn apply_interaction_for_simulation(
@@ -1020,6 +1333,7 @@ struct RawActionApplication {
     result: ActionResult,
     journal_start: usize,
     is_actor_scoped_preference: bool,
+    suppress_auto_pass_once: bool,
     boundary_snapshot: GameState,
     previous_interaction_waiting: WaitingFor,
     previous_interaction_slots: Vec<crate::types::interaction::ActiveInteractionSlot>,
@@ -1128,11 +1442,22 @@ fn apply_action_boundary_core(
     // defers to the next boundary at which the flag is clear. No "outermost"
     // depth test is added: gating on it would leave AI-probe clones unrepaired
     // while the real state is repaired.
-    effects::sweep_ownerless_post_replacement_strand(state);
-    state.remove_empty_active_post_replacement_frame();
+    let pre_recovery_pass_was_authorized = matches!(&action, GameAction::PassPriority)
+        && check_actor_authorization(state, authenticated_actor, &action).is_ok();
+    let recovered_terminal_rest_boundary = sweep_and_recover_priority_boundary_rest(state);
+    let recovered_stale_priority_pass =
+        recovered_terminal_rest_boundary && matches!(&action, GameAction::PassPriority);
     let boundary_snapshot = state.clone();
     let journal_start = state.resolved_rules_journal.entries().len();
     let is_actor_scoped_preference = action.is_actor_scoped_preference();
+    let suppress_auto_pass_once = recovered_stale_priority_pass
+        || matches!(
+            &action,
+            GameAction::RespondResolveAllConsent {
+                decision: ResolveAllConsentDecision::Decline,
+                ..
+            } | GameAction::RevokeResolveAllConsent { .. }
+        );
     interaction::ensure_interaction_authority(state);
     let previous_interaction_waiting = state.waiting_for.clone();
     let previous_interaction_slots = state.active_interaction_slots.clone();
@@ -1150,10 +1475,34 @@ fn apply_action_boundary_core(
     state.exiled_from_hand_this_resolution = 0;
     state.die_result_this_resolution = None;
     state.consumed_before_priority_trigger_events.clear();
-    if let Err(err) = check_actor_authorization(state, authenticated_actor, &action) {
+    if recovered_stale_priority_pass && !pre_recovery_pass_was_authorized {
         lifecycle.discard();
-        *state = boundary_snapshot;
-        return Err(err);
+        return Err(EngineError::WrongPlayer);
+    }
+    if !recovered_stale_priority_pass {
+        if let Err(err) = check_actor_authorization(state, authenticated_actor, &action) {
+            lifecycle.discard();
+            *state = boundary_snapshot;
+            return Err(err);
+        }
+    }
+    if recovered_stale_priority_pass {
+        return Ok(RawActionApplication {
+            result: ActionResult {
+                events: vec![],
+                waiting_for: state.waiting_for.clone(),
+                log_entries: vec![],
+            },
+            journal_start,
+            is_actor_scoped_preference,
+            suppress_auto_pass_once,
+            boundary_snapshot,
+            previous_interaction_waiting,
+            previous_interaction_slots,
+            submitted_interaction_owner,
+            preserve_interaction,
+            lifecycle,
+        });
     }
     let mut result = match apply_action(state, semantic_owner, action, stack_resolution_limit) {
         Ok(result) => result,
@@ -1209,6 +1558,7 @@ fn apply_action_boundary_core(
         result,
         journal_start,
         is_actor_scoped_preference,
+        suppress_auto_pass_once,
         boundary_snapshot,
         previous_interaction_waiting,
         previous_interaction_slots,
@@ -1216,6 +1566,317 @@ fn apply_action_boundary_core(
         preserve_interaction,
         lifecycle,
     })
+}
+
+/// CR 117.3b + CR 608.2c + CR 614.12a + CR 614.13a: A completed Devour entry
+/// cannot leave priority assigned to a later player while its spell carrier,
+/// empty replacement drain, and snapshot frame remain live. Recover the exact
+/// persisted rest shape before an old priority pass can advance the turn.
+///
+/// The recovery is intentionally narrower than ordinary continuation draining:
+/// it requires the captured two-frame shape (an empty `PostReplacement` parent
+/// and a Devour-only `ChangeZone` child), an active resolving carrier, and a
+/// live priority window. A prompt-bearing Devour entry or a pending multi-entry
+/// ChangeZone iteration therefore remains untouched.
+fn recover_orphaned_devour_completion_at_priority_boundary(state: &mut GameState) -> bool {
+    if !is_orphaned_devour_completion_at_priority_boundary(state) {
+        return false;
+    }
+
+    let mut recovered = state.clone();
+    let cleared = recovered.clear_completed_active_devour_snapshot();
+    debug_assert!(cleared, "the guarded Devour frame must be consumable");
+    recovered.remove_empty_active_post_replacement_frame();
+    settle_resolving_stack_entry_after_continuation_resume(&mut recovered);
+    if recovered.resolving_stack_entry.is_some() {
+        return false;
+    }
+
+    priority::reset_priority(&mut recovered);
+    recovered.waiting_for = WaitingFor::Priority {
+        player: recovered.active_player,
+    };
+    *state = recovered;
+    true
+}
+
+/// CR 117.3b + CR 608.2c: A persisted permanent-spell epilogue may retain its
+/// sole `SpellResolution` frame after every other instruction has completed.
+/// Consume only that exact bare carrier rest, then route settlement through the
+/// ordinary completed-carrier authority.
+fn recover_orphaned_spell_resolution_at_priority_boundary(state: &mut GameState) -> bool {
+    if !is_orphaned_spell_resolution_at_priority_boundary(state) {
+        return false;
+    }
+
+    let mut recovered = state.clone();
+    let pending = recovered
+        .take_active_spell_resolution()
+        .expect("the guarded bare spell-resolution frame must be active");
+    debug_assert!(matches!(
+        recovered.resolving_stack_entry.as_ref(),
+        Some(crate::types::game_state::StackEntry { id, .. }) if *id == pending.object_id
+    ));
+    settle_resolving_stack_entry_after_continuation_resume(&mut recovered);
+    if recovered.resolving_stack_entry.is_some() {
+        return false;
+    }
+
+    priority::reset_priority(&mut recovered);
+    recovered.waiting_for = WaitingFor::Priority {
+        player: recovered.active_player,
+    };
+    *state = recovered;
+    true
+}
+
+/// Prepare a decoded persisted state before runtime-only card data is restored.
+///
+/// This is deliberately a bounded, monotonic repair loop rather than a call to
+/// the ordinary action reducer: decoding must not invent a player action or a
+/// Resolve All continuation. Each iteration first retires ownerless
+/// post-replacement dispatches, then consumes one exact terminal carrier, then
+/// removes the newly exposed empty frame. If that sequence cannot strictly
+/// lower the terminal-rest measure, the caller receives a fail-closed restore
+/// error instead of publishing a priority state that `start_next_turn` will
+/// later reject.
+pub(crate) fn recover_terminal_resolution_rest_on_restore(
+    state: &mut GameState,
+) -> Result<bool, PersistedRestoreError> {
+    if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+        return Ok(false);
+    }
+
+    // A construction recipient may be serialized after the direct
+    // triggered-mana root has completed. At Priority, that recipient alone is
+    // not proof of the exceptional settled-priority path, so it cannot survive
+    // the persistence boundary as scheduling authority.
+    if state.pending_triggered_mana_resume.is_none() {
+        state.pending_trigger_construction_priority_recipient = None;
+    }
+
+    let mut remaining_steps = terminal_rest_measure(state).saturating_add(1);
+    let mut recovered_terminal_rest = false;
+    loop {
+        let before = terminal_rest_measure(state);
+        recovered_terminal_rest |= sweep_and_recover_priority_boundary_rest(state);
+        let after = terminal_rest_measure(state);
+
+        if after == 0 {
+            break;
+        }
+        if after >= before {
+            return Err(PersistedRestoreError::TerminalRestRecoveryExhausted);
+        }
+        remaining_steps = remaining_steps
+            .checked_sub(1)
+            .ok_or(PersistedRestoreError::TerminalRestRecoveryExhausted)?;
+        if remaining_steps == 0 {
+            return Err(PersistedRestoreError::TerminalRestRecoveryExhausted);
+        }
+    }
+
+    if matches!(state.waiting_for, WaitingFor::Priority { .. })
+        && state.stack_resolution_session.is_none()
+        && (state.resolving_stack_entry.is_some() || state.pending_resolution_completion.is_some())
+    {
+        return Err(PersistedRestoreError::UnsettledPriorityResolution);
+    }
+    Ok(recovered_terminal_rest)
+}
+
+fn terminal_rest_measure(state: &GameState) -> usize {
+    // Removing an outer ownerless/empty post-replacement frame can expose the
+    // terminal carrier below it. Weight the outer obstruction above that
+    // carrier so every permitted exposure is still strictly decreasing.
+    let (ownerless, empty_post_replacement) =
+        state
+            .active_post_replacement_drains()
+            .map_or((0, 0), |drains| {
+                (
+                    usize::from(drains.resident().is_some_and(|drain| {
+                        matches!(
+                            drain.status,
+                            crate::types::game_state::DrainStatus::Dispatching
+                        )
+                    })),
+                    usize::from(
+                        crate::types::game_state::PostReplacementDrainStack::is_empty(drains),
+                    ),
+                )
+            });
+    ownerless * 4
+        + empty_post_replacement * 2
+        + usize::from(is_orphaned_devour_completion_at_priority_boundary(state))
+        + usize::from(is_orphaned_spell_resolution_at_priority_boundary(state))
+}
+
+fn has_ownerless_post_replacement_dispatch_at_priority_boundary(state: &GameState) -> bool {
+    matches!(state.waiting_for, WaitingFor::Priority { .. })
+        && !crate::game::engine_replacement::post_replacement_dispatch_is_live()
+        && state
+            .active_post_replacement_drains()
+            .and_then(crate::types::game_state::PostReplacementDrainStack::resident)
+            .is_some_and(|drain| {
+                matches!(
+                    drain.status,
+                    crate::types::game_state::DrainStatus::Dispatching
+                )
+            })
+}
+
+/// Retires the exact, engine-owned terminal rest that can remain visible at a
+/// priority boundary after a post-replacement dispatch has completed.
+///
+/// The live action boundary and persisted restore must preserve this ordering:
+/// sweep the ownerless dispatch, consume an exact terminal carrier, then remove
+/// the exposed empty frame before considering the post-replacement completion.
+fn sweep_and_recover_priority_boundary_rest(state: &mut GameState) -> bool {
+    let swept_ownerless_post_replacement_dispatch =
+        has_ownerless_post_replacement_dispatch_at_priority_boundary(state);
+    effects::sweep_ownerless_post_replacement_strand(state);
+    let recovered_terminal_rest = recover_orphaned_devour_completion_at_priority_boundary(state)
+        || recover_orphaned_spell_resolution_at_priority_boundary(state);
+    state.remove_empty_active_post_replacement_frame();
+    recovered_terminal_rest
+        || recover_ownerless_post_replacement_completion_at_priority_boundary(
+            state,
+            swept_ownerless_post_replacement_dispatch,
+        )
+}
+
+/// An ownerless post-replacement dispatch proves that its continuation already
+/// returned, but pre-v0.65 persistence could retain the resolving carrier after
+/// the now-empty drain frame is removed. Settle only that carrier completion; a
+/// Ready or Paused drain, any remaining frame, or a pending completion is live
+/// work and remains untouched.
+fn recover_ownerless_post_replacement_completion_at_priority_boundary(
+    state: &mut GameState,
+    swept_ownerless_post_replacement_dispatch: bool,
+) -> bool {
+    if !swept_ownerless_post_replacement_dispatch
+        || !matches!(state.waiting_for, WaitingFor::Priority { .. })
+        || !state.resolution_stack.is_empty()
+        || state.pending_cast.is_some()
+        || state.pending_resolution_completion.is_some()
+        || state.resolving_stack_entry.is_none()
+    {
+        return false;
+    }
+
+    let mut recovered = state.clone();
+    settle_resolving_stack_entry_after_continuation_resume(&mut recovered);
+    if recovered.resolving_stack_entry.is_some() {
+        return false;
+    }
+
+    priority::reset_priority(&mut recovered);
+    recovered.waiting_for = WaitingFor::Priority {
+        player: recovered.active_player,
+    };
+    *state = recovered;
+    true
+}
+
+fn is_orphaned_devour_completion_at_priority_boundary(state: &GameState) -> bool {
+    matches!(state.waiting_for, WaitingFor::Priority { .. })
+        && state.resolving_stack_entry.is_some()
+        && state.resolution_stack.len() == 2
+        && state.active_change_zone_frame().is_some_and(|frame| {
+            frame.pending.is_none() && frame.devour_eligible_snapshot.is_some()
+        })
+        && state
+            .active_post_replacement_drains()
+            .is_some_and(crate::types::game_state::PostReplacementDrainStack::is_empty)
+}
+
+fn is_orphaned_spell_resolution_at_priority_boundary(state: &GameState) -> bool {
+    let Some(pending) = state.active_spell_resolution() else {
+        return false;
+    };
+    matches!(state.waiting_for, WaitingFor::Priority { .. })
+        && state.stack.is_empty()
+        && state.resolution_stack.len() == 1
+        && state.active_ability_continuation().is_none()
+        && state.pending_cast.is_none()
+        && state.pending_resolution_completion.is_none()
+        && matches!(
+            state.resolving_stack_entry.as_ref(),
+            Some(crate::types::game_state::StackEntry {
+                id,
+                kind: StackEntryKind::Spell { .. },
+                ..
+            }) if *id == pending.object_id
+        )
+}
+
+/// Finalize a checked persisted restore after its runtime-only data is present.
+///
+/// `finalize_rules_state` remains interior to this boundary so no partially
+/// rehydrated state escapes. The terminal-rest preparation has already either
+/// settled exact engine-owned residue or failed closed, so this makes no pass,
+/// stack-resolution, or Resolve All decision on the caller's behalf.
+pub(crate) fn finalize_persisted_restore(
+    state: &mut GameState,
+    recovered_terminal_rest: bool,
+) -> Result<(), PersistedRestoreError> {
+    finalize_rules_state(state);
+    let recovered_terminal_rest =
+        recovered_terminal_rest || recover_terminal_resolution_rest_on_restore(state)?;
+    if recovered_terminal_rest {
+        settle_deferred_triggers_after_persisted_restore(state)?;
+    }
+    // The settlement pipeline returns its authoritative wait rather than
+    // publishing it itself. Synchronize that wait before the one display
+    // finalization below.
+    finalize_rules_state(state);
+    finalize_display_state(state);
+    Ok(())
+}
+
+/// Settle a deferred trigger batch that survived a persisted terminal-rest
+/// repair before publishing a priority window.
+///
+/// Restore never treats a serialized construction recipient as proof that the
+/// settled-priority pipeline is safe. That recipient is scheduling state, not
+/// a live typed root: a raw snapshot can forge it without the completed
+/// triggered-mana root that validated the exceptional drain policy. Drop it
+/// and use the ordinary resolution-safe pipeline instead. A batch that remains
+/// queued after that policy is not publishable.
+fn settle_deferred_triggers_after_persisted_restore(
+    state: &mut GameState,
+) -> Result<(), PersistedRestoreError> {
+    let WaitingFor::Priority { player } = &state.waiting_for else {
+        return Ok(());
+    };
+    let player = *player;
+    // `pending_triggered_mana_resume` is absent once the direct root has
+    // completed, so the saved recipient alone cannot establish the live root
+    // provenance required by `SettledPriority`. Do not manufacture that
+    // provenance from serialized scheduling data.
+    state.pending_trigger_construction_priority_recipient = None;
+    if state.deferred_triggers.is_empty() {
+        return Ok(());
+    }
+
+    let mut events = Vec::new();
+    let waiting_for = engine_priority::run_post_action_pipeline_from(
+        state,
+        &mut events,
+        0,
+        &WaitingFor::Priority { player },
+        false,
+        false,
+    )
+    .map_err(|error| PersistedRestoreError::PrioritySettlementFailed(error.to_string()))?;
+    state.waiting_for = waiting_for;
+
+    if matches!(state.waiting_for, WaitingFor::Priority { .. })
+        && !state.deferred_triggers.is_empty()
+    {
+        return Err(PersistedRestoreError::DeferredTriggerSettlement);
+    }
+    Ok(())
 }
 
 fn finish_action_boundary(
@@ -1243,6 +1904,7 @@ fn finish_action_boundary_with_lifecycle(
         mut result,
         journal_start,
         is_actor_scoped_preference,
+        suppress_auto_pass_once,
         boundary_snapshot,
         previous_interaction_waiting,
         previous_interaction_slots,
@@ -1253,12 +1915,19 @@ fn finish_action_boundary_with_lifecycle(
     reconcile_terminal_result(state, &mut result);
     bump_state_revision(state);
     sync_waiting_for(state, &result.waiting_for);
-    let auto_pass_advanced = if is_actor_scoped_preference {
+    // Decline/Revoke are transactional consent rollbacks. They restore the
+    // frozen Priority checkpoint exactly; a standing auto-pass may resume on
+    // the next ordinary action boundary, but must not consume that checkpoint
+    // as an implicit side effect of withdrawing the authorization.
+    let auto_pass_advanced = if is_actor_scoped_preference || suppress_auto_pass_once {
         false
     } else {
         run_auto_pass_loop(state, &mut result)
     };
     reconcile_terminal_result(state, &mut result);
+    if matches!(result.waiting_for, WaitingFor::GameOver { .. }) {
+        take_and_restore_stack_resolution_session(state);
+    }
     // Debug "infinite mana" (CR 500.5 suppressed for flagged players): restore any
     // pool that a spend during this action depleted, before public state is
     // finalized and the next affordability probe runs. No-op when none flagged.
@@ -1307,8 +1976,8 @@ fn finish_action_boundary_with_lifecycle(
 thread_local! {
     /// PR-3 (Option C): set while inside a legality/search simulation probe
     /// (`ai_support::SimulationFilter`'s clone-and-apply). Loop-shortcut detection
-    /// (`reconcile_terminal_result` §3) and ring accumulation
-    /// (`pass_priority_once_with_pipeline` §2) are TOP-LEVEL-ONLY — a hypothetical
+    /// (`reconcile_terminal_result`) and ring accumulation
+    /// (`pass_priority_once_with_pipeline`) are TOP-LEVEL-ONLY — a hypothetical
     /// single-action probe is NOT a real CR 732.2a play sequence, so it must neither
     /// shortcut nor accumulate. Engine game logic is single-threaded (no rayon /
     /// par_iter / std::thread::spawn in the apply or legal_actions path), `apply()` is
@@ -1320,7 +1989,8 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
-/// True while inside a `SimulationFilter` legality probe. Read by §2 and §3.
+/// True while inside a `SimulationFilter` legality probe. Read by the ring-accumulation and
+/// loop-shortcut-detection sites above.
 pub(crate) fn in_simulation_probe() -> bool {
     IN_SIMULATION_PROBE.with(|f| f.get())
 }
@@ -1368,7 +2038,7 @@ fn reconcile_terminal_result(state: &mut GameState, result: &mut ActionResult) {
     // 704.5a SBA first and this never preempts or double-fires a legitimate win — it
     // only fires when the game would otherwise grind on (high victim life, or mid-drain
     // before 0). The `!GameOver` guard makes it idempotent across the two
-    // `reconcile_terminal_result` calls in `apply` (`:326` and `:330`).
+    // `reconcile_terminal_result` calls in `apply`.
     if !matches!(state.waiting_for, WaitingFor::GameOver { .. })
         && matches!(state.waiting_for, WaitingFor::Priority { .. }) // a player would get priority (CR 704.3)
         // CR 732.2a: the mandatory-loop game-ending shortcut is gated behind the
@@ -1387,15 +2057,14 @@ fn reconcile_terminal_result(state: &mut GameState, result: &mut ActionResult) {
         && !state.stack.is_empty()
         && !state.loop_detect_ring.is_empty()
         // PR-3 Defect-2: loop-shortcut detection is TOP-LEVEL-ONLY. Inside a
-        // `SimulationFilter` legality probe the flag is set, so §3 is skipped. This
+        // `SimulationFilter` legality probe the flag is set, so detection is skipped. This
         // enforces the invariant that a hypothetical single-action probe never runs
         // game-ending shortcut logic, and guards the
-        // reconcile→§3→§9→legal_actions→SimulationFilter→reconcile path against
-        // unbounded re-entry. (In the current architecture the §9 gate's pass-state
-        // reset already makes those nested probes handoffs that do not re-resolve, so
-        // the path is bounded even without this conjunct — see the impl report's
-        // Defect-2 measurement — but the guard keeps the top-level-only invariant
-        // explicit and robust to future §9/§2 changes.)
+        // reconcile→detection→legal_actions→SimulationFilter→reconcile path against
+        // unbounded re-entry. (The priority gate's pass-state reset already makes
+        // those nested probes handoffs that do not re-resolve, so the path is bounded
+        // even without this conjunct, but the guard keeps the top-level-only
+        // invariant explicit.)
         && !in_simulation_probe()
     {
         // PR-7 Phase 3: dispatch the confirmed-loop body by mode. The `On` arm is the
@@ -1579,7 +2248,7 @@ fn interactive_loop_bridge(state: &mut GameState, result: &mut ActionResult) {
             // loop can be detected during a different player's priority window.
             // `build_cert`'s only use of the frame is `board_delta(prior, state)`, a
             // comparand read ⇒ the CR 104.4b `.normalized` half.
-            let certificate = build_cert(&prior.normalized, state, &delta, winner);
+            let certificate = build_cert(&prior.normalized, state, &delta, winner, None);
             // CR 732.2a: a non-targeted drain reifies no per-iteration player choice ⇒ carry an
             // empty pin list; only the `iteration_count` (from `win_kind`) is populated.
             let WaitingFor::Priority { player: proposer } = state.waiting_for else {
@@ -1820,10 +2489,21 @@ fn build_cert(
     state: &GameState,
     delta: &crate::analysis::resource::ResourceVector,
     winner: PlayerId,
+    departure: Option<&crate::analysis::resource::CertifiedInstructedDeparture>,
 ) -> crate::analysis::loop_check::LoopCertificate {
+    // CR 732.2a: the two fields are derived from DIFFERENT deltas, deliberately. `unbounded`
+    // reads the FULL delta, because an instructed non-caster library departure is genuine
+    // unbounded progress and rides the certificate as its own `LibraryDelta` advantage axis.
+    // `win_kind` reads the REDUCED one, because CR 121.4 / CR 104.3c put the loss on a DRAW
+    // from an empty library rather than on the departure, so classifying `Decking` here would
+    // claim a threshold the engine cannot prove — see `without_certified_departure`.
+    let win_kind_delta = match departure {
+        Some(certified) => delta.without_certified_departure(&certified.per_victim),
+        None => delta.clone(),
+    };
     crate::analysis::loop_check::LoopCertificate {
         unbounded: delta.unbounded_axes_for(winner),
-        win_kind: crate::analysis::loop_check::classify_win_kind(winner, delta),
+        win_kind: crate::analysis::loop_check::classify_win_kind(winner, &win_kind_delta),
         // The offer is only reached for an OPTIONAL loop.
         mandatory: false,
         residual_board_delta: crate::analysis::resource::board_delta(prior, state),
@@ -2151,7 +2831,6 @@ fn certified_bounded_cycle_offer<'a>(
         certified_period_touch, PeriodCertification, PeriodTouch, PeriodicDelta, ResourceVector,
     };
 
-    let cur = ResourceVector::snapshot(state);
     // Written as an explicit newest-first walk rather than `find_map` because the candidate
     // body now threads `&mut verdicts` and carries an owned per-candidate `PeriodTouch` out.
     let mut basis_a: Option<(
@@ -2174,7 +2853,10 @@ fn certified_bounded_cycle_offer<'a>(
         // over the CERTIFIED PERIOD's announced pairs rather than over the offer-beat stack.
         let points = bounded_cycle_pin_slots_for_window(&touch_cover, proposer);
         let slots: Vec<DecisionSlot> = points.iter().map(|p| p.slot.clone()).collect();
-        let delta = ResourceVector::delta(&ResourceVector::snapshot(prior), &cur);
+        // `period` re-snapshots `state` once per candidate — accepted: the walk is bounded by
+        // the ring's length, and a hoisted snapshot cannot be handed to the single authority
+        // without splitting it back into the two-snapshot form it exists to remove.
+        let delta = ResourceVector::period(prior, state);
         // The existing disjunction, written as an `if / else if` that RECORDS the matching
         // disjunct instead of discarding it. Semantics are byte-for-byte the `||` it
         // replaces: the equality arm is still evaluated first and `_pinned` still runs only
@@ -2227,6 +2909,7 @@ fn certified_bounded_cycle_offer<'a>(
                 frames_per_period: span,
                 delta,
                 victim_slot: Vec::new(),
+                declarable_victims: Vec::new(),
             },
         ));
         break;
@@ -2314,6 +2997,7 @@ fn certified_bounded_cycle_offer<'a>(
                     frames_per_period: k,
                     delta,
                     victim_slot: Vec::new(),
+                    declarable_victims: Vec::new(),
                 },
             )
         }
@@ -2415,6 +3099,10 @@ fn certified_bounded_cycle_offer<'a>(
         .iter()
         .map(|(slot, _)| (slot.clone(), worst_seat_life_loss))
         .collect();
+    // CR 704.5a: the SAME seat set `elimination_bounds` is handed two statements below,
+    // carried on the certificate so the per-cycle conformance check confines its lift to what
+    // the bound actually reserved instead of re-deriving a domain from the driven board.
+    periodic.declarable_victims = declarable_victims.clone();
     // `.cloned()`, not `.copied()`: `(DecisionSlot, i64)` is not `Copy`.
     let slot_magnitude: std::collections::BTreeMap<DecisionSlot, i64> =
         periodic.victim_slot.iter().cloned().collect();
@@ -2435,7 +3123,7 @@ fn certified_bounded_cycle_offer<'a>(
     // Path A's spelled out at the site rather than mutated after the fact.
     // `cert_current` is the live `state` on both bases, exactly as before: `build_cert`'s only
     // use of the pair is `board_delta`, a comparand read.
-    let base = build_cert(cert_prior, state, &periodic.delta, proposer);
+    let base = build_cert(cert_prior, state, &periodic.delta, proposer, None);
     let certificate = crate::analysis::loop_check::LoopCertificate {
         per_cycle: Some(periodic),
         // CR 732.5: honest, and currently read by nothing in production — a loop nobody can
@@ -2512,10 +3200,10 @@ fn certified_bounded_cycle_offer<'a>(
 ///
 /// FAIL-CLOSED on every uncertainty, because a wrong pin is worse than no offer:
 ///
-/// * an empty point set publishes no declaration at all — a declaration against an empty
-///   schema would be the one shape `handle_declare_shortcut` validates neither
-///   `predictability_gate` nor `validate_pins` against (both live inside its
-///   `if !offer.schema.points.is_empty()` block);
+/// * an empty point set publishes no declaration at all — `handle_declare_shortcut` validates
+///   every declaration it resolves, whatever the schema published, so one minted against an
+///   exposed-nothing schema is refused on any slot-addressing pin it carries and states nothing
+///   without one; either way `declaration.is_some()` would stop meaning "the handler takes this";
 /// * `None` (that seat never answered this slot) and [`LoopAnswer::Conflicted`] (it answered
 ///   two ways — see that type: an engine-capability refusal, NOT a CR 732.2a mandate) are the
 ///   SAME disposition here, because neither names a single answer to pin;
@@ -3046,7 +3734,7 @@ fn entry_announces(
     // `Err` (no legal target, CR 603.3d) also yields `None` — fail-closed, matching this
     // function's contract that the schema can only ever UNDER-publish. Purity survives:
     // `build_target_slots` never reads `state.waiting_for` (its only hit in
-    // `ability_utils.rs` is a test at `:7722`).
+    // `ability_utils.rs` is a test).
     let source = object_decision_source(state, entry.source_id)?;
     // CR 603.5 + CR 732.2a: `entry.controller == proposer` above bounds who OWNS the entry;
     // it does NOT bound who the resolver ASKS, nor WHETHER it asks, nor HOW MANY TIMES.
@@ -3105,7 +3793,7 @@ fn entry_announces(
     .filter(|gate| {
         gate.key
             .as_ref()
-            .is_none_or(|key| state.may_trigger_auto_choice(key).is_none())
+            .is_none_or(|key| state.may_trigger_auto_choice_for_live_prompt(key).is_none())
     })
     .map(|_| DecisionSlot::may(source.clone()));
     let mut slots = super::ability_utils::build_target_slots(state, ability).ok()?;
@@ -3157,9 +3845,9 @@ fn entry_announces(
     // `WaitingFor::TriggerTargetSelection` is ever raised, so `record_trigger_target_answer`
     // — whose only two call sites are that prompt's reducer arms — never runs. A point
     // published here would demand a `predictability_gate` answer no writer can produce, and
-    // one unanswerable point makes the WHOLE offer undeclarable (the gate's `required` set is
-    // every published point). Journalling the auto-selection instead would model a decision
-    // the player never made.
+    // since the gate's `required` set is every published point, one such point leaves the
+    // offer with no declaration the engine can publish. Journalling the auto-selection instead
+    // would model a decision the player never made.
     //
     // THE SAME AUTHORITY AS THE RELIEF, exported rather than re-derived: gate (3)'s
     // `stack_entry_has_no_ordering_input` asks `forced_unique_targeting` about this same
@@ -3859,29 +4547,22 @@ fn until_lethal_fallback(
 /// is a `Ranking`, which lives INSIDE the step and never changes the count — this seam is
 /// type-only across that parameterization.
 ///
-/// DORMANT for every Stage-2 crownable loop (Ruling B) — and the REASON has now been restated
-/// TWICE, because each restatement was falsified by the next commit and the history is the
-/// useful part. (i) It was "`TargetSchedule` rotates DecisionSource objects, not players";
-/// parameterizing a step's subject admitted `AnnouncementSubject::Seat` and killed that.
-/// (ii) It was then "no in-tree producer emits a `Seat` into a schedule", which is FALSE as of
-/// the provenance split: `record_trigger_target_answer` and
-/// `game::interaction::materialize_loop_shortcut_response` both mint
-/// `Scheduled(TargetSchedule::Constant(Ranking::one(AnnouncementSubject::Seat(..))))` for a
-/// CR 601.2c announced seat.
-///
-/// (iii) The property that actually holds, and the one this function's return value depends on,
-/// is about ROTATION rather than about subjects: **no in-tree producer emits a multi-STEP
-/// schedule** (`RoundRobin` / `Piecewise`) **or a multi-entry `Ranking`**. Every seat-carrying
-/// schedule the engine mints is a one-step `Constant`, which lands on the `1` arm of the match
-/// below — the same `1` a `TargetPin::Player` lands on, so the split moved the spelling and not
-/// the period. `live_mandatory_loop_winner` crowns on PLAYER fallers, and a loop whose targets
-/// do not rotate produces no NEW player faller per cycle to aggregate. The only crownable >2p
-/// player drain pins ALL opponents every cycle (constant, period 1 — via the
-/// `Scheduled(Constant(_))` arm below since the split, via `TargetPin::Player(_)` before it,
-/// and those two arms return the same `1`). The seam is built for generality and a multi-cycle
-/// aggregation is fail-safe either way (a loop reaching the arm measures 1 cycle, finds no
-/// faller, does not crown), so a future ROTATING producer changes what must be re-argued here,
-/// not what this function returns.
+/// DORMANT for every Stage-2 crownable loop (Ruling B). The producer
+/// `game::interaction::materialize_loop_shortcut_response` emits a ONE-entry `Constant` on an
+/// `UntilLethal` offer and a `Piecewise` on a `Fixed` one, and NEITHER MOVES THIS FUNCTION'S
+/// ANSWER OFF 1 — the reason is which consumer sees which. This function's two consumers are
+/// [`shortcut_validated_range`]'s `UntilLethal` arm and `apply_until_lethal_shortcut`, both
+/// UNTIL-LETHAL paths, and the multi-STEP shape is minted only under a FIXED count, which reads
+/// its range off the count and never consults a schedule. A MULTI-entry `Constant` can still
+/// reach here from a decoded save — `declaration_conforms` refuses one at DECLARE, not at load —
+/// and it lands on the same `Constant(_)` arm and returns 1, correctly, since
+/// `evaluate_schedule` resolves `head()` only. The argument therefore rests on the schedule's
+/// SHAPE rather than on any producer's arity. `live_mandatory_loop_winner` crowns on PLAYER
+/// fallers, and a loop whose targets do not rotate produces no NEW player faller per cycle to
+/// aggregate. The seam is built for generality and a multi-cycle aggregation is fail-safe either
+/// way (a loop reaching the arm measures 1 cycle, finds no faller, does not crown), so a future
+/// ROTATING producer on an until-lethal path changes what must be re-argued here, not what this
+/// function returns.
 ///
 /// CR 732.2a SAFETY LIMIT: the returned period is clamped to `MAX_SHORTCUT_CYCLES`. Both
 /// consumers derive their `0..period` range from this one helper (`validate_pins` and
@@ -3940,14 +4621,17 @@ fn shortcut_drive_period(
 /// and at a count of 1 over a length-2 rotation `Ok` is the CORRECT answer. Do not re-derive
 /// and re-add that term.
 ///
-/// PRECONDITION, discharged at its call site: the count is already cap-checked, because
-/// `handle_declare_shortcut` runs the `MAX_SHORTCUT_CYCLES` / `max_iterations` match ABOVE
-/// the pin-validation block. Without that ordering a hostile `Fixed(4e9)` would become a
-/// four-billion-iteration validation loop. Exactly ONE call site consumes this helper.
+/// PRECONDITION, DISCHARGED BY EACH CALLER: the count handed in is already bounded. A caller
+/// that has not bounded it must not call this — an unchecked `Fixed(4e9)` becomes a
+/// four-billion-iteration validation loop. `handle_declare_shortcut` discharges it by running
+/// the `MAX_SHORTCUT_CYCLES` / `max_iterations` match above its pin-validation block;
+/// `build_bounded_declaration` by passing the schema's own `iteration_count`; the interaction
+/// decoder by the count-spec projection, which computes
+/// `max = schema.max_iterations.min(MAX_SHORTCUT_CYCLES)` and admits only that window.
 ///
 /// Exhaustive over `IterationCount` with no wildcard, so a future variant build-breaks here
 /// and forces a range decision instead of silently inheriting one.
-fn shortcut_validated_range(
+pub(crate) fn shortcut_validated_range(
     count: &crate::analysis::decision_template::IterationCount,
     template: Option<&crate::analysis::decision_template::DecisionTemplate>,
 ) -> crate::analysis::decision_template::IterationIndex {
@@ -4073,7 +4757,10 @@ fn drive_one_shortcut_cycle(
         match pass_priority_once_with_pipeline(&mut work, &mut beat_events, None) {
             // Cross-lethal: COMMIT + STOP. The GameOver event + transition are already in
             // `work`/`beat_events`.
-            Ok(WaitingFor::GameOver { winner }) => {
+            Ok(PriorityPassPipelineOutcome {
+                waiting_for: WaitingFor::GameOver { winner },
+                ..
+            }) => {
                 ev.append(&mut beat_events);
                 return CycleOutcome::CrossLethal {
                     state: Box::new(work),
@@ -4088,7 +4775,10 @@ fn drive_one_shortcut_cycle(
             // it advances the same counter. Both arms key the advance on the ring's BACK
             // ALLOCATION actually changing rather than on the beat kind, which is what keeps
             // the drive's frame count equal to the mint's on either path.
-            Ok(WaitingFor::Priority { player }) if player == work.active_player => {
+            Ok(PriorityPassPipelineOutcome {
+                waiting_for: WaitingFor::Priority { player },
+                ..
+            }) if player == work.active_player => {
                 ev.append(&mut beat_events);
                 let ring_back_after = work.loop_detect_ring.back().map(std::sync::Arc::as_ptr);
                 if ring_back_after.is_some() && ring_back_after != ring_back_before {
@@ -4107,13 +4797,18 @@ fn drive_one_shortcut_cycle(
                 continue; // active beat, not yet recurred ⇒ keep driving within the cap
             }
             // Opponent's mid-cycle priority window ⇒ keep driving.
-            Ok(WaitingFor::Priority { .. }) => {
+            Ok(PriorityPassPipelineOutcome {
+                waiting_for: WaitingFor::Priority { .. },
+                ..
+            }) => {
                 ev.append(&mut beat_events);
                 continue;
             }
             // Any OTHER prompt (OrderTriggers / TriggerTargetSelection / …): answer it from the
             // pins and continue. An unpinned prompt fails closed ⇒ abort to manual.
-            Ok(other) => {
+            Ok(PriorityPassPipelineOutcome {
+                waiting_for: other, ..
+            }) => {
                 ev.append(&mut beat_events);
                 match inject_pinned_answer(&mut work, template, iteration, &other) {
                     Ok(()) => {
@@ -4461,13 +5156,18 @@ fn materialize_fixed_shortcut(
                 // remaining repetitions could carry a seat past a threshold inside the
                 // proposal. Measured before commit, on the same axes the bound reads, and
                 // fail-closed: a divergent cycle is dropped whole and the drive hands back
-                // to manual play with the last conforming cycle intact.
+                // to manual play with the last conforming cycle intact. The comparison is
+                // victim-INVARIANT rather than exact: CR 601.2c lets one declaration aim an
+                // announced slot at a different seat each iteration, and `conforms` states
+                // both what that licenses and what it still refuses.
                 if let Some(pd) = per_cycle {
-                    let actual = crate::analysis::resource::ResourceVector::delta(
-                        &crate::analysis::resource::ResourceVector::snapshot(&committed),
-                        &crate::analysis::resource::ResourceVector::snapshot(&s),
-                    );
-                    if actual != pd.delta {
+                    let pins = template
+                        .as_ref()
+                        .map_or(&[][..], |t| t.decisions.as_slice());
+                    if !pd.conforms(
+                        &crate::analysis::resource::ResourceVector::period(&committed, &s),
+                        pins,
+                    ) {
                         break 'cycles;
                     }
                 }
@@ -4523,12 +5223,6 @@ fn materialize_fixed_shortcut(
     // priority, though it need not be the player proposing the shortcut." THIS BLOCK IS
     // THAT ENDING POINT, and it is the ending point for BOTH entry paths above — `n`
     // cycles done with no cross-lethal, and `break 'cycles`.
-    //
-    // What the boundary means for a declared `Ranking`: within one accepted drive only its
-    // HEAD is ever resolved (`evaluate_schedule`), so this seam is where the NEXT episode
-    // may legitimately re-evaluate the tail. The reasoning is not restated here — it lives
-    // on `analysis::decision_template::Ranking` ("CONSUMED AT AN EPISODE BOUNDARY, NEVER
-    // MID-DRIVE"), and a second copy is the drift the R1 doc sweep exists to prevent.
     //
     // PROBE-PINNED (probe arm `MUT_SEAM`): the window clear here is load-bearing, not a
     // backstop. MEASURED — skipping it on the f4 accepted drive leaves `loop_detect_ring`
@@ -5236,24 +5930,71 @@ fn normalize_recast_frame(
     s
 }
 
-/// CR 111.10: the content class of the reproduced token — the single battlefield object
-/// present in `after` but absent from `before` (the one predefined token the recast
-/// creates). `None` unless EXACTLY one new battlefield object appeared (the target class
-/// creates one Saproling; zero or several ⇒ not this shape ⇒ fail-closed).
-fn derived_fodder_class(
-    before: &GameState,
-    after: &GameState,
-) -> Option<crate::game::game_object::GameObject> {
-    let mut new_ids = after
+/// CR 111.1: the battlefield objects one period MINTED — created with no prior existence in any
+/// zone — as opposed to those that ARRIVED by moving zones. `zones::move_to_zone` carries the
+/// existing `object_id` through a move, so an arrival is keyed in BOTH frames' `objects` maps
+/// while a mint is keyed only in `after`'s.
+///
+/// The test is a CONJUNCTION with the shipped new-to-the-battlefield test, not a replacement of
+/// it, and the conjunction carries the safety argument: the narrowed set is a SUBSET of the
+/// shipped one, so no id the shipped rule excluded can enter a derived class and the published
+/// per-cycle count cannot be inflated in either direction. Replacing the test would leave one
+/// direction open — a `before.battlefield` id with no `before.objects` entry — and in THAT
+/// direction an extra member matching the class does not make the class heterogeneous, so the
+/// count would silently rise.
+///
+/// ONE test, TWO readers: the class derivation and the producer's token-axis feed, which must
+/// publish the count the boundary mint will reproduce.
+pub(crate) fn minted_battlefield_ids(before: &GameState, after: &GameState) -> Vec<ObjectId> {
+    after
         .battlefield
         .iter()
         .copied()
-        .filter(|id| !before.battlefield.contains(id));
-    let id = new_ids.next()?;
-    if new_ids.next().is_some() {
-        return None;
+        .filter(|id| !before.battlefield.contains(id) && !before.objects.contains_key(id))
+        .collect()
+}
+
+/// CR 111.3 / CR 707.2: the content class of the reproduced fodder, and the per-cycle count `k` of
+/// members the period reproduces — the battlefield objects `after` MINTED. `None`
+/// unless EVERY new battlefield object belongs to ONE class; `Some((class, k))` with `k >= 1`
+/// otherwise, and `None` for zero new objects. CR 111.3 is the authority for a created token's
+/// copiable values, with a Saproling as its own example (CR 111.10 scopes PREDEFINED tokens).
+///
+/// HOMOGENEITY IS A CONJUNCTION, and the second conjunct is not optional:
+/// [`crate::analysis::resource::fodder_content_eq`] routes through `object_content_eq`, whose per-id
+/// justification — "card-intrinsic fields are immutable FOR A GIVEN OBJECT ID" — does not transfer
+/// to this CROSS-id compare, which reads neither `card_types`, `color` nor `keywords`, exactly the
+/// characteristics CR 707.2 says a copy acquires. The mint reproduces the class by copying
+/// `intrinsic_copiable_values`, so a multiset homogeneous only under `fodder_content_eq` could mint
+/// k*N copies of ONE representative while the period produced k DIFFERENT permanents.
+///
+/// THE SET IS THE MINTED MEMBERS, and the criterion is what the collapse can DELIVER rather than
+/// what the frames contain. `PersistentAxisMaterialization::Tokens`' boundary mint reproduces `k`
+/// members of the class per cycle by MINTING them (CR 111.1, with CR 111.3 / CR 707.2 fixing the
+/// values reproduced), so an object that merely MOVED onto the battlefield is not a member of a
+/// class that mint can reproduce, and publishing it as one is a promise the collapse cannot keep
+/// (CR 732.2a). What such an object is instead is the board cover's question, answered by
+/// `analysis::resource::certify_instructed_opponent_library_departure`.
+fn derived_fodder_class(
+    before: &GameState,
+    after: &GameState,
+) -> Option<(crate::game::game_object::GameObject, u32)> {
+    let new_ids = minted_battlefield_ids(before, after);
+    let mut members = new_ids.iter().filter_map(|id| after.objects.get(id));
+    let class = members.next()?.clone();
+    let class_values = crate::game::printed_cards::intrinsic_copiable_values(&class);
+    let mut k: u32 = 1;
+    for other in members {
+        if !crate::analysis::resource::fodder_content_eq(&class, other)
+            || crate::game::printed_cards::intrinsic_copiable_values(other) != class_values
+        {
+            return None;
+        }
+        k += 1;
     }
-    after.objects.get(&id).cloned()
+    // Fail-closed on a partial resolve: an id in `after.battlefield` with no `after.objects` entry
+    // was silently skipped by the `filter_map` above and must not be counted as homogeneous.
+    (k as usize == new_ids.len()).then_some((class, k))
 }
 
 /// The reproduced fodder class of one accepted object-growth period, plus whether that
@@ -5263,6 +6004,10 @@ fn derived_fodder_class(
 /// clone-drive that derives the class.
 struct PeriodFodder {
     class: crate::game::game_object::GameObject,
+    /// CR 111.3: the per-cycle count `k` of class members the period reproduces, measured by
+    /// [`derived_fodder_class`] on the same one-period drive. `>= 1`. The boundary mint multiplies
+    /// by it (`PersistentAxisMaterialization::Tokens`' `per_cycle_delta`).
+    per_cycle_count: u32,
     taps_fodder: bool,
 }
 
@@ -5280,10 +6025,15 @@ struct PeriodFodder {
 /// cannot proceed from `state` as-is — seed a `Priority{controller}` window on the driven
 /// frame exactly as `apply_until_lethal_shortcut` does before its identical drive.
 ///
+/// CR 732.2a: this is the accept-time RE-DERIVATION of the same measurement the offer
+/// published, so it must see what the offer saw — hence the same
+/// `visibility::proposer_hidden_view` base — or the two can disagree for a reason no
+/// player can see.
+///
 /// INV (clone-only): takes `&GameState` (SHARED borrow) ⇒ a live write is TYPE-IMPOSSIBLE.
 /// The `Priority{controller}` seed and the drive both mutate `before`/`after`, which are
-/// THROWAWAY clones (`state.clone()` → `before.clone()`); live `state.waiting_for` is never
-/// touched, so this cannot corrupt the real accept flow (INV-1, mirrors
+/// THROWAWAY clones (the redacted view → `before.clone()`); live `state.waiting_for` is
+/// never touched, so this cannot corrupt the real accept flow (INV-1, mirrors
 /// `try_offer_object_growth_shortcut`).
 fn drive_one_period_frames(state: &GameState) -> Option<(GameState, GameState)> {
     let seq = state.last_loop_action_sequence.clone();
@@ -5298,7 +6048,7 @@ fn drive_one_period_frames(state: &GameState) -> Option<(GameState, GameState)> 
     let _probe = SimulationProbeGuard::enter();
     // Seed + drive on THROWAWAY clones only (never `state`): `before` is the pre-drive frame,
     // `after` the post-one-period frame; callers diff the two clones.
-    let mut before = state.clone();
+    let mut before = crate::game::visibility::proposer_hidden_view(state, controller);
     priority::reset_priority(&mut before);
     before.waiting_for = WaitingFor::Priority { player: controller };
     let mut after = before.clone();
@@ -5309,9 +6059,11 @@ fn drive_one_period_frames(state: &GameState) -> Option<(GameState, GameState)> 
 /// CR 732.2a / CR 111.1: re-derive the reproduced fodder class of the accepted
 /// object-growth period by driving ONE iteration of `last_loop_action_sequence` on a
 /// clone (`drive_one_period_frames`), and measure whether that period taps a fodder member.
-/// `None` when the sequence is empty or the period reproduces no single new battlefield
-/// object (a multi-activation mana engine → no fodder pile to display). Same
-/// `derived_fodder_class` single-new-object rule as the detection drive. Called at
+/// `None` when the sequence is empty or the period reproduces no HOMOGENEOUS multiset of new
+/// battlefield objects (a multi-activation mana engine reproduces none → no fodder pile to
+/// display; a heterogeneous multi-entry period is not this shape). Same
+/// `derived_fodder_class` one-class rule as the detection drive, and the same per-cycle count
+/// `k` it measures. Called at
 /// materialize (with the sequence still intact) to snapshot the ∞ pile and its tapped-growth
 /// axis. The post-drive `derived_fodder_class` / `tapped_fodder_members` inspections are pure
 /// (they never read the probe flag), so running them after the shared kernel's guard has
@@ -5319,7 +6071,7 @@ fn drive_one_period_frames(state: &GameState) -> Option<(GameState, GameState)> 
 fn current_period_fodder(state: &GameState) -> Option<PeriodFodder> {
     let controller = state.last_loop_action_sequence.first()?.controller;
     let (before, after) = drive_one_period_frames(state)?;
-    let class = derived_fodder_class(&before, &after)?;
+    let (class, per_cycle_count) = derived_fodder_class(&before, &after)?;
     // CR 702.51a: the period taps a fodder iff the driven tapped-fodder multiset GREW across the
     // one-period drive. `select_convoke_taps` sorts fodder (`is_token`) FIRST, so a convoke/
     // tap-cost period taps a reproduced fodder → this grows; a mana-paid untapped-growth period
@@ -5328,7 +6080,11 @@ fn current_period_fodder(state: &GameState) -> Option<PeriodFodder> {
     let taps_fodder = crate::analysis::resource::tapped_fodder_members(&after, controller, &class)
         .len()
         > crate::analysis::resource::tapped_fodder_members(&before, controller, &class).len();
-    Some(PeriodFodder { class, taps_fodder })
+    Some(PeriodFodder {
+        class,
+        per_cycle_count,
+        taps_fodder,
+    })
 }
 
 /// CR 122.1 + CR 732.2a: THE SINGLE per-object counter derivation of an accepted period — drive
@@ -5446,7 +6202,7 @@ fn try_offer_object_growth_shortcut(
     // (optional) loop — every driving step must be a player-initiated cast/activation. Replaces
     // the pre-P7 `no_living_player_has_meaningful_priority_action` offer gate (HAZARD A: that
     // predicate + its leaf `is_meaningful_priority_activation` (mana_sources.rs) stay byte-identical
-    // for the MANDATORY `:431`/`:515` lethal/draw paths). A mana engine's activations are voluntary
+    // for the MANDATORY lethal/draw paths). A mana engine's activations are voluntary
     // (CR 605.3a) so it offers; a future mandatory driving variant is forced to return `false`.
     if !seq.iter().all(|c| c.action.is_voluntarily_repeatable()) {
         return None;
@@ -5524,9 +6280,28 @@ fn try_offer_object_growth_shortcut(
     }
 
     // Drive two whole PERIODS (three settle frames) under the re-entrancy guard.
+    //
+    // CR 732.2a: the settle frame and the driven clone share ONE base — the proposer's own
+    // information set — because a proposal may rest only on the current game state and the
+    // PREDICTABLE results of the sequence, and a card the proposer may not look at is not
+    // predictable to them (CR 400.6 puts that reading with the card's owner). Redaction is
+    // applied once, here, and the drive mutates that same clone, so a card the period moves
+    // is blank in every frame the cover compares.
+    //
+    // `seq`, `expected_defs` and the randomness pre-scan above deliberately keep reading the
+    // LIVE `state`: they resolve the recast object and its combined spell ability, which is
+    // the determinism question, not the information one. `pinned_decisions_to_points` below
+    // keeps the live state for the same reason — the declaration is made against the real
+    // board. Three consequences, stated rather than left to be rediscovered: the RNG
+    // word-position check still compares the driven clone against the live `state`, and
+    // redaction draws no randomness, so it stays valid; `derived_fodder_class` now compares
+    // redacted frames, which is sound because the fodder is a battlefield token and public;
+    // and redaction costs one pass over the hidden-zone objects against a hook that already
+    // drives two whole periods through `apply()` — if that measures hot, redact once per
+    // beat rather than once per hook, never narrow the rule.
     let _probe = SimulationProbeGuard::enter();
-    let s_n = state.clone();
-    let mut clone = state.clone();
+    let s_n = crate::game::visibility::proposer_hidden_view(state, caster);
+    let mut clone = s_n.clone();
     drive_loop_sequence_iteration(&mut clone, &seq, 0, &expected_defs).ok()?;
     let s_n1 = clone.clone();
     drive_loop_sequence_iteration(&mut clone, &seq, 1, &expected_defs).ok()?;
@@ -5561,20 +6336,21 @@ fn try_offer_object_growth_shortcut(
         normalize_recast_frame(&s_n2, &seq[0]),
     );
     // CR 732.2a board recurrence on BOTH pairs — two disjoint recurrence shapes:
-    //  - fodder-growth (a token was reproduced each period, `derived_fodder_class` is `Some`):
-    //    cover modulo the inert reproduced fodder class (the P3 object-growth path, unchanged).
+    //  - fodder-growth (one HOMOGENEOUS class of k >= 1 members was reproduced each period,
+    //    `derived_fodder_class` is `Some`): cover modulo the inert reproduced fodder class (the
+    //    P3 object-growth path, unchanged — the cover consumes only the class, never k).
     //  - pure resource growth (NO new battlefield object — the multi-activation mana-engine class):
     //    the board returns EQUAL modulo projected resources (mana grows +N/period, board identical).
     //    PROBE-1 measured `loop_states_equal_modulo_resources` TRUE on real Basalt+Power sequence
     //    boundaries. A PARTIAL period never reaches here board-equal (the drive re-taps a tapped
     //    source and aborts first), so the drive+cover IS the period-boundary check.
     let cover_ok = match derived_fodder_class(&s_n, &s_n1) {
-        Some(mut fodder) => {
+        Some((mut fodder, _k)) => {
             crate::analysis::resource::project_object_for_loop(&mut fodder);
             crate::analysis::resource::loop_states_cover_modulo_fodder_growth(
-                &cs_n, &cs_n1, &fodder,
+                &cs_n, &cs_n1, &fodder, caster,
             ) && crate::analysis::resource::loop_states_cover_modulo_fodder_growth(
-                &cs_n1, &cs_n2, &fodder,
+                &cs_n1, &cs_n2, &fodder, caster,
             )
         }
         None => {
@@ -5604,16 +6380,35 @@ fn try_offer_object_growth_shortcut(
         &crate::analysis::resource::ResourceVector::snapshot(&s_n1),
         &crate::analysis::resource::ResourceVector::snapshot(&s_n2),
     );
-    // CR 111.10: `tokens_created` is an EVENT-fed axis (0 under a snapshot diff), but the
-    // cover above already proved the battlefield grows ONLY by inert reproduced tokens, so
-    // the battlefield growth IS the per-cycle tokens-created count — the unbounded axis. Feed
-    // it so `net_progress_for` sees the progress and the certificate names TokensCreated.
-    let board_growth = s_n2.battlefield.len() as i64 - s_n1.battlefield.len() as i64;
-    if board_growth > 0 {
-        delta.tokens_created += board_growth;
+    // CR 111.1: `tokens_created` is an EVENT-fed axis (0 under a snapshot diff),
+    // so the period's MINTED count is fed in as the per-cycle tokens-created count — the
+    // unbounded axis — and `net_progress_for` then sees the progress the certificate names.
+    // The count is the MINTED one, not the raw `battlefield.len()` delta, because the boundary
+    // mint reproduces minted members and an ARRIVAL grows the battlefield without being one:
+    // publishing the raw delta would promise a per-cycle count the collapse cannot reproduce.
+    // Same `minted_battlefield_ids` test the class derivation uses, so the two cannot drift.
+    let minted_growth = minted_battlefield_ids(&s_n1, &s_n2).len() as i64;
+    if minted_growth > 0 {
+        delta.tokens_created += minted_growth;
     }
+    // CR 701.17b: an instructed, choiceless, non-caster top-of-library departure is an
+    // ADVANTAGE axis, not a loss one — CR 121.4 / CR 104.3c / CR 704.5b lose a player for
+    // DRAWING from an empty library, never for milling one. `has_no_loss_axis` is therefore
+    // asked about the delta with the certified departure added back, and ONLY it:
+    // `net_progress_for` and `driving_resources_non_decreasing` keep the full delta, and
+    // `has_no_loss_axis` itself is not edited — its other call sites are the CR 732.4
+    // mandatory-draw arms, where relieving this would turn an unbreakable mandatory mill loop
+    // into a draw (CR 104.4b needs the game state to REPEAT, and a shrinking library does not).
+    let certified_departure =
+        crate::analysis::resource::certify_instructed_opponent_library_departure(
+            &s_n1, &s_n2, caster,
+        );
+    let sign_check_delta = match &certified_departure {
+        Some(certified) => delta.without_certified_departure(&certified.per_victim),
+        None => delta.clone(),
+    };
     if !delta.net_progress_for(caster)
-        || !has_no_loss_axis(&delta)
+        || !has_no_loss_axis(&sign_check_delta)
         || !crate::analysis::resource::driving_resources_non_decreasing(&s_n1, &s_n2, caster)
     {
         return None;
@@ -5622,8 +6417,8 @@ fn try_offer_object_growth_shortcut(
     // (The CR 104.4b optionality gate moved ABOVE the drive as STEP D's
     // `seq.iter().all(is_voluntarily_repeatable)` — HAZARD A: it no longer routes through
     // `no_living_player_has_meaningful_priority_action`, which stays scoped to the mandatory
-    // `:431`/`:515` lethal/draw paths.)
-    let certificate = build_cert(&s_n1, &s_n2, &delta, caster);
+    // lethal/draw paths.)
+    let certificate = build_cert(&s_n1, &s_n2, &delta, caster, certified_departure.as_ref());
     // CR 732.2a (CARRY, don't re-derive): the schema's decision list is the SAME
     // `build_recast_template` output the drive uses — `[ConvokeTaps]` when `seq[0]` is a convoke
     // recast, else `[]` (a multi-activation period carries no convoke pin). Legal sets are derived
@@ -5642,9 +6437,14 @@ fn try_offer_object_growth_shortcut(
     //
     // CR 704.5a / CR 704.5c: the `UntilLethal` arm is UNREACHABLE FROM THIS PRODUCER — `delta` is
     // a two-`snapshot` diff, and `ResourceVector::snapshot` writes neither `damage_dealt` nor
-    // `extra_turns` and never keys a poison `counters` entry by `ObjectClass::Player`, while
-    // `has_no_loss_axis` just above forces `life >= 0`, `library_delta >= 0`, `poison <= 0` on
-    // every seat; together those negate every non-`Advantage` branch of `classify_win_kind`. The
+    // `extra_turns` and never keys a poison `counters` entry by `ObjectClass::Player`, while the
+    // sign check just above forces `life >= 0` and `poison <= 0` on every seat; together those
+    // negate every non-`Advantage` branch of `classify_win_kind` but `Decking`. The forcing
+    // function for THAT one is no longer the sign check, which now admits a certified departure
+    // carrying a genuinely negative `library_delta`: it is `without_certified_departure`, which
+    // `build_cert` applies to the delta `win_kind` is classified on, so a certified departure
+    // classifies `Advantage` while an UNCERTIFIED negative library delta never reaches here at
+    // all. The
     // arm is kept anyway so `shortcut_iteration_count` stays the SINGLE authority for that
     // classification, and so this wildcard-free match build-breaks on a future third
     // `IterationCount` variant — the guard `handle_declare_shortcut` states for its own cap. The
@@ -5663,6 +6463,26 @@ fn try_offer_object_growth_shortcut(
         MAX_SHORTCUT_CYCLES,
     );
     Some((certificate, schema))
+}
+
+/// CR 732.2a: which materialization strategy an accepted object-growth collapse selected.
+///
+/// A LOCAL name for a decision `materialize_object_growth_shortcut` makes and consumes in
+/// adjacent expressions. The route is never stored, returned, or read at a distance, so the type
+/// buys nothing at a distance either. What it does buy is the wildcard-free `match` below: the
+/// two registration bodies sit under one exhaustive dispatch, so a future third strategy
+/// build-breaks here rather than silently inheriting `Batched`. Never re-derive a route from a
+/// registration — `LoopCollapseAxis::from_materializations` cannot tell the routes apart at all,
+/// since a `DriveSequence { collapsed_axes: [TokensCreated] }` folds to the same
+/// `LoopCollapseAxis::Tokens` the batched `Tokens(_)` item folds to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopCollapseRoute {
+    /// N x delta batched items (`Tokens` / `Counters` / `Life`). O(1) in N; no per-cycle replay.
+    Batched,
+    /// `DriveSequence` — the captured period replayed through real `apply()` N times. Cubic in N,
+    /// so this arm is where a future iteration budget would attach; there is none today, and the
+    /// published ceiling stays the accepted count.
+    Replay,
 }
 
 /// PR-7 Phase 4d-ii / P7 v3 (CR 732.2a): "materialize" a confirmed UNBOUNDED object-growth
@@ -5696,7 +6516,11 @@ fn materialize_object_growth_shortcut(
     // DISPLAY (hoisted, unconditional — runs for BOTH the observed and unobserved routes so an
     // observed token+X loop keeps its on-battlefield ∞ pile accept→boundary): seed the pile's
     // anchors and register it, capturing the token copiable profile for the batched Tokens stash.
-    let token_profile: Option<crate::types::ability::CopiableValues> =
+    // PAIRED, not two bindings: the per-cycle count `k` travels WITH the profile so
+    // `per_cycle_delta > 1 ⇒ token_profile.is_some()` is enforced by the type rather than by a
+    // reader remembering it. A `k` bound outside this `if let` (defaulted to 1) would compile and
+    // silently disable the route guard below.
+    let token_growth: Option<(crate::types::ability::CopiableValues, u32)> =
         if let Some(period) = current_period_fodder(state) {
             let class = &period.class;
             // CR 732.2a / CR 707.2: capture the fodder's copiable profile NOW, while the recast
@@ -5744,7 +6568,7 @@ fn materialize_object_growth_shortcut(
             let pile =
                 crate::analysis::resource::tapped_fodder_members(state, proposal.proposer, class);
             state.register_unbounded_loop_pile(proposal.proposer, pile);
-            Some(profile)
+            Some((profile, period.per_cycle_count))
         } else {
             None
         };
@@ -5758,7 +6582,7 @@ fn materialize_object_growth_shortcut(
     // bypasses the counter doubler pipeline). Everything else BATCHES. A pure token/mana loop grows
     // no counter/life axis (`growths`/`life` empty) → its only observer surface is token creation,
     // already vetted by the OFFER-time fodder firewall → it always batches even when the board
-    // carries an unrelated life/counter observer (plan §5 Note; the observedness firewall is
+    // carries an unrelated life/counter observer (the observedness firewall is
     // AXIS-SPECIFIC so an incidental board observer never mis-routes a disjoint-axis loop).
     let growths = current_period_counter_growth(state);
     // CR 732.2a / CR 122.1: the ∞ counter DISPLAY targets are the SAME per-object growth the
@@ -5795,8 +6619,51 @@ fn materialize_object_growth_shortcut(
     // `apply_life_gain` from four resolvers, including CR 702.15b lifelink on an ETB damage
     // trigger (the Terror of the Peaks shape), which no effect-shape test can see.
     let life_etb_sourced = !life.is_empty()
-        && token_profile.is_some()
+        && token_growth.is_some()
         && crate::analysis::resource::board_has_functioning_etb_trigger(state);
+    // CR 601.2i + CR 732.2a: a per-cycle side effect the board re-earns from the loop's own CAST
+    // also belongs on the concrete replay. The conjuncts above are AXIS-shaped because the
+    // batched arm PRODUCES the ETB events it must not double-pay; the cast axis has no such
+    // analogue, since the batched collapse never casts anything, so the cast event belongs to the
+    // ELIDED period and the batched arm re-performs it 0x. `token_profile.is_some()` is therefore
+    // UNSOUND as a cast-side narrowing (a counter loop driven by a buyback recast has a cast
+    // trigger and no token profile), the ACTION-SHAPE period-side alternative is unsound too
+    // (`LoopAction` names the DRIVING action, so excluding `Activate` batches a period whose
+    // activated ability casts during resolution), and the `TapLandForMana`-ONLY form is vacuous.
+    //
+    // HOISTED before the move below (`token_growth` is consumed by the `if let` in `batched`),
+    // exactly as `life_etb_sourced` reads it. `u32` is `Copy`, so this is a read, not a clone. 0
+    // when no `Tokens` item exists — never 1, which would read as "one token per cycle" and
+    // switch the route guard off for a stash that does not exist.
+    let token_per_cycle_delta: u32 = token_growth.as_ref().map_or(0, |(_, k)| *k);
+    // SINGLE AUTHORITY for what the batched arm registers: the exact item list this block hands
+    // to `register_pending_materialization`, built ONCE and consumed as a VALUE by both that arm
+    // and the route's `!batched.is_empty()` conjunct — deliberately NOT a predicate mirroring the
+    // arm's per-axis conditions, which is the drift this shape forecloses. A future fourth
+    // batched axis is a fourth push HERE and feeds the route guard for free.
+    let batched: Vec<crate::types::game_state::PersistentAxisMaterialization> = {
+        use crate::types::game_state::{PersistentAxisMaterialization, TokenGrowth};
+        let mut items = Vec::new();
+        if let Some((profile, per_cycle_delta)) = token_growth {
+            items.push(PersistentAxisMaterialization::Tokens(Box::new(
+                TokenGrowth {
+                    profile: Box::new(profile),
+                    per_cycle_delta,
+                },
+            )));
+        }
+        if !growths.is_empty() {
+            items.push(PersistentAxisMaterialization::Counters(growths));
+        }
+        items.extend(life.into_iter().map(|(player, per_cycle_delta)| {
+            PersistentAxisMaterialization::Life {
+                player,
+                per_cycle_delta,
+            }
+        }));
+        items
+    };
+    let cast_sourced = crate::analysis::resource::board_has_functioning_cast_trigger(state);
     // M5: hoisted out of the branch so an empty period can never register NOTHING — a route
     // flipped to the replay falls back to the batched arm instead of silently dropping the whole
     // materialization. (Unreachable today: `growths`/`life` are derived from the same
@@ -5804,39 +6671,118 @@ fn materialize_object_growth_shortcut(
     // predicate is already false there. Kept explicit so a future route conjunct cannot
     // reintroduce the hole.)
     let sequence = state.last_loop_action_sequence.clone();
-    if (counter_observed || life_observed || life_etb_sourced) && !sequence.is_empty() {
-        // CR 732.2a: OBSERVED batchable growth — one DriveSequence collapses the WHOLE loop (all
-        // axes); replaying the captured sequence recreates every per-cycle effect honoring
-        // observers. Do NOT also register batched items (the routes are exclusive per accept).
-        state.register_pending_materialization(
-            proposal.proposer,
-            crate::types::game_state::PersistentAxisMaterialization::DriveSequence {
-                sequence,
-                collapsed_axes: proposal.unbounded.clone(),
-            },
-        );
+    // CR 614.1a + CR 603.6a: the batched `Tokens` mint collapses k·N real creations into ONE
+    // `ProposedEvent::CreateToken` of size k·N and RE-RUNS the replacement pipeline on it
+    // (`token_copy`'s `replace_event` call, keyed by
+    // `replacement::replacement_event_keys_for_event`), so it is faithful only if nothing
+    // re-derives a count from that event or its entries. At k > 1 the multiplicity came from
+    // SOMEWHERE and the batched arm cannot tell a replacement's factor from the period's own
+    // count, so it refuses to guess and replays — otherwise the mint proposes k·N and the doubler
+    // multiplies it again, elision 2k·N against performance k·N. The gate also keeps every
+    // currently-green LoopShortcut row on its route (all are k == 1) and makes an
+    // OPPONENT-controlled doubler a no-op, since doublers match by `token_owner_scope`. k == 1 is
+    // left EXACTLY as shipped, which is NOT a claim that the old path is exact: a rider-only
+    // `CreateToken` replacement changes no count, so it never produces k >= 2 and this conjunct
+    // switches off, yet it fires once per EVENT — a lump mint fires it 1x where N cycles fire it
+    // Nx. The same hole exists for a NON-TOKEN fodder class; both are PRE-EXISTING.
+    let token_growth_needs_replay =
+        token_per_cycle_delta > 1 && crate::analysis::resource::token_growth_is_observed(state);
+    // CR 732.2c: the shortcut is TAKEN, "with all game choices contained in the shortcut
+    // proposal having been taken". A promise the collapse cannot deliver must not be accepted.
+    // An axis whose ∞ mark this collapse ENDS (`DeferredAccrual`) but for which NO batched item
+    // exists can only be delivered by replaying the period — so it routes to the replay
+    // regardless of what else the period grew. Expressed over the two shipped classifiers
+    // rather than over a hard-coded axis, so a future replay-only deferred axis inherits it.
+    let unbatchable_deferred = proposal.unbounded.iter().any(|axis| {
+        axis.unbounded_mark_kind() == crate::analysis::resource::UnboundedMarkKind::DeferredAccrual
+            && crate::types::game_state::LoopCollapseAxis::from_resource_axis(*axis).is_none()
+    });
+    // `!batched.is_empty()` is the SYMMETRY guard for the OTHER four disjuncts, a conjunct of
+    // that sub-disjunction rather than a narrowing bolted onto the cast leg: a replay with
+    // nothing deferred to deliver is
+    // pure cost — UNCAPPED and cubic in N — plus a spurious CR 500.5 collapse prompt for a loop
+    // with nothing to collapse, since the prompt gate
+    // `next_apnap_player_with_pending_materialization` tests STASH PRESENCE only. Pinned by
+    // `loop_shortcut_cast_route::mana_engine_with_cast_trigger_registers_nothing`. Hoisting it is
+    // exactly equivalent to narrowing the cast leg alone, because the other three disjuncts
+    // already imply it, and a future fifth inherits it. Do NOT replace it with
+    // `!accountable.is_empty()`: `growths` / `life` come from `current_period_counter_growth` /
+    // `current_period_life_growth` at accept time, a DIFFERENT derivation from the offer-time
+    // `proposal.unbounded`, and the two can disagree in exactly the direction that would route an
+    // OBSERVED counter loop to the batched arm.
+    //
+    // `unbatchable_deferred` sits OUTSIDE that guard: such an axis routes to Replay whatever
+    // `batched` holds. CR 732.2c advances the game "with all game choices contained in the
+    // shortcut proposal having been taken", so no route may DROP AN AXIS the proposal covered —
+    // which is this comment's subject. It says nothing about how many iterations are delivered:
+    // the drive below commits whole-period prefixes under CR 732.2a, and that is not a partial
+    // delivery in 732.2c's sense. Neither population may take the
+    // O(1) mint and drop the deferred axis — not a period whose only growth is that axis (EMPTY
+    // `batched`), nor one that grows a batchable axis alongside it (NON-EMPTY `batched`: tokens,
+    // counters or life plus a library delta, the shipped mill board). Both therefore pay the
+    // uncapped, cubic-in-N replay at N up to `MAX_SHORTCUT_CYCLES`, which the `Replay` arm's own
+    // doc records as where a future iteration budget attaches. The guard's other cost, a spurious
+    // CR 500.5 prompt, does not arise: such a period genuinely has something to collapse. Pinned
+    // by `wba_loop_firewall_interposition`'s Altar / Altar-free route pair.
+    //
+    // RESIDUAL: with `sequence.is_empty()` a deferred axis cannot be delivered by either route.
+    // This producer never publishes one there, because its own drive produced the sequence.
+    let route = if !sequence.is_empty()
+        && (unbatchable_deferred
+            || (!batched.is_empty()
+                && (counter_observed
+                    || life_observed
+                    || life_etb_sourced
+                    || cast_sourced
+                    || token_growth_needs_replay)))
+    {
+        LoopCollapseRoute::Replay
     } else {
-        // UNOBSERVED fast path — register each grown persistent axis for the batched N×δ collapse.
-        if let Some(profile) = token_profile {
+        LoopCollapseRoute::Batched
+    };
+    // Exhaustive, no wildcard: a future third strategy must build-break here rather than
+    // silently inherit one of these two registrations.
+    match route {
+        LoopCollapseRoute::Replay => {
+            // CR 732.2a: OBSERVED batchable growth — one DriveSequence collapses the loop;
+            // replaying the captured sequence recreates every per-cycle effect honoring
+            // observers. Do NOT also register batched items (the routes are exclusive per
+            // accept). `collapsed_axes` is the set this materialization is ACCOUNTABLE for —
+            // computed per axis, NEVER a wholesale copy of `proposal.unbounded`. The copy
+            // asserted that every ∞-marked axis is one this collapse ends, which is false for a
+            // STANDING capability: an ∞-mana mark whose only authority is CR 500.5 + CR 106.4
+            // (`turns::drain_pending_phase_transition_progress`, which deliberately EXCLUDES
+            // `debug_infinite_mana` seats) would be ended by the collapse. See
+            // `ResourceAxis::unbounded_mark_kind` for the criterion and the per-axis table. The
+            // replay drives the WHOLE period, so it delivers every DEFERRED axis whether or not a
+            // batched item for it exists yet — batchability is owned by
+            // `LoopCollapseAxis::from_resource_axis`, and a subset-of-batchable filter here would
+            // refuse a mill board.
             state.register_pending_materialization(
                 proposal.proposer,
-                crate::types::game_state::PersistentAxisMaterialization::Tokens(Box::new(profile)),
-            );
-        }
-        if !growths.is_empty() {
-            state.register_pending_materialization(
-                proposal.proposer,
-                crate::types::game_state::PersistentAxisMaterialization::Counters(growths),
-            );
-        }
-        for (player, per_cycle_delta) in life {
-            state.register_pending_materialization(
-                proposal.proposer,
-                crate::types::game_state::PersistentAxisMaterialization::Life {
-                    player,
-                    per_cycle_delta,
+                crate::types::game_state::PersistentAxisMaterialization::DriveSequence {
+                    sequence,
+                    collapsed_axes: proposal
+                        .unbounded
+                        .iter()
+                        .copied()
+                        .filter(|axis| {
+                            axis.unbounded_mark_kind()
+                                == crate::analysis::resource::UnboundedMarkKind::DeferredAccrual
+                        })
+                        .collect(),
                 },
             );
+        }
+        LoopCollapseRoute::Batched => {
+            // UNOBSERVED fast path — register each grown persistent axis for the batched N×δ
+            // collapse. The payload was built ONCE above, in the same Tokens → Counters → Life
+            // order the per-axis pushes use; this arm carries no per-axis
+            // condition of its own, so what the route's `!batched.is_empty()` guard measured and
+            // what lands here cannot disagree.
+            for item in batched {
+                state.register_pending_materialization(proposal.proposer, item);
+            }
         }
     }
     state.loop_detect_ring.clear();
@@ -5861,6 +6807,40 @@ fn materialize_object_growth_shortcut(
 /// re-introduction of the removed accept-time drive (commit 6d9344af1), bounded to observed loops
 /// at the boundary; the private `drive_loop_sequence_iteration` / `loop_action_expected_def` /
 /// `RecastAbort` cannot be named from `engine_resolution_choices`, so the drive lives here.
+///
+/// **What the abort implements, beyond the machinery departure above.** CR 732.2a bounds a
+/// proposal to choices "that may be legally taken based on the current game state and the
+/// predictable results of the sequence of choices", forbids "conditional actions, where the
+/// outcome of a game event determines the next action a player takes", and requires the ending
+/// point to "be a place where a player has priority". An interposing player's undetermined choice
+/// is exactly such a point, so the accepted sequence was legal only UP TO it — truncating there is
+/// the rule, not a degradation of it. Each iteration commits whole, so what the drive hands back is
+/// a committed whole-period prefix; the CR 732.2a ending point is the caller's exit, not this
+/// function's.
+///
+/// The delivered prefix is a value in `[0, n]`, and the table already consented to every value in
+/// that range — see the L3 prefix-consent statement at `game::turns`' `PayableResource::LoopCollapse`
+/// prompt, which is the licence and is not restated here. That block is cited for prefix consent
+/// ALONE.
+/// An engine-chosen prefix k is therefore observationally identical to the controller naming k at
+/// that same prompt, which the prompt's `min: 0` explicitly permits. That identity is why the
+/// collapse stays `Committed` rather than becoming conditional: nothing was delivered that a
+/// legal answer at the prompt could not have produced.
+///
+/// Two `waiting_for` shapes survive this function: an untouched `PayAmountChoice` when the drive
+/// aborts on iteration zero, and a `Priority` beat otherwise. NEITHER is the terminal beat. The
+/// caller — the `PayableResource::LoopCollapse` submit arm in `game::engine_resolution_choices` —
+/// re-drains and, once that completes the phase entry, hands BOTH shapes to `turns::auto_advance`:
+/// a `Priority` this function wrote is the CR 117.3a grant with the entered phase's own triggers
+/// still owed, so it is no more terminal than the untouched prompt. So the abort is not observable
+/// as a terminal state, and the CR 732.2a ending point is the turn interpreter's.
+/// `the_delivered_prefix_tracks_the_interposers_depth` pins the `depth = 0` arm.
+///
+/// The abort is only one route to zero delivery. An interposer-free board reaches it when the
+/// controller simply answers `0`, the value the prompt's own `min: 0` advertises and the submit
+/// handler accepts, and the batched route reaches it without entering this function at all — every
+/// one of them ends at that same caller exit. Bounded to opt-in boards: no offer exists unless
+/// `loop_detection` was turned on at match creation, and it defaults `Off`.
 pub(crate) fn drive_persistent_axis_collapse(
     state: &mut GameState,
     seq: &[crate::types::game_state::LoopActionContext],
@@ -5989,11 +6969,15 @@ fn handle_declare_shortcut(
     // once at declare suffices: the board is frozen through Accept (apply_confirmed_shortcut
     // doc), and the drive's per-iteration `resolve` (CR 608.2b) is the runtime backstop.
     //
-    // A CHOICE-FREE offer (empty schema — a non-targeted drain) exposes no decisions to
-    // validate: its win derivation is pin-independent (the E1 measure is the authority), and
-    // any template the caller supplies is inert for the drive (the loop raises no target
-    // prompt). This preserves the established `Fixed(N)` drain behavior (the resolve-firewall
-    // materialize tests drive a synthetic pin against the empty drain schema).
+    // A CHOICE-FREE offer (empty schema — a non-targeted drain) exposes no decision to pin, so
+    // a declaration against it may carry no SLOT-ADDRESSING pin: its win derivation is
+    // pin-independent (the E1 measure is the authority), and a template that pinned a choice
+    // would fix one this offer never stated. That refusal needs no test of its own here —
+    // `declaration_conforms` already rejects a SLOT-ADDRESSING pin naming a slot no published
+    // point matches, whatever the schema's size — and for those kinds it is what keeps a
+    // client-supplied pin out of `proposal.template`, which the drive's per-cycle conformance
+    // check reads. The established `Fixed(N)` drain behavior is untouched: its declaration
+    // carries no pins.
     // ⚠ ORDER IS LOAD-BEARING: the count cap runs BEFORE the pin validation below, because
     // `shortcut_validated_range` derives the validated range FROM the declared count and so
     // must not be handed an unchecked one — a `Fixed(4_000_000_000)` would otherwise become
@@ -6095,11 +7079,10 @@ fn handle_declare_shortcut(
     // compares an attacker-chosen value against itself. `offer.proposer` is engine state,
     // copied from `WaitingFor::LoopShortcut { proposer }`.
     //
-    // PLACEMENT IS LOAD-BEARING: this sits OUTSIDE the `!offer.schema.points.is_empty()`
-    // block below, so it is reached for every declaration regardless of schema emptiness —
-    // an empty-schema offer skips `predictability_gate` / `validate_pins` entirely and would
-    // otherwise reach the proposal with an unvalidated owner. It is the SIXTH sibling of the
-    // five refusal arms and lands on their single authority (`reject_shortcut_declaration`),
+    // Runs on EVERY resolved declaration, whatever the schema published, and it is the SOLE
+    // refuser of a foreign owner: `declaration_conforms` below reads no `owner` at all, so no
+    // arm of the match can catch one. It is the SIXTH sibling of the five refusal arms and
+    // lands on their single authority (`reject_shortcut_declaration`),
     // so no row can observe which refusal fired first — the "sixth reject path added later"
     // that authority's doc anticipates. Defence in depth for the RESTORE ingress (a persisted
     // `WaitingFor::RespondToShortcut` never runs this handler) lives on
@@ -6108,54 +7091,74 @@ fn handle_declare_shortcut(
         reject_shortcut_declaration(state, &mut result);
         return Ok(result);
     }
-    if !offer.schema.points.is_empty() {
-        match &template {
-            Some(t) => {
-                // CR 732.2a: validate over the range the ACCEPTED COUNT will drive, not
-                // over the schedule's own period. `shortcut_drive_period` answers a
-                // different question (how many cycles one measurement must aggregate), and
-                // using it here both ACCEPTED a pin whose driven image leaves the published
-                // set at an index the count reaches, and REFUSED conforming declarations
-                // whose count is shorter than the schedule.
-                let validated_range = shortcut_validated_range(&count, Some(t));
-                // Coverage + value legality via the shared authority, so the predicate this
-                // handler ACCEPTS under is the same one `build_bounded_declaration` PUBLISHES
-                // under and the human ingress EMITS under. The range is this site's own.
-                if !crate::analysis::decision_template::declaration_conforms(
-                    offer.schema,
-                    t,
-                    validated_range,
-                    state,
-                ) {
-                    reject_shortcut_declaration(state, &mut result);
-                    return Ok(result);
-                }
-            }
-            // CR 732.2a: a `template: None` declaration against a NON-EMPTY schema skips the
-            // validation above entirely — the pins the offer published are never checked. That
-            // is legitimate for exactly one drive shape: the object-growth route, which
-            // re-derives its template from `state.last_loop_action_sequence` (the same routing
-            // discriminant `materialize` dispatches on) and never reads `proposal.template`.
-            // With nothing this proposer can re-derive from, a pin-consuming drive would run with
-            // no pins at all — fail closed into the same manual-play handback the validation
-            // failure above uses. Both conjuncts are required: keying on `template.is_none()`
-            // alone breaks the shipped object-growth declarations.
-            //
-            // SITE F (CR 732.2a) — THE STRICTEST LOCKSTEP CONSTRAINT ON SITE B, because it is the
-            // one direction in which relaxing (1b) would make the engine LESS safe than before.
-            // "Re-derivable" means the period is THIS offer's proposer's own — the same test
-            // `materialize` dispatches on. A merely non-empty test would let a FOREIGN period take
-            // the sibling `None => {}` arm, which performs ZERO pin validation, and open the APNAP
-            // window on a client-supplied declaration against a schema with published points. So
-            // this arm must reject unless the period is the proposer's, not merely unless one
-            // exists. `None` from a heterogeneous run also rejects, which is the fail-closed
-            // direction: nothing can be re-derived from a period that is nobody's.
-            None if state.loop_period_controller() != Some(offer.proposer) => {
+    // CR 732.2a: a declaration cannot pin choices the offer published none of. Every
+    // `Some(t)` meets `declaration_conforms` whatever the schema published — its
+    // `PinValidation::UnexposedSlot` arm is that refusal for every SLOT-ADDRESSING pin, so a
+    // points-empty offer needs no second predicate for those.
+    //
+    // SLOT-ADDRESSING is this path's term throughout, in `pin_slot`'s own sense: a pin that
+    // CARRIES an explicit `DecisionSlot` (`Targets` / `Mode` / `MayChoice` / `UnlessBreak` /
+    // `ManaColor` / `ConvokeTaps`) and is therefore looked up against `schema.points`.
+    // `pin_slot` synthesizes no slot for `Order`, so the term is exact rather than approximate.
+    //
+    // CLOSED FOR `PinnedDecision::Order`, ON EVERY SCHEMA SIZE. `pin_slot` returns `None` for
+    // an ordering pin, so it covers no published point — coverage is kind-aware via
+    // `pin_answers_point` — and `validate_pins` refuses it outright as `NotALoopDecision`
+    // (CR 603.3b: trigger ordering is a different decision kind from the CR 732.2a
+    // per-iteration choices a loop declaration answers). `PinnedDecision` derives
+    // `Deserialize` and rides `GameAction::DeclareShortcut` verbatim, so that refusal is what
+    // stands between the wire and `proposal.template`.
+    //
+    // Only the `None` arm's re-derivation test is conditioned on the schema having points: an
+    // offer publishing none exposes nothing to re-derive.
+    match &template {
+        Some(t) => {
+            // CR 732.2a: validate over the range the ACCEPTED COUNT will drive, not
+            // over the schedule's own period. `shortcut_drive_period` answers a
+            // different question (how many cycles one measurement must aggregate), and
+            // using it here both ACCEPTED a pin whose driven image leaves the published
+            // set at an index the count reaches, and REFUSED conforming declarations
+            // whose count is shorter than the schedule.
+            let validated_range = shortcut_validated_range(&count, Some(t));
+            // Coverage + value legality via the shared authority, so the predicate this
+            // handler ACCEPTS under is the same one `build_bounded_declaration` PUBLISHES
+            // under and the human ingress EMITS under. The range is this site's own.
+            if !crate::analysis::decision_template::declaration_conforms(
+                offer.schema,
+                t,
+                validated_range,
+                state,
+            ) {
                 reject_shortcut_declaration(state, &mut result);
                 return Ok(result);
             }
-            None => {}
         }
+        // CR 732.2a: a `template: None` declaration against a NON-EMPTY schema skips the
+        // validation above entirely — the pins the offer published are never checked. That
+        // is legitimate for exactly one drive shape: the object-growth route, which
+        // re-derives its template from `state.last_loop_action_sequence` (the same routing
+        // discriminant `materialize` dispatches on) and never reads `proposal.template`.
+        // With nothing this proposer can re-derive from, a pin-consuming drive would run with
+        // no pins at all — fail closed into the same manual-play handback the validation
+        // failure above uses. Every conjunct is required: keying on `template.is_none()`
+        // alone breaks the shipped object-growth declarations.
+        //
+        // SITE F (CR 732.2a) — THE STRICTEST LOCKSTEP CONSTRAINT ON SITE B, because it is the
+        // one direction in which relaxing (1b) would make the engine LESS safe than before.
+        // "Re-derivable" means the period is THIS offer's proposer's own — the same test
+        // `materialize` dispatches on. A merely non-empty test would let a FOREIGN period take
+        // the sibling `None => {}` arm, which performs ZERO pin validation, and open the APNAP
+        // window on a client-supplied declaration against a schema with published points. So
+        // this arm must reject unless the period is the proposer's, not merely unless one
+        // exists. `None` from a heterogeneous run also rejects, which is the fail-closed
+        // direction: nothing can be re-derived from a period that is nobody's.
+        None if !offer.schema.points.is_empty()
+            && state.loop_period_controller() != Some(offer.proposer) =>
+        {
+            reject_shortcut_declaration(state, &mut result);
+            return Ok(result);
+        }
+        None => {}
     }
     let proposal = crate::analysis::loop_check::ShortcutProposal {
         proposer: offer.proposer,
@@ -6533,8 +7536,10 @@ pub(crate) fn drain_pending_cost_move_resume(
         // opponent's Solemnity would prevent the counters) must still complete the
         // parked activation instead of wedging, so `LoyaltyActivation` is eligible
         // at the Prevented boundary as well. Counter-addition unless payments
-        // are eligible here too: a prevented counter placement fails the cost
-        // (CR 118.3) and must resolve the pending unless branch, not wedge.
+        // are eligible here too: whether a prevented placement leaves that
+        // payment paid or failed is `resume_counter_addition_unless_payment`'s
+        // call, argued in its own header; either way the pending unless branch
+        // must resolve here, not wedge.
         CostMoveDrainBoundary::ReplacementPrevented { .. } => matches!(
             state.pending_cost_move_resume,
             Some(
@@ -6626,11 +7631,7 @@ pub(crate) fn drain_pending_cost_move_resume(
         state.pending_cost_move_resume,
         Some(PendingCostMoveResume::CounterAdditionUnlessPayment { .. })
     ) {
-        engine_payment_choices::resume_counter_addition_unless_payment(
-            state,
-            events,
-            matches!(boundary, CostMoveDrainBoundary::ReplacementDelivered { .. }),
-        )?
+        engine_payment_choices::resume_counter_addition_unless_payment(state, events, boundary)?
     } else if matches!(
         state.pending_cost_move_resume,
         Some(PendingCostMoveResume::RandomDiscardUnlessPayment(..))
@@ -6713,6 +7714,16 @@ pub(super) fn resume_pending_continuation_if_priority(
                 events,
                 CostMoveDrainBoundary::PriorityBoundary,
             )?;
+        }
+        // CR 117.3a: LAST, once every continuation above has drained back to an ordinary
+        // priority boundary. A phase entry that completed while a paused prompt owned the beat
+        // still owes the entered phase's turn-based actions and its beginning-of-phase
+        // abilities; `turns::resume_deferred_step_triggers` is the single authority that pays
+        // that debt, and it is inert unless one is recorded.
+        if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+            if let Some(resumed) = turns::resume_deferred_step_triggers(state, events) {
+                state.waiting_for = resumed;
+            }
         }
     }
     settle_resolving_stack_entry_after_continuation_resume(state);
@@ -6970,9 +7981,11 @@ pub(super) fn resume_delve_mana_payment(state: &mut GameState) -> WaitingFor {
 enum AutoPassDecision {
     /// No active auto-pass — leave the loop and let the frontend take over.
     Exit,
-    /// Auto-pass completed or was interrupted (opponent action, phase stop,
-    /// stack terminator). Clear the flag and exit.
+    /// Auto-pass completed at a terminal stop. Clear the flag and exit.
     Finish,
+    /// Pause this auto-pass run without clearing the session. The next normal
+    /// action boundary will re-enter the loop and re-evaluate the same mode.
+    Break,
     /// Continue passing priority for this iteration.
     Pass,
 }
@@ -6987,11 +8000,31 @@ enum AutoPassDecision {
 /// interrupt logic is boundary-agnostic — both `EndOfCurrentTurn` and
 /// `MyNextTurnStart` behave identically within a priority window.
 fn priority_auto_pass_decision(state: &GameState, player: PlayerId) -> AutoPassDecision {
+    // CR 117.1 + CR 723.5: Full Control is the player's standing refusal to have
+    // any window taken from them, and it outranks every auto-pass session —
+    // including one another player installed, which is what reaches this loop
+    // without ever consulting the frontend. Checked BEFORE the no-session `Exit`
+    // arm because `Exit` itself falls through to a pass when someone else holds
+    // a live `UntilStackEmpty` session. Preference ownership follows the
+    // authorized submitter, as it does in `auto_pass_recommended`.
+    if state.priority_passing_mode(turn_control::authorized_submitter_for_player(state, player))
+        == PriorityPassingMode::FullControl
+    {
+        // `Finish` also drops a stale session this player owns; both variants
+        // break the loop, so either way the window is theirs.
+        return if state.auto_pass.contains_key(&player) {
+            AutoPassDecision::Finish
+        } else {
+            AutoPassDecision::Break
+        };
+    }
     let Some(mode) = state.auto_pass.get(&player) else {
         return AutoPassDecision::Exit;
     };
     match mode {
-        AutoPassMode::UntilStackEmpty { initial_stack_len } => {
+        AutoPassMode::UntilStackEmpty {
+            initial_stack_len, ..
+        } => {
             if state.stack.is_empty() || state.stack.len() > *initial_stack_len {
                 AutoPassDecision::Finish
             } else {
@@ -7006,7 +8039,9 @@ fn priority_auto_pass_decision(state: &GameState, player: PlayerId) -> AutoPassD
             let opponent_on_stack = state.stack.last().is_some_and(|top| {
                 top.controller != player && !state.is_priority_yielded(player, top)
             });
-            if opponent_on_stack || state.phase_stop_hit(player) {
+            if opponent_on_stack {
+                AutoPassDecision::Break
+            } else if state.phase_stop_hit(player) {
                 AutoPassDecision::Finish
             } else {
                 AutoPassDecision::Pass
@@ -7017,8 +8052,8 @@ fn priority_auto_pass_decision(state: &GameState, player: PlayerId) -> AutoPassD
 
 /// True when `player` has an active turn-boundary auto-pass session (either
 /// boundary). Both `EndOfCurrentTurn` and `MyNextTurnStart` drive the
-/// DeclareAttackers/DeclareBlockers empty auto-submit arms, since both
-/// auto-submit empty attackers within the current turn.
+/// DeclareAttackers empty auto-submit arm, since both pre-commit that player
+/// to declaring no attackers within the current turn.
 fn end_of_turn_active(state: &GameState, player: PlayerId) -> bool {
     matches!(
         state.auto_pass.get(&player),
@@ -7026,14 +8061,22 @@ fn end_of_turn_active(state: &GameState, player: PlayerId) -> bool {
     )
 }
 
+struct PriorityPassPipelineOutcome {
+    waiting_for: WaitingFor,
+    consumed_stack_entries: u32,
+}
+
 fn pass_priority_once_with_pipeline(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
     stack_resolution_limit: Option<u32>,
-) -> Result<WaitingFor, EngineError> {
+) -> Result<PriorityPassPipelineOutcome, EngineError> {
     if let WaitingFor::Priority { player } = &state.waiting_for {
         if super::precast_copy_shortcut::blocks_pass(state, *player) {
-            return Ok(state.waiting_for.clone());
+            return Ok(PriorityPassPipelineOutcome {
+                waiting_for: state.waiting_for.clone(),
+                consumed_stack_entries: 0,
+            });
         }
     }
     state.cancelled_casts.clear();
@@ -7043,7 +8086,7 @@ fn pass_priority_once_with_pipeline(
     state.pending_activations.clear();
 
     let stack_was_empty = state.stack.is_empty();
-    // PR-3 (Option C) Defect-1: capture the pre-pipeline stack frame for the §2
+    // PR-3 (Option C) Defect-1: capture the pre-pipeline stack frame for the
     // loop-shortcut window maintenance below. `stack_top_before` is the resolving
     // entry's id; a real resolution this beat replaces the top with a different id
     // (every refilled trigger gets a fresh monotonic ObjectId), whereas a bare
@@ -7055,13 +8098,13 @@ fn pass_priority_once_with_pipeline(
     // submitter (the controller), which would mis-count consecutive passes and
     // soft-lock the game.
     let current_seat = turn_control::priority_seat(state);
-    let wf = priority::handle_priority_pass_with_limit(
+    let priority_outcome = priority::handle_priority_pass_with_limit(
         current_seat,
         state,
         events,
         stack_resolution_limit,
     );
-    sync_waiting_for(state, &wf);
+    sync_waiting_for(state, &priority_outcome.waiting_for);
 
     // CR 608.2 + CR 117.4: Drain any pending continuation queued during the
     // priority pass (e.g. effects that chain a sub-resolution after the parent
@@ -7151,7 +8194,10 @@ fn pass_priority_once_with_pipeline(
     // No else-branch: a bare handoff or an empty-stack pass-to-advance-phase does NOT
     // touch the ring (leave-intact), so accumulation survives the inter-resolution beats.
 
-    Ok(wf)
+    Ok(PriorityPassPipelineOutcome {
+        waiting_for: wf,
+        consumed_stack_entries: priority_outcome.consumed_stack_entries,
+    })
 }
 
 fn active_until_stack_empty_requester(state: &GameState) -> Option<PlayerId> {
@@ -7202,12 +8248,21 @@ fn no_living_player_has_meaningful_priority_action(state: &GameState) -> bool {
 }
 
 fn finish_completed_or_interrupted_until_stack_empty_sessions(state: &mut GameState) -> bool {
+    let session_representatives = state
+        .stack_resolution_session
+        .as_ref()
+        .map(|session| &session.representatives);
     let finished: Vec<PlayerId> = state
         .auto_pass
         .iter()
         .filter_map(|(player, mode)| match mode {
-            AutoPassMode::UntilStackEmpty { initial_stack_len }
-                if state.stack.is_empty() || state.stack.len() > *initial_stack_len =>
+            AutoPassMode::UntilStackEmpty {
+                initial_stack_len, ..
+            } if !session_representatives.is_some_and(|representatives| {
+                representatives.contains(&super::topology::priority_pass_representative(
+                    state, *player,
+                ))
+            }) && (state.stack.is_empty() || state.stack.len() > *initial_stack_len) =>
             {
                 Some(*player)
             }
@@ -7220,6 +8275,219 @@ fn finish_completed_or_interrupted_until_stack_empty_sessions(state: &mut GameSt
     }
 
     !finished.is_empty()
+}
+
+/// Restores the exact sparse auto-pass map that existed before a stack
+/// resolution session installed its representative overlay.
+///
+/// This intentionally does not touch priority bookkeeping or `WaitingFor`:
+/// a cancelled or invalidated authorization leaves the current ordinary
+/// priority window in place (CR 117.3d / CR 117.4).
+pub(crate) fn take_and_restore_stack_resolution_session(state: &mut GameState) -> bool {
+    let Some(session) = state.stack_resolution_session.take() else {
+        return false;
+    };
+    state.auto_pass = session.auto_pass_overlay.baseline.into_iter().collect();
+    true
+}
+
+/// Drives an already-authorized restored stack-resolution session through the
+/// same ordinary auto-pass runner used at a player-action boundary.
+///
+/// Restore itself deliberately does not call this: deserialization must remain
+/// a pure state reconstruction. The explicit restore-resume entry point
+/// validates the saved authorization before selecting this lifecycle seam.
+pub(crate) fn resume_stack_resolution_session_runner(state: &mut GameState) -> ActionResult {
+    let boundary_snapshot = state.clone();
+    let journal_start = state.resolved_rules_journal.entries().len();
+    let mut result = ActionResult {
+        events: Vec::new(),
+        waiting_for: state.waiting_for.clone(),
+        log_entries: Vec::new(),
+    };
+
+    reconcile_terminal_result(state, &mut result);
+    bump_state_revision(state);
+    sync_waiting_for(state, &result.waiting_for);
+    run_auto_pass_loop(state, &mut result);
+    reconcile_terminal_result(state, &mut result);
+    if matches!(result.waiting_for, WaitingFor::GameOver { .. }) {
+        take_and_restore_stack_resolution_session(state);
+    }
+    super::mana_payment::refill_infinite_mana(state);
+    remember_public_reveals(state, &result.events, journal_start);
+    mark_public_state_from_events(state, &result.events);
+    finalize_rules_state(state);
+    result.waiting_for = state.waiting_for.clone();
+    finalize_display_state(state);
+    result.log_entries = super::log::resolve_log_entries(&result.events, &boundary_snapshot, state);
+    interaction::ensure_interaction_authority(state);
+    #[cfg(debug_assertions)]
+    debug_assert_runtime_resolution_invariants(state);
+    result
+}
+
+#[derive(Clone, Copy)]
+enum StackResolutionSessionPassKind {
+    /// The session runner is considering an implicit pass. A rechecking AI
+    /// session may reuse only a representative who already supplied a verified
+    /// pass within this fenced stack cohort.
+    Automatic,
+    /// A player explicitly submitted `PassPriority`. That choice is itself the
+    /// fresh decision, so it may consume the session's next authorized entry.
+    Explicit,
+}
+
+enum StackResolutionSessionPriorityDecision {
+    NotActive,
+    Pause,
+    /// A rechecking AI session is waiting on an unverified representative.
+    /// Keep it intact so that representative's explicit decision can continue
+    /// its fenced cohort.
+    PauseRetained,
+    Resolve {
+        limit: u32,
+    },
+}
+
+fn stack_resolution_session_priority_decision(
+    state: &mut GameState,
+    holder: PlayerId,
+    pass_kind: StackResolutionSessionPassKind,
+) -> StackResolutionSessionPriorityDecision {
+    let canonical_holder = super::topology::priority_pass_representative(state, holder);
+    let decision = {
+        let Some(session) = state.stack_resolution_session.as_ref() else {
+            return StackResolutionSessionPriorityDecision::NotActive;
+        };
+        // CR 117.1: a Full Control holder is never auto-passed by a session —
+        // theirs or anyone else's. Scoped to `Automatic`: an EXPLICIT
+        // PassPriority is that player's own deliberate decision and still drives
+        // the session. This is the only gate covering a session REPRESENTATIVE,
+        // whose windows are otherwise passed without even the meaningful-action
+        // check below. (The no-session case is handled one layer out, by
+        // `priority_auto_pass_decision`.)
+        if matches!(pass_kind, StackResolutionSessionPassKind::Automatic)
+            && state
+                .priority_passing_mode(turn_control::authorized_submitter_for_player(state, holder))
+                == PriorityPassingMode::FullControl
+        {
+            return StackResolutionSessionPriorityDecision::Pause;
+        }
+
+        let current_representatives = super::topology::canonical_priority_representatives(
+            state,
+            session.representatives.iter().copied(),
+        );
+        let live_representatives = super::topology::priority_pass_participants(state)
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        if current_representatives != session.representatives
+            || !session
+                .representatives
+                .iter()
+                .all(|representative| live_representatives.contains(representative))
+            || session.cursor == session.entries.len()
+            || state.stack.is_empty()
+        {
+            None
+        } else {
+            let remaining_budget = match session.budget.max_resolutions() {
+                Some(maximum) => {
+                    maximum.saturating_sub(session.cursor.try_into().unwrap_or(u32::MAX))
+                }
+                None => u32::MAX,
+            };
+            let top_matches = session
+                .entries
+                .get(session.cursor)
+                .is_some_and(|top_fence| {
+                    state
+                        .stack
+                        .back()
+                        .is_some_and(|entry| top_fence.matches_captured_entry(entry))
+                });
+            if remaining_budget == 0 || !top_matches {
+                None
+            } else {
+                let rechecks =
+                    session.policy == StackResolutionPolicy::RecheckNoMeaningfulPriorityAction;
+                let holder_is_representative = session.representatives.contains(&canonical_holder);
+                if matches!(pass_kind, StackResolutionSessionPassKind::Automatic) {
+                    if rechecks {
+                        return if holder_is_representative
+                            && session
+                                .verified_pass_representatives
+                                .contains(&canonical_holder)
+                        {
+                            StackResolutionSessionPriorityDecision::Resolve { limit: 1 }
+                        } else {
+                            StackResolutionSessionPriorityDecision::PauseRetained
+                        };
+                    }
+                    if !holder_is_representative && priority_player_has_meaningful_action(state) {
+                        return StackResolutionSessionPriorityDecision::Pause;
+                    }
+                }
+                let matching_prefix = state
+                    .stack
+                    .iter()
+                    .rev()
+                    .zip(session.entries.iter().skip(session.cursor))
+                    .take_while(|(entry, fence)| fence.matches_captured_entry(entry))
+                    .count();
+                let limit = matching_prefix
+                    .min(remaining_budget as usize)
+                    .min(u32::MAX as usize) as u32;
+                // A verified representative may reuse its own pass only
+                // inside this exact fenced session. Each all-pass boundary
+                // still resolves one entry so a changed stack topology tears
+                // the session down before a pass can escape its cohort.
+                let limit =
+                    if session.policy == StackResolutionPolicy::RecheckNoMeaningfulPriorityAction {
+                        limit.min(1)
+                    } else {
+                        limit
+                    };
+                (limit != 0).then_some(limit)
+            }
+        }
+    };
+
+    match decision {
+        Some(limit) => StackResolutionSessionPriorityDecision::Resolve { limit },
+        None => {
+            take_and_restore_stack_resolution_session(state);
+            StackResolutionSessionPriorityDecision::Pause
+        }
+    }
+}
+
+fn advance_stack_resolution_session_after_priority_pass(
+    state: &mut GameState,
+    consumed_stack_entries: u32,
+    waiting_for: &WaitingFor,
+) -> bool {
+    let should_restore = {
+        let Some(session) = state.stack_resolution_session.as_mut() else {
+            return false;
+        };
+        let consumed_stack_entries = usize::try_from(consumed_stack_entries)
+            .expect("a stack resolver count fits the engine's native index size");
+        session.cursor = session.cursor.saturating_add(consumed_stack_entries);
+        let budget_exhausted = session
+            .budget
+            .max_resolutions()
+            .is_some_and(|maximum| session.cursor >= maximum as usize);
+        !matches!(waiting_for, WaitingFor::Priority { .. })
+            || session.cursor == session.entries.len()
+            || budget_exhausted
+            || state.stack.is_empty()
+    };
+    if should_restore {
+        take_and_restore_stack_resolution_session(state);
+    }
+    should_restore
 }
 
 // CR 732.2a SAFETY LIMIT: a shortcut is "a loop that repeats a specified number of times";
@@ -7305,37 +8573,57 @@ fn run_auto_pass_loop(state: &mut GameState, result: &mut ActionResult) -> bool 
                 if super::precast_copy_shortcut::blocks_pass(state, player) {
                     break;
                 }
-                let decision = priority_auto_pass_decision(state, player);
-                match decision {
-                    AutoPassDecision::Exit => {
-                        let Some(requester) = active_until_stack_empty_requester(state) else {
-                            break;
-                        };
-                        if requester == player {
-                            break;
+                let stack_resolution_limit = match stack_resolution_session_priority_decision(
+                    state,
+                    player,
+                    StackResolutionSessionPassKind::Automatic,
+                ) {
+                    StackResolutionSessionPriorityDecision::Resolve { limit } => Some(limit),
+                    StackResolutionSessionPriorityDecision::Pause => break,
+                    StackResolutionSessionPriorityDecision::PauseRetained => break,
+                    StackResolutionSessionPriorityDecision::NotActive => {
+                        let decision = priority_auto_pass_decision(state, player);
+                        match decision {
+                            AutoPassDecision::Exit => {
+                                let Some(requester) = active_until_stack_empty_requester(state)
+                                else {
+                                    break;
+                                };
+                                if requester == player {
+                                    break;
+                                }
+                                if finish_completed_or_interrupted_until_stack_empty_sessions(state)
+                                {
+                                    break;
+                                }
+                                if priority_player_has_meaningful_action(state) {
+                                    break;
+                                }
+                            }
+                            AutoPassDecision::Finish => {
+                                state.auto_pass.remove(&player);
+                                break;
+                            }
+                            AutoPassDecision::Break => break,
+                            AutoPassDecision::Pass => {}
                         }
-                        if finish_completed_or_interrupted_until_stack_empty_sessions(state) {
-                            break;
-                        }
-                        if priority_player_has_meaningful_action(state) {
-                            break;
-                        }
+                        None
                     }
-                    AutoPassDecision::Finish => {
-                        state.auto_pass.remove(&player);
-                        break;
-                    }
-                    AutoPassDecision::Pass => {}
-                }
+                };
 
                 let mut events = Vec::new();
-                match pass_priority_once_with_pipeline(state, &mut events, None) {
-                    Ok(wf) => {
+                match pass_priority_once_with_pipeline(state, &mut events, stack_resolution_limit) {
+                    Ok(outcome) => {
                         advanced = true;
                         let stack_empty_or_grew =
                             finish_completed_or_interrupted_until_stack_empty_sessions(state);
+                        let session_finished = advance_stack_resolution_session_after_priority_pass(
+                            state,
+                            outcome.consumed_stack_entries,
+                            &outcome.waiting_for,
+                        );
                         result.events.extend(events);
-                        result.waiting_for = wf;
+                        result.waiting_for = outcome.waiting_for;
                         // CR 732.2: a mandatory cascade growing the board or
                         // event stream past the resource ceiling cannot settle —
                         // halt gracefully rather than exhaust WASM memory.
@@ -7380,17 +8668,17 @@ fn run_auto_pass_loop(state: &mut GameState, result: &mut ActionResult) -> bool 
 
                             // PR-3 (Option C): the NET-PROGRESS mandatory-loop WIN
                             // shortcut is NOT duplicated here. `run_auto_pass_loop`
-                            // resolves via `pass_priority_once_with_pipeline` (:1339),
-                            // whose §2 maintenance accumulates the persisted
+                            // resolves via `pass_priority_once_with_pipeline`, whose
+                            // window maintenance accumulates the persisted
                             // `loop_detect_ring` across these internal iterations, but
-                            // `reconcile_terminal_result` (the §3 win site) is NOT called
-                            // inside this loop — only at :200 AFTER it returns. So the §3
+                            // `reconcile_terminal_result` (the win site) is NOT called
+                            // inside this loop, only after it returns. So the win
                             // shortcut does NOT accelerate this auto-pass grind: this loop
                             // runs its own net-progress drive to the natural CR 704.5a
                             // death (or the strict CR 104.4b DRAW block above) on its own.
                             // The accelerated path is the per-beat repeated
                             // `apply(PassPriority)` drive (the production frontend
-                            // default), where §3 runs after every beat. Keeping a second
+                            // default), where it runs after every beat. Keeping a second
                             // win site here would create two divergent detectors.
 
                             // CR 104.4b: a sliding window of the most recent
@@ -7409,7 +8697,7 @@ fn run_auto_pass_loop(state: &mut GameState, result: &mut ActionResult) -> bool 
                             loop_window.push_back((fingerprint, normalized));
                         }
 
-                        if stack_empty_or_grew {
+                        if stack_empty_or_grew || session_finished {
                             break;
                         }
                     }
@@ -7449,11 +8737,12 @@ fn run_auto_pass_loop(state: &mut GameState, result: &mut ActionResult) -> bool 
                 }
             }
 
-            // Auto-submit empty blockers only when there's nothing to choose.
-            // CR 509.1 says the turn-based action still runs when no legal blocks
-            // are available, and CR 117.1c requires the active player to receive
-            // priority during the step (instants and Ninjutsu-family activations
-            // per CR 702.49 — notably Sneak, which is restricted to this step).
+            // Auto-submit empty blockers only when there is no blocking choice:
+            // no legal blocker exists, or every attacker has left the battlefield.
+            // Unlike declaring attackers, a turn-boundary preference does not
+            // pre-commit the defender to declining optional blocks.
+            // CR 509.1 performs the defender's declaration, and CR 509.2 then
+            // gives the active player priority after that declaration completes.
             // A phase stop on Declare Blockers overrides this even without an
             // auto-pass session: if the player explicitly asked to pause here,
             // honor it.
@@ -7482,6 +8771,41 @@ fn run_auto_pass_loop(state: &mut GameState, result: &mut ActionResult) -> bool 
         }
     }
     advanced
+}
+
+/// CR 117.3d + CR 117.4: continues a live auto-pass preference after Resolve
+/// All has discharged its one-run consent. Resolve All is not an ordinary
+/// action boundary, so it owns the aggregation while this seam owns the normal
+/// priority progression.
+pub(crate) fn resume_auto_pass_after_resolve_all(
+    state: &mut GameState,
+    batch: &mut super::engine_resolve_batch::ResolveAllFastForwardResult,
+) {
+    let before = state.clone();
+    let mut result = ActionResult {
+        events: Vec::new(),
+        waiting_for: state.waiting_for.clone(),
+        log_entries: Vec::new(),
+    };
+    // CR 704.3: mirror the ordinary action-boundary reconciliation on both
+    // sides of the internal auto-pass drive. The resume seam bypasses
+    // `finish_action_boundary`, so without this a loss created by its final
+    // resolution could remain at Priority instead of becoming GameOver.
+    reconcile_terminal_result(state, &mut result);
+    run_auto_pass_loop(state, &mut result);
+    reconcile_terminal_result(state, &mut result);
+
+    let log_entries = super::log::resolve_log_entries(&result.events, &before, state);
+    batch.items_resolved = batch.items_resolved.saturating_add(
+        result
+            .events
+            .iter()
+            .filter(|event| matches!(event, GameEvent::StackResolved { .. }))
+            .count() as u32,
+    );
+    batch.events.extend(result.events);
+    batch.log_entries.extend(log_entries);
+    batch.waiting_for = state.waiting_for.clone();
 }
 
 /// CR 732.2: settle a runaway mandatory cascade gracefully. Pauses resolution,
@@ -7597,10 +8921,34 @@ fn begin_resolve_all_consent(
     state: &mut GameState,
     priority_player: PlayerId,
     max_resolutions: u32,
+    scope: ResolveAllScope,
 ) -> Result<WaitingFor, EngineError> {
+    match state
+        .stack_resolution_session
+        .as_ref()
+        .map(|session| session.policy)
+    {
+        // An AI-issued recheck is an internal, provisional shortcut. An
+        // explicit Resolve All proposal is the priority holder's replacement
+        // shortcut, so restore the saved preferences before installing the
+        // requester's own session below.
+        Some(StackResolutionPolicy::RecheckNoMeaningfulPriorityAction) => {
+            take_and_restore_stack_resolution_session(state);
+        }
+        Some(StackResolutionPolicy::Committed) => {
+            return Err(EngineError::ActionNotAllowed(
+                "Resolve All cannot replace an active stack-resolution session".to_string(),
+            ));
+        }
+        None => {}
+    }
     super::priority::pass_priority_legality(state, priority_player)?;
     let current_representative =
         super::topology::priority_pass_representative(state, priority_player);
+    // CR 117.3d: `Own` binds the requester alone (no consent to ask,
+    // so nobody can block it); `Shared` opens the table-wide compression
+    // proposal, rotated so the requester is first and self-granted. See
+    // `ResolveAllScope`.
     let mut representatives = super::topology::priority_pass_participants(state);
     let Some(current_index) = representatives
         .iter()
@@ -7610,7 +8958,10 @@ fn begin_resolve_all_consent(
             "Resolve All requires a live priority representative".to_string(),
         ));
     };
-    representatives.rotate_left(current_index);
+    match scope {
+        ResolveAllScope::Own => representatives = vec![current_representative],
+        ResolveAllScope::Shared => representatives.rotate_left(current_index),
+    }
 
     let epoch = state.next_resolve_all_consent_epoch;
     let next_epoch = epoch.checked_add(1).ok_or_else(|| {
@@ -7622,7 +8973,8 @@ fn begin_resolve_all_consent(
     // or revoked before its authorized one-entry materialization begins.
     state.resolve_all_consent_run = Some(ResolveAllConsentRun {
         epoch,
-        max_resolutions,
+        max_resolutions: StackResolutionBudget::from_legacy_max_resolutions(max_resolutions),
+        scope,
         priority_snapshot: ResolveAllPrioritySnapshot {
             waiting_player: priority_player,
             priority_player: state.priority_player,
@@ -7640,7 +8992,25 @@ fn begin_resolve_all_consent(
                 granted: representative == current_representative,
             })
             .collect(),
+        auto_pass_baseline: Some(
+            state
+                .auto_pass
+                .iter()
+                .map(|(&player, &mode)| (player, mode))
+                .collect(),
+        ),
     });
+
+    // An `Own` run is single-participant and self-granted, so it materializes on
+    // the spot and never raises a consent prompt. A `Shared` run queues the
+    // remaining representatives for the table-wide compression proposal.
+    if state
+        .resolve_all_consent_run
+        .as_ref()
+        .is_some_and(|run| run.participants.len() == 1)
+    {
+        return materialize_live_resolve_all_session(state, None);
+    }
 
     resolve_all_consent_waiting_for(state).ok_or_else(|| {
         EngineError::ActionNotAllowed(
@@ -7651,14 +9021,16 @@ fn begin_resolve_all_consent(
 
 fn resolve_all_consent_waiting_for(state: &GameState) -> Option<WaitingFor> {
     let run = state.resolve_all_consent_run.as_ref()?;
-    Some(
-        run.next_pending_representative()
-            .map(|representative| WaitingFor::ResolveAllConsent {
-                epoch: run.epoch,
-                representative,
-            })
-            .unwrap_or(WaitingFor::ResolveAllReady { epoch: run.epoch }),
-    )
+    run.next_pending_representative()
+        .map(|representative| WaitingFor::ResolveAllConsent {
+            epoch: run.epoch,
+            representative,
+        })
+        .or_else(|| {
+            run.auto_pass_baseline
+                .is_none()
+                .then_some(WaitingFor::ResolveAllReady { epoch: run.epoch })
+        })
 }
 
 // CR 117.3d + CR 117.4: A declined optimized batch restores the exact
@@ -7668,6 +9040,9 @@ fn restore_resolve_all_priority_snapshot(state: &mut GameState) -> Result<Waitin
     let run = state.resolve_all_consent_run.take().ok_or_else(|| {
         EngineError::InvalidAction("Resolve All consent is not active".to_string())
     })?;
+    if let Some(baseline) = run.auto_pass_baseline {
+        state.auto_pass = baseline.into_iter().collect();
+    }
     let snapshot = run.priority_snapshot;
     state.priority_player = snapshot.priority_player;
     state.priority_pass_count = snapshot.priority_pass_count;
@@ -7677,12 +9052,115 @@ fn restore_resolve_all_priority_snapshot(state: &mut GameState) -> Result<Waitin
     })
 }
 
+/// Installs the single fenced stack-resolution session used by committed human
+/// Resolve All, direct UntilStackEmpty, and a verified AI pass. The caller owns
+/// authorization and supplies the exact sparse preference map to restore when
+/// the bounded cohort ends.
+pub(crate) fn install_stack_resolution_session(
+    state: &mut GameState,
+    representatives: BTreeSet<PlayerId>,
+    budget: StackResolutionBudget,
+    policy: StackResolutionPolicy,
+    baseline: BTreeMap<PlayerId, AutoPassMode>,
+) {
+    let overlay_mode = AutoPassMode::UntilStackEmpty {
+        initial_stack_len: state.stack.len(),
+        policy,
+    };
+    for representative in &representatives {
+        state.auto_pass.insert(*representative, overlay_mode);
+    }
+    state.stack_resolution_session = Some(StackResolutionSession {
+        entries: state
+            .stack
+            .iter()
+            .rev()
+            .map(StackResolutionEntryFence::capture)
+            .collect(),
+        cursor: 0,
+        representatives,
+        verified_pass_representatives: BTreeSet::new(),
+        budget,
+        policy,
+        auto_pass_overlay: StackResolutionAutoPassOverlay { baseline },
+    });
+}
+
+/// Converts a newly-created unanimous Resolve All authorization into the
+/// ordinary shared stack-resolution session. Legacy persisted consent runs
+/// intentionally do not take this path; their `ResolveAllReady` latch remains
+/// readable until its migration phase.
+///
+/// CR 117.3d + CR 117.4: the session resumes at the exact normal Priority
+/// checkpoint and lets the ordinary priority-pass pipeline resolve each entry.
+/// CR 400.7: the captured fence compares entry-local provenance, never a live
+/// source object that may have left and returned.
+fn materialize_live_resolve_all_session(
+    state: &mut GameState,
+    expected_grant_epoch: Option<u64>,
+) -> Result<WaitingFor, EngineError> {
+    let Some(run) = state.resolve_all_consent_run.as_ref() else {
+        return Err(EngineError::InvalidAction(
+            "Resolve All consent is not active".to_string(),
+        ));
+    };
+    let origin_matches = match expected_grant_epoch {
+        Some(epoch) => {
+            matches!(
+                state.waiting_for,
+                WaitingFor::ResolveAllConsent { epoch: active, .. } if active == epoch
+            ) && run.epoch == epoch
+        }
+        None => {
+            matches!(state.waiting_for, WaitingFor::Priority { .. }) && run.participants.len() == 1
+        }
+    };
+    let coherent = origin_matches
+        && run.auto_pass_baseline.is_some()
+        && run
+            .participants
+            .iter()
+            .all(|participant| participant.granted)
+        && state.stack_resolution_session.is_none()
+        && !state.stack.is_empty()
+        && state.priority_player == run.priority_snapshot.priority_player
+        && state.priority_pass_count == run.priority_snapshot.priority_pass_count
+        && state.priority_passes == run.priority_snapshot.priority_passes
+        && turn_control::resolve_all_consent_authority_matches_live(state, run);
+    if !coherent {
+        turn_control::rebase_invalid_resolve_all_consent(state);
+        return Ok(state.waiting_for.clone());
+    }
+
+    let run = state
+        .resolve_all_consent_run
+        .take()
+        .expect("coherent Resolve All consent run remains present");
+    let baseline = run
+        .auto_pass_baseline
+        .expect("a live Resolve All session requires a captured baseline");
+    let representatives = run
+        .participants
+        .iter()
+        .map(|participant| participant.representative)
+        .collect();
+    install_stack_resolution_session(
+        state,
+        representatives,
+        run.max_resolutions,
+        StackResolutionPolicy::Committed,
+        baseline,
+    );
+    Ok(WaitingFor::Priority {
+        player: run.priority_snapshot.waiting_player,
+    })
+}
+
 /// Installs one player's requested auto-pass mode and, when that player holds
 /// the current Priority window, consumes it through the ordinary pipeline.
 ///
-/// `SetAutoPass` and a declined Resolve All consent share this exact reducer
-/// path: both preserve the current stack baseline and must obey the same
-/// shortened-precast-pass restriction.
+/// Direct `SetAutoPass` owns its own live session producer. Resolve All uses
+/// the same session type after its separate unanimous-consent handshake.
 fn install_auto_pass_and_pass_priority(
     state: &mut GameState,
     auto_pass_owner: PlayerId,
@@ -7692,14 +9170,15 @@ fn install_auto_pass_and_pass_priority(
     let WaitingFor::Priority { player } = &state.waiting_for else {
         unreachable!("auto-pass may only be installed from a Priority window");
     };
-    let pass_immediately = *player == auto_pass_owner;
-    if pass_immediately && super::precast_copy_shortcut::blocks_pass(state, *player) {
+    let player = *player;
+    let pass_immediately = player == auto_pass_owner;
+    if pass_immediately && super::precast_copy_shortcut::blocks_pass(state, player) {
         return Err(EngineError::ActionNotAllowed(
             "A shortened pre-cast shortcut requires a different meaningful action before passing"
                 .to_string(),
         ));
     }
-    store_auto_pass_request(state, auto_pass_owner, mode);
+    store_direct_auto_pass_request(state, auto_pass_owner, mode);
     if !pass_immediately {
         return Ok(ActionResult {
             events: std::mem::take(events),
@@ -7707,15 +9186,53 @@ fn install_auto_pass_and_pass_priority(
             log_entries: vec![],
         });
     }
-    let waiting_for = pass_priority_once_with_pipeline(state, events, None)?;
+    pass_installed_auto_pass_priority(state, player, events)
+}
+
+/// Consume the immediate pass implied by a successful direct auto-pass request.
+///
+/// This is deliberately the same pre-pass authorization boundary used by the
+/// auto-pass runner. In particular, the first pass can be the final CR 117.4
+/// pass, so it must not bypass a frozen cohort merely because it happens
+/// synchronously with installation.
+fn pass_installed_auto_pass_priority(
+    state: &mut GameState,
+    player: PlayerId,
+    events: &mut Vec<GameEvent>,
+) -> Result<ActionResult, EngineError> {
+    let stack_resolution_limit = match stack_resolution_session_priority_decision(
+        state,
+        player,
+        StackResolutionSessionPassKind::Explicit,
+    ) {
+        StackResolutionSessionPriorityDecision::Resolve { limit } => Some(limit),
+        // A stale session is torn down by the decision seam. The explicit
+        // pass still means what its submitter chose, so continue through the
+        // ordinary CR 117.3d path after that restoration.
+        StackResolutionSessionPriorityDecision::Pause => None,
+        StackResolutionSessionPriorityDecision::PauseRetained => {
+            return Ok(ActionResult {
+                events: std::mem::take(events),
+                waiting_for: state.waiting_for.clone(),
+                log_entries: vec![],
+            });
+        }
+        StackResolutionSessionPriorityDecision::NotActive => None,
+    };
+    let outcome = pass_priority_once_with_pipeline(state, events, stack_resolution_limit)?;
+    advance_stack_resolution_session_after_priority_pass(
+        state,
+        outcome.consumed_stack_entries,
+        &outcome.waiting_for,
+    );
     Ok(ActionResult {
         events: std::mem::take(events),
-        waiting_for,
+        waiting_for: outcome.waiting_for,
         log_entries: vec![],
     })
 }
 
-fn store_auto_pass_request(
+fn store_legacy_auto_pass_request(
     state: &mut GameState,
     auto_pass_owner: PlayerId,
     mode: AutoPassRequest,
@@ -7723,25 +9240,88 @@ fn store_auto_pass_request(
     let stored_mode = match mode {
         AutoPassRequest::UntilStackEmpty => AutoPassMode::UntilStackEmpty {
             initial_stack_len: state.stack.len(),
+            policy: StackResolutionPolicy::Committed,
         },
         AutoPassRequest::UntilTurnBoundary { until } => AutoPassMode::UntilTurnBoundary { until },
     };
     state.auto_pass.insert(auto_pass_owner, stored_mode);
 }
 
-/// Stores Resolve All's durable "do not make me pass each frame" intent in
-/// the same engine-owned `UntilStackEmpty` flow as a direct priority request.
-pub(crate) fn install_until_stack_empty_auto_pass_and_pass_priority(
+/// Applies a cancellation to both the live map and a pending fresh Resolve All
+/// baseline. The baseline is the source restored by either consent rollback,
+/// so omitting this mirror would resurrect a preference the player withdrew
+/// while another representative was considering the authorization.
+fn cancel_pending_resolve_all_auto_pass(state: &mut GameState, actor: PlayerId) -> bool {
+    let representative = super::topology::priority_pass_representative(state, actor);
+    let Some(run) = state.resolve_all_consent_run.as_mut() else {
+        return false;
+    };
+    let Some(baseline) = run.auto_pass_baseline.as_mut() else {
+        return false;
+    };
+    state.auto_pass.remove(&representative);
+    baseline.remove(&representative);
+    true
+}
+
+fn store_direct_auto_pass_request(
     state: &mut GameState,
     auto_pass_owner: PlayerId,
-    events: &mut Vec<GameEvent>,
-) -> Result<ActionResult, EngineError> {
-    install_auto_pass_and_pass_priority(
+    mode: AutoPassRequest,
+) {
+    let representative = super::topology::priority_pass_representative(state, auto_pass_owner);
+    if let Some(representatives) = state
+        .stack_resolution_session
+        .as_ref()
+        .map(|session| session.representatives.clone())
+    {
+        if representatives.contains(&representative) {
+            take_and_restore_stack_resolution_session(state);
+        } else {
+            // A different priority seat may update only its own standing
+            // preference; it cannot replace another seat's frozen cohort. The
+            // same preference becomes part of the teardown baseline so a later
+            // session stop never erases a valid intervening player choice.
+            store_legacy_auto_pass_request(state, representative, mode);
+            let updated_mode = *state
+                .auto_pass
+                .get(&representative)
+                .expect("the legacy request was just stored");
+            state
+                .stack_resolution_session
+                .as_mut()
+                .expect("the nonrepresentative path preserves the live session")
+                .auto_pass_overlay
+                .baseline
+                .insert(representative, updated_mode);
+            return;
+        }
+    }
+
+    if !matches!(mode, AutoPassRequest::UntilStackEmpty) || state.stack.is_empty() {
+        store_legacy_auto_pass_request(state, representative, mode);
+        return;
+    }
+
+    let representatives =
+        super::topology::canonical_priority_representatives(state, [auto_pass_owner]);
+    if representatives.is_empty() {
+        store_legacy_auto_pass_request(state, representative, mode);
+        return;
+    }
+
+    let baseline: BTreeMap<PlayerId, AutoPassMode> = state
+        .auto_pass
+        .iter()
+        .map(|(&player, &auto_pass)| (player, auto_pass))
+        .collect();
+    install_stack_resolution_session(
         state,
-        auto_pass_owner,
-        AutoPassRequest::UntilStackEmpty,
-        events,
-    )
+        representatives,
+        StackResolutionBudget::Unlimited,
+        StackResolutionPolicy::Committed,
+        baseline,
+    );
 }
 
 /// Retains Resolve All's durable no-manual-priority preference when a rules
@@ -7751,33 +9331,7 @@ pub(crate) fn install_until_stack_empty_auto_pass(
     state: &mut GameState,
     auto_pass_owner: PlayerId,
 ) {
-    store_auto_pass_request(state, auto_pass_owner, AutoPassRequest::UntilStackEmpty);
-}
-
-/// CR 117.3d + CR 117.4: Declining the optimized Resolve All batch preserves
-/// the requester's intent by switching to the ordinary engine auto-pass flow.
-fn decline_resolve_all_consent_with_auto_pass(
-    state: &mut GameState,
-    epoch: u64,
-    representative: PlayerId,
-    response_epoch: u64,
-    events: &mut Vec<GameEvent>,
-) -> Result<ActionResult, EngineError> {
-    let waiting_for = respond_resolve_all_consent(
-        state,
-        epoch,
-        representative,
-        response_epoch,
-        ResolveAllConsentDecision::Decline,
-    )?;
-    let WaitingFor::Priority { player } = waiting_for else {
-        unreachable!("declined Resolve All consent must restore Priority");
-    };
-    // `pass_priority_once_with_pipeline` derives the semantic priority seat
-    // from this state. Install the captured Priority window before reusing the
-    // normal SetAutoPass path, rather than passing from the consent prompt.
-    state.waiting_for = WaitingFor::Priority { player };
-    install_until_stack_empty_auto_pass_and_pass_priority(state, player, events)
+    store_legacy_auto_pass_request(state, auto_pass_owner, AutoPassRequest::UntilStackEmpty);
 }
 
 fn respond_resolve_all_consent(
@@ -7792,11 +9346,11 @@ fn respond_resolve_all_consent(
             "Resolve All consent epoch is stale".to_string(),
         ));
     }
-    {
+    let legacy_grant = {
         let run = state.resolve_all_consent_run.as_mut().ok_or_else(|| {
             EngineError::InvalidAction("Resolve All consent is not active".to_string())
         })?;
-        if run.epoch != epoch || run.next_pending_representative() != Some(representative) {
+        if !run.accepts_response_from(epoch, representative) {
             return Err(EngineError::InvalidAction(
                 "Resolve All consent response is no longer pending".to_string(),
             ));
@@ -7808,26 +9362,29 @@ fn respond_resolve_all_consent(
                 .find(|participant| participant.representative == representative)
                 .expect("pending Resolve All representative must be a participant");
             participant.granted = true;
+            run.auto_pass_baseline.is_none()
+        } else {
+            false
         }
+    };
+    // A missing baseline identifies the persisted pre-session protocol. Its
+    // Ready reader requires an empty live map, so retain its historical
+    // per-grant removal while fresh `Some` runs preserve their transaction
+    // baseline until the session materializes or rolls back.
+    if legacy_grant {
+        state.auto_pass.remove(&representative);
     }
     if matches!(decision, ResolveAllConsentDecision::Decline) {
         return restore_resolve_all_priority_snapshot(state);
     }
+    if state.resolve_all_consent_run.as_ref().is_some_and(|run| {
+        run.auto_pass_baseline.is_some() && run.next_pending_representative().is_none()
+    }) {
+        return materialize_live_resolve_all_session(state, Some(epoch));
+    }
     let waiting_for = resolve_all_consent_waiting_for(state).ok_or_else(|| {
         EngineError::InvalidAction("Resolve All consent is not active".to_string())
     })?;
-    // ResolveAllReady has no current actor, so the ordinary waiting-state sync
-    // deliberately leaves `priority_player` alone. Restore the saved priority
-    // cursor now; the Ready consumer validates this exact snapshot before it
-    // begins its first materialized CR 117.4 pass cycle.
-    if matches!(waiting_for, WaitingFor::ResolveAllReady { .. }) {
-        state.priority_player = state
-            .resolve_all_consent_run
-            .as_ref()
-            .expect("an active consent run produced ResolveAllReady")
-            .priority_snapshot
-            .priority_player;
-    }
     Ok(waiting_for)
 }
 
@@ -7871,6 +9428,14 @@ fn apply_action(
             | WaitingFor::SeparatePilesChooseOpponent { .. }
             | WaitingFor::SeparatePilesPartition { .. }
             | WaitingFor::SeparatePilesChoice { .. }
+            // CR 702.60a + CR 701.20a: Ripple's revealed top-of-library cards
+            // stay in the library and remain public while the controller works
+            // through the same-named free-cast offers and the bottom-order step.
+            | WaitingFor::CastOffer {
+                kind: crate::types::game_state::CastOfferKind::Ripple { .. },
+                ..
+            }
+            | WaitingFor::RippleBottomOrder { .. }
     ) {
         state.revealed_cards.clear();
     }
@@ -7918,7 +9483,27 @@ fn apply_action(
     // `authorized_submitter(state)`, which silently cancelled the wrong player's
     // session when fired while an opponent held the prompt.
     if matches!(action, GameAction::CancelAutoPass) {
-        state.auto_pass.remove(&actor);
+        let representative = super::topology::priority_pass_representative(state, actor);
+        if state
+            .stack_resolution_session
+            .as_ref()
+            .is_some_and(|session| session.representatives.contains(&representative))
+        {
+            take_and_restore_stack_resolution_session(state);
+        } else if cancel_pending_resolve_all_auto_pass(state, actor) {
+            // A fresh consent run owns a complete rollback baseline. The helper
+            // changes both representations atomically; legacy runs intentionally
+            // retain their pre-session cancellation behavior below.
+        } else {
+            state.auto_pass.remove(&actor);
+            if let Some(session) = state.stack_resolution_session.as_mut() {
+                // A nonrepresentative preference can be merged into the
+                // pre-overlay baseline while a session is live. Cancelling it
+                // must remove the same saved key, or later teardown would
+                // resurrect a preference the player explicitly withdrew.
+                session.auto_pass_overlay.baseline.remove(&actor);
+            }
+        }
         return Ok(ActionResult {
             events: vec![],
             waiting_for: state.waiting_for.clone(),
@@ -7996,12 +9581,9 @@ fn apply_action(
     // player can only mutate their own preferences regardless of the payload.
     if let GameAction::SetMayTriggerAutoChoice { op } = &action {
         match op {
-            MayTriggerAutoChoiceOp::Remove { key } => {
-                let actor_key = MayTriggerAutoChoiceKey {
-                    player: actor,
-                    ..key.clone()
-                };
-                state.remove_may_trigger_auto_choice(&actor_key);
+            MayTriggerAutoChoiceOp::Remove { selector } => {
+                let actor_selector = selector.for_player(actor);
+                state.remove_may_trigger_auto_choice_selector(&actor_selector);
             }
             MayTriggerAutoChoiceOp::ClearAll => {
                 state.clear_may_trigger_auto_choices(actor);
@@ -8050,11 +9632,7 @@ fn apply_action(
         let player = &mut state.players[actor.0 as usize];
 
         if order.len() != player.hand.len() {
-            return Err(EngineError::InvalidAction(format!(
-                "ReorderHand: expected {} ids, got {}",
-                player.hand.len(),
-                order.len()
-            )));
+            return Err(EngineError::StaleAction);
         }
 
         // Permutation check: same multiset. Sort copies and compare — O(n log n)
@@ -8066,9 +9644,7 @@ fn apply_action(
         current.sort_unstable_by_key(|id| id.0);
         requested.sort_unstable_by_key(|id| id.0);
         if current != requested {
-            return Err(EngineError::InvalidAction(
-                "ReorderHand: order is not a permutation of the current hand".into(),
-            ));
+            return Err(EngineError::StaleAction);
         }
 
         player.hand = order.iter().copied().collect();
@@ -8228,9 +9804,25 @@ fn apply_action(
     let action_for_divergence = action.clone();
 
     // Any deliberate player action (not auto-pass-related or a simple pass) cancels their auto-pass.
-    // CR 103.5: Use the authenticated `actor` directly so the simultaneous mulligan
-    // variants (where `authorized_submitter` is None when multiple players are pending)
-    // still clear per-actor side-effect state correctly.
+    // CR 723.1: A Priority-window action belongs to the semantic priority
+    // seat, not necessarily to its authenticated submitter. In
+    // particular, a turn controller can act for P0; tearing down P2's
+    // representative instead would leave P0's frozen cohort live and let the
+    // boundary runner resolve an entry after P0 deliberately acted. Outside a
+    // Priority window retain the authenticated actor: simultaneous mulligan
+    // variants have no single semantic priority seat.
+    // CR 117.6 + CR 805.5b: Canonicalize that seat before consulting a
+    // session, because a shared team's representative owns its priority pass.
+    let session_preference_owner = match (&state.waiting_for, &action) {
+        // CR 104.3a: Concede is the one self-authorized action that may be
+        // submitted while another player holds priority, so it remains scoped
+        // to its authenticated actor rather than that other priority seat.
+        (_, GameAction::Concede { .. }) => actor,
+        (WaitingFor::Priority { player }, _) => {
+            super::topology::priority_pass_representative(state, *player)
+        }
+        _ => actor,
+    };
     match &action {
         GameAction::SetAutoPass { .. }
         | GameAction::PassPriority
@@ -8239,7 +9831,30 @@ fn apply_action(
         | GameAction::RespondResolveAllConsent { .. }
         | GameAction::RevokeResolveAllConsent { .. } => {}
         _ => {
-            state.auto_pass.remove(&actor);
+            if state
+                .stack_resolution_session
+                .as_ref()
+                .is_some_and(|session| session.representatives.contains(&session_preference_owner))
+            {
+                // A representative's deliberate action revokes the frozen
+                // authorization before this action reaches its reducer. Restore
+                // the pre-session preferences first, then remove this action's
+                // standing preference below; otherwise the boundary runner could
+                // consume the cohort after an off-stack action, or teardown could
+                // resurrect the preference the representative just cancelled.
+                take_and_restore_stack_resolution_session(state);
+            } else if let Some(session) = state.stack_resolution_session.as_mut() {
+                if !session.representatives.contains(&session_preference_owner) {
+                    // A deliberate action revokes this nonrepresentative's standing
+                    // preference. Keep the deferred restore baseline in lockstep so
+                    // a later session teardown cannot resurrect the revoked mode.
+                    session
+                        .auto_pass_overlay
+                        .baseline
+                        .remove(&session_preference_owner);
+                }
+            }
+            state.auto_pass.remove(&session_preference_owner);
         }
     }
 
@@ -8272,16 +9887,36 @@ fn apply_action(
             // AI candidate-legality hatch and the projection fast path so the
             // three cannot drift.
             super::priority::pass_priority_legality(state, *player)?;
-            let wf = pass_priority_once_with_pipeline(state, &mut events, stack_resolution_limit)?;
-            return Ok(ActionResult {
-                events,
-                waiting_for: wf,
-                log_entries: vec![],
-            });
+            // An explicit pass can be the final CR 117.4 pass. Route it
+            // through the same fenced session seam as an installed auto-pass,
+            // so its resolved-entry count advances the persisted cursor rather
+            // than silently bypassing a live stack-resolution authorization.
+            if stack_resolution_limit.is_some() {
+                let outcome = pass_priority_once_with_pipeline(
+                    state,
+                    &mut events,
+                    stack_resolution_limit,
+                )?;
+                advance_stack_resolution_session_after_priority_pass(
+                    state,
+                    outcome.consumed_stack_entries,
+                    &outcome.waiting_for,
+                );
+                return Ok(ActionResult {
+                    events,
+                    waiting_for: outcome.waiting_for,
+                    log_entries: vec![],
+                });
+            }
+            return pass_installed_auto_pass_priority(state, *player, &mut events);
         }
-        (WaitingFor::Priority { player }, GameAction::BeginResolveAll { max_resolutions }) => {
-            begin_resolve_all_consent(state, *player, max_resolutions)?
-        }
+        (
+            WaitingFor::Priority { player },
+            GameAction::BeginResolveAll {
+                max_resolutions,
+                scope,
+            },
+        ) => begin_resolve_all_consent(state, *player, max_resolutions, scope)?,
         (
             WaitingFor::ResolveAllConsent {
                 epoch,
@@ -8292,13 +9927,13 @@ fn apply_action(
                 decision: ResolveAllConsentDecision::Decline,
             },
         ) => {
-            return decline_resolve_all_consent_with_auto_pass(
+            respond_resolve_all_consent(
                 state,
                 *epoch,
                 *representative,
                 response_epoch,
-                &mut events,
-            );
+                ResolveAllConsentDecision::Decline,
+            )?
         }
         (
             WaitingFor::ResolveAllConsent {
@@ -8651,28 +10286,22 @@ fn apply_action(
             }
             if let Some(obj) = state.objects.get_mut(object_id) {
                 if back_face {
-                    // Swap to back face using existing primitives
-                    let back = obj.back_face.take().expect("dual-faced card has back face");
-                    let front_snapshot = super::printed_cards::snapshot_object_face(obj);
-                    super::printed_cards::apply_back_face_to_object(obj, back);
-                    obj.back_face = Some(front_snapshot);
+                    // Swap to back face — the shared swap preserves the stored
+                    // slot's layout_kind (#7565).
+                    super::printed_cards::swap_object_faces(obj);
                     // CR 712.8a (MDFC) / CR 709.3 (split): non-front face showing;
                     // `apply_zone_exit_cleanup` reverts when leaving the stack.
                     obj.modal_back_face = true;
-                } else {
-                    // Front face chosen — clear layout_kind so the intercept
-                    // won't re-fire on re-entry into handle_play_land / handle_cast_spell.
-                    if let Some(ref mut bf) = obj.back_face {
-                        bf.layout_kind = None;
-                    }
                 }
-                // After choosing either face, clear layout on the stashed other
-                // half so cast/play re-entry does not re-prompt.
-                if back_face {
-                    if let Some(ref mut bf) = obj.back_face {
-                        bf.layout_kind = None;
-                    }
-                }
+                // CR 601.2b (#7565): remember that THIS cast's face choice is
+                // made so the handle_play_land / handle_cast_spell re-entry
+                // does not re-prompt. A transient flag, NOT
+                // `back_face.layout_kind = None`: that erasure was permanent,
+                // so a recast from hand (Rescue, bounce) silently auto-picked
+                // the front face and every other layout_kind consumer went
+                // blind. Cleared on any zone change off the stack and on
+                // cancel.
+                obj.cast_face_committed = true;
             }
             // CR 712.12 / CR 712.11b: Route the re-entry by the now-active face's
             // type. A land face is put onto the battlefield via the play-land
@@ -9308,13 +10937,14 @@ fn apply_action(
                         &mut events,
                     )?
                 }
-                PayCostKind::TapCreatures { aggregate } => {
+                PayCostKind::TapCreatures { mode } => {
                     engine_casting::handle_tap_creatures_for_spell_cost(
                         state,
                         *player,
                         *pending_cast.clone(),
+                        *min_count,
                         *count,
-                        *aggregate,
+                        *mode,
                         choices,
                         &chosen,
                         &mut events,
@@ -9342,12 +10972,14 @@ fn apply_action(
             CostResume::ManaAbility {
                 mana_ability: pending_mana_ability,
             } => match kind {
-                // CR 605.1a: mana-ability tap costs are always fixed-count; the
-                // aggregate form never resumes a mana ability.
-                PayCostKind::TapCreatures { .. } => {
+                // CR 605.1a: the aggregate form never resumes a mana ability;
+                // fixed-count and X-sentinel forms both do.
+                PayCostKind::TapCreatures { mode } => {
                     let wf = engine_casting::handle_tap_creatures_for_mana_ability(
                         state,
+                        *min_count,
                         *count,
+                        *mode,
                         choices,
                         pending_mana_ability,
                         &chosen,
@@ -9437,11 +11069,21 @@ fn apply_action(
                 }
             },
             CostResume::Resolution => match kind {
-                PayCostKind::TapCreatures { aggregate } => {
+                PayCostKind::Sacrifice => {
+                    casting_costs::handle_resolution_optional_sacrifice_for_cost(
+                        state,
+                        *player,
+                        choices,
+                        &chosen,
+                        &mut events,
+                    )?
+                }
+                PayCostKind::TapCreatures { mode } => {
                     casting_costs::pay_tap_creatures_selection(
                         state,
+                        *min_count,
                         *count,
-                        *aggregate,
+                        *mode,
                         choices,
                         &chosen,
                         &mut events,
@@ -9455,7 +11097,6 @@ fn apply_action(
                 }
                 PayCostKind::Discard
                 | PayCostKind::Reveal
-                | PayCostKind::Sacrifice
                 | PayCostKind::ReturnToHand
                 | PayCostKind::ExileFromZone { .. }
                 | PayCostKind::ExilePermanent { .. }
@@ -9827,11 +11468,12 @@ fn apply_action(
         }
         (
             waiting_for @ WaitingFor::OptionalEffectChoice { .. },
-            GameAction::DecideOptionalEffectAndRemember { choice },
-        ) => engine_payment_choices::handle_optional_effect_choice_and_remember(
+            GameAction::DecideOptionalEffectAndRemember { choice, scope },
+        ) => engine_payment_choices::handle_optional_effect_choice_and_remember_with_scope(
             state,
             waiting_for.clone(),
             choice,
+            scope,
             &mut events,
         )?,
         // CR 608.2d: Opponent decided on "any opponent may" effect.
@@ -10853,11 +12495,47 @@ fn apply_action(
             engine_combat::handle_declare_attackers(state, *player, &attacks, &bands, &mut events)?
         }
         (
+            WaitingFor::DeclareAttackers { player, .. },
+            GameAction::SetAutoPass {
+                mode: AutoPassRequest::UntilTurnBoundary { until },
+            },
+        ) => {
+            store_direct_auto_pass_request(
+                state,
+                *player,
+                AutoPassRequest::UntilTurnBoundary { until },
+            );
+            state.waiting_for.clone()
+        }
+        (WaitingFor::DeclareAttackers { .. }, GameAction::SetAutoPass { .. }) => {
+            return Err(EngineError::ActionNotAllowed(
+                "UntilStackEmpty auto-pass is unavailable while declaring attackers".to_string(),
+            ));
+        }
+        (
             WaitingFor::DeclareBlockers { player, .. },
             GameAction::DeclareBlockers { assignments },
         ) => {
             triggers_processed_inline = true;
             engine_combat::handle_declare_blockers(state, *player, &assignments, &mut events)?
+        }
+        (
+            WaitingFor::DeclareBlockers { player, .. },
+            GameAction::SetAutoPass {
+                mode: AutoPassRequest::UntilTurnBoundary { until },
+            },
+        ) => {
+            store_direct_auto_pass_request(
+                state,
+                *player,
+                AutoPassRequest::UntilTurnBoundary { until },
+            );
+            state.waiting_for.clone()
+        }
+        (WaitingFor::DeclareBlockers { .. }, GameAction::SetAutoPass { .. }) => {
+            return Err(EngineError::ActionNotAllowed(
+                "UntilStackEmpty auto-pass is unavailable while declaring blockers".to_string(),
+            ));
         }
         (
             WaitingFor::UntapChoice {
@@ -11029,7 +12707,13 @@ fn apply_action(
             }
         }
         (WaitingFor::ReplacementChoice { .. }, GameAction::ChooseReplacement { index }) => {
-            engine_replacement::handle_replacement_choice(state, index, &mut events)?
+            if let Some(waiting_for) =
+                casting_costs::abandon_stale_resolution_sacrifice_cursor(state, &mut events)
+            {
+                waiting_for
+            } else {
+                engine_replacement::handle_replacement_choice(state, index, &mut events)?
+            }
         }
         (
             WaitingFor::EntryControllerChoice { .. },
@@ -12085,6 +13769,8 @@ fn apply_action(
             WaitingFor::ChooseObjectsSelection {
                 player,
                 eligible,
+                min,
+                max,
                 trigger_event,
             },
             GameAction::SelectTargets { targets },
@@ -12092,21 +13778,39 @@ fn apply_action(
             let p = *player;
             let eligible_set = eligible.clone();
             let pending_event = trigger_event.clone();
-            // Validate all selected targets are in the eligible set.
+            let selected_count = targets.len();
+            if selected_count < *min as usize
+                || max.is_some_and(|maximum| selected_count > maximum as usize)
+            {
+                return Err(EngineError::InvalidAction(format!(
+                    "Object selection must choose at least {min}{} distinct objects, got {selected_count}",
+                    max.map_or(String::new(), |maximum| format!(" and at most {maximum}"))
+                )));
+            }
+            // Validate all selected targets are distinct objects in the eligible set.
+            let mut selected_objects = HashSet::with_capacity(selected_count);
             for t in &targets {
                 if !eligible_set.contains(t) {
                     return Err(EngineError::InvalidAction(
                         "Selected target not eligible for object selection".to_string(),
                     ));
                 }
+                let TargetRef::Object(id) = t else {
+                    return Err(EngineError::InvalidAction(
+                        "Object selection accepts battlefield objects only".to_string(),
+                    ));
+                };
+                if !selected_objects.insert(*id) {
+                    return Err(EngineError::InvalidAction(
+                        "Duplicate object in object selection".to_string(),
+                    ));
+                }
             }
-            // Map TargetRef → ObjectId. The eligible set is all battlefield
-            // permanents, so every selected target is an Object.
             let ids: Vec<ObjectId> = targets
                 .iter()
-                .filter_map(|t| match t {
-                    TargetRef::Object(id) => Some(*id),
-                    TargetRef::Player(_) => None,
+                .map(|target| match target {
+                    TargetRef::Object(id) => *id,
+                    TargetRef::Player(_) => unreachable!("validated as objects above"),
                 })
                 .collect();
             // CR 603.7: Always allocate a fresh tracked set — a player-chosen
@@ -12529,8 +14233,9 @@ fn apply_action(
                 stack_entry_index,
                 scope,
                 current_targets,
+                slots,
+                slot_pools,
                 legal_new_targets,
-                ..
             },
             GameAction::RetargetSpell { new_targets },
         ) => apply_retarget(
@@ -12541,6 +14246,8 @@ fn apply_action(
                 stack_entry_index: *stack_entry_index,
                 scope,
                 current_targets,
+                slots,
+                slot_pools,
                 legal_new_targets,
                 new_targets,
             },
@@ -12556,8 +14263,9 @@ fn apply_action(
                 stack_entry_index,
                 scope: RetargetScope::Single,
                 current_targets,
+                slots,
+                slot_pools,
                 legal_new_targets,
-                ..
             },
             GameAction::ChooseTarget { target: Some(t) },
         ) => apply_retarget(
@@ -12568,6 +14276,8 @@ fn apply_action(
                 stack_entry_index: *stack_entry_index,
                 scope: &RetargetScope::Single,
                 current_targets,
+                slots,
+                slot_pools,
                 legal_new_targets,
                 new_targets: vec![t],
             },
@@ -12680,8 +14390,8 @@ fn apply_action(
         // ONE CONSEQUENCE OF USING THE SYNCHRONIZER RATHER THAN A RAW CLONE:
         // `normalize_legacy_attach_waiting_for` can now edit `state.waiting_for` on this
         // path, so it may differ from the returned `ActionResult.waiting_for`, where the raw
-        // clone made the two exactly equal. Benign — the boundary re-normalizes at `:1171`
-        // and copies back at `:1189`, and `inject_pinned_answer` fails closed on every prompt
+        // clone made the two exactly equal. Benign — the boundary re-normalizes and copies
+        // back, and `inject_pinned_answer` fails closed on every prompt
         // kind it has no pin producer for.
         sync_waiting_for(state, &wf);
         if answering_forced_window
@@ -12808,6 +14518,8 @@ struct RetargetSubmission<'a> {
     stack_entry_index: usize,
     scope: &'a RetargetScope,
     current_targets: &'a [TargetRef],
+    slots: &'a [RetargetSlotAddress],
+    slot_pools: &'a [Vec<TargetRef>],
     legal_new_targets: &'a [TargetRef],
     new_targets: Vec<TargetRef>,
 }
@@ -12826,9 +14538,91 @@ fn apply_retarget(
         stack_entry_index,
         scope,
         current_targets,
+        slots,
+        slot_pools,
         legal_new_targets,
         new_targets,
     } = submission;
+
+    // CR 115.7d + CR 601.2c: derived here (rather than only after the match
+    // below) because H3's outer-empty re-derivation needs it before
+    // `pool_for` is built. The address space the player was OFFERED must be
+    // the one their submission is validated, admitted and written against;
+    // the payload snapshots it, `chain_retarget_slots` re-derives it.
+    let derived = state
+        .stack
+        .get(stack_entry_index)
+        .and_then(|entry| entry.ability())
+        .map(crate::game::ability_utils::chain_retarget_slots)
+        .unwrap_or_default();
+
+    // CR 115.7d, INVARIANT SC + N16 (phase-rs/phase#8355 round-8 review
+    // finding H3): an OUTER-empty `slot_pools` means a `#[serde(default)]`
+    // payload predating the field (or version-skewed). Falling back to the
+    // flat `legal_new_targets` UNION for every position — as `retarget_slot_
+    // violation` alone would — restores BASE's write but not BASE's per-slot
+    // validation: it degrades every position to the same set and can no
+    // longer tell a candidate legal for slot 1 from one legal only for slot 0,
+    // reopening round-5 defect B2. Re-derive REAL per-position pools from the
+    // freshly-derived `derived` bindings instead, using the SAME one
+    // computation (`change_targets::slot_pool`, via `derive_slot_pools`) a
+    // live prompt would have used. An empty INNER pool at a given position is
+    // NOT re-derived here — `slot_pools.get(idx)` already returns `Some(&[])`
+    // for it, which correctly admits nothing (N16's sibling: an all-empty
+    // INNER `slot_pools` of the right length must admit nothing, not fall
+    // back to the union).
+    let derived_pools;
+    let effective_pools: &[Vec<TargetRef>] = if !slot_pools.is_empty() {
+        slot_pools
+    } else {
+        derived_pools = match state
+            .stack
+            .get(stack_entry_index)
+            .and_then(|entry| entry.ability().map(|ability| (entry, ability)))
+        {
+            Some((entry, stack_ability)) => {
+                crate::game::effects::change_targets::derive_slot_pools(
+                    state,
+                    entry,
+                    stack_ability,
+                    &derived,
+                )
+            }
+            None => Vec::new(),
+        };
+        // CR 115.7a + INVARIANT SC (phase-rs/phase#8355 round-8 review finding
+        // H1, second pass): a re-derived per-position pool can disagree with
+        // the compat payload's OWN `legal_new_targets` — measured on a B10-
+        // shaped Hallow board, where the declared source spell had left the
+        // stack: `derive_slot_pools` returns `[[]]` (outer non-empty, inner
+        // empty), `pool_for(0)` then admits nothing including the unchanged
+        // current target, and `Single` has no unchanged-position exemption —
+        // an unconditional hang. `retarget_prompt_is_dischargeable` asks
+        // EXACTLY the question `resolve` asks before parking a fresh prompt;
+        // when the re-derived pools fail it here too, trust them no further
+        // and fall back to `legal_new_targets`, which is what the field's own
+        // doc already promises ("behaves as at BASE").
+        if crate::game::effects::change_targets::retarget_prompt_is_dischargeable(
+            scope,
+            &derived_pools,
+            legal_new_targets,
+        ) {
+            &derived_pools
+        } else {
+            &[]
+        }
+    };
+
+    // EMPTY OUTER `effective_pools` (bindings could not be derived, e.g. the
+    // stack entry has no ability) falls back to `legal_new_targets`, exactly
+    // as the outer-empty payload case did before H3. An empty INNER pool is
+    // NOT a fallback — `get(idx)` returns `Some(&[])` and the position
+    // correctly admits nothing.
+    let pool_for = |idx: usize| -> &[TargetRef] {
+        effective_pools
+            .get(idx)
+            .map_or(legal_new_targets, Vec::as_slice)
+    };
 
     match scope {
         RetargetScope::Single => {
@@ -12837,7 +14631,7 @@ fn apply_retarget(
                     "Retarget: single-target change requires exactly one target".to_string(),
                 ));
             }
-            if !legal_new_targets.contains(&new_targets[0]) {
+            if !pool_for(0).contains(&new_targets[0]) {
                 return Err(EngineError::InvalidAction(
                     "Retarget: chosen target not in legal alternatives".to_string(),
                 ));
@@ -12850,6 +14644,34 @@ fn apply_retarget(
                         .to_string(),
                 ));
             }
+            // CR 115.7a + INVARIANT SC (phase-rs/phase#8355 round-8 review
+            // finding MED-1): `pool_for`'s union fallback is PER-INDEX
+            // (`.get(idx)`), so a NON-EMPTY `effective_pools` shorter than
+            // `current_targets` would silently mix two authorities inside
+            // ONE submission — positions within bounds enforced against
+            // their real per-position pool, positions past the end
+            // degrading individually to the flat union. Measured: a
+            // length-3 compat `All` payload against a 2-binding node
+            // enforced position 0 narrowly, admitted position 2 from the
+            // union, and the compat write path (`slots.is_empty()`, below)
+            // then wrote all three positions onto a 2-slot node. A real
+            // per-position address space is never shorter than
+            // `current_targets` — `derive_slot_pools`/a stored payload both
+            // map 1:1 over the node's OWN bindings — so a shorter, non-empty
+            // `effective_pools` means the address space no longer matches
+            // this entry: the same "no longer applicable" case
+            // `retarget_slots_aligned` exists to catch, just for the
+            // outer-empty compat shape that check can't see (its own
+            // `slots`/`derived` comparison is vacuously true when `slots` is
+            // empty). Reject the WHOLE submission rather than enforce it
+            // unevenly. `effective_pools.is_empty()` is excluded here: that
+            // is the DELIBERATE uniform fallback (H1/H3 — every position
+            // reads `legal_new_targets` alike), not a mix.
+            if !effective_pools.is_empty() && effective_pools.len() < current_targets.len() {
+                return Err(EngineError::InvalidAction(
+                    "Retarget: prompt per-position pools no longer cover every target".to_string(),
+                ));
+            }
             // CR 115.7d: For "choose new targets", unchanged targets may remain
             // unchanged even if they are no longer legal. Changed targets still
             // must be legal alternatives.
@@ -12857,7 +14679,7 @@ fn apply_retarget(
                 if current_targets.get(idx) == Some(target) {
                     continue;
                 }
-                if !legal_new_targets.contains(target) {
+                if !pool_for(idx).contains(target) {
                     return Err(EngineError::InvalidAction(
                         "Retarget: chosen target not in legal alternatives".to_string(),
                     ));
@@ -12870,6 +14692,23 @@ fn apply_retarget(
             ));
         }
     }
+
+    // CR 115.7d + CR 601.2c: the address space the player was OFFERED must be
+    // the one their submission is validated, admitted and written against.
+    // The payload snapshots it; `derived` (computed above, before `pool_for`
+    // was built) re-derives it. Pin them equal here (M5) via the single
+    // alignment authority also consulted by `ai_support::candidates::
+    // retarget_actions`, so the two cannot disagree about whether a payload
+    // is still applicable.
+    if !crate::game::ability_utils::retarget_slots_aligned(&derived, slots) {
+        return Err(EngineError::InvalidAction(
+            "Retarget: prompt slot addresses no longer match the stack entry".into(),
+        ));
+    }
+    debug_assert!(
+        slot_pools.is_empty() || slot_pools.len() == slots.len(),
+        "slot_pools must be aligned 1:1 with slots or absent",
+    );
 
     // CR 115.7a: "each target can be changed only to another legal target." The
     // `legal_new_targets` pool checked above is flat, so for a multi-slot node it
@@ -12884,54 +14723,197 @@ fn apply_retarget(
     // `Single`-scope retarget (Bolt Bend) of that shape therefore does run
     // this per-slot validation — CR 115.7a-correct, and the reason the check
     // is wired for both scopes rather than only `All`.
-    if let Some(ability) = state
-        .stack
-        .get(stack_entry_index)
-        .and_then(|entry| entry.ability())
-    {
-        if let Some(slot) = crate::game::ability_utils::retarget_slot_violation(
-            state,
-            ability,
-            current_targets,
-            &new_targets,
-        ) {
-            return Err(EngineError::InvalidAction(format!(
-                "Retarget: chosen target is not legal for target slot {slot}"
-            )));
-        }
+    //
+    // `effective_pools` (H3), not the raw payload `slot_pools`: an
+    // outer-empty payload must still be checked against REAL per-position
+    // pools, not degrade to the flat union here too.
+    if let Some(slot) = crate::game::ability_utils::retarget_slot_violation(
+        &derived,
+        effective_pools,
+        legal_new_targets,
+        current_targets,
+        &new_targets,
+    ) {
+        return Err(EngineError::InvalidAction(format!(
+            "Retarget: chosen target is not legal for target slot {slot}"
+        )));
     }
 
-    if stack_entry_index < state.stack.len() {
-        let target_pins: Vec<_> = state
-            .stack
-            .get(stack_entry_index)
-            .and_then(|entry| entry.ability())
-            .map(|ability| {
-                current_targets
-                    .iter()
-                    .zip(new_targets.iter())
-                    .filter(|(old, new)| {
-                        ability.retarget_target_requires_pin_refresh(old, new, state)
-                    })
-                    .filter_map(|(_, target)| match target {
-                        TargetRef::Object(id) => {
-                            state.objects.get(id).map(ObjectIncarnationRef::from_object)
-                        }
-                        TargetRef::Player(_) => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        if let Some(ability) = state.stack[stack_entry_index].ability_mut() {
-            ability.targets = new_targets;
-            for pin in target_pins {
-                ability.update_selected_target_incarnation(pin);
-            }
-        }
-    } else {
+    if stack_entry_index >= state.stack.len() {
         return Err(EngineError::InvalidAction(
             "Invalid stack entry index for retargeting".to_string(),
         ));
+    }
+
+    // CR 115.7d: "choose new targets" is an operation on the SPELL, so it
+    // writes every chain node that owns an addressed slot, not only the root
+    // — and the target-incarnation pin refresh follows the same address,
+    // because `selected_target_incarnations` is a field of the OWNING
+    // `ResolvedAbility` (phase-rs/phase#8355).
+    //
+    // CR 115.7d again (phase-rs/phase#8355 round-8 review finding MED-3,
+    // correcting a comment that contradicted the write loop below and could
+    // lead a future edit to silently revert H2): only CHANGED positions are
+    // VALIDATED against their slot's pool (`retarget_slot_violation`, above)
+    // — an unchanged position is exempt from THAT check, which is what lets
+    // an unchanged-but-illegal target stay illegal. The write loop below
+    // addresses EVERY position in `new_targets` unconditionally, changed or
+    // not; whether a given position's PIN is refreshed is decided
+    // separately, per position, by `retarget_target_requires_pin_refresh` —
+    // never by raw `TargetRef` (in)equality (H2). A same-ID retarget can
+    // still be a genuine re-incarnation (the object left and returned) whose
+    // pin is stale, and that function is the only thing that can tell a true
+    // no-op apart from one; skipping a position on `TargetRef` equality would
+    // make that case unreachable again. `capture_target_incarnations_
+    // recursive` must NOT be used here either — it blanket re-pins every
+    // position regardless of that per-position decision.
+    let Some(mut mutated) = state.stack[stack_entry_index].ability().cloned() else {
+        return Err(EngineError::InvalidAction(
+            "Retarget: stack entry has no ability to retarget".to_string(),
+        ));
+    };
+    if slots.is_empty() {
+        // M9/N16 compatibility fallback: an empty OUTER `slots` means a
+        // payload predating the field, and BASE's write was an unconditional
+        // root-level `ability.targets = new_targets` with a pin refresh
+        // computed by zipping EVERY position (not gated on "changed" — CR 400.7:
+        // a same-ID retarget with a stale incarnation must still refresh).
+        // Falling back to that exact write (rather than silently writing
+        // nothing) is what keeps this case "behaves as at BASE" rather than a
+        // silently-accepted no-op.
+        let target_pins: Vec<_> = current_targets
+            .iter()
+            .zip(new_targets.iter())
+            .filter(|(old, new)| mutated.retarget_target_requires_pin_refresh(old, new, state))
+            .filter_map(|(_, target)| match target {
+                TargetRef::Object(id) => {
+                    state.objects.get(id).map(ObjectIncarnationRef::from_object)
+                }
+                TargetRef::Player(_) => None,
+            })
+            .collect();
+        mutated.targets = new_targets.clone();
+        for pin in target_pins {
+            mutated.update_selected_target_incarnation(pin);
+        }
+    } else {
+        // CR 400.7 + CR 603.7c (mirrors `write_retarget_position`'s forced-path
+        // semantics, incl. its `exposed.len() == 1` exemption): do NOT skip a
+        // position on raw `TargetRef` equality. A same-ID retarget can still be
+        // a genuine re-incarnation (the object left and returned) whose pin is
+        // stale, and only `retarget_target_requires_pin_refresh` can tell that
+        // apart from a true no-op — skipping the whole branch here made that
+        // case unreachable and left `update_selected_target_incarnation` uncalled
+        // on the interactive path (phase-rs/phase#8355 round-8 review finding
+        // H2). Writing the same `TargetRef` back is harmless; the pin decision
+        // is the part that must not be shortcut.
+        for (i, new_target) in new_targets.iter().enumerate() {
+            let Some(address) = slots.get(i) else {
+                continue;
+            };
+            let Some(node) = crate::game::ability_utils::node_at_mut(&mut mutated, &address.path)
+            else {
+                return Err(EngineError::InvalidAction(
+                    "Retarget: prompt slot address no longer resolves".to_string(),
+                ));
+            };
+            let Some(old) = node.targets.get(address.slot).cloned() else {
+                continue;
+            };
+            let refresh = node.retarget_target_requires_pin_refresh(&old, new_target, state);
+            node.targets[address.slot] = new_target.clone();
+            if refresh {
+                let pin = match new_target {
+                    TargetRef::Object(id) => {
+                        state.objects.get(id).map(ObjectIncarnationRef::from_object)
+                    }
+                    TargetRef::Player(_) => None,
+                };
+                if let Some(pin) = pin {
+                    node.update_selected_target_incarnation(pin);
+                }
+            }
+        }
+    }
+    crate::game::ability_utils::restamp_derived_chain_targets(&mut mutated);
+
+    // CR 115.7d (second clause) + CR 115.7e ("only the final set of targets is
+    // evaluated"): after the write, every UNCHANGED addressed slot that was
+    // LEGAL before the change must still be legal. A slot that was ALREADY
+    // illegal stays accepted — that is CR 115.7d's FIRST clause and must not
+    // be disturbed. Evaluated on the post-write chain and transactionally so a
+    // violation rolls back: the ability is only put back on the stack once
+    // this pass succeeds. `Legacy` bindings are skipped: they have no filter,
+    // and BASE applies no per-slot check to them. Uses the SAME constructor
+    // and controller as the pool builder (`slot_pool`), not
+    // `validate_targets_for_ability` (which would reintroduce round-5 defect
+    // B8's `ability.controller`).
+    let pool_controller = crate::game::effects::change_targets::retarget_pool_controller(
+        state,
+        &state.stack[stack_entry_index],
+        &mutated,
+    );
+    // `pre_write` is the ability as it stood before this call's write loop —
+    // `state.stack[stack_entry_index]` has not been overwritten yet (that
+    // happens below, only once this whole pass succeeds).
+    let pre_write = state.stack[stack_entry_index].ability().cloned();
+    for (i, binding) in derived.iter().enumerate() {
+        // A position this submission itself addressed and changed is already
+        // validated by the per-slot check above (CR 115.7d's FIRST clause);
+        // this pass is only for positions the submission left UNCHANGED,
+        // including every position beyond the exposed prefix.
+        let changed = i < new_targets.len() && current_targets.get(i) != new_targets.get(i);
+        if changed {
+            continue;
+        }
+        let crate::game::ability_utils::SlotEnforcement::Filtered(filter) = &binding.enforcement
+        else {
+            continue;
+        };
+        let Some(pre_node) = pre_write
+            .as_ref()
+            .and_then(|a| crate::game::ability_utils::node_at(a, &binding.address.path))
+        else {
+            continue;
+        };
+        let Some(pre_current) = pre_node.targets.get(binding.address.slot) else {
+            continue;
+        };
+        let was_legal = crate::game::targeting::find_legal_targets_for_ability_with_controller(
+            state,
+            filter,
+            pre_node,
+            pool_controller,
+        )
+        .contains(pre_current);
+        if !was_legal {
+            // CR 115.7d FIRST clause: an already-illegal unchanged target
+            // stays accepted.
+            continue;
+        }
+        let Some(post_node) = crate::game::ability_utils::node_at(&mutated, &binding.address.path)
+        else {
+            continue;
+        };
+        let Some(post_current) = post_node.targets.get(binding.address.slot) else {
+            continue;
+        };
+        let still_legal = crate::game::targeting::find_legal_targets_for_ability_with_controller(
+            state,
+            filter,
+            post_node,
+            pool_controller,
+        )
+        .contains(post_current);
+        if !still_legal {
+            return Err(EngineError::InvalidAction(
+                "Retarget: the change would make an unchanged target illegal".to_string(),
+            ));
+        }
+    }
+
+    if let Some(stack_ability_mut) = state.stack[stack_entry_index].ability_mut() {
+        *stack_ability_mut = mutated;
     }
 
     events.push(GameEvent::EffectResolved {
@@ -13112,8 +15094,11 @@ pub(super) fn begin_pending_trigger_target_selection(
                     source_id,
                     origin,
                 });
+                let same_card_may_trigger_choice_available = may_trigger_key
+                    .as_ref()
+                    .is_some_and(|key| state.may_trigger_same_card_choice_available(key));
                 if let Some(ref key) = may_trigger_key {
-                    if let Some(choice) = state.may_trigger_auto_choice(key) {
+                    if let Some(choice) = state.may_trigger_auto_choice_for_live_prompt(key) {
                         match choice {
                             AutoMayChoice::Decline => {
                                 drop_mid_construction_pending_trigger(state);
@@ -13140,6 +15125,7 @@ pub(super) fn begin_pending_trigger_target_selection(
                     source_id,
                     description: trigger_description,
                     may_trigger_key,
+                    same_card_may_trigger_choice_available,
                 }));
             }
 
@@ -13304,6 +15290,7 @@ fn record_exile_play_permission(
         Some(casting::ExileLandPlayAuthorization::ObjectAttached {
             source,
             frequency: CastFrequency::OncePerTurn,
+            ..
         }) => crate::game::ledger::consume_once_per_turn_permission(
             state,
             source,
@@ -13614,10 +15601,14 @@ fn handle_play_land(
 
     // CR 712.12: MDFC land face selection
     if let Some(obj) = state.objects.get(&object_id) {
-        let is_modal = obj
-            .back_face
-            .as_ref()
-            .is_some_and(|bf| bf.layout_kind == Some(crate::types::card::LayoutKind::Modal));
+        // CR 712.12 + CR 601.2b (#7565): the face prompt is offered only while
+        // this cast's choice is still open — `cast_face_committed` suppresses
+        // the re-entry re-prompt (layout_kind itself stays untouched).
+        let is_modal = !obj.cast_face_committed
+            && obj
+                .back_face
+                .as_ref()
+                .is_some_and(|bf| bf.layout_kind == Some(crate::types::card::LayoutKind::Modal));
         let front_is_land = obj
             .card_types
             .core_types
@@ -13643,10 +15634,7 @@ fn handle_play_land(
         if is_modal && !front_is_land && back_is_land {
             // CR 712.12: Only back face is a land — auto-swap (player already chose "play as land")
             let obj = state.objects.get_mut(&object_id).unwrap();
-            let back = obj.back_face.take().expect("MDFC has back face");
-            let front_snapshot = super::printed_cards::snapshot_object_face(obj);
-            super::printed_cards::apply_back_face_to_object(obj, back);
-            obj.back_face = Some(front_snapshot);
+            super::printed_cards::swap_object_faces(obj);
             // CR 712.8a: Mark back-face so apply_zone_exit_cleanup reverts to front face
             // when this land leaves the battlefield. Do NOT set obj.transformed — MDFC
             // face selection is not transformation.
@@ -13720,7 +15708,13 @@ fn handle_play_land(
         let enters_tapped = state
             .objects
             .get(&object_id)
-            .is_some_and(|obj| super::casting::exile_play_land_enters_tapped(obj, player));
+            .zip(
+                exile_play_authorization
+                    .and_then(|authorization| authorization.casting_permission_index()),
+            )
+            .is_some_and(|(obj, permission_index)| {
+                super::casting::exile_play_land_enters_tapped(state, obj, player, permission_index)
+            });
         if enters_tapped {
             if let Some(slot) = proposed.battlefield_entry_tap_state_mut() {
                 *slot = crate::types::zones::EtbTapState::Tapped;
@@ -13732,13 +15726,11 @@ fn handle_play_land(
         super::replacement::ReplacementResult::Execute(event) => {
             if let crate::types::proposed_event::ProposedEvent::ZoneChange { object_id, .. } = event
             {
-                // Phase B (PLAN §6.2 / §7): the divergent partial copy of
-                // `deliver_replaced_zone_change` that used to live here is
-                // dissolved — the post-`replace_event` event is a
+                // The post-`replace_event` event is a
                 // `ReplacementResult::Execute` payload, sealed through the third
                 // mint path (`approve_post_replacement`) and delivered by the
                 // shared `zone_pipeline::deliver`. The land entry now gets the
-                // FULL delivery tail the copy skipped (CR 614.1c
+                // FULL delivery tail (CR 614.1c
                 // `EntersWithAdditionalCounters` statics snapshot, the CR 303.4f
                 // `attach_to` host, `entered_via_ability_source` provenance, the
                 // CR 701.24a library-shuffle arm). `drain = CallerEpilogue`: the
@@ -14228,16 +16220,59 @@ fn is_tappable_creature_for_cost(state: &GameState, id: ObjectId, player: Player
     })
 }
 
-/// CR 602.5b + CR 702.122a: "activate only once each turn" is keyed to the exact
-/// object incarnation, so a Vehicle that leaves and returns (a new object per
-/// CR 400.7) may be crewed again. Single authority for reading the crew-cadence
-/// set — callers never touch `crew_activated_this_turn` directly.
+/// CAVEAT: the set is recorded at crew ANNOUNCEMENT and cleared only at turn
+/// start (CR 602.5b). It is therefore NOT a layer-independent test for "the
+/// crew payoff is in force": a Stifle-class counter (CR 701.6a) removes the
+/// pending crew entry before it resolves, leaving the cadence record stale all
+/// turn while the Vehicle never became a creature. Consumers that must reject
+/// a redundant re-crew should test PAYOFF-IN-FORCE instead — see
+/// [`crew_pending_on_stack`] / [`crew_resolved_this_turn_contains`].
 pub(crate) fn crew_activated_this_turn_contains(state: &GameState, vehicle_id: ObjectId) -> bool {
     state
         .objects
         .get(&vehicle_id)
         .map(crate::types::identifiers::ObjectIncarnationRef::from_object)
         .is_some_and(|r| state.crew_activated_this_turn.contains(&r))
+}
+
+/// CR 702.122a: Has a `KeywordAction::Crew` for this Vehicle RESOLVED this
+/// turn (the resolved-crew marker)? This is the crew-repeat guard's
+/// PAYOFF-IN-FORCE authority: the marker is written only when the Crew stack
+/// entry actually resolves and installs the transient UEOT `AddType(Creature)`
+/// effect, so a countered crew (CR 701.6a) never sets it — and neither does a
+/// generic SelfRef self-animation (Kylox-class), which installs the same
+/// transient shape with no Crew resolution behind it. Only an explicit
+/// successful Crew sets the marker. Incarnation-keyed: a Vehicle that leaves
+/// and returns is a new object (CR 400.7) and is re-crewable.
+pub fn crew_resolved_this_turn_contains(state: &GameState, vehicle_id: ObjectId) -> bool {
+    state
+        .objects
+        .get(&vehicle_id)
+        .map(crate::types::identifiers::ObjectIncarnationRef::from_object)
+        .is_some_and(|r| state.crew_resolved_this_turn.contains(&r))
+}
+
+/// CR 702.122a + CR 113.3b + CR 117.3c: Is a Crew activation for this Vehicle
+/// currently pending on the stack? Crew's payoff — the transient UEOT
+/// `AddType(Creature)` effect — is applied at stack RESOLUTION, not at
+/// announcement (CR 113.3b opens a priority window for counterspell-class
+/// effects between the two; CR 117.3c hands that same player priority again
+/// after the activation — the very re-crew window this guard exists to close).
+/// Between announcement and resolution the pending `KeywordAction::Crew` entry
+/// is the proof that the payoff is owed; the cadence set alone is not (see
+/// [`crew_activated_this_turn_contains`]).
+pub fn crew_pending_on_stack(state: &GameState, vehicle_id: ObjectId) -> bool {
+    state.stack.iter().any(|entry| {
+        matches!(
+            &entry.kind,
+            StackEntryKind::KeywordAction {
+                action: KeywordAction::Crew {
+                    vehicle_id: pending,
+                    ..
+                },
+            } if *pending == vehicle_id
+        )
+    })
 }
 
 /// CR 602.5b + CR 702.122a: record a crew activation against the Vehicle's current
@@ -14249,6 +16284,23 @@ pub(crate) fn record_crew_activation(state: &mut GameState, vehicle_id: ObjectId
         .map(crate::types::identifiers::ObjectIncarnationRef::from_object)
     {
         state.crew_activated_this_turn.insert(r);
+    }
+}
+
+/// CR 702.122a: record a RESOLVED crew against the Vehicle's current
+/// incarnation. Single authority for writing the resolved-crew marker set —
+/// called from the `KeywordAction::Crew` stack-resolution arm (stack.rs) in
+/// the exact block that installs the UEOT `AddType(Creature)` transient, so
+/// the marker and the payoff are written together and cannot drift.
+/// Deliberately NOT written at crew announcement: a countered crew (CR 701.6a)
+/// installs no payoff, and the Vehicle must stay re-crewable.
+pub(crate) fn record_crew_resolution(state: &mut GameState, vehicle_id: ObjectId) {
+    if let Some(r) = state
+        .objects
+        .get(&vehicle_id)
+        .map(crate::types::identifiers::ObjectIncarnationRef::from_object)
+    {
+        state.crew_resolved_this_turn.insert(r);
     }
 }
 
@@ -14971,6 +17023,14 @@ pub fn start_game_with_starting_player(
     state.active_player = starting_player;
     state.priority_player = starting_player;
     state.current_starting_player = starting_player;
+    // CR 103.8 + CR 500: the starting player takes their first turn HERE — turn 1
+    // is established inline rather than through `turns::start_next_turn`, which is
+    // where every later turn's per-player count is incremented. Without this the
+    // starting player's `turns_taken` stays one behind every other seat for the
+    // whole game, so `QuantityRef::TurnsTaken` ("the number of turns you've taken
+    // this game") and every "your Nth turn" condition read low for exactly the
+    // player who has taken the MOST turns.
+    state.players[starting_player.0 as usize].turns_taken += 1;
     // First-game default chooser is the starting player; BO3 restarts can pre-set this.
     if state.next_game_chooser.is_none() {
         state.next_game_chooser = Some(starting_player);
@@ -15027,6 +17087,10 @@ pub fn start_game_skip_mulligan(state: &mut GameState) -> ActionResult {
     state.active_player = starting_player;
     state.priority_player = starting_player;
     state.current_starting_player = starting_player;
+    // CR 103.8 + CR 500: see the matching increment in
+    // `start_game_with_starting_player` — turn 1 bypasses `turns::start_next_turn`,
+    // so the starting player's own first turn must be counted here.
+    state.players[starting_player.0 as usize].turns_taken += 1;
     state.phase = Phase::Untap;
 
     events.push(GameEvent::TurnStarted {
@@ -15412,6 +17476,102 @@ pub(super) fn check_exile_returns(state: &mut GameState, events: &mut Vec<GameEv
 mod tests;
 
 #[cfg(test)]
+mod resolve_all_consent_session_tests {
+    use super::*;
+    use crate::types::format::FormatConfig;
+    use std::collections::BTreeSet;
+
+    const P0: PlayerId = PlayerId(0);
+    const P1: PlayerId = PlayerId(1);
+    const P2: PlayerId = PlayerId(2);
+    const P3: PlayerId = PlayerId(3);
+
+    fn no_op_entry(id: u64, controller: PlayerId) -> StackEntry {
+        StackEntry {
+            id: ObjectId(id),
+            source_id: ObjectId(id),
+            controller,
+            kind: StackEntryKind::ActivatedAbility {
+                source_id: ObjectId(id),
+                ability: Box::new(crate::types::ability::ResolvedAbility::new(
+                    crate::types::ability::Effect::NoOp,
+                    vec![],
+                    ObjectId(id),
+                    controller,
+                )),
+            },
+        }
+    }
+
+    #[test]
+    fn one_representative_begin_materializes_a_session_without_a_consent_or_ready_stop() {
+        // This invokes the producer before the outer lifecycle can terminalize
+        // an intentionally one-seat fixture, so the assertion observes the
+        // actual singleton materializer rather than a post-GameOver boundary.
+        let mut state = GameState::new(FormatConfig::free_for_all(), 1, 0x51_1E);
+        state.stack.push_back(no_op_entry(1, P0));
+
+        let waiting = begin_resolve_all_consent(&mut state, P0, 1, ResolveAllScope::Shared)
+            .expect("the sole representative is already unanimous");
+
+        assert!(matches!(waiting, WaitingFor::Priority { player: P0 }));
+        assert!(state.resolve_all_consent_run.is_none());
+        let session = state
+            .stack_resolution_session
+            .as_ref()
+            .expect("singleton Begin creates the ordinary session directly");
+        assert_eq!(session.representatives, BTreeSet::from([P0]));
+        assert_eq!(session.budget.max_resolutions(), Some(1));
+    }
+
+    #[test]
+    fn two_headed_giant_final_grant_overlays_only_canonical_team_representatives() {
+        let mut state = GameState::new(FormatConfig::two_headed_giant(), 4, 0x2A6);
+        state.stack.push_back(no_op_entry(1, P0));
+        let waiting = begin_resolve_all_consent(&mut state, P0, 7, ResolveAllScope::Shared)
+            .expect("the active team representative begins consent");
+        let WaitingFor::ResolveAllConsent {
+            epoch,
+            representative: P2,
+        } = waiting
+        else {
+            panic!("the opposing team's canonical representative must consent")
+        };
+        state.waiting_for = WaitingFor::ResolveAllConsent {
+            epoch,
+            representative: P2,
+        };
+
+        let materialized = respond_resolve_all_consent(
+            &mut state,
+            epoch,
+            P2,
+            epoch,
+            ResolveAllConsentDecision::Grant,
+        )
+        .expect("the final team grant materializes a shared session");
+
+        assert!(matches!(materialized, WaitingFor::Priority { player: P0 }));
+        let session = state
+            .stack_resolution_session
+            .as_ref()
+            .expect("the final team grant creates a session");
+        assert_eq!(session.representatives, BTreeSet::from([P0, P2]));
+        for representative in [P0, P2] {
+            assert!(matches!(
+                state.auto_pass.get(&representative),
+                Some(AutoPassMode::UntilStackEmpty {
+                    policy: StackResolutionPolicy::Committed,
+                    ..
+                })
+            ));
+        }
+        assert!(!state.auto_pass.contains_key(&P1));
+        assert!(!state.auto_pass.contains_key(&P3));
+    }
+}
+
+#[cfg(test)]
 #[path = "engine_trigger_target_tests.rs"]
 mod trigger_target_tests;
 
@@ -15632,6 +17792,7 @@ mod priority_principal_tests {
             .get_mut(&object_id)
             .unwrap()
             .back_face = Some(BackFaceData {
+            is_swap_snapshot: false,
             name: "Blow Off Steam".to_string(),
             power: None,
             toughness: None,
@@ -16333,9 +18494,11 @@ mod bounded_declaration_tests {
 
     /// **Row D4 — an empty schema publishes NO declaration.**
     ///
-    /// LOAD-BEARING, not tidiness: `predictability_gate` and `validate_pins` both live inside
-    /// `handle_declare_shortcut`'s `if !offer.schema.points.is_empty()` block, so a declaration
-    /// minted against an empty schema would travel the one declare path that runs NEITHER gate.
+    /// LOAD-BEARING, not tidiness: an empty schema exposes no slot, so a declaration minted
+    /// against one that pinned a SLOT-ADDRESSING choice would be refused by the handler that
+    /// has to accept it — `validate_pins` matches those pins to a published point. Publishing
+    /// one would make `declaration.is_some()`, the predicate `ai_support::candidates` gates
+    /// its declare candidate on, mean the opposite of what it says.
     /// The invariant is also staged at fixture level by
     /// `tests/integration/loop_shortcut.rs::r28_empty_schema_offer`, which passes
     /// `declaration: None` for this reason.
@@ -16476,9 +18639,8 @@ mod bounded_declaration_tests {
                     DecisionKind::LoopChoice,
                 ),
             };
-            let required: Vec<_> = schema.points.iter().map(|p| p.slot.clone()).collect();
             assert!(
-                predictability_gate(&as_published, &required).is_ok(),
+                predictability_gate(&as_published, &schema.points).is_ok(),
                 "[{label}] reach-guard: COVERAGE passes on this template — every published slot \
                  is pinned — so the handler's verdict below is the VALUE half's"
             );
@@ -17788,10 +19950,11 @@ mod stage2_injector_tests {
         // first, so this helper exercises the chokepoint the server's `from_persisted`
         // and WASM's `decode_restored_game_state` actually funnel through — including
         // the CR 732.2a load-seam bound invariant.
-        // `.expect(..)`, not `?`: `into_game_state` returns `GameState`, not `Result`.
+        // The test unwraps the fallible persistence boundary after asserting this fixture decodes.
         serde_json::from_value::<PersistedGameState>(envelope["gameState"].clone())
             .expect("gameState deserializes through the production decoder")
             .into_game_state()
+            .expect("persisted test snapshot satisfies the checked restore contract")
     }
 
     const EMBLEM: ObjectId = ObjectId(541);
@@ -18236,9 +20399,9 @@ mod stage2_injector_tests {
     /// # What this does NOT measure
     ///
     /// ACCEPTANCE. Whether `mixed_no_order` is *submittable* is `declaration_conforms`'
-    /// question; no row here asks it, and the answer is not always yes (an `Order` pin can be
-    /// the sole cover of a required point, in which case dropping it fails
-    /// `predictability_gate` — pre-existing and zone-independent).
+    /// question, and no row here asks it. `mixed` itself is not submittable — `validate_pins`
+    /// refuses its `Order` element as `NotALoopDecision` (CR 603.3b) — which is why these rows
+    /// drive `resolve` directly.
     ///
     /// REVERT-PROBES: reverting the `Order` arm to `resolve_source` ⇒ rows **R** and **P**
     /// fail; **N**, **N2** and **P-minus** are deliberately revert-insensitive.
@@ -18498,109 +20661,15 @@ mod stage2_injector_tests {
         );
     }
 
-    /// R23, conjunct 3 — **the PRODUCER census, so a new producer is a COUNTED event.**
+    /// The CR 603.5 prompt sites in ONE source text: `(producers, readers, in_test)`.
     ///
-    /// The struck form of this conjunct pinned `optional_prompt_player`'s own call-site count,
-    /// which is trivially stable at 2 and moves neither when the guard is deleted nor when an
-    /// unguarded producer is added — this plan's own "verify the seam, not the line" defect,
-    /// committed. What actually bounds the mint conjunct's reach is how many things PRODUCE
-    /// `WaitingFor::OptionalEffectChoice`: the conjunct is a fail-closed pre-filter on ONE of
-    /// them, and soundness over the others is discharged at the consumption point.
-    ///
-    /// The five production producers are named individually, and exactly one of them is inside
-    /// the CR 603.5 gate that consults the recipient authority. If a sixth appears, this row
-    /// fails and whoever added it must decide where its recipient is bound.
-    ///
-    /// ⚠ **ADJUDICATED IN U4, NOT RELAXED.** The census moved `34 ⇒ 37`. The PRODUCER half is
-    /// unchanged at **5** and its per-file list is byte-identical (only one line NUMBER moved,
-    /// `game/engine.rs:10433 ⇒ :10493`, because U4's arm sits above it) — that half is what this
-    /// row's claim is about, and it did not move. The `+1` READER is `game/engine.rs`'s new
-    /// `OptionalEffectChoice` arm in `inject_pinned_answer`, i.e. the CONSUMPTION point this
-    /// doc already names as where soundness over the other four producers is discharged; the
-    /// `+2` are U4's own `#[cfg(test)]` fixtures. A new READER is the benign case — adjudicate
-    /// it, do not relax the assert.
-    ///
-    /// ⚠ **RE-ADJUDICATED IN THE 5d LOW-FIX, NOT RELAXED.** One line NUMBER moved again,
-    /// `game/engine.rs:10493 ⇒ :10500`, on the same terms as U4's shift above. Cause: the
-    /// LOW-fix added a net **+7 DOC lines** above that producer (the mint's corrected
-    /// board-not-prompt contract, and the Braids, Conjurer Adept Oracle-text correction) —
-    /// comments only, not one executable line. The producer itself is BYTE-IDENTICAL (the
-    /// `return Ok(Some(WaitingFor::OptionalEffectChoice` head, diffed against `HEAD`), the
-    /// total stays **37** and the partition stays **5/7/25**, and the other four entries are
-    /// unchanged. The two companion asserts above run FIRST and both fired GREEN on the run
-    /// that caught this — which is the evidence that the SET did not move and only this
-    /// entry's coordinate did. A line-number-only shift is the benign case; a changed
-    /// producer set is not, and stays a counted event.
-    ///
-    /// ⚠ **RE-ADJUDICATED ON THE REBASE ONTO UPSTREAM #6842 (`8121fd1c6`), NOT RELAXED.**
-    /// The row fired again; the PRODUCER COUNT IS STILL **5** and no sixth producer exists.
-    /// Four of five coordinates shifted and one did not:
-    /// `game/effects/mod.rs:5896/5973/8927 ⇒ :5918/5995/8949` (uniform **+22**, lines that
-    /// commit adds above them in that file), `game/engine.rs:10500 ⇒ :10589` (**+89**, same
-    /// cause), and `game/effects/scoped_library_search.rs:452` **UNMOVED**.
-    /// Evidence this is a coordinate shift and not a set change: each of the five was re-read
-    /// at its new coordinate and diffed against the pre-rebase tree (`chain3-prefold-backup`)
-    /// at its old one — all five are BYTE-IDENTICAL, same files, same order, and the one
-    /// entry at an unchanged coordinate is byte-identical in place, which a gained-or-lost
-    /// producer could not produce. Same set, new line numbers ⇒ benign, re-baselined here.
-    /// NOTE for the record: this rebase did NOT add a CR 603.5 producer. An earlier report of
-    /// mine said upstream had added one; that was wrong — the row fired on coordinates.
-    ///
-    /// ⚠ **RE-ADJUDICATED ON THE REBASE ONTO UPSTREAM #6851 (`96e41b3ab`), NOT RELAXED.**
-    /// The row fired in CI but not locally, because CI builds the MERGE ref (branch + main)
-    /// while the branch was still based on `e12447f4f`. The PRODUCER COUNT IS STILL **5**, no
-    /// sixth producer exists, and this time only ONE coordinate moved:
-    /// `game/engine.rs:10589 ⇒ :10640` (**+51**), with `game/effects/mod.rs:5918/5995/8949`
-    /// and `game/effects/scoped_library_search.rs:452` all **UNMOVED**.
-    /// Evidence this is a coordinate shift and not a set change, three independent ways:
-    /// (1) all five producers were re-read at their new coordinates and diffed against the
-    /// pre-rebase tree at their old ones — **byte-identical**, same files, same order, with a
-    /// negative control confirming the diff instrument discriminates (the new tree at the OLD
-    /// coordinate `:10589` is a bare `}`, not the producer); (2) the +51 is fully accounted
-    /// for by #6851's own insertions ABOVE this producer in the same file — measured net
-    /// `+51` from `git diff -U0 e12447f4f 96e41b3ab`, so predicted `10589+51 = 10640` equals
-    /// the observed coordinate exactly, and #6851's whole-file delta is also `+51`, i.e. it
-    /// adds nothing below; (3) the total stays **37** and the partition stays **5/7/25**, so
-    /// neither a producer nor a reader was gained or lost. Same set, one new line number ⇒
-    /// benign, re-baselined here.
-    ///
-    /// ⚠ **RE-ADJUDICATED BY C1 (the CR 603.5 may-answer journal), NOT RELAXED.** `37 ⇒ 38`,
-    /// partition `5/7/25 ⇒ 5/8/25`. The PRODUCER half is unchanged at **5** and four of the
-    /// five coordinates did not move at all. The `+1` READER is **`game/engine.rs:8626`** —
-    /// `apply_action`'s `(OptionalEffectChoice, DecideOptionalEffect)` arm, which C1 widened
-    /// from `{ .. }` to bind `player` and `source_id` so it can journal the answer under
-    /// `(DecisionSource, PlayerId)`. It READS the (cloned) `state.waiting_for` scrutinee and
-    /// never writes it, so it is a reader by this instrument's own rule, and it is the same
-    /// benign class as U4's `inject_pinned_answer` arm. Note WHY it became visible at all:
-    /// the instrument deliberately skips multi-line read destructures by excluding lines
-    /// containing `..`, and rustfmt puts `..` on the needle's own line only while the
-    /// pattern body is narrow — adding two bindings pushes it to the next line. The
-    /// exclusion is an approximation, and this is it losing one case, not a new prompt.
-    ///
-    /// The fifth producer's coordinate moved `engine.rs:11942 ⇒ :11977`, and the shift is
-    /// measured rather than assumed: `git diff -U0 <C0f tip> HEAD -- game/engine.rs` has
-    /// exactly six hunks above it — five `+2` journal clears paired with the ring clears at
-    /// `:3274/:3951/:5130/:6334/:7139`, and `+25` for the reducer arm above — summing to
-    /// **+35**, so predicted `11942 + 35 = 11977` equals the observed coordinate exactly.
-    /// Identity re-established, not assumed: the line is **sha256-identical**
-    /// (`8a544e87…5cc7d63`) at the old coordinate in the pre-C1 tree and at the new one
-    /// here, and it is still inside `begin_pending_trigger_target_selection`. C1 adds no
-    /// line matching the needle in a producing position anywhere.
-    #[test]
-    fn the_cr_603_5_prompt_census_is_pinned_so_a_sixth_producer_is_a_counted_event() {
-        /// Every `.rs` under the crate's `src`, and the `#[cfg(test)]`-attributed
-        /// column-0 `mod … {` … column-0 `}` spans inside it. A whole file whose stem
-        /// ends `_tests` is test-only (its parent declares it under `#[cfg(test)]`).
-        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for entry in std::fs::read_dir(dir).expect("readable source dir") {
-                let path = entry.expect("readable dir entry").path();
-                if path.is_dir() {
-                    rs_files(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    out.push(path);
-                }
-            }
-        }
+    /// A producer's key is `file::fn {fields}` — its enclosing column-0 `fn` plus the
+    /// whitespace-stripped field text of the construction minted there, so a REPLACEMENT
+    /// inside an already-pinned function moves the key. A reader keys as `file::fn`.
+    fn cr_603_5_sites(rel: &str, text: &str) -> (Vec<String>, Vec<String>, usize) {
+        use crate::source_census::code as code_of;
+
+        /// The `#[cfg(test)]`-attributed column-0 `mod … {` … column-0 `}` spans.
         fn cfg_test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
             let mut spans = Vec::new();
             let mut i = 0;
@@ -18630,30 +20699,132 @@ mod stage2_injector_tests {
             spans
         }
 
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        rs_files(&root, &mut files);
-        files.sort();
-        assert!(files.len() > 100, "reach-guard: the walker found the crate");
+        /// The construction's field text, brace-matched over the CODE half from `after` —
+        /// just past its opening `{` on line `n` — to the matching `}`, with ALL whitespace
+        /// removed so re-indenting or re-breaking a field expression cannot move it.
+        /// Unbalanced input runs to EOF and yields a key nothing matches: red, never a
+        /// silent pass.
+        fn fields(lines: &[&str], n: usize, after: usize) -> String {
+            let mut body = String::new();
+            let mut depth = 1usize;
+            let mut rest = &code_of(lines[n])[after..];
+            let mut i = n;
+            loop {
+                for ch in rest.chars() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return body;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if !ch.is_whitespace() {
+                        body.push(ch);
+                    }
+                }
+                i += 1;
+                let Some(line) = lines.get(i) else {
+                    return body;
+                };
+                rest = code_of(line);
+            }
+        }
 
-        // COMMENT TEXT IS NOT A CENSUS SITE — this instrument counts CODE, and it had no
-        // comment rule at all until now. The consequence was measured, not theorised: a doc
-        // comment that quoted the needle verbatim counted ITSELF, reading 39 against a pin of
-        // 38, and was worked around by deleting the brace from the quotation (`aa313f122`).
-        // That repaired one sentence and left the counter broken for the next one. The rule now
-        // has ONE home for the whole repository, `crate::source_census`, which the integration
-        // binary compiles from the same file.
-        use crate::source_census::code as code_of;
+        let lines: Vec<&str> = text.lines().collect();
+        let spans = cfg_test_spans(&lines);
+        // A whole file whose stem ends `_tests` is test-only (its parent declares it under
+        // `#[cfg(test)]`).
+        let test_file = rel.trim_end_matches(".rs").ends_with("_tests");
 
         // The needle is ASSEMBLED so this row's own source cannot be counted by its own
         // instrument. `..` excludes multi-line READ destructures whose rest-pattern sits on
         // a later line — the inflation the raw grep suffers from.
         let needle = format!("WaitingFor::{}Choice {{", "OptionalEffect");
         let (mut producers, mut readers, mut in_test) = (Vec::new(), Vec::new(), 0usize);
+        // Enclosing-function tracker for this file: `enclosing` names each site and
+        // `fn_start` bounds the qualifying look-back below, so no coordinate is minted.
+        // Column-0 `fn` headers only — a producer inside an `impl` method would take the
+        // preceding free function's name; all five producers today are free functions.
+        let (mut enclosing, mut fn_start) = (String::new(), 0usize);
+        for (n, line) in lines.iter().enumerate() {
+            let code = code_of(line);
+            if !line.starts_with([' ', '\t']) {
+                let tokens: Vec<&str> = code.split_whitespace().collect();
+                if let Some(at) = tokens.iter().position(|token| *token == "fn") {
+                    enclosing = tokens
+                        .get(at + 1)
+                        .and_then(|token| token.split(['(', '<']).next())
+                        .unwrap_or_default()
+                        .to_string();
+                    fn_start = n;
+                }
+            }
+            let Some(open) = code.find(&needle) else {
+                continue;
+            };
+            if code.contains("..") {
+                continue;
+            }
+            if test_file || spans.iter().any(|(a, b)| (*a..=*b).contains(&n)) {
+                in_test += 1;
+            } else if code.contains("waiting_for = ")
+                || code.contains("Ok(Some(")
+                // `install_direct_choice_frame` owns the actual `state.waiting_for`
+                // write, so its typed prompt argument is a mint, not a read. The
+                // window is the enclosing fn; `code_of` keeps prose out of it.
+                || lines[fn_start..n]
+                    .iter()
+                    .any(|prior| code_of(prior).contains(".install_direct_choice_frame("))
+            {
+                let body = fields(&lines, n, open + needle.len());
+                let trimmed = body.trim_end_matches(',');
+                producers.push(format!("{rel}::{enclosing} {{{trimmed}}}"));
+            } else {
+                readers.push(format!("{rel}::{enclosing}"));
+            }
+        }
+        (producers, readers, in_test)
+    }
+
+    /// **The PRODUCER census, so a new producer is a COUNTED event.** What bounds the mint
+    /// conjunct's reach is how many things PRODUCE `WaitingFor::OptionalEffectChoice`: the
+    /// conjunct is a fail-closed pre-filter on ONE of them, and soundness over the others is
+    /// discharged at the consumption point. Exactly one of the five sits inside the CR 603.5 gate
+    /// that consults the recipient authority, so if a sixth appears this row fails and whoever
+    /// added it must decide where its recipient is bound.
+    ///
+    /// A producer is identified by its ENCLOSING FUNCTION and the CONSTRUCTION it mints
+    /// (`file::fn {fields}`, whitespace stripped), and the qualifying
+    /// `.install_direct_choice_frame(` look-back is bounded by that same function. NO line
+    /// coordinate is asserted, so movement above a producer is not an event and a REPLACEMENT
+    /// inside a pinned function is. The pin is a sorted MULTISET, so a sixth mint in one of them
+    /// still fails here; comment text is never a site (`source_census::code`).
+    #[test]
+    fn the_cr_603_5_prompt_census_is_pinned_so_a_sixth_producer_is_a_counted_event() {
+        /// Every `.rs` under the crate's `src`.
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("readable source dir") {
+                let path = entry.expect("readable dir entry").path();
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rs_files(&root, &mut files);
+        files.sort();
+        assert!(files.len() > 100, "reach-guard: the walker found the crate");
+
+        let (mut producers, mut readers, mut in_test) = (Vec::new(), Vec::new(), 0usize);
         for path in &files {
             let text = std::fs::read_to_string(path).expect("readable source file");
-            let lines: Vec<&str> = text.lines().collect();
-            let spans = cfg_test_spans(&lines);
             let rel = path
                 .strip_prefix(&root)
                 .expect("under src")
@@ -18664,1506 +20835,55 @@ mod stage2_injector_tests {
                 // separator (backslash on Windows), but the pins are written in
                 // the crate's forward-slash convention. No-op on Unix/CI.
                 .replace('\\', "/");
-            let test_file = rel.trim_end_matches(".rs").ends_with("_tests");
-            for (n, line) in lines.iter().enumerate() {
-                let code = code_of(line);
-                if !code.contains(&needle) || code.contains("..") {
-                    continue;
-                }
-                if test_file || spans.iter().any(|(a, b)| (*a..=*b).contains(&n)) {
-                    in_test += 1;
-                } else if code.contains("waiting_for = ")
-                    || code.contains("Ok(Some(")
-                    // `install_direct_choice_frame` owns the actual
-                    // `state.waiting_for` write. Its typed prompt argument is
-                    // still a production mint, not a reader; the call sits
-                    // within this bounded argument expression. Read through
-                    // `code_of` as well, so prose naming the call cannot
-                    // promote a reader to a producer.
-                    || lines[n.saturating_sub(32)..n]
-                        .iter()
-                        .any(|prior| code_of(prior).contains(".install_direct_choice_frame("))
-                {
-                    producers.push(format!("{rel}:{}", n + 1));
-                } else {
-                    readers.push(format!("{rel}:{}", n + 1));
-                }
-            }
+            let (file_producers, file_readers, file_in_test) = cr_603_5_sites(&rel, &text);
+            producers.extend(file_producers);
+            readers.extend(file_readers);
+            in_test += file_in_test;
         }
+        producers.sort();
 
         assert_eq!(
             producers.len() + readers.len() + in_test,
-            41,
+            46,
             "CR 603.5 prompt census drifted. A new PRODUCER must have its recipient bound \
              somewhere — the mint's conjunct (a) covers exactly ONE of them. A new READER is \
-             the benign case (U4's own consumption arm was one): adjudicate it in this doc and \
-             name the site, do not merely move the number.\n\
+             the benign case (U4's own consumption arm was one).\n\
              producers={producers:#?}\nreaders={readers:#?}"
         );
-        // TEST-FIXTURE DRIFT, adjudicated on THIS branch (plan-v23 Step 5, session 4),
-        // `27 ⇒ 28`. One new line, again in the third (benign) partition:
-        // `game/triggers.rs::approved_construction_prompts` — the fixture that enumerates one
-        // instance of each of the six approved trigger-construction prompts, which the
-        // construction-finisher contract rows iterate. It mints nothing in production and
-        // reads `state.waiting_for` nowhere. The PRODUCER half is unchanged at 5 and the
-        // READER half unchanged at 7, both with byte-identical per-file lists.
-        // TEST-FIXTURE DRIFT, adjudicated on THIS branch (plan-v23 Steps 6/7), `25 ⇒ 27`.
-        // Both new lines are `#[cfg(test)]` fixture waits, i.e. the third partition — the
-        // benign class. The PRODUCER half is unchanged at 5 with a byte-identical per-file
-        // list, and the READER half is unchanged at 7, which is what this row's claim is
-        // about. The two lines are:
-        //   - `game/triggers.rs::observer_helper_fixture` — the paused wait the
-        //     `park_observer_triggers_if_paused` rows need in order to reach that helper's
-        //     collecting branch at all;
-        //   - `game/visibility.rs::triggered_mana_projection_fixture` — the live public
-        //     prompt the Step-6 redaction rows assert survives viewer filtering.
-        // Neither mints a prompt in production; neither reads `state.waiting_for` in
-        // production. Adjudicated, not relaxed: a sixth PRODUCER would still red the
-        // partition assert below before this total could absorb it.
         assert_eq!(
             (producers.len(), readers.len(), in_test),
-            (5, 8, 28),
-            "the partition, not just the total: five PRODUCTION producers, eight PRODUCTION \
-             readers (they read `state.waiting_for` and never write it), 28 `#[cfg(test)]` lines.\nproducers={producers:#?}\n\
+            (5, 9, 32),
+            "the partition, not just the total: five PRODUCTION producers, nine PRODUCTION \
+             readers (they read `state.waiting_for` and never write it), 32 `#[cfg(test)]` lines \
+             (the 31st is `sba.rs`'s paused-resolution fixture for the CR 704.4 safety-net guard; \
+             the 32nd is `triggers.rs`'s positive reach-guard row for \
+             `resolution_frame_is_live_off_priority`).\nproducers={producers:#?}\n\
              readers={readers:#?}"
         );
         assert_eq!(
             producers,
             vec![
-                // DRIFT LOG for these three, newest last. Every entry is pure line movement
-                // with the producer re-read and sha256-compared at its new coordinate; none has
-                // ever been a real sixth producer.
-                //   #6842 (8121fd1c6): `:5896/:5973/:8927 ⇒ :5918/:5995/:8949`, uniform +22.
-                //   #6933: `engine.rs :10640 ⇒ :11427` (that entry, below).
-                //   #6955 (c9daf66e3): `:8949 ⇒ :8970`, +21 == that commit's insertion count,
-                //     and the other two did NOT move, which located the insertion below them.
-                //   #6961 (2ead7aab1) + v0.44.0: `:5918/:5995/:8970 ⇒ :5996/:6073/:9048`,
-                //     uniform +78 above all three (whole-file delta +153/-15).
-                //   #6957 (this branch, base 4f524c6014): `:5999/:6076/:9051 ⇒
-                //     `:6061/:6138/:9113`, uniform +62 above all three. The two hunks above
-                //     them are `-3` (the `matches!(scope, PlayerFilter::All)` gate replaced by
-                //     a named local) and `+65` (`scope_keeps_scoped_whole_hand_shuffle_local`
-                //     and its doc comment); every other hunk in the file is at `:27733+`, i.e.
-                //     BELOW all three. Identity re-established, not assumed: each producer is
-                //     sha256-identical to `4f524c6014:effects/mod.rs` at its old coordinate.
-                //   #6956 (same branch, second unit): `:9113 ⇒ :9243`, +130, and ONLY that
-                //     entry moved — the other four stayed byte-identical AND in place, which is
-                //     the set-preservation evidence. The +109 is the
-                //     zero-policy pair inserted at `:7030` (+131, minus a 1-line comment
-                //     reflow at `:7020`), i.e. below `:6061`/`:6138` and above `:9113`. The
-                //     only other hunks are in `mod tests`. Producer sha256-identical at its
-                //     new coordinate.
-                //   #6956 fix round (review round 1): `:6061/:6138/:9243 ⇒ :6065/:6142/:9324`,
-                //     +4 above the first two and +81 above the third. The +4 is the
-                //     `AllExcept` recursion arm added to
-                //     `scope_keeps_scoped_whole_hand_shuffle_local`; the further +77 is the
-                //     `amount_channel` classifier that collapses the twin `_ => 0` / `_ => false`
-                //     registry, plus the relay guard. All three producers sha256-identical at
-                //     their new coordinates AND still inside the same enclosing functions
-                //     (`drive_sequential_repeated_optional_payment` ×2, `resolve_chain_body`),
-                //     which is stronger evidence than the coordinate alone.
-                //   THIS PR, REBASED ONTO UPSTREAM `b654513cb` (#6996, #6999, #6998, #7001,
-                //     #6997, #6946): `:6065/:6142/:9324 ⇒ :6175/:6252/:9456`. The three pins
-                //     it replaces were UPSTREAM's own literals, correct for the upstream tree
-                //     — verified by re-deriving them at `b654513cb`, where all three sit
-                //     exactly there — so this shift is THIS BRANCH's commits replayed on top,
-                //     i.e. LOCAL, and the CI-vs-local diagnosis in the header does not apply.
-                //     The shift is NOT UNIFORM (`+110/+110/+132`), and that asymmetry is the
-                //     measurement rather than a puzzle: `git diff -U0 b654513cb HEAD` on this
-                //     file has exactly four hunks. `@@ -5957,0 +5958,110 @@` — C1's
-                //     `upfront_optional_gate` authority plus `OptionalFeasibility` — lands
-                //     above ALL THREE producers and is the whole `+110`. The third producer
-                //     takes a further `+22` from two hunks INSIDE `resolve_chain_body` and
-                //     above its own gate: `@@ -9207,0 +9318,7 @@` (the `optional_for` fan-out
-                //     coupling note) and `@@ -9281,6 +9398,21 @@` (adoption A — the inline
-                //     conjunct chain replaced by the `upfront_optional_gate` call and its
-                //     `debug_assert!`); the fourth hunk is net `0`. Whole-file delta is also
-                //     `+132`, so nothing was added below the third producer, and predicted
-                //     `6065+110`, `6142+110`, `9324+132` equal the observed coordinates
-                //     exactly. Identity re-established, not assumed: each producer at its new
-                //     coordinate is sha256-identical to `b654513cb:effects/mod.rs` at its old
-                //     one (`9869a19f…9b43a2`, `2bc316e3…e861185`, `3134c156…2aeeb66`)
-                //     and to the pre-rebase tip `117baa6a1` at
-                //     `:6109/:6186/:9183`, AND each is still inside the enclosing function
-                //     this row NAMES — `drive_sequential_repeated_optional_payment`,
-                //     `resolve_repeated_optional_payment_choice`, `resolve_chain_body`. The
-                //     diff instrument discriminates: in the NEW tree the three OLD coordinates
-                //     hold a `may_trigger_auto_choice` lookup, a blank line, and a bare `//`,
-                //     none of which mints anything. Set preservation: the two asserts above
-                //     this one ran FIRST and both fired GREEN on the run that caught this —
-                //     total still **37**, partition still **5/7/25** — and the other two
-                //     entries (`scoped_library_search.rs:452`, `engine.rs:11549`) did not move
-                //     at all, both re-read and sha256-confirmed in place. (`engine.rs`'s entry
-                //     has since moved to `:11619` — see the item-2 note on that entry below;
-                //     `scoped_library_search.rs:452` still has not moved.)
-                //   Valakut #7047 fix round: `:9458 ⇒ :9442`, −16, and only that
-                //     effects/mod.rs entry moved relative to current main. The
-                //     `QuantityExpr::any_ref` relocation replaces the 16-line traversal match
-                //     with a delegation; it sits above this producer and below the first two.
-                //     The merge tree therefore retains main's first two coordinates
-                //     (`:6177`/`:6254`) and shifts this one by −16 to `:9442`.
-                //   Random-discard-as-a-cost (#7320, review round 1): `engine.rs:12004 ⇒
-                //     :12019`, +15, and ONLY the engine.rs entry moved — the four
-                //     effects/mod.rs + scoped_library_search entries did not, which is the
-                //     set-preservation evidence. `git diff -U0` on this file has exactly three
-                //     hunks, ALL inside `drain_pending_cost_move_resume` at `:5761`/
-                //     `:5865` (+1/+13 = +14, zero deletions), i.e. entirely ABOVE this
-                //     producer; predicted `12004+14` equals the observed coordinate exactly.
-                //     They add the `RandomDiscardUnlessPayment` delivery resume and its
-                //     dispatch arm — a cost-payment continuation, not
-                //     a prompt mint: it RESUMES an already-minted `UnlessPayment` rather than
-                //     creating a recipient, so it is correctly absent from this census.
-                //     Identity re-established, not assumed: the producer at `:12019` is the
-                //     same announcement-time modal mint this row NAMES — an `Ok(Some(..))` of
-                //     the optional-effect prompt over `player` / `source_id` /
-                //     `trigger_description` / `may_trigger_key` — still inside
-                //     `begin_pending_trigger_target_selection`. (Spelled out rather than
-                //     quoted: the needle above is ASSEMBLED so this row cannot be counted by
-                //     its own instrument, and a verbatim quote here re-introduces exactly the
-                //     self-count that defends against — it inflates `in_test` and reds the
-                //     TOTAL assert instead of this one.) The two asserts
-                //     above this one fired GREEN on the run that caught it — total still 37,
-                //     partition still 5/7/25 — so no producer was added or lost.
-                //
-                // ⚠ THIS ROW FAILS IN CI BEFORE IT FAILS LOCALLY, and that is not a bug in the
-                // row. CI checks out `refs/pull/<n>/merge` — this branch merged with CURRENT
-                // `main` — so an upstream insertion above a producer reds it in CI while the
-                // branch tree stays green, until the branch merges that upstream. Diagnose by
-                // rebuilding the merge tree (`git merge-tree --write-tree HEAD upstream/main`)
-                // and comparing coordinates there, NOT by editing pins to match a local tree.
-                //
-                // Five drifts, all upstream, zero true positives. The pin stays line-exact
-                // because that is what makes a NEW mint a counted event; a function +
-                // content-hash anchor would end the drift class while keeping that property,
-                // and is offered as a follow-up rather than taken unannounced mid-review.
-                // #6812 noted-mana support inserts two lines above all three producers:
-                // `:6210/:6287/:9475 => :6212/:6289/:9477`. The producers remain byte-identical.
-                // #7018 adds the 16-line distinct-player-scope continuation gate above all
-                // three producers: `:6212/:6289/:9477 => :6228/:6305/:9493`.
-                // shifts combine with #6958's paid-cast outcome exclusion and
-                // #6976's conditional-branch exclusions. None creates an
-                // `OptionalEffect` prompt. Re-pinned against the merged source.
-                // Current-main port: #7221's typed player-action completion seam and the
-                // contemporaneous upstream changes moved these three producers. Re-derived
-                // in the merged source, still in their named production functions.
-                //
-                // Fight for the Throne commander-gate unit (base 8035813e6):
-                // `:6640/:6717/:9922 ⇒ :6647/:6724/:9929`, uniform +7. LOCAL, not upstream,
-                // so the CI-vs-local diagnosis in the header does not apply. `git diff -U0`
-                // on effects/mod.rs has exactly four hunks: `@@ -12,7 +12,7 @@` (net 0 — the
-                // `CommanderOwnership` import reflow), `@@ -3238,0 +3239,3 @@` (+3, the
-                // `AbilityCondition::ControlsCommander` leaf arm in
-                // `condition_reads_filter_population`), `@@ -3639,0 +3643,4 @@` (+4, the same
-                // variant joining `should_resolve_subability_on_optional_decline`'s live-gate
-                // list), and `@@ -12474,0 +12482,23 @@` (+23, the `evaluate_condition`
-                // delegation to `game::commander`) which sits BELOW all three producers and
-                // therefore moves none of them. 3 + 4 = the whole +7, and predicted
-                // `6640+7`/`6717+7`/`9922+7` equal the observed coordinates exactly. None of
-                // the three arms mints a prompt — they are condition CLASSIFICATION arms plus
-                // one boolean predicate delegation. Identity re-established, not assumed: each
-                // producer at its new coordinate is sha256-identical to
-                // `8035813e6:effects/mod.rs` at its old one (`a8512b402f8675b7`,
-                // `82c6c569182ae4ed`, `c9d8e7ba3b9e29e2`) and still sits inside the enclosing
-                // function this row NAMES (`drive_sequential_repeated_optional_payment` ×2,
-                // `resolve_chain_body`). The diff instrument discriminates: the three OLD
-                // coordinates now hold a `PendingRepeatedOptionalPayment` field init, a
-                // `payment_unit` argument, and a `trigger_events` clone — none of which mints
-                // anything. Set preservation: the two asserts above this one ran FIRST and
-                // both fired GREEN on the run that caught this (total still 37, partition
-                // still 5/7/25), and the other two entries did not move.
-                //
-                // Fight for the Throne review-fix round (same base 8035813e6):
-                // `:6647/:6724/:9929 ⇒ :6680/:6757/:9964`, i.e. `+40/+40/+42` measured
-                // from BASE (`:6640/:6717/:9922`), not from the row above. LOCAL, not
-                // upstream, so the CI-vs-local diagnosis in the header does not apply.
-                // `git diff -U0 8035813e6` on effects/mod.rs now has eight hunks; the
-                // ones that move a producer are, in order: `@@ -2935,0 +2936,33 @@`
-                // (+33, `condition_survives_false_parent_gate` — the single authority
-                // the CR 603.4 delayed-hoist carve-out now shares with
-                // `resolve_chain_body`), `@@ -3238,0 +3272,3 @@` (+3) and
-                // `@@ -3639,0 +3676,4 @@` (+4) — the two condition-classification arms
-                // already logged above. 33 + 3 + 4 = the `+40` on the first two. The
-                // third takes a further `+2` from the two hunks INSIDE
-                // `resolve_chain_body` and above its own gate:
-                // `@@ -9679,4 +9719,10 @@` (+6, the twin sub-gate clauses collapsed
-                // into the shared `condition_survives_false_parent_gate` call) and
-                // `@@ -9701,5 +9747 @@` (−4, the corresponding conjunct removal); the
-                // remaining hunks (`@@ -12,7 +12,7 @@` net 0, the `evaluate_condition`
-                // delegation, and `mod tests`) are net-zero or BELOW all three.
-                // Predicted `6640+40`/`6717+40`/`9922+42` equal the observed
-                // coordinates exactly. None of the moved code mints a prompt: it is one
-                // boolean condition classifier plus the call sites that consume it.
-                // Identity re-established, not assumed: each producer at its new
-                // coordinate is sha256-identical to `8035813e6:effects/mod.rs` at its
-                // old one (`9869a19f28c791ee`, `2bc316e3aa0297f8`, `8df98486627bfe15`)
-                // and still sits inside the enclosing production function it always
-                // did — `drive_sequential_repeated_optional_payment` (6653-6687),
-                // `resolve_repeated_optional_payment_choice` (6695-6779) and
-                // `resolve_chain_body`. (The row above names the first two as
-                // `drive_sequential_repeated_optional_payment` ×2; re-derived here, the
-                // second is the `resolve_repeated_optional_payment_choice` resume arm,
-                // which is what the older entries called it.) The diff instrument
-                // discriminates: the three OLD coordinates now hold a blank line, an
-                // `.active_repeated_optional_payment_frame_mut()` call and a `//`
-                // comment, none of which mints anything. Set preservation: the two
-                // asserts above this one ran FIRST and both fired GREEN on the run that
-                // caught this (total still 37, partition still 5/7/25), and the other
-                // two entries did not move.
-                //
-                // Fight for the Throne review-fix round 2 (same base 8035813e6):
-                // `:6715/:6792/:9994`, i.e. `+75/+75/+72` measured from BASE
-                // (`:6640/:6717/:9922`), not from the row above. LOCAL, not upstream, so
-                // the CI-vs-local diagnosis in the header does not apply. `git diff -U0
-                // 8035813e6` on effects/mod.rs has eight hunks; above the first two
-                // producers are `@@ -2935,0 +2936,68 @@` (+68 — the condition classifier
-                // of the row above, now also carrying the shared
-                // `sub_outlives_false_parent_gate` authority the CR 603.4 delayed-hoist
-                // carve-out and `resolve_chain_body` both call), `@@ -3238,0 +3307,3 @@`
-                // (+3) and `@@ -3639,0 +3711,4 @@` (+4): 68 + 3 + 4 = the `+75`. The third
-                // producer nets `−3` more from the two hunks INSIDE `resolve_chain_body`
-                // and above its own gate — `@@ -9679,4 +9753,0 @@` (−4, the twin
-                // `sub_survives_false_parent_gate` / `sub_is_replicated_or_branch` locals
-                // collapsed into the one shared call) and `@@ -9698,9 +9769,10 @@` (+1) —
-                // giving `+72`; the remaining hunks (`@@ -12,7 +12,7 @@` net 0, the
-                // `evaluate_condition` delegation, and `mod tests`) are net-zero or BELOW
-                // all three. Predicted `6640+75`/`6717+75`/`9922+72` equal the observed
-                // coordinates exactly. None of the moved code mints a prompt: it is one
-                // boolean sub-classification predicate plus the call site that consumes it.
-                // Identity re-established, not assumed: each producer at its new coordinate
-                // is sha256-identical to `8035813e6:effects/mod.rs` at its old one
-                // (`9869a19f28c791ee`, `2bc316e3aa0297f8`, `8df98486627bfe15`) and still
-                // sits inside the enclosing production function this row NAMES —
-                // `drive_sequential_repeated_optional_payment` (opens 6702),
-                // `resolve_repeated_optional_payment_choice` (opens 6730) and
-                // `resolve_chain_body`. The diff instrument discriminates: the three OLD
-                // coordinates now hold a `return Ok(());`, an
-                // `optional_cost_payments_this_resolution` binding and a
-                // `resolve_optional_effect_decision(` call, none of which mints anything.
-                // Set preservation: the two asserts above this one ran FIRST and both
-                // fired GREEN on the run that caught this (total still 37, partition still
-                // 5/7/25), and the other two entries did not move.
-                //   Fight for the Throne, same branch, same base `8035813e6`:
-                //   `:6715/:6792/:9994 ⇒ :6722/:6799/:10001`, a UNIFORM `+7` on all three,
-                //   i.e. `+82/+82/+79` measured from the base. The row above measured
-                //   `+75/+75/+72` from that same base, so the delta is `+7` and its sole
-                //   cause is that the FIRST hunk GREW: `@@ -2935,0 +2936,68 @@ ⇒
-                //   @@ -2935,0 +2936,75 @@`, the `condition_survives_false_parent_gate`
-                //   doc/authority block picking up seven more lines. No hunk was added or
-                //   removed and none changed size: the other four are byte-for-byte the
-                //   sizes the row above names (`+3` at `:3307 ⇒ :3314`, `+4` at
-                //   `:3711 ⇒ :3718`, `−4` at `:9753 ⇒ :9760`, `+1` at `:9769 ⇒ :9776`) and
-                //   merely shifted by the same `+7`, which is what makes the shift uniform
-                //   even for the third producer (its `−4/+1` pair still nets the same `−3`
-                //   below the other two). Predicted `6640+82`/`6717+82`/`9922+79` against
-                //   `8035813e6` equal the observed coordinates exactly. Identity
-                //   re-established, not assumed: each producer at its new coordinate is
-                //   sha256-identical to `8035813e6:effects/mod.rs` at its old one
-                //   (`7067db50922da31f`, `975791a569b1f587`, `967e35eb66a5780b` over the
-                //   15-line mint expression at each site). This card's own effects/mod.rs
-                //   edits — the two `AbilityCondition::ControlsCommander` registrations at
-                //   `:3314`/`:3718` and the `evaluate_condition` arm below all three — mint
-                //   nothing: they are classifier list entries and one condition evaluator.
-                //
-                // Wheel of Misfortune (#7266), MEASURED ON THE MERGE TREE. This row's
-                // own header warns that a fork branch's pins are correct for the branch
-                // and wrong for `refs/pull/<n>/merge`; both sides of this conflict were
-                // that kind of local-correct. `origin/main` carried `:6306/:6383/:9578`
-                // and the branch carried `:6261/:6338/:9550`; NEITHER is right here, so
-                // the merged file was re-measured rather than either side taken:
-                // `:6306/:6383/:9578 => :6315/:6392/:9606`, i.e. `+9/+9/+28`.
-                //
-                // The asymmetry IS the measurement. This branch's non-test additions to
-                // effects/mod.rs, in file order:
-                //   `pub mod reveal_chosen_numbers;` — 1 line, above all three.
-                //   the `Effect::RevealChosenNumbers` dispatch arm — 3 lines, above all
-                //     three (the dispatch table precedes every producer).
-                //   the `QuantityRef::PlayerChosenNumber` arm in
-                //     `candidate_player_scalar` — 5 lines, above all three.
-                // 1 + 3 + 5 = the uniform `+9` the first two producers take. The third
-                // takes a further `+19` from the depth-0 per-player secret-number ledger
-                // reset in `resolve_ability_chain` (16 lines, plus 3 widening the clear
-                // to retain both `Number` and `RevealedNumber`), which sits above it and
-                // below the first two: 9 + 19 = 28. Predicted and observed agree.
-                //
-                // Nothing added here raises a `WaitingFor`: the two clears and the scalar
-                // read are pure state reads/writes, and the dispatch arm delegates to
-                // `reveal_chosen_numbers::resolve`, which converts
-                // `ChosenAttribute::Number` to `RevealedNumber` and emits an event. The
-                // census set is therefore still exactly 5.
-                //
-                // NOTE for the next drift: upstream refactored the third producer from a
-                // `state.waiting_for = …` assignment form into a bare struct-literal value
-                // inside a returned tuple. It is still one producer and still matches this
-                // row's assembled needle, but a grep for the old assignment form now finds
-                // only two — measure with the needle, not with the assignment.
-                //
-                // And do NOT spell the needle literally in this comment. It is assembled
-                // at the top of this row precisely so the row cannot count itself, but the
-                // walker reads every line of this file: writing the struct-literal form
-                // out in prose here adds a phantom `in_test` hit per mention. Two such
-                // mentions in an earlier draft of this very note pushed the partition to
-                // 27 and reded the row — the instrument working exactly as intended.
-                //
-                // SECOND merge with main (#7221's typed player-action completion seam and
-                // its contemporaries). Same rule, applied again: `main` re-derived these to
-                // `:6640/:6717/:9922` for ITS tree and the branch carried `:6315/:6392/:9606`
-                // for its own; the merged file measures `:6653/:6730/:9954`, a uniform `+13`
-                // over main's coordinates. That `+13` is exactly this branch's four
-                // additions above all three producers: `pub mod reveal_chosen_numbers;` (1),
-                // the `Effect::RevealChosenNumbers` dispatch arm (3), the
-                // `QuantityRef::PlayerChosenNumber` arm in `candidate_player_scalar` (5),
-                // and its arm in main's new `quantity_ref_counts_population_matching` (4).
-                // It is uniform this time — unlike the first merge — because main's own
-                // churn moved the depth-0 ledger reset and the third producer together, so
-                // the branch's extra offset there is already inside main's baseline rather
-                // than stacked on top of it.
-                //
-                // Measure AFTER the last edit to effects/mod.rs, not during: an earlier
-                // pass here recorded `+9` from a measurement taken before that fourth arm
-                // was added, and the row caught the 4-line discrepancy.
-                // Unbounded-number round (same PR): `:6653/:6730/:9954 =>
-                // `:6655/:6732/:9956`, a uniform `+2` — the unbounded-range arm
-                // added to `compute_options`' sibling classifier in this file,
-                // which sits above all three producers. Nothing added raises a
-                // `WaitingFor`; the census set is still exactly 5.
-                //
-                // MERGE OF `origin/main` (`59f5a51e`) INTO THIS BRANCH (First Family's
-                // characteristic-set union). This array conflicted, and the header's rule
-                // applied a third time: `origin/main` carried `:6656/:6733/:9974` and this
-                // branch carried `:6648/:6725/:9947`, each correct for its own tree and
-                // neither correct for the merge. NEITHER SIDE WAS TAKEN — the merged file
-                // was re-measured: `:6656/:6733/:9974 => :6664/:6741/:9982`, a uniform
-                // `+8` over main's coordinates.
-                //
-                // The `+8` is exactly this branch's net insertion into effects/mod.rs, and
-                // all of it sits above the FIRST producer, which is why the shift is
-                // uniform rather than staggered. `git diff -U0 origin/main` on that file
-                // has exactly four hunks, ALL between `:2966` and `:3047`:
-                //   `filter_contains_last_created`'s characteristic-source arm (+1),
-                //   `card_type_set_source_counts_population_matching`'s zone/tracked-set/
-                //     union population cases (+7),
-                //   the `quantity_ref_counts_population_matching` arm the union folds
-                //     into the shared helper (-1), and
-                //   its replacement delegation (+1).
-                // 1 + 7 - 1 + 1 = 8, with nothing below `:3047` — predicted and observed
-                // agree. None of the four raises a prompt: they are population COUNTS
-                // (pure reads over zones, tracked sets and unions), so the census set is
-                // still exactly 5.
-                //
-                // Identity re-established at the new coordinates rather than assumed. Each
-                // producer line is byte-identical by sha256 to the same producer on BOTH
-                // parents — `9869a19f…`, `2bc316e3…` and `8df98486…` respectively, the
-                // same three digests the line carries at `:6656/:6733/:9974` on main and
-                // at `:6648/:6725/:9947` on this branch. The two asserts above this one
-                // fired GREEN on the merged tree — total still 38, partition still 5/8/25
-                // — and the other two entries did not move (`scoped_library_search.rs:452`
-                // unmoved, `engine.rs:12773` unmoved, both re-read and sha256-confirmed in
-                // place). A merge that had gained or lost a producer could not leave two
-                // entries byte-identical AND at their coordinates while moving the other
-                // three by a figure the diff predicts exactly.
-                //
-                // CR-CITATION ROUND (review follow-up), LOCAL not upstream — so the
-                // CI-vs-local diagnosis in the header does not apply, the shift
-                // originates in this same diff. `:6664/:6741/:9982 => :6670/:6747/:9988`,
-                // a uniform `+6`.
-                //
-                // A COMMENT-ONLY round, and the census caught it, which is the row
-                // working exactly as designed rather than a defect in the row.
-                // effects/mod.rs's entire delta is two comment hunks in
-                // `card_type_set_source_counts_population_matching`, both ABOVE all three
-                // producers: `@@ -2976,2 +2976,5 @@` (+3, the `TurnJournal` arm's
-                // citation corrected off CR 601.2a) and `@@ -2979 +2982,4 @@` (+3, the
-                // `AnyOf` arm's off CR 109.2). 3 + 3 = 6, with nothing below `:2985` —
-                // predicted and observed agree. Prose cannot mint a prompt, and the
-                // census agrees: the two asserts above this one fired GREEN on the run
-                // that caught this (total still 38, partition still 5/8/25) and the
-                // panic was on this third assert alone, which is what makes it a
-                // coordinate shift rather than a set change.
-                //
-                // Identity re-established rather than assumed: the three producer lines
-                // are byte-identical by sha256 at their new coordinates to the same
-                // producers at `:6664/:6741/:9982` — `9869a19f…`, `2bc316e3…`,
-                // `8df98486…`, the same digests this log recorded one entry above. The
-                // other two entries did not move (`scoped_library_search.rs:452` and
-                // `engine.rs:12773`, both re-read and sha256-confirmed in place); this
-                // round does not touch either file's producer region at all.
-                //
-                // BOUNDED-UNION-WALKER ROUND (review follow-up), LOCAL not upstream.
-                // `:6670/:6747/:9988 => :6685/:6762/:10003`, a uniform `+15`.
-                //
-                // effects/mod.rs's whole delta is the split of
-                // `card_type_set_source_counts_population_matching` into a bounded
-                // walker plus a leaf classifier, both ABOVE all three producers:
-                // `@@ -2971,0 +2972,16 @@` (+16, the walker and its truncation
-                // contract) and `@@ -2982,7 +2998,6 @@` (-1, the `AnyOf` recursion arm
-                // collapsing to a no-op now that unions are unrolled before the
-                // classifier sees them). 16 - 1 = 15, with nothing below `:3004` —
-                // predicted and observed agree.
-                //
-                // The split moves a recursion; it mints nothing. The census agrees: the
-                // two asserts above this one fired GREEN (total still 38, partition
-                // still 5/8/25) and the panic was on this third assert alone. Identity
-                // re-established rather than assumed — `9869a19f…`, `2bc316e3…`,
-                // `8df98486…` at the new coordinates, the same digests recorded one
-                // entry above — and the other two entries did not move.
-                //
-                // THIRD merge with main (this branch × `origin/main` @ 59f5a51e, which
-                // by now carries Wheel of Misfortune's unbounded-number round). Same rule
-                // as the two merges logged above, applied a third time: each side's pins
-                // were local-correct and BOTH are wrong for the merged tree, so the merged
-                // file was re-measured rather than either side taken. `origin/main`
-                // carried `:6656/:6733/:9974`; this branch carried `:6722/:6799/:10001`;
-                // the merged file measures `:6738/:6815/:10053`.
-                //
-                // The merged coordinates are PREDICTED, not merely observed, and the
-                // prediction is what makes this a measurement rather than a fixup:
-                // `main`'s pins plus this branch's own base-relative offsets — `+82/+82/+79`,
-                // the figure the row immediately above derives from base `8035813e6` and
-                // re-derives twice — give `6656+82`/`6733+82`/`9974+79` =
-                // `:6738`/`:6815`/`:10053`, equal to the observed coordinates exactly.
-                // That the branch's offsets compose additively onto main's is the evidence
-                // the merge introduced no new producer and displaced none: a merge that had
-                // gained or lost one would break the additivity, not just shift a pin.
-                //
-                // Set preservation: the assembled needle finds exactly five hits in the
-                // merged effects/mod.rs (`:6738`, `:6815`, `:10053`, `:14805`, `:15290`);
-                // the last two fall inside the `#[cfg(test)]` span opening at `:13563` and
-                // so are the partition's test half, leaving the same three production
-                // producers this row has always pinned. Total still 37, partition still
-                // 5/7/25. The merge added no `WaitingFor` producer on either side — main's
-                // contribution here is the unbounded-range arm in `compute_options`' sibling
-                // classifier and this branch's is the CR 603.4 delayed-hoist carve-out, both
-                // pure classification code.
-                //
-                // FOURTH MERGE (this branch × `origin/main` @ `2ae92459`). The header's
-                // rule applies again and for the same reason: `origin/main` carried
-                // `:6738/:6815/:10053` and this branch carried `:6685/:6762/:10003`, each
-                // correct for its own tree and NEITHER correct for the merge. Neither side
-                // was taken — the merged file was re-measured to
-                // `:6767/:6844/:10082`, a uniform `+29` over main's coordinates.
-                //
-                // The `+29` is this branch's CUMULATIVE net insertion into
-                // effects/mod.rs relative to main, not any single round's:
-                // `git diff --numstat origin/main` on that file reads `33 4` = `+29`, and
-                // its five hunks all sit between `:3041` and `:3144`, above the first
-                // producer with nothing below. It is the sum of the three rounds this log
-                // records — `+8` (union population), `+6` (CR citations), `+15` (bounded
-                // walker) — which is exactly why the per-round figure is the WRONG one to
-                // compose here.
-                //
-                // Recorded because the first attempt at this entry got it wrong: it
-                // composed only the last round's `+15` onto main and predicted
-                // `:6753/:6830/:10068`, which the measurement contradicted. The pins below
-                // come from measuring the merged tree, and the arithmetic is reconciled
-                // to that measurement rather than the other way round. A prediction is
-                // evidence only when it is made against the cumulative offset.
-                //
-                // Identity re-established rather than assumed — `9869a19f…`, `2bc316e3…`,
-                // `8df98486…` at the new coordinates, the same three digests this log has
-                // carried since the first merge — and the other two entries did not move:
-                // `scoped_library_search.rs:452`, and `engine.rs:12796`, which is main's
-                // own coordinate for that producer (this branch's engine.rs edits are all
-                // in the census array far below it).
-                //
-                // NOTE on the prose above from main: that entry's "total still 37,
-                // partition still 5/7/25" describes an older census. The asserts in this
-                // file read 38 and 5/8/25, and both fired GREEN on the merged tree.
-                //
-                // FIFTH MERGE (this branch × `origin/main` @ `0f37d27b`, Doomsday).
-                // Main's own entry for this round, preserved: "#7403/#7389 move main's
-                // three production pins to `:6738/:6815/:10053`; the Doomsday tracked-set
-                // publication adds seven lines above each. Re-measured in this merged
-                // tree: `:6745/:6822/:10060`. The three sites remain the existing
-                // producers." That is main's coordinate, correct for main.
-                //
-                // Neither side taken, again. Main carried `:6745/:6822/:10060` and this
-                // branch carried `:6767/:6844/:10082`; the merged file measures
-                // `:6774/:6851/:10089`.
-                //
-                // Predicted with the CUMULATIVE offset, which is the lesson the previous
-                // entry records: main's `:6745` plus this branch's `+29` net insertion
-                // into effects/mod.rs gives `6745+29`/`6822+29`/`10060+29` =
-                // `:6774`/`:6851`/`:10089`, equal to the measurement. Main's `+7`
-                // (Doomsday) and this branch's `+29` compose additively, which is the
-                // set-preservation evidence: a merge that gained or lost a producer would
-                // break the additivity rather than merely shift a pin.
-                //
-                // Identity re-established: `9869a19f…`, `2bc316e3…`, `8df98486…` at the
-                // new coordinates. The other two entries did not move.
-                //
-                // CONVERGENT RE-MEASUREMENT, and the strongest evidence in this log. The
-                // maintainer merged the same upstream commit into this branch
-                // independently and in parallel, and recorded it thus: "#7404's Doomsday
-                // tracked-set publication and this branch's characteristic-source work
-                // both shift the producer coordinates. Re-measured in this merged tree:
-                // `:6774/:6851/:10089`. The three sites remain the existing producers."
-                //
-                // Two independent measurements of the same merged tree, agreeing to the
-                // line on all three coordinates. That is what a coordinate this log can
-                // trust looks like — and it is why the two prose entries are BOTH kept
-                // rather than one overwriting the other: they are separate witnesses, not
-                // duplicates.
-                // Mycoloth devour/drain freeze (Discord 1537641754298290226), measured at
-                // upstream `66b2cbf5a1`: `:6774/:6851/:10089 ⇒ :6852/:6929/:10167`, a UNIFORM
-                // `+78` on all three. LOCAL, not upstream, so the CI-vs-local diagnosis in the
-                // header does not apply — the `+78` is this change's own `effects/mod.rs` delta
-                // (`git diff --stat` on that file against `76751548f` is `+78/-0`), namely the
-                // ADDITION of the new `sweep_ownerless_post_replacement_strand` function and its
-                // doc block, inserted immediately above `resume_resolution_frames` and therefore
-                // above all three producers.
-                //
-                // Stated as an ADDITION because that is what the committed diff contains: the
-                // hunk is `+78/-0` with no deletion anywhere, and
-                // `git grep -c ownerless 76751548f -- crates/engine/src` finds nothing, so there
-                // was no already-shipped sweep for a relocation to have moved. An earlier draft
-                // of this entry called it a relocation; the block was indeed moved, but only
-                // within this branch's own uncommitted history, which is invisible to every
-                // future reader of the committed diff. This log speaks in terms of the committed
-                // diff or it is not evidence.
-                //
-                // The conclusion is unchanged and still correct: the new function mints nothing,
-                // because it only retires a `DrainStatus::Dispatching` resident and creates no
-                // recipient, so it is correctly absent from this census.
-                // The `engine.rs` entry moved TOO this round (`:12796 ⇒ :12850`, `+54`) — see the
-                // note on that entry below. That is the first time a non-`effects/mod.rs` pin has
-                // drifted here, and the cause is this change's OWN second authorized edit in this
-                // file, not a set change.
-                // Identity re-established, not assumed: each producer at its new coordinate is
-                // sha256-identical to `66b2cbf5a1:effects/mod.rs` at its old one
-                // (`9869a19f28c791ee`, `2bc316e3aa0297f8`, `8df98486627bfe15`).
-                // Set preservation: the two asserts above this one ran FIRST and both fired
-                // GREEN on the run that caught this — total still **38**, partition still
-                // **5/8/25** — so no producer was added or lost, and this change's added lines
-                // contain zero occurrences of the assembled needle.
-                // `scoped_library_search.rs:452` did NOT move, re-read and confirmed in place.
-                //
-                // C1 FIX ROUND (clippy `doc_lazy_continuation` on that same new sweep's doc):
-                // `:6852/:6929/:10167 ⇒ :6853/:6930/:10168`, a UNIFORM `+1`. LOCAL, not
-                // upstream, so the CI-vs-local diagnosis in the header does not apply. The whole
-                // cause is ONE blank `///` line added to `sweep_ownerless_post_replacement_strand`'s
-                // doc block, separating its two closing prose lines from the bullet list above
-                // them so they read as their own paragraph rather than as an unindented
-                // continuation of the last bullet. That doc block sits above all three producers
-                // and is `effects/mod.rs`'s only change this round, taking the whole-file delta
-                // against `76751548f` from the `+78/-0` measured above to `+79/-0`. A doc line
-                // cannot mint a prompt.
-                //
-                // Set preservation: this row's OWN failure output named all five entries, and
-                // only the three `effects/mod.rs` ones shifted — `scoped_library_search.rs:452`
-                // was reported unmoved, which a census that had gained or lost a producer could
-                // not do.
-                // The `engine.rs` entry is deliberately NOT offered as a second unmoved control.
-                // It did read `:12850` when this row failed, but the L1 entry below moves it to
-                // `:12852` in this same commit, so a future reader of the committed diff cannot
-                // reproduce the `:12850` reading at all. The two readings reconcile only as
-                // separate uncommitted sub-rounds — exactly the within-branch history the
-                // ADDITION-vs-relocation note above rules inadmissible. One reproducible control
-                // is worth more than two that need the branch's private history to agree.
-                // Identity re-established rather than assumed:
-                // each producer at its new coordinate is sha256-identical to
-                // `2264d4aa3:effects/mod.rs` at its old one (`9869a19f28c791ee`,
-                // `2bc316e3aa0297f8`, `8df98486627bfe15` — the SAME three prefixes the entry
-                // above records, so this is pure line movement).
-                //
-                // REBASE ONTO `b2071a7f41`, the PR base. The local base this change was
-                // authored on (`76751548f`) never reached the remote; its companion
-                // phase-boundary drain landed upstream as #7475 instead. The header's rule
-                // applies yet again: this branch carried `:6853/:6930/:10168` and main
-                // carries `:6923/:7000/:10238`; NEITHER is correct for the rebased tree, and
-                // neither was taken — it measures `:7002/:7079/:10317`.
-                //
-                // Predicted with the cumulative offset, which is what makes this a
-                // measurement rather than a fixup: main's `:6923/:7000/:10238` plus this
-                // branch's CUMULATIVE net insertion into `effects/mod.rs` — `git diff
-                // --numstat` against the rebase base reads `79 0`, the `+78` sweep relocation
-                // plus the `+1` doc-continuation blank, and every hunk sits above the first
-                // producer — gives `6923+79`/`7000+79`/`10238+79` =
-                // `:7002`/`:7079`/`:10317`, equal to the observation on all three.
-                //
-                // Set preservation, measured on BOTH sides rather than assumed: the census
-                // reads total **41**, partition **5/8/28**, identically at the rebase base and
-                // in the rebased tree. Additivity holding on every pin while the partition is
-                // unchanged is the evidence the rebase minted and displaced nothing — a rebase
-                // that had gained or lost a producer would break the additivity, not merely
-                // shift a coordinate. Note the totals themselves moved upstream since this
-                // change was authored (**38**, `5/8/25` ⇒ **41**, `5/8/28`); that drift is
-                // main's and is adjudicated in the asserts above, which this branch does not
-                // touch.
-                //
-                // Identity re-established, not assumed: `9869a19f28c791ee`,
-                // `2bc316e3aa0297f8`, `8df98486627bfe15` at the new coordinates — the same
-                // three digests this log has carried since the first merge.
-                // `PreviousEffectCount` classification adds one line above all three
-                // producers, so main's move uniformly to `:7003/:7080/:10318`; no prompt
-                // site changes.
-                //
-                // #6857 (this branch, re-measured after the rebase onto `4c987f92a`):
-                // main's `:7003/:7080/:10318` => `:7225/:7302/:10582`. LOCATED BY DIGEST,
-                // not by arithmetic: each upstream pin's 10-line producer block was hashed
-                // at `upstream/main` and that digest searched for in this tree --
-                // `817ae852`/`43c05331`/`37d51f60`, each found at exactly ONE coordinate.
-                // Those three digests measure IDENTICALLY at `a8244e734` and at
-                // `4c987f92a`, so #7503 moved the producers without modifying them, and
-                // this branch displaced none of them.
-                //
-                // The deltas are AGAIN NOT uniform: `+222`/`+222`/`+264`. The additivity
-                // argument used above does not apply to this branch, because its
-                // insertions are not all above the first producer -- the mode-boundary
-                // reset lands in `resolve_ability_chain`, between the second and third.
-                // Uniformity is therefore the WRONG evidence here; digest identity is the
-                // right one, and it is what establishes the set was preserved. This
-                // branch writes `state.waiting_for` nowhere: the publish arms return
-                // `Vec<ObjectId>` and prompt for nothing, so it adds no producer here.
-                //
-                // #7484 maintainer review round 4 (same branch, no rebase):
-                // `:7225/:7302/:10582` => `:7261/:7338/:10618`, UNIFORM `+36`, and this
-                // time uniformity IS available as corroboration because every insertion
-                // sits above all three: the `GenericEffect` publish arm's
-                // `is_sole_chain_producer` gate at `:6037` and its comment block. Still
-                // located by digest rather than by arithmetic — each producer's 9-line
-                // block was hashed at this branch's committed tip and re-found at exactly
-                // one coordinate in the working tree (`cffb4348`/`0c3bdd6d`/`393bb75a`,
-                // all MATCH). The round's other edits are the two new `#[cfg(test)]`
-                // tests, which are below all three and mint no prompt, so the `in_test`
-                // total is unchanged.
-                // #7496's parked Cipher frame extends the exhaustive resume dispatch above
-                // all three producers. It adds six lines without assigning an optional-effect
-                // prompt, so the measured production producers move uniformly by `+6`.
-                // Incarnation-pin round and the port across main, adjudicated together
-                // because the port is what moved the pre-port coordinates.
-                //
-                // The port's conflict resolution kept BOTH sides of this list: main's
-                // `:7267/:7344/:10624` and the branch's `:11124`, giving FOUR
-                // `effects/mod.rs` entries. There are only THREE producers in that file,
-                // so the union could not match a census computed from source, and it
-                // contradicted the `(5, 8, 28)` partition assert directly above. A union
-                // is the wrong merge for a list whose LENGTH is asserted: these entries
-                // are not additive facts, they are one coordinate per producer.
-                //
-                // Re-measured in the ported tree BY DIGEST, not by arithmetic: each
-                // producer's 9-line block was hashed at `upstream/main`
-                // (`f9098299`/`96338f0e`/`bc850c67`) and each digest is found at exactly
-                // ONE coordinate here. `:7267/:7344/:10624` => `:7325/:7402/:11131`.
-                //
-                // The shift is NON-UNIFORM (`+58/+58/+507`): this branch's insertions are
-                // not all above the first producer, and the third sits below every
-                // discard-carrier and test addition. `bc850c67` is byte-identical to its
-                // value before the port — the same digest that pinned this producer at
-                // `:11103` and `:11124` earlier in this log — which is the evidence that
-                // it MOVED rather than being replaced.
-                // #7494 finish: `:11131 => :11229`, +98. The ordered-discard
-                // resume/finalization helpers are above this existing producer;
-                // they do not mint an optional-effect prompt. The census above
-                // still finds exactly the same five production producers.
-                // #7577 after merging upstream `07f5cfeb1`: all three producers
-                // move uniformly by -17. The census still reports exactly five
-                // production producers, and each remains in its named function.
-                "game/effects/mod.rs:7356".to_string(),
-                "game/effects/mod.rs:7433".to_string(),
-                "game/effects/mod.rs:11260".to_string(),
-                // UNMOVED across the rebase, and that is itself evidence the SET did not
-                // move: a census that had gained or lost a producer would not leave this
-                // entry both byte-identical AND at the same coordinate.
-                "game/effects/scoped_library_search.rs:452".to_string(),
-                // 5d LOW-fix: `:10493 ⇒ :10500`, a doc-only line shift (+7 comment lines
-                // above); producer byte-identical, total 37 and partition 5/7/25 untouched.
-                // Rebase onto #6842: `:10500 ⇒ :10589`, on the same terms — that commit adds
-                // lines above this producer too. Producer byte-identical.
-                // Rebase onto #6851 (96e41b3ab): `:10589 ⇒ :10640`, again on the same terms.
-                // The +51 is exactly #6851's measured net insertion above this line (and its
-                // whole-file delta is also +51, so it adds nothing below). The OTHER FOUR
-                // entries did not move at all this time — a census that had gained or lost a
-                // producer could not leave four entries byte-identical AND in place.
-                //
-                // Fold of upstream #6933 (409956671, merged by the maintainer as d1a5270a4):
-                // `:10640 ⇒ :11427`, +787. engine.rs's whole-file delta over the same range is
-                // +1134, so 787 lands above this producer and 347 below — consistent with a
-                // file that grew around it rather than one that gained a mint. Identity
-                // re-established at the new coordinate rather than assumed: the line is
-                // byte-identical by sha256 to `ea1b0ac19:engine.rs:10640`, and it is still
-                // inside `begin_pending_trigger_target_selection` (fn opens at :11278), which
-                // is the producer this row NAMES below. The old coordinate now holds
-                // copy-target-slot code that mints nothing. The OTHER FOUR entries did not
-                // move, which is the same set-preservation evidence as the previous rebases.
-                //
-                // `PassPriority` structural-legality unit: `:11427 ⇒ :11420`, −7. UNLIKE every
-                // drift above, this one is LOCAL, not upstream — the CI-vs-local diagnosis in
-                // the header does not apply, because the shift originates in this same diff.
-                // The `(Priority, PassPriority)` reducer arm's two inline guards were extracted
-                // into `game::priority::pass_priority_legality`, replacing 11 lines with 4.
-                // That is engine.rs's only hunk ABOVE this producer — `@@ -6798,11 +6798,4 @@`,
-                // net -7, exactly accounting for the shift. The unit's only other engine.rs
-                // hunk is THIS drift-log comment, which sits below the producer and therefore
-                // cannot move it. Identity re-established at the new
-                // coordinate rather than assumed: the line is byte-identical by sha256 to
-                // `93da0ca15:engine.rs:11427`, and it is still inside
-                // `begin_pending_trigger_target_selection` (fn now opens at :11271, itself −7).
-                // The OTHER FOUR entries live in `game/effects/`, which this unit does not
-                // touch at all, and did not move — the same set-preservation evidence.
-                //
-                // THIS PR (C4's answer-beat sampler + C5's `candidate_windows` extraction), ON
-                // TOP OF UPSTREAM'S `:11420`: both insertions land in `engine.rs` ABOVE this
-                // producer and neither is a prompt. The coordinate below is re-derived from the
-                // row's OWN failure output at this base, with the line re-read and
-                // sha256-compared there and the enclosing function re-checked.
-                //
-                // THIS PR (the ACCEPT-WITH-FIXES doc round), ON TOP OF `:11515`: `⇒ :11549`,
-                // +34. LOCAL, not upstream, so the CI-vs-local diagnosis in the header does
-                // not apply. engine.rs's ENTIRE delta this round is two COMMENT hunks, and
-                // both sit above this producer: `@@ -3409,3 +3409,5 @@` in
-                // `drive_one_shortcut_cycle` (+2) and `@@ -11148,3 +11150,35 @@` in
-                // `apply_action` (+32) — 2 + 32 = 34, the whole shift, with nothing below.
-                // A comment round cannot mint a prompt, and the census agrees: total 37 and
-                // partition 5/7/25 are untouched and the other four entries did not move.
-                // Identity re-established rather than assumed: line :11549 is byte-identical
-                // by sha256 (`8a544e878d3e77fb…5cc7d63`) to `c7b18c3c7:engine.rs:11515`, and
-                // it is still inside `begin_pending_trigger_target_selection`, which moved by
-                // the same +34 (opens :11366 ⇒ :11400).
-                //
-                // REBASE ONTO UPSTREAM `b654513cb`: re-derived rather than carried over, and
-                // **UNMOVED** at `:11549`. Upstream's six commits contribute a net ZERO above
-                // this producer, measured on both sides of the rebase: it sits at `:11420` in
-                // the OLD base `dcb8f3808` and at `:11420` in the NEW base `b654513cb`, so
-                // this branch's own `+95` (C4/C5) and `+34` (the doc round) still land it on
-                // `:11549`. That an entry can stay put while three others move by `+110`/`+132`
-                // is the set-preservation evidence for this rebase: a gained or lost producer
-                // could not leave this one byte-identical AND in place. Identity re-checked at
-                // the unchanged coordinate rather than presumed from the unchanged number:
-                // sha256 `a6d7f2f9d1e15de5…5cb032`, matching `117baa6a1:engine.rs:11549`, and
-                // still inside `begin_pending_trigger_target_selection` (opens :11400 here,
-                // :11271 at `b654513cb`).
-                //
-                // THIS PR (the basis-A prose correction), ON TOP OF `a6d1a0e62`: `:11549 ⇒
-                // :11583`, +34. LOCAL, not upstream — the CI-vs-local diagnosis in the header
-                // does not apply. engine.rs's entire delta this round is THREE COMMENT HUNKS
-                // and nothing else. Two sit ABOVE this producer — `@@ -1924,5 +1924,6 @@` in
-                // `bounded_cycle_offer` (+1: the rotted `:481/:668/:710/:808` sibling-scan
-                // coordinates replaced by symbol names) and `@@ -11177,8 +11178,41 @@` in
-                // `apply_action` (+33) — summing to +34, and 11549 + 34 = 11583 exactly. The
-                // third is THIS drift entry, below the producer, which therefore cannot move
-                // it (its own size is deliberately not arithmetic here — a self-counting
-                // entry restates itself every edit). A comment round cannot mint a prompt,
-                // and the census agrees — the two asserts above this one fired GREEN on the
-                // run that caught this (total still 37, partition still 5/7/25) and the other
-                // four entries did not move (`effects/` is untouched by this commit;
-                // `scoped_library_search.rs:452` re-read and sha256-confirmed in place).
-                // Identity re-established rather than assumed: line :11583 is byte-identical
-                // by sha256 (`8a544e878d3e77fb…`, the SAME prefix this log recorded for
-                // `:11549`) to `a6d1a0e62:engine.rs:11549`, and it is still inside
-                // `begin_pending_trigger_target_selection`, which moved by the same +34
-                // (opens :11400 ⇒ :11434).
-                //
-                // ITEM 2 (`loop_period_controller`), REBASED ONTO `fa5fbdfd7`: `:11583 ⇒ :11696`.
-                // The three predecessor entries above were written against bases that are now
-                // history, and the rebase resolved a conflict in THIS array on every one of this
-                // branch's three commits — so the pin was NOT carried from either side of those
-                // conflicts. It was re-derived at the rebased tip, which is the only tree the
-                // assertion runs against.
-                //
-                // LOCATED BY CONTENT, NOT BY ARITHMETIC. Hashing every line in the file that
-                // opens this producer's prompt yields exactly ONE whose sha256 is
-                // `8a544e878d3e77fb` — `:11696`. (The producer's own text is deliberately NOT
-                // quoted in this comment: a prose copy of it would make the locating grep match
-                // twice, and a census that finds its instrument's own documentation is the
-                // stale-coordinate failure wearing a different hat.) A sum-of-hunks figure
-                // would have been the wrong instrument here regardless: three-way conflict
-                // resolution is not a line-shift, so `+113` is a description of where the
-                // producer landed, never the evidence that it is the same producer. Uniqueness of
-                // the hash IS that evidence, and it is what a stale-coordinate defect (the exact
-                // failure this census exists to catch) cannot survive.
-                //
-                // Still inside `begin_pending_trigger_target_selection` (opens `:11547`).
-                // PR #7041's typed trigger-provenance initializers sit above the
-                // first three effects producers and this engine producer. CI
-                // re-derived the same five writes at these coordinates.
-                //
-                // CR 603.3d CARRIER-RELEASE FIX: `:11697 ⇒ :11712`. Pure line movement from
-                // two edits in this file, neither of which mints a prompt: the empty-attackers
-                // auto-submit guard in `run_auto_pass_loop` (`:6457`, +15) and the collapse of
-                // four duplicated mid-construction drop blocks into calls to
-                // `drop_mid_construction_pending_trigger` (`:11511` +14 for its doc comment,
-                // `:11519` +1 for the `pending_trigger_event_batch.clear()` line, then -5 at
-                // each of `:11613`/`:11636`/`:11654`). Those six hunks sum to +15 and
-                // 11697 + 15 = 11712 exactly. The fourth collapsed block (`:11773`, also -5)
-                // sits BELOW this producer and therefore cannot move it, which is why the sum
-                // is +15 rather than the whole-file +10.
-                //
-                // LOCATED BY CONTENT, as this log requires: `:11712` hashes to sha256
-                // `8a544e878d3e77fb…`, the same prefix carried for this producer since
-                // `a6d1a0e62`, and it is the ONLY line in the file matching the producer shape
-                // outside `#[cfg(test)]`. Still inside `begin_pending_trigger_target_selection`,
-                // which moved `:11548 ⇒ :11578` by the +30 of the three hunks above the function
-                // itself — the same arithmetic re-derived against a different anchor.
-                //
-                // SET PRESERVATION: the other four entries are byte-identical AND in place
-                // (`effects/` and `scoped_library_search.rs` are untouched by this change), and
-                // the two tests this change adds contain no line matching the needle, so the
-                // total stays 37 and the partition stays 5/7/25. A drop path releasing a
-                // construction cursor cannot mint a CR 603.5 prompt.
-                //
-                // CR 732 ANNOTATION ROUND (this branch, base `684335b0a`): `:11712 ⇒ :11763`,
-                // `+51`, and ONLY this entry moved — the other four live in `effects/` and
-                // `scoped_library_search.rs`, untouched by a comment-only change. The `+51` is
-                // exactly this file's three hunks, ALL of which land above the producer:
-                // `@@ -4663,0 +4664,36 @@` (the CR 732.1b / 732.1a / 732.2a block on
-                // `try_offer_object_growth_shortcut`) is `+36`, `@@ -4706 +4742,13 @@` (the
-                // no-conditional-actions clause's role) is `+12`, and `@@ -5446,2 +5494,5 @@`
-                // (the `Shorten` deficiency note) is `+3`; predicted `11712+51` equals the
-                // observed coordinate exactly. Identity re-established, not assumed, on three
-                // axes: the line at `:11763` is sha256-identical to
-                // `684335b0a:game/engine.rs:11712`
-                // (`8a544e878d3e77fb80391b95af8f74059540d5ce4ad6fb83559f364df5cc7d63`); that
-                // text occurs exactly ONCE in the file, so the coordinate is unambiguous; and
-                // it is still inside `begin_pending_trigger_target_selection` on both sides.
-                // (That enclosing-function name is a CORRECTION: this row previously said
-                // `apply_retarget`, which is the function ABOVE it — `apply_retarget` ends where
-                // `begin_pending_trigger_target_selection` begins, and the producer sits inside
-                // the latter, as this assertion's own message has always said. The coordinate,
-                // the `+51`, and the digest were unaffected; only the named function was wrong.)
-                // The round is comment-only, so no `waiting_for = ` or `Ok(Some(` line was added
-                // or removed anywhere and the total stays 37 with the partition 5/7/25.
-                //
-                // CR 732 FIX ROUND (same branch, review response): `:11763 ⇒ :11783`, `+20`, and
-                // again ONLY this entry moved — the other four live in `effects/` and
-                // `scoped_library_search.rs`, which this comment-only round does not touch. The
-                // `+20` decomposes over exactly five hunks, ALL above the producer: four
-                // one-line growths in `interactive_loop_bridge` converting the redundancy
-                // proof's four wrong line citations to symbol anchors (`+1` each), plus
-                // `@@ -4750,3 +4754,19 @@` in `try_offer_object_growth_shortcut` (`+16`) for the
-                // `FamilyCollapseState` correction and the lemma closure that follows it.
-                // Predicted `11763+20` equals the observed coordinate exactly. Identity
-                // re-established, not assumed: the line at `:11783` is sha256-identical to
-                // `684335b0a:game/engine.rs:11712` and to `2b20aa73a:game/engine.rs:11763`
-                // (`8a544e878d3e77fb80391b95af8f74059540d5ce4ad6fb83559f364df5cc7d63`); the text
-                // occurs exactly ONCE in the file; and it is still inside
-                // `begin_pending_trigger_target_selection`. Worth recording WHY this drift was
-                // caught late: the round that introduced it shipped while GitHub Actions was in
-                // a major outage, so CI could not answer, and a comment-only diff reads as
-                // incapable of moving a line pin right up until it does.
-                //
-                // SETTLE-GATE LAYER SEPARATION (rebased onto `ea8771200`): `:11783 ⇒ :11828`.
-                // Pure line movement, LOCAL (so the CI-vs-local diagnosis above does not
-                // apply), from four hunks in `resolving_stack_entry_can_settle` /
-                // `settle_finished_resolving_stack_entry` — none of which mints a prompt, and
-                // none of which is even reachable from a prompt path: the readiness doc comment
-                // (+12), the well-formedness conjunct lifted OUT of the readiness gate (-5),
-                // the extracted `resolving_carrier_is_triggered` /
-                // `resolving_carrier_parity_is_coherent` predicates (+16), and the settle-path
-                // `tracing::warn!` (+12). Those sum to +35, then review follow-ups added +10
-                // more above the producer (+2 widening the carrier-kind CR annotation to
-                // `CR 113.3c + CR 603.7`, +8 qualifying the warn's reach — `engine-wasm`
-                // installs no `tracing` subscriber, so that channel is native-only), giving
-                // +45. Every other hunk in this change — the inline
-                // `resolving_carrier_settle_tests` module appended at the end of the file, and
-                // THIS drift entry — sits BELOW this producer and therefore cannot move it,
-                // which is why the sum is +45 and not the whole-file net. (Those two are
-                // deliberately left un-quantified here: a self-counting entry restates itself
-                // every edit.)
-                //
-                // The hunk sizes are quoted WITHOUT `@@` coordinates on purpose: this entry was
-                // rebased, so the coordinates from the pre-rebase base would name lines that no
-                // longer exist. The sizes survive a rebase; the coordinates do not.
-                //
-                // LOCATED BY CONTENT, as this log requires — and the `+45` above is a
-                // PREDICTION that was checked, not the source of this coordinate: `:11828`
-                // hashes to sha256 `8a544e878d3e77fb…5cc7d63`, the same prefix carried for this
-                // producer since `a6d1a0e62`, and it is the UNIQUE line in the file with that
-                // hash (whole-file scan). Still inside
-                // `begin_pending_trigger_target_selection`.
-                //
-                // SET PRESERVATION: the other four entries live in `game/effects/` and
-                // `scoped_library_search.rs`, neither of which this change touches, and the
-                // test module it adds contains no line matching the needle — total still 37,
-                // partition still 5/7/25.
-                // Search-observer dispatch: `:11828 ⇒ :11821`, −7. Removing the retired
-                // `WaitingForWithParkedObservers` match arm is the only hunk above this
-                // producer; it changes trigger-drain timing but does not add a prompt.
-                //
-                // ∞ AXIS-SCOPED REVOCATION ROUND (re-application of the ∞ badge/axis change onto
-                // `b5b8f4ecf`): `:11821 ⇒ :11814`, `-7`. This entry is written the way the
-                // doctrine at the head of this log demands and the way the two rounds above did
-                // NOT get for free: the coordinate was LOCATED BY CONTENT FIRST and the arithmetic
-                // was computed afterwards as a CHECK. Two incoming numbers were available and both
-                // were stale — this file's own `:11828` (pre-edit) and the original branch's
-                // `:11700` (pre-rebase) — which is exactly the situation in which inheriting a
-                // number is wrong. That judgement was vindicated a second time on the rebase onto
-                // `b5b8f4ecf`: the search-observer entry directly above ALSO landed its producer
-                // on `:11821`, from an unrelated hunk, so the 3-way merge saw both sides write the
-                // same coordinate and silently accepted it as AGREEMENT — when in fact the two
-                // shifts are independent and must COMPOSE: `11828 -7 (search-observer) -7 (here)`
-                // = `11814`. A conflict-free auto-merge of this pin would have been wrong by 7.
-                // Four hunks in this file, ALL above the producer, sum to this entry's own `-7`:
-                // the `drive_one_period_frames` caller-list doc going from two lines to three
-                // (`+1`), the deletion of `current_period_counter_targets` plus the rewrite of
-                // `current_period_counter_growth`'s doc into the single-derivation statement
-                // (27 lines to 13, `-14`), the deletion of the second display-registration block
-                // in `materialize_object_growth_shortcut` (12 lines to 1, `-11`), and its
-                // re-insertion below `let growths = …` as one derivation projected to two
-                // consumers (`+17`). Predicted `11821-7` equals the observed coordinate exactly.
-                //
-                // Identity re-established on three axes rather than assumed: the line at `:11814`
-                // is sha256-identical (WITH its trailing newline) to every earlier coordinate this
-                // row has carried —
-                // `8a544e878d3e77fb80391b95af8f74059540d5ce4ad6fb83559f364df5cc7d63`, the prefix
-                // carried since `a6d1a0e62`; that hash is UNIQUE in the file under a whole-file
-                // scan, so the coordinate is unambiguous; and it is still inside
-                // `begin_pending_trigger_target_selection`, which itself moved by the same `-7`
-                // and therefore did not change functions.
-                //
-                // HASHING CONVENTION, recorded because this branch produced the near-miss once:
-                // the line is hashed WITH its trailing newline. Piping through `tr -d '\n'` first
-                // yields `a6d7f2f9d1e15de538f5c2c5803f28e76e86ccd60898c7602a089345a25cb032` — a
-                // DIFFERENT digest for the SAME line. Both are written out in full here so a
-                // future reader who reproduces the wrong one identifies the convention instead of
-                // re-litigating the coordinate.
-                //
-                // SET PRESERVATION: unchanged. The other four entries live in `game/effects/` and
-                // `scoped_library_search.rs`; this change touches neither, and its own new tests
-                // live in `types/game_state.rs`, `derived_views.rs` and `tests/integration/`, so
-                // no line matching the needle is added to this file at all — total still 37,
-                // partition still 5/7/25.
-                //
-                // COLLISION NOTE: a separate in-flight CR 500.5 `max` bugfix also edits this file
-                // above this producer. Whichever lands second MUST re-derive by content; it cannot
-                // reuse this number, and neither entry's arithmetic is authority for the other's.
-                //
-                // CR 500.5 `max` BUGFIX (WB-7048): `:11814 ⇒ :11837`, `+23`. This IS the in-flight
-                // bugfix the COLLISION NOTE directly above anticipated, and it is the one landing
-                // SECOND — so the coordinate was re-derived BY CONTENT exactly as that note
-                // requires, and the arithmetic was computed afterwards as a CHECK, never as the
-                // source. The number above was NOT reused. The insertion is a single expression in
-                // `try_offer_object_growth_shortcut` — the unbounded object-growth producer now
-                // STATES the ceiling it publishes (`Fixed(MAX_SHORTCUT_CYCLES)`) instead of seeding
-                // `Fixed(1)`, since CR 732.2c makes the accepted count binding and that count caps
-                // the CR 500.5 collapse prompt. Its 33 lines replace 10 (23 of the 33 are comment),
-                // netting `+23`; the shift is LOCAL, originating in this diff, not rebase-induced.
-                // That insertion sits ABOVE this producer and BELOW nothing else pinned by this
-                // row. Predicted `11814+23` equals the observed coordinate exactly.
-                //
-                // Identity re-established, hashing convention per the entry above (hashed WITH the
-                // trailing newline — not restated here): the line at `:11837` is sha256-identical
-                // to every earlier coordinate this row has carried, that digest is still UNIQUE
-                // under a whole-file scan, and it is still inside
-                // `begin_pending_trigger_target_selection`.
-                //
-                // SET PRESERVATION: unchanged. The other four entries live in `game/effects/mod.rs`
-                // and `game/effects/scoped_library_search.rs`, neither of which this change touches,
-                // and the inserted expression adds no line matching the needle — total still 37,
-                // partition still 5/7/25.
-                //
-                // The Ward continuation port independently inserts +13 lines above the same
-                // producer, while this branch's durable-knowledge hooks add another 24, so the
-                // combined tree is `:11828 - 7 + 13 + 24 = :11858`.
-                //
-                // MERGE OF `upstream/main` 117b430c2 INTO THIS BRANCH: `:11837` / `:11858` => `:11874`.
-                // This is the case the COLLISION NOTE above was written for, and it arrived as a real
-                // conflict rather than a silent auto-merge. BOTH incoming numbers were stale, each
-                // correct only for its own side: this branch's `:11837` counts the search-observer `-7`,
-                // the axis-scoped `-7` and the CR 500.5 `+23`, but not upstream's insertions; upstream's
-                // `:11858` counts the Ward continuation `+13` and the durable-knowledge hooks `+24`, but
-                // not this branch's. The shifts are INDEPENDENT and COMPOSE, so accepting either side
-                // verbatim would have been wrong by `37` or `16` respectively.
-                //
-                // Resolved BY CONTENT FIRST, arithmetic afterwards as a CHECK, per the doctrine at the
-                // head of this log. The line whose sha256 (WITH trailing newline) is
-                // `8a544e878d3e77fb80391b95af8f74059540d5ce4ad6fb83559f364df5cc7d63` sits at `:11874`
-                // in the merged tree; that digest matches exactly ONE line under a whole-file scan, and
-                // the literal text is likewise unique, so the coordinate is unambiguous. The check:
-                // `11828 -7 (search-observer) -7 (axis-scoped) +23 (CR 500.5) +13 (Ward) +24 (durable
-                // knowledge) = 11874`, which equals the located coordinate exactly. The conflict markers
-                // sat BELOW the producer, so resolving them could not have shifted it.
-                //
-                // #7128 adds forty lines above this producer while introducing the source-bound debug
-                // card entry boundary. The producer remains byte-identical; only its coordinate moves.
-                //
-                // SET PRESERVATION: unchanged. Upstream adds no line matching the needle to this file and
-                // neither does this branch.
-                //
-                // REBASE — this coordinate has absorbed THREE independent shifts and all are folded
-                // here rather than each overwriting the last. From the merge base at `:12004`:
-                //   upstream #7303 round 3: -1  (the `ReturnAsAuraTarget` resume arm's two raw
-                //     attach calls became one call to the entering-Aura attachment authority,
-                //     `-8 +7`, in a hunk ABOVE this producer)
-                //   upstream #4155: +5  (seven lines for abandoned-cast finalization, less two
-                //     removed by its deferred-resume cleanup — also entirely above this producer)
-                //   lane C1 (CR 603.5 may-answer journal): +35  (five `+2` journal clears paired
-                //     with the five ring clears, plus `+25` for the `DecideOptionalEffect` arm)
-                // No two of those hunks overlap, so the shifts compose: 12004 -1 +5 +35 = 12043.
-                // The value below is MEASURED in the rebased file by content digest, never computed
-                // from that sum; the sum is retained only as the prediction it agreed with, and it
-                // did agree. The offset from the enclosing fn is the control and is unchanged at 134.
-                //
-                // Producer identity re-established rather than assumed: the line at the new
-                // coordinate is byte-identical to the base's `:12004` and to upstream's `:12003`
-                // (`return Ok(Some(WaitingFor::OptionalEffectChoice {`), and it is still inside
-                // `begin_pending_trigger_target_selection`. THE OPENING BRACE IS QUOTED WHOLE
-                // AGAIN, and that is the point: it was dropped as a workaround because the census
-                // had no comment filter and this sentence counted ITSELF as the 39th hit against
-                // a pin of 38. Mutilating the prose repaired the sentence, not the counter — the
-                // next whole quotation anywhere in the crate would have broken it again. The
-                // counter now excludes comment text, so this line is a comment and is not a site;
-                // restoring the brace is what makes that repair MEASURED on the real tree rather
-                // than latent. Under the old rule this exact line reds the census at 39.
-                //
-                // TO BE UNAMBIGUOUS FOR THE NEXT READER: the `+1` in `apply_action`'s
-                // `DecideOptionalEffect` arm is a READER, NOT A SIXTH PRODUCER. It destructures the cloned `state.waiting_for`
-                // scrutinee to journal the answer and never assigns `state.waiting_for`; the
-                // producer count in this vec is still five and this branch mints no new prompt.
-                //
-                // ⚠ RE-ADJUDICATED BY C2a (the CR 608.2b target axis on the same journal), NOT
-                // RELAXED. `:11977 ⇒ :12052`, **+75**, and ONLY this entry moved — the three
-                // `effects/mod.rs` pins and `scoped_library_search.rs:452` are in files C2a does
-                // not touch and did not move at all, which is the set-preservation evidence. The
-                // total stays **38** and the partition **5/8/25**: both of those asserts ran and
-                // fired GREEN on the run that caught this, so no producer or reader was gained.
-                // The `+75` is fully accounted for by C2a's own hunks ABOVE this line, measured
-                // with `git diff -U0 70fcd851a -- game/engine.rs`: `-3` (`entry_publishes_pin_slots`'s
-                // may-slot literal collapsing into `DecisionSlot::may`), `+1` (its target-slot
-                // comment), `+53` (`record_trigger_target_answer` and its doc), `+6`/`-2` (the
-                // `DecideOptionalEffect` arm re-expressed over `DecisionSlot::may` +
-                // `LoopAnswerValue::May`), `+1` (`source_id` bound in the `SelectTargets` arm) and
-                // `+19` (both `TriggerTargetSelection` arms' journal calls and their comments) —
-                // summing to exactly `+75`, so predicted `11977 + 75 = 12052` equals the observed
-                // coordinate. EVERY OTHER HUNK IN THIS FILE IS BELOW THIS PRODUCER — row T5 and
-                // this comment block, both inside `mod stage2_injector_tests` — which is why the
-                // shift equals the sum above it exactly. (No whole-file total is quoted here on
-                // purpose: this comment is itself part of that total, so the number could not be
-                // stated without falsifying itself.) Identity
-                // re-established rather than assumed: the line is sha256-identical
-                // (`8a544e87…5cc7d63` — the SAME digest this doc already recorded above) and is
-                // still inside `begin_pending_trigger_target_selection` (`:11843 ⇒ :11918`, the
-                // same `+75`). The diff instrument discriminates: the NEW tree at the OLD
-                // coordinate `:11977` holds a bare `source_id,` struct-field line, which mints
-                // nothing. C2a adds NO line matching the needle in a producing position.
-                //
-                // ⚠ C2a FIX ROUND (round 2/3, closing an independent review's F1/F2): `:12052 ⇒ :12132`,
-                // **+80**. RE-ADJUDICATED BY THE ORCHESTRATOR, NOT BY THE IMPLEMENTER — the executor was
-                // instructed to REPORT the shift and leave the literal alone, precisely so the number could
-                // not be nudged until the row passed. It complied; this line is the orchestrator's.
-                //
-                // Located BY CONTENT FIRST, arithmetic afterwards as a CHECK, per the doctrine at the head of
-                // this log. The line whose sha256 (WITH trailing newline) is
-                // `8a544e878d3e77fb80391b95af8f74059540d5ce4ad6fb83559f364df5cc7d63` sits at `:12132`; that
-                // digest matches exactly ONE line under a whole-file scan, so the coordinate is unambiguous.
-                // It is still inside `begin_pending_trigger_target_selection`, which opens at `:11998` with no
-                // intervening `fn`. The checks, computed AFTER locating the line and never used as its source:
-                // `12052 + 80 = 12132` for the producer and `11918 + 80 = 11998` for the function's opening
-                // line — the SAME `+80`, which is what a set of hunks lying wholly above one producer requires.
-                //
-                // The `+80` is accounted for by six hunks above this producer: `+2` (`EntryPinSlots.target`
-                // doc), `+1` (`legal_targets` doc), `+6` (fn doc), `+37` (the forced-target withhold), `+26`
-                // (writer doc) and `+8` (the writer's multi-slot guard). The remaining hunks are inside
-                // `mod stage2_injector_tests` and therefore below it.
-                //
-                // SET PRESERVATION: unchanged, and this is the conjunct that makes the move a SHIFT rather
-                // than a census drift. The other four entries are byte-identical AND unmoved
-                // (`effects/mod.rs:6252/6329/9522`, `scoped_library_search.rs:452`) — this round touches
-                // neither file. The total (**38**) and partition (**5/8/25**) asserts both ran FIRST and fired
-                // GREEN; the panic was on the third assert alone. Withholding a published `Targets` point
-                // removes a DECISION POINT, not a prompt producer, so no line matching the needle is added or
-                // removed by this round.
-                //
-                // ⚠ C2a FIX ROUND 3 (the cap round, closing the CR 704.5a bound regression the round-2 review
-                // found): `:12132 ⇒ :12302`, **+170**. Orchestrator's adjudication; the executor reported the
-                // shift and left the literal alone, as instructed.
-                //
-                // PURELY POSITIONAL, and that is measured rather than asserted: every hunk this round adds
-                // sits above `engine.rs:3133` (the announcement/charging split — `entry_announces`,
-                // `AnnouncedTarget`/`TargetAnnouncement`/`EntryAnnouncement`, and
-                // `bounded_cycle_charged_targets_for_window`), and there is NO hunk between there and this
-                // producer. The other four entries are byte-identical AND unmoved.
-                //
-                // Located BY CONTENT FIRST, arithmetic afterwards as a CHECK. The line whose sha256 (WITH
-                // trailing newline) is `8a544e878d3e77fb80391b95af8f74059540d5ce4ad6fb83559f364df5cc7d63`
-                // sits at `:12425`, and that digest matches exactly ONE line under a whole-file scan. It is
-                // still inside `begin_pending_trigger_target_selection`, which opens at `:12291` with no
-                // intervening `fn`. Checks computed AFTER locating it: `12302 + 123 = 12425` for the producer
-                // and `12168 + 123 = 12291` for the function's opening line — the SAME `+123`.
-                //
-                // FOURTH re-derivation of this one coordinate (`:12052 → :12132 → :12302 → :12425`),
-                // and the reason it keeps moving is that it is a LINE NUMBER in the most-edited function
-                // of the most-edited file. Every move has been resolved BY CONTENT FIRST — the digest
-                // above has been this producer's identity since `a6d1a0e62` and has never itself changed
-                // — with arithmetic used only as a check that agrees afterwards. A coordinate re-derived
-                // four times to the same content is evidence the pin tracks the right line, not evidence
-                // the pin is fragile.
-                //
-                // SET PRESERVATION (C2a round 4): that round adds a withhold CONDITION, not a prompt
-                // producer. `entry_announces` reports an announcement; it does not assign
-                // `state.waiting_for`, so no line matching the needle is added or removed (grep-counted 0
-                // on both the `+` and `-` sets). Total (38) and partition (5/8/25) both fire GREEN first;
-                // the panic was on the third assert alone, which is what makes it a coordinate shift
-                // rather than a population change.
-                //
-                // item-4 C2b (`WaitingFor::LoopShortcut.declaration`), base `1bc45bb8c`: `:12425 ⇒ :12552`,
-                // `+127`, and ONLY this entry moved — the other four live in `effects/` and
-                // `scoped_library_search.rs`, which this commit does not touch. LOCAL, not upstream, so the
-                // CI-vs-local diagnosis in the header does not apply.
-                //
-                // LOCATED BY CONTENT FIRST, as this log requires: the line at `:12552` is sha256-identical
-                // (`8a544e878d3e77fb80391b95…`, the digest this producer has carried since `a6d1a0e62`) to
-                // `1bc45bb8c:game/engine.rs:12425`, and it is still inside
-                // `begin_pending_trigger_target_selection`, which moved by the same `+127` (opens
-                // `:12291 ⇒ :12418`). Arithmetic afterwards as a CHECK: `git diff -U0` on this file has five
-                // hunks above the producer — `+4` and `+3` (the two `declaration: None` mints with their
-                // reasons, in `reconcile_terminal_result` and `interactive_loop_bridge`), `+5` (the mint
-                // wiring in `certified_bounded_cycle_offer`), `+110` (`build_bounded_declaration` and its
-                // doc), and `+5` (`apply_action`'s `declaration: _` discharge and its deferral note) — which
-                // sum to exactly `+127`. The file's remaining two hunks (`mod bounded_declaration_tests`,
-                // `+302`, and one `#[cfg(test)]` field, `+1`) sit BELOW it.
-                //
-                // SET PRESERVATION: this commit adds a FIELD to `WaitingFor::LoopShortcut` and one
-                // declaration consumer; neither assigns `state.waiting_for` to an
-                // `OptionalEffectChoice`, so no line matching the needle is added or removed. The total (38)
-                // and the partition (5/8/25) both fired GREEN on the run that caught this; the panic was on
-                // this third assert alone, which is what makes it a coordinate shift rather than a
-                // population change.
-                //
-                // item-4 C2b FIX ROUND (F1: `declaration_conforms`, the shared declare-legality
-                // authority), base `908720e6f`: `:12552 ⇒ :12582`, `+30`, and ONLY this entry moved —
-                // the other four live in `effects/` and `scoped_library_search.rs`, untouched here.
-                // LOCAL, not upstream, so the CI-vs-local diagnosis in the header does not apply.
-                //
-                // LOCATED BY CONTENT FIRST, as this log requires: the line at `:12582` is
-                // sha256-identical (`8a544e878d3e77fb80391b95…`, the digest this producer has carried
-                // since `a6d1a0e62`) to `908720e6f:game/engine.rs:12552`, and it is still inside
-                // `begin_pending_trigger_target_selection`, which moved by the same `+30` (opens
-                // `:12418 ⇒ :12448`). Arithmetic afterwards as a CHECK: `git diff -U0` on this file has
-                // five hunks above the producer — `+22` (`build_bounded_declaration`'s "PUBLISHED IS
-                // VALIDATED" doc section), `0` (the `Some(..)` tail rebound to `let template = ..`),
-                // `+10` (step (5)'s `declaration_conforms` call), `-2` (the `required` derivation
-                // DELETED from `handle_declare_shortcut`, now derived once inside the authority) and
-                // `0` (that site's condition rewritten in place) — summing to exactly `+30`. The
-                // file's remaining hunk (row D8 in `mod bounded_declaration_tests`, `+139`) is BELOW.
-                //
-                // SET PRESERVATION: this round adds one validation call and one `#[cfg(test)]` row;
-                // neither assigns `state.waiting_for` an `OptionalEffectChoice`, so no line matching
-                // the needle is added or removed. The total (38) and the partition (5/8/25) both fired
-                // GREEN on the run that caught this; the panic was on this third assert alone.
-                //
-                // ⚠ C3 (the stale-coordinate comment sweep), REBASED ONTO THE C2b FIX ROUND:
-                // `:12582 ⇒ :12590`, `+8`, LOCAL — measured at this tip, not carried. C3's own
-                // hunks above this producer are unchanged and have always summed to `+8`: `+1` in
-                // `shortcut_drive_period` and `+1` in `handle_declare_shortcut` (both replacing a
-                // measured-wrong "8 KB" WS frame cap with `phase-server`'s `MAX_WS_MESSAGE_BYTES`,
-                // 64 KB), `+2` on `reject_shortcut_declaration`'s doc (rotted `MagicCompRules.txt` line
-                // numbers dropped in favour of the CR numbers, which are the stable identifiers), and
-                // `+4` on `handle_decline_shortcut`'s doc (the twice-rotted `engine.rs:3006-3011`
-                // ring-clear coordinate replaced by a SYMBOL reference). `engine.rs`'s entire delta in
-                // C3 is COMMENT HUNKS and nothing else, so a comment round cannot mint a prompt.
-                //
-                // THIS ENTRY'S BASE HAS NOW BEEN RE-DERIVED SIX TIMES, and recording that is the point.
-                // C3 was authored against `70fcd851a` (`:11977 ⇒ :11985`); successive rebases moved its
-                // base to C2a's `:12052`, then `:12132`, then `:12302`, then C2a round 4's `:12425`,
-                // then C2b's `:12552`, and now the C2b fix round's `:12582`. Every stored number was
-                // correct only for the parent it was written against, and every time the CONTENT was
-                // unchanged. **A coordinate is a fact about a tree, not a property of this commit** —
-                // which is exactly why C3 replaces line coordinates with SYMBOL references everywhere
-                // else, and why this row's own pin is the one place that cannot take its own advice.
-                //
-                // Resolved BY CONTENT FIRST, arithmetic afterwards as a CHECK: the line whose sha256
-                // (WITH trailing newline) is `8a544e878d3e77fb80391b95af8f74059540d5ce4ad6fb83559f364df5cc7d63`,
-                // which must match exactly ONE line under a whole-file scan and must still sit inside
-                // `begin_pending_trigger_target_selection` with no intervening `fn`.
-                //
-                // SET PRESERVATION (C3): unchanged. The other four entries live in `game/effects/mod.rs`
-                // and `game/effects/scoped_library_search.rs`, neither of which C3 touches, and a comment
-                // round adds no line matching the needle — total still 38, partition still 5/8/25.
-                //
-                // ⚠ item-4 R1 (the `Ranking` parameterization): `:12590 ⇒ :12575`, `-15`, LOCAL.
-                // Resolved BY CONTENT FIRST per the protocol above: the sha256 above matched exactly
-                // ONE line under a whole-file scan, at `:12575`, and the nearest preceding `fn` is
-                // still `begin_pending_trigger_target_selection` (`:12441`) with none intervening.
-                // Arithmetic CHECK afterwards: `git diff -U0` against the parent shows exactly four
-                // non-zero hunks above the old coordinate — `+2` and `+5` on `shortcut_drive_period`'s
-                // doc (Ruling B's dormancy REASON restated: the type now admits a seat subject, so the
-                // dormancy is a measured producer property rather than a structural one) and `-5`/`-17`
-                // for `slot_source_prompted`'s factoring into
-                // `analysis::decision_template::resolve_ability_instance` (a doc block and its two
-                // inlined zone arms, replaced by one delegating call and a pointer) — summing to `-15`.
-                // SET PRESERVATION: all four hunks are a doc block or a delegating call; none assigns
-                // `state.waiting_for` and none mints a prompt, and this round's remaining `engine.rs`
-                // hunks are inside `#[cfg(test)]` below this producer. The total (38) and the
-                // partition (5/8/25) both fired GREEN on the run that caught this; only this third
-                // assert panicked.
-                //
-                // ⚠ item-4 R2 (the seat-pin provenance split): `:12575 ⇒ :12606`, `+31`, LOCAL.
-                // Resolved BY CONTENT FIRST per the protocol above: the sha256 recorded there
-                // matched exactly ONE line under a whole-file scan, at `:12606`, and the nearest
-                // preceding `fn` is still `begin_pending_trigger_target_selection` (`:12472`) with
-                // none intervening. Arithmetic CHECK afterwards: `git diff -U0` against the parent
-                // shows exactly four hunks above the old coordinate — `+5` on `entry_announces`'
-                // withhold rationale (a comment), `+12` on `shortcut_drive_period`'s dormancy doc
-                // (a comment), and `+1`/`+13` inside `record_trigger_target_answer` (its `use`
-                // list and the `TargetRef::Player` arm re-spelled to
-                // `Scheduled(Constant(Ranking::one(AnnouncementSubject::Seat(..))))`) — summing to
-                // `+31`, and `12575 + 31 = 12606` exactly. SET PRESERVATION: two of the four hunks
-                // are pure comment; the other two are a `use` list and ONE expression inside a
-                // `LoopAnswerValue::Targets` mapping, which assigns no `state.waiting_for` and
-                // mints no `OptionalEffectChoice` prompt. This round's remaining `engine.rs` hunks
-                // are all inside `#[cfg(test)] mod stage2_injector_tests`, BELOW this producer. The
-                // total (38) and the partition (5/8/25) both fired GREEN on the run that caught
-                // this — only this third assert (`:17342`) panicked.
-                //
-                // R2b (the slot-question accessor migration at the last three call sites):
-                // `:12606 ⇒ :12622`, +16. LOCAL, not upstream — the CI-vs-local diagnosis in the
-                // header does not apply. Arithmetic CHECK: `git diff -U0` against the parent has
-                // NINE hunks above the old coordinate, netting exactly `+16`, and
-                // `12606 + 16 = 12622`. SET PRESERVATION: every one of those nine is either a
-                // doc/comment rewrite (the CR 114.2 → CR 114.4 / CR 113.6p sweep, the two
-                // `pinned_*` headers, `slot_source_prompted`'s header, `bounded_cycle_pin_slots`'
-                // class list) or ONE of the two production call-site swaps
-                // (`resolve_source(&slot.source, clone) == Some(source_id)` ⇒
-                // `slot_source_prompted(clone, &slot.source, source_id)`), which changes which
-                // predicate answers a slot question and assigns no `state.waiting_for` — it mints
-                // no `OptionalEffectChoice` prompt. This round's remaining `engine.rs` hunks are
-                // inside `#[cfg(test)] mod stage2_injector_tests`, BELOW this producer. The total
-                // (38) and the partition (5/8/25) both fired GREEN on the run that caught this —
-                // only this third assert panicked. Identity re-established rather than assumed:
-                // line `:12622` is byte-identical by sha256
-                // (`8a544e878d3e77fb…5cc7d63`, the SAME hash this log recorded for `:11549` and
-                // `:11583`) to `10e80db9c:engine.rs:12606`, and it is still inside
-                // `begin_pending_trigger_target_selection`, which moved by the same +16 (opens
-                // `:12472 ⇒ :12488`).
-                //
-                // ⚠ item-4 R3 (the drive-end seam's CR 732.2a doc amendment): `:12622 ⇒ :12646`,
-                // `+24`. LOCAL, and a COMMENT-ONLY round. Resolved BY CONTENT FIRST per the
-                // protocol above: the sha256 this log already records for this producer
-                // (`8a544e878d3e77fb…5cc7d63`) matches EXACTLY ONE line under a whole-file scan
-                // of the new tree, at `:12646` — and exactly one in the parent, at `:12622` — and
-                // it is still inside `begin_pending_trigger_target_selection`, which moved by the
-                // same +24 (opens `:12488 ⇒ :12512`). Arithmetic CHECK afterwards, never as the
-                // source: `git diff -U0` against the parent shows exactly ONE hunk ABOVE this
-                // producer, `@@ -4452,0 +4453,24 @@` inside `materialize_fixed_shortcut` — the
-                // CR 732.2a episode-boundary amendment — and `12622 + 24 = 12646` exactly. (The
-                // file carries a SECOND hunk, this very comment block; it is BELOW the producer
-                // and so contributes nothing to the coordinate. Counting whole-file hunks instead
-                // of hunks-above-the-producer is the arithmetic slip to avoid here.)
-                // SET PRESERVATION: all 24 inserted lines are `//` comments, so no
-                // `waiting_for = ` or `Ok(Some(` line was added and a comment round cannot mint a
-                // prompt. R3's `crates/engine/src` diff is comment-only APART FROM THIS PIN
-                // STRING: with comment lines stripped, `analysis/decision_template.rs` is
-                // byte-identical to the parent and `game/engine.rs` differs in exactly one line —
-                // the pin literal directly below. The total (38) and the partition
-                // (5/8/25) both fired GREEN on the run that caught this — only this third assert
-                // panicked.
-                //
-                // ⚠ item-4 R3 FIX-ROUND 3 (reword of that same block's abort-entry PROBE-PINNED
-                // clause, which called the window "equally live" while reporting `answers=0`):
-                // `:12646 ⇒ :12651`, `+5`. LOCAL, COMMENT-ONLY again, same protocol: the recorded
-                // sha256 (`8a544e878d3e77fb…5cc7d63`, verbatim line + trailing newline) matches
-                // EXACTLY ONE line under a whole-file scan of the new tree, at `:12651` — and
-                // exactly one in the parent, at `:12646` — and it is still inside
-                // `begin_pending_trigger_target_selection`, which moved by the same +5 (opens
-                // `:12512 ⇒ :12517`). Arithmetic CHECK afterwards, never as the source: `git diff
-                // -U0` shows exactly ONE hunk ABOVE this producer, `@@ -4469,2 +4469,7 @@` inside
-                // `materialize_fixed_shortcut` (2 comment lines ⇒ 7), and `12646 + 5 = 12651`.
-                // The other hunk is this very block plus the pin below it — BELOW the producer,
-                // contributing nothing, the same slip the entry above flags. SET PRESERVATION
-                // holds identically: all 5 net inserted lines are `//` comments, so no
-                // `waiting_for = ` or `Ok(Some(` line was added, and the pin below is once more
-                // the ONLY non-comment line in this round's `crates/engine/src` diff.
-                // ⚠ RE-REBASE onto upstream `7127326673`: `:12712 ⇒ :12717`, the **+5** that
-                // upstream #4155 inserts above this producer (seven lines for abandoned-cast
-                // finalization, less two removed by its deferred-resume cleanup). LOCATED BY
-                // CONTENT DIGEST, never by arithmetic: the line whose sha256 is
-                // `8a544e87…5cc7d63` matches exactly ONE line under a whole-file scan and is
-                // still inside `begin_pending_trigger_target_selection`, at the invariant offset
-                // 134. `12712 + 5` is the CHECK that agreed, not the derivation.
-                //
-                // ⚠ item-4 C2 (the manual declare path honours the offer's own published
-                // declaration): `:12717 ⇒ :12759`, `+42`. LOCAL, not upstream. LOCATED BY
-                // CONTENT DIGEST, never by arithmetic: the line whose sha256 is
-                // `8a544e87…5cc7d63` — the digest this log has carried since `a6d1a0e62` —
-                // matches EXACTLY ONE line under a whole-file scan of the new tree, at `:12759`,
-                // and exactly one in the parent, at `:12717`. It is still inside
-                // `begin_pending_trigger_target_selection` (`:12625`) with no intervening `fn`,
-                // at the INVARIANT OFFSET 134 — `12759 - 12625`, and the parent's
-                // `12717 - 12583`. Arithmetic CHECK afterwards, never as the source: `git diff
-                // -U0` against the parent shows FOUR hunks, ALL above this producer — `+4`
-                // (`LoopShortcutOffer`'s new `declaration` field and its doc), `+35`
-                // (`handle_declare_shortcut`'s `or_else` and the placement rationale above it),
-                // `+2` net (`apply_action`'s `declaration: _` discharge rewritten as a bind,
-                // `-5`/`+7`) and `+1` (`declaration: declaration.as_ref(),` in the struct
-                // literal) — summing to exactly `+42`, and `12717 + 42 = 12759`.
-                //
-                // DERIVED TWICE, ACROSS A REBASE, AND THAT IS THE ENTRY'S POINT. This value was
-                // first measured pre-rebase against `b51e45c59`, then DISCARDED unused and
-                // re-derived from scratch against the rebased tree rather than carried — the
-                // discipline the entry six above states as *"a coordinate is a fact about a
-                // tree, not a property of this commit"*. The two derivations agreeing is a
-                // result, not a shortcut that was taken. (The rebase moved this file's OTHER
-                // stale element for us: upstream `d11529d0c` re-pinned
-                // `game/effects/mod.rs:9922 ⇒ :9932`, which arrived through the rebase already
-                // correct and is not this commit's to touch.)
-                //
-                // SET PRESERVATION: C2 adds ONE production statement (an `Option::or_else`) and
-                // one struct field, and rewrites a match-arm binding from `declaration: _` to a
-                // bind. None of the three assigns `state.waiting_for`, so no line matching the
-                // needle is added or removed and no `OptionalEffectChoice` prompt can be minted.
-                // Confirmed by the failure shape rather than by inspection alone: the total (38)
-                // and the partition (5/8/25) both fired GREEN on the run that caught this, and
-                // the panic was on this third assert alone — which is what makes it a coordinate
-                // shift rather than a population change.
-                // ⚠ REBASE onto upstream `635c51ec4` (#7382, pre-entry opponent controller):
-                // `:12759 ⇒ :12763`, +4 from a hunk at `apply_action` `@@ -9867,0 +9868,4 @@`,
-                // entirely above this producer. MEASURED in the rebased file, never computed: the
-                // offset from `begin_pending_trigger_target_selection` is the control and is STILL
-                // 134, which is what re-establishes identity — the same mint text occurs at several
-                // coordinates in this crate, so the offset discriminates where the text cannot.
-                // This rebase raised the literal as a CONFLICT twice and then drifted it SILENTLY a
-                // third time at the tip; only the offset control caught the silent one. That is the
-                // drift class FU-4 (content-hash coordinate anchor) exists to end.
-                // #7320's random-discard continuation adds ten lines above this producer in the
-                // merged tree. Re-derived by the exact producer text at `:12773`, not by carrying
-                // the prior coordinate.
-                // Proliferate frame-orphan fix (#7384): `:12773 ⇒ :12796`, +23, and ONLY this
-                //   engine.rs entry moved — the four `effects/mod.rs` +
-                //   `scoped_library_search` entries were re-read byte-identical AND in
-                //   place, which is the set-preservation evidence. `git diff -U0` on this
-                //   file has exactly seven hunks; six sit at `:11`–`:11687`, entirely ABOVE
-                //   this producer: net `0` (a dropped `PlayerActionKind` import), `+1` (the
-                //   `game_state` import list gaining a line), `-7` and `+9` (the
-                //   `ProliferateChoice` handler taking its frame BEFORE applying counters),
-                //   `+24` (the loop-pin block moved above `apply_proliferate`, plus the
-                //   completion construction) and `-4` (the terminal `EffectResolved` push
-                //   moving into `continue_proliferate_actions`). `0+1-7+9+24-4 = +23`, and
-                //   predicted `12773+23` equals the observed coordinate exactly. The seventh
-                //   and only remaining hunk is THIS drift note, which sits at `:18964` —
-                //   below the producer — so nothing that moved it is unaccounted for.
-                //   Deliberately stated WITHOUT pinning that hunk's own line count or the
-                //   whole-file delta: this note is self-referential, its length feeds any
-                //   such total, and the previous revision of this row asserted a
-                //   whole-file figure that its own next wording edit falsified by exactly
-                //   the size of that edit. The six above-producer hunks are the whole
-                //   load-bearing claim; the seventh is identified by position, which no
-                //   rewording can invalidate.
-                //   None of it mints a prompt: the handler consumes an ALREADY-minted
-                //   `ProliferateChoice`, and the completion defers a keyword action rather
-                //   than creating a recipient, so the census set is still exactly 5.
-                //   Identity re-established, not assumed, on BOTH controls this row uses:
-                //   the line at `:12796` is sha256-identical (`8a544e87…5cc7d63`) to
-                //   `origin/main:crates/engine/src/game/engine.rs:12773`, and its offset from
-                //   `begin_pending_trigger_target_selection` (`:12662`) is STILL 134 — the
-                //   control that caught this row's one historical SILENT drift.
-                //   Mycoloth devour/drain freeze, measured at upstream `66b2cbf5a1`:
-                //   `:12796 ⇒ :12850`, `+54`, and this is the FIRST time this entry has moved
-                //   for a LOCAL reason. The cause is this change's other authorized edit in this
-                //   same file: the ownerless-strand recovery call at the ENTRY of
-                //   `apply_action_boundary_core`, inserted immediately before
-                //   `let boundary_snapshot = state.clone();` at `:1066`. `git diff --stat` on
-                //   this file is `+54/-0`, the insertion is a comment block plus exactly two
-                //   call lines, and it sits ~11.7k lines ABOVE this producer, so predicted
-                //   `12796+54` equals the observed coordinate exactly. The inserted code mints
-                //   NOTHING: it calls `effects::sweep_ownerless_post_replacement_strand` and
-                //   `GameState::remove_empty_active_post_replacement_frame`, which retire a
-                //   corrupt `Dispatching` drain and drop an emptied frame — no recipient is
-                //   created, so the census set is still exactly 5.
-                //   Identity re-established, not assumed, on BOTH controls this row uses: the
-                //   line at `:12850` is sha256-identical (`a6d7f2f9d1e15de5`) to
-                //   `66b2cbf5a1:crates/engine/src/game/engine.rs:12796`, and it is still the
-                //   announcement-time modal mint inside `begin_pending_trigger_target_selection`
-                //   that this row NAMES.
-                //   L1 FIX ROUND (the CR-citation correction on that same recovery call's doc):
-                //   `:12850 ⇒ :12852`, `+2`. LOCAL, not upstream. This file has FOUR hunks this
-                //   round, and only ONE is above this producer — `@@ -1086,2 +1086,4 @@`, which
-                //   replaces the wrong `CR 508.1` gloss on the declare-attackers turn-based
-                //   action with `CR 117.3a + CR 703.1` and costs two lines. Predicted `12850+2`
-                //   equals the observed coordinate exactly.
-                //   The other THREE all sit in this `stage2_injector_tests` module BELOW the
-                //   producer: the two census edits ~5.8k lines below it, and — the one an
-                //   earlier revision of this row miscounted away — THIS ENTRY ITSELF, ~6.5k
-                //   lines below it. That revision said "exactly three hunks" because it counted
-                //   the file before writing itself into it. A self-referential census must count
-                //   the hunk it is being written as.
-                //   Position is the whole load-bearing claim and position alone settles it:
-                //   everything below `:12852` cannot move `:12852`, so the miscount never
-                //   threatened the conclusion. Those three are deliberately NOT pinned by `@@`
-                //   coordinate or line count — each is self-referential, and any rewording of
-                //   this log falsifies such a pin by exactly the size of the edit, the same trap
-                //   recorded in the row above. A comment cannot mint a prompt, so the census set
-                //   is still exactly 5.
-                //   Identity re-established, not assumed, on BOTH controls this row uses: the
-                //   line at `:12852` is sha256-identical (`a6d7f2f9d1e15de5`, the SAME prefix
-                //   the entry above records) to `2264d4aa3:crates/engine/src/game/engine.rs:12850`,
-                //   and its offset from `begin_pending_trigger_target_selection` is STILL 134
-                //   (the function opens `:12716 ⇒ :12718`, moving by the same `+2`) — the
-                //   control that caught this row's one historical SILENT drift.
-                //
-                //   REBASE ONTO `b2071a7f41`. Same rule, same composition: main carries
-                //   `:12856`, this branch carried `:12852`, and the rebased tree measures
-                //   `:12912`. Predicted as `12856+56`. This file's diff against the rebase
-                //   base is `+211/-41`, but only ONE hunk (`old@1065`, `+56`) lies above this
-                //   producer — the entry hook described above, plus the doc-continuation
-                //   blank; the other two hunks (`old@18681`, `+90`; `old@19369`, `+24`) are
-                //   THIS census array's own prose, ~5.8k lines BELOW the pin, which is why the
-                //   file's net `+170` is the wrong figure to compose and `+56` is the right
-                //   one. Those two figures include the two entries you are reading: this log
-                //   grows inside the region it measures, so they were re-measured AFTER being
-                //   written rather than quoted from the pre-edit tree.
-                //   Identity re-established, not assumed, on BOTH controls: the line at
-                //   `:12912` is sha256-identical (`a6d7f2f9d1e15de5`) to the same producer at
-                //   main's `:12856`, and its offset from
-                //   `begin_pending_trigger_target_selection` is STILL 134 — the function opens
-                //   `:12722 ⇒ :12778`, moving by the same `+56` as the pin, so the control
-                //   that caught this row's one historical silent drift is intact.
-                //   Resolve All consent adds its frozen-authority protocol above this producer:
-                //   `:12912 ⇒ :13113`. It does not create a CR 603.5 prompt, and the pinned
-                //   line remains the same `OptionalEffectChoice` construction.
-                //   Folding the turn-face-up special action into `morph::handle_turn_face_up`
-                //   removed 80 lines from the reducer above this producer:
-                //   `:13210 ⇒ :13130`. It creates no CR 603.5 prompt either — a special
-                //   action does not use the stack (CR 116.1) — and the pinned line is again
-                //   the same `OptionalEffectChoice` construction, moved wholesale.
-                //   ResolveAllReady latch-consumption fix: `:13135 ⇒ :13137`, `+2`.
-                //   The `engine_resolve_batch` re-export block is the whole of it, and
-                //   the symbol delta is ENUMERATED rather than counted: the block goes
-                //   from 5 names to 10. Six arrive —
-                //   `pending_resolve_all_ready_requester`,
-                //   `recover_orphaned_resolve_all`, `resolve_all_ready_access`,
-                //   `resolve_all_ready_prefix_with`, `ResolveAllContinuation`,
-                //   `ResolveAllReadyAccess` — and exactly one leaves,
-                //   `resolve_all_ready_is_authorized`. rustfmt spends two more lines on
-                //   the result. (`ResolveAllReadyAuthority` is NOT in the departure
-                //   column, though a reader tracking this change's history may expect it
-                //   there: `git grep` finds ZERO occurrences of that name anywhere in the
-                //   base tree, so nothing it could have departed from ever held it. That
-                //   is the whole of what is measurable, and this note asserts no more —
-                //   how any earlier wording came to be is drafting history, which git
-                //   cannot answer. Stated because a note whose weight is "MEASURED" earns
-                //   nothing if its enumeration is taken on trust.)
-                //   MEASURED, never carried: `diff -u` on this file between the base tree
-                //   and the candidate has exactly ONE hunk above this producer,
-                //   `@@ -76,8 +76,10 @@` — that block alone. Identity re-established on
-                //   BOTH controls, not assumed: the line at `:13137` is sha256-identical
-                //   (`8a544e87…5cc7d63`) to the producer at `:13135` in the base tree,
-                //   and its offset from `begin_pending_trigger_target_selection` is STILL
-                //   134 — the control that discriminates when the same mint text occurs
-                //   at several coordinates in this crate.
-                //   A re-export mints nothing: it NAMES symbols. None of the Resolve All
-                //   entry points it exposes constructs a CR 603.5 modal — they consume or
-                //   repair a `ResolveAllReady` latch, which `acting_player()` reports as
-                //   having no actor at all. The PRODUCER half stays 5 and the partition
-                //   stays 5/8/28.
-                "game/engine.rs:13138".to_string(),
+                "game/effects/mod.rs::drive_sequential_repeated_optional_payment {player:ability.controller,source_id:ability.source_id,description:ability.description.clone(),may_trigger_key:None,same_card_may_trigger_choice_available:false}".to_string(),
+                "game/effects/mod.rs::resolve_chain_body {player:prompt_player,source_id:ability.source_id,description,may_trigger_key,same_card_may_trigger_choice_available}".to_string(),
+                "game/effects/mod.rs::resolve_repeated_optional_payment_choice {player,source_id,description,may_trigger_key:None,same_card_may_trigger_choice_available:false}".to_string(),
+                "game/effects/scoped_library_search.rs::advance_acceptance {player,source_id,description,may_trigger_key:None,same_card_may_trigger_choice_available:false}".to_string(),
+                "game/engine.rs::begin_pending_trigger_target_selection {player,source_id,description:trigger_description,may_trigger_key,same_card_may_trigger_choice_available}".to_string(),
             ],
-            "the five production producers, NAMED: the CR 603.5 gate in `resolve_chain_body` \
-             plus the two repeated-optional-payment drivers, the per-player acceptance cursor \
-             in `scoped_library_search`, and `begin_pending_trigger_target_selection`'s \
-             ANNOUNCEMENT-time modal prompt. Four of the five choose `player` WITHOUT \
+            "the five production producers, each keyed by its ENCLOSING FUNCTION and the \
+             CONSTRUCTION it mints, compared as a sorted MULTISET, so a sixth mint inside one \
+             of these functions still fails here. Four of the five choose `player` WITHOUT \
              consulting the recipient authority, which is exactly why the mint conjunct is a \
-             fail-closed pre-filter and not a soundness proof"
+             fail-closed pre-filter and not a soundness proof. A CR 603.5 producer's \
+             construction changed — if that was intended, update this literal; if it was not, \
+             you changed who or how the optional choice is offered."
         );
 
         // Exactly ONE of them routes through the recipient authority: the CR 603.5 gate.
         let effects_src = std::fs::read_to_string(root.join("game/effects/mod.rs"))
             .expect("readable effects module");
         let authority = format!("{}_prompt_player", "optional");
-        // CODE ONLY, and now the CODE HALF of each line rather than only non-comment lines:
-        // a whole-file `matches()` counted PROSE, and this PR's C1 adds a doc link to the
-        // authority in `upfront_optional_gate`'s comment — a mention that is neither a
-        // definition nor a call. `crate::source_census::code` is the shared rule; the pinned
-        // count is unchanged at 2 (re-measured), and a real second call still trips it because
+        // Counted over the CODE HALF of each line, via `crate::source_census::code`: a prose
+        // mention of the authority is not a call. A real second call still trips this, because
         // a call cannot live in comment text.
         let authority_code_hits = effects_src
             .lines()
@@ -20175,6 +20895,144 @@ mod stage2_injector_tests {
             "one definition + exactly one call — the CR 603.5 gate's `let prompt_player = ..`. \
              A second call inside `effects/mod.rs` means a second producer started consulting \
              the authority and this row's partition needs re-deriving"
+        );
+    }
+
+    /// The producer key's discrimination, on PLANTED input: the real tree cannot exhibit both
+    /// polarities at once, so a repo-scanning assertion for this property is vacuous BY
+    /// CONSTRUCTION. Each arm feeds `cr_603_5_sites` a synthetic source and states what the
+    /// key must and must not move with. The mint spelling is ASSEMBLED, so none of these
+    /// sources is itself a census site.
+    #[test]
+    fn a_producer_key_moves_with_the_construction_and_not_with_its_position() {
+        let mint = format!("WaitingFor::{}Choice {{", "OptionalEffect");
+        let rel = "game/planted.rs";
+        let keys = |lines: &[&str]| cr_603_5_sites(rel, &lines.join("\n")).0;
+        let base_key = format!(
+            "{rel}::mint_one {{player:prompt_player,source_id:ability.source_id,may_trigger_key}}"
+        );
+        let assign = format!("    state.waiting_for = {mint}");
+
+        // BASELINE — the paired positive for the bare negative below: the same scanner,
+        // through the same helpers, returns exactly one key for one construction.
+        let baseline = keys(&[
+            "fn mint_one() {",
+            assign.as_str(),
+            "        player: prompt_player,",
+            "        source_id: ability.source_id,",
+            "        may_trigger_key,",
+            "    };",
+            "}",
+        ]);
+        assert_eq!(
+            baseline,
+            vec![base_key.clone()],
+            "one construction in one function keys as `file::fn {{fields}}`"
+        );
+
+        let moved = keys(&[
+            "// text above the producer",
+            "// more text above the producer",
+            "// and more",
+            "fn mint_one() {",
+            "    let _ = ();",
+            assign.as_str(),
+            "        player: prompt_player,",
+            "        source_id: ability.source_id,",
+            "        may_trigger_key,",
+            "    };",
+            "}",
+        ]);
+        assert_eq!(
+            moved, baseline,
+            "inserting lines above a producer must not move its key"
+        );
+
+        let nested_assign = format!("        state.waiting_for = {mint}");
+        let renested = keys(&[
+            "fn mint_one() {",
+            "    if gate {",
+            nested_assign.as_str(),
+            "            player: prompt_player,",
+            "            source_id: ability",
+            "                .source_id,",
+            "            may_trigger_key,",
+            "        };",
+            "    }",
+            "}",
+        ]);
+        assert_eq!(
+            renested, baseline,
+            "re-indenting the construction and breaking a field expression across lines is \
+             what `rustfmt` does; neither may move the key"
+        );
+
+        let twice = keys(&[
+            "fn mint_one() {",
+            assign.as_str(),
+            "        player: prompt_player,",
+            "        source_id: ability.source_id,",
+            "        may_trigger_key,",
+            "    };",
+            assign.as_str(),
+            "        player: prompt_player,",
+            "        source_id: ability.source_id,",
+            "        may_trigger_key,",
+            "    };",
+            "}",
+        ]);
+        assert_eq!(
+            twice,
+            vec![base_key.clone(), base_key.clone()],
+            "a second mint inside an already-pinned function is a counted event: the keys are \
+             a MULTISET, not a set"
+        );
+
+        let removed = keys(&["fn mint_one() {", "    let _ = ();", "}"]);
+        assert!(
+            removed.is_empty(),
+            "a function that mints nothing yields no key, got {removed:?}"
+        );
+
+        let rebound = keys(&[
+            "fn mint_one() {",
+            assign.as_str(),
+            "        player: ability.controller,",
+            "        source_id: ability.source_id,",
+            "        may_trigger_key,",
+            "    };",
+            "}",
+        ]);
+        assert_eq!(
+            rebound,
+            vec![format!(
+                "{rel}::mint_one {{player:ability.controller,source_id:ability.source_id,may_trigger_key}}"
+            )],
+            "the recipient expression is part of the key"
+        );
+
+        let second_authority = keys(&[
+            "fn mint_one() {",
+            assign.as_str(),
+            "        player: prompt_player,",
+            "        source_id: ability.source_id,",
+            "        may_trigger_key: None,",
+            "    };",
+            "}",
+        ]);
+        assert_eq!(
+            second_authority,
+            vec![format!(
+                "{rel}::mint_one {{player:prompt_player,source_id:ability.source_id,may_trigger_key:None}}"
+            )],
+            "the stored-choice authority is part of the key, with the recipient HELD"
+        );
+
+        assert!(
+            rebound != baseline && second_authority != baseline,
+            "a construction REPLACED inside an already-pinned function must move its key — \
+             recipient rebound: {rebound:?}; stored-choice authority changed: \
+             {second_authority:?}; unchanged construction: {baseline:?}"
         );
     }
 
@@ -20483,6 +21341,7 @@ mod stage2_injector_tests {
             source_id: src,
             description: None,
             may_trigger_key: None,
+            same_card_may_trigger_choice_available: false,
         };
         (state, src)
     }
@@ -20752,9 +21611,16 @@ mod stage2_injector_tests {
         }
     }
 
-    /// A live `LoopShortcut` offer with an EMPTY schema, proposed by P0 on `state`.
-    fn u4_park_on_offer(state: &mut GameState) {
-        use crate::analysis::decision_template::ShortcutDecisionSchema;
+    /// A live `LoopShortcut` offer proposed by P0 on `state`, publishing the one CR 603.5
+    /// `MayChoice` point [`u4_may_template`] pins.
+    ///
+    /// CR 732.2a: a declaration may pin only choices the offer published, so an offer exposing
+    /// no point refuses a template carrying any SLOT-ADDRESSING pin — which would take the
+    /// `owner` axis out of the measurement below rather than isolate it.
+    fn u4_park_on_offer(state: &mut GameState, src: ObjectId) {
+        use crate::analysis::decision_template::{
+            DecisionPoint, DecisionPointKind, ShortcutDecisionSchema,
+        };
         use crate::analysis::loop_check::{LoopCertificate, WinKind};
         use crate::analysis::resource::BoardDelta;
         state.waiting_for = WaitingFor::LoopShortcut {
@@ -20767,7 +21633,16 @@ mod stage2_injector_tests {
                 residual_board_delta: BoardDelta::default(),
                 per_cycle: None,
             },
-            schema: ShortcutDecisionSchema::default(),
+            schema: ShortcutDecisionSchema {
+                points: vec![DecisionPoint {
+                    slot: DecisionSlot {
+                        source: this_object(src),
+                        index: 1,
+                    },
+                    kind: DecisionPointKind::MayChoice,
+                }],
+                ..ShortcutDecisionSchema::default()
+            },
             declaration: None,
         };
     }
@@ -20784,7 +21659,7 @@ mod stage2_injector_tests {
     /// binding lives at declare (`handle_declare_shortcut`) and at consumption
     /// (`apply_confirmed_shortcut`), one layer above this one.
     ///
-    /// ⚠ **PLAN DEVIATION, DISCLOSED:** §6 R28(b) predicts the drive seam refuses this pair
+    /// ⚠ **DISCLOSED:** an earlier design predicted the drive seam refuses this pair
     /// (*"must still `RecastAbort`"*). It does not, and cannot — the same cell's own analysis
     /// says so two sentences later (*"under the round-33 design alone it returns `Ok(())`"*).
     /// The arm ships keyed to the measurement, with (b2) supplying the refusal the row is
@@ -20832,7 +21707,7 @@ mod stage2_injector_tests {
         for owner in [P1, P0] {
             let (mut state, offer_src) = u4_may_board(P0);
             assert_eq!(offer_src, src, "one fixture feeds both halves");
-            u4_park_on_offer(&mut state);
+            u4_park_on_offer(&mut state, offer_src);
             apply_action(
                 &mut state,
                 P0,
@@ -20911,10 +21786,11 @@ mod kilo_interruptibility_tests {
         // Decoding AS `PersistedGameState` (rather than decoding a bare `GameState` and
         // wrapping it) additionally routes the dump through
         // `reject_legacy_raw_prompt_authority` + `decode_persisted_resolution_state`.
-        // `.expect(..)`, not `?`: `into_game_state` returns `GameState`, not `Result`.
+        // The test unwraps the fallible persistence boundary after asserting this fixture decodes.
         serde_json::from_value::<PersistedGameState>(envelope["gameState"].clone())
             .expect("gameState deserializes through the production decoder")
             .into_game_state()
+            .expect("persisted test snapshot satisfies the checked restore contract")
     }
 
     fn beat_actor(state: &GameState) -> PlayerId {
@@ -21155,7 +22031,7 @@ mod kilo_interruptibility_tests {
         );
     }
 
-    /// Synthetic positive/negative drive-replay reach-guard (plan §7 unit c). The SAME recorded
+    /// Synthetic positive/negative drive-replay reach-guard. The SAME recorded
     /// 2-step period is driven WITH pins (offer) and WITHOUT (abort). The `len()==2` anchor holds
     /// in BOTH variants, so the negative's None is a drive-abort at the unpinned
     /// `PayCost{TapCreatures}`, NOT a vacuous "no sequence to drive" upstream short-circuit
@@ -21625,7 +22501,7 @@ mod bounded_offer_conjunct_tests {
     /// EXEMPTION, EVEN THOUGH ITS WINDOW HAS ONE AVAILABLE.
     ///
     /// CR 732.2a + CR 608.1. Arms (a)/(b)/(a′1) prove the CONSTRUCTOR keys the subtraction to
-    /// the certificate value. This arm proves §3 D2's step 4b actually SELECTS the right
+    /// the certificate value. This arm proves the selection step actually SELECTS the right
     /// value: it is the only arm that fails on the round-39 shape (one `BoardCovered`
     /// certificate for the whole `equality || cover` disjunction), which every other arm in
     /// the row passes unchanged.
@@ -22034,7 +22910,7 @@ mod bounded_offer_conjunct_tests {
     // ───────────────────────────────────────────────────────────────────────────────────
 
     /// Symbol-anchored extent of a column-0 `fn` in THIS file, as `(head, end)` line indices —
-    /// the §6 R8 self-census extractor: signature line to the first column-0 `}`.
+    /// the self-census extractor: signature line to the first column-0 `}`.
     #[cfg(test)]
     fn engine_fn_extent(lines: &[&str], signature: &str) -> (usize, usize) {
         let head = lines
@@ -22746,5 +23622,181 @@ mod resolving_carrier_settle_tests {
                 "{described}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cost_move_drain_priority_boundary_tests {
+    use super::{drain_pending_cost_move_resume, CostMoveDrainBoundary};
+    use crate::types::ability::{AbilityCost, Effect, ResolvedAbility, TargetFilter};
+    use crate::types::game_state::{GameState, PendingCostMoveResume};
+    use crate::types::identifiers::ObjectId;
+    use crate::types::mana::ManaCost;
+    use crate::types::player::PlayerId;
+
+    /// `engine_payment_choices::resume_counter_addition_unless_payment` maps
+    /// `CostMoveDrainBoundary::PriorityBoundary` to `unreachable!`, and nothing but
+    /// this eligibility table makes that true: it admits only `DelveManaPayment` and
+    /// `ManaAbilityPayment` at that boundary. Nothing else in the crate pinned that
+    /// premise, so widening the table would leave the suite green and abort a live
+    /// session instead.
+    ///
+    /// This pins the guard, not the panic. A `#[should_panic]` row would assert the
+    /// panic is *reachable*, which is the inverse of the invariant. Admitting
+    /// `CounterAdditionUnlessPayment` at `PriorityBoundary` turns this row red: the
+    /// root takes the parked continuation and panics before it can return `Ok(None)`.
+    #[test]
+    fn a_parked_counter_addition_unless_payment_is_never_drained_at_the_priority_boundary() {
+        let mut state = GameState::new_two_player(42);
+        state.pending_cost_move_resume =
+            Some(PendingCostMoveResume::CounterAdditionUnlessPayment {
+                cost: AbilityCost::Mana {
+                    cost: ManaCost::generic(2),
+                },
+                pending_effect: Box::new(ResolvedAbility::new(
+                    Effect::TargetOnly {
+                        target: TargetFilter::Any,
+                    },
+                    vec![],
+                    ObjectId(60),
+                    PlayerId(0),
+                )),
+                trigger_event: None,
+                effect_description: None,
+                remaining: Vec::new(),
+            });
+        let mut events = Vec::new();
+
+        let drained = drain_pending_cost_move_resume(
+            &mut state,
+            &mut events,
+            CostMoveDrainBoundary::PriorityBoundary,
+        );
+
+        assert!(
+            matches!(drained, Ok(None)),
+            "the priority boundary must not drain a counter-addition unless-payment"
+        );
+        assert!(
+            matches!(
+                state.pending_cost_move_resume,
+                Some(PendingCostMoveResume::CounterAdditionUnlessPayment { .. })
+            ),
+            "the continuation must stay parked for the replacement boundary that owns it"
+        );
+        assert!(events.is_empty(), "an ineligible drain must emit no events");
+    }
+}
+
+/// CR 111.1 vs CR 400.7: the mint / arrival split that `derived_fodder_class` publishes a class
+/// from. `zones::move_to_zone` carries the existing `ObjectId`, so an ARRIVED object is keyed in
+/// BOTH frames' `objects` while a MINTED one is keyed only in `after`'s — the single fact the
+/// boundary mint's promise rests on, and the one an `after.battlefield − before.battlefield`
+/// difference alone cannot see.
+#[cfg(test)]
+mod minted_battlefield_set_tests {
+    use super::{derived_fodder_class, minted_battlefield_ids};
+    use crate::game::game_object::GameObject;
+    use crate::types::game_state::GameState;
+    use crate::types::identifiers::{CardId, ObjectId};
+    use crate::types::player::PlayerId;
+    use crate::types::zones::Zone;
+
+    fn put(state: &mut GameState, id: u64, name: &str, zone: Zone) -> ObjectId {
+        let oid = ObjectId(id);
+        state.objects.insert(
+            oid,
+            GameObject::new(oid, CardId(id), PlayerId(0), name.into(), zone),
+        );
+        if zone == Zone::Battlefield {
+            state.battlefield.push_back(oid);
+        }
+        oid
+    }
+
+    /// Move `id` onto the battlefield with its `ObjectId` PRESERVED.
+    fn arrive(state: &mut GameState, id: ObjectId) {
+        state
+            .objects
+            .get_mut(&id)
+            .expect("the arriving object is live")
+            .zone = Zone::Battlefield;
+        state.battlefield.push_back(id);
+    }
+
+    /// **The minted set is `after.battlefield` minus everything `before` KNEW, not minus
+    /// everything `before` had on the battlefield.**
+    ///
+    /// The two halves move the same id onto the same battlefield and differ only in whether
+    /// `before.objects` holds it, so the `!before.objects.contains_key` conjunct is the sole
+    /// discriminator — a row that only added a battlefield id would pass with that conjunct
+    /// deleted.
+    #[test]
+    fn minted_battlefield_ids_excludes_an_id_preserving_arrival() {
+        let mut before = GameState::new_two_player(7);
+        put(&mut before, 1, "Engine", Zone::Battlefield);
+        let arrival = put(&mut before, 3, "Library Card", Zone::Library);
+
+        let mut after = before.clone();
+        put(&mut after, 2, "Saproling", Zone::Battlefield);
+        arrive(&mut after, arrival);
+
+        assert_eq!(
+            minted_battlefield_ids(&before, &after),
+            vec![ObjectId(2)],
+            "only the id `before` never knew is MINTED"
+        );
+
+        // PAIRED CONTROL: the same id arriving on the same battlefield IS minted when `before`
+        // does not know it. Same id, same zone, one field of the fixture flipped.
+        let mut unknown_before = before.clone();
+        unknown_before.objects.remove(&arrival);
+        unknown_before
+            .players
+            .iter_mut()
+            .for_each(|p| p.library.retain(|x| *x != arrival));
+        let mut minted = minted_battlefield_ids(&unknown_before, &after);
+        minted.sort();
+        assert_eq!(
+            minted,
+            vec![ObjectId(2), ObjectId(3)],
+            "the same arrival counts as MINTED once `before` no longer knows the id"
+        );
+    }
+
+    /// **`derived_fodder_class` reports `k` over the MINTED members only.**
+    ///
+    /// CR 732.2a: `PersistentAxisMaterialization::Tokens` reproduces `k` members per cycle by
+    /// MINTING them, so counting an id-preserving arrival into `k` publishes a per-cycle delta the
+    /// collapse cannot deliver. The arrival here is content-identical to the minted member, so an
+    /// implementation counting battlefield-difference would find a homogeneous class of TWO and
+    /// return `k == 2`.
+    #[test]
+    fn derived_fodder_class_counts_minted_members_and_not_arrivals() {
+        let mut before = GameState::new_two_player(7);
+        put(&mut before, 700, "Saproling", Zone::Battlefield);
+        let arrival = put(&mut before, 900, "Saproling", Zone::Library);
+
+        let mut after = before.clone();
+        put(&mut after, 701, "Saproling", Zone::Battlefield);
+        arrive(&mut after, arrival);
+
+        let (class, k) = derived_fodder_class(&before, &after).expect("one minted class");
+        assert_eq!(class.name, "Saproling");
+        assert_eq!(
+            k, 1,
+            "the arrival is not a member of a class the mint reproduces"
+        );
+
+        // PAIRED CONTROL: mint the second member instead of moving it, and `k` rises to 2 — the
+        // same content, the same battlefield, only the provenance changed.
+        let mut minted_both = before.clone();
+        minted_both.objects.remove(&arrival);
+        minted_both
+            .players
+            .iter_mut()
+            .for_each(|p| p.library.retain(|x| *x != arrival));
+        let (_, k2) = derived_fodder_class(&minted_both, &after).expect("one minted class");
+        assert_eq!(k2, 2, "two MINTED members of one class report k = 2");
     }
 }

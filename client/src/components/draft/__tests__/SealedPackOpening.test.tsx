@@ -11,10 +11,14 @@ vi.mock("../../../hooks/useCardImage", () => ({
 const VIEW: DraftPlayerView = {
   status: "Deckbuilding",
   kind: "Sealed",
+  launch_capability: "None",
+  commanders_required: 0,
   current_pack_number: 0,
   pick_number: 0,
   pass_direction: "Left",
   current_pack: null,
+  required_pick_count: 0,
+  pick_selection_mode: "Direct",
   pool: [
     {
       instance_id: "creature",
@@ -67,16 +71,28 @@ const VIEW: DraftPlayerView = {
     type_filter_options: [],
     color_filter_options: [],
     color_counts: { white: 1, blue: 0, black: 0, red: 1, green: 0 },
+    workspace_capabilities: {
+      rarity_group_order: ["mythic", "rare", "uncommon", "common", "rarity_other"],
+    },
+    workspace_row_classification: {
+      creature_instance_ids: ["creature"],
+      noncreature_instance_ids: ["instant"],
+    },
   },
   sealed_packs: [],
   seats: [],
   cards_per_pack: 1,
+  pack_sizes: [1, 1, 1],
+  pack_set_codes: ["TST", "TST", "TST"],
+  pack_pick_steps: [1, 1, 1],
+  pick_steps_per_pack: 1,
   pack_count: 2,
   min_deck_size: 40,
   addable_cards: ["Plains"],
   timer_remaining_ms: null,
   standings: [],
   current_round: 0,
+  next_pairing_round: 1,
   tournament_format: "Swiss",
   pod_policy: "Competitive",
   pairings: [],
@@ -93,6 +109,7 @@ describe("SealedPackOpening", () => {
       />,
     );
 
+    expect(screen.getByText("Open 2 packs, one at a time.")).toBeInTheDocument();
     expect(screen.getByText("Pack 1 of 2")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Open pack" }));
     expect(await screen.findAllByText("Silvercoat Lion")).toHaveLength(2);
@@ -109,5 +126,16 @@ describe("SealedPackOpening", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Build deck" }));
     expect(onComplete).toHaveBeenCalledOnce();
+  });
+
+  it("uses singular copy for one engine-provided pack", () => {
+    render(
+      <SealedPackOpening
+        view={{ ...VIEW, pack_count: 1, sealed_packs: [[VIEW.pool[0]]] }}
+        onComplete={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Open 1 pack.")).toBeInTheDocument();
   });
 });

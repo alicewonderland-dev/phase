@@ -60,7 +60,7 @@ fn gunzip(gz: &[u8]) -> String {
 /// The migration drops the primed loop sequence
 /// because the dump sits at empty-stack Priority (NOT a shortcut window), so the offer must be
 /// rebuilt by a live cast below.
-fn load_realistic_dump() -> GameState {
+pub fn load_realistic_dump() -> GameState {
     let json = gunzip(include_bytes!(
         "../fixtures/sprout_witherbloom_realistic_lands_4p.json.gz"
     ));
@@ -69,10 +69,11 @@ fn load_realistic_dump() -> GameState {
     // Decode AS `PersistedGameState` rather than decoding a bare `GameState` and wrapping
     // it in `Raw`: only the former runs `reject_legacy_raw_prompt_authority` and
     // `decode_persisted_resolution_state`, which is the rest of the production chokepoint.
-    // `.expect(..)`, not `?`: `into_game_state` returns `GameState`, not `Result`.
+    // The test unwraps the fallible persistence boundary after asserting this fixture decodes.
     serde_json::from_value::<PersistedGameState>(envelope["gameState"].clone())
         .expect("gameState deserializes through the production decoder")
         .into_game_state()
+        .expect("persisted test snapshot satisfies the checked restore contract")
 }
 
 /// Count the battlefield Saprolings `who` controls (tapped or not) — the fodder reach-guard oracle.
@@ -92,7 +93,7 @@ fn count_saprolings(state: &GameState, who: PlayerId) -> usize {
 /// Drive the real Sprout Swarm object-growth cast (accept Buyback + convoke one fodder Saproling
 /// for the {G}) through the public GameRunner boundary, exactly as the sibling untapped-precast
 /// acceptance test does.
-fn drive_sprout_cast(state: GameState) -> engine::game::scenario::Outcome {
+pub fn drive_sprout_cast(state: GameState) -> engine::game::scenario::Outcome {
     GameRunner::from_state(state)
         .cast(SPROUT)
         .accept_optional()

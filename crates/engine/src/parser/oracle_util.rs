@@ -182,6 +182,35 @@ impl<'a> TextPair<'a> {
         })
     }
 
+    /// CR 604.1: split around `sep` only when the split point sits OUTSIDE a
+    /// quoted granted ability. An ability written in quotation marks is a
+    /// separate static whose own gate belongs to IT, not to the clause granting
+    /// it (Ancestral Katana: `gets +2/+2 and has "This creature has first strike
+    /// as long as it's attacking."` — the `as long as` gates the granted first
+    /// strike, not the +2/+2). A body with an EVEN number of double quotes ends
+    /// outside any "…", so the split point is safe; an odd count means the
+    /// separator was found inside a quoted region and the split must be refused.
+    ///
+    /// INHERITS [`Self::split_around`]'s FIRST-OCCURRENCE semantics: an
+    /// odd-quote body refuses the split outright rather than scanning on to a
+    /// later separator that may lie outside the quotes
+    /// (`has "X as long as Y" as long as Z`). No corpus line has that shape
+    /// today. Measured over the distinct oracle lines in MTGJSON AtomicCards:
+    /// 7 lines have an odd-quote FIRST `" as long as "` and 24 have an odd-quote
+    /// first `" unless "`, and for BOTH separators ZERO of those lines carry a
+    /// LATER outside-quotes occurrence — which is the claim that actually
+    /// matters, since it is what makes the first-occurrence refusal lossless.
+    /// Both incumbent guards already
+    /// behave this way, so this is a documented property rather than a
+    /// deviation.
+    ///
+    /// SINGLE AUTHORITY for that rule. Callers must not re-derive the quote
+    /// count.
+    pub(crate) fn split_around_outside_quotes(&self, sep: &str) -> Option<(Self, Self)> {
+        self.split_around(sep)
+            .filter(|(body, _)| body.original.chars().filter(|&c| c == '"').count() % 2 == 0)
+    }
+
     /// Find last `needle` in lowered text, return `(before, after)` excluding needle.
     pub fn rsplit_around(&self, needle: &str) -> Option<(Self, Self)> {
         self.lower.rfind(needle).map(|pos| {
@@ -1415,17 +1444,56 @@ pub fn has_unconsumed_conditional(text: &str) -> bool {
 /// For comma-form names, the short self-reference is the span before the comma
 /// after removing MTGJSON's structural Alchemy `A-` prefix.
 pub(crate) fn comma_short_self_name(card_name: &str) -> Option<&str> {
-    let effective_name = if card_name.as_bytes().get(0..2) == Some(b"A-") {
-        &card_name[2..]
-    } else {
-        card_name
-    };
+    let effective_name = alchemy_effective_name(card_name);
     let (_, (short_name, _)) = nom_primitives::split_once_on(effective_name, ", ").ok()?;
     if short_name.len() >= 2 {
         Some(short_name)
     } else {
         None
     }
+}
+
+/// Remove MTGJSON's structural Alchemy prefix while accepting either casing.
+fn alchemy_effective_name(card_name: &str) -> &str {
+    card_name
+        .get(..2)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("A-"))
+        .and_then(|_| card_name.get(2..))
+        .unwrap_or(card_name)
+}
+
+/// CR 201.5c: derive the printed first-and-last-word short name used by some
+/// multi-word legendary names (for example, "Captain James T. Kirk" →
+/// "Captain Kirk").
+///
+/// The leading word must be a proper-name/title word, not an article, game
+/// term, keyword, verb, or subtype. This rejects ambiguous prose and flavor
+/// labels such as "The Minstrel's Ballad" for "The Wandering Minstrel"
+/// (CR 207.2c–d) while keeping the rule independent of any individual card.
+fn compound_short_self_name(card_name: &str) -> Option<String> {
+    let effective_name = alchemy_effective_name(card_name);
+    let words: Vec<&str> = effective_name.split_whitespace().collect();
+    if comma_short_self_name(card_name).is_some() || words.contains(&"//") || words.len() < 3 {
+        return None;
+    }
+    let first = words[0];
+    let last = *words.last()?;
+    let lower_first = first.to_lowercase();
+    if first.eq_ignore_ascii_case(last)
+        || matches!(
+            lower_first.as_str(),
+            "the" | "a" | "an" | "of" | "in" | "on" | "to" | "for" | "at" | "by"
+        )
+        || is_core_type_name(&lower_first)
+        || is_non_subtype_subject_name(&lower_first)
+        || is_supertype_word(&lower_first)
+        || super::oracle_nom::primitives::is_keyword_word(&lower_first)
+        || super::oracle_nom::primitives::is_verb_word(&lower_first)
+        || is_subtype_word(&lower_first)
+    {
+        return None;
+    }
+    Some(format!("{first} {last}"))
 }
 
 /// Replace all occurrences of `needle` in `haystack` with `replacement`,
@@ -2083,13 +2151,65 @@ fn unmask_card_named_literal_spans(text: String, originals: &[String]) -> String
 /// [`mask_granting_self_reference_in_quotes`] when a card's own printed name
 /// appears in a self-reference (verb-object) position inside a *quoted granted
 /// body*. Unlike the other placeholders in this module it is deliberately NOT
-/// unmasked at the end of normalization — it survives into the parser, where
-/// `parse_self_reference` and the cost self-ref combinators map it to
-/// `TargetFilter::GrantingObject` (concretized to the granting object at
-/// grant-clone time). Any un-migrated parser path that still sees it degrades it
-/// to `~` (host `SelfRef`) via a final cleanup in `parse_quoted_ability`, so a
-/// missed site is never worse than the pre-fix host binding.
+/// unmasked at the end of normalization — it survives into the parser and feeds
+/// TWO channels:
+///
+/// * the TYPED channel — `parse_self_reference` (`oracle_nom/target.rs`) and the
+///   cost self-ref combinators map it to `TargetFilter::GrantingObject`,
+///   concretized to the granting object at each Layer-6 grant; and
+/// * the DISPLAY channel — [`render_granting_self_reference`], invoked from the
+///   two production parse entry points `parser::oracle::parse_oracle_text` and
+///   `game::effects::token::catalog_rules_text_abilities`, which renders the
+///   marker as the granting object's PRINTED name.
+///
+/// Naming both entry points here makes the leak surface auditable from the
+/// constant itself. The standing completeness authority for the display channel
+/// is not this comment: it is `parser::oracle::tests::render_net_effect_carrier_census`
+/// (a new `Effect` variant, or a new variant on an intermediate payload enum,
+/// reds it), `parser::oracle::tests::render_net_reaches_every_nested_description_carrier`
+/// (a new description-bearing FIELD on an existing carrier reds it), and the
+/// corpus-wide `serde_json` leak guards.
 pub(crate) const GRANTING_SELF_PLACEHOLDER: &str = "\u{E0002}";
+
+/// CR 201.5a + CR 201.5c: Render a granting-object self-reference for DISPLAY.
+///
+/// [`mask_granting_self_reference_in_quotes`] marks a granted quoted body's
+/// by-name reference to its GRANTING object with [`GRANTING_SELF_PLACEHOLDER`],
+/// keeping it distinct from the host self-reference `~`. The typed channel
+/// consumes the marker as `TargetFilter::GrantingObject`; this is that channel's
+/// display mirror — the marker renders as the granting object's PRINTED name, so
+/// the client's host-name substitution (`~` -> the object the ability is on;
+/// CR 201.5b, `client/src/utils/description.ts::renderDescription`) can never
+/// capture a granter reference.
+///
+/// WHY PARSE TIME, NOT THE LAYER-6 GRANT (CR 201.5a, last sentence — "This is
+/// also true if the second ability is copied onto a new object"):
+/// `GrantAllActivatedAbilitiesOf` is expanded at continuous-effect collection
+/// time into one synthesized `GrantAbility` per donated ability, each emitted
+/// with `source_id: recipient_id` (`game::layers::expand_granted_activated_abilities`).
+/// Layer 6 concretizes against that `source_id`, so a live name lookup there
+/// would stamp the RE-GRANTING object's name rather than the original granter's.
+/// The printed name resolved once, here, travels through the copy correctly.
+///
+/// CR 201.5c: a printed shortened name is treated as the card's full name, so
+/// emitting the full printed name is correct even where the body printed a short
+/// form ("Sacrifice Captain Kirk" on "Captain James T. Kirk").
+///
+/// PRECONDITION: `card_name` must be a real printed name. With an empty
+/// (or empty-after-`A-`-strip) name there is nothing to render, so the marker is
+/// left in place — a visible failure rather than a silently DELETED CR 201.5a
+/// reference. `game::coverage`'s `normalize_for_matching` passes `""` in three
+/// unit tests whose inputs carry no marker; production always passes a real name.
+///
+/// Single authority: every site that finalizes a display description calls this.
+pub(crate) fn render_granting_self_reference(text: &str, card_name: &str) -> String {
+    let printed = alchemy_effective_name(card_name);
+    if printed.is_empty() {
+        return text.to_string();
+    }
+    // allow-noncombinator: display-string sentinel rendering; not parsing dispatch.
+    text.replace(GRANTING_SELF_PLACEHOLDER, printed)
+}
 
 /// CR 201.5a: Self-reference verb-object trigger phrases — the positions whose
 /// downstream combinator (`parse_cost_self_reference` in `oracle_cost.rs` /
@@ -2129,34 +2249,39 @@ const GRANTER_SELF_REF_VERB_PREFIXES: &[&str] = &[
 /// everywhere else (outside quotes, or in-quote QuantityRef / condition /
 /// damage-source / exclusion / name-filter positions) the card name still
 /// normalizes to `~` (host self-ref), byte-identical to pre-fix. Only the
-/// deterministic proper-noun variants (full multi-word name and comma-separated
-/// short name) are masked, mirroring `normalize_card_name_refs` strategies 1–2;
-/// the risky single-word / of-short fallbacks are skipped to avoid matching
-/// English words.
+/// deterministic proper-noun variants (full multi-word name, comma-separated
+/// short name, and guarded compound first/last short name) are masked, mirroring
+/// `normalize_card_name_refs`; the risky single-word / of-short fallbacks are
+/// skipped to avoid matching English words.
 fn mask_granting_self_reference_in_quotes(text: &str, card_name: &str) -> String {
     // allow-noncombinator: structural masking of a card-name self-reference
     // before `~` normalization (mirrors `mask_card_name_keyword_action`), not
     // parsing dispatch.
     // allow-noncombinator: strip MTGJSON A- prefix (structural, mirrors normalize_card_name_refs)
-    let effective_name = card_name.strip_prefix("A-").unwrap_or(card_name);
+    let effective_name = alchemy_effective_name(card_name);
     // (name, case_sensitive). Multi-word / comma-short are case-insensitive
     // (proper nouns); a single-word name is matched case-sensitively so it only
     // hits the capitalized card-name occurrence — mirroring
     // `normalize_card_name_refs`' single-word discipline. Position-gating (the
     // verb-object allowlist) makes even single-word masking safe here.
-    let mut variants: Vec<(&str, bool)> = Vec::new();
+    let mut variants: Vec<(String, bool)> = Vec::new();
     if effective_name.contains(' ') {
-        variants.push((effective_name, false));
+        variants.push((effective_name.to_string(), false));
     } else if effective_name.len() >= 3 {
         // `>= 3`: skip 1-2 char names, matching normalize_card_name_refs guards.
-        variants.push((effective_name, true));
+        variants.push((effective_name.to_string(), true));
     }
     // allow-noncombinator: comma-short name extraction (structural, not parsing dispatch)
     if let Some(comma_pos) = effective_name.find(", ") {
         let short = &effective_name[..comma_pos];
         // `>= 2`: matches the comma-short guard in `normalize_card_name_refs`.
         if short.len() >= 2 && short.contains(' ') {
-            variants.push((short, false));
+            variants.push((short.to_string(), false));
+        }
+    }
+    if let Some(compound) = compound_short_self_name(card_name) {
+        if !variants.iter().any(|(name, _)| name == &compound) {
+            variants.push((compound, false));
         }
     }
     if variants.is_empty() {
@@ -2170,8 +2295,8 @@ fn mask_granting_self_reference_in_quotes(text: &str, card_name: &str) -> String
         }
         if seg_idx % 2 == 1 {
             let mut masked = segment.to_string();
-            for &(name, case_sensitive) in &variants {
-                masked = mask_name_occurrences_in_segment(&masked, name, case_sensitive);
+            for (name, case_sensitive) in &variants {
+                masked = mask_name_occurrences_in_segment(&masked, name, *case_sensitive);
             }
             result.push_str(&masked);
         } else {
@@ -2262,7 +2387,7 @@ pub fn normalize_card_name_refs(text: &str, card_name: &str) -> String {
     };
     let (text, card_named_originals) = mask_card_named_literal_spans(&text);
     // Strip A- prefix (Alchemy rebalanced cards in MTGJSON)
-    let effective_name = card_name.strip_prefix("A-").unwrap_or(card_name);
+    let effective_name = alchemy_effective_name(card_name);
 
     // Alchemy rebalanced cards (CR n/a — MTGJSON convention): the Oracle
     // text often references the prefixed name literally ("Return A-~ from
@@ -2303,6 +2428,14 @@ pub fn normalize_card_name_refs(text: &str, card_name: &str) -> String {
     } else {
         replace_all_words_case_sensitive(&result, effective_name, "~")
     };
+
+    // CR 201.5c: some multi-word names use a first-and-last-word printed short
+    // name. Run this independently of full-name replacement because one Oracle
+    // paragraph may contain both forms. Word boundaries prevent partial-name
+    // collisions; candidate construction rejects ambiguous game/prose words.
+    if let Some(short_name) = compound_short_self_name(card_name) {
+        result = replace_all_words(&result, &short_name, "~");
+    }
 
     // Comma-based legendary short name: "Haliya, Guided by Light" → "Haliya"
     // CR 201.3a: A legendary creature's name is the full name printed on the card;
@@ -2583,6 +2716,62 @@ mod tests {
     use super::*;
     use crate::types::mana::ManaCostShard;
     use nom::Parser;
+
+    fn tp(text: &str) -> (String, String) {
+        (text.to_string(), text.to_lowercase())
+    }
+
+    /// CR 604.1: the building block, exercised across its documented contract
+    /// rather than through any one card. An EVEN quote count before the
+    /// separator means the split point is outside a quoted granted ability and
+    /// the split is safe; an ODD count means the separator was found inside
+    /// `"…"` and the split must be refused, so the quoted ability keeps its own
+    /// gate instead of the gate being hoisted onto the granting clause.
+    #[test]
+    fn split_around_outside_quotes_refuses_separator_inside_a_quoted_ability() {
+        // Zero quotes before the separator — plain conditional static, splits.
+        let (o, l) = tp("this creature gets +1/+1 as long as you control a Swamp");
+        let (body, cond) = TextPair::new(&o, &l)
+            .split_around_outside_quotes(" as long as ")
+            .expect("an unquoted gate must split");
+        assert_eq!(body.original, "this creature gets +1/+1");
+        assert_eq!(cond.original, "you control a Swamp");
+
+        // ONE quote before the separator — the separator is inside the quoted
+        // granted ability (the Ancestral Katana / Giant's Amulet shape). Refuse:
+        // splitting here would drop the granted ability and hoist its gate onto
+        // the unconditional buff.
+        let (o, l) =
+            tp("gets +2/+2 and has \"this creature has first strike as long as it's attacking.\"");
+        assert!(
+            TextPair::new(&o, &l)
+                .split_around_outside_quotes(" as long as ")
+                .is_none(),
+            "a separator inside a quoted granted ability must not split"
+        );
+
+        // TWO quotes before the separator — the quoted region CLOSED before the
+        // separator, so the gate belongs to the granting clause. Splits.
+        let (o, l) =
+            tp("creatures you control have \"first strike\" as long as you control a Swamp");
+        let (body, cond) = TextPair::new(&o, &l)
+            .split_around_outside_quotes(" as long as ")
+            .expect("a closed quoted region must not block a later outside split");
+        assert_eq!(body.original, "creatures you control have \"first strike\"");
+        assert_eq!(cond.original, "you control a Swamp");
+
+        // Documented FIRST-OCCURRENCE property: an odd-quote body refuses
+        // outright rather than scanning on to a later outside-quotes separator.
+        // No corpus line has this shape; pinning it makes the deviation
+        // deliberate rather than accidental if one ever appears.
+        let (o, l) = tp("has \"x as long as y\" as long as you control a Swamp");
+        assert!(
+            TextPair::new(&o, &l)
+                .split_around_outside_quotes(" as long as ")
+                .is_none(),
+            "first-occurrence semantics: refuse, do not scan on to the later separator"
+        );
+    }
 
     fn parse_every_creature_type_prefix(input: &str) -> OracleResult<'_, ()> {
         let (input, _) = tag("creatures you control are").parse(input)?;
@@ -3042,6 +3231,142 @@ mod tests {
             ),
             "Whenever ~ or another creature enters"
         );
+    }
+
+    #[test]
+    fn normalize_compound_printed_short_names() {
+        // CR 201.5c: printed shortened names are the same object reference.
+        assert_eq!(
+            normalize_card_name_refs(
+                "Whenever Captain Kirk enters or attacks, choose one.",
+                "Captain James T. Kirk",
+            ),
+            "Whenever ~ enters or attacks, choose one."
+        );
+        assert_eq!(
+            normalize_card_name_refs(
+                "Whenever Captain Janeway or another creature you control enters, that creature explores.",
+                "Captain Kathryn Janeway",
+            ),
+            "Whenever ~ or another creature you control enters, that creature explores."
+        );
+        assert_eq!(
+            normalize_card_name_refs(
+                "Whenever you gain life, put a +1/+1 counter on Dr. Crusher.",
+                "Dr. Beverly Crusher",
+            ),
+            "Whenever you gain life, put a +1/+1 counter on ~."
+        );
+    }
+
+    #[test]
+    fn normalize_compound_short_name_rejects_ambiguous_prose_and_labels() {
+        // CR 207.2c–d: an ability/flavor label has no rules meaning and is not
+        // a shortened self-reference merely because it shares the outer words.
+        assert_eq!(
+            normalize_card_name_refs(
+                "The Minstrel's Ballad — At the beginning of combat on your turn, create a token.",
+                "The Wandering Minstrel",
+            ),
+            "The Minstrel's Ballad — At the beginning of combat on your turn, create a token."
+        );
+        // The same candidate guard rejects an ordinary imperative/game-word
+        // collision rather than rewriting prose as a self-reference.
+        assert_eq!(
+            normalize_card_name_refs("Search Tomorrow for a card.", "Search for Tomorrow"),
+            "Search Tomorrow for a card."
+        );
+    }
+
+    #[test]
+    fn normalize_compound_short_name_preserves_named_literals() {
+        assert_eq!(
+            normalize_card_name_refs(
+                "A deck can have only one card named Captain Kirk.",
+                "Captain James T. Kirk",
+            ),
+            "A deck can have only one card named Captain Kirk."
+        );
+        assert_eq!(
+            normalize_card_name_refs(
+                "Create a legendary 1/1 Human creature token named Captain Kirk.",
+                "Captain James T. Kirk",
+            ),
+            "Create a legendary 1/1 Human creature token named Captain Kirk."
+        );
+    }
+
+    #[test]
+    fn normalize_compound_short_name_masks_quoted_granter_reference() {
+        let normalized = normalize_card_name_refs(
+            "Creatures you control have \"Sacrifice Captain Kirk: Draw a card.\" Whenever Captain Kirk attacks, draw a card.",
+            "Captain James T. Kirk",
+        );
+        assert_eq!(
+            normalized,
+            format!(
+                "Creatures you control have \"Sacrifice {GRANTING_SELF_PLACEHOLDER}: Draw a card.\" Whenever ~ attacks, draw a card."
+            )
+        );
+    }
+
+    /// H1 — CR 201.5b: a host self-reference (`~`) is NOT a granter reference and
+    /// must survive the render byte-for-byte. The helper's only production branch
+    /// on a marker-free string is `String::replace` with zero matches.
+    #[test]
+    fn render_granting_self_reference_leaves_a_host_reference_alone() {
+        assert_eq!(
+            render_granting_self_reference("Sacrifice ~: Draw a card.", "Spare Dagger"),
+            "Sacrifice ~: Draw a card."
+        );
+    }
+
+    /// H2 — the render reuses [`alchemy_effective_name`], the same helper the
+    /// masker uses, so a rebalanced Alchemy card renders its base printed name.
+    #[test]
+    fn render_granting_self_reference_strips_the_alchemy_prefix() {
+        assert_eq!(
+            render_granting_self_reference(
+                &format!("Sacrifice {GRANTING_SELF_PLACEHOLDER}: Draw a card."),
+                "A-Spare Dagger",
+            ),
+            "Sacrifice Spare Dagger: Draw a card."
+        );
+    }
+
+    /// H3 — CR 201.5c: printed text may use a shortened name, but the reference
+    /// is to the card, so the FULL printed name is what renders. Composed with
+    /// the real masker rather than a hand-planted marker, with a positive
+    /// reach-guard that the masker actually fired.
+    #[test]
+    fn render_granting_self_reference_emits_the_full_printed_name() {
+        let masked = normalize_card_name_refs(
+            "Creatures you control have \"Sacrifice Captain Kirk: Draw a card.\"",
+            "Captain James T. Kirk",
+        );
+        assert!(
+            masked.contains(GRANTING_SELF_PLACEHOLDER),
+            "reach-guard: the masker must place the granter marker, or the \
+             render assertion below proves nothing; got {masked}"
+        );
+        let rendered = render_granting_self_reference(&masked, "Captain James T. Kirk");
+        // allow-noncombinator: assertion over a rendered display string, not parsing dispatch.
+        let emits_full_name = rendered.contains("Sacrifice Captain James T. Kirk");
+        assert!(
+            emits_full_name,
+            "CR 201.5c: the full printed name must be emitted, got {rendered}"
+        );
+    }
+
+    /// H4 — the precondition branch. With no printed name there is nothing to
+    /// render, and DELETING a CR 201.5a reference would be worse than leaving a
+    /// visible marker. `game::coverage::normalize_for_matching` passes `""` in
+    /// three unit tests whose inputs carry no marker.
+    #[test]
+    fn render_granting_self_reference_keeps_the_marker_without_a_printed_name() {
+        let text = format!("x{GRANTING_SELF_PLACEHOLDER}y");
+        assert_eq!(render_granting_self_reference(&text, ""), text);
+        assert_eq!(render_granting_self_reference(&text, "A-"), text);
     }
 
     #[test]
@@ -3799,12 +4124,9 @@ mod tests {
         assert!(matches!(
             qty,
             QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: AggregateFunction::Max,
-                    property: ObjectProperty::ManaValue,
-                    ..
-                }
-            }
+                qty: QuantityRef::PropertyAggregate(aggregate),
+            } if aggregate.function() == AggregateFunction::Max
+                && aggregate.property() == ObjectProperty::ManaValue
         ));
         assert!(rest.is_empty());
     }

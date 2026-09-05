@@ -191,6 +191,7 @@ fn guard_mana_restrictions_payload(
                 count: _,
             }
             | ManaRestriction::OnlyForSpellFromZone(_)
+            | ManaRestriction::CannotCastSpellFromZone(_)
             | ManaRestriction::OnlyForFaceDownSpell
             | ManaRestriction::OnlyForSpecialAction(_)
             | ManaRestriction::Impossible
@@ -698,6 +699,7 @@ pub fn guard_game_action_payload(action: &GameAction) -> Result<(), String> {
         | GameAction::CastSpellAsMiracle { .. }
         | GameAction::CastSpellAsMadness { .. }
         | GameAction::DecideOptionalEffect { .. }
+        | GameAction::ChooseResolutionOptionalPaymentBranch { .. }
         | GameAction::DecideOptionalEffectAndRemember { .. }
         | GameAction::PayUnlessCost { .. }
         | GameAction::ChooseUnlessCostBranch { .. }

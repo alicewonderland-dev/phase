@@ -4,8 +4,9 @@
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, BeholdCostAction, CounterCostSelection, Effect,
-    QuantityExpr, ReplacementDefinition, SacrificeCost, TapCreaturesRequirement, TargetFilter,
-    TargetRef, TypeFilter, TypedFilter, REMOVE_COUNTER_COST_X,
+    QuantityExpr, ReplacementDefinition, SacrificeCost, TapCreaturesRequirement,
+    TapCreaturesSelectionMode, TargetFilter, TargetRef, TypeFilter, TypedFilter,
+    REMOVE_COUNTER_COST_X,
 };
 use engine::types::actions::GameAction;
 use engine::types::counter::{CounterMatch, CounterType};
@@ -175,7 +176,12 @@ fn targeted_activation_surfaces_tap_creatures_cost_after_target_selection() {
     let WaitingFor::PayCost { kind, choices, .. } = runner.state().waiting_for.clone() else {
         panic!("target declaration must surface the tap-creatures cost");
     };
-    assert_eq!(kind, PayCostKind::TapCreatures { aggregate: None });
+    assert_eq!(
+        kind,
+        PayCostKind::TapCreatures {
+            mode: TapCreaturesSelectionMode::Fixed
+        }
+    );
     assert!(choices.contains(&payment));
 
     runner

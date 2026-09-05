@@ -20,11 +20,13 @@ const mocks = vi.hoisted(() => {
     // pin the mock to `Promise<null>` and reject every replay value below.
     getNativeEngineProgress: vi.fn(async (): Promise<NativeEngineProgress | null> => null),
     invoke: vi.fn(),
+    isDesktopTauri: vi.fn(() => true),
     unlisten,
   };
 });
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
+vi.mock("../../../services/platform", () => ({ isDesktopTauri: mocks.isDesktopTauri }));
 
 // Only the shell's event bridge is faked. `ensureNativeEngine` and
 // `useNativeEngineProvisioning` stay real so these tests exercise the actual

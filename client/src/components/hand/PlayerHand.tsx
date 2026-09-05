@@ -6,6 +6,7 @@ import { useTranslation } from "react-i18next";
 import { CardImage } from "../card/CardImage.tsx";
 import { ManaCostPips } from "../mana/ManaCostPips.tsx";
 import { spellCostDisplay } from "../../viewmodel/costLabel.ts";
+import { useBackFaceSpellCost } from "../../hooks/useBackFaceSpellCost.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
 import { usePreferencesStore } from "../../stores/preferencesStore.ts";
@@ -439,7 +440,12 @@ export function PlayerHand() {
     (objectId: number, e?: React.MouseEvent) => {
       if (useUiStore.getState().debugInteractionMode && e) {
         e.stopPropagation();
-        useUiStore.getState().openDebugContextMenu({ objectId, x: e.clientX, y: e.clientY });
+        useUiStore.getState().openDebugContextMenu({
+          objectId,
+          x: e.clientX,
+          y: e.clientY,
+          surface: "game",
+        });
         return;
       }
       if (isMobile) {
@@ -619,8 +625,10 @@ export function PlayerHand() {
       >
         <AnimatePresence>
           {/* Exile wing (left): absolute fan positions 0 .. E-1. Cast-only —
-              never reorder targets. zIndex stays negative so exile sits beneath
-              the hand cards (whose zIndex is their 0-based hand index). */}
+              never reorder targets. Keep their stacking level non-negative:
+              a negative z-index puts the cards behind the transformed fan
+              container's hit-test layer, so they render but cannot be grabbed
+              for their flick-up-to-cast gesture. */}
           {exileCards.map((obj, j) => {
             return (
               <ZoneFanCard
@@ -628,13 +636,14 @@ export function PlayerHand() {
                 objectId={obj.id}
                 cardName={obj.name}
                 manaCost={obj.mana_cost}
+                backFaceManaCost={obj.back_face?.mana_cost}
                 unimplementedMechanics={obj.unimplemented_mechanics}
                 rotation={fan.rotation(j)}
                 arcOffset={fan.arc(j)}
                 restingY={verticalMetrics.restingY}
                 hoverY={verticalMetrics.hoverY}
                 marginLeft={j === 0 ? 0 : fan.overlap}
-                zIndex={j - exileCount}
+                zIndex={j}
                 theme={ZONE_THEME.exile}
                 hasPriority={hasPriority}
                 isSelected={selectedCardId === obj.id}
@@ -661,6 +670,7 @@ export function PlayerHand() {
               oracleId={obj.printed_ref?.oracle_id}
               faceName={obj.printed_ref?.face_name}
               manaCost={obj.mana_cost}
+              backFaceManaCost={obj.back_face?.mana_cost}
               unimplementedMechanics={obj.unimplemented_mechanics}
               index={i}
               handSize={handObjects.length}
@@ -699,6 +709,7 @@ export function PlayerHand() {
                 objectId={obj.id}
                 cardName={obj.name}
                 manaCost={obj.mana_cost}
+                backFaceManaCost={obj.back_face?.mana_cost}
                 unimplementedMechanics={obj.unimplemented_mechanics}
                 rotation={fan.rotation(k)}
                 arcOffset={fan.arc(k)}
@@ -814,6 +825,7 @@ interface HandCardProps {
   oracleId?: string;
   faceName?: string;
   manaCost: ManaCost;
+  backFaceManaCost?: ManaCost;
   unimplementedMechanics?: string[];
   index: number;
   handSize: number;
@@ -847,6 +859,7 @@ const HandCard = memo(function HandCard({
   oracleId,
   faceName,
   manaCost,
+  backFaceManaCost,
   unimplementedMechanics,
   index,
   handSize,
@@ -921,6 +934,7 @@ const HandCard = memo(function HandCard({
   // free-cast permissions such as Omniscience); falls back to the printed cost.
   const effectiveCost = useGameStore((s) => s.spellCosts[String(objectId)]);
   const { displayCost, isReduced } = spellCostDisplay(effectiveCost, manaCost);
+  const backFace = useBackFaceSpellCost(objectId, backFaceManaCost);
   const playedRef = useRef(false);
 
   const setPreviewSticky = useUiStore((s) => s.setPreviewSticky);
@@ -1039,7 +1053,7 @@ const HandCard = memo(function HandCard({
             from the card wrapper, so container-type can't collapse it); lets the
             pips scale in cqi with --hand-card-w instead of a fixed px size. */}
         <div className="pointer-events-none absolute inset-0 @container">
-          <ManaCostPips cost={displayCost} isReduced={isReduced} size="fluid" />
+          <ManaCostPips cost={displayCost} isReduced={isReduced} backFace={backFace} size="fluid" />
         </div>
       </motion.div>
     </motion.div>
@@ -1050,6 +1064,7 @@ interface ZoneFanCardProps {
   objectId: number;
   cardName: string;
   manaCost: ManaCost;
+  backFaceManaCost?: ManaCost;
   unimplementedMechanics?: string[];
   rotation: number;
   arcOffset: number;
@@ -1080,6 +1095,7 @@ const ZoneFanCard = memo(function ZoneFanCard({
   objectId,
   cardName,
   manaCost,
+  backFaceManaCost,
   unimplementedMechanics,
   rotation,
   arcOffset,
@@ -1108,12 +1124,15 @@ const ZoneFanCard = memo(function ZoneFanCard({
 
   const effectiveCost = useGameStore((s) => s.spellCosts[String(objectId)]);
   const { displayCost, isReduced } = spellCostDisplay(effectiveCost, manaCost);
+  const backFace = useBackFaceSpellCost(objectId, backFaceManaCost);
   // Suppress dragSnapToOrigin only when the flick actually cast the card, so a
   // short/sideways drag springs back into the wing instead of flying off.
   const playedRef = useRef(false);
 
   return (
     <motion.div
+      data-zone-fan-card
+      data-object-id={objectId}
       // Marks the card as inspectable, which is what usePreviewDismiss's 300ms
       // `[data-card-hover]:hover` poll (and uiStore's 50ms deferred clear) test
       // for. Without it the poll saw nothing hovered and tore the preview down
@@ -1160,7 +1179,7 @@ const ZoneFanCard = memo(function ZoneFanCard({
       }}
       onMouseEnter={() => onMouseEnter(objectId)}
       onMouseLeave={onMouseLeave}
-      className="relative cursor-pointer leading-[0] select-none"
+      className="relative cursor-grab active:cursor-grabbing leading-[0] select-none"
       style={{ marginLeft, zIndex }}
       {...longPressHandlers}
     >
@@ -1183,7 +1202,7 @@ const ZoneFanCard = memo(function ZoneFanCard({
       {/* @container overlay sized to the card so the pips scale in cqi with
           --hand-card-w (see the hand-card render above). */}
       <div className="pointer-events-none absolute inset-0 @container">
-        <ManaCostPips cost={displayCost} isReduced={isReduced} size="fluid" />
+        <ManaCostPips cost={displayCost} isReduced={isReduced} backFace={backFace} size="fluid" />
       </div>
     </motion.div>
   );

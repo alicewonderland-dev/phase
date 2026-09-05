@@ -172,6 +172,7 @@ pub(crate) fn affected_filter_uses_object_population(filter: &TargetFilter) -> b
         | TargetFilter::SpecificObject { .. }
         | TargetFilter::SpecificPlayer { .. }
         | TargetFilter::PlayerWhoChoseLabel { .. }
+        | TargetFilter::PlayerMatching { .. }
         | TargetFilter::Neighbor { .. }
         | TargetFilter::ScopedPlayer
         | TargetFilter::AttachedTo
@@ -179,6 +180,9 @@ pub(crate) fn affected_filter_uses_object_population(filter: &TargetFilter) -> b
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        // CR 701.47c: fixed resolution-local object ref — never whole-board
+        // population (mirrors `CostPaidObject`).
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
@@ -379,6 +383,11 @@ pub(crate) fn target_filter_characteristic_reads_at(
         return CharacteristicKinds::ALL;
     };
     match filter {
+        // CR 102.1: an arbitrary player predicate can read anything about the
+        // boards those players control (`ControlsCount` boxes a whole
+        // `TargetFilter`), so it is undeterminable here — the same verdict the
+        // object-axis mirror `FilterProp::ControllerMatches` already carries.
+        TargetFilter::PlayerMatching { .. } => CharacteristicKinds::ALL,
         TargetFilter::Not { filter: inner } => target_filter_characteristic_reads_at(inner, depth),
         TargetFilter::Or { filters } | TargetFilter::And { filters } => {
             filters.iter().fold(CharacteristicKinds::EMPTY, |acc, f| {
@@ -451,6 +460,7 @@ pub(crate) fn target_filter_characteristic_reads_at(
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
@@ -819,6 +829,7 @@ pub(crate) fn entered_object_perturbs_affected_filter(
         | TargetFilter::SpecificObject { .. }
         | TargetFilter::SpecificPlayer { .. }
         | TargetFilter::PlayerWhoChoseLabel { .. }
+        | TargetFilter::PlayerMatching { .. }
         | TargetFilter::Neighbor { .. }
         | TargetFilter::ScopedPlayer
         | TargetFilter::AttachedTo
@@ -826,6 +837,7 @@ pub(crate) fn entered_object_perturbs_affected_filter(
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
@@ -1458,13 +1470,12 @@ pub(crate) fn controller_ref_player(
         ControllerRef::ScopedPlayer => {
             scoped_player_or_controller(state, ability, source_controller, None)
         }
-        // CR 109.4: TargetOpponent reads identically to TargetPlayer (first player target).
-        ControllerRef::TargetPlayer | ControllerRef::TargetOpponent => ability.and_then(|a| {
-            a.targets.iter().find_map(|t| match t {
-                TargetRef::Player(pid) => Some(*pid),
-                TargetRef::Object(_) => None,
-            })
-        }),
+        // CR 109.4: TargetOpponent reads identically to TargetPlayer (first
+        // declared player target), including an earlier slot in the resolving
+        // root after an intervening object-target node.
+        ControllerRef::TargetPlayer | ControllerRef::TargetOpponent => {
+            target_player_from_ability_or_root(state, ability)
+        }
         ControllerRef::ParentTargetController => parent_target_controller_player(state, ability),
         ControllerRef::ParentTargetOwner => parent_target_owner_player(state, ability),
         ControllerRef::DefendingPlayer => {
@@ -1496,6 +1507,36 @@ pub(crate) fn controller_ref_player(
         // resolving ability (Gideon Jura's "+2").
         ControllerRef::SpecificPlayer { id } => Some(*id),
     }
+}
+
+/// CR 608.2c: resolve the first declared player target without letting a
+/// chained node's most-recent object-target propagation hide an earlier player
+/// slot. Local targets remain the fast path; the flattened resolving root is
+/// the exact fallback used by `ParentTargetSlot` anaphors elsewhere.
+fn target_player_from_ability_or_root(
+    state: &GameState,
+    ability: Option<&ResolvedAbility>,
+) -> Option<PlayerId> {
+    let ability = ability?;
+    ability
+        .targets
+        .iter()
+        .find_map(|target| match target {
+            TargetRef::Player(player) => Some(*player),
+            TargetRef::Object(_) => None,
+        })
+        .or_else(|| {
+            let root = crate::game::targeting::resolving_root_ability(state, ability);
+            if std::ptr::eq(root, ability) {
+                return None;
+            }
+            crate::game::ability_utils::flatten_targets_in_chain(root)
+                .into_iter()
+                .find_map(|target| match target {
+                    TargetRef::Player(player) => Some(player),
+                    TargetRef::Object(_) => None,
+                })
+        })
 }
 /// Whether `filter`, or any filter nested anywhere inside it, satisfies `leaf`.
 ///
@@ -1529,6 +1570,12 @@ pub(crate) fn filter_contains(filter: &TargetFilter, leaf: &dyn Fn(&TargetFilter
     match filter {
         TargetFilter::And { filters } | TargetFilter::Or { filters } => filters.iter().any(recurse),
         TargetFilter::Not { filter } => recurse(filter),
+        // CR 102.1: the player-axis crossing into `PlayerFilter`, which boxes
+        // filters of its own (`ControlsCount`, `TrackedSetPossessor`,
+        // `OpponentDealtDamage`) — the mirror of the
+        // `FilterProp::ControllerMatches` arm below (which keeps CR 109.4
+        // because it really is about an object's controller). NOT a leaf.
+        TargetFilter::PlayerMatching { player } => player_filter_contains(player, leaf),
         TargetFilter::TrackedSetFiltered { filter, .. } => recurse(filter),
         // CR 609.7a: the source a "source of your choice" effect chose. CR 609.7b:
         // the optional inner filter is the "red source"-style quality the shield
@@ -1567,6 +1614,7 @@ pub(crate) fn filter_contains(filter: &TargetFilter, leaf: &dyn Fn(&TargetFilter
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
@@ -1900,6 +1948,11 @@ pub(crate) fn matches_stack_target_filter(
                 })
         }
         TargetFilter::Typed(tf) => {
+            // CR 205.1: this is a stack-entry-vs-object DISPATCH, not a guard
+            // against an empty conjunction. A type-line constraint is answerable
+            // only against the object, so a non-empty list delegates to the
+            // object matcher; an empty list stays here and is answered by
+            // `controller` / `properties`, matching every other evaluator (#8508).
             if !tf.type_filters.is_empty() {
                 return state.objects.contains_key(&stack_obj_id)
                     && matches_target_filter(state, stack_obj_id, filter, ctx);
@@ -1974,15 +2027,10 @@ fn stack_entry_controller_matches(
             ctx.scoped_iteration_player,
         )
         .is_some_and(|pid| pid == entry_controller),
-        Some(ControllerRef::TargetPlayer | ControllerRef::TargetOpponent) => ctx
-            .ability
-            .and_then(|ability| {
-                ability.targets.iter().find_map(|target| match target {
-                    TargetRef::Player(pid) => Some(*pid),
-                    TargetRef::Object(_) => None,
-                })
-            })
-            .is_some_and(|pid| pid == entry_controller),
+        Some(ControllerRef::TargetPlayer | ControllerRef::TargetOpponent) => {
+            target_player_from_ability_or_root(state, ctx.ability)
+                .is_some_and(|pid| pid == entry_controller)
+        }
         Some(ControllerRef::ParentTargetController) => {
             parent_target_controller_player(state, ctx.ability)
                 .is_some_and(|pid| pid == entry_controller)
@@ -2431,9 +2479,12 @@ pub fn is_owner_scoped_zone(zone: Zone) -> bool {
 /// In an owner-scoped zone (see [`is_owner_scoped_zone`]) this delegates to
 /// [`matches_target_filter_in_owner_zone`], so a stale `obj.controller` left behind
 /// by a control-change effect cannot exclude the object from its own owner's
-/// player-scoped query — the state `effects::change_zone` documents for a stolen
-/// creature that dies into its owner's graveyard, where `reset_for_battlefield_exit`
-/// leaves `controller = thief`. Everywhere else it delegates to the ordinary
+/// player-scoped query. `zones::apply_zone_exit_cleanup`'s
+/// `revert_layered_characteristics_to_base` call already resets `controller` back
+/// to the owner fallback for a stolen creature that dies into its owner's
+/// graveyard, but this filter is defence-in-depth for a hand-built or serialized
+/// state where the two have diverged — the state `effects::change_zone` documents
+/// at its own site. Everywhere else it delegates to the ordinary
 /// controller-scoped [`matches_target_filter`].
 pub fn matches_target_filter_for_zone(
     state: &GameState,
@@ -2449,6 +2500,20 @@ pub fn matches_target_filter_for_zone(
     }
 }
 
+/// The object a battlefield entry is about to deliver, as currently staged:
+/// the liminal projection when one exists, otherwise the live object. Shared
+/// by every entry-projection arm below so the resolution logic cannot drift.
+fn entering_object_projection(
+    state: &GameState,
+    object_id: &ObjectId,
+) -> Option<crate::game::game_object::GameObject> {
+    state
+        .liminal_entries
+        .get(object_id)
+        .map(|entry| entry.object.projected().clone())
+        .or_else(|| state.objects.get(object_id).cloned())
+}
+
 pub fn matches_target_filter_on_battlefield_entry(
     state: &GameState,
     event: &ProposedEvent,
@@ -2460,15 +2525,37 @@ pub fn matches_target_filter_on_battlefield_entry(
             object_id,
             to,
             enter_as_copy,
+            face_down_profile,
             ..
         } if *to == Zone::Battlefield => {
+            if let Some(profile) = face_down_profile {
+                // CR 708.2a + CR 708.3 + CR 708.10 + CR 614.12: an object
+                // entering face down IS the profile's body (a colorless 2/2
+                // creature for manifest/morph/cloak) — checked BEFORE the copy
+                // arm, because a face-down permanent that becomes a copy keeps
+                // the face-down characteristics (CR 708.10): only its copiable
+                // underside changes, and the observable entry characteristics
+                // stay the face-down profile.
+                let Some(mut obj) = entering_object_projection(state, object_id) else {
+                    return false;
+                };
+                crate::game::morph::apply_face_down_creature_characteristics(&mut obj, profile);
+                return filter_inner_for_object(
+                    state,
+                    &obj,
+                    *object_id,
+                    filter,
+                    ctx.source_id,
+                    ctx.source_controller,
+                    ctx.ability,
+                    ctx.trigger_source,
+                    ctx.recipient_id,
+                    ctx.scoped_iteration_player,
+                    ControllerLookup::LiveOrLki,
+                );
+            }
             if let Some(copy) = enter_as_copy {
-                let Some(mut obj) = state
-                    .liminal_entries
-                    .get(object_id)
-                    .map(|entry| entry.object.projected().clone())
-                    .or_else(|| state.objects.get(object_id).cloned())
-                else {
+                let Some(mut obj) = entering_object_projection(state, object_id) else {
                     return false;
                 };
                 crate::game::effects::token::apply_copiable_values_to_liminal_object(
@@ -3056,7 +3143,11 @@ fn filter_inner_for_object(
             controller,
             properties,
         }) => {
-            // Type filters check (all must match — conjunction)
+            // CR 205.1: type-filter conjunction. An EMPTY list is an empty conjunction
+            // — "no type-line constraint", not "matches nothing" — and the
+            // `controller` / `properties` checks carry the restriction instead. See
+            // the invariant on `TypedFilter::type_filters` for why the empty case is
+            // load-bearing on both the object and the player axis (#8508).
             for tf in type_filters {
                 if !type_filter_matches(tf, obj, &state.all_creature_types) {
                     return false;
@@ -3118,13 +3209,7 @@ fn filter_inner_for_object(
                     // whenever this variant appears). CR 109.4: TargetOpponent reads
                     // identically (the opponent constraint lives in the slot).
                     ControllerRef::TargetPlayer | ControllerRef::TargetOpponent => {
-                        let target_player = ability
-                            .and_then(|a| {
-                                a.targets.iter().find_map(|t| match t {
-                                    TargetRef::Player(pid) => Some(*pid),
-                                    TargetRef::Object(_) => None,
-                                })
-                            })
+                        let target_player = target_player_from_ability_or_root(state, ability)
                             // CR 603.2: When no player target was chosen, "that
                             // player" is the triggering event's player. Non-Phase
                             // triggers resolve their player anaphor from event
@@ -3327,6 +3412,11 @@ fn filter_inner_for_object(
         // CR 607 (by analogy): PlayerWhoChoseLabel scopes to players, not
         // objects — no object matches (evaluated on the player axis).
         TargetFilter::PlayerWhoChoseLabel { .. } => false,
+        // CR 102.1: PlayerMatching scopes to players, not objects — no object
+        // matches (it is evaluated on the player axis by
+        // `trigger_matchers::player_matches_filter` and
+        // `filter::player_matches_target_filter_in_state`).
+        TargetFilter::PlayerMatching { .. } => false,
         // CR 102.1 + CR 103.1: Neighbor scopes to a seating-relative player,
         // not an object — no object matches.
         TargetFilter::Neighbor { .. } => false,
@@ -3362,6 +3452,14 @@ fn filter_inner_for_object(
                     .as_ref()
                     .or(ability.effect_context_object.as_ref())
             })
+            .is_some_and(|snapshot| snapshot.object_id == object_id),
+        // CR 701.47c: "the amassed Army" / "the Army you amassed" — the Army
+        // creature the current amass instruction chose, threaded via
+        // `ability.amassed_army_object` (mirrors `CostPaidObject` immediately
+        // above, minus the effect-context-object fallback: amass has no such
+        // secondary carrier).
+        TargetFilter::AmassedArmy => ability
+            .and_then(|ability| ability.amassed_army_object.as_ref())
             .is_some_and(|snapshot| snapshot.object_id == object_id),
         // CR 613.1f + CR 611.2c + CR 400.7: the FILTER source's last-remembered
         // card (`ChosenAttribute::Card`, written by `Effect::RememberCard`). Read
@@ -3519,15 +3617,32 @@ fn filter_inner_for_object(
         | TargetFilter::TriggeringSpellOwner
         | TargetFilter::TriggeringSourceController
         | TargetFilter::TriggeringPlayer
-        | TargetFilter::TriggeringSource
         | TargetFilter::DefendingPlayer => false,
-        // CR 603.2 + CR 120.1 + CR 603.4: "that creature"/"that permanent" bound
-        // to the damaged object of the current trigger event. Matches only the
-        // specific object that received this trigger's damage, so an
-        // intervening-`if` like "if that creature was dealt excess damage this
-        // turn" (Maarika) never fires off an unrelated creature's earlier excess
-        // hit. Resolves through the same event-extraction authority as
-        // `ObjectScope::EventTarget`; inert (matches nothing) outside a trigger.
+        // CR 608.2k: `TriggeringSource` IS object-valued (unlike its player-axis
+        // siblings above — types/ability.rs documents it as "the source object
+        // of the triggering event"), but it is still not a population predicate,
+        // so it belongs in its own arm rather than the CR 603.7c group. Its
+        // referent is bound at resolution time by `targeting::resolved_targets`
+        // (delegating to `targeting::resolve_event_context_target` for the event
+        // tier), and `TargetFilter::is_context_ref()` guarantees no target slot
+        // is ever built from it (`ability_utils::collect_target_slots_inner` /
+        // `build_target_slot_specs` skip it). Matching `true` here would make a
+        // resolution-time ref ENUMERABLE — selectable as a population member —
+        // across every `matches_target_filter` consumer, including
+        // `layers::apply_continuous_effect_filtered`, where a `TriggeringSource`
+        // affected-filter would start selecting a population instead of the one
+        // bound referent. It would also fire at trigger DETECTION time through
+        // `quantity::triggering_event_source_object`'s thread-local fallback,
+        // changing trigger-condition and intervening-if evaluation corpus-wide.
+        // Contrast `EventTarget` below: that arm serves a DIFFERENT consumer,
+        // CR 603.4 intervening-if object matching, not population enumeration.
+        TargetFilter::TriggeringSource => false,
+        // CR 603.2 + CR 603.4: "that creature"/"that permanent" bound to the
+        // object target carried by the current trigger event. Matches only that
+        // specific object (including a BecomesTarget object), so an
+        // intervening-`if` never fires from an unrelated event. Resolves through
+        // the same event-extraction authority as `ObjectScope::EventTarget`;
+        // inert (matches nothing) outside a trigger.
         TargetFilter::EventTarget => crate::game::quantity::triggering_event_target_object(state)
             .is_some_and(|damaged| damaged == object_id),
         // CR 400.7 + CR 603.7c: a parent object can be the member predicate of
@@ -3717,6 +3832,11 @@ fn zone_change_filter_inner(
             controller,
             properties,
         }) => {
+            // CR 205.1: type-filter conjunction. An EMPTY list is an empty conjunction
+            // — "no type-line constraint", not "matches nothing" — and the
+            // `controller` / `properties` checks carry the restriction instead. See
+            // the invariant on `TypedFilter::type_filters` for why the empty case is
+            // load-bearing on both the object and the player axis (#8508).
             if !type_filters.iter().all(|tf| {
                 zone_change_record_matches_type_filter(record, tf, &state.all_creature_types)
             }) {
@@ -3750,12 +3870,7 @@ fn zone_change_filter_inner(
                     // record's controller against the chosen player target.
                     // TargetOpponent reads identically (opponent constraint in slot).
                     ControllerRef::TargetPlayer | ControllerRef::TargetOpponent => {
-                        let target_player = ability.and_then(|a| {
-                            a.targets.iter().find_map(|t| match t {
-                                TargetRef::Player(pid) => Some(*pid),
-                                TargetRef::Object(_) => None,
-                            })
-                        });
+                        let target_player = target_player_from_ability_or_root(state, ability);
                         match target_player {
                             Some(pid) if pid == record.controller => {}
                             _ => return false,
@@ -3834,6 +3949,9 @@ fn zone_change_filter_inner(
         // CR 607 (by analogy): PlayerWhoChoseLabel scopes to players, not
         // objects — a zone-change record is always an object transition.
         TargetFilter::PlayerWhoChoseLabel { .. } => false,
+        // CR 102.1: PlayerMatching scopes to players, not objects — a
+        // zone-change record is always an object transition.
+        TargetFilter::PlayerMatching { .. } => false,
         // CR 102.1 + CR 103.1: Neighbor scopes to a seating-relative player,
         // not an object — a zone-change record is always an object transition.
         TargetFilter::Neighbor { .. } => false,
@@ -3880,6 +3998,7 @@ fn zone_change_filter_inner(
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
@@ -4158,6 +4277,11 @@ pub fn spell_record_matches_filter(
                 }
             }
 
+            // CR 205.1: type-filter conjunction. An EMPTY list is an empty conjunction
+            // — "no type-line constraint", not "matches nothing" — and the
+            // `controller` / `properties` checks carry the restriction instead. See
+            // the invariant on `TypedFilter::type_filters` for why the empty case is
+            // load-bearing on both the object and the player axis (#8508).
             type_filters.iter().all(|type_filter| {
                 spell_record_matches_type_filter(record, type_filter, all_creature_types)
             }) && properties
@@ -4200,12 +4324,14 @@ pub fn spell_record_matches_filter(
         | TargetFilter::SpecificObject { .. }
         | TargetFilter::SpecificPlayer { .. }
         | TargetFilter::PlayerWhoChoseLabel { .. }
+        | TargetFilter::PlayerMatching { .. }
         | TargetFilter::Neighbor { .. }
         | TargetFilter::AttachedTo
         | TargetFilter::LastCreated
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
@@ -4401,12 +4527,7 @@ fn spell_cast_record_from_object(spell_obj: &GameObject) -> SpellCastRecord {
 /// split spell whose `fused_split_spell` marker is not yet set; the non-`_for`
 /// entry delegates with `fused = false`.
 fn spell_cast_record_from_object_for(spell_obj: &GameObject, fused: bool) -> SpellCastRecord {
-    crate::game::restrictions::spell_cast_record_for(
-        spell_obj,
-        spell_obj.zone,
-        crate::types::game_state::CastingVariant::Normal,
-        fused,
-    )
+    crate::game::restrictions::live_spell_cast_record_for(spell_obj, spell_obj.zone, fused)
 }
 
 #[derive(Clone, Copy)]
@@ -4461,6 +4582,11 @@ fn spell_object_matches_filter_inner(
                 }
             }
 
+            // CR 205.1: type-filter conjunction. An EMPTY list is an empty conjunction
+            // — "no type-line constraint", not "matches nothing" — and the
+            // `controller` / `properties` checks carry the restriction instead. See
+            // the invariant on `TypedFilter::type_filters` for why the empty case is
+            // load-bearing on both the object and the player axis (#8508).
             type_filters.iter().all(|type_filter| {
                 spell_record_matches_type_filter(record, type_filter, all_creature_types)
             }) && properties.iter().all(|prop| {
@@ -4518,12 +4644,14 @@ fn spell_object_matches_filter_inner(
         | TargetFilter::SpecificObject { .. }
         | TargetFilter::SpecificPlayer { .. }
         | TargetFilter::PlayerWhoChoseLabel { .. }
+        | TargetFilter::PlayerMatching { .. }
         | TargetFilter::Neighbor { .. }
         | TargetFilter::AttachedTo
         | TargetFilter::LastCreated
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
@@ -4602,18 +4730,16 @@ fn spell_object_matches_property(
                 })
         }),
         FilterProp::MostPrevalentCreatureTypeIn { .. } => false,
+        // CR 608.2d: "the chosen color" for this filter form wants the
+        // CURRENT answer, not the CR 607.2d linked one — mirrors
+        // `GameObject::current_chosen_color`.
         FilterProp::IsChosenColor => context.is_some_and(|context| {
             context
                 .state
                 .objects
                 .get(&context.source_id)
-                .and_then(|source| {
-                    source.chosen_attributes.iter().find_map(|attr| match attr {
-                        ChosenAttribute::Color(color) => Some(color),
-                        _ => None,
-                    })
-                })
-                .is_some_and(|color| record.colors.contains(color))
+                .and_then(|source| source.current_chosen_color())
+                .is_some_and(|color| record.colors.contains(&color))
         }),
         FilterProp::IsChosenCardType => context.is_some_and(|context| {
             // CR 205.2a: `chosen_card_type()` resolves both the `CardType`
@@ -4789,7 +4915,21 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         // CR 107.3 + CR 202.1: The snapshot captured whether the printed mana
         // cost contained an `{X}` shard at cast time.
         FilterProp::HasXInManaCost => record.has_x_in_cost,
+        // CR 715.2a + CR 715.2b: A spell-cast snapshot preserves the
+        // Adventure alternative-characteristics fact after the spell leaves
+        // the stack; this is distinct from casting the Adventure face.
+        FilterProp::HasAdventure => record.has_adventure,
         FilterProp::WasKicked => record.was_kicked,
+        // CR 708.4: A face-down spell is a real spell on the stack, not a
+        // battlefield-only state — a morph/megamorph/disguise card cast face down
+        // IS a face-down 2/2 creature spell (CR 702.37c / CR 702.168b). The record
+        // states that as the cast variant, both in the ledger (announced by
+        // `record_spell_cast_from_zone`) and at the live seams
+        // (`live_spell_cast_record_for`), so "face-down creature spells you cast"
+        // resolves here instead of failing closed.
+        FilterProp::FaceDown => {
+            record.cast_variant == crate::types::game_state::CastingVariant::FaceDown
+        }
         FilterProp::HasXInActivationCost => false,
         // CR 605.1: Spell-cast records snapshot the spell object, not the
         // object's ability list. Fail closed for history predicates.
@@ -4849,7 +4989,6 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         | FilterProp::Counters { .. }
         | FilterProp::Owned { .. }
         | FilterProp::Foretold
-        | FilterProp::HasAdventure
         | FilterProp::EnchantedBy
         | FilterProp::EquippedBy
         | FilterProp::AttachedToSource
@@ -4893,7 +5032,6 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         // CR 122.6: A spell on the stack hasn't received counters as a
         // permanent — fail closed against the spell-cast snapshot.
         | FilterProp::CountersPutOnThisTurn { .. }
-        | FilterProp::FaceDown
         | FilterProp::Transformed
         | FilterProp::TargetsOnly { .. }
         | FilterProp::Targets { .. }
@@ -5266,6 +5404,7 @@ fn aura_can_enchant_referenced_target(
             enchant_filter,
             *player_id,
             Some(aura.controller),
+            Some(aura_id),
         ),
     }
 }
@@ -5707,17 +5846,13 @@ fn matches_filter_prop(
                     .is_some_and(|pid| pid == obj.owner)
             }
             // CR 109.5: Ownership relative to a chosen target player.
-            // Resolves against the first TargetRef::Player in ability.targets.
-            // TargetOpponent reads identically (opponent constraint lives in the slot).
-            ControllerRef::TargetPlayer | ControllerRef::TargetOpponent => source
-                .ability
-                .and_then(|a| {
-                    a.targets.iter().find_map(|t| match t {
-                        TargetRef::Player(pid) => Some(*pid),
-                        TargetRef::Object(_) => None,
-                    })
-                })
-                .is_some_and(|pid| pid == obj.owner),
+            // Resolves against the first player target on the current node or
+            // its resolving root. TargetOpponent reads identically (the
+            // opponent constraint lives in the declared slot).
+            ControllerRef::TargetPlayer | ControllerRef::TargetOpponent => {
+                target_player_from_ability_or_root(state, source.ability)
+                    .is_some_and(|pid| pid == obj.owner)
+            }
             ControllerRef::ParentTargetController => {
                 parent_target_controller_player(state, source.ability)
                     .is_some_and(|pid| pid == obj.owner)
@@ -5984,11 +6119,17 @@ fn matches_filter_prop(
                     )
                 })
         }
-        // CR 105.4: Match objects whose colors include the source's chosen color.
-        // Used for "of the chosen color" (Hall of Triumph, Prismatic Strands).
+        // CR 105.4 + CR 608.2d: Match objects whose colors include the source's
+        // CURRENT chosen color. Used for "of the chosen color" (Hall of
+        // Triumph, Prismatic Strands). Mirrors `GameObject::current_chosen_color`
+        // (newest / last-match) — this arm cannot call that accessor directly
+        // because `source` here is a `SourceContext`, which carries its own
+        // `chosen_attributes: Vec<ChosenAttribute>` rather than a `GameObject`,
+        // so the newest-match scan is inlined instead.
         FilterProp::IsChosenColor => source
             .chosen_attributes
             .iter()
+            .rev()
             .find_map(|a| match a {
                 crate::types::ability::ChosenAttribute::Color(c) => Some(c),
                 _ => None,
@@ -6302,9 +6443,13 @@ fn stack_entry_targets_satisfy(
     };
     let check = |t: &TargetRef| match t {
         TargetRef::Object(id) => matches_target_filter(state, *id, filter, &ctx),
-        TargetRef::Player(pid) => {
-            player_matches_target_filter_in_state(state, filter, *pid, ctx.source_controller)
-        }
+        TargetRef::Player(pid) => player_matches_target_filter_in_state(
+            state,
+            filter,
+            *pid,
+            ctx.source_controller,
+            Some(ctx.source_id),
+        ),
     };
     if require_all {
         ability.targets.iter().all(check)
@@ -6467,14 +6612,8 @@ fn zone_change_record_matches_property(
             }
             // CR 109.5: Ownership relative to a chosen target player.
             // TargetOpponent reads identically (opponent constraint lives in the slot).
-            ControllerRef::TargetPlayer | ControllerRef::TargetOpponent => source
-                .ability
-                .and_then(|a| {
-                    a.targets.iter().find_map(|t| match t {
-                        TargetRef::Player(pid) => Some(*pid),
-                        TargetRef::Object(_) => None,
-                    })
-                })
+            ControllerRef::TargetPlayer | ControllerRef::TargetOpponent =>
+                target_player_from_ability_or_root(state, source.ability)
                 .is_some_and(|pid| pid == record.owner),
             ControllerRef::ParentTargetController => {
                 parent_target_controller_player(state, source.ability)
@@ -6835,15 +6974,10 @@ fn attachment_controller_matches(
             scoped_player_or_controller(state, source.ability, source.controller, None)
                 .is_some_and(|pid| pid == attachment_controller)
         }
-        Some(ControllerRef::TargetPlayer | ControllerRef::TargetOpponent) => source
-            .ability
-            .and_then(|a| {
-                a.targets.iter().find_map(|t| match t {
-                    TargetRef::Player(pid) => Some(*pid),
-                    TargetRef::Object(_) => None,
-                })
-            })
-            .is_some_and(|pid| pid == attachment_controller),
+        Some(ControllerRef::TargetPlayer | ControllerRef::TargetOpponent) => {
+            target_player_from_ability_or_root(state, source.ability)
+                .is_some_and(|pid| pid == attachment_controller)
+        }
         Some(ControllerRef::ParentTargetController) => {
             parent_target_controller_player(state, source.ability)
                 .is_some_and(|pid| pid == attachment_controller)
@@ -7473,6 +7607,13 @@ pub fn player_matches_target_filter(
         player_id,
         source_controller,
         &|controller, player| controller != player,
+        // CR 109.5 + CR 608.2c: an arbitrary player predicate is answerable only
+        // against live game state and a source object (life totals, controlled
+        // permanents, attack history). This stateless entry point has neither, so
+        // it fails CLOSED — the same verdict its `TargetPlayer` / `DefendingPlayer`
+        // / `TriggeringPlayer` siblings already carry, and pinned by
+        // `player_matching_fails_closed_without_state`.
+        &|_, _| false,
     )
 }
 
@@ -7480,17 +7621,46 @@ pub fn player_matches_target_filter(
 /// opponent semantics from the game state.
 /// CR 102.2 / CR 102.3 / CR 115.9c: Opponent-scoped player targets exclude
 /// teammates in team multiplayer.
+///
+/// `source_id` is the object whose filter this is. It is threaded because
+/// `TargetFilter::PlayerMatching`'s payload can be source-relative
+/// (`OpponentDealtDamage { source }`, `OwnersOfCardsExiledBySource`,
+/// `DefendingPlayer`, `OpponentAttacked`), and it is an `Option` because a few
+/// callers legitimately have no source object; those fail CLOSED on the
+/// `PlayerMatching` arm rather than answering it against a fabricated id.
 pub fn player_matches_target_filter_in_state(
     state: &GameState,
     filter: &TargetFilter,
     player_id: PlayerId,
     source_controller: Option<PlayerId>,
+    source_id: Option<ObjectId>,
 ) -> bool {
     player_matches_target_filter_with(
         filter,
         player_id,
         source_controller,
         &|controller, player| crate::game::players::is_opponent(state, controller, player),
+        // CR 102.1 + CR 109.5 + CR 608.2c: `TargetFilter::PlayerMatching` makes
+        // every `PlayerFilter` predicate usable anywhere a `TargetFilter` names a
+        // player, so this door must answer it rather than fall to the wildcard
+        // tail. This IS the player-target legality door — `targeting::
+        // target_ref_matches_resolved_filter`, `casting`'s CR 115.9c "targets
+        // only" check and `ability_utils`' slot enumeration all arrive here for
+        // `TargetRef::Player` — so a missing arm enumerates ZERO legal players for
+        // "target player who has more life than you" and CR 603.3d / CR 601.2c
+        // silently discards the spell or ability.
+        //
+        // Delegates to the single authority `effects::matches_player_scope`
+        // (which `trigger_matchers::player_matches_filter` also uses) rather than
+        // re-implementing any predicate here. `source_controller` is CR 109.5
+        // "you": with no controller the payload's `relation` axis is unanswerable,
+        // so fail closed — likewise with no source object.
+        &|player, candidate| match (source_controller, source_id) {
+            (Some(controller), Some(source)) => crate::game::effects::matches_player_scope(
+                state, candidate, player, controller, source,
+            ),
+            _ => false,
+        },
     )
 }
 
@@ -7499,6 +7669,7 @@ fn player_matches_target_filter_with(
     player_id: PlayerId,
     source_controller: Option<PlayerId>,
     is_opponent: &impl Fn(PlayerId, PlayerId) -> bool,
+    matches_player_scope: &impl Fn(&PlayerFilter, PlayerId) -> bool,
 ) -> bool {
     match filter {
         TargetFilter::Any | TargetFilter::Player => true,
@@ -7545,11 +7716,28 @@ fn player_matches_target_filter_with(
         },
         // Typed filters with type_filters don't match players
         TargetFilter::Typed(_) => false,
+        // CR 102.1 + CR 109.5: the arbitrary player predicate. Answered by the
+        // injected scope matcher (live and source-bound in the `_in_state` entry
+        // point, fail-closed in the stateless one) — see the two call sites above
+        // for why this is injected rather than resolved inline.
+        TargetFilter::PlayerMatching { player } => matches_player_scope(player, player_id),
         TargetFilter::Or { filters } => filters.iter().any(|f| {
-            player_matches_target_filter_with(f, player_id, source_controller, is_opponent)
+            player_matches_target_filter_with(
+                f,
+                player_id,
+                source_controller,
+                is_opponent,
+                matches_player_scope,
+            )
         }),
         TargetFilter::And { filters } => filters.iter().all(|f| {
-            player_matches_target_filter_with(f, player_id, source_controller, is_opponent)
+            player_matches_target_filter_with(
+                f,
+                player_id,
+                source_controller,
+                is_opponent,
+                matches_player_scope,
+            )
         }),
         // CR 102.1 + CR 103.1: seating-neighbor resolution requires
         // `state.seat_order`, which is not available in this stateless matcher.
@@ -7569,7 +7757,7 @@ mod tests {
         AbilityDefinition, AbilityKind, AggregateFunction, AttachmentKind, ChosenAttribute,
         Comparator, ControllerRef, Effect, FilterProp, ManaContribution, ManaProduction,
         PlayerScope, QuantityExpr, QuantityRef, ReplacementDefinition, ResolvedAbility,
-        StaticDefinition, TargetFilter, TargetRef, TriggerDefinition, TypedFilter,
+        StaticDefinition, TargetFilter, TargetRef, TriggerDefinition, TypeFilter, TypedFilter,
     };
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::events::GameEvent;
@@ -7642,6 +7830,252 @@ mod tests {
             .core_types
             .push(CoreType::Creature);
         id
+    }
+
+    /// CR 205.1: the `type_filters` conjunction, pinned at all three arities
+    /// with a positive control that proves the list is really evaluated.
+    ///
+    /// #8508 read the zero arity as a defect (`.all()` on an empty iterator is
+    /// `true`, so "an empty `type_filters` matches every object"). It is instead
+    /// the deliberate encoding of "no type-line constraint" — see the invariant
+    /// on `TypedFilter::type_filters` — and this test is what any change to that
+    /// reading has to break first.
+    #[test]
+    fn typed_filter_type_conjunction_holds_at_every_arity() {
+        let mut state = setup();
+        let source = add_creature(&mut state, PlayerId(0), "Source");
+        let bear = add_creature(&mut state, PlayerId(0), "Bear");
+
+        let typed = |types: Vec<TypeFilter>| {
+            TargetFilter::Typed(TypedFilter {
+                type_filters: types,
+                ..TypedFilter::default()
+            })
+        };
+
+        // Arity 0: an empty conjunction imposes no type-line constraint.
+        assert!(matches_target_filter(&state, bear, &typed(vec![]), source));
+        // Arity 1.
+        assert!(matches_target_filter(
+            &state,
+            bear,
+            &typed(vec![TypeFilter::Creature]),
+            source
+        ));
+        // Arity many: every element must hold.
+        assert!(matches_target_filter(
+            &state,
+            bear,
+            &typed(vec![TypeFilter::Permanent, TypeFilter::Creature]),
+            source
+        ));
+
+        // Positive control. Without these the arity-0 `true` above would be
+        // equally consistent with a matcher that says yes to everything.
+        assert!(!matches_target_filter(
+            &state,
+            bear,
+            &typed(vec![TypeFilter::Land]),
+            source
+        ));
+        assert!(!matches_target_filter(
+            &state,
+            bear,
+            &typed(vec![TypeFilter::Creature, TypeFilter::Land]),
+            source
+        ));
+    }
+
+    /// CR 109.1 + CR 102.1: a player is not an object, so a type-line constraint
+    /// can never be satisfied by a player — which makes an empty `type_filters`
+    /// the ONLY spelling of a player-shaped `Typed` filter ("each opponent").
+    ///
+    /// This is the half of #8508 that forecloses "empty means match nothing":
+    /// that reading would delete this encoding outright.
+    #[test]
+    fn empty_type_filters_is_the_only_player_shaped_typed_filter() {
+        let you = PlayerId(0);
+        let opponent = PlayerId(1);
+
+        let each_opponent =
+            TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent));
+        assert!(player_matches_target_filter(
+            &each_opponent,
+            opponent,
+            Some(you)
+        ));
+        // Positive control on the same filter: it discriminates by controller,
+        // so the match above is not a blanket yes.
+        assert!(!player_matches_target_filter(
+            &each_opponent,
+            you,
+            Some(you)
+        ));
+
+        // The same filter carrying ANY type constraint matches no player.
+        let typed_opponent = TargetFilter::Typed(
+            TypedFilter::new(TypeFilter::Creature).controller(ControllerRef::Opponent),
+        );
+        assert!(!player_matches_target_filter(
+            &typed_opponent,
+            opponent,
+            Some(you)
+        ));
+    }
+
+    /// CR 205.1: the spell-cast-history matcher conjoins `type_filters` exactly
+    /// as the live object matcher does, so a filter cannot match an object and
+    /// then miss that object's own cast record. Same three arities, same
+    /// positive control (#8508).
+    #[test]
+    fn spell_record_type_conjunction_agrees_with_the_object_axis() {
+        let record = SpellCastRecord {
+            core_types: vec![CoreType::Creature],
+            ..SpellCastRecord::default()
+        };
+        let typed = |types: Vec<TypeFilter>| {
+            TargetFilter::Typed(TypedFilter {
+                type_filters: types,
+                ..TypedFilter::default()
+            })
+        };
+
+        assert!(spell_record_matches_filter(
+            &record,
+            &typed(vec![]),
+            PlayerId(0),
+            &[]
+        ));
+        assert!(spell_record_matches_filter(
+            &record,
+            &typed(vec![TypeFilter::Creature]),
+            PlayerId(0),
+            &[]
+        ));
+        assert!(!spell_record_matches_filter(
+            &record,
+            &typed(vec![TypeFilter::Land]),
+            PlayerId(0),
+            &[]
+        ));
+        assert!(!spell_record_matches_filter(
+            &record,
+            &typed(vec![TypeFilter::Creature, TypeFilter::Land]),
+            PlayerId(0),
+            &[]
+        ));
+    }
+
+    /// CR 608.2c: every target-relative player seam must recover the root's
+    /// earlier player slot when the current chained node carries only an object.
+    #[test]
+    fn sibling_target_player_lookups_recover_player_from_resolving_root() {
+        use crate::types::game_state::{StackEntry, StackEntryKind};
+
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let opponent_object = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Opponent Object".to_string(),
+            Zone::Battlefield,
+        );
+        let child = ResolvedAbility::new(
+            Effect::TargetOnly {
+                target: TargetFilter::Any,
+            },
+            vec![TargetRef::Object(opponent_object)],
+            source,
+            PlayerId(0),
+        );
+        let mut root = ResolvedAbility::new(
+            Effect::TargetOnly {
+                target: TargetFilter::Opponent,
+            },
+            vec![TargetRef::Player(PlayerId(1))],
+            source,
+            PlayerId(0),
+        );
+        root.sub_ability = Some(Box::new(child.clone()));
+        state.stack.push_back(StackEntry {
+            id: ObjectId(900),
+            source_id: source,
+            controller: PlayerId(0),
+            kind: StackEntryKind::TriggeredAbility {
+                source_id: source,
+                ability: Box::new(root),
+                condition: None,
+                trigger_event: None,
+                description: None,
+                source_name: String::new(),
+                subject_match_count: None,
+                die_result: None,
+                provenance: None,
+            },
+        });
+
+        let ctx = FilterContext::from_ability(&child);
+        assert!(stack_entry_controller_matches(
+            &state,
+            Some(&ControllerRef::TargetOpponent),
+            PlayerId(1),
+            &ctx,
+        ));
+
+        let owned =
+            TargetFilter::Typed(TypedFilter::default().properties(vec![FilterProp::Owned {
+                controller: ControllerRef::TargetOpponent,
+            }]));
+        assert!(super::matches_target_filter(
+            &state,
+            opponent_object,
+            &owned,
+            &ctx,
+        ));
+
+        let record = ZoneChangeRecord {
+            controller: PlayerId(1),
+            owner: PlayerId(1),
+            ..ZoneChangeRecord::test_minimal(
+                opponent_object,
+                Some(Zone::Battlefield),
+                Zone::Graveyard,
+            )
+        };
+        assert!(zone_change_filter_inner(
+            &state,
+            &record,
+            &TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::TargetOpponent)),
+            source,
+            Some(PlayerId(0)),
+            Some(&child),
+            None,
+        ));
+        assert!(zone_change_filter_inner(
+            &state,
+            &record,
+            &owned,
+            source,
+            Some(PlayerId(0)),
+            Some(&child),
+            None,
+        ));
+
+        let source_ctx =
+            source_context_from_filter(&state, source, Some(PlayerId(0)), Some(&child), None, None);
+        assert!(attachment_controller_matches(
+            Some(&ControllerRef::TargetOpponent),
+            PlayerId(1),
+            &state,
+            &source_ctx,
+        ));
     }
 
     #[test]
@@ -8042,12 +8476,183 @@ mod tests {
             &state,
             &opponent_filter,
             PlayerId(1),
-            Some(PlayerId(0))
+            Some(PlayerId(0)),
+            None,
         ));
         assert!(player_matches_target_filter_in_state(
             &state,
             &opponent_filter,
             PlayerId(2),
+            Some(PlayerId(0)),
+            None,
+        ));
+    }
+
+    /// CR 102.1 + CR 109.5 + CR 115.9c — `TargetFilter::PlayerMatching` is
+    /// ANSWERED by the player-target legality door, not silently dropped on its
+    /// wildcard tail.
+    ///
+    /// This is the door `targeting::target_ref_matches_resolved_filter`,
+    /// `casting`'s CR 115.9c check and `ability_utils`' slot enumeration all use
+    /// for `TargetRef::Player`, so before the arm existed a "target player who
+    /// has more life than you" filter enumerated ZERO legal players.
+    ///
+    /// Revert-failing: delete the `PlayerMatching` arm from
+    /// `player_matches_target_filter_with` and the first assertion flips to
+    /// `false` (the wildcard tail), which is exactly the empty-enumeration bug.
+    #[test]
+    fn player_matching_is_answered_by_the_player_target_door() {
+        use crate::types::ability::{PlayerFilter, PlayerRelation};
+
+        let mut state = GameState::new(FormatConfig::free_for_all(), 3, 42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Predicate Source".to_string(),
+            crate::types::zones::Zone::Battlefield,
+        );
+        state.players[0].life = 20;
+        state.players[1].life = 30;
+        state.players[2].life = 10;
+
+        // "a player who has more life than you" — the exact shape the Namor
+        // trigger clause lowers to.
+        let more_life = TargetFilter::PlayerMatching {
+            player: Box::new(PlayerFilter::PlayerAttribute {
+                relation: PlayerRelation::All,
+                attr: Box::new(QuantityRef::LifeTotal {
+                    player: PlayerScope::ScopedPlayer,
+                }),
+                comparator: Comparator::GT,
+                value: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::LifeTotal {
+                        player: PlayerScope::Controller,
+                    },
+                }),
+            }),
+        };
+
+        assert!(
+            player_matches_target_filter_in_state(
+                &state,
+                &more_life,
+                PlayerId(1),
+                Some(PlayerId(0)),
+                Some(source),
+            ),
+            "30 > 20 — the predicate must admit this player"
+        );
+        assert!(
+            !player_matches_target_filter_in_state(
+                &state,
+                &more_life,
+                PlayerId(2),
+                Some(PlayerId(0)),
+                Some(source),
+            ),
+            "10 is not more than 20 — the predicate must discriminate, not admit all"
+        );
+        assert!(
+            !player_matches_target_filter_in_state(
+                &state,
+                &more_life,
+                PlayerId(0),
+                Some(PlayerId(0)),
+                Some(source),
+            ),
+            "20 is not more than 20"
+        );
+
+        // Nested under `Or`, proving the recursion carries the injected matcher
+        // rather than losing it one level down.
+        let nested = TargetFilter::Or {
+            filters: vec![TargetFilter::None, more_life.clone()],
+        };
+        assert!(player_matches_target_filter_in_state(
+            &state,
+            &nested,
+            PlayerId(1),
+            Some(PlayerId(0)),
+            Some(source),
+        ));
+        assert!(!player_matches_target_filter_in_state(
+            &state,
+            &nested,
+            PlayerId(2),
+            Some(PlayerId(0)),
+            Some(source),
+        ));
+
+        // A different payload family through the same single authority, so the
+        // arm is predicate-generic rather than life-specific.
+        let opponent_only = TargetFilter::PlayerMatching {
+            player: Box::new(PlayerFilter::Opponent),
+        };
+        assert!(player_matches_target_filter_in_state(
+            &state,
+            &opponent_only,
+            PlayerId(1),
+            Some(PlayerId(0)),
+            Some(source),
+        ));
+        assert!(!player_matches_target_filter_in_state(
+            &state,
+            &opponent_only,
+            PlayerId(0),
+            Some(PlayerId(0)),
+            Some(source),
+        ));
+
+        // DECIDED, not defaulted: with no source object the payload is
+        // unanswerable, so the arm fails closed.
+        assert!(
+            !player_matches_target_filter_in_state(
+                &state,
+                &more_life,
+                PlayerId(1),
+                Some(PlayerId(0)),
+                None,
+            ),
+            "no source object — fail closed, never fail open"
+        );
+    }
+
+    /// CR 109.5 + CR 608.2c — the STATELESS sibling's fail-closed answer is
+    /// DECIDED, matching the pins the same matcher already carries for
+    /// `TargetPlayer` / `DefendingPlayer` / `TriggeringPlayer`.
+    ///
+    /// A life total is not readable without `state`, so answering `true` here
+    /// would be fail-OPEN: `player_matches_target_filter` is the CR 115.9c
+    /// "targets only" path, where fail-open silently widens a restriction.
+    #[test]
+    fn player_matching_fails_closed_without_state() {
+        use crate::types::ability::{PlayerFilter, PlayerRelation};
+
+        let filter = TargetFilter::PlayerMatching {
+            player: Box::new(PlayerFilter::PlayerAttribute {
+                relation: PlayerRelation::All,
+                attr: Box::new(QuantityRef::LifeTotal {
+                    player: PlayerScope::ScopedPlayer,
+                }),
+                comparator: Comparator::GT,
+                value: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::LifeTotal {
+                        player: PlayerScope::Controller,
+                    },
+                }),
+            }),
+        };
+        assert!(!player_matches_target_filter(
+            &filter,
+            PlayerId(1),
+            Some(PlayerId(0))
+        ));
+        // Reach guard: the same stateless matcher DOES answer a filter it can
+        // resolve, so the negative above is not vacuous.
+        assert!(player_matches_target_filter(
+            &TargetFilter::Player,
+            PlayerId(1),
             Some(PlayerId(0))
         ));
     }
@@ -8478,6 +9083,7 @@ mod tests {
             colors: vec![ManaColor::Blue],
             mana_value: 3,
             has_x_in_cost: false,
+            has_adventure: false,
             from_zone: Zone::Hand,
             cast_variant: crate::types::game_state::CastingVariant::Normal,
             was_kicked: false,
@@ -8593,6 +9199,7 @@ mod tests {
             colors: vec![],
             mana_value: 3,
             has_x_in_cost: true,
+            has_adventure: false,
             from_zone: Zone::Hand,
             cast_variant: crate::types::game_state::CastingVariant::Normal,
             was_kicked: false,
@@ -8600,6 +9207,7 @@ mod tests {
         };
         let non_x_record = SpellCastRecord {
             has_x_in_cost: false,
+            has_adventure: false,
             from_zone: Zone::Hand,
             ..x_record.clone()
         };
@@ -8675,6 +9283,7 @@ mod tests {
             colors: vec![],
             mana_value: 2,
             has_x_in_cost: false,
+            has_adventure: false,
             from_zone: Zone::Hand,
             cast_variant: crate::types::game_state::CastingVariant::Normal,
             was_kicked: false,
@@ -13084,6 +13693,7 @@ mod tests {
                 colors: Vec::new(),
                 mana_value: 0,
                 has_x_in_cost: false,
+                has_adventure: false,
                 from_zone: Zone::Hand,
                 cast_variant: crate::types::game_state::CastingVariant::Normal,
                 was_kicked: false,
@@ -13122,6 +13732,42 @@ mod tests {
         assert!(!spell_record_matches_property(
             &vanilla_record,
             &FilterProp::Historic,
+        ));
+    }
+
+    /// CR 715.2a: A spell-cast snapshot must preserve the distinction between
+    /// a creature spell with an Adventure and an ordinary creature spell.
+    #[test]
+    fn spell_record_adventure_property_matches_snapshot() {
+        use crate::types::game_state::SpellCastRecord;
+
+        let filter = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Creature],
+            controller: None,
+            properties: vec![FilterProp::HasAdventure],
+        });
+        let adventure_record = SpellCastRecord {
+            core_types: vec![CoreType::Creature],
+            has_adventure: true,
+            ..SpellCastRecord::default()
+        };
+        let ordinary_record = SpellCastRecord {
+            core_types: vec![CoreType::Creature],
+            has_adventure: false,
+            ..SpellCastRecord::default()
+        };
+
+        assert!(spell_record_matches_filter(
+            &adventure_record,
+            &filter,
+            PlayerId(0),
+            &[],
+        ));
+        assert!(!spell_record_matches_filter(
+            &ordinary_record,
+            &filter,
+            PlayerId(0),
+            &[],
         ));
     }
 
@@ -13574,6 +14220,7 @@ mod tests {
             colors: vec![],
             mana_value: 7,
             has_x_in_cost: false,
+            has_adventure: false,
             from_zone: Zone::Hand,
             cast_variant: crate::types::game_state::CastingVariant::Normal,
             was_kicked: false,
@@ -14494,6 +15141,96 @@ mod tests {
                 FaceControllerScope::AssumeOwn
             ),
             "a definitely-matching alternative admits even beside an unknown"
+        );
+    }
+
+    /// CR 708.10 + CR 708.2a: a `ZoneChange` carrying BOTH `enter_as_copy` AND
+    /// `face_down_profile` matches entry filters as the face-down 2/2 — a
+    /// face-down permanent that becomes a copy keeps the face-down
+    /// characteristics; only its copiable underside changes. Discriminator for
+    /// the arm ordering in `matches_target_filter_on_battlefield_entry`:
+    /// reverse the arms and BOTH assertions flip (the green copied face would
+    /// match as face-up and the colorless face-down body would not).
+    #[test]
+    fn a_face_down_copy_entry_matches_as_the_face_down_body() {
+        use crate::types::ability::{FaceDownProfile, TypeFilter};
+        use crate::types::proposed_event::{CopyTokenSpec, ProposedEvent};
+
+        let mut state = GameState::new_two_player(42);
+        let entering = create_object(
+            &mut state,
+            CardId(900),
+            PlayerId(0),
+            "Copying Entrant".to_string(),
+            Zone::Library,
+        );
+        let green_source = create_object(
+            &mut state,
+            CardId(901),
+            PlayerId(0),
+            "Green Original".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&green_source).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.color = vec![ManaColor::Green];
+            obj.power = Some(3);
+            obj.toughness = Some(3);
+        }
+        let values =
+            crate::game::printed_cards::intrinsic_copiable_values(&state.objects[&green_source]);
+
+        let mut event =
+            ProposedEvent::zone_change(entering, Zone::Library, Zone::Battlefield, None);
+        if let ProposedEvent::ZoneChange {
+            enter_as_copy,
+            face_down_profile,
+            ..
+        } = &mut event
+        {
+            *enter_as_copy = Some(Box::new(CopyTokenSpec {
+                values: Box::new(values),
+                display_source: crate::game::game_object::DisplaySource::Token,
+                printed_ref: None,
+                token_image_ref: None,
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+                tapped: false,
+                enters_attacking: false,
+                sacrifice_at: None,
+                source_id: ObjectId(0),
+                controller: PlayerId(0),
+            }));
+            *face_down_profile = Some(Box::new(FaceDownProfile::vanilla_2_2()));
+        } else {
+            unreachable!();
+        }
+
+        let ctx = FilterContext::from_source(&state, entering);
+        let colorless_creatures = TargetFilter::Typed(
+            TypedFilter::new(TypeFilter::Creature)
+                .controller(ControllerRef::You)
+                .properties(vec![FilterProp::ColorCount {
+                    comparator: Comparator::EQ,
+                    count: 0,
+                }]),
+        );
+        let green_creatures = TargetFilter::Typed(
+            TypedFilter::new(TypeFilter::Creature)
+                .controller(ControllerRef::You)
+                .properties(vec![FilterProp::HasColor {
+                    color: ManaColor::Green,
+                }]),
+        );
+
+        assert!(
+            matches_target_filter_on_battlefield_entry(&state, &event, &colorless_creatures, &ctx),
+            "the face-down body (colorless 2/2 creature) must match"
+        );
+        assert!(
+            !matches_target_filter_on_battlefield_entry(&state, &event, &green_creatures, &ctx),
+            "the copied green face must NOT leak into entry matching (CR 708.10)"
         );
     }
 }

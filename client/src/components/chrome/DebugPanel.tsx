@@ -11,13 +11,14 @@ import { usePlayerId } from "../../hooks/usePlayerId";
 import { getSeatColor } from "../../hooks/useSeatColor";
 import {
   copyGameStateDebugSnapshot,
-  exportGameStateDebugZip,
+  exportAuthoritativeGameStateZip,
 } from "../../services/gameStateExport";
 import { gameStateFromImportText, readImportFile } from "../../services/gameStateImport";
-import { useGameStore } from "../../stores/gameStore";
+import { canExportAuthoritativeState, useGameStore } from "../../stores/gameStore";
 import { getPlayerDisplayName } from "../../stores/multiplayerStore";
 import { useUiStore } from "../../stores/uiStore";
 import { DebugActions } from "./DebugActions";
+import { copyText } from "../../services/copyText";
 
 const SCROLL_THRESHOLD = 40; // px from bottom to count as "at bottom"
 
@@ -70,6 +71,8 @@ export function DebugPanel({
   const adapter = useGameStore((s) => s.adapter);
   const gameState = useGameStore((s) => s.gameState);
   const gameMode = useGameStore((s) => s.gameMode);
+  const canExportAuthoritative = canExportAuthoritativeState(gameMode)
+    && adapter?.exportPersistenceState !== undefined;
   // The transport, not the mode, decides whether a rollback request can be
   // bound to an authenticated session — same idiom as `supportsMatchConcede`.
   const rewindAdapter = supportsServerRewind(adapter) ? adapter : null;
@@ -172,14 +175,14 @@ export function DebugPanel({
   }, [gameState]);
 
   const handleExportGameState = useCallback(() => {
-    if (!gameState) return;
-    exportGameStateDebugZip(gameState)
+    if (!adapter) return;
+    exportAuthoritativeGameStateZip(adapter)
       .then((filename) => setStatus({ type: "success", message: `Exported ${filename}` }))
       .catch((err: unknown) => {
         if (err instanceof DOMException && err.name === "AbortError") return;
         setStatus({ type: "error", message: "Failed to export game state" });
       });
-  }, [gameState]);
+  }, [adapter]);
 
   // Same destination as the top-left report flag. Close this panel first — it
   // renders at z-[9999], above the report dialog's z-50 overlay, so leaving it
@@ -220,9 +223,10 @@ export function DebugPanel({
       setStatus({ type: "error", message: "No console entries to copy" });
       return;
     }
-    navigator.clipboard.writeText(formatEntries(visibleEntries))
-      .then(() => setStatus({ type: "success", message: `Copied ${visibleEntries.length} entries` }))
-      .catch(() => setStatus({ type: "error", message: "Failed to copy console" }));
+    void copyText(formatEntries(visibleEntries)).then((copied) =>
+      setStatus(copied
+        ? { type: "success", message: `Copied ${visibleEntries.length} entries` }
+        : { type: "error", message: "Failed to copy console" }));
   }, [visibleEntries, formatEntries]);
 
   const handleExportZip = useCallback(() => {
@@ -516,11 +520,11 @@ export function DebugPanel({
           </button>
           <button
             onClick={handleExportGameState}
-            disabled={!gameState}
+            disabled={!canExportAuthoritative}
             className="mt-1 w-full rounded bg-gray-800 px-2 py-1 text-xs transition-colors hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-40"
-            title="Download the current debug game state as minified JSON inside a compressed ZIP"
+            title={t("debug.exportAuthoritativeTitle")}
           >
-            Export Game State
+            {t("debug.exportAuthoritative")}
           </button>
         </section>
 

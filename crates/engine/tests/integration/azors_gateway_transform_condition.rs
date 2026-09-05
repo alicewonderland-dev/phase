@@ -43,6 +43,7 @@ const AZORS_GATEWAY_ORACLE: &str = "{1}, {T}: Draw a card, then exile a card fro
 
 fn sanctum_of_the_sun_back_face() -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
         name: "Sanctum of the Sun".to_string(),
         power: None,
         toughness: None,

@@ -194,6 +194,7 @@ mod tests {
         obj.color = vec![ManaColor::Green];
         obj.base_color = vec![ManaColor::Green];
         obj.back_face = Some(crate::game::game_object::BackFaceData {
+            is_swap_snapshot: false,
             name: "Back Face".to_string(),
             power: Some(4),
             toughness: Some(4),

@@ -58,6 +58,7 @@ const LITHOFORM_ENGINE_ORACLE: &str = "{2}, {T}: Copy target activated or trigge
 /// CR 712: the back face Thraben Gargoyle transforms into.
 fn stonewing_antagonizer_back_face() -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
         name: "Stonewing Antagonizer".to_string(),
         power: Some(4),
         toughness: Some(2),

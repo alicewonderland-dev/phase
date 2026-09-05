@@ -13,7 +13,8 @@ use crate::types::ability::{EffectScope, TapStateChange};
 use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    GameState, PendingCounterPostAction, PendingZoneChangeDelivery, WaitingFor,
+    GameState, MassLibraryOrderBatch, MassLibraryOrderMember, PendingCounterPostAction,
+    PendingZoneChangeDelivery, WaitingFor,
 };
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use crate::types::player::PlayerId;
@@ -204,6 +205,77 @@ fn tracked_set_member_zones(state: &GameState, filter: &TargetFilter) -> Option<
             zones
         });
     (!zones.is_empty()).then_some(zones)
+}
+
+/// Returns the zones scanned by a `ChangeZoneAll` before its target is resolved.
+/// Kept shared with compatibility validation so an archived mass-order prompt
+/// cannot admit cards from a zone the original producer would not have scanned.
+pub(crate) fn change_zone_all_origin_zones(
+    state: &GameState,
+    origin: Option<Zone>,
+    target: &TargetFilter,
+) -> Vec<Zone> {
+    let extracted = target.extract_zones();
+    if !extracted.is_empty() {
+        extracted
+    } else if let Some(origin) = origin {
+        vec![origin]
+    } else if let Some(zones) = tracked_set_member_zones(state, target) {
+        zones
+    } else {
+        vec![Zone::Battlefield]
+    }
+}
+
+pub(crate) fn change_zone_all_player_scope(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    target_filter: &TargetFilter,
+) -> Option<PlayerId> {
+    match target_filter {
+        TargetFilter::Controller => Some(ability.controller),
+        TargetFilter::Player => ability
+            .targets
+            .iter()
+            .find_map(|target| match target {
+                TargetRef::Player(player) => Some(*player),
+                _ => None,
+            })
+            .or(Some(ability.controller)),
+        TargetFilter::ParentTarget => ability.targets.iter().find_map(|target| match target {
+            TargetRef::Player(player) => Some(*player),
+            _ => None,
+        }),
+        TargetFilter::ParentTargetController => crate::game::targeting::resolve_effect_player_ref(
+            state,
+            ability,
+            &TargetFilter::ParentTargetController,
+        ),
+        TargetFilter::ParentTargetOwner => crate::game::targeting::resolve_effect_player_ref(
+            state,
+            ability,
+            &TargetFilter::ParentTargetOwner,
+        ),
+        TargetFilter::ScopedPlayer => crate::game::targeting::resolve_effect_player_ref(
+            state,
+            ability,
+            &TargetFilter::ScopedPlayer,
+        ),
+        _ => None,
+    }
+}
+
+pub(crate) fn change_zone_all_player_scope_member_matches(
+    object: &crate::game::game_object::GameObject,
+    player: PlayerId,
+    origin_zones: &[Zone],
+) -> bool {
+    origin_zones.contains(&object.zone)
+        && if object.zone == Zone::Battlefield {
+            object.controller == player
+        } else {
+            object.owner == player
+        }
 }
 
 /// CR 400.7 + CR 603.7c: A delayed tracked-set move retains an object-anaphor
@@ -585,11 +657,15 @@ pub fn resolve(
             .as_ref()
             .and_then(|event| match event {
                 GameEvent::ZoneChanged { to, .. } => Some(*to),
+                // CR 701.17c: the milled card is in "the zone it moved to from
+                // the library", which is where a "…, then exile it" clause on a
+                // mill trigger must move it from.
+                GameEvent::Milled { to, .. } => Some(*to),
                 _ => None,
             });
     }
     let filter_controller =
-        crate::game::effects::controller_for_relative_filter(ability, target_filter);
+        crate::game::effects::controller_for_relative_filter(state, ability, target_filter);
     let track_exiled_by_source =
         crate::game::exile_links::should_track_exiled_by_source(state, ability.source_id, ability);
 
@@ -1010,6 +1086,7 @@ pub fn resolve(
             conditional_enter_with_counters: effect_conditional_enter_with_counters.clone(),
             count_param: 0,
             library_position: None,
+            mass_library_order: None,
             is_cost_payment: false,
             // CR 614.12: carry the moved-object type gate across the
             // `EffectZoneChoice` round-trip so it is evaluated against the
@@ -1562,16 +1639,20 @@ fn group_object_ids_by_owner_apnap(
 }
 
 fn mass_library_order_effect_zone_choice(
-    owner: PlayerId,
-    cards: Vec<ObjectId>,
+    batch: MassLibraryOrderBatch,
     source_id: ObjectId,
     library_position: crate::types::ability::LibraryPosition,
     track_exiled_by_source: bool,
     duration: Option<crate::types::ability::Duration>,
 ) -> WaitingFor {
-    let choice_count = cards.len();
+    let choice_count = batch.members.len();
+    let cards = batch
+        .members
+        .iter()
+        .map(|member| member.identity.object_id)
+        .collect();
     WaitingFor::EffectZoneChoice {
-        player: owner,
+        player: batch.owner,
         cards,
         count: choice_count,
         min_count: choice_count,
@@ -1591,9 +1672,34 @@ fn mass_library_order_effect_zone_choice(
         conditional_enter_with_counters: vec![],
         count_param: 0,
         library_position: Some(library_position),
+        mass_library_order: Some(batch),
         is_cost_payment: false,
         enters_modified_if: None,
         duration,
+    }
+}
+
+/// Freeze the exact object incarnation and origin that a
+/// mass library-order prompt may arrange. This is deliberately captured before
+/// the first selection is published; a later zone change creates a distinct
+/// object even when the engine retains its object id.
+fn snapshot_mass_library_order_batch(
+    state: &GameState,
+    owner: PlayerId,
+    cards: Vec<ObjectId>,
+) -> MassLibraryOrderBatch {
+    MassLibraryOrderBatch {
+        owner,
+        members: cards
+            .into_iter()
+            .map(|object_id| {
+                let object = &state.objects[&object_id];
+                MassLibraryOrderMember {
+                    identity: ObjectIncarnationRef::from_object(object),
+                    origin: object.zone,
+                }
+            })
+            .collect(),
     }
 }
 
@@ -1601,22 +1707,36 @@ fn mass_library_order_effect_zone_choice(
 /// surface the next owner's `EffectZoneChoice` if any remain.
 pub(crate) fn resume_next_mass_library_order_choice(state: &mut GameState) -> Option<PlayerId> {
     let mut pending = state.pending_mass_library_order_choice.take()?;
-    let (owner, cards) = pending.remaining_batches.first()?.clone();
-    pending.remaining_batches.remove(0);
+    let batch = match &mut pending.remaining_batches {
+        crate::types::game_state::PendingMassLibraryOrderBatches::Typed(batches) => {
+            if batches.is_empty() {
+                return None;
+            }
+            batches.remove(0)
+        }
+        crate::types::game_state::PendingMassLibraryOrderBatches::Legacy(batches) => {
+            let (owner, cards) = batches.first()?.clone();
+            batches.remove(0);
+            // Legacy tuple queues did not record identity/origin. The strict legacy
+            // admission gate accepted the CURRENT prompt only after proving every
+            // member still occupies its old battlefield origin; snapshot the next
+            // batch before publishing it so every later interaction is typed.
+            snapshot_mass_library_order_batch(state, owner, cards)
+        }
+    };
     if pending.remaining_batches.is_empty() {
         state.pending_mass_library_order_choice = None;
     } else {
         state.pending_mass_library_order_choice = Some(pending.clone());
     }
     state.waiting_for = mass_library_order_effect_zone_choice(
-        owner,
-        cards,
+        batch.clone(),
         pending.source_id,
         pending.library_position,
         pending.track_exiled_by_source,
         pending.duration,
     );
-    Some(owner)
+    Some(batch.owner)
 }
 
 /// Move all objects matching the filter from `Origin` zone to `Destination` zone.
@@ -1651,16 +1771,7 @@ pub fn resolve_all(
             library_position,
             random_order,
         } => {
-            let extracted = target.extract_zones();
-            let scan_zones = if !extracted.is_empty() {
-                extracted
-            } else if let Some(origin) = origin {
-                vec![*origin]
-            } else if let Some(zones) = tracked_set_member_zones(state, target) {
-                zones
-            } else {
-                vec![Zone::Battlefield]
-            };
+            let scan_zones = change_zone_all_origin_zones(state, *origin, target);
             // CR 122.1 + CR 122.1h: Resolve each `QuantityExpr` counter count
             // to a concrete u32 once, mirroring the single-object `ChangeZone`
             // arm. Every entering object receives these counters (e.g. a
@@ -1696,51 +1807,10 @@ pub fn resolve_all(
     // into their library" (Player / ParentTarget / ParentTargetController).
     // Translate them here to "all cards owned by that player in the origin zone"
     // — the object-level matcher would otherwise reject them outright.
-    let player_scope: Option<crate::types::player::PlayerId> = match &target_filter {
-        TargetFilter::Controller => Some(ability.controller),
-        TargetFilter::Player => ability
-            .targets
-            .iter()
-            .find_map(|t| match t {
-                crate::types::ability::TargetRef::Player(p) => Some(*p),
-                _ => None,
-            })
-            .or(Some(ability.controller)),
-        TargetFilter::ParentTarget => ability.targets.iter().find_map(|t| match t {
-            crate::types::ability::TargetRef::Player(p) => Some(*p),
-            _ => None,
-        }),
-        // CR 608.2c + CR 109.4: "that player shuffles their hand into their
-        // library" (Jace, the Mind Sculptor −12) binds the mass move to the
-        // parent instruction's chosen player via `ParentTargetController`.
-        TargetFilter::ParentTargetController => crate::game::targeting::resolve_effect_player_ref(
-            state,
-            ability,
-            &TargetFilter::ParentTargetController,
-        ),
-        // CR 108.3 + CR 608.2c: "its owner shuffles their graveyard into their
-        // library" mass moves key off owner, not controller.
-        TargetFilter::ParentTargetOwner => crate::game::targeting::resolve_effect_player_ref(
-            state,
-            ability,
-            &TargetFilter::ParentTargetOwner,
-        ),
-        // CR 603.2b + CR 102.1: "At the beginning of each player's draw step,
-        // that player puts the cards in their hand on the bottom of their
-        // library" (Teferi's Puzzle Box). The per-player trigger binds "that
-        // player" to `ScopedPlayer` (the active player whose step it is), so the
-        // whole-hand move must scan that player's hand, not the source
-        // controller's.
-        TargetFilter::ScopedPlayer => crate::game::targeting::resolve_effect_player_ref(
-            state,
-            ability,
-            &TargetFilter::ScopedPlayer,
-        ),
-        _ => None,
-    };
+    let player_scope = change_zone_all_player_scope(state, ability, &target_filter);
 
     let filter_controller =
-        crate::game::effects::controller_for_relative_filter(ability, &target_filter);
+        crate::game::effects::controller_for_relative_filter(state, ability, &target_filter);
     let target_filter = owner_scoped_nonbattlefield_mass_filter(target_filter, &origin_zones);
 
     // Use a permissive default filter if the effect's target is None
@@ -1833,24 +1903,22 @@ pub fn resolve_all(
         // keyed by *owner*, not controller — only a card on the battlefield is a
         // permanent (CR 110.1) and thus has a controller; ownership (CR 108.3)
         // is the player who started the game with the card. A creature stolen
-        // via Mind Control retains
-        // `obj.controller = thief` even after dying into its owner's graveyard
-        // (`reset_for_battlefield_exit` does not reset controller; only the
-        // layer pass over `battlefield_phased_in_ids` does, and it skips zones
-        // off the battlefield). Filtering by owner is therefore both rules-
-        // correct and robust to that state divergence. For battlefield-origin
+        // via Mind Control has its controller reset to the owner fallback by
+        // `zones::apply_zone_exit_cleanup` on the way into the graveyard
+        // (`reset_for_battlefield_exit` does not reset controller itself; the
+        // CR 109.4 reset alongside it in `apply_zone_exit_cleanup` does — the
+        // stack/off-battlefield-exit counterpart to the layers pass's own
+        // `battlefield_phased_in_ids`-scoped reset for permanents still ON the
+        // battlefield). Filtering by owner is therefore both rules-correct and
+        // robust to any state divergence in a hand-built or serialized state.
+        // For battlefield-origin
         // mass moves ("exile all permanents you control"), `obj.controller`
         // is authoritative, so we keep that filter for the battlefield case.
         state
             .objects
             .iter()
             .filter(|(_, obj)| {
-                origin_zones.contains(&obj.zone)
-                    && if obj.zone == Zone::Battlefield {
-                        obj.controller == player
-                    } else {
-                        obj.owner == player
-                    }
+                change_zone_all_player_scope_member_matches(obj, player, &origin_zones)
             })
             .map(|(id, _)| *id)
             .collect()
@@ -1936,7 +2004,11 @@ pub fn resolve_all(
             .first()
             .expect("matching.len() > 1 guarantees at least one owner batch")
             .clone();
-        let remaining_batches: Vec<_> = owner_batches.into_iter().skip(1).collect();
+        let remaining_batches: Vec<_> = owner_batches
+            .into_iter()
+            .skip(1)
+            .map(|(owner, cards)| snapshot_mass_library_order_batch(state, owner, cards))
+            .collect();
         if !remaining_batches.is_empty() {
             state.pending_mass_library_order_choice =
                 Some(crate::types::game_state::PendingMassLibraryOrderChoice {
@@ -1946,12 +2018,14 @@ pub fn resolve_all(
                         .expect("library-order branch requires an explicit library position"),
                     track_exiled_by_source,
                     duration: ability.duration.clone(),
-                    remaining_batches,
+                    remaining_batches:
+                        crate::types::game_state::PendingMassLibraryOrderBatches::Typed(
+                            remaining_batches,
+                        ),
                 });
         }
         state.waiting_for = mass_library_order_effect_zone_choice(
-            first_owner,
-            first_cards,
+            snapshot_mass_library_order_batch(state, first_owner, first_cards),
             ability.source_id,
             effect_library_position
                 .clone()
@@ -2286,6 +2360,62 @@ mod tests {
             ObjectId(100),
             PlayerId(0),
         )
+    }
+
+    /// V15 — CR 701.17c + CR 400.7 + CR 603.7c: `resolve` fills an absent
+    /// `origin` for a `TriggeringSource` subject from the trigger event's
+    /// destination zone — for a mill, "the zone it moved to from the library".
+    /// The match ends in `_ => None`, so the compiler never asks for this arm;
+    /// without it `origin` stays `None` and the stale-object guard never fires.
+    #[test]
+    fn triggering_source_origin_fallback_reads_the_milled_destination() {
+        let build = |resident: Zone| {
+            let mut state = GameState::new_two_player(42);
+            let card = create_object(
+                &mut state,
+                CardId(1),
+                PlayerId(1),
+                "Milled Card".to_string(),
+                resident,
+            );
+            state.current_trigger_event = Some(GameEvent::Milled {
+                player_id: PlayerId(1),
+                object_id: card,
+                to: Zone::Exile,
+            });
+            let ability = ResolvedAbility::new(
+                Effect::ChangeZone {
+                    origin: None,
+                    destination: Zone::Hand,
+                    target: TargetFilter::TriggeringSource,
+                    owner_library: false,
+                    enter_transformed: false,
+                    enters_under: None,
+                    enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                    enters_attacking: false,
+                    up_to: false,
+                    enter_with_counters: vec![],
+                    conditional_enter_with_counters: vec![],
+                    face_down_profile: None,
+                    enters_modified_if: None,
+                },
+                vec![],
+                ObjectId(100),
+                PlayerId(0),
+            );
+            let mut events = Vec::new();
+            resolve(&mut state, &ability, &mut events).expect("change zone resolves");
+            state.objects[&card].zone
+        };
+
+        // Reach guard: the milled card really is in the zone the event names, so
+        // the "…, then return it to its owner's hand" clause moves it.
+        assert_eq!(build(Zone::Exile), Zone::Hand);
+
+        // Revert-failing leg: the card has since left that zone, so the CR 400.7
+        // guard must refuse the move. With the arm removed `origin` is `None`,
+        // the guard is skipped, and this card is bounced out of the graveyard.
+        assert_eq!(build(Zone::Graveyard), Zone::Graveyard);
     }
 
     #[test]
@@ -4734,12 +4864,14 @@ mod tests {
     #[test]
     fn change_zone_all_exile_target_player_graveyard_includes_stolen_then_died() {
         // CR 404.2 + CR 110.2: A creature stolen via Mind Control / Bribery
-        // dies into its *owner's* graveyard, but `obj.controller` retains the
-        // thief's PlayerId because `reset_for_battlefield_exit` does not reset
-        // controller and the layer pass only re-applies controller modifications
-        // to permanents that are still on the battlefield. "Exile target
-        // player's graveyard" must filter by `obj.owner`, not `obj.controller`,
-        // so the stolen-then-died corpse is not silently left behind.
+        // dies into its *owner's* graveyard, and `zones::apply_zone_exit_cleanup`
+        // resets `obj.controller` back to the owner fallback on that exit (via
+        // `revert_layered_characteristics_to_base`). "Exile target player's
+        // graveyard" must still filter by `obj.owner`, not `obj.controller`, as
+        // defence-in-depth for a hand-built or serialized state where the two
+        // have diverged (e.g. loaded from an older save, or constructed directly
+        // as this test does) — the filter must not depend on `obj.controller`
+        // having been correctly reset.
         //
         // Regression for the bug shipped in 08ab17b97: `create_object` sets
         // `controller = owner`, so the original test could not exercise this
@@ -5927,6 +6059,7 @@ mod tests {
                 player,
                 cards,
                 effect_kind,
+                mass_library_order,
                 ..
             } => {
                 assert_eq!(
@@ -5936,6 +6069,22 @@ mod tests {
                 );
                 assert_eq!(cards.len(), 3);
                 assert_eq!(*effect_kind, EffectKind::PutAtLibraryPosition);
+                let batch = mass_library_order
+                    .as_ref()
+                    .expect("fresh mass ordering prompt carries exact member identities");
+                assert_eq!(batch.owner, PlayerId(1));
+                assert_eq!(
+                    batch
+                        .members
+                        .iter()
+                        .map(|member| member.identity.object_id)
+                        .collect::<Vec<_>>(),
+                    *cards
+                );
+                assert!(batch
+                    .members
+                    .iter()
+                    .all(|member| member.origin == Zone::Library));
             }
             other => panic!("expected EffectZoneChoice, got {other:?}"),
         }
@@ -5994,7 +6143,12 @@ mod tests {
         resolve_all(&mut state, &ability, &mut events).unwrap();
 
         match &state.waiting_for {
-            WaitingFor::EffectZoneChoice { player, cards, .. } => {
+            WaitingFor::EffectZoneChoice {
+                player,
+                cards,
+                mass_library_order,
+                ..
+            } => {
                 assert_eq!(
                     *player,
                     PlayerId(1),
@@ -6005,11 +6159,24 @@ mod tests {
                 let mut expect = vec![p1_a, p1_b];
                 expect.sort_by_key(|id| id.0);
                 assert_eq!(sorted, expect);
+                assert_eq!(
+                    mass_library_order.as_ref().map(|batch| batch.owner),
+                    Some(PlayerId(1))
+                );
             }
             other => panic!("expected first-owner EffectZoneChoice, got {other:?}"),
         }
         assert!(
-            state.pending_mass_library_order_choice.is_some(),
+            state
+                .pending_mass_library_order_choice
+                .as_ref()
+                .is_some_and(|pending| {
+                    matches!(
+                        &pending.remaining_batches,
+                        crate::types::game_state::PendingMassLibraryOrderBatches::Typed(batches)
+                            if batches.len() == 1 && batches[0].owner == PlayerId(0)
+                    )
+                }),
             "non-active owner batch must remain queued"
         );
 
@@ -6022,9 +6189,18 @@ mod tests {
         .unwrap();
 
         match &state.waiting_for {
-            WaitingFor::EffectZoneChoice { player, cards, .. } => {
+            WaitingFor::EffectZoneChoice {
+                player,
+                cards,
+                mass_library_order,
+                ..
+            } => {
                 assert_eq!(*player, PlayerId(0), "second owner receives their batch");
                 assert_eq!(cards, &vec![p0_card]);
+                assert_eq!(
+                    mass_library_order.as_ref().map(|batch| batch.owner),
+                    Some(PlayerId(0))
+                );
             }
             other => panic!("expected second-owner EffectZoneChoice, got {other:?}"),
         }
@@ -9447,6 +9623,7 @@ mod tests {
             conditional_enter_with_counters: vec![],
             count_param: 0,
             library_position: None,
+            mass_library_order: None,
             is_cost_payment: false,
             enters_modified_if: None,
             duration: None,
@@ -9711,6 +9888,7 @@ mod tests {
             obj.base_characteristics_initialized = true;
             // Back face: Sorin, Ravenous Neonate — planeswalker with loyalty 3
             obj.back_face = Some(BackFaceData {
+                is_swap_snapshot: false,
                 name: "Sorin, Ravenous Neonate".to_string(),
                 power: None,
                 toughness: None,

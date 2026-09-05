@@ -1,8 +1,11 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { createRef, useState } from "react";
 import { MemoryRouter } from "react-router";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { GameMenu } from "../GameMenu";
+import { ConcedeDialog } from "../../multiplayer/ConcedeDialog";
+import { ModalPanelShell } from "../../ui/ModalPanelShell";
 
 vi.mock("../../../hooks/useCardDataMeta.ts", () => ({
   useCardDataMeta: () => null,
@@ -21,6 +24,8 @@ function renderGameMenu(
         isOnlineMode={false}
         showAiHand={false}
         onToggleAiHand={vi.fn()}
+        logPanelOpen={false}
+        onToggleGameLog={vi.fn()}
         onSettingsClick={vi.fn()}
         onHelpClick={vi.fn()}
         multiplayerBoardLayout="split"
@@ -64,12 +69,46 @@ describe("GameMenu", () => {
     );
   });
 
+  it("exposes the production hamburger through a shared trigger ref", () => {
+    const menuTriggerRef = createRef<HTMLButtonElement>();
+    renderGameMenu({ menuTriggerRef });
+
+    expect(menuTriggerRef.current).toBe(
+      screen.getByRole("button", { name: "Game menu" }),
+    );
+  });
+
   it("labels the legacy state with the split destination", () => {
     renderGameMenu({ multiplayerBoardLayout: "focused" });
 
     fireEvent.click(screen.getByRole("button", { name: "Game menu" }));
 
     expect(screen.getByRole("button", { name: "Switch to split table view Legacy" })).toBeInTheDocument();
+  });
+
+  it("routes the split-layout nudge through its supplied callbacks", () => {
+    const onTryMultiplayerSplitLayout = vi.fn();
+    const onDismissMultiplayerSplitLayoutNudge = vi.fn();
+    renderGameMenu({
+      showMultiplayerSplitLayoutNudge: true,
+      onTryMultiplayerSplitLayout,
+      onDismissMultiplayerSplitLayoutNudge,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Game menu" }));
+    fireEvent.click(screen.getByRole("button", { name: "Try split view" }));
+
+    expect(onTryMultiplayerSplitLayout).toHaveBeenCalledOnce();
+    expect(onDismissMultiplayerSplitLayoutNudge).not.toHaveBeenCalled();
+  });
+
+  it("hides the split-layout nudge without its complete callback contract", () => {
+    renderGameMenu({ showMultiplayerSplitLayoutNudge: true });
+
+    fireEvent.click(screen.getByRole("button", { name: "Game menu" }));
+
+    expect(screen.queryByRole("button", { name: "Try split view" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Not now" })).toBeNull();
   });
 
   it("opens sandbox tools from the collapsed menu", () => {
@@ -81,6 +120,122 @@ describe("GameMenu", () => {
 
     expect(onSandboxToolsClick).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole("button", { name: "Open Sandbox Tools" })).not.toBeInTheDocument();
+  });
+
+  it("restores the hamburger after Settings replaces its transient menu item", async () => {
+    function SettingsHarness() {
+      const [settingsOpen, setSettingsOpen] = useState(false);
+      return (
+        <MemoryRouter initialEntries={["/game/test-game"]}>
+          <GameMenu
+            gameId="test-game"
+            isAiMode={false}
+            isOnlineMode={false}
+            showAiHand={false}
+            onToggleAiHand={vi.fn()}
+            logPanelOpen={false}
+            onToggleGameLog={vi.fn()}
+            onSettingsClick={() => setSettingsOpen(true)}
+            onHelpClick={vi.fn()}
+          />
+          <ModalPanelShell
+            open={settingsOpen}
+            title="Settings"
+            onClose={() => setSettingsOpen(false)}
+          >
+            <button type="button">Save settings</button>
+          </ModalPanelShell>
+        </MemoryRouter>
+      );
+    }
+
+    render(<SettingsHarness />);
+    const trigger = screen.getByRole("button", { name: "Game menu" });
+    fireEvent.click(trigger);
+    const settingsItem = screen.getByRole("button", { name: "Settings" });
+    settingsItem.focus();
+    fireEvent.click(settingsItem);
+
+    const dialog = screen.getByRole("dialog", { name: "Settings" });
+    await waitFor(() => expect(dialog).toHaveFocus());
+    fireEvent.keyDown(dialog, { key: "Escape" });
+
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Settings" })).not.toBeInTheDocument(),
+    );
+    expect(trigger).toHaveFocus();
+  });
+
+  it("moves focus to the hamburger before opening menu-owned surfaces", () => {
+    const onReportCardClick = vi.fn();
+    const onHelpClick = vi.fn();
+    renderGameMenu({ showReportCard: true, onReportCardClick, onHelpClick });
+
+    const trigger = screen.getByRole("button", { name: "Game menu" });
+    fireEvent.click(trigger);
+    const reportItem = screen.getByRole("button", { name: "Report a card" });
+    reportItem.focus();
+    fireEvent.click(reportItem);
+
+    expect(onReportCardClick).toHaveBeenCalledOnce();
+    expect(trigger).toHaveFocus();
+
+    fireEvent.click(trigger);
+    const helpItem = screen.getByRole("button", { name: "Help & Shortcuts ?" });
+    helpItem.focus();
+    fireEvent.click(helpItem);
+
+    expect(onHelpClick).toHaveBeenCalledOnce();
+    expect(trigger).toHaveFocus();
+  });
+
+  it("restores the hamburger after the online concede confirmation closes", async () => {
+    function OnlineConcedeHarness() {
+      const [open, setOpen] = useState(false);
+      return (
+        <MemoryRouter initialEntries={["/game/test-game"]}>
+          <GameMenu
+            gameId="test-game"
+            isAiMode={false}
+            isOnlineMode
+            showAiHand={false}
+            onToggleAiHand={vi.fn()}
+            logPanelOpen={false}
+            onToggleGameLog={vi.fn()}
+            onSettingsClick={vi.fn()}
+            onHelpClick={vi.fn()}
+            onConcede={() => setOpen(true)}
+          />
+          <ConcedeDialog
+            isOpen={open}
+            gameAction={{
+              kind: "game",
+              consequence: "ordinary-game",
+              onConfirm: vi.fn(),
+            }}
+            onCancel={() => setOpen(false)}
+          />
+        </MemoryRouter>
+      );
+    }
+    render(<OnlineConcedeHarness />);
+
+    const trigger = screen.getByRole("button", { name: "Game menu" });
+    fireEvent.click(trigger);
+    const concedeItem = screen.getByRole("button", { name: "Concede" });
+    concedeItem.focus();
+    fireEvent.click(concedeItem);
+
+    const dialog = await screen.findByRole("alertdialog", { name: "Concede Game?" });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus(),
+    );
+    fireEvent.keyDown(dialog, { key: "Escape" });
+
+    await waitFor(() =>
+      expect(screen.queryByRole("alertdialog", { name: "Concede Game?" })).not.toBeInTheDocument(),
+    );
+    expect(trigger).toHaveFocus();
   });
 
   it("toggles the floating click mode button from the collapsed menu", () => {
@@ -182,4 +337,25 @@ describe("GameMenu", () => {
     expect(screen.queryByRole("button", { name: "Request Takeback" })).toBeNull();
   });
 
+  it("replaces the no-op Resume entry with a game log toggle", () => {
+    const onToggleGameLog = vi.fn();
+    renderGameMenu({ onToggleGameLog });
+
+    fireEvent.click(screen.getByRole("button", { name: "Game menu" }));
+
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Open Game Log" }));
+
+    expect(onToggleGameLog).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "Open Game Log" })).not.toBeInTheDocument();
+  });
+
+  it("offers to close the game log while it is open", () => {
+    renderGameMenu({ logPanelOpen: true });
+
+    fireEvent.click(screen.getByRole("button", { name: "Game menu" }));
+
+    expect(screen.getByRole("button", { name: "Close Game Log" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Open Game Log" })).toBeNull();
+  });
 });

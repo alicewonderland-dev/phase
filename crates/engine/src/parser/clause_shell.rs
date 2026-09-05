@@ -69,14 +69,15 @@
 use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, tag_no_case, take_until};
-use nom::combinator::{opt, value};
-use nom::sequence::delimited;
+use nom::combinator::{map, opt, value};
+use nom::sequence::{delimited, terminated};
 use nom::Parser;
 
 use super::oracle_effect::conditions::{
     strip_leading_general_conditional, strip_unrecognized_conditional_head_when_body_optional,
 };
 use super::oracle_effect::strip_trailing_duration;
+use super::oracle_ir::ast::is_play_from_exile_lifetime_duration;
 use super::oracle_ir::context::ParseContext;
 use super::oracle_nom::bridge::nom_on_lower;
 use crate::types::ability::{
@@ -326,17 +327,19 @@ fn try_peel_opponent_may_prefix(
     }
     nom_on_lower(text, &lower, |input| {
         alt((
-            // CR 102.2 + CR 603.2: "each of that player's opponents may" — the
-            // caster's opponents, fanned out per-player. Must precede the bare
-            // "each opponent may" arm (which scopes to the controller's
-            // opponents). Apostrophe variants: ASCII ' and curly U+2019 '.
-            value(
-                (None, Some(PlayerFilter::OpponentOfTriggeringPlayer)),
-                tag("each of that player's opponents may "),
-            ),
-            value(
-                (None, Some(PlayerFilter::OpponentOfTriggeringPlayer)),
-                tag("each of that player\u{2019}s opponents may "),
+            // CR 102.2 + CR 603.2: "each of ⟨that player | its controller⟩'s
+            // opponents may" — the TRIGGERING player's opponents, fanned out
+            // per-player. Must precede the bare "each opponent may" arm (which
+            // scopes to the ABILITY CONTROLLER's opponents). The subject grammar
+            // itself is the single authority in `oracle_effect::lower`, shared with
+            // the mandatory (no-"may") route so the two cannot drift apart; only
+            // the trailing "may " is this site's own.
+            map(
+                terminated(
+                    super::oracle_effect::lower::parse_each_of_triggering_players_opponents,
+                    tag("may "),
+                ),
+                |scope| (None, Some(scope)),
             ),
             value(
                 (None, Some(PlayerFilter::Opponent)),
@@ -415,6 +418,14 @@ fn is_specialized_duration_carrier(text_lower: &str) -> bool {
     use nom::branch::alt;
     use nom::bytes::complete::tag;
     use nom::combinator::value;
+    let (body, duration) = strip_trailing_duration(text_lower);
+    let bare_tracked_exile_grant = duration
+        .as_ref()
+        .is_some_and(is_play_from_exile_lifetime_duration)
+        && tag::<_, _, OracleError<'_>>("cast spells from among ")
+            .parse(body)
+            .is_ok();
+
     let head: nom::IResult<&str, (), OracleError<'_>> = alt((
         // CR 400.7i — impulse-draw bare form (post strip_optional_effect_prefix
         // in the chunk loop). `try_parse_play_from_exile` requires the
@@ -455,7 +466,7 @@ fn is_specialized_duration_carrier(text_lower: &str) -> bool {
         parse_additional_land_head,
     ))
     .parse(text_lower);
-    head.is_ok()
+    bare_tracked_exile_grant || head.is_ok()
 }
 
 /// CR 305.2: Head matcher for the turn-scoped additional-land grant, used by

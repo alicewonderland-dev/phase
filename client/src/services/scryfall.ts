@@ -1,4 +1,11 @@
 import type { GameFormat, TokenImageRef } from "../adapter/types";
+import type { CardImageSource, ImageRungs } from "./visualPacks/types.ts";
+
+interface ScryfallImageFace {
+  small?: string | null;
+  normal?: string | null;
+  art_crop?: string | null;
+}
 
 interface ScryfallDataEntry {
   oracle_id: string;
@@ -6,7 +13,7 @@ interface ScryfallDataEntry {
    * single-faced cards. Used to resolve `faceIndex` from an engine-reported
    * `printed_ref.face_name`. */
   face_names: string[];
-  faces: Array<{ normal: string; art_crop: string }>;
+  faces: ScryfallImageFace[];
   layout?: string;
   name: string;
   mana_cost: string;
@@ -33,6 +40,74 @@ interface ScryfallDataEntry {
 export const CARD_BACK_URL =
   "https://backs.scryfall.io/normal/0/a/0aeebaf5-8c7d-4636-9e82-8c27447861f7.jpg";
 
+declare const manaSymbolShardBrand: unique symbol;
+/** A mana shard string admitted by the finite Scryfall card-symbol catalog. */
+export type ManaSymbolShard = string & { readonly [manaSymbolShardBrand]: true };
+
+/**
+ * The catalog below is the COMPLETE set published by Scryfall's `/symbology`
+ * endpoint — all 84 symbols, every one of which has an SVG asset.
+ *
+ * "Complete" is the definition on purpose, rather than "the ones we happen to
+ * have needed". A symbol missing from here is not merely un-rendered: it is
+ * also never installed by `coreDescriptors()`, so it breaks offline in exactly
+ * the way this catalog exists to prevent. `manaSymbolCatalog.test.ts` pins the
+ * full expected set against an independently-authored literal, because a test
+ * that derives its expectation from `MANA_SYMBOL_SHARDS` cannot see an omission.
+ */
+const SINGLE_MANA_SYMBOL_SHARDS = [
+  "W", "U", "B", "R", "G", "C", "S", "T", "Q", "E", "P", "X", "Y", "Z", "A", "∞", "½", "CHAOS",
+  // One colored mana or two life, one-half white/red mana, one mana from a
+  // legendary source, one potential land drop, planeswalker, ticket counter.
+  "H", "HW", "HR", "L", "D", "PW", "TK",
+] as const;
+const COMPOSITE_MANA_SYMBOL_SHARDS = [
+  "W/U", "W/B", "U/B", "U/R", "B/R", "B/G", "R/W", "R/G", "G/W", "G/U",
+  "2/W", "2/U", "2/B", "2/R", "2/G",
+  "W/P", "U/P", "B/P", "R/P", "G/P",
+  "W/U/P", "W/B/P", "U/B/P", "U/R/P", "B/R/P", "B/G/P", "R/W/P", "R/G/P", "G/W/P", "G/U/P",
+  "C/W", "C/U", "C/B", "C/R", "C/G",
+  // Colorless Phyrexian: one colorless mana or two life.
+  "C/P",
+] as const;
+const FINITE_NUMERIC_MANA_SYMBOL_SHARDS: readonly string[] = [
+  ...Array.from({ length: 21 }, (_, value) => String(value)),
+  "100",
+  "1000000",
+];
+const MANA_SYMBOL_SHARD_SET = new Set<string>([
+  ...SINGLE_MANA_SYMBOL_SHARDS,
+  ...COMPOSITE_MANA_SYMBOL_SHARDS,
+  ...FINITE_NUMERIC_MANA_SYMBOL_SHARDS,
+]);
+
+/** True when `shard` has a corresponding Scryfall card-symbol SVG. */
+export function isManaSymbolShard(shard: string): shard is ManaSymbolShard {
+  return MANA_SYMBOL_SHARD_SET.has(shard);
+}
+
+/** Every admitted mana shard, for callers that must enumerate the whole
+ *  finite catalog (e.g. pre-caching every symbol for offline play). */
+export const MANA_SYMBOL_SHARDS: readonly ManaSymbolShard[] =
+  Array.from(MANA_SYMBOL_SHARD_SET) as ManaSymbolShard[];
+
+/** The URL- and asset-key-safe code for an admitted mana shard: strips the
+ *  hybrid/Phyrexian slash separators and spells out the two symbols with no
+ *  ASCII representation, matching Scryfall's `card-symbols` filenames. Also
+ *  usable verbatim as an `[A-Za-z0-9_-]+` visual-pack asset-key suffix. */
+export function manaSymbolCode(shard: string): string {
+  return shard === "∞"
+    ? "INFINITY"
+    : shard === "½"
+      ? "HALF"
+      : shard.replace(/\//g, "");
+}
+
+/** Build the authoritative Scryfall source URL for an admitted mana shard. */
+export function manaSymbolSourceUrl(shard: string): string {
+  return `https://svgs.scryfall.io/card-symbols/${encodeURIComponent(manaSymbolCode(shard))}.svg`;
+}
+
 export interface PrintingEntry {
   id: string;
   set: string;
@@ -42,7 +117,7 @@ export interface PrintingEntry {
   border_color: string;
   frame_effects: string[];
   full_art: boolean;
-  faces: Array<{ normal: string; art_crop: string }>;
+  faces: ScryfallImageFace[];
 }
 
 type ScryfallDataMap = Record<string, ScryfallDataEntry>;
@@ -57,16 +132,86 @@ let printingsDataPromise: Promise<PrintingsDataMap | null> | null = null;
 let tokenImagesDataPromise: Promise<TokenImagesDataMap | null> | null = null;
 let scryfallQueue: Promise<void> = Promise.resolve();
 
+function isNonEmptyRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.keys(value).length > 0;
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+
+function isScryfallImageFace(value: unknown): value is ScryfallImageFace {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const face = value as ScryfallImageFace;
+  return (face.small === undefined || face.small === null || typeof face.small === "string")
+    && (face.normal === undefined || face.normal === null || typeof face.normal === "string")
+    && (face.art_crop === undefined || face.art_crop === null || typeof face.art_crop === "string");
+}
+
+function isScryfallDataEntry(value: unknown): value is ScryfallDataEntry {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const entry = value as Partial<ScryfallDataEntry>;
+  return typeof entry.oracle_id === "string"
+    && typeof entry.name === "string"
+    && typeof entry.mana_cost === "string"
+    && typeof entry.cmc === "number"
+    && typeof entry.type_line === "string"
+    && isStringArray(entry.face_names)
+    && isStringArray(entry.colors)
+    && isStringArray(entry.color_identity)
+    && isStringArray(entry.keywords)
+    && (entry.layout === undefined || typeof entry.layout === "string")
+    && Array.isArray(entry.faces)
+    && entry.faces.length > 0
+    && entry.faces.every(isScryfallImageFace);
+}
+
+function isScryfallDataMap(value: unknown): value is ScryfallDataMap {
+  return isNonEmptyRecord(value) && Object.values(value).every(isScryfallDataEntry);
+}
+
+function isPrintingEntry(value: unknown): value is PrintingEntry {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const entry = value as Partial<PrintingEntry>;
+  return typeof entry.id === "string"
+    && typeof entry.set === "string"
+    && typeof entry.set_name === "string"
+    && typeof entry.collector_number === "string"
+    && typeof entry.released_at === "string"
+    && typeof entry.border_color === "string"
+    && isStringArray(entry.frame_effects)
+    && typeof entry.full_art === "boolean"
+    && Array.isArray(entry.faces)
+    && entry.faces.length > 0
+    && entry.faces.every(isScryfallImageFace);
+}
+
+function isPrintingsDataMap(value: unknown): value is PrintingsDataMap {
+  return isNonEmptyRecord(value)
+    && Object.values(value).every((printings) =>
+      Array.isArray(printings) && printings.length > 0 && printings.every(isPrintingEntry));
+}
+
 export function loadScryfallData(): Promise<ScryfallDataMap | null> {
   if (!scryfallDataPromise) {
-    scryfallDataPromise = fetch(__SCRYFALL_DATA_URL__)
-      .then((r) => r.json() as Promise<ScryfallDataMap>)
-      .then((data) => {
-        scryfallDataResolved = data;
-        scryfallFoldedNameIndex = buildFoldedNameIndex(data);
-        return data;
-      })
+    const pending = (async () => {
+      const response = await fetch(__SCRYFALL_DATA_URL__);
+      if (!response.ok) return null;
+      const data: unknown = await response.json();
+      if (!isScryfallDataMap(data)) return null;
+      const foldedNameIndex = buildFoldedNameIndex(data);
+      scryfallDataResolved = data;
+      scryfallFoldedNameIndex = foldedNameIndex;
+      return data;
+    })()
       .catch(() => null);
+    scryfallDataPromise = pending;
+    void pending.then((data) => {
+      if (!data && scryfallDataPromise === pending) scryfallDataPromise = null;
+    });
   }
   return scryfallDataPromise;
 }
@@ -75,15 +220,66 @@ let printingsDataResolved: PrintingsDataMap | null = null;
 
 export function loadPrintingsData(): Promise<PrintingsDataMap | null> {
   if (!printingsDataPromise) {
-    printingsDataPromise = fetch(__SCRYFALL_PRINTINGS_URL__)
-      .then((r) => r.json() as Promise<PrintingsDataMap>)
-      .then((data) => {
-        printingsDataResolved = data;
-        return data;
-      })
+    const pending = (async () => {
+      const response = await fetch(__SCRYFALL_PRINTINGS_URL__);
+      if (!response.ok) return null;
+      const data: unknown = await response.json();
+      if (!isPrintingsDataMap(data)) return null;
+      printingsDataResolved = data;
+      return data;
+    })()
       .catch(() => null);
+    printingsDataPromise = pending;
+    void pending.then((data) => {
+      if (!data && printingsDataPromise === pending) printingsDataPromise = null;
+    });
   }
   return printingsDataPromise;
+}
+
+/**
+ * True when both card-data maps are already in memory, so a caller that needs
+ * them can run without a fetch.
+ *
+ * `scryfall-data.json` is 36,748,238 bytes and `scryfall-printings.json` is
+ * 39,541,979 bytes, and the two loaders above memoize at module scope — so this
+ * is the difference between a free read and a 76 MB download-and-parse. It
+ * exists so a PASSIVE surface can decline to be what triggers that: the
+ * visual-pack panel measures curated drift on mount, and a user who opens
+ * Preferences without having rendered a card must not pay for a measurement
+ * they never asked for.
+ *
+ * WHICH SESSIONS REACH THE RESIDENT STATE, precisely, because the two maps are
+ * NOT loaded together and the conjunction is much narrower than "has drawn a
+ * card":
+ *
+ *  - `scryfall-data.json` is the common one. `fetchCardImageAsset` and
+ *    `fetchCardImageAssetByOracleId` each await `loadScryfallData` and nothing
+ *    else, so any rendered card image has it.
+ *  - `scryfall-printings.json` is reached only on CONDITIONAL paths: the
+ *    placeholder fallback in `resolveImageAssetWithPrintingFallback` (only when
+ *    the resolved art is a placeholder), `resolveStrategyInBackground` in
+ *    `useCardImage` (only inside the `artChain.length > 0` branch), and the
+ *    deck-pinned lookup (only when a `sourcePrinting` is set).
+ *
+ * So a user on the DEFAULT empty art chain, with no overrides and no
+ * `(SET) NUM` annotations in their decks, can play a whole game and still have
+ * the printings map unloaded — and this stays false for the life of the tab.
+ * That user is not exotic; `PackSelector` ships a `curatedDefaultNote` written
+ * for exactly them. For them the drift badge does not appear on mount, and
+ * becomes available only when something else loads printings or when they
+ * select the curated option, which plans a membership and loads both.
+ *
+ * The conjunction is still the right test and must NOT be widened:
+ * `planCuratedPack` needs both maps, so either one missing means measuring
+ * would fetch. Its failure direction is the safe one — it declines to measure
+ * rather than declining to protect.
+ *
+ * Same shape as `isLocaleArtReady`: a synchronous predicate over this module's
+ * own resolved state, doubling as the caller's "do I need to load?" gate.
+ */
+export function isCardDataResident(): boolean {
+  return scryfallDataResolved !== null && printingsDataResolved !== null;
 }
 
 function loadTokenImagesData(): Promise<TokenImagesDataMap | null> {
@@ -97,15 +293,44 @@ function loadTokenImagesData(): Promise<TokenImagesDataMap | null> {
 
 /**
  * Per-locale card-art map: English Scryfall printing id → the same printing's
- * localized sibling id (`scryfall-images.<lng>.json`, generated by
- * `scripts/gen-scryfall-locale-images.sh` from MTGJSON `foreignData`).
+ * exact localized face URLs (`scryfall-images.v2.<lng>.json`, generated by
+ * `scripts/gen-scryfall-locale-images.sh` by joining MTGJSON `foreignData`
+ * to Scryfall's all-cards bulk export).
  *
  * Only one locale is resolved at a time — the UI renders in exactly one
  * language — mirroring how `scryfallDataResolved` holds a single module-global
  * map rather than threading data through every call site.
  */
-let localeArtResolved: { lang: string; map: Map<string, string> } | null = null;
-const localeArtPromises = new Map<string, Promise<Map<string, string>>>();
+interface LocalizedArtEntry {
+  id: string;
+  faces: Array<{ small?: string; normal?: string; art_crop?: string }>;
+}
+
+function isLocalizedArtEntry(value: unknown): value is LocalizedArtEntry {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const entry = value as Partial<LocalizedArtEntry>;
+  return typeof entry.id === "string"
+    && Array.isArray(entry.faces)
+    && entry.faces.length > 0
+    && entry.faces.every((face) =>
+      Boolean(face)
+      && typeof face.small === "string"
+      && typeof face.normal === "string"
+      && typeof face.art_crop === "string"
+    );
+}
+
+function parseLocalizedArtMap(value: unknown): Map<string, LocalizedArtEntry> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return new Map();
+  const map = new Map<string, LocalizedArtEntry>();
+  for (const [key, entry] of Object.entries(value)) {
+    if (isLocalizedArtEntry(entry)) map.set(key, entry);
+  }
+  return map;
+}
+
+let localeArtResolved: { lang: string; map: Map<string, LocalizedArtEntry> } | null = null;
+const localeArtPromises = new Map<string, Promise<Map<string, LocalizedArtEntry>>>();
 /**
  * The locale the app currently wants. Set synchronously on every request so a
  * slow fetch for a language the user has already switched away from cannot
@@ -133,11 +358,11 @@ export function isLocaleArtReady(lang: string): boolean {
  * empty map, so every card falls back to English art — localized art is
  * best-effort display data, never a hard dependency.
  */
-export function loadLocaleArt(lang: string): Promise<Map<string, string>> {
+export function loadLocaleArt(lang: string): Promise<Map<string, LocalizedArtEntry>> {
   desiredArtLang = lang;
   if (lang === "en") {
     localeArtResolved = null;
-    return Promise.resolve(new Map());
+    return Promise.resolve(new Map<string, LocalizedArtEntry>());
   }
   let promise = localeArtPromises.get(lang);
   if (!promise) {
@@ -148,10 +373,9 @@ export function loadLocaleArt(lang: string): Promise<Map<string, string>> {
       const resp = await fetch(
         __SCRYFALL_IMAGES_LOCALE_URL_TEMPLATE__.replace("{lng}", lang),
       );
-      if (!resp.ok) return new Map<string, string>();
-      const obj = (await resp.json()) as Record<string, string>;
-      return new Map(Object.entries(obj));
-    })().catch(() => new Map<string, string>());
+      if (!resp.ok) return new Map<string, LocalizedArtEntry>();
+      return parseLocalizedArtMap(await resp.json());
+    })().catch(() => new Map<string, LocalizedArtEntry>());
     localeArtPromises.set(lang, promise);
   }
   return promise.then((map) => {
@@ -212,6 +436,42 @@ export function pickOldestPrinting(printings: PrintingEntry[]): PrintingEntry {
 export function resolveOracleIdSync(cardName: string): string | null {
   if (!scryfallDataResolved) return null;
   return lookupEntryByName(cardName)?.oracle_id ?? null;
+}
+
+export interface AlternateCardFace {
+  name: string;
+  faceIndex: number;
+  side: "front" | "back";
+}
+
+const PHYSICAL_MULTI_FACE_LAYOUTS = new Set([
+  "transform",
+  "modal_dfc",
+  "meld",
+  "double_faced_token",
+  "reversible_card",
+]);
+
+export function resolveAlternateCardFaceSync(
+  cardName: string,
+): AlternateCardFace | null | undefined {
+  if (!scryfallDataResolved) return undefined;
+  const entry = lookupEntryByName(cardName);
+  if (!entry) return undefined;
+  if (entry.faces.length < 2 || !entry.layout || !PHYSICAL_MULTI_FACE_LAYOUTS.has(entry.layout)) {
+    return null;
+  }
+
+  const normalizedName = normalizeCardName(cardName).toLowerCase();
+  const currentFaceIndex = entry.face_names.indexOf(normalizedName);
+  const activeFaceIndex = currentFaceIndex >= 0 ? currentFaceIndex : 0;
+  const alternateFaceIndex = activeFaceIndex === 0 ? 1 : 0;
+  const displayFaceNames = entry.name.split(" // ");
+  return {
+    name: displayFaceNames[alternateFaceIndex] ?? entry.face_names[alternateFaceIndex],
+    faceIndex: alternateFaceIndex,
+    side: alternateFaceIndex === 0 ? "front" : "back",
+  };
 }
 
 /**
@@ -351,11 +611,15 @@ function localizeImageUrl(url: string): string {
   if (dot < 0) return url;
   const localized = localeArtResolved.map.get(filename.slice(0, dot));
   if (!localized) return url;
-  const segments = [...parsed.segments];
-  segments[3] = localized[0];
-  segments[4] = localized[1];
-  segments[5] = `${localized}.jpg`;
-  return `${parsed.scheme}://${segments.join("/")}`;
+  const faceIndex = parsed.segments[2] === "back" ? 1 : 0;
+  const face = localized.faces[faceIndex] ?? localized.faces[0];
+  if (!face) return url;
+  const localizedUrl = parsed.size === "art_crop"
+    ? face.art_crop
+    : parsed.size === "small"
+      ? face.small
+      : face.normal;
+  return localizedUrl ?? url;
 }
 
 /**
@@ -369,7 +633,7 @@ function localizeImageUrl(url: string): string {
  * history. Do not "fix" this without measuring that memory cost.
  */
 function localFaceImageUrl(
-  face: { normal: string; art_crop: string } | undefined,
+  face: ScryfallImageFace | undefined,
   size: ImageSize,
 ): string | undefined {
   if (!face) return undefined;
@@ -378,15 +642,34 @@ function localFaceImageUrl(
   // lookup), rather than in each caller. Size derivation and localization
   // commute — `deriveImageUrl` rewrites segment 1, `localizeImageUrl` rewrites
   // segments 3-5 — so the order below is immaterial.
-  if (size === "art_crop") return localizeImageUrl(face.art_crop);
-  return localizeImageUrl(
-    size === "small" ? deriveImageUrl(face.normal, "small") : face.normal,
-  );
+  if (size === "art_crop") {
+    return face.art_crop ? localizeImageUrl(face.art_crop) : undefined;
+  }
+  if (size === "small") {
+    const url = face.small ?? (face.normal ? deriveImageUrl(face.normal, "small") : undefined);
+    return url ? localizeImageUrl(url) : undefined;
+  }
+  return face.normal ? localizeImageUrl(face.normal) : undefined;
 }
 
 export interface CardImageAsset {
   src: string;
   isRotated: boolean;
+  source: CardImageSource;
+  rungs?: ImageRungs;
+  semantic: {
+    oracleId?: string;
+    englishPrintingId?: string;
+    faceIndex: number;
+    alias?: string;
+  };
+}
+
+function remoteImageSource(src: string, size: ImageSize): { source: CardImageSource; rungs?: ImageRungs } {
+  const rungs = size === "art_crop" || imageUrlSize(src) === null
+    ? undefined
+    : { small: deriveImageUrl(src, "small"), normal: deriveImageUrl(src, "normal") };
+  return { source: { kind: "remote", src, rungs }, rungs };
 }
 
 function isSidewaysLayout(layout: string | undefined): boolean {
@@ -399,6 +682,7 @@ function isFlipLayout(layout: string | undefined): boolean {
 
 export interface ScryfallCard {
   id?: string;
+  oracle_id?: string;
   name: string;
   mana_cost: string;
   cmc: number;
@@ -620,6 +904,19 @@ export interface LocalSearchCardOverrides {
   legalities: Record<string, string>;
 }
 
+function localFaceImageUris(face: ScryfallImageFace): Record<string, string> | undefined {
+  const imageUris: Record<string, string> = {};
+  const artCrop = localFaceImageUrl(face, "art_crop");
+  const normal = localFaceImageUrl(face, "normal");
+  const small = localFaceImageUrl(face, "small");
+  const large = localFaceImageUrl(face, "large");
+  if (artCrop) imageUris.art_crop = artCrop;
+  if (normal) imageUris.normal = normal;
+  if (small) imageUris.small = small;
+  if (large) imageUris.large = large;
+  return Object.keys(imageUris).length > 0 ? imageUris : undefined;
+}
+
 /**
  * Build a display `ScryfallCard` for an engine search result. Rules data comes
  * from the engine (the `overrides`); presentation data — artwork, printed type
@@ -634,12 +931,8 @@ export function buildLocalSearchCard(overrides: LocalSearchCardOverrides): Scryf
       ? scryfallDataResolved?.[overrides.oracleId.toLowerCase()]
       : undefined) ?? scryfallDataResolved?.[overrides.name.toLowerCase()];
   const face = entry?.faces[0];
-  // Copies stored face URLs straight into `image_uris` rather than going through
-  // `localFaceImageUrl`, so localization has to be applied explicitly here or
-  // deck-builder search results would stay English while the board is localized.
-  // The size mapping below (small/large both reusing `normal`) is preserved
-  // as-is — deriving a real `small` here would change which asset search
-  // results download.
+  // Use the same stored-URL funnel as every card sink so deck-builder search
+  // preserves exact small/localized URLs rather than reconstructing CDN paths.
   return {
     name: entry?.name ?? overrides.name,
     mana_cost: entry?.mana_cost ?? "",
@@ -649,14 +942,7 @@ export function buildLocalSearchCard(overrides: LocalSearchCardOverrides): Scryf
     color_identity: overrides.colorIdentity,
     keywords: entry?.keywords ?? [],
     legalities: overrides.legalities,
-    image_uris: face
-      ? {
-          art_crop: localizeImageUrl(face.art_crop),
-          normal: localizeImageUrl(face.normal),
-          small: localizeImageUrl(face.normal),
-          large: localizeImageUrl(face.normal),
-        }
-      : undefined,
+    image_uris: face ? localFaceImageUris(face) : undefined,
   };
 }
 
@@ -742,9 +1028,17 @@ function resolveImageAsset(
   size: ImageSize,
   diagnosticName: string,
 ): CardImageAsset {
+  const src = resolveImageUrl(entry, faceIndex, size, diagnosticName);
+  const remote = remoteImageSource(src, size);
   return {
-    src: resolveImageUrl(entry, faceIndex, size, diagnosticName),
+    src,
     isRotated: isSidewaysLayout(entry.layout),
+    ...remote,
+    semantic: {
+      oracleId: entry.oracle_id.toLowerCase(),
+      faceIndex,
+      alias: diagnosticName.toLowerCase().normalize("NFC"),
+    },
   };
 }
 
@@ -752,16 +1046,16 @@ function isPlaceholderImageUrl(url: string): boolean {
   return url === "https://errors.scryfall.com/soon.jpg";
 }
 
-function resolvePrintingFallbackImageUrl(
+function resolvePrintingFallback(
   oracleId: string,
   faceIndex: number,
   size: ImageSize,
-): string | null {
+): { id: string; url: string } | null {
   const printings = printingsDataResolved?.[oracleId.toLowerCase()] ?? [];
   for (const printing of printings) {
     if (printing.set === "plst") continue;
     const url = resolvePrintingImageUrl(printing, faceIndex, size);
-    if (url && !isPlaceholderImageUrl(url)) return url;
+    if (url && !isPlaceholderImageUrl(url)) return { id: printing.id, url };
   }
   return null;
 }
@@ -776,8 +1070,14 @@ async function resolveImageAssetWithPrintingFallback(
   if (!isPlaceholderImageUrl(asset.src)) return asset;
 
   await loadPrintingsData();
-  const fallback = resolvePrintingFallbackImageUrl(entry.oracle_id, faceIndex, size);
-  return fallback ? { ...asset, src: fallback } : asset;
+  const fallback = resolvePrintingFallback(entry.oracle_id, faceIndex, size);
+  if (!fallback) return asset;
+  return {
+    ...asset,
+    src: fallback.url,
+    ...remoteImageSource(fallback.url, size),
+    semantic: { ...asset.semantic, englishPrintingId: fallback.id.toLowerCase() },
+  };
 }
 
 function resolveImageUrl(
@@ -884,10 +1184,15 @@ export async function fetchTokenImageUrl(
   throw new Error(`No token image found for "${tokenName}"`);
 }
 
-export async function fetchTokenImageByRef(
+export interface TokenImageAssetByRef {
+  src: string;
+  faceIndex: number;
+}
+
+export async function fetchTokenImageAssetByRef(
   ref: TokenImageRef,
   size: ImageSize = "normal",
-): Promise<string | null> {
+): Promise<TokenImageAssetByRef | null> {
   const data = await loadTokenImagesData();
   if (!data) return null;
 
@@ -896,7 +1201,7 @@ export async function fetchTokenImageByRef(
     const faceIndex = ref.face_name
       ? Math.max(0, idEntry.face_names.indexOf(ref.face_name.toLowerCase()))
       : 0;
-    return resolveImageUrl(idEntry, faceIndex, size, idEntry.name);
+    return { src: resolveImageUrl(idEntry, faceIndex, size, idEntry.name), faceIndex };
   }
 
   if (ref.scryfall_oracle_id) {
@@ -906,11 +1211,18 @@ export async function fetchTokenImageByRef(
       const faceIndex = ref.face_name
         ? Math.max(0, oracleEntry.face_names.indexOf(ref.face_name.toLowerCase()))
         : 0;
-      return resolveImageUrl(oracleEntry, faceIndex, size, oracleEntry.name);
+      return { src: resolveImageUrl(oracleEntry, faceIndex, size, oracleEntry.name), faceIndex };
     }
   }
 
   return null;
+}
+
+export async function fetchTokenImageByRef(
+  ref: TokenImageRef,
+  size: ImageSize = "normal",
+): Promise<string | null> {
+  return (await fetchTokenImageAssetByRef(ref, size))?.src ?? null;
 }
 
 async function fetchTokenImageFromLocal(

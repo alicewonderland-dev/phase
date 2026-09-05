@@ -2,8 +2,8 @@ use crate::game::functioning_abilities::static_kind_present;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, CardSelectionMode, ChoiceValue,
     ChosenAttribute, ContinuousModification, CostPaidObjectSnapshot, Effect, ManaProduction,
-    QuantityExpr, QuantityRef, ResolvedAbility, TargetFilter, REMOVE_COUNTER_COST_ALL,
-    REMOVE_COUNTER_COST_ANY_NUMBER,
+    QuantityExpr, QuantityRef, ResolvedAbility, TapCreaturesSelectionMode, TargetFilter,
+    REMOVE_COUNTER_COST_ALL, REMOVE_COUNTER_COST_ANY_NUMBER,
 };
 use crate::types::ability_visit::{
     visit_ability_def_costs_scoped, visit_ability_def_scoped, ResolutionScope,
@@ -1406,31 +1406,67 @@ pub(crate) fn batch_activate_mana_siblings(
 }
 
 /// CR 118.3 / CR 605.3b: Complete the tapped-creature choice, then resolve the mana ability.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_tap_creatures_for_mana_ability(
     state: &mut GameState,
+    min_count: usize,
     count: usize,
+    mode: TapCreaturesSelectionMode,
     legal_creatures: &[ObjectId],
     pending: &PendingManaAbility,
     chosen: &[ObjectId],
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
-    if chosen.len() != count {
-        return Err(EngineError::InvalidAction(format!(
-            "Must tap exactly {} creature(s), got {}",
-            count,
-            chosen.len()
-        )));
+    match mode {
+        // CR 601.2h + CR 107.3a: the fixed-count form has `min_count == count`,
+        // so this range check subsumes the prior exact-match behavior unchanged;
+        // the X-sentinel form bounds the announced X to [0, eligible].
+        TapCreaturesSelectionMode::Fixed | TapCreaturesSelectionMode::VariableX => {
+            if chosen.len() < min_count || chosen.len() > count {
+                let requirement = if min_count == count {
+                    format!("exactly {count} creature(s)")
+                } else {
+                    format!("between {min_count} and {count} creature(s)")
+                };
+                return Err(EngineError::InvalidAction(format!(
+                    "Must tap {requirement}, got {}",
+                    chosen.len()
+                )));
+            }
+        }
+        // CR 605.1a: an aggregate (Crew/Saddle/Teamwork) tap cost is never a
+        // mana-ability cost — `tap_creature_cost_choice` refuses to register one,
+        // so this state is unreachable through the production registration path.
+        TapCreaturesSelectionMode::Aggregate(_) => {
+            return Err(EngineError::InvalidAction(
+                "Aggregate-power tap cost is not valid for a mana ability".to_string(),
+            ));
+        }
     }
-    for id in chosen {
+    for (index, id) in chosen.iter().enumerate() {
         if !legal_creatures.contains(id) {
             return Err(EngineError::InvalidAction(
                 "Selected creature not eligible for mana ability cost".to_string(),
+            ));
+        }
+        // CR 601.2h: one creature can only pay for itself once. Rejecting the
+        // duplicate here keeps the X binding below honest — a repeated id would
+        // otherwise inflate the announced X above the number actually tapped.
+        if chosen[..index].contains(id) {
+            return Err(EngineError::InvalidAction(
+                "Cannot tap the same creature twice for a mana ability cost".to_string(),
             ));
         }
     }
 
     let mut updated = pending.clone();
     updated.chosen_tappers = chosen.to_vec();
+    // CR 107.3a: for the X-sentinel form only, the selected payment count *is*
+    // the announced value of X for this mana ability. `min_count == 0` is not a
+    // usable signal here for the same reason it is not at the spell-cost seam.
+    if matches!(mode, TapCreaturesSelectionMode::VariableX) {
+        updated.chosen_x = Some(chosen.len().try_into().unwrap_or(u32::MAX));
+    }
     advance_mana_ability_activation(state, updated, events)
 }
 
@@ -2026,20 +2062,23 @@ pub(super) fn advance_mana_ability_activation(
     }
 
     if pending.chosen_tappers.is_empty() {
-        if let Some((count, creatures)) =
+        if let Some((min_count, max_count, creatures, mode)) =
             tap_creature_cost_choice(state, pending.player, pending.source_id, &ability_def.cost)
         {
-            if creatures.len() < count {
+            // CR 601.2h: partial payment is refused for the fixed-count form
+            // (`min_count == count`). CR 107.3a's X-sentinel form has a zero
+            // floor, so an empty board is a legal X=0 activation, not a failure.
+            if creatures.len() < min_count {
                 return Err(EngineError::ActionNotAllowed(
                     "Not enough untapped creatures to pay mana ability cost".to_string(),
                 ));
             }
             return Ok(WaitingFor::PayCost {
                 player: pending.player,
-                kind: PayCostKind::TapCreatures { aggregate: None },
+                kind: PayCostKind::TapCreatures { mode },
                 choices: creatures,
-                count,
-                min_count: 0,
+                count: max_count,
+                min_count,
                 resume: CostResume::ManaAbility {
                     mana_ability: Box::new(pending),
                 },
@@ -3725,14 +3764,31 @@ where
             requirement,
             filter,
         }) => {
-            // CR 605.1a: Mana-ability tap costs (Convoke-style) are fixed-count
-            // only; the aggregate "total power N" form is reserved for
-            // Crew/Saddle/Teamwork, which are never mana abilities.
-            let count = requirement.fixed_count().ok_or_else(|| {
-                EngineError::InvalidAction(
-                    "Aggregate-power tap cost is not valid for a mana ability".to_string(),
-                )
-            })?;
+            // CR 605.1a: the aggregate "total power N" form is reserved for
+            // Crew/Saddle/Teamwork, which are never mana abilities; fixed-count
+            // and X-sentinel forms both are valid mana-ability tap costs.
+            //
+            // CR 107.3a: the loop bound must be the *selection* size, not the raw
+            // requirement count — for the X-sentinel form the requirement count is
+            // `u32::MAX`, and draining that many tappers would fail immediately
+            // after consuming the (much smaller) real selection. The announced X,
+            // bound at selection completion by
+            // `handle_tap_creatures_for_mana_ability`, is the authority.
+            let count = match requirement.selection_mode() {
+                TapCreaturesSelectionMode::Fixed => requirement
+                    .fixed_count()
+                    .expect("Fixed mode is derived from TapCreaturesRequirement::Count"),
+                TapCreaturesSelectionMode::VariableX => chosen_x.ok_or_else(|| {
+                    EngineError::InvalidAction(
+                        "Missing announced X for tap-creatures mana ability cost".to_string(),
+                    )
+                })?,
+                TapCreaturesSelectionMode::Aggregate(_) => {
+                    return Err(EngineError::InvalidAction(
+                        "Aggregate-power tap cost is not valid for a mana ability".to_string(),
+                    ));
+                }
+            };
             for _ in 0..count {
                 let chosen_id = chosen_tappers.next().ok_or_else(|| {
                     EngineError::InvalidAction(
@@ -4559,11 +4615,14 @@ fn tap_creature_cost_choice(
     player: PlayerId,
     source_id: ObjectId,
     cost: &Option<AbilityCost>,
-) -> Option<(usize, Vec<ObjectId>)> {
+) -> Option<(usize, usize, Vec<ObjectId>, TapCreaturesSelectionMode)> {
     let (requirement, filter) = super::casting::find_tap_creatures_cost(cost.as_ref()?)?;
-    // CR 605.1a: mana-ability tap costs (Convoke-style) are fixed-count only.
+    // CR 605.1a: the aggregate form is never a valid mana-ability tap cost;
+    // fixed-count and X-sentinel forms both are. `fixed_count()` returning `None`
+    // is the aggregate rejection.
     let count = requirement.fixed_count()?;
-    let creatures = state
+    let mode = requirement.selection_mode();
+    let creatures: Vec<ObjectId> = state
         .battlefield
         .iter()
         .copied()
@@ -4585,7 +4644,12 @@ fn tap_creature_cost_choice(
             )
         })
         .collect();
-    Some((count as usize, creatures))
+    // CR 107.3a: a `u32::MAX` count is the "Tap X untapped … you control"
+    // X-sentinel, whose payable range is [0, eligible] — never a literal floor of
+    // `u32::MAX`. A fixed (non-X) count degrades to `(count, count)`, preserving
+    // the CR 601.2h exact-payment requirement for every existing card.
+    let (min_count, max_count) = super::casting::sacrifice_cost_bounds(count, creatures.len());
+    Some((min_count, max_count, creatures, mode))
 }
 
 fn discard_cost_choice(
@@ -6475,6 +6539,8 @@ mod tests {
         let exile_with_alt_cost = |graveyard_replacement: Option<
             SpellStackToGraveyardReplacement,
         >| CastingPermission::ExileWithAltCost {
+            source_id: None,
+            cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
             cost: ManaCost::generic(0),
             cast_transformed: false,
             constraint: None,
@@ -6496,7 +6562,7 @@ mod tests {
         let free_cast =
             |zones: Vec<Zone>, graveyard_replacement: Option<SpellStackToGraveyardReplacement>| {
                 Effect::FreeCastFromZones {
-                    count: 1,
+                    count: Some(1),
                     max_total_mv: None,
                     filter: TargetFilter::Any,
                     zones,
@@ -14732,5 +14798,228 @@ mod tests {
             restored.lifecycle,
             ManaAbilityCostParentLifecycle::Suspended
         ));
+    }
+
+    /// CR 107.3a + CR 605.1a — the mana-ability cost-APPLICATION loop bound.
+    ///
+    /// `pay_mana_ability_cost_with_choices`'s `TapCreatures` arm used to loop
+    /// `0..requirement.fixed_count()`, i.e. `0..u32::MAX` for a "Tap X untapped
+    /// … you control" cost. It drained the player's (small) real selection, then
+    /// asked the exhausted iterator for one more tapper and failed with
+    /// "Missing tapped creature selection for mana ability" — so an X-sentinel
+    /// mana ability could never be paid, regardless of the registration and
+    /// completion fixes.
+    ///
+    /// This is a direct-call test because the function is private to this
+    /// module; `casting_tests.rs` is `game::casting::tests`, a SIBLING of
+    /// `mana_abilities`, and Rust privacy puts this target out of its reach.
+    ///
+    /// REVERT-PROBE: restore `requirement.fixed_count()` as the loop bound ⇒
+    /// `x_sentinel_loop_bound_uses_the_announced_x` fails with the
+    /// "Missing tapped creature selection" error, while the `Fixed` sibling
+    /// below still passes (proving the fix is scoped to the sentinel shape).
+    mod x_sentinel_mana_ability_cost_application {
+        use super::*;
+        use crate::types::ability::TapCreaturesRequirement;
+
+        /// Two untapped creatures the caller can offer as tappers, plus a
+        /// battlefield source, on a fresh two-player state.
+        fn fixture() -> (GameState, ObjectId, Vec<ObjectId>) {
+            let mut state = GameState::new_two_player(42);
+            let player = PlayerId(0);
+            state.active_player = player;
+            state.priority_player = player;
+            state.waiting_for = WaitingFor::Priority { player };
+            let source = create_object(
+                &mut state,
+                CardId(9_701),
+                player,
+                "Hazel fixture".to_string(),
+                Zone::Battlefield,
+            );
+            let tappers: Vec<ObjectId> = (0..2)
+                .map(|i| {
+                    let id = create_object(
+                        &mut state,
+                        CardId(9_710 + i),
+                        player,
+                        format!("Token {i}"),
+                        Zone::Battlefield,
+                    );
+                    let obj = state.objects.get_mut(&id).unwrap();
+                    obj.card_types.core_types.push(CoreType::Creature);
+                    obj.power = Some(1);
+                    obj.toughness = Some(1);
+                    obj.tapped = false;
+                    obj.summoning_sick = false;
+                    id
+                })
+                .collect();
+            (state, source, tappers)
+        }
+
+        fn pay(
+            state: &mut GameState,
+            source: ObjectId,
+            requirement: TapCreaturesRequirement,
+            tappers: &[ObjectId],
+            chosen_x: Option<u32>,
+        ) -> Result<ManaAbilityCostComponentProgress, EngineError> {
+            let cost = Some(AbilityCost::TapCreatures {
+                requirement,
+                filter: TargetFilter::Typed(crate::types::ability::TypedFilter::creature()),
+            });
+            let mut tap_iter = tappers.iter().copied();
+            let mut discards = std::iter::empty();
+            let mut sacrificed = std::iter::empty();
+            pay_mana_ability_cost_with_choices(
+                state,
+                source,
+                PlayerId(0),
+                Some(0),
+                &cost,
+                &mut Vec::new(),
+                &mut tap_iter,
+                &mut discards,
+                &mut sacrificed,
+                None,
+                None,
+                chosen_x,
+                &HashSet::new(),
+                None,
+                None,
+            )
+        }
+
+        /// The discriminator: an X-sentinel cost must consume exactly the
+        /// announced X (bound at selection completion by
+        /// `handle_tap_creatures_for_mana_ability`), not the raw `u32::MAX`.
+        #[test]
+        fn x_sentinel_loop_bound_uses_the_announced_x() {
+            let (mut state, source, tappers) = fixture();
+            // Positive reach guard: this really is the sentinel shape, so the
+            // test cannot silently degrade into the `Fixed` branch.
+            let requirement = TapCreaturesRequirement::Count { count: u32::MAX };
+            assert_eq!(
+                requirement.selection_mode(),
+                TapCreaturesSelectionMode::VariableX,
+                "reach guard: the fixture must be the X-sentinel shape"
+            );
+
+            pay(&mut state, source, requirement, &tappers, Some(2))
+                .expect("CR 107.3a: the announced X (2) bounds the tap loop");
+            assert!(
+                tappers.iter().all(|id| state.objects[id].tapped),
+                "both announced tappers must actually be tapped"
+            );
+        }
+
+        /// A smaller announced X taps strictly fewer creatures, proving the bound
+        /// tracks the announcement rather than the offered-iterator length.
+        #[test]
+        fn x_sentinel_loop_bound_taps_only_the_announced_count() {
+            let (mut state, source, tappers) = fixture();
+            pay(
+                &mut state,
+                source,
+                TapCreaturesRequirement::Count { count: u32::MAX },
+                &tappers,
+                Some(1),
+            )
+            .expect("CR 107.3a: X=1 is a legal announcement");
+            assert!(
+                state.objects[&tappers[0]].tapped,
+                "the first tapper is used"
+            );
+            assert!(
+                !state.objects[&tappers[1]].tapped,
+                "X=1 must not consume a second tapper"
+            );
+        }
+
+        /// X=0 is a legal announcement and taps nothing at all (CR 107.3a).
+        #[test]
+        fn x_sentinel_loop_bound_accepts_zero() {
+            let (mut state, source, tappers) = fixture();
+            pay(
+                &mut state,
+                source,
+                TapCreaturesRequirement::Count { count: u32::MAX },
+                &[],
+                Some(0),
+            )
+            .expect("CR 107.3a: X=0 is a legal announcement");
+            assert!(
+                tappers.iter().all(|id| !state.objects[id].tapped),
+                "X=0 taps nothing"
+            );
+        }
+
+        /// Hostile: an X-sentinel cost with NO announced X is a hard error rather
+        /// than a silent fallback to some other count.
+        #[test]
+        fn x_sentinel_without_an_announced_x_is_an_error() {
+            let (mut state, source, tappers) = fixture();
+            let err = pay(
+                &mut state,
+                source,
+                TapCreaturesRequirement::Count { count: u32::MAX },
+                &tappers,
+                None,
+            )
+            .expect_err("an unannounced X must not silently pick a count");
+            let EngineError::InvalidAction(message) = &err else {
+                panic!("expected an InvalidAction, got {err:?}");
+            };
+            assert!(
+                message.contains("Missing announced X"),
+                "the missing-X path must be what fired, got {message:?}"
+            );
+        }
+
+        /// Sibling: the FIXED shape is untouched — it still consumes exactly
+        /// `count` tappers, which is the pre-existing behavior for every non-X
+        /// mana-ability tap cost (Grand Architect, Springleaf Drum).
+        #[test]
+        fn fixed_loop_bound_is_unchanged() {
+            let (mut state, source, tappers) = fixture();
+            pay(
+                &mut state,
+                source,
+                TapCreaturesRequirement::count(1),
+                &tappers,
+                None,
+            )
+            .expect("a fixed `count: 1` tap cost consumes exactly one tapper");
+            assert!(state.objects[&tappers[0]].tapped);
+            assert!(
+                !state.objects[&tappers[1]].tapped,
+                "a `count: 1` cost must not consume a second tapper"
+            );
+        }
+
+        /// CR 605.1a: an aggregate (Crew/Saddle/Teamwork) tap cost is never a
+        /// mana-ability cost, and the exhaustive `match` on the selection mode
+        /// keeps that refusal explicit rather than falling through.
+        #[test]
+        fn aggregate_shape_is_refused() {
+            let (mut state, source, tappers) = fixture();
+            let err = pay(
+                &mut state,
+                source,
+                TapCreaturesRequirement::total_power_at_least(1),
+                &tappers,
+                Some(1),
+            )
+            .expect_err("CR 605.1a: an aggregate tap cost cannot fund a mana ability");
+            assert!(
+                matches!(err, EngineError::InvalidAction(_)),
+                "expected an InvalidAction, got {err:?}"
+            );
+            assert!(
+                tappers.iter().all(|id| !state.objects[id].tapped),
+                "a refused aggregate cost must not tap anything"
+            );
+        }
     }
 }

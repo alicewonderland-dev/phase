@@ -6,7 +6,13 @@ import {
   WebSocketAdapter,
 } from "../ws-adapter";
 import { AdapterError, supportsMatchConcede, supportsServerRewind } from "../types";
-import type { GameState } from "../types";
+import type { FormatConfig, GameState } from "../types";
+import type {
+  InteractionChoiceId,
+  InteractionId,
+  InteractionPreviewRequest,
+  PreviewRequestId,
+} from "../generated/interaction";
 import type { PhaseSocketTransport } from "../../services/openPhaseSocket";
 
 // Minimal mock WebSocket. Latest-constructed instance is exposed via
@@ -87,6 +93,35 @@ async function completeHandshake(adapter: WebSocketAdapter): Promise<MockWebSock
   return (adapter as unknown as { ws: MockWebSocket }).ws;
 }
 
+/**
+ * Starts observing `promise` immediately and returns a reader that yields the
+ * rejection reason — or the string `"never settled"` if the promise is still
+ * pending.
+ *
+ * Observation has to start before the first `await` so an already-rejected
+ * promise is handled in the same tick, and the drain is what turns an orphaned
+ * promise — the exact defect these settlement fixes prevent — into a readable
+ * assertion failure instead of a suite timeout.
+ *
+ * The reader yields a MACROTASK turn (`setTimeout(…, 0)`), not a microtask
+ * drain: that is strictly more generous than the settlement paths need, since
+ * both `dispose()` and `onclose` reject synchronously. The cost is that it
+ * couples the reader to real timers — a caller running it under
+ * `vi.useFakeTimers()` would hang. No current caller does; the only fake-timer
+ * scope in these suites is closed by a `finally { vi.useRealTimers(); }`.
+ */
+function trackRejection(promise: Promise<unknown>): () => Promise<unknown> {
+  let outcome: unknown = "never settled";
+  void promise.then(
+    (value) => { outcome = { resolvedWith: value }; },
+    (error) => { outcome = error; },
+  );
+  return async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return outcome;
+  };
+}
+
 // Shared session service relies on localStorage in test environments.
 vi.stubGlobal("localStorage", {
   getItem: vi.fn(() => null),
@@ -126,7 +161,7 @@ describe("WebSocketAdapter", () => {
   beforeEach(async () => {
     MockWebSocket.last = null;
     adapter = new WebSocketAdapter(
-      "ws://localhost:9374/ws",
+      "wss://localhost:9374/ws",
       "host",
       { main_deck: [], sideboard: [] },
     );
@@ -151,6 +186,105 @@ describe("WebSocketAdapter", () => {
     expect(ws.send).toHaveBeenLastCalledWith(JSON.stringify({ type: "ConcedeMatch" }));
   });
 
+  it("exports only the trusted snapshot returned by the server", async () => {
+    const exported = adapter.exportPersistenceState();
+
+    expect(ws.send).toHaveBeenLastCalledWith(JSON.stringify({ type: "ExportAuthoritativeState" }));
+
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({ type: "AuthoritativeStateExport", data: { state: "{\"state\":{}}" } }),
+    );
+
+    await expect(exported).resolves.toBe("{\"state\":{}}");
+  });
+
+  it("rejects an authoritative export failure without ending the session", async () => {
+    const exported = adapter.exportPersistenceState();
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({
+        type: "AuthoritativeStateExportFailed",
+        data: { message: "Only the game host can export authoritative state" },
+      }),
+    );
+
+    await expect(exported).rejects.toMatchObject({
+      code: "WS_ERROR",
+      message: "Only the game host can export authoritative state",
+      recoverable: false,
+    });
+  });
+
+  it("rejects a malformed authoritative export and clears the pending request", async () => {
+    const malformed = adapter.exportPersistenceState();
+    ws.dispatchSynthetic("message", JSON.stringify({ type: "AuthoritativeStateExport" }));
+
+    await expect(malformed).rejects.toMatchObject({
+      code: "WS_ERROR",
+      message: "Server sent an invalid authoritative-state export.",
+      recoverable: false,
+    });
+
+    const retried = adapter.exportPersistenceState();
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({ type: "AuthoritativeStateExport", data: { state: "{\"state\":{}}" } }),
+    );
+
+    await expect(retried).resolves.toBe("{\"state\":{}}");
+  });
+
+  it.each([
+    ["invalid JSON", "{"],
+    ["null", "null"],
+    ["scalar", "1"],
+    ["typeless object", "{}"],
+    ["non-string type", JSON.stringify({ type: 1 })],
+    ["unknown type", JSON.stringify({ type: "UnexpectedMessage" })],
+  ])("rejects a pending export for a %s frame and permits a retry", async (_label, frame) => {
+    const exported = adapter.exportPersistenceState();
+    ws.dispatchSynthetic("message", frame);
+
+    await expect(exported).rejects.toMatchObject({
+      code: "WS_ERROR",
+      recoverable: false,
+    });
+
+    const retried = adapter.exportPersistenceState();
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({ type: "AuthoritativeStateExport", data: { state: "{\"state\":{}}" } }),
+    );
+    await expect(retried).resolves.toBe("{\"state\":{}}");
+  });
+
+  it("ignores unknown frames when no authoritative export is pending", async () => {
+    ws.dispatchSynthetic("message", JSON.stringify({ type: "UnexpectedMessage" }));
+
+    const exported = adapter.exportPersistenceState();
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({ type: "AuthoritativeStateExport", data: { state: "{\"state\":{}}" } }),
+    );
+    await expect(exported).resolves.toBe("{\"state\":{}}");
+  });
+
+  it("does not request an authoritative export over cleartext WebSocket", async () => {
+    const insecure = new WebSocketAdapter(
+      "ws://localhost:9374/ws",
+      "host",
+      { main_deck: [], sideboard: [] },
+    );
+
+    await expect(insecure.exportPersistenceState()).rejects.toMatchObject({
+      code: "WS_ERROR",
+      message: "Authoritative-state export requires a secure connection",
+      recoverable: false,
+    });
+  });
+
+/* Legacy browser-owned Resolve All transport coverage removed with the transport.
   it("publishes a Resolve All decision state before resolving its acknowledgement", async () => {
     const listener = vi.fn();
     adapter.onEvent(listener);
@@ -211,13 +345,13 @@ describe("WebSocketAdapter", () => {
     );
     ws.dispatchSynthetic(
       "message",
-      JSON.stringify({ type: "ActionRejected", data: { reason: "stale action rejection" } }),
+      JSON.stringify({ type: "ActionRejected", data: { rejection: { code: "stale_action", disposition: "stale", message: "stale action rejection", related_object_ids: [] } } }),
     );
     ws.dispatchSynthetic(
       "message",
       JSON.stringify({
         type: "ResolveAllRejected",
-        data: { request_id: 2, reason: "a different batch" },
+        data: { request_id: 2, rejection: { code: "invalid_action", disposition: "invalid", message: "a different batch", related_object_ids: [] } },
       }),
     );
 
@@ -228,25 +362,25 @@ describe("WebSocketAdapter", () => {
       "message",
       JSON.stringify({
         type: "ResolveAllRejected",
-        data: { request_id: 1, reason: "batch snapshot rejected" },
+        data: { request_id: 1, rejection: { code: "invalid_action", disposition: "invalid", message: "batch snapshot rejected", related_object_ids: [] } },
       }),
     );
 
     await expect(resultPromise).rejects.toMatchObject({ message: "batch snapshot rejected" });
   });
 
-  it("scopes the stale priority race to correlated Resolve All rejections", async () => {
+  it("keeps correlated Resolve All rejections engine-classified", async () => {
     const stale = adapter.resolveAll(0, [{ playerId: 1, difficulty: "Medium" }], 5);
     ws.dispatchSynthetic(
       "message",
       JSON.stringify({
         type: "ResolveAllRejected",
-        data: { request_id: 1, reason: "Resolve All requires your priority" },
+        data: { request_id: 1, rejection: { code: "resolve_all_not_ready", disposition: "unavailable", message: "Resolve All is not ready to run.", related_object_ids: [] } },
       }),
     );
     await expect(stale).rejects.toMatchObject({
-      code: "STALE_ACTION",
-      recoverable: false,
+      code: "ACTION_REJECTED",
+      recoverable: true,
     });
 
     const rejected = adapter.resolveAll(0, [{ playerId: 1, difficulty: "Medium" }], 5);
@@ -254,7 +388,7 @@ describe("WebSocketAdapter", () => {
       "message",
       JSON.stringify({
         type: "ResolveAllRejected",
-        data: { request_id: 2, reason: "batch snapshot rejected" },
+        data: { request_id: 2, rejection: { code: "invalid_action", disposition: "invalid", message: "batch snapshot rejected", related_object_ids: [] } },
       }),
     );
     await expect(rejected).rejects.toMatchObject({
@@ -263,6 +397,60 @@ describe("WebSocketAdapter", () => {
     });
   });
 
+  it("settles operational failures only against their pending game operation", async () => {
+    const action = adapter.submitAction({ type: "PassPriority" }, 0);
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({ type: "ActionFailed", data: { message: "action persistence failed" } }),
+    );
+    await expect(action).rejects.toMatchObject({
+      code: "WS_ERROR",
+      message: "action persistence failed",
+      recoverable: false,
+    });
+
+    const resolveAll = adapter.resolveAll(0, [{ playerId: 1, difficulty: "Medium" }], 5);
+    const resolveAllSettled = vi.fn();
+    void resolveAll.then(resolveAllSettled, resolveAllSettled);
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({ type: "ResolveAllFailed", data: { request_id: 2, message: "other batch failed" } }),
+    );
+    await Promise.resolve();
+    expect(resolveAllSettled).not.toHaveBeenCalled();
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({ type: "ResolveAllFailed", data: { request_id: 1, message: "batch persistence failed" } }),
+    );
+    await expect(resolveAll).rejects.toMatchObject({
+      code: "WS_ERROR",
+      message: "batch persistence failed",
+      recoverable: false,
+    });
+
+    const preview = adapter.previewManaPayment({ type: "PassPriority" }, 0);
+    const calls = ws.send.mock.calls;
+    const sent = JSON.parse(calls[calls.length - 1][0] as string);
+    const previewSettled = vi.fn();
+    void preview.then(previewSettled, previewSettled);
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({ type: "ManaPaymentPreviewFailed", data: { request_id: sent.data.request_id + 1, message: "other preview failed" } }),
+    );
+    await Promise.resolve();
+    expect(previewSettled).not.toHaveBeenCalled();
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({ type: "ManaPaymentPreviewFailed", data: { request_id: sent.data.request_id, message: "preview lookup failed" } }),
+    );
+    await expect(preview).rejects.toMatchObject({
+      code: "WS_ERROR",
+      message: "preview lookup failed",
+      recoverable: false,
+    });
+  });
+
+*/
   describe("server rewind capability (F2)", () => {
     it("declares the capability through the standalone type guard", () => {
       expect(supportsServerRewind(adapter)).toBe(true);
@@ -459,6 +647,65 @@ describe("WebSocketAdapter", () => {
     // `reconnectFailed` before the `reconnecting` emit at all. The sidecar
     // runs `--single-user`, so its reconnect window is effectively unbounded
     // and the session is still there to reconnect to.
+    // The desktop (Tauri) solo route hands the setup screen's edited config to
+    // the sidecar through this frame and nowhere else: that route deliberately
+    // writes no resume pointer, so if `format_config` were dropped here the
+    // native server would fall back to Standard's 20 life with no other copy of
+    // the user's choice anywhere in the session.
+    it("carries a custom starting life to the native engine", async () => {
+      MockWebSocket.last = null;
+      const socketFactory = vi.fn(
+        () => new MockWebSocket("native-engine") as unknown as PhaseSocketTransport,
+      );
+      const formatConfig: FormatConfig = {
+        format: "Commander",
+        starting_life: 25,
+        min_players: 2,
+        max_players: 4,
+        deck_size: { type: "Exactly", data: 100 },
+        singleton: true,
+        command_zone: true,
+        commander_damage_threshold: 21,
+        range_of_influence: null,
+        team_based: false,
+        sideboard_policy: { type: "Forbidden" },
+        default_deck_copy_limit: { type: "UpTo", data: 1 },
+        uses_commander: true,
+        allow_debug_actions: false,
+      };
+      const nativeAdapter = new WebSocketAdapter(
+        "native-engine",
+        "host",
+        { main_deck: [], sideboard: [] },
+        undefined,
+        undefined,
+        undefined,
+        "Player",
+        {
+          nativeAi: {
+            ...nativeAiOptions(socketFactory).nativeAi,
+            formatConfig,
+          },
+        },
+      );
+
+      const initPromise = nativeAdapter.initialize();
+      const nativeSocket = await completeHandshake(nativeAdapter);
+      const calls = nativeSocket.send.mock.calls;
+      const frame = JSON.parse(calls[calls.length - 1]![0] as string);
+      expect(frame.type).toBe("CreateGameWithSettings");
+      expect(frame.data.format_config).toEqual(formatConfig);
+
+      nativeSocket.dispatchSynthetic(
+        "message",
+        JSON.stringify({
+          type: "GameStarted",
+          data: { state: createMockState(), your_player: 0 },
+        }),
+      );
+      await initPromise;
+    });
+
     it("retries a dropped native-ai socket instead of failing on first drop", async () => {
       MockWebSocket.last = null;
       const nativeAdapter = new WebSocketAdapter(
@@ -522,6 +769,71 @@ describe("WebSocketAdapter", () => {
     // Scope guard: this asserts a property of the DIFF (the change was scoped
     // to `nativeAi` and did not widen to both options), not that 0 is the
     // right answer for pregame — that path is explicitly not analysed.
+    // Desktop hosting from the multiplayer screen: `P2PHostAdapter` builds a
+    // `NativeP2PBridge`, which creates the sidecar game through this pregame
+    // frame rather than the `nativeAi` one. `HostSetup`'s edited starting life
+    // reaches the engine only if it survives here too.
+    it("carries a custom starting life to the native pregame host", async () => {
+      MockWebSocket.last = null;
+      const formatConfig: FormatConfig = {
+        format: "Commander",
+        starting_life: 25,
+        min_players: 2,
+        max_players: 4,
+        deck_size: { type: "Exactly", data: 100 },
+        singleton: true,
+        command_zone: true,
+        commander_damage_threshold: 21,
+        range_of_influence: null,
+        team_based: false,
+        sideboard_policy: { type: "Forbidden" },
+        default_deck_copy_limit: { type: "UpTo", data: 1 },
+        uses_commander: true,
+        allow_debug_actions: false,
+      };
+      const pregameAdapter = new WebSocketAdapter(
+        "native-engine",
+        "host",
+        { main_deck: [], sideboard: [] },
+        undefined,
+        undefined,
+        undefined,
+        "Host",
+        {
+          nativePregame: {
+            kind: "host",
+            socketFactory: () =>
+              new MockWebSocket("native-engine") as unknown as PhaseSocketTransport,
+            playerCount: 4,
+            aiSeats: [],
+            formatConfig,
+          },
+        },
+      );
+
+      const attached = pregameAdapter.initializePregame();
+      const nativeSocket = await completeHandshake(pregameAdapter);
+      const calls = nativeSocket.send.mock.calls;
+      const frame = JSON.parse(calls[calls.length - 1]![0] as string);
+      expect(frame.type).toBe("CreateGameWithSettings");
+      expect(frame.data.format_config).toEqual(formatConfig);
+
+      nativeSocket.dispatchSynthetic(
+        "message",
+        JSON.stringify({
+          type: "SessionAttached",
+          data: {
+            game_code: "WXYZ",
+            player_id: 0,
+            player_token: "tok",
+            full_key: { game_code: "WXYZ", generation: 1 },
+          },
+        }),
+      );
+      await attached;
+      pregameAdapter.dispose();
+    });
+
     it("leaves the native pregame transport failing on first drop", async () => {
       MockWebSocket.last = null;
       const pregameAdapter = new WebSocketAdapter(
@@ -618,6 +930,50 @@ describe("WebSocketAdapter", () => {
         },
       },
     );
+
+    it("settles an export when native session identity validation fails", async () => {
+      const nativeAdapter = new WebSocketAdapter(
+        "wss://localhost:9374/ws",
+        "join",
+        { main_deck: [], sideboard: [] },
+        undefined,
+        undefined,
+        undefined,
+        "Guest",
+        {
+          nativePregame: {
+            kind: "reconnect",
+            socketFactory: () => new MockWebSocket("native-engine") as unknown as PhaseSocketTransport,
+            gameCode: "NATIVE",
+            playerId: 1,
+            playerToken: "guest-token",
+            fullKey: { game_code: "NATIVE", generation: 1 },
+          },
+        },
+      );
+      const attached = nativeAdapter.initializePregame();
+      const nativeSocket = await completeHandshake(nativeAdapter);
+      const exported = nativeAdapter.exportPersistenceState();
+      const slots = nativeAdapter.waitForPlayerSlots();
+
+      nativeSocket.dispatchSynthetic(
+        "message",
+        JSON.stringify({
+          type: "SessionAttached",
+          data: {
+            game_code: "NATIVE",
+            player_id: 1,
+            player_token: "guest-token",
+            full_key: { game_code: "NATIVE", generation: 2 },
+          },
+        }),
+      );
+
+      await expect(exported).rejects.toThrow("Server changed the Full session identity");
+      await expect(attached).rejects.toThrow("Server changed the Full session identity");
+  await expect(slots).rejects.toThrow("Server changed the Full session identity");
+      await expect(nativeAdapter.exportPersistenceState()).rejects.toThrow("Session identity rejected");
+    });
 
     it("rejects a native seat attachment without a Full session key", async () => {
       const nativeAdapter = new WebSocketAdapter(
@@ -1239,7 +1595,7 @@ describe("WebSocketAdapter", () => {
         "message",
         JSON.stringify({
           type: "ActionRejected",
-          data: { reason: "Engine error: ReorderHand: expected 6 ids, got 5" },
+          data: { rejection: { code: "stale_action", disposition: "stale", message: "That action is based on outdated game state.", related_object_ids: [] } },
         }),
       );
       await expect(pending).rejects.toMatchObject({
@@ -1254,7 +1610,7 @@ describe("WebSocketAdapter", () => {
         "message",
         JSON.stringify({
           type: "ActionRejected",
-          data: { reason: "Resolve All requires your priority" },
+          data: { rejection: { code: "resolve_all_not_ready", disposition: "unavailable", message: "Resolve All is not ready to run.", related_object_ids: [] } },
         }),
       );
       await expect(pending).rejects.toMatchObject({
@@ -1298,7 +1654,7 @@ describe("WebSocketAdapter", () => {
     // body was skipped and the refusal was dropped on the floor — which is why
     // the server had been reaching for `ServerMessage::error` instead, the
     // event `handleNativeEvent` treats as terminal.
-    it("emits requestRejected when an ActionRejected has no in-flight action", () => {
+    it("emits requestRejected for a request-level refusal", () => {
       const listener = vi.fn();
       adapter.onEvent(listener);
 
@@ -1306,7 +1662,7 @@ describe("WebSocketAdapter", () => {
       ws.dispatchSynthetic(
         "message",
         JSON.stringify({
-          type: "ActionRejected",
+          type: "RequestRejected",
           data: { reason: "There is no previous action of yours to take back" },
         }),
       );
@@ -1339,7 +1695,7 @@ describe("WebSocketAdapter", () => {
         "message",
         JSON.stringify({
           type: "ActionRejected",
-          data: { reason: "Engine error: Something genuinely wrong" },
+          data: { rejection: { code: "invalid_action", disposition: "invalid", message: "That action is not valid in the current game state.", related_object_ids: [] } },
         }),
       );
 
@@ -1404,6 +1760,72 @@ describe("WebSocketAdapter", () => {
       );
     });
 
+    it("rejects an in-flight action when the native AI driver faults", async () => {
+      const listener = vi.fn();
+      adapter.onEvent(listener);
+      const pending = adapter.submitAction({ type: "PassPriority" }, 0);
+
+      ws.dispatchSynthetic(
+        "message",
+        JSON.stringify({
+          type: "AiDriverFault",
+          data: { fault: { id: 7, after_state_revision: 3, cause: "ActionSafetyCapReached" } },
+        }),
+      );
+
+      await expect(pending).rejects.toMatchObject({
+        code: "WS_ERROR",
+        recoverable: false,
+      });
+      expect(listener).toHaveBeenCalledWith({ type: "actionPendingChanged", pending: false });
+      expect(listener).toHaveBeenCalledWith(expect.objectContaining({ type: "aiDriverFault" }));
+    });
+
+    // `dispose()` used to null the submission handles instead of rejecting
+    // them, so the caller — which holds the module-level dispatch mutex —
+    // waited forever on a reply the closed socket could never deliver.
+    it("rejects an in-flight submitAction when the adapter is disposed", async () => {
+      const pending = trackRejection(adapter.submitAction({ type: "PassPriority" }, 0));
+
+      adapter.dispose();
+
+      expect(await pending()).toMatchObject({
+        code: "WS_CLOSED",
+        message: "Adapter disposed during action",
+        recoverable: true,
+      });
+    });
+
+    // The `sessionIdentityRejected` guard used to sit ABOVE the pending
+    // submission block in `onclose`, so a close taken on the identity-rejected
+    // path abandoned an in-flight submission.
+    it("settles the pending submission on close even after session identity is rejected", async () => {
+      ws.dispatchSynthetic(
+        "message",
+        JSON.stringify({
+          type: "GameCreated",
+          data: {
+            game_code: "ABCD",
+            player_token: "tok",
+            // generation < 1 is rejected by `acceptFullSessionKey`, latching
+            // `sessionIdentityRejected`.
+            full_key: { game_code: "ABCD", generation: 0 },
+          },
+        }),
+      );
+      // Reach-guard: the latch really is set, otherwise this test would pass
+      // against the unguarded close path and prove nothing.
+      await expect(adapter.exportPersistenceState()).rejects.toThrow("Session identity rejected");
+
+      const pending = trackRejection(adapter.submitAction({ type: "PassPriority" }, 0));
+      ws.dispatchSynthetic("close");
+
+      expect(await pending()).toMatchObject({
+        code: "WS_CLOSED",
+        message: "Connection closed during action",
+      });
+    });
+
     it("emits an error instead of throwing when a fire-and-forget send hits a closed socket", () => {
       const listener = vi.fn();
       adapter.onEvent(listener);
@@ -1413,6 +1835,176 @@ describe("WebSocketAdapter", () => {
       expect(listener).toHaveBeenCalledWith(
         expect.objectContaining({ type: "error" }),
       );
+    });
+  });
+
+  describe("interaction preview transport", () => {
+    /**
+     * An allocation whose segments are UNEQUAL and whose `choice_id` order is
+     * NOT the candidate publication order, so a sort or a canonicalisation
+     * anywhere in the adapter layer is caught rather than coinciding.
+     */
+    const cid = (id: string) => id as InteractionChoiceId;
+    const request = {
+      requestId: "preview-req-1" as PreviewRequestId,
+      interactionId: "interaction-1" as InteractionId,
+      response: {
+        type: "shortcut",
+        data: {
+          decision: { type: "fixed", data: { iterations: 6 } },
+          pins: [{
+            group: 0,
+            choiceIds: [cid("choice-c"), cid("choice-a"), cid("choice-b")],
+            amounts: [
+              { choiceId: cid("choice-c"), amount: 3 },
+              { choiceId: cid("choice-a"), amount: 1 },
+              { choiceId: cid("choice-b"), amount: 2 },
+            ],
+          }],
+        },
+      },
+    } satisfies InteractionPreviewRequest;
+
+    const answer = (requestId: string) => ({
+      requestId,
+      interactionId: "interaction-1",
+      status: { type: "confirmable" },
+      progress: { selected: 3, minimum: 1, maximum: 3, aggregate: 6, confirmable: true },
+      outcome: "advanced",
+      summaries: ["confirmAvailable", "progress"],
+    });
+
+    function sentPreviewFrame(): { type: string; data: { request: InteractionPreviewRequest } } {
+      const calls = ws.send.mock.calls;
+      for (let i = calls.length - 1; i >= 0; i--) {
+        const parsed = JSON.parse(calls[i][0] as string);
+        if (parsed.type === "PreviewInteraction") return parsed;
+      }
+      throw new Error("no PreviewInteraction frame was sent");
+    }
+
+    // Row 8. Reshape the request anywhere in the adapter layer — reorder
+    // `amounts`, renumber a `choiceId`, rebuild the object field-by-field —
+    // and the deep-equal below fails.
+    it("sends the authored request verbatim and resolves its own answer", async () => {
+      ws.send.mockClear();
+      const pending = adapter.previewInteraction(request, 0);
+
+      const frame = sentPreviewFrame();
+      expect(frame.type).toBe("PreviewInteraction");
+      expect(frame.data.request).toEqual(request);
+      const response = frame.data.request.response;
+      if (response.type !== "shortcut") throw new Error(`not a shortcut: ${response.type}`);
+      const pins = response.data.pins;
+      const amounts = pins[0].amounts;
+      // `amounts` is OPTIONAL on the wire, so its presence is an assertion rather than a shape
+      // the narrow gives for free.
+      if (amounts === undefined) throw new Error("the sent pin carries no amounts");
+      // Reach guard: the asserted allocation has more than one segment, so an
+      // adapter that dropped all but the first could not pass.
+      expect(amounts.length).toBeGreaterThan(1);
+      expect(amounts).toEqual([
+        { choiceId: "choice-c", amount: 3 },
+        { choiceId: "choice-a", amount: 1 },
+        { choiceId: "choice-b", amount: 2 },
+      ]);
+      expect(amounts.map((a) => a.choiceId)).toEqual(pins[0].choiceIds);
+
+      ws.dispatchSynthetic(
+        "message",
+        JSON.stringify({
+          type: "InteractionPreview",
+          data: { preview: answer("preview-req-1") },
+        }),
+      );
+      await expect(pending).resolves.toMatchObject({ requestId: "preview-req-1" });
+    });
+
+    // An answer whose id is absent from the in-flight map settles nothing and
+    // disturbs no other pending entry.
+    it("drops an answer for a request it never sent", async () => {
+      const settled = vi.fn();
+      const pending = adapter.previewInteraction(request, 0);
+      void pending.then(settled, settled);
+
+      ws.dispatchSynthetic(
+        "message",
+        JSON.stringify({
+          type: "InteractionPreview",
+          data: { preview: answer("some-other-request") },
+        }),
+      );
+      // Enough microtask turns for a settlement to reach `settled`: one tick
+      // is not, and a one-tick wait would make this negative unfalsifiable.
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+      expect(settled).not.toHaveBeenCalled();
+
+      // Positive control on the identical path: the correlated answer DOES
+      // settle it, so the silence above is correlation and not a dead handler.
+      ws.dispatchSynthetic(
+        "message",
+        JSON.stringify({
+          type: "InteractionPreview",
+          data: { preview: answer("preview-req-1") },
+        }),
+      );
+      await expect(pending).resolves.toMatchObject({ requestId: "preview-req-1" });
+    });
+
+    it("settles a correlated operational failure", async () => {
+      const pending = adapter.previewInteraction(request, 0);
+      ws.dispatchSynthetic(
+        "message",
+        JSON.stringify({
+          type: "InteractionPreviewFailed",
+          data: { request_id: "preview-req-1", message: "preview lookup failed" },
+        }),
+      );
+      await expect(pending).rejects.toMatchObject({
+        code: "WS_ERROR",
+        message: "preview lookup failed",
+        recoverable: false,
+      });
+    });
+
+    // Row 12, close-site leg. Delete the `rejectPendingInteractionPreviews`
+    // call in `socket.ws.onclose` and this hangs until the test times out.
+    it("rejects every in-flight preview when the socket closes, keeping answered ones", async () => {
+      const answered = adapter.previewInteraction(request, 0);
+      const unanswered = adapter.previewInteraction(
+        { ...request, requestId: "preview-req-2" as PreviewRequestId },
+        0,
+      );
+
+      ws.dispatchSynthetic(
+        "message",
+        JSON.stringify({
+          type: "InteractionPreview",
+          data: { preview: answer("preview-req-1") },
+        }),
+      );
+      await expect(answered).resolves.toMatchObject({ requestId: "preview-req-1" });
+
+      ws.dispatchSynthetic("close");
+      // The clearing loop walks the map rather than rejecting indiscriminately:
+      // the already-answered promise keeps its value.
+      await expect(answered).resolves.toMatchObject({ requestId: "preview-req-1" });
+      await expect(unanswered).rejects.toMatchObject({
+        code: "WS_CLOSED",
+        message: "Connection closed during interaction preview",
+      });
+    });
+
+    // Row 12, dispose-site leg. The site a single-site wiring drops: measured
+    // on the mana twin, deleting it alone leaves this promise never settling
+    // while the close-site leg above still passes.
+    it("rejects every in-flight preview when the adapter is disposed", async () => {
+      const pending = adapter.previewInteraction(request, 0);
+      adapter.dispose();
+      await expect(pending).rejects.toMatchObject({
+        code: "WS_CLOSED",
+        message: "Adapter disposed during interaction preview",
+      });
     });
   });
 });

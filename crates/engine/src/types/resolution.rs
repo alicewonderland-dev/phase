@@ -14,13 +14,16 @@ use serde_json::{Map, Value};
 pub use frame_vec::ChildStackDepth;
 use frame_vec::{FrameSlot, FrameVec};
 
-use crate::types::ability::{AbilityDefinition, DiscardedCardResult, ResolvedAbility, TargetRef};
+use crate::types::ability::{
+    AbilityDefinition, DiscardedCardResult, EffectKind, ResolvedAbility, TargetRef,
+};
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    DrainStatus, DrawSequenceStack, GameState, GameStateDecode, GameStateDecodeMode,
-    PendingBatchDeliveries, PendingChangeZoneIteration, PendingChooseOneOf, PendingConniveReentry,
-    PendingContinuation, PendingCopyTokenResolution, PendingCounterAdditionQueue,
-    PendingCounterMoveQueue, PendingCounterRemovalQueue, PendingDebugCardEntries,
+    CostResume, DrainStatus, DrawSequenceStack, GameState, GameStateDecode, GameStateDecodeMode,
+    PayCostKind, PendingBatchDeliveries, PendingChangeZoneIteration, PendingChooseOneOf,
+    PendingConniveReentry, PendingContinuation, PendingCopyTokenResolution,
+    PendingCounterAdditionQueue, PendingCounterMoveQueue, PendingCounterRemoval,
+    PendingCounterRemovalInFlight, PendingCounterRemovalQueue, PendingDebugCardEntries,
     PendingEachPlayerCopyChosen, PendingLifeTotalAssignment, PendingMultiDraw,
     PendingPerCategoryZoneChoice, PendingPerPlayerZoneChoice, PendingRepeatIteration,
     PendingRepeatUntil, PendingSpellResolution, PendingVoteBallotIteration, PostReplacementDrain,
@@ -29,6 +32,7 @@ use crate::types::game_state::{
 };
 use crate::types::identifiers::{DiscardFrameId, ObjectId};
 use crate::types::player::PlayerId;
+use crate::types::proposed_event::ProposedEvent;
 
 /// The complete shipped draw authority carried by one `MultiDraw` frame.
 ///
@@ -379,8 +383,8 @@ impl ResolutionFrame {
             Self::RepeatedOptionalPayment(RepeatedOptionalPaymentFrame {
                 pending: Some(_),
                 ..
-            })
-            | Self::OptionalEffect(_) => FrameGate::DirectChoice(DirectChoiceGate::OptionalEffect),
+            }) => FrameGate::DirectChoice(DirectChoiceGate::RepeatedOptionalPayment),
+            Self::OptionalEffect(_) => FrameGate::DirectChoice(DirectChoiceGate::OptionalEffect),
             Self::CoinFlip(_) => FrameGate::DirectChoice(DirectChoiceGate::CoinFlipKeep),
             Self::Proliferate(_) => FrameGate::DirectChoice(DirectChoiceGate::Proliferate),
             Self::MutateMerge(_) => FrameGate::DirectChoice(DirectChoiceGate::MutateMerge),
@@ -431,6 +435,7 @@ pub enum FrameGate {
 /// A concrete prompt that a direct-choice frame is permitted to consume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DirectChoiceGate {
+    RepeatedOptionalPayment,
     OptionalEffect,
     CoinFlipKeep,
     Proliferate,
@@ -443,9 +448,27 @@ impl DirectChoiceGate {
         matches!(
             (self, waiting_for),
             (
+                Self::RepeatedOptionalPayment,
+                WaitingFor::OptionalEffectChoice { .. }
+            ) | (
+                Self::RepeatedOptionalPayment,
+                WaitingFor::OpponentMayChoice { .. }
+            ) | (
                 Self::OptionalEffect,
                 WaitingFor::OptionalEffectChoice { .. }
             ) | (Self::OptionalEffect, WaitingFor::OpponentMayChoice { .. })
+                | (
+                    Self::OptionalEffect,
+                    WaitingFor::ResolutionOptionalPaymentChoice { .. }
+                )
+                | (
+                    Self::OptionalEffect,
+                    WaitingFor::PayCost {
+                        kind: PayCostKind::Sacrifice,
+                        resume: CostResume::Resolution,
+                        ..
+                    }
+                )
                 | (Self::CoinFlipKeep, WaitingFor::CoinFlipKeepChoice { .. })
                 | (Self::Proliferate, WaitingFor::ProliferateChoice { .. })
                 | (Self::MutateMerge, WaitingFor::MutateMergeChoice { .. })
@@ -928,6 +951,21 @@ impl ResolutionStack {
                 actual: frame.kind(),
             }),
         }
+    }
+
+    /// Consume only an active continuation that owns an Attach
+    /// `EffectZoneChoice`; callers must never take a generic continuation just
+    /// because the current UI prompt happens to be an Attach choice.
+    pub fn take_active_attachment_choice_continuation(
+        &mut self,
+    ) -> Result<Option<AbilityContinuationFrame>, ResolutionStackError> {
+        if !self
+            .active_ability_continuation()
+            .is_some_and(|frame| frame.pending.attachment_choice.is_some())
+        {
+            return Ok(None);
+        }
+        self.take_active_ability_continuation()
     }
 
     /// Consumes the active continuation, or its exact parent when a
@@ -2800,6 +2838,62 @@ impl ResolutionStack {
         self.frames.get(self.frames.below(top)?)
     }
 
+    /// True only when the active post-replacement frame is immediately above
+    /// the typed Attach-choice child that owns the interrupted operation.
+    ///
+    /// This is a positional lifecycle predicate, not a search for a buried
+    /// continuation. The child must remain marked until both frames retire
+    /// together; otherwise the ordinary continuation drain would replay its
+    /// already-resolved Attach instruction.
+    pub fn has_active_post_replacement_attach_choice_pair(&self) -> bool {
+        let Some(post_replacement) = self.frames.top() else {
+            return false;
+        };
+        let Some(attachment_child) = self.frames.below(post_replacement) else {
+            return false;
+        };
+        if !matches!(
+            (self.frames.get(attachment_child), self.frames.get(post_replacement)),
+            (
+                Some(ResolutionFrame::AbilityContinuation(child)),
+                Some(ResolutionFrame::PostReplacement(_)),
+            ) if child.pending.attachment_choice.is_some()
+        ) {
+            return false;
+        }
+        true
+    }
+
+    /// Retires the exact empty post-replacement/Attach-choice pair at the
+    /// active boundary.
+    ///
+    /// The post-replacement frame is popped first so its marked Attach child
+    /// becomes active, then the child is popped before generic continuation
+    /// draining can replay the consumed Attach operation. A nonempty drain or
+    /// any other frame shape is deliberately left untouched.
+    pub fn take_active_empty_post_replacement_attach_choice_pair(&mut self) -> bool {
+        if !self.has_active_post_replacement_attach_choice_pair()
+            || !self.last().is_some_and(|frame| {
+                matches!(
+                    frame,
+                    ResolutionFrame::PostReplacement(drains) if drains.is_empty()
+                )
+            })
+        {
+            return false;
+        }
+
+        let _ = self
+            .take_active_post_replacement()
+            .expect("an empty post-replacement Attach pair must keep its owner active")
+            .expect("an empty post-replacement Attach pair must retain its owner");
+        let _ = self
+            .take_active_attachment_choice_continuation()
+            .expect("the post-replacement Attach pair must expose its child")
+            .expect("the post-replacement Attach pair must retain its child");
+        true
+    }
+
     /// True only for the live general-drain/draw pair at the active stack
     /// boundary. This inspects the top and its exact immediate predecessor; it
     /// is not a search for a buried PostReplacement frame.
@@ -3331,6 +3425,236 @@ pub const RESOLUTION_STATE_WIRE_VERSION: u64 = 2;
 /// never emits v1 resolution fields.
 const LEGACY_RESOLUTION_STATE_WIRE_VERSION: u64 = 1;
 
+/// The `GameState` fields whose serialized form is UNCONDITIONAL: each carries
+/// `#[serde(default …)]` but NO `skip_serializing_if`, so the derived
+/// `Serialize` emits every one of them for every possible value. Their absence
+/// is therefore a fact about the WRITER, not about the values — the only thing
+/// that can produce it is an explicit remover.
+///
+/// The remover is `client_state_wire_value` (`crate::game::derived_views`),
+/// which strips exactly these three plus six `skip_serializing_if` siblings.
+/// The six siblings are deliberately NOT listed here: their absence is
+/// value-dependent, so it proves nothing.
+///
+/// This is a fact about a MUTABLE removal list, and nothing in the type system
+/// ties the two together — the same kind of premise, with the same mitigation,
+/// as the `resolution_stack` keep-list documented on
+/// [`declare_raw_resolution_wire`]. It is pinned by
+/// `client_wire_removes_every_unconditional_projection_field` in
+/// `types/game_state.rs`'s `mod tests`, which goes red if the removal list
+/// changes. It does NOT catch an added `skip_serializing_if` unconditionally —
+/// that detection is VALUE-dependent, and that test's own doc states the exact
+/// limit and what its serde-default control does and does not close. Read it
+/// there before trusting this list against a serde change. Do not delete it.
+///
+/// STOPGAP, and scoped to stay one. This list exists only because the producer
+/// leaves no positive mark. The engine's other projection gate,
+/// `reject_viewer_projection_as_authority` (`crate::types::game_state`), keys
+/// on a `viewer_projection` stamp its writer sets; the principled sibling here
+/// is the same thing for the client wire — a `wire_projection` stamp written at
+/// `client_state_wire_value` (`crate::game::derived_views`). That stamp is a
+/// DEFERRED item and is not shipped, so reading absence is what a reader must
+/// do UNTIL THE PRODUCER STAMPS. When it lands, this const and
+/// [`is_redacted_client_wire_projection`] are what it replaces, and a versioned
+/// payload already takes [`declare_raw_resolution_wire`]'s early return, so it
+/// can supersede this without conflicting with it.
+const CLIENT_WIRE_UNCONDITIONAL_FIELDS: &[&str] = &[
+    "next_delayed_trigger_token",
+    "next_delayed_trigger_instance",
+    "resolved_rules_journal",
+];
+
+/// Whether an unversioned raw payload was written by the client wire rather
+/// than by a raw persistence writer — inferred from what that writer REMOVED,
+/// because it leaves no positive mark. A fingerprint UNTIL THE PRODUCER STAMPS:
+/// see [`CLIENT_WIRE_UNCONDITIONAL_FIELDS`] for the deferred `wire_projection`
+/// stamp at `client_state_wire_value` that supersedes it.
+///
+/// Conjunctive on purpose. Each field individually went in at a different time
+/// — `resolved_rules_journal` in #6331 (2026-07-22), the two allocators in
+/// #6842 (2026-08-01), while `resolution_stack` itself landed in #6269
+/// (2026-07-21) — so a genuine save from a build in the 2026-07-21..22 window
+/// carries `resolution_stack` and lacks all three legitimately. Requiring all
+/// three keeps that window as small as the field history allows. It changes no
+/// outcome regardless: every `resolution_stack`-bearing unversioned payload was
+/// refused outright before the wire inference existed, so a window save fails
+/// either way. Only the wording it receives changes, and the refusal raised by
+/// [`declare_raw_resolution_wire`] is deliberately worded to be TRUE of that
+/// population as well as of a real projection.
+///
+/// The conjunction AND each entry of the `const` above are pinned by
+/// `redaction_fingerprint_is_conjunctive_over_every_unconditional_field`
+/// (`types/game_state.rs` `mod tests`), which decodes three payloads each
+/// carrying exactly one of the three keys. A `.any(…)` here, or a dropped
+/// `const` entry, reddens it.
+fn is_redacted_client_wire_projection(object: &Map<String, Value>) -> bool {
+    CLIENT_WIRE_UNCONDITIONAL_FIELDS
+        .iter()
+        .all(|field| !object.contains_key(*field))
+}
+
+/// Declares the resolution-wire shape of an UNVERSIONED raw `GameState`
+/// payload. The only place in the engine permitted to infer a wire version.
+///
+/// TWO production writers emit this shape, and the rule must hold for both.
+///
+/// 1. `GameState`'s derived `Serialize` emits `resolution_stack` exactly when
+///    the typed frame stack is non-empty
+///    (`skip_serializing_if = "ResolutionStack::is_empty"`). Reached by
+///    `phase_ai::saved_state` and by anything handing engine-wasm's
+///    `prepare_restored_game_state` a bare object.
+/// 2. `client_state_wire_value` (`crate::game::derived_views`) — production
+///    Rust, the origin of every payload that crosses the WASM boundary to the
+///    client, and therefore of every client debug export. It runs that same
+///    derived `Serialize` and then removes nine top-level carriers plus a
+///    recursive six-key firing sweep. It removes NEITHER `resolution_stack`
+///    NOR `resolving_stack_entry`, so its output carries `resolution_stack`
+///    under exactly the same condition as (1).
+///
+///    Writer (2)'s UNVERSIONED output is now REFUSED rather than inferred:
+///    [`is_redacted_client_wire_projection`] recognises it by the three
+///    unconditionally-serialized fields the redactor removes, and this function
+///    returns an error for it below. A VERSIONED client-wire payload is
+///    unaffected — it takes the first statement's early return and never
+///    reaches the fingerprint check, which is what leaves room for a future
+///    write-time `wire_projection` stamp to supersede the inference without
+///    conflicting with it.
+///
+///    `phase_ai::saved_state::load_saved_game_state` is a second in-repo
+///    consumer of this arm besides a player's restore: it decodes the
+///    `.gameState` of the same `{"gameState": …}` envelope a client debug
+///    export writes as `PersistedGameState`, i.e. through this exact ingress,
+///    so a CLIENT-WIRE capture taken while a game is paused mid-resolution
+///    fails there rather than loading a projection. The scope matters: a
+///    genuine RAW save taken mid-resolution is what this function now makes
+///    restore, and only the fingerprint conjunct separates the two.
+///
+/// This reader keys on that field, and the mapping holds for both writers.
+///
+/// For writer (2) that agreement is a fact about a MUTABLE removal list, not a
+/// structural identity: if `client_state_wire_value` ever begins stripping
+/// `resolution_stack`, this rule silently stops applying to the entire
+/// client-wire population, with no compiler signal. That is why it is pinned by
+/// a test rather than by this comment — `client_wire_still_carries_resolution_stack`
+/// in `types/game_state.rs`'s `mod tests` goes red if the redactor's keep-list
+/// changes. Do not delete it.
+///
+/// The version stamped below is the same kind of mutable premise: the mapping
+/// is to the shape **v2** defines — v2's carrier is `resolution_frames`, and it
+/// deserializes the same `ResolutionStack` that `resolution_stack` does — not to
+/// "whatever the current version is", so it must be RE-DERIVED, not merely
+/// recompiled, if `RESOLUTION_STATE_WIRE_VERSION` moves.
+///
+/// An undeclared payload carrying BOTH carriers is refused rather than
+/// inferred: choosing one would discard the other with no error, at an ingress
+/// that takes untrusted uploaded saves.
+///
+/// `PersistedGameState::Raw` does NOT write this shape: its `Serialize` routes
+/// through `ResolutionStateWire::to_value`, which always declares version 2.
+///
+/// The mapping is exact, not heuristic. #6269 (`f4a6f32b85`, 2026-07-21) added
+/// `resolution_stack` and removed all 29 legacy `pending_*` /
+/// `post_replacement_*` fields in ONE commit, and no legacy field has been
+/// re-added since, so a payload carrying `resolution_stack` is necessarily
+/// post-#6269 and never a v1 save. A payload WITHOUT it is either pre-#6269 or
+/// post-#6269 with an empty frame stack; both project to the same empty frame
+/// stack through the v1 branch. (The three `ResolutionStack` allocators are a
+/// separate, pre-existing matter: `is_empty` reads only `frames`, so an
+/// empty-frames save omits the whole field and loses them either way.)
+///
+/// A payload that already declares a version keeps it, and receives exactly the
+/// treatment that version gets through any other ingress — there is no
+/// origin-dependent behavior anywhere downstream.
+///
+/// `resolution_stack` and `resolution_frames` carry the same serialized
+/// `ResolutionStack`, allocators included: `to_value` builds its frames by
+/// copying `state.resolution_stack` (see `canonicalize_legacy_resolution_state`),
+/// and the v2 branch deserializes the field straight back into `ResolutionStack`.
+/// The move below is a rename, not a reinterpretation.
+pub(crate) fn declare_raw_resolution_wire(object: &mut Map<String, Value>) -> Result<(), String> {
+    if object.contains_key("resolution_state_version") {
+        return Ok(());
+    }
+    // An undeclared payload carrying BOTH carriers is ambiguous, and inferring
+    // from one would move `resolution_stack` onto the `resolution_frames` key
+    // and discard the declared `resolution_frames` silently. Refuse instead.
+    if object.contains_key("resolution_stack") && object.contains_key("resolution_frames") {
+        return Err(
+            "unversioned raw resolution state must not contain both resolution_stack and \
+             resolution_frames; the wire shape is inferred from which carrier the payload \
+             declares, and this ingress refuses two conflicting carriers rather than choosing \
+             one and discarding the other"
+                .to_string(),
+        );
+    }
+    // A client-wire payload is a PROJECTION, not a persistence authority, and
+    // the engine already refuses the other producer of one:
+    // `reject_viewer_projection_as_authority` (`crate::types::game_state`)
+    // catches the viewer-FILTERED projection by its `viewer_projection` stamp.
+    // `client_state_wire_value(state, None)` leaves no stamp, so the reader has
+    // to recognise it by what the writer removed.
+    //
+    // What it removed is not cosmetic. CR 603.7: `resolved_rules_journal` holds
+    // the delayed-install roots `validate_trigger_firing_coherence` checks every
+    // `ReceiptEligible` firing against, and `normalize_delayed_trigger_allocators`
+    // re-derives both allocators from that same set — so a restored projection
+    // can mint a delayed-trigger identity that collides with one the removed
+    // journal recorded. The recursive firing sweep additionally resets
+    // `PendingContinuation.trigger_firing` to `None` (it is
+    // `skip_serializing_if = "Option::is_none"`), which is a CR 603.2 ordinary
+    // vs CR 603.7 delayed classification the drain reads back. None of it is
+    // reconstructible; a repair could only fabricate rules authority.
+    //
+    // Placed AFTER the two-carrier refusal above so a payload that is both
+    // ambiguous and redacted is named by the ambiguity — the more specific
+    // fault. That ordering is a message-accuracy choice, not a fail-open
+    // boundary: reversing the two statements produces the OTHER refusal, never
+    // an admission. It is pinned by
+    // `two_carrier_conflict_outranks_the_projection_refusal`
+    // (`tests/integration/raw_resolution_stack_restore.rs`), which is the only
+    // row carrying a payload that bears both carriers AND the fingerprint.
+    //
+    // SCOPED TO THIS ARM ON PURPOSE. A payload WITHOUT `resolution_stack` keeps
+    // the legacy v1 treatment untouched even when it bears the fingerprint:
+    // those payloads decode today, their exposure predates the wire inference,
+    // and refusing them would be a genuine availability regression for a defect
+    // this ingress did not introduce. Within this arm nothing regresses,
+    // because every `resolution_stack`-bearing unversioned payload was refused
+    // outright before the inference existed.
+    if object.contains_key("resolution_stack") && is_redacted_client_wire_projection(object) {
+        return Err(
+            // Written to be TRUE of both populations that reach here, not just
+            // the client-wire one. A genuine save from the 2026-07-21..22 build
+            // window lacks all three fingerprint fields legitimately, and is
+            // refused by this same statement; telling that player their file is
+            // a debug export would be a false statement of fact about their
+            // file. So the first clause states only what is observable of the
+            // FILE (the rules record is absent), and the second names the
+            // common cause without asserting it of this one.
+            "This saved game is missing the private rules record for the \
+                    resolution it was paused in — this is what a debug export \
+                    of the on-screen state looks like."
+                .to_string(),
+        );
+    }
+    match object.remove("resolution_stack") {
+        Some(frames) => {
+            object.insert("resolution_frames".to_string(), frames);
+            object.insert(
+                "resolution_state_version".to_string(),
+                Value::from(RESOLUTION_STATE_WIRE_VERSION),
+            );
+        }
+        None => {
+            object.insert(
+                "resolution_state_version".to_string(),
+                Value::from(LEGACY_RESOLUTION_STATE_WIRE_VERSION),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// V1 suspension carriers that may retain an active `GameEvent::ZoneChanged`.
 /// Both provenance materialization and occurrence-key reconciliation must visit
 /// this exact legacy surface before it projects into the v2 frame stack.
@@ -3543,6 +3867,7 @@ impl ResolutionStateWire {
                 if let Some(frame) = legacy_counter_removals.into_frame() {
                     legacy.push_counter_removals(frame);
                 }
+                migrate_legacy_counter_removal_replacement_pause(&mut legacy);
                 // A per-player copy walk parks beneath its inner token-copy
                 // work, and CopyToken in turn parks beneath an ETB-counter
                 // child. Rebuild that exact outer-to-inner order from the v1
@@ -3674,12 +3999,23 @@ impl ResolutionStateWire {
     }
 }
 
-/// CR 608.2c: Historical v1 snapshots could retain a completed stack entry as
-/// incidental last-known information until the next resolution. A priority
-/// boundary with no typed resolution frame has no remaining resolution owner,
-/// so restore it as the canonical settled state. A newly announced stack
-/// object belongs to the next priority window; it cannot keep the prior
-/// resolution carrier alive.
+/// CR 608.1: a spell or ability resolves once all players have passed in
+/// succession, and CR 117.3b hands the active player priority again AFTER that
+/// resolution — the rules place a priority window on either side of a
+/// resolution, not inside one. CR 608.2g closes the one opening: where an
+/// effect lets a player cast a spell DURING a resolution, no player receives
+/// priority after it is cast. (CR 117.3a grants the active player priority at
+/// the beginning of most steps and phases as well, so CR 117.3b is not the only
+/// grant. This argument does not need it to be, and must not be rewritten as if
+/// it were — that over-claim has been made and corrected here twice.) So a
+/// `WaitingFor::Priority` rest with no typed resolution frame has no remaining
+/// resolution owner. CR 608.2n: the resolving object leaves the stack as the
+/// final part of its own resolution, so a retained carrier at that rest is
+/// incidental last-known information, not live work. Historical v1 snapshots
+/// could retain a completed stack entry that way until the next resolution, so
+/// restore it as the canonical settled state. A newly announced stack object
+/// belongs to the next priority window; it cannot keep the prior resolution
+/// carrier alive.
 ///
 /// This is intentionally limited to the v1 projection above. Current v2
 /// snapshots must preserve their exact active carrier and are validated rather
@@ -3693,6 +4029,104 @@ fn normalize_legacy_completed_resolution_carrier(state: &mut GameState) {
         state.resolving_trigger_firing = None;
         state.resolution_source_relatch = None;
     }
+}
+
+/// CR 122.1 + CR 614.1: v1 counter-removal queues removed the current tuple
+/// before a replacement choice but did not serialize it separately. Rebuild
+/// that unsettled removal from the parked proposed event so its actual result
+/// contributes to the resumed queue's `applied_total`. v1 only retained the
+/// queue's original requested total and unconsumed tail, so it cannot recover
+/// a replacement-modified actual count for a fully settled prefix. Preserve
+/// that format's requested-count semantics by seeding the prefix as
+/// `total - remaining requested - current requested`; the reconstructed current
+/// removal still contributes its measured actual result after it resumes.
+fn migrate_legacy_counter_removal_replacement_pause(state: &mut GameState) {
+    let Some((object_id, counter_type, count)) =
+        state
+            .pending_replacement
+            .as_ref()
+            .and_then(|pending| match &pending.proposed {
+                ProposedEvent::RemoveCounter {
+                    object_id,
+                    counter_type,
+                    count,
+                    ..
+                } => Some((*object_id, counter_type.clone(), *count)),
+                ProposedEvent::ZoneChange { .. }
+                | ProposedEvent::Damage { .. }
+                | ProposedEvent::Draw { .. }
+                | ProposedEvent::SearchFound { .. }
+                | ProposedEvent::Scry { .. }
+                | ProposedEvent::Mill { .. }
+                | ProposedEvent::CoinFlip { .. }
+                | ProposedEvent::Explore { .. }
+                | ProposedEvent::Connive { .. }
+                | ProposedEvent::Proliferate { .. }
+                | ProposedEvent::LifeGain { .. }
+                | ProposedEvent::LifeLoss { .. }
+                | ProposedEvent::AddCounter { .. }
+                | ProposedEvent::MoveCounter { .. }
+                | ProposedEvent::CreateToken { .. }
+                | ProposedEvent::TokenEntry { .. }
+                | ProposedEvent::Discard { .. }
+                | ProposedEvent::Tap { .. }
+                | ProposedEvent::Untap { .. }
+                | ProposedEvent::TurnFaceUp { .. }
+                | ProposedEvent::Destroy { .. }
+                | ProposedEvent::Sacrifice { .. }
+                | ProposedEvent::BeginTurn { .. }
+                | ProposedEvent::BeginPhase { .. }
+                | ProposedEvent::ProduceMana { .. }
+                | ProposedEvent::EmptyManaPool { .. }
+                | ProposedEvent::Planeswalk { .. }
+                | ProposedEvent::Attach { .. } => None,
+            })
+    else {
+        return;
+    };
+    if !matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }) {
+        return;
+    }
+
+    let counter_count_before = state
+        .objects
+        .get(&object_id)
+        .and_then(|object| object.counters.get(&counter_type))
+        .copied()
+        .unwrap_or(0);
+    let Some(queue) = state.active_counter_removals_mut() else {
+        return;
+    };
+    if queue.effect_kind != EffectKind::RemoveCounter
+        || queue.in_flight.is_some()
+        || !queue
+            .remaining
+            .iter()
+            .all(|removal| removal.object_id == object_id)
+    {
+        return;
+    }
+
+    let remaining_requested = queue
+        .remaining
+        .iter()
+        .map(|removal| removal.count)
+        .sum::<u32>();
+    // v1 removed the current tuple from `remaining` before it surfaced the
+    // replacement choice. Its settled prefix has no actual-count record, so
+    // retain the legacy requested-count accounting for that unrecoverable
+    // prefix while the in-flight tuple below remains actual-count based.
+    queue.applied_total = queue
+        .total
+        .saturating_sub(remaining_requested.saturating_add(count));
+    queue.in_flight = Some(PendingCounterRemovalInFlight {
+        removal: PendingCounterRemoval {
+            object_id,
+            counter_type,
+            count,
+        },
+        counter_count_before,
+    });
 }
 
 impl Serialize for ResolutionStateWire {
@@ -4559,9 +4993,9 @@ mod tests {
     use crate::game::scenario::GameScenario;
     use crate::types::ability::{
         AbilityDefinition, AbilityKind, CardSelectionMode, Chooser, CopyChooseScope, Effect,
-        EffectKind, ForEachCategoryAction, IterationCategory, PostReplacementContinuation,
-        QuantityExpr, RepeatContinuation, ReplacementDefinition, SpellContext, TargetFilter,
-        ZoneOwner,
+        EffectKind, ForEachCategoryAction, IterationCategory, PerPlayerScope,
+        PostReplacementContinuation, QuantityExpr, RepeatContinuation, ReplacementDefinition,
+        SpellContext, TargetFilter, ZoneOwner,
     };
     use crate::types::actions::GameAction;
     use crate::types::game_state::{
@@ -5428,6 +5862,54 @@ mod tests {
     }
 
     #[test]
+    fn v2_replayed_resolution_optional_payment_prompt_requires_optional_effect_frame() {
+        let waiting_for = WaitingFor::ResolutionOptionalPaymentChoice {
+            player: PlayerId(0),
+            source_id: ObjectId(8),
+            costs: Vec::new(),
+        };
+
+        let mut repeated_state = GameState::new_two_player(8);
+        repeated_state.waiting_for = waiting_for.clone();
+        let mut repeated_frames = ResolutionStack::default();
+        repeated_frames.push_inner(ResolutionFrame::RepeatedOptionalPayment(
+            RepeatedOptionalPaymentFrame {
+                pending: Some(Box::new(PendingRepeatedOptionalPayment {
+                    payment_unit: Box::new(resolved_draw(8)),
+                    reflexive: Box::new(resolved_draw(9)),
+                    remaining: 1,
+                })),
+                optional_cost_payments_this_resolution: 0,
+            },
+        ));
+        let repeated_payload = v2_fixture_with_frames(repeated_state, repeated_frames);
+        let error = serde_json::from_value::<ResolutionStateWire>(repeated_payload)
+            .expect_err("a replayed repeated-payment frame cannot own the Phase 1 prompt");
+        assert!(
+            error
+                .to_string()
+                .contains("ResolutionOptionalPaymentChoice"),
+            "the wire rejection must identify the mismatched prompt: {error}"
+        );
+
+        let mut optional_state = GameState::new_two_player(10);
+        optional_state.waiting_for = waiting_for;
+        let mut optional_frames = ResolutionStack::default();
+        optional_frames.push_inner(ResolutionFrame::OptionalEffect(OptionalEffectFrame {
+            ability: Box::new(resolved_draw(10)),
+            trigger_event: None,
+            trigger_events: Vec::new(),
+            trigger_match_count: None,
+        }));
+        let optional_payload = v2_fixture_with_frames(optional_state, optional_frames);
+        let restored: ResolutionStateWire = serde_json::from_value(optional_payload)
+            .expect("an OptionalEffect frame owns the Phase 1 prompt after deserialize");
+        let replayed = serde_json::to_value(restored).expect("restored state reserializes");
+        serde_json::from_value::<ResolutionStateWire>(replayed)
+            .expect("the accepted OptionalEffect prompt remains valid on replay");
+    }
+
+    #[test]
     fn serde_round_trip_preserves_adjacent_and_separated_same_kind_frames() {
         let mut stack = ResolutionStack::default();
         stack.push_inner(change_zone_frame(1));
@@ -6023,6 +6505,7 @@ mod tests {
             source_id: ObjectId(100),
             description: None,
             may_trigger_key: None,
+            same_card_may_trigger_choice_available: false,
         };
         let mut repeated = restore_v1_repeated_optional_payment_fixture(
             repeated,
@@ -6049,6 +6532,7 @@ mod tests {
             source_id: ObjectId(102),
             description: None,
             may_trigger_key: None,
+            same_card_may_trigger_choice_available: false,
         };
         let mut optional = restore_v1_optional_effect_fixture(
             optional,
@@ -6232,10 +6716,11 @@ mod tests {
             counter_removals,
             PendingCounterRemovalQueue {
                 remaining: Vec::new(),
-                source_id: ObjectId(115),
                 effect_kind: EffectKind::RemoveCounter,
                 source_ability_id: ObjectId(115),
                 total: 0,
+                applied_total: 0,
+                in_flight: None,
             },
         ));
         assert!(counter_removals.active_counter_removals().is_none());
@@ -6419,7 +6904,7 @@ mod tests {
                 source_id: ObjectId(131),
                 branches: Vec::new(),
                 parent_targets: Vec::new(),
-                context: SpellContext::default(),
+                context: Box::new(SpellContext::default()),
                 continuation: None,
                 replacement_applied: HashSet::new(),
                 remaining_players: Vec::new(),
@@ -6452,9 +6937,11 @@ mod tests {
                 count: 1,
                 zone: Zone::Graveyard,
                 additional_zones: Vec::new(),
-                zone_owner: ZoneOwner::EachPlayer,
+                zone_owner: ZoneOwner::Each(PerPlayerScope::AllPlayers),
                 filter: None,
-                chooser: Chooser::Controller,
+                chooser: Chooser::Controller.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: true,
                 selection: CardSelectionMode::Chosen,
                 constraint: None,
@@ -7365,6 +7852,7 @@ mod tests {
             source_id: ObjectId(151),
             description: None,
             may_trigger_key: None,
+            same_card_may_trigger_choice_available: false,
         };
         let mut buried_optional_frames = ResolutionStack::default();
         buried_optional_frames.push_inner(ResolutionFrame::OptionalEffect(OptionalEffectFrame {

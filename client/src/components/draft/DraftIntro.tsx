@@ -4,13 +4,19 @@ import { menuButtonClass } from "../menu/buttonStyles";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
-type DraftMode = "quick" | "pod";
+type DraftMode = "quick" | "pod" | "commander";
 
 interface DraftIntroProps {
   mode: DraftMode;
-  podSize?: number;
-  packCount?: number;
-  cardsPerPack?: number;
+  podSize: number;
+  packCount: number;
+  cardsPerPack: number;
+  minDeckSize: number;
+  /**
+   * Engine-provided size of each booster, in pack order. A multi-set draft
+   * mixes sizes, so the "packs of N cards" line only holds when they agree.
+   */
+  packSizes?: number[];
   onContinue: () => void;
 }
 
@@ -25,28 +31,85 @@ interface Step {
 
 export function DraftIntro({
   mode,
-  podSize = 8,
-  packCount = 3,
-  cardsPerPack = 14,
+  podSize,
+  packCount,
+  cardsPerPack,
+  minDeckSize,
+  packSizes,
   onContinue,
 }: DraftIntroProps) {
   const { t } = useTranslation("draft");
 
+  const mixedPackSizes = (packSizes?.length ?? 0) > 1
+    && new Set(packSizes).size > 1;
+  const packs = t("intro.quantity.packsOpened", { count: packCount });
+  const cardsPerPackLabel = t("intro.quantity.cardsContained", { count: cardsPerPack });
+  const minimumDeckCards = t("intro.quantity.minimumDeckCards", { count: minDeckSize });
+  const packSizeLabels = (packSizes ?? [])
+    .map((size) => t("intro.quantity.packSizeEntry", { count: size }));
+  const packPassing = t("intro.packPassing", { count: packCount });
+
   const quickSteps: Step[] = [
-    { icon: "1", text: t("intro.quick.step1", { packCount, cardsPerPack }) },
+    {
+      icon: "1",
+      text: mixedPackSizes
+        ? t("intro.quick.step1Mixed", {
+            packs,
+            packSizes: packSizeLabels,
+          })
+        : t("intro.quick.step1", { packs, cardsPerPack: cardsPerPackLabel }),
+    },
     { icon: "2", text: t("intro.quick.step2") },
-    { icon: "3", text: t("intro.quick.step3") },
-    { icon: "4", text: t("intro.quick.step4") },
+    { icon: "3", text: packPassing },
+    { icon: "4", text: t("intro.quick.step4", { minimumDeckCards }) },
   ];
   const podStepList: Step[] = [
     { icon: "1", text: t("intro.pod.step1", { count: podSize }) },
-    { icon: "2", text: t("intro.pod.step2") },
-    { icon: "3", text: t("intro.pod.step3") },
-    { icon: "4", text: t("intro.pod.step4") },
+    {
+      icon: "2",
+      text: mixedPackSizes
+        ? t("intro.pod.step2Mixed", {
+            packs,
+            packSizes: packSizeLabels,
+          })
+        : t("intro.pod.step2", { packs, cardsPerPack: cardsPerPackLabel }),
+    },
+    { icon: "3", text: packPassing },
+    { icon: "4", text: t("intro.pod.step4", { minimumDeckCards }) },
+  ];
+  // CR 903.13a/b: Commander Draft is a draft followed by a multiplayer game,
+  // and players draft two cards from each booster before passing it. Commander
+  // reuses the pod player-count key and the shared pack-passing key rather than
+  // duplicating either sentence into seven locales.
+  const commanderSteps: Step[] = [
+    { icon: "1", text: t("intro.pod.step1", { count: podSize }) },
+    {
+      icon: "2",
+      text: mixedPackSizes
+        ? t("intro.commander.step2Mixed", {
+            packs,
+            packSizes: packSizeLabels,
+          })
+        : t("intro.commander.step2", { packs, cardsPerPack: cardsPerPackLabel }),
+    },
+    { icon: "3", text: packPassing },
+    { icon: "4", text: t("intro.commander.step4", { minimumDeckCards }) },
   ];
 
-  const steps = mode === "quick" ? quickSteps : podStepList;
-  const title = mode === "quick" ? t("intro.quickTitle") : t("intro.podTitle");
+  // Total over `DraftMode`: a future mode is a compile error here rather than a
+  // silent fall-through to the pod copy.
+  const stepsByMode: Record<DraftMode, Step[]> = {
+    quick: quickSteps,
+    pod: podStepList,
+    commander: commanderSteps,
+  };
+  const titleByMode: Record<DraftMode, string> = {
+    quick: t("intro.quickTitle"),
+    pod: t("intro.podTitle"),
+    commander: t("intro.commanderTitle"),
+  };
+  const steps = stepsByMode[mode];
+  const title = titleByMode[mode];
 
   return (
     <div className="mx-auto flex w-full max-w-lg flex-col items-center gap-8 py-12">

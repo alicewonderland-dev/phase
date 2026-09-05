@@ -61,7 +61,7 @@ fn entries_to_count_map(entries: &[DeckEntry]) -> HashMap<String, u32> {
 /// `current_main`/`current_sideboard` and only the revealed companion copy is
 /// returned (CR 400.11a).
 fn restore_revealed_sideboard_companions(state: &mut GameState) {
-    if state.format_config.format.uses_commander() {
+    if state.format_config.uses_commander {
         return;
     }
 
@@ -331,12 +331,13 @@ pub(crate) fn sideboard_submission_bounds(
     state: &GameState,
     player: PlayerId,
 ) -> (u32, Option<u32>) {
-    // CR 100.2a / CR 100.2b: `deck_size` is a *minimum* deck size, and CR 100.5
-    // adds that there is no maximum deck size for non-Commander decks.
-    // Sideboarding is therefore not a one-for-one swap: a player who registered
-    // 60/15 may legally present 61, 70, or all 75 cards in their main deck. The
-    // registered total bounds the *pool* (checked separately), never the
-    // main-deck size.
+    // CR 100.2a / CR 100.2b: `deck_size.min_cards()` is the floor of the
+    // format's `DeckSizeRule`, and CR 100.5 adds that there is no maximum deck
+    // size for non-Commander decks (the `Minimum` variant). Sideboarding is
+    // therefore not a one-for-one swap: under a `Minimum` rule a player who
+    // registered 60/15 may legally present 61, 70, or all 75 cards in their
+    // main deck. The registered total bounds the *pool* (checked separately),
+    // never the main-deck size.
     //
     // Clamping to the registered total keeps the floor satisfiable: a match
     // whose deck was registered below the format minimum (scenario decks, and
@@ -349,12 +350,13 @@ pub(crate) fn sideboard_submission_bounds(
         .iter()
         .find(|p| p.player == player)
         .map_or(0, |pool| total_count(&pool.registered_main));
-    let min_main_deck_size = u32::from(state.format_config.deck_size).min(registered_main_total);
+    let min_main_deck_size =
+        u32::from(state.format_config.deck_size.min_cards()).min(registered_main_total);
 
     // CR 100.4a: the sideboard cap is per-format. `Forbidden` formats (the
     // Commander family) have no sideboard at all, which bounds it at zero and
     // therefore pins the whole pool in the main deck.
-    let max_sideboard_size = match state.format_config.format.sideboard_policy() {
+    let max_sideboard_size = match state.format_config.sideboard_policy {
         SideboardPolicy::Forbidden => Some(0),
         SideboardPolicy::Limited(max) => Some(max),
         SideboardPolicy::Unlimited => None,
@@ -789,10 +791,11 @@ mod tests {
         assert!(bad_pool.is_err());
     }
 
-    /// CR 100.2a + CR 100.5: `deck_size` is a minimum, not an exact size, so a
-    /// player may side a card *in* without siding one out and submit a larger
-    /// main deck than they registered. This is the case the old exact-equality
-    /// check rejected.
+    /// CR 100.2a + CR 100.5: under a `DeckSizeRule::Minimum` rule
+    /// `deck_size.min_cards()` is a floor, not an exact size, so a player may
+    /// side a card *in* without siding one out and submit a larger main deck
+    /// than they registered. This is the case the old exact-equality check
+    /// rejected.
     #[test]
     fn sideboard_accepts_main_deck_larger_than_registered() {
         let mut state = GameState::new_two_player(3);

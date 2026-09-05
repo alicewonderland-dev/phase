@@ -1,5 +1,6 @@
 import {
   type CSSProperties,
+  type RefObject,
   useCallback,
   useEffect,
   useMemo,
@@ -14,6 +15,7 @@ import type { TFunction } from "i18next";
 import type {
   CompanionRevealChoice,
   DeckCardCount,
+  FormatConfig,
   GameFormat,
   MatchConfig,
   ObjectId,
@@ -57,6 +59,7 @@ import { GameBoard } from "../components/board/GameBoard.tsx";
 import { CardImage } from "../components/card/CardImage.tsx";
 import { GameCardPreview } from "../components/card/GameCardPreview.tsx";
 import { CardReportDialog } from "../components/card/CardReportDialog.tsx";
+import { isFocusTargetAvailable } from "../components/ui/focusTarget.ts";
 import { ActionButton } from "../components/board/ActionButton.tsx";
 import { FullControlToggle } from "../components/controls/FullControlToggle.tsx";
 import { CombatPhaseIndicator } from "../components/controls/PhaseStopBar.tsx";
@@ -81,6 +84,7 @@ import { CardDataMissingModal } from "../components/modal/CardDataMissingModal.t
 import { UnhandledWaitingForModal } from "../components/modal/UnhandledWaitingForModal.tsx";
 import { AdventureCastModal } from "../components/modal/AdventureCastModal.tsx";
 import { CascadeChoiceModal } from "../components/modal/CascadeChoiceModal.tsx";
+import { RippleRevealChoiceModal } from "../components/modal/RippleRevealChoiceModal.tsx";
 import { FreeCastWindowModal } from "../components/modal/FreeCastWindowModal.tsx";
 import { ModalFaceModal } from "../components/modal/ModalFaceModal.tsx";
 import { AlternativeCostModal } from "../components/modal/AlternativeCostModal.tsx";
@@ -90,6 +94,7 @@ import { SpliceOfferModal } from "../components/modal/SpliceOfferModal.tsx";
 import { CardChoiceModal } from "../components/modal/CardChoiceModal.tsx";
 import { ChoiceModal } from "../components/modal/ChoiceModal.tsx";
 import { OptionalEffectModalContent } from "../components/modal/OptionalEffectModal.tsx";
+import { ResolutionOptionalPaymentModalContent } from "../components/modal/ResolutionOptionalPaymentModal.tsx";
 import { OptionalCostModalContent } from "../components/modal/OptionalCostModal.tsx";
 import { ChooseOneOfBranchModal } from "../components/modal/ChooseOneOfBranchModal.tsx";
 import { LifeRedistributionModal } from "../components/modal/LifeRedistributionModal.tsx";
@@ -147,7 +152,7 @@ import { DisconnectChoiceDialog } from "../components/hud/DisconnectChoiceDialog
 import { PlayerEnchantmentsDialog } from "../components/hud/PlayerEnchantmentsDialog.tsx";
 import { AttachmentFan } from "../components/board/AttachmentFan.tsx";
 import { PausedBanner } from "../components/chrome/PausedBanner.tsx";
-import type { P2PAdapterEvent } from "../adapter/p2p-adapter.ts";
+import { P2PHostAdapter, type P2PAdapterEvent } from "../adapter/p2p-adapter.ts";
 import { WebSocketAdapter } from "../adapter/ws-adapter.ts";
 import type { WsAdapterEvent } from "../adapter/ws-adapter.ts";
 import { MANA_PAYMENT_WAITING_FOR_TYPES } from "../game/waitingForRegistry.ts";
@@ -158,7 +163,6 @@ import { clearPromptOverlayState } from "../game/sessionCleanup.ts";
 import { clearGame, hasRemoteHumans, loadActiveGame, useGameStore } from "../stores/gameStore.ts";
 import { useUiStore } from "../stores/uiStore.ts";
 import { usePreferencesStore } from "../stores/preferencesStore.ts";
-import type { MultiplayerBoardLayout } from "../stores/preferencesStore.ts";
 import {
   FORMAT_DEFAULTS,
   getOpponentDisplayName,
@@ -173,12 +177,16 @@ import { SpectatorChrome } from "../components/spectator/SpectatorChrome.tsx";
 import { useSpectatorMode } from "../hooks/useSpectatorMode.ts";
 import { GameProvider } from "../providers/GameProvider.tsx";
 import { useCanActForWaitingState, usePerspectivePlayerId, usePlayerId } from "../hooks/usePlayerId.ts";
+import { ABILITY_BLOCK_REASON_KEY } from "../viewmodel/abilityBlockReason.ts";
 import {
   abilityChoiceLabel,
+  abilityLabel,
   formatAbilityCost,
   loyaltyBadge,
+  stripCostPrefix,
   stripLoyaltyCostPrefix,
 } from "../viewmodel/costLabel.ts";
+import { renderDescription } from "../utils/description.ts";
 import { LoyaltyBadge } from "../components/ui/LoyaltyBadge.tsx";
 import {
   getCastableZoneViewerTarget,
@@ -187,6 +195,7 @@ import {
   getSeatCount,
   getWaitingForObjectChoiceIds,
   isSplitBoardActive,
+  resolveMultiplayerBoardLayout,
   resolveFocusedOpponent,
   shouldRenderFocusedOpponentTopRow,
   type ZoneViewerTarget,
@@ -254,7 +263,9 @@ export function GamePage() {
   // Without this gate, refreshing `/game/<id>?mode=p2p-host` against a
   // Full-mode server would attempt `openBrokerClient` and surface an
   // "Expected LobbyOnly server, got Full" error to the user.
-  const locationState = location.state as { useBroker?: boolean } | null;
+  const locationState = location.state as
+    | { useBroker?: boolean; formatConfig?: FormatConfig }
+    | null;
   const cachedServerMode = useMultiplayerStore((s) => s.serverInfo?.mode);
   const useBroker = locationState?.useBroker ?? (cachedServerMode === "LobbyOnly");
   const rawMode = searchParams.get("mode");
@@ -268,6 +279,11 @@ export function GamePage() {
   const roomNameParam = searchParams.get("roomName");
   const sourceParam = searchParams.get("source") ?? undefined;
   const draftIdParam = searchParams.get("draftId") ?? undefined;
+  // The lobby authority this join/spectate was launched from. Produced by
+  // our own navigation from a canonical `LobbySource.url`; a hand-edited
+  // value surfaces through the adapter's existing handshake error path, the
+  // same way a hand-edited `code` does.
+  const serverParam = searchParams.get("server") ?? undefined;
   const playerCount = playersParam ? Number(playersParam) : undefined;
   const activeGameMeta = useMemo(
     () => (gameId ? loadActiveGame() : null),
@@ -277,6 +293,12 @@ export function GamePage() {
     activeGameMeta && activeGameMeta.id === gameId
       ? activeGameMeta.formatConfig
       : undefined;
+  // The setup screen's edited config (starting life), handed over on the
+  // navigation that started this game. `GameSetupPage`'s native-engine route
+  // writes no resume pointer, so router state is the only channel that
+  // reaches both engine routes; `savedFormatConfig` still wins because it
+  // survives a hard refresh, and the two agree whenever both are present.
+  const setupFormatConfig = locationState?.formatConfig;
   // Memoize so the `GameProvider` `useEffect` dep array doesn't
   // tear-down/rebuild the P2P session on every parent re-render. Without
   // `useMemo`, each render constructs a fresh object reference from
@@ -289,10 +311,10 @@ export function GamePage() {
       if (savedFormatConfig && isDirectSetupFormat(savedFormatConfig.format)) {
         return savedFormatConfig;
       }
-      return directSetupFormatConfig(formatParam);
+      return setupFormatConfig ?? directSetupFormatConfig(formatParam);
     }
     return savedFormatConfig ?? (formatParam ? FORMAT_DEFAULTS[formatParam] : undefined);
-  }, [formatParam, rawMode, savedFormatConfig]);
+  }, [formatParam, rawMode, savedFormatConfig, setupFormatConfig]);
   // CR 103.1: 0 = play first, 1 = draw first, undefined = random
   const firstPlayer = firstParam === "play" ? 0 : firstParam === "draw" ? 1 : undefined;
   const matchConfig = useMemo<MatchConfig>(
@@ -540,11 +562,14 @@ export function GamePage() {
             deckRejected: true,
             reason: event.reason,
             joinCode,
+            // Carry the origin back: the retry must re-join the same server,
+            // not whichever one this client hosts on.
+            server: serverParam,
           },
         });
         break;
     }
-  }, [gameId, navigate, joinCode, isOnlineMode, t]);
+  }, [gameId, navigate, joinCode, serverParam, isOnlineMode, t]);
 
   const handleP2PEvent = useCallback((event: P2PAdapterEvent) => {
     switch (event.type) {
@@ -750,6 +775,7 @@ export function GamePage() {
       roomName={roomNameParam ?? undefined}
       source={sourceParam}
       draftId={draftIdParam}
+      serverUrl={serverParam}
       onWsEvent={mode === "ai" || mode === "online" || mode === "spectate" ? handleWsEvent : undefined}
       onP2PEvent={
         mode === "p2p-host" || mode === "p2p-join" ? handleP2PEvent : undefined
@@ -932,6 +958,38 @@ function GamePageContent({
   const [preferencesOpen, setPreferencesOpen] = useState<
     null | { tab?: SettingsTabId; highlight?: SettingsHighlight }
   >(null);
+  const gameMenuTriggerRef = useRef<HTMLButtonElement>(null);
+  const preferencesReturnFocusRef = useRef<HTMLElement | SVGElement | null>(null);
+  const zoneViewerReturnFocusRef = useRef<HTMLElement | SVGElement | null>(null);
+  const resolvedZoneViewerReturnFocusRef = useMemo<
+    RefObject<HTMLElement | SVGElement | null>
+  >(
+    () => ({
+      get current() {
+        const exactLauncher = zoneViewerReturnFocusRef.current;
+        // A manually opened pile is the most precise return target, but the
+        // final card can leave that pile while the viewer is open. Resolve at
+        // restoration time so the persistent game-menu trigger remains a
+        // connected fallback instead of allowing focus to fall to <body>.
+        return isFocusTargetAvailable(exactLauncher)
+          ? exactLauncher
+          : gameMenuTriggerRef.current;
+      },
+    }),
+    [],
+  );
+  const openPreferences = useCallback(
+    (request: { tab?: SettingsTabId; highlight?: SettingsHighlight } = {}) => {
+      // Toast and context-menu launchers unmount as settings opens. Hand focus
+      // to the persistent game-menu button first, and make that same durable
+      // element the modal's explicit restoration target.
+      const returnTarget = gameMenuTriggerRef.current;
+      preferencesReturnFocusRef.current = returnTarget;
+      returnTarget?.focus();
+      setPreferencesOpen(request);
+    },
+    [],
+  );
   const [boardContextMenu, setBoardContextMenu] = useState<{ x: number; y: number } | null>(null);
 
   const playerId = usePlayerId();
@@ -952,8 +1010,15 @@ function GamePageContent({
   const cardReportDialogOpen = useUiStore((s) => s.cardReportDialogOpen);
   const multiplayerBoardLayout = usePreferencesStore((s) => s.multiplayerBoardLayout);
   const setMultiplayerBoardLayout = usePreferencesStore((s) => s.setMultiplayerBoardLayout);
+  const multiplayerSplitLayoutNudgeDismissed = usePreferencesStore(
+    (s) => s.multiplayerSplitLayoutNudgeDismissed,
+  );
+  const setMultiplayerSplitLayoutNudgeDismissed = usePreferencesStore(
+    (s) => s.setMultiplayerSplitLayoutNudgeDismissed,
+  );
   const debugPanelOpen = useUiStore((s) => s.debugPanelOpen);
   const debugClickModeButtonVisible = useUiStore((s) => s.debugClickModeButtonVisible);
+  const logPanelOpen = useUiStore((s) => s.logPanelOpen);
   const toggleDebugClickModeButtonVisible = useUiStore(
     (s) => s.toggleDebugClickModeButtonVisible,
   );
@@ -990,18 +1055,40 @@ function GamePageContent({
   const activeOpponentId =
     resolveFocusedOpponent(focusedOpponent, opponents) ?? opponents[0] ?? null;
   const seatCount = getSeatCount(gameState);
-  const effectiveMultiplayerBoardLayout: MultiplayerBoardLayout =
-    seatCount > 2 && canActForWaitingState && getBoardChoiceView(waitingFor, objects)?.intent === "untap"
-      ? "split"
-      : multiplayerBoardLayout;
+  const resolvedMultiplayerBoardLayout = resolveMultiplayerBoardLayout(
+    multiplayerBoardLayout,
+    seatCount,
+    isMobile,
+  );
+  const untapForcedSplit =
+    seatCount > 2 &&
+    canActForWaitingState &&
+    getBoardChoiceView(waitingFor, objects)?.intent === "untap";
+  const effectiveMultiplayerBoardLayout = untapForcedSplit
+    ? "split"
+    : resolvedMultiplayerBoardLayout;
   const splitBoardActive = isSplitBoardActive(effectiveMultiplayerBoardLayout, seatCount);
   const renderFocusedOpponentTopRow = shouldRenderFocusedOpponentTopRow(
     effectiveMultiplayerBoardLayout,
     seatCount,
   );
   const handleToggleMultiplayerBoardLayout = useCallback(() => {
-    setMultiplayerBoardLayout(multiplayerBoardLayout === "split" ? "focused" : "split");
-  }, [multiplayerBoardLayout, setMultiplayerBoardLayout]);
+    setMultiplayerBoardLayout(
+      resolvedMultiplayerBoardLayout === "split" ? "focused" : "split",
+    );
+  }, [resolvedMultiplayerBoardLayout, setMultiplayerBoardLayout]);
+  const handleTryMultiplayerSplitLayout = useCallback(() => {
+    setMultiplayerBoardLayout("split");
+  }, [setMultiplayerBoardLayout]);
+  const handleDismissMultiplayerSplitLayoutNudge = useCallback(() => {
+    setMultiplayerSplitLayoutNudgeDismissed(true);
+  }, [setMultiplayerSplitLayoutNudgeDismissed]);
+  const showMultiplayerSplitLayoutNudge =
+    seatCount > 2 &&
+    !isMobile &&
+    multiplayerBoardLayout === "focused" &&
+    !untapForcedSplit &&
+    !multiplayerSplitLayoutNudgeDismissed;
   const gridTemplateRows = splitBoardActive ? splitGridTemplateRows : focusedGridTemplateRows;
   const handleKickPlayer = useCallback((pid: number) => {
     const adapter = useGameStore.getState().adapter as
@@ -1009,6 +1096,9 @@ function GamePageContent({
       | null;
     void adapter?.kickPlayer?.(pid);
   }, []);
+  const handleResumeP2P = useCallback(() => {
+    if (adapter instanceof P2PHostAdapter) adapter.requestResume();
+  }, [adapter]);
 
   // Memoize the HUD elements passed to GameBoard. GameBoard is wrapped in
   // React.memo, which shallow-compares props; without stable element
@@ -1167,6 +1257,7 @@ function GamePageContent({
     // zone control glow prompts the user to pick.
     if (groups.size === 1 && firstHit) {
       dismissedCastableZoneViewerKeyRef.current = null;
+      zoneViewerReturnFocusRef.current = gameMenuTriggerRef.current;
       setViewingZone(firstHit);
       return;
     }
@@ -1179,6 +1270,7 @@ function GamePageContent({
     if (castableTarget) {
       const autoOpenKey = castableZoneViewerAutoOpenKey(castableTarget);
       if (dismissedCastableZoneViewerKeyRef.current !== autoOpenKey) {
+        zoneViewerReturnFocusRef.current = gameMenuTriggerRef.current;
         setViewingZone({
           zone: castableTarget.zone,
           playerId: castableTarget.playerId,
@@ -1197,6 +1289,13 @@ function GamePageContent({
     }
     setViewingZone(null);
   }, [viewingZone]);
+
+  const prepareZoneViewerActionClose = useCallback(() => {
+    // A cast/play action can remove the final card only after its asynchronous
+    // engine dispatch resolves. Choose the durable launcher before the viewer
+    // closes so focus never lands on a pile that disappears moments later.
+    zoneViewerReturnFocusRef.current = gameMenuTriggerRef.current;
+  }, []);
 
   const handleDeclareCompanion = useCallback(
     (choice: CompanionRevealChoice | null) => {
@@ -1277,6 +1376,10 @@ function GamePageContent({
   const gamePageStyle = {
     "--game-top-overlay-offset": `${topOverlayOffsetPx}px`,
     "--game-split-safe-top": "0px",
+    // Where the targeting prompt starts, which is the only part of its
+    // placement this page can state: the split layout puts seat panes at the
+    // very top of the board, so the prompt clears them. How TALL the block is
+    // stays the block's own business — see TargetingOverlay.
     "--game-targeting-prompt-top": splitBoardActive
       ? isMobile ? "4.25rem" : "4.75rem"
       : "0.25rem",
@@ -1288,7 +1391,13 @@ function GamePageContent({
     ? { width: "38px", height: "53px" }
     : { width: "clamp(45px, 4.5vw, 70px)", height: "clamp(63px, 6.3vw, 98px)" };
   const handleViewZone = useCallback(
-    (zone: "graveyard" | "exile" | "library", zonePlayerId: number) => {
+    (
+      zone: "graveyard" | "exile" | "library",
+      zonePlayerId: number,
+      launcher?: HTMLButtonElement,
+    ) => {
+      zoneViewerReturnFocusRef.current =
+        launcher ?? gameMenuTriggerRef.current;
       setViewingZone({ zone, playerId: zonePlayerId });
     },
     [],
@@ -1430,6 +1539,13 @@ function GamePageContent({
         className={`relative ${boardChoiceLayerActive && !isReconnecting ? GAME_Z_LAYER.boardChoiceGrid : GAME_Z_LAYER.board} grid min-w-0 h-full${isReconnecting ? " pointer-events-none" : ""}`}
         style={{
           paddingTop: "var(--game-top-overlay-offset, 0px)",
+          // The game log docks as a rail, not an overlay: it publishes its width
+          // as `--game-{left,right}-rail-offset` and the board's content box
+          // shrinks by that much, so nothing is ever hidden underneath it.
+          // Padding (not width/margin) keeps row 3's `100dvh`-derived height
+          // math untouched — only the horizontal content box moves.
+          paddingLeft: "var(--game-left-rail-offset, 0px)",
+          paddingRight: "var(--game-right-rail-offset, 0px)",
           gridTemplateRows,
           gridTemplateColumns: "1fr",
         }}
@@ -1458,17 +1574,23 @@ function GamePageContent({
                     <ExilePile
                       playerId={activeOpponentId}
                       size={pileSize}
-                      onClick={() => handleViewZone("exile", activeOpponentId)}
+                      onClick={(launcher) =>
+                        handleViewZone("exile", activeOpponentId, launcher)
+                      }
                     />
                     <LibraryPile
                       playerId={activeOpponentId}
                       size={pileSize}
-                      onView={() => handleViewZone("library", activeOpponentId)}
+                      onView={(launcher) =>
+                        handleViewZone("library", activeOpponentId, launcher)
+                      }
                     />
                     <GraveyardPile
                       playerId={activeOpponentId}
                       size={pileSize}
-                      onClick={() => handleViewZone("graveyard", activeOpponentId)}
+                      onClick={(launcher) =>
+                        handleViewZone("graveyard", activeOpponentId, launcher)
+                      }
                     />
                   </>
                 ) : null}
@@ -1518,24 +1640,35 @@ function GamePageContent({
             flexZone="playerPiles"
             scaleKey="playerPiles"
             className="pointer-events-none absolute left-0 top-0 bottom-0 z-10 flex w-fit flex-col items-start justify-end gap-0.5 p-1 lg:gap-1 lg:p-3 [&>*]:pointer-events-auto [&>div>*]:pointer-events-auto"
-            // Anchor box-scale to the bottom-left dock corner.
-            style={{ ...playerZoneRailStyle, transformOrigin: "bottom left" }}
+            // Anchor box-scale to the bottom-left dock corner. No left-rail
+            // offset here: this pile is absolutely positioned inside the board
+            // grid, whose padding already accounts for a left-docked log panel.
+            style={{
+              ...playerZoneRailStyle,
+              transformOrigin: "bottom left",
+            }}
           >
             <div className="flex items-end gap-2">
               <ExilePile
                 playerId={perspectivePlayerId}
                 size={pileSize}
-                onClick={() => handleViewZone("exile", perspectivePlayerId)}
+                onClick={(launcher) =>
+                  handleViewZone("exile", perspectivePlayerId, launcher)
+                }
               />
               <GraveyardPile
                 playerId={perspectivePlayerId}
                 size={pileSize}
-                onClick={() => handleViewZone("graveyard", perspectivePlayerId)}
+                onClick={(launcher) =>
+                  handleViewZone("graveyard", perspectivePlayerId, launcher)
+                }
               />
               <LibraryPile
                 playerId={perspectivePlayerId}
                 size={pileSize}
-                onView={() => handleViewZone("library", perspectivePlayerId)}
+                onView={(launcher) =>
+                  handleViewZone("library", perspectivePlayerId, launcher)
+                }
               />
             </div>
           </DraggableWidget>
@@ -1620,9 +1753,23 @@ function GamePageContent({
         isOnlineMode={isOnlineMode}
         showAiHand={showAiHand}
         onToggleAiHand={() => setShowAiHand((v) => !v)}
-        multiplayerBoardLayout={seatCount > 2 ? multiplayerBoardLayout : undefined}
-        onToggleMultiplayerBoardLayout={seatCount > 2 ? handleToggleMultiplayerBoardLayout : undefined}
-        onSettingsClick={() => setPreferencesOpen({})}
+        logPanelOpen={logPanelOpen}
+        onToggleGameLog={() => useUiStore.getState().toggleLogPanel()}
+        multiplayerBoardLayout={
+          seatCount > 2 && !untapForcedSplit ? resolvedMultiplayerBoardLayout : undefined
+        }
+        onToggleMultiplayerBoardLayout={
+          seatCount > 2 && !untapForcedSplit ? handleToggleMultiplayerBoardLayout : undefined
+        }
+        showMultiplayerSplitLayoutNudge={showMultiplayerSplitLayoutNudge}
+        onTryMultiplayerSplitLayout={
+          showMultiplayerSplitLayoutNudge ? handleTryMultiplayerSplitLayout : undefined
+        }
+        onDismissMultiplayerSplitLayoutNudge={
+          showMultiplayerSplitLayoutNudge ? handleDismissMultiplayerSplitLayoutNudge : undefined
+        }
+        onSettingsClick={() => openPreferences()}
+        menuTriggerRef={gameMenuTriggerRef}
         onHelpClick={() => setHelpSheetOpen(true)}
         onConcede={onShowConcedeDialog}
         // Takeback is a TRANSPORT capability, not a mode policy: only
@@ -1655,7 +1802,7 @@ function GamePageContent({
         onReportCardClick={() => useUiStore.getState().openCardReportDialog()}
       />
       <HelpSheet />
-      <CardReportDialog />
+      <CardReportDialog returnFocusRef={gameMenuTriggerRef} />
 
       {/* The page's toast surface, not an online-only one: solo games raise
           toasts too (the native-engine fallback notice). Only online games get
@@ -1663,7 +1810,7 @@ function GamePageContent({
           to re-dial and would just restart itself. */}
       <ConnectionToast
         onRetry={isOnlineMode ? () => window.location.reload() : undefined}
-        onSettings={() => setPreferencesOpen({})}
+        onSettings={() => openPreferences()}
       />
 
 
@@ -1690,7 +1837,11 @@ function GamePageContent({
       )}
 
       {/* P2P pause banner — visible to everyone while paused. */}
-      <PausedBanner isVisible={pauseReason !== null} reason={pauseReason ?? ""} />
+      <PausedBanner
+        isVisible={pauseReason !== null}
+        reason={pauseReason ?? ""}
+        onResume={isP2PHost && adapter instanceof P2PHostAdapter ? handleResumeP2P : undefined}
+      />
 
       {/* P2P host-only disconnect decision modal. */}
       {isP2PHost && disconnectChoice !== null && (
@@ -1798,6 +1949,7 @@ function GamePageContent({
           onClose={() => setPreferencesOpen(null)}
           initialTab={preferencesOpen.tab}
           highlight={preferencesOpen.highlight}
+          returnFocusRef={preferencesReturnFocusRef}
         />
       )}
 
@@ -1807,7 +1959,7 @@ function GamePageContent({
           y={boardContextMenu.y}
           onClose={() => setBoardContextMenu(null)}
           onChangeBackground={() =>
-            setPreferencesOpen({ tab: "gameplay", highlight: "board-background" })
+            openPreferences({ tab: "gameplay", highlight: "board-background" })
           }
           onCustomizeLayout={() => useUiStore.getState().setFlexEditMode(true)}
           onToggleGameLog={() => useUiStore.getState().toggleLogPanel()}
@@ -1818,8 +1970,8 @@ function GamePageContent({
         />
       )}
 
-      <DebugCardContextMenu />
-      <DebugLibraryViewer />
+      <DebugCardContextMenu surface="game" />
+      <DebugLibraryViewer returnFocusRef={gameMenuTriggerRef} />
 
       {/* Animation overlay (above board, below modals) */}
       <AnimationOverlay containerRef={containerRef} />
@@ -1895,6 +2047,7 @@ function GamePageContent({
         <LifeRedistributionModal />
         <AdventureCastModal />
         <CascadeChoiceModal />
+        <RippleRevealChoiceModal />
         <SpellbookDraftModal />
         <FreeCastWindowModal />
         <ModalFaceModal />
@@ -1910,7 +2063,7 @@ function GamePageContent({
         {/* Ability choice picker (planeswalkers, multi-ability permanents) */}
         <AbilityChoiceModal />
 
-        {/* Player-attached Aura viewer (Curse cycle, Faith's Fetters, etc.).
+        {/* Player-attached Aura viewer (Curse cycle, Paradox Haze, etc.).
             Mounted here — not from inside HudPlate where the badge lives —
             so the dialog's `fixed inset-0` shell anchors to the viewport
             instead of HudPlate's transform-CB bounding box. */}
@@ -1941,6 +2094,11 @@ function GamePageContent({
           canActForWaitingState && (
             <OptionalEffectModal />
           )}
+
+        {/* Optional immediate payment branch ("discard a card or pay {2}") */}
+        {waitingFor?.type === "ResolutionOptionalPaymentChoice" && (
+          <ResolutionOptionalPaymentModal />
+        )}
 
         {/* CR 401.4: Owner puts permanent on top or bottom of library */}
         {(waitingFor?.type === "TopOrBottomChoice" || waitingFor?.type === "ClashCardPlacement") &&
@@ -1996,6 +2154,8 @@ function GamePageContent({
           zone={viewingZone.zone}
           playerId={viewingZone.playerId}
           onClose={handleZoneViewerClose}
+          onPrepareActionClose={prepareZoneViewerActionClose}
+          returnFocusRef={resolvedZoneViewerReturnFocusRef}
         />
       )}
 
@@ -2132,6 +2292,7 @@ function GamePageContent({
                 : undefined
             }
             onCancel={onHideConcedeDialog}
+            returnFocusRef={gameMenuTriggerRef}
           />
           <TakebackRequestDialog
             isOpen={pendingTakeback !== null}
@@ -2834,7 +2995,14 @@ function GameOverScreen({
     params.delete("roomName");
     if (mode) params.set("mode", mode);
     params.set("difficulty", difficulty);
-    navigate(`/game/${newId}?${params.toString()}`);
+    // `format` names the format but carries none of its edited knobs, and the
+    // saved active-game record is keyed to the game id we are leaving — so a
+    // custom starting life would revert to the format default here. Hand over
+    // the config the engine actually played with, on the same router-state
+    // channel `GameSetupPage` uses to start a game.
+    navigate(`/game/${newId}?${params.toString()}`, {
+      state: { formatConfig: gameState?.format_config },
+    });
   };
 
   const handleBackToDraft = () => {
@@ -3032,6 +3200,8 @@ export function manaRestrictionLabel(
       return t("gamePage.manaRestrictions.onlyForSpellColor", restriction.data);
     case "onlyForSpellFromZone":
       return t("gamePage.manaRestrictions.onlyForSpellFromZone", restriction.data);
+    case "cannotCastSpellFromZone":
+      return t("gamePage.manaRestrictions.cannotCastSpellFromZone", restriction.data);
     case "onlyForFaceDownSpell":
       return t("gamePage.manaRestrictions.onlyForFaceDownSpell");
     case "onlyForAny":
@@ -3123,7 +3293,22 @@ function AbilityChoiceModal() {
   const webSlingingCosts = useGameStore(
     (s) => s.gameState?.derived?.web_slinging_costs,
   );
+  // CR 709.5b: engine-published Room halves, already resolved through the
+  // COPIED halves for a permanent that copies a Room.
+  const roomHalfIdentities = useGameStore(
+    (s) => s.gameState?.derived?.room_half_identities,
+  );
   const viewerInteraction = useGameStore((s) => s.viewerInteraction);
+  // CR 118.3: the engine-authored "can't pay this cost right now" read-out.
+  // Read from the store slice (not from `uiStore.pendingAbilityChoice`) so the
+  // rows stay live against the current state rather than latched to whatever
+  // was true when the choice was queued.
+  // `?? {}` is load-bearing, not defensive noise: a store SNAPSHOT that predates
+  // this slice (a restored session, or any consumer holding an older store
+  // shape) yields `undefined`, and subscripting it would crash the whole game
+  // page for a display-only feature. Mirrors `legalResultState`'s own
+  // `result.activationBlockReasons ?? {}` default.
+  const activationBlockReasons = useGameStore((s) => s.activationBlockReasons) ?? {};
 
   if (!pending || !obj) return null;
 
@@ -3163,12 +3348,14 @@ function AbilityChoiceModal() {
       subtitle={subtitle}
       previewCardName={obj.name}
       previewCardTypes={obj.card_types}
-      options={pending.actions.map((action, i) => {
+      options={[
+        ...pending.actions.map((action, i) => {
         let { label, description } = abilityChoiceLabel(
           action,
           obj,
           objects,
           webSlingingCosts,
+          roomHalfIdentities,
         );
         if (action.type === "TapLandForMana") {
           const surfaces = action.interactionActionId
@@ -3190,16 +3377,62 @@ function AbilityChoiceModal() {
             // badge already expresses its cost, so keeping the effect in the
             // secondary description would visually detach it from that badge.
             label: description ?? stripLoyaltyCostPrefix(label),
-            labelTone: "secondary",
+            // `as const`: a spread element no longer receives `ChoiceOption[]`
+            // as its contextual type, so this would otherwise widen to `string`.
+            labelTone: "secondary" as const,
             icon: (
               <LoyaltyBadge amount={badge.amount} kind="cost" />
             ),
           };
         }
         return { id: String(i), label, description };
-      })}
+        }),
+        // CR 118.3: display-only rows for abilities the engine is withholding
+        // solely because the cost is unpayable right now. Appended AFTER the
+        // action rows so the positional `id = String(i)` <-> `pending.actions[Number(id)]`
+        // contract above is preserved byte-for-byte.
+        //
+        // No de-duplication against the offered rows is needed: the engine's
+        // read-out and its offered set are produced by the SAME
+        // `activation_verdict` core, so an ability is in exactly one of them.
+        ...(activationBlockReasons[String(pending.objectId)] ?? []).map((entry) => {
+          // CR 201.5: `~` is the engine's self-reference token; bind it to the
+          // host object, the idiom both shipped consumers use. A runtime-granted
+          // index has no printed description, so the row falls back to the
+          // reason alone (matching `PermanentCard`'s badge).
+          const ability = entry.ability_index < obj.abilities.length
+            ? obj.abilities[entry.ability_index]
+            : undefined;
+          const reason = t(ABILITY_BLOCK_REASON_KEY[entry.type]);
+          // Same label/description split the OFFERED rows above get from
+          // `abilityChoiceLabel` (`costLabel.ts`: `abilityLabel` for the label,
+          // `stripCostPrefix` for the description). A blocked `{3}` and an
+          // offered `{3}` therefore render identically in the same list and
+          // differ only by the disabled styling — which is the comparison the
+          // reported defect is about, since the card face shows both. Reusing
+          // the shipped helpers rather than re-deriving the split here keeps the
+          // two row kinds from drifting apart. `RichLabel` inside `ChoiceModal`
+          // renders `{3}` as a real mana pip, so no cost plumbing is needed.
+          const effect = ability?.description
+            ? renderDescription(stripCostPrefix(ability.description), obj.name)
+            : undefined;
+          return {
+            id: `blocked:${entry.ability_index}`,
+            label: ability ? renderDescription(abilityLabel(ability), obj.name) : reason,
+            description: effect ? `${effect} — ${reason}` : ability ? reason : undefined,
+            disabled: true,
+          };
+        }),
+      ]}
       onChoose={(id) => {
-        dispatch(pending.actions[Number(id)]);
+        // CR 118.3: blocked rows are display-only and carry a non-numeric id.
+        // Without this guard `Number("blocked:0")` is `NaN`, so
+        // `pending.actions[NaN]` is `undefined` and a malformed dispatch
+        // reaches the engine.
+        if (id.startsWith("blocked:")) return;
+        const action = pending.actions[Number(id)];
+        if (!action) return;
+        dispatch(action);
         setPending(null);
       }}
       onClose={() => setPending(null)}
@@ -3295,6 +3528,22 @@ function OptionalEffectModal() {
   if (waitingFor?.type !== "OptionalEffectChoice" && waitingFor?.type !== "OpponentMayChoice") return null;
 
   return <OptionalEffectModalContent waitingFor={waitingFor} objects={objects} dispatch={dispatch} />;
+}
+
+function ResolutionOptionalPaymentModal() {
+  const dispatch = useGameDispatch();
+  const waitingFor = useGameStore((s) => s.waitingFor);
+  const canActForWaitingState = useCanActForWaitingState();
+
+  if (waitingFor?.type !== "ResolutionOptionalPaymentChoice") return null;
+
+  return (
+    <ResolutionOptionalPaymentModalContent
+      waitingFor={waitingFor}
+      canActForWaitingState={canActForWaitingState}
+      dispatch={dispatch}
+    />
+  );
 }
 
 // ── Top or Bottom Choice Modal (CR 401.4) ──────────────────────────────

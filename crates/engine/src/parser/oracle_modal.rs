@@ -8,10 +8,11 @@ use nom::sequence::{delimited, preceded, terminated};
 use nom::Parser;
 
 use crate::types::ability::{
-    AbilityDefinition, AbilityKind, AdditionalCostOrigin, AdditionalCostPaymentSource, ChoiceType,
-    ControllerRef, Effect, ModalChoice, ModalSelectionCondition, ModalSelectionConstraint,
-    PlayerFilter, QuantityExpr, QuantityRef, ReplacementDefinition, StaticCondition, TargetFilter,
-    TargetSelectionMode, TriggerCondition, TypedFilter,
+    AbilityCondition, AbilityDefinition, AbilityKind, AdditionalCostOrigin,
+    AdditionalCostPaymentSource, ChoiceType, ControllerRef, Effect, ModalChoice,
+    ModalSelectionCondition, ModalSelectionConstraint, PlayerFilter, QuantityExpr, QuantityRef,
+    ReplacementDefinition, StaticCondition, TargetFilter, TargetSelectionMode, TriggerCondition,
+    TypedFilter,
 };
 use crate::types::replacements::ReplacementEvent;
 use crate::types::triggers::TriggerMode;
@@ -46,8 +47,6 @@ use super::oracle_util::{parse_mana_symbols, strip_reminder_text, TextPair};
 use crate::parser::oracle_ir::ast::{
     parsed_clause, ModalHeaderAst, ModalOptionality, ModeAst, OracleBlockAst, ReflexiveModalParent,
 };
-#[cfg(test)]
-use crate::types::ability::AbilityCondition;
 use crate::types::mana::ManaCost;
 
 pub(crate) fn parse_oracle_block(lines: &[&str], start: usize) -> Option<(OracleBlockAst, usize)> {
@@ -1226,6 +1225,7 @@ pub(crate) fn lower_oracle_block_ir(
                                     .body,
                                 ),
                             },
+                            connector: AbilityCondition::WhenYouDo,
                             effect_chain: EffectChainIr::single_clause(
                                 cost_text,
                                 AbilityKind::Spell,
@@ -1251,6 +1251,7 @@ pub(crate) fn lower_oracle_block_ir(
                         Some(TriggerBody::EffectChain(instruction)) => {
                             TriggerBody::Reflexive(Box::new(ReflexiveParentIr {
                                 parent: ReflexiveParent::Mandatory { instruction },
+                                connector: AbilityCondition::WhenYouDo,
                                 effect_chain: payload.marker.clone(),
                                 modal: Some(payload.clone()),
                             }))
@@ -4574,6 +4575,11 @@ When The Ruinous Wrecking Crew enters, choose up to X —\n\
         let Some(TriggerBody::Reflexive(reflexive)) = trigger.body.as_ref() else {
             panic!("Caesar must retain its native reflexive-payment trigger body");
         };
+        assert_eq!(
+            reflexive.connector,
+            AbilityCondition::WhenYouDo,
+            "Caesar's native IR must retain its printed reflexive connector"
+        );
         let modal = reflexive
             .modal
             .as_ref()
@@ -5077,9 +5083,9 @@ When The Ruinous Wrecking Crew enters, choose up to X —\n\
         );
     }
 
-    /// R7(b): a real typed (non-self) trigger subject flows through the
-    /// filter's identity arm and keeps its threading — the mode-body "It"
-    /// resolves to the triggering object (CR 608.2k), NOT the mode target.
+    /// R7(b): a mode-local target is the nearest typed antecedent, even when
+    /// the surrounding trigger has a typed subject — the mode-body "It"
+    /// resolves to that target, not the triggering object.
     #[test]
     fn mode_anaphor_subject_retains_typed_subject() {
         let ctx = ParseContext {
@@ -5094,8 +5100,8 @@ When The Ruinous Wrecking Crew enters, choose up to X —\n\
             .expect("mode 2 second sentence present");
         assert_eq!(
             generic_effect_affected(sub),
-            TargetFilter::TriggeringSource,
-            "retained typed subject: mode-body 'It' binds the triggering object"
+            TargetFilter::ParentTarget,
+            "mode-local target: mode-body 'It' binds the preceding target creature"
         );
     }
 

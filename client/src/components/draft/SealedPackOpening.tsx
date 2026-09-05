@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import type { DraftCardInstance, DraftPoolGroup, DraftPlayerView } from "../../adapter/draft-adapter";
 import { useCardImage } from "../../hooks/useCardImage";
 import { menuButtonClass } from "../menu/buttonStyles";
+import { getCardImageSrcSetProps } from "../card/cardImageSrcSet.ts";
 import { POOL_GROUP_LABEL_KEYS } from "./poolGroupLabels";
 
 interface SealedPackOpeningProps {
@@ -13,7 +14,7 @@ interface SealedPackOpeningProps {
 }
 
 function PullCard({ card, index }: { card: DraftCardInstance; index: number }) {
-  const { src, isLoading } = useCardImage(card.name, {
+  const { src, isLoading, rungs, advanceFailedSource } = useCardImage(card.name, {
     size: "normal",
     sourcePrinting: { setCode: card.set_code, collectorNumber: card.collector_number },
   });
@@ -33,8 +34,10 @@ function PullCard({ card, index }: { card: DraftCardInstance; index: number }) {
       ) : (
         <img
           src={src}
+          {...getCardImageSrcSetProps(src, rungs)}
           alt={card.name}
           draggable={false}
+          onError={() => advanceFailedSource?.(src)}
           className="aspect-[488/680] w-full object-cover"
         />
       )}
@@ -187,7 +190,9 @@ export function SealedPackOpening({ view, onComplete }: SealedPackOpeningProps) 
       {!showReview && (
         <div className="mb-5 text-center">
           <h1 className="menu-display text-3xl text-white">{t("sealedOpening.title")}</h1>
-          <p className="mt-2 text-sm text-white/50">{t("sealedOpening.subtitle")}</p>
+          <p className="mt-2 text-sm text-white/50">
+            {t("sealedOpening.subtitle", { count: view.pack_count })}
+          </p>
         </div>
       )}
       <AnimatePresence mode="wait">

@@ -1229,6 +1229,7 @@ fn assert_land_sacrifice_clause(def: &AbilityDefinition) {
                 qty: QuantityRef::ControlledByEachPlayer {
                     aggregate: AggregateFunction::Min,
                     filter: TargetFilter::Typed(tf),
+                    relation: PlayerRelation::All,
                 }
             } if tf.controller == Some(ControllerRef::You)
         ),

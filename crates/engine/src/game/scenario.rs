@@ -703,6 +703,43 @@ impl GameScenario {
         builder
     }
 
+    /// CR 301.1: Add an artifact to the battlefield with abilities parsed from
+    /// Oracle text. Mirrors [`Self::add_enchantment_from_oracle`]; needed when
+    /// an artifact's own registered activated ability (not a cast) is under
+    /// test — e.g. Scroll of Fate's "{T}: Manifest a card from your hand."
+    pub fn add_artifact_from_oracle(
+        &mut self,
+        player: PlayerId,
+        name: &str,
+        oracle_text: &str,
+    ) -> CardBuilder<'_> {
+        let card_id = CardId(self.state.next_object_id);
+        let id = create_object(
+            &mut self.state,
+            card_id,
+            player,
+            name.to_string(),
+            Zone::Battlefield,
+        );
+        let ts = self.state.next_timestamp();
+        let entered_turn = self.state.turn_number.saturating_sub(1);
+        let obj = self.state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Artifact);
+        obj.base_card_types = obj.card_types.clone();
+        obj.timestamp = ts;
+        obj.entered_battlefield_turn = Some(entered_turn);
+        // A pre-existing permanent (entered on a prior turn), matching the
+        // enchantment/land builders (CR 302.6 gates only creatures).
+        obj.summoning_sick = false;
+
+        let mut builder = CardBuilder {
+            state: &mut self.state,
+            id,
+        };
+        builder.from_oracle_text(oracle_text);
+        builder
+    }
+
     /// CR 306.1 + CR 306.5b: Add a planeswalker to the battlefield with its
     /// loyalty abilities parsed from Oracle text and `loyalty` loyalty counters
     /// already on it.
@@ -879,6 +916,22 @@ impl GameScenario {
         is_instant: bool,
     ) -> CardBuilder<'_> {
         self.add_spell_to_zone(player, name, is_instant, Zone::Graveyard)
+    }
+
+    /// Add an instant or sorcery directly to a player's exile zone without
+    /// Oracle text or any exile-link record. Used to stage a card that is
+    /// merely SITTING in exile (via some unrelated mechanism) so tests can
+    /// prove a `TargetFilter::ExiledBySource`-scoped cast permission does not
+    /// accidentally widen to "any eligible card in exile".
+    ///
+    /// Use `is_instant: true` for instants, `false` for sorceries.
+    pub fn add_spell_to_exile(
+        &mut self,
+        player: PlayerId,
+        name: &str,
+        is_instant: bool,
+    ) -> CardBuilder<'_> {
+        self.add_spell_to_zone(player, name, is_instant, Zone::Exile)
     }
 
     fn add_spell_to_zone(
@@ -1909,6 +1962,8 @@ impl GameRunner {
             WaitingFor::ReturnAsAuraTarget { .. } => "ReturnAsAuraTarget",
             WaitingFor::EquipTarget { .. } => "EquipTarget",
             WaitingFor::ScryChoice { .. } => "ScryChoice",
+            WaitingFor::RippleRevealChoice { .. } => "RippleRevealChoice",
+            WaitingFor::RippleBottomOrder { .. } => "RippleBottomOrder",
             WaitingFor::ArrangePlanarDeckTopChoice { .. } => "ArrangePlanarDeckTopChoice",
             WaitingFor::RedistributeLifeTotals { .. } => "RedistributeLifeTotals",
             WaitingFor::CoinFlipKeepChoice { .. } => "CoinFlipKeepChoice",
@@ -2099,6 +2154,7 @@ impl GameRunner {
             WaitingFor::SeparatePilesPartition { .. } => "SeparatePilesPartition",
             WaitingFor::SeparatePilesChoice { .. } => "SeparatePilesChoice",
             WaitingFor::ActivationCostOneOfChoice { .. } => "ActivationCostOneOfChoice",
+            WaitingFor::ResolutionOptionalPaymentChoice { .. } => "ResolutionOptionalPaymentChoice",
         }
     }
 
@@ -3090,6 +3146,7 @@ pub struct AbilityActivation<'a> {
     pay_with: Vec<ObjectId>,
     search_pick: SearchPolicy,
     optional: OptionalPolicy,
+    named_choice: Option<String>,
     spellbook_pick: Option<String>,
 }
 
@@ -3106,6 +3163,7 @@ impl<'a> AbilityActivation<'a> {
             pay_with: Vec::new(),
             search_pick: SearchPolicy::default(),
             optional: OptionalPolicy::default(),
+            named_choice: None,
             spellbook_pick: None,
         }
     }
@@ -3177,6 +3235,14 @@ impl<'a> AbilityActivation<'a> {
         self
     }
 
+    /// Choose a named/string option at a `NamedChoice` prompt during
+    /// resolution. Mirrors [`SpellCast::choose_option`]; the shared
+    /// [`drive_resolution`] honours [`ResolutionPolicy::named_choice`].
+    pub fn choose_option(mut self, choice: &str) -> Self {
+        self.named_choice = Some(choice.to_string());
+        self
+    }
+
     /// Draft this card name at any `SpellbookDraft` prompt during resolution
     /// (Alchemy `Effect::DraftFromSpellbook`). Mirrors [`SpellCast::spellbook_pick`].
     pub fn spellbook_pick(mut self, name: &str) -> Self {
@@ -3198,6 +3264,7 @@ impl<'a> AbilityActivation<'a> {
             pay_with,
             search_pick,
             optional,
+            named_choice,
             spellbook_pick,
         } = self;
 
@@ -3336,7 +3403,7 @@ impl<'a> AbilityActivation<'a> {
             search_pick,
             optional,
             replacement_choice: None,
-            named_choice: None,
+            named_choice,
             discard_cards: Vec::new(),
             effect_zone_cards: Vec::new(),
             copy_target: None,

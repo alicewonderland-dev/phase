@@ -1,7 +1,8 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 
 import { useCardImage } from "../../hooks/useCardImage";
+import { getCardImageSrcSetProps } from "../card/cardImageSrcSet.ts";
 import { usePrintingsLoaded } from "../../hooks/usePrintingsLoaded";
 import { hasAlternatePrintingsSync, resolveOracleIdSync } from "../../services/scryfall";
 import type { DeckEntry, ParsedDeck } from "../../services/deckParser";
@@ -32,6 +33,8 @@ interface DeckStackProps {
   format?: GameFormat;
   /** Whether the main deck is sub-grouped by card type or by color. */
   groupMode: GroupMode;
+  /** Stable deck surface restored after the nested printing picker closes. */
+  pickerReturnFocusRef?: RefObject<HTMLElement | SVGElement | null>;
 }
 
 type DeckStackSection = "commander" | "main" | "sideboard";
@@ -181,7 +184,7 @@ function DeckStackCard({
   onContextMenu?: (cardName: string, x: number, y: number) => void;
 }) {
   const { t } = useTranslation("deck-builder");
-  const { src, isLoading } = useCardImage(item.name, { size: "normal", sourcePrinting: item.sourcePrinting });
+  const { src, isLoading, rungs, advanceFailedSource } = useCardImage(item.name, { size: "normal", sourcePrinting: item.sourcePrinting });
   const printingsLoaded = usePrintingsLoaded();
   const oracleId = printingsLoaded ? resolveOracleIdSync(item.name) : null;
   const hasAlternates = oracleId ? hasAlternatePrintingsSync(oracleId) : false;
@@ -298,8 +301,10 @@ function DeckStackCard({
         ) : (
           <img
             src={src}
+            {...getCardImageSrcSetProps(src, rungs)}
             alt={item.name}
             draggable={false}
+            onError={() => advanceFailedSource?.(src)}
             className="object-cover"
             style={{ height: CARD_HEIGHT, width: CARD_WIDTH }}
           />
@@ -446,6 +451,7 @@ export function DeckStack({
   onCardHover,
   format,
   groupMode,
+  pickerReturnFocusRef,
 }: DeckStackProps) {
   const { t } = useTranslation("deck-builder");
   const isMaybeboard = isMaybeboardPolicy(useSideboardPolicy(format));
@@ -597,6 +603,7 @@ export function DeckStack({
           oracleId={pickerCard.oracleId}
           onCardHover={onCardHover}
           onClose={() => setPickerCard(null)}
+          returnFocusRef={pickerReturnFocusRef}
         />
       )}
     </div>

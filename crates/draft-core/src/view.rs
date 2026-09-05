@@ -1,7 +1,12 @@
 use engine::types::player::PlayerId;
 use serde::{Deserialize, Serialize};
 
+use crate::pick_pass::required_pick_count;
+use crate::session::{concession_set_codes, session_concessions};
 use crate::types::*;
+// Deep-path import by design: `engine::game::mod` re-exports `deck_validation`'s
+// public surface, but this phase must not edit that file.
+use engine::game::deck_validation::GrantableCommanderFiller;
 use engine::types::match_config::MatchConfig;
 
 /// A single entry in the standings table.
@@ -42,6 +47,13 @@ pub struct SeatPublicView {
     pub connected: bool,
     pub has_submitted_deck: bool,
     pub pick_status: PickStatus,
+    /// Engine-owned presence signal for a pack a seat is actively drafting.
+    ///
+    /// This deliberately exposes only `0` or `1`, never the pack's card
+    /// count or identity. It is `1` precisely while the session is drafting
+    /// and this seat has a nonempty current pack that it has not picked from in
+    /// the current round; otherwise it is `0`.
+    pub active_pack_count: u8,
     /// CR 905.2c: Draft cards that remain face up are visible to every player.
     pub face_up_draft_cards: Vec<DraftCardInstance>,
 }
@@ -80,6 +92,16 @@ pub enum DraftPoolGroupKind {
     ManaValue6Plus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftRarityGroupKind {
+    Mythic,
+    Rare,
+    Uncommon,
+    Common,
+    RarityOther,
+}
+
 /// One distinct card and the number of copies in a pool group.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DraftPoolEntry {
@@ -116,6 +138,43 @@ pub struct DraftPoolColorCounts {
     pub green: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DraftWorkspaceCapabilities {
+    pub rarity_group_order: Option<Vec<DraftRarityGroupKind>>,
+}
+
+impl<'de> Deserialize<'de> for DraftWorkspaceCapabilities {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireCapabilities {
+            #[serde(deserialize_with = "deserialize_required_nullable")]
+            rarity_group_order: Option<Vec<DraftRarityGroupKind>>,
+        }
+
+        let wire = WireCapabilities::deserialize(deserializer)?;
+        Ok(Self {
+            rarity_group_order: wire.rarity_group_order,
+        })
+    }
+}
+
+fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftWorkspaceRowClassification {
+    pub creature_instance_ids: Vec<String>,
+    pub noncreature_instance_ids: Vec<String>,
+}
+
 /// Pre-grouped, ordered presentation data for a player's limited pool.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DraftPoolGroups {
@@ -140,20 +199,77 @@ pub struct DraftPoolGroups {
     #[serde(default)]
     pub color_filter_options: Vec<DraftPoolGroupKind>,
     pub color_counts: DraftPoolColorCounts,
+    #[serde(default)]
+    pub workspace_capabilities: DraftWorkspaceCapabilities,
+    #[serde(default)]
+    pub workspace_row_classification: DraftWorkspaceRowClassification,
+}
+
+/// A source description that may cross a player or spectator boundary.
+///
+/// This is deliberately distinct from [`DraftSource`]. A persisted Chaos
+/// source contains every seat's future booster assignments; that authoritative
+/// layout belongs to the host snapshot, never to an ordinary draft view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum DraftSourceView {
+    Set { layout: SetLayoutView },
+    Cube { id: String, name: String },
+}
+
+/// The view-safe portion of a set source.
+///
+/// `Chaos` records the candidate intent everywhere, the viewer's currently
+/// opened booster while drafting, and their completed sequence only after all
+/// picks are over. It intentionally has no representation for another seat's
+/// assignment or any unopened booster.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SetLayoutView {
+    UniformByRound {
+        codes: Vec<String>,
+    },
+    Chaos {
+        candidate_codes: Vec<String>,
+        current_pack_code: Option<String>,
+        completed_own_pack_codes: Option<Vec<String>>,
+        actual_set_codes: Option<Vec<String>>,
+    },
 }
 
 impl DraftPoolGroups {
     /// Builds the engine-owned ordering, grouping, and duplicate counts for a
     /// limited pool display.
-    pub fn from_pool(pool: &[DraftCardInstance]) -> Self {
+    pub fn from_pool(pool: &[DraftCardInstance], source: &DraftSource) -> Self {
+        let (rarity_groups, rarity_group_order) = match source {
+            DraftSource::Set { .. } => (
+                source_order_groups_for(pool, &RARITY_GROUP_ORDER, rarity_group),
+                Some(RARITY_CAPABILITY_ORDER.to_vec()),
+            ),
+            DraftSource::Cube { .. } => (Vec::new(), None),
+        };
+        let mut creature_instance_ids = Vec::new();
+        let mut noncreature_instance_ids = Vec::new();
+        for card in pool {
+            if type_memberships(card).contains(&DraftPoolGroupKind::Creature) {
+                creature_instance_ids.push(card.instance_id.clone());
+            } else {
+                noncreature_instance_ids.push(card.instance_id.clone());
+            }
+        }
+
         Self {
             color_groups: groups_for(pool, &COLOR_GROUP_ORDER, color_group, true),
             type_groups: groups_for(pool, &TYPE_GROUP_ORDER, type_group, true),
             cmc_groups: groups_for(pool, &CMC_GROUP_ORDER, mana_value_group, false),
-            rarity_groups: groups_for(pool, &RARITY_GROUP_ORDER, rarity_group, true),
+            rarity_groups,
             type_filter_options: type_filter_options(pool),
             color_filter_options: color_filter_options(pool),
             color_counts: color_counts(pool),
+            workspace_capabilities: DraftWorkspaceCapabilities { rarity_group_order },
+            workspace_row_classification: DraftWorkspaceRowClassification {
+                creature_instance_ids,
+                noncreature_instance_ids,
+            },
         }
     }
 }
@@ -235,6 +351,17 @@ pub struct DraftPlayerView {
     pub status: DraftStatus,
     /// Draft kind (Quick/Premier/Traditional/Sealed)
     pub kind: DraftKind,
+    /// View-safe source metadata. This is never the persisted `DraftSource`:
+    /// Chaos assignment matrices remain host-only.
+    pub source: DraftSourceView,
+    /// Engine-authorized post-draft game launch. This is a procedure-derived
+    /// capability, not a client inference from the draft-kind label: a
+    /// completed pod only offers a game when the procedure says it can.
+    pub launch_capability: DraftLaunchCapability,
+    /// CR 903.3 / CR 903.13f: number of commanders the deck must designate
+    /// under this draft procedure. This is a count, not a boolean, because
+    /// Commander deck construction can require multiple designated cards.
+    pub commanders_required: u8,
     /// Which pack round (0, 1, 2)
     pub current_pack_number: u8,
     /// Which pick within the current pack
@@ -243,6 +370,19 @@ pub struct DraftPlayerView {
     pub pass_direction: PassDirection,
     /// The viewer's current pack (None if between packs or not their turn)
     pub current_pack: Option<Vec<DraftCardInstance>>,
+    /// CR 903.13b: how many cards the viewer's next pick step takes from
+    /// `current_pack` — `min(cards_per_pick, remaining pack size)`, the exact
+    /// count `pick_pass::apply_pick_inner` enforces. 0 when there is no
+    /// pending pack.
+    ///
+    /// Published so the display layer never re-derives it: the count is 1 for
+    /// the four CR 905.1a kinds, 2 for `CommanderDraft`, and drops to 1 on an
+    /// odd pack's final step — a distinction no per-kind lookup can make.
+    pub required_pick_count: usize,
+    /// Engine-owned selection interaction for this draft procedure. This stays
+    /// ordered for Commander Draft's one-card final step, unlike
+    /// `required_pick_count`.
+    pub pick_selection_mode: PickSelectionMode,
     /// The viewer's drafted pool
     pub pool: Vec<DraftCardInstance>,
     /// Drafted cards whose effects can be activated during a later pick.
@@ -256,14 +396,72 @@ pub struct DraftPlayerView {
     pub sealed_packs: Option<Vec<Vec<DraftCardInstance>>>,
     /// Public info for all seats
     pub seats: Vec<SeatPublicView>,
-    /// Total cards per pack (for UI progress display)
+    /// Cards in the booster currently being drafted (for UI progress display).
+    /// Multi-set drafts mix booster sizes, so this tracks `current_pack_number`
+    /// rather than describing the session as a whole — see `pack_sizes`.
     pub cards_per_pack: u8,
+    /// Cards in each booster of the session, in pack order. Engine-derived so
+    /// clients render per-pack progress without reconstructing pack shape.
+    pub pack_sizes: Vec<u8>,
+    /// The set filling each booster, in pack order. Multi-set drafts open a
+    /// different set each round; single-set drafts repeat one code. Cube
+    /// sources report the cube id for every pack.
+    pub pack_set_codes: Vec<String>,
+    /// CR 903.13b: pick STEPS in each booster, in pack order — the per-pack
+    /// counterpart of `pick_steps_per_pack`. A progress display measures each
+    /// booster against this, never against `pack_sizes`: the two differ
+    /// whenever a kind takes more than one card per step.
+    pub pack_pick_steps: Vec<u8>,
+    /// CR 903.13b: how many pick STEPS the booster currently being drafted
+    /// contains for this kind — `cards_per_pack.div_ceil(cards_per_pick)`.
+    /// `pick_number` counts steps, not cards, so this is the denominator a
+    /// progress display can actually reach: a 14-card Commander pack is 7
+    /// steps, not 14. Derived from `cards_per_pack`, so it tracks
+    /// `current_pack_number` for the same reason that field does — a multi-set
+    /// draft whose packs differ in size also differs in step count per pack.
+    ///
+    /// Published so the display layer never re-derives it. A client that
+    /// divided `cards_per_pack` itself would be a second authority for
+    /// CR 903.13b's step rule, and it would be right for the four CR 905.1a
+    /// kinds and wrong by 2x for `CommanderDraft`.
+    pub pick_steps_per_pack: u8,
     /// Total pack count (for UI progress display)
     pub pack_count: u8,
     /// Minimum main deck size for this draft.
     pub min_deck_size: usize,
     /// Cards available in unlimited quantity during deck construction.
     pub addable_cards: Vec<String>,
+    /// CR 903.13e: every commander filler this draft's booster sets grant, and
+    /// each one's cap. EMPTY when no contained set grants one.
+    ///
+    /// Plural because CR 903.13e states its grants per contained set: a draft
+    /// that opened Commander Masters and Battle for Baldur's Gate boosters
+    /// satisfies both conditions and concedes both cards.
+    ///
+    /// Deliberately NOT folded into `addable_cards`, whose contract is
+    /// *unlimited quantity* -- the exact property CR 903.13e denies. Engine-
+    /// derived: the client must never re-derive it from the set codes.
+    /// Rendered by `PoolPanel` (the grant lines) and by `LimitedDeckBuilder`
+    /// (the addable list); the caps and the CR 903.13e commander-condition stay
+    /// engine-enforced in `validate_limited_deck`.
+    pub grantable_commander_fillers: Vec<GrantableCommanderFiller>,
+    /// CR 903.13f(3): every set this draft was latched to, as OPAQUE courier
+    /// tokens for the engine functions that map contained sets to a
+    /// deck-construction concession (`commanderPartnerCandidates`). EMPTY for
+    /// a cube and for every kind outside CR 903.13's scope.
+    ///
+    /// Plural for the same reason as `grantable_commander_fillers`: both rules
+    /// ask what the draft CONTAINED, and a mixed-set draft contained all of
+    /// them. Publishing one representative would silently drop the grants the
+    /// others make.
+    ///
+    /// The display layer passes them back to the engine and NEVER interprets
+    /// them: which sets grant what is engine knowledge, tabled once in
+    /// `deck_validation::DRAFT_SET_CONCESSIONS`. In particular they must never
+    /// be reconstructed from a pool card's `set_code` -- the filler cards are
+    /// printed in the granting sets' own boosters, so a card's printing is
+    /// evidence of the grant in neither direction.
+    pub draft_set_codes: Vec<String>,
     /// Milliseconds remaining on the pick timer. Always None from the reducer;
     /// the P2P host injects the authoritative value on the wire.
     pub timer_remaining_ms: Option<u32>,
@@ -271,6 +469,13 @@ pub struct DraftPlayerView {
     pub standings: Vec<StandingEntry>,
     /// Current tournament round (0 = not started).
     pub current_round: u8,
+    /// The round pairings may next be generated for. Engine-derived from the
+    /// single authority (`DraftSession::next_pairing_round`) so clients never
+    /// recompute it. Always >= 1. Published unconditionally, so once `status`
+    /// is `Complete` it names a round that can never be generated
+    /// (`apply_generate_pairings` accepts only `Deckbuilding`/`Pairing`/
+    /// `RoundComplete`) — read `current_round` on a finished pod.
+    pub next_pairing_round: u8,
     /// Tournament format from config.
     pub tournament_format: TournamentFormat,
     /// Pod policy from config.
@@ -281,25 +486,187 @@ pub struct DraftPlayerView {
     pub match_config: MatchConfig,
 }
 
-/// Re-export SpectatorVisibility from types for convenience.
-pub use crate::types::SpectatorVisibility;
+/// Re-export view-facing types from `types` for convenience.
+pub use crate::types::{DraftLaunchCapability, SpectatorVisibility};
+
+/// Whether the draft has finished assigning boosters. Only then may a player
+/// learn their completed Chaos sequence and the actual pod-wide set union.
+/// Lobby, drafting, paused, and abandoned sessions can still contain unopened
+/// boosters, so those states deliberately retain only the candidate intent.
+fn chaos_assignments_are_complete(status: DraftStatus) -> bool {
+    matches!(
+        status,
+        DraftStatus::Deckbuilding
+            | DraftStatus::Pairing
+            | DraftStatus::MatchInProgress
+            | DraftStatus::RoundComplete
+            | DraftStatus::Complete
+    )
+}
+
+fn set_source_view_for_player(
+    layout: &SetLayout,
+    status: DraftStatus,
+    seat_index: u8,
+    current_pack_number: u8,
+    current_pack_origin: Option<u8>,
+) -> SetLayoutView {
+    match layout {
+        SetLayout::UniformByRound { codes } => SetLayoutView::UniformByRound {
+            codes: codes.clone(),
+        },
+        SetLayout::Chaos {
+            candidate_codes,
+            assignments,
+        } => {
+            let assignments_complete = chaos_assignments_are_complete(status);
+            SetLayoutView::Chaos {
+                candidate_codes: candidate_codes.clone(),
+                current_pack_code: (status == DraftStatus::Drafting)
+                    .then(|| {
+                        current_pack_origin.and_then(|origin| {
+                            assignments
+                                .get(usize::from(origin))
+                                .and_then(|rounds| rounds.get(usize::from(current_pack_number)))
+                                .cloned()
+                        })
+                    })
+                    .flatten(),
+                completed_own_pack_codes: assignments_complete
+                    .then(|| assignments.get(usize::from(seat_index)).cloned())
+                    .flatten(),
+                actual_set_codes: assignments_complete.then(|| {
+                    layout
+                        .actual_set_codes()
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                }),
+            }
+        }
+    }
+}
+
+fn source_view_for_player(session: &DraftSession, seat_index: u8) -> DraftSourceView {
+    match &session.config.source {
+        DraftSource::Set { layout } => DraftSourceView::Set {
+            layout: set_source_view_for_player(
+                layout,
+                session.status,
+                seat_index,
+                session.current_pack_number,
+                current_pack_origin(session, seat_index),
+            ),
+        },
+        DraftSource::Cube { id, name } => DraftSourceView::Cube {
+            id: id.clone(),
+            name: name.clone(),
+        },
+    }
+}
+
+/// The opening seat of a player's live booster. A Chaos assignment belongs to
+/// this origin, not the seat holding the booster after a pass.
+fn current_pack_origin(session: &DraftSession, seat_index: u8) -> Option<u8> {
+    session
+        .current_pack
+        .get(usize::from(seat_index))
+        .and_then(Option::as_ref)
+        .filter(|pack| !pack.0.is_empty())?;
+    session
+        .current_pack_origins
+        .get(usize::from(seat_index))
+        .copied()
+        .flatten()
+}
+
+fn source_view_for_spectator(session: &DraftSession) -> DraftSourceView {
+    match &session.config.source {
+        DraftSource::Set { layout } => DraftSourceView::Set {
+            layout: match layout {
+                SetLayout::UniformByRound { codes } => SetLayoutView::UniformByRound {
+                    codes: codes.clone(),
+                },
+                SetLayout::Chaos {
+                    candidate_codes, ..
+                } => SetLayoutView::Chaos {
+                    candidate_codes: candidate_codes.clone(),
+                    current_pack_code: None,
+                    completed_own_pack_codes: None,
+                    actual_set_codes: None,
+                },
+            },
+        },
+        DraftSource::Cube { id, name } => DraftSourceView::Cube {
+            id: id.clone(),
+            name: name.clone(),
+        },
+    }
+}
+
+/// Legacy progress metadata that remains safe for every viewer.
+///
+/// Uniform drafts expose their round sequence as before. Chaos intentionally
+/// returns no sequence: callers must use `DraftSourceView`'s scoped values
+/// instead of accidentally treating seat zero's schedule as public.
+fn visible_pack_set_codes(session: &DraftSession) -> Vec<String> {
+    match &session.config.source {
+        DraftSource::Set {
+            layout: SetLayout::UniformByRound { .. },
+        }
+        | DraftSource::Cube { .. } => session.pack_set_code_sequence(),
+        DraftSource::Set {
+            layout: SetLayout::Chaos { .. },
+        } => Vec::new(),
+    }
+}
+
+fn visible_chaos_concessions(session: &DraftSession) -> bool {
+    !matches!(
+        &session.config.source,
+        DraftSource::Set {
+            layout: SetLayout::Chaos { .. }
+        }
+    ) || chaos_assignments_are_complete(session.status)
+}
 
 /// Filtered view for spectators watching a draft.
 ///
 /// Public mode hides all private information (pools, packs).
-/// Omniscient mode exposes all pools and current packs for all seats.
+/// Omniscient mode exposes all pools and current packs for all seats, except
+/// Chaos sources: a spectator connection is not an authenticated host export,
+/// so Chaos keeps every assignment-bearing card view private.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpectatorDraftView {
     pub status: DraftStatus,
     pub kind: DraftKind,
+    /// View-safe source metadata. A Chaos spectator receives candidate intent,
+    /// never any seat's assignment or future booster identity.
+    pub source: DraftSourceView,
     pub current_pack_number: u8,
     pub pick_number: u8,
     pub pass_direction: PassDirection,
     pub seats: Vec<SeatPublicView>,
+    /// Cards in the booster currently being drafted. See
+    /// [`DraftPlayerView::cards_per_pack`].
     pub cards_per_pack: u8,
+    /// Cards in each booster of the session, in pack order.
+    pub pack_sizes: Vec<u8>,
+    /// The set filling each booster, in pack order.
+    pub pack_set_codes: Vec<String>,
+    /// CR 903.13b: mirrors `DraftPlayerView::pack_pick_steps`; see that field.
+    pub pack_pick_steps: Vec<u8>,
+    /// CR 903.13b: mirrors `DraftPlayerView::pick_steps_per_pack`; see that
+    /// field. Present on both views because `DraftProgress` renders either
+    /// shape through one shared prop contract.
+    pub pick_steps_per_pack: u8,
     pub pack_count: u8,
     pub min_deck_size: usize,
     pub addable_cards: Vec<String>,
+    /// CR 903.13e: every commander filler this draft's booster sets grant, and
+    /// each one's cap. Chaos spectators receive an empty list: those grants
+    /// are published only to a deckbuilding owner once all assignments finish.
+    pub grantable_commander_fillers: Vec<GrantableCommanderFiller>,
     pub standings: Vec<StandingEntry>,
     pub current_round: u8,
     pub tournament_format: TournamentFormat,
@@ -363,6 +730,13 @@ pub fn filter_for_spectator(
                     .map(|pid| session.submitted_decks.contains_key(&pid))
                     .unwrap_or(false),
                 pick_status,
+                active_pack_count: u8::from(
+                    is_drafting
+                        && session.current_pack[i]
+                            .as_ref()
+                            .is_some_and(|pack| !pack.0.is_empty())
+                        && !session.seats_picked_this_round.get(i as u8),
+                ),
                 face_up_draft_cards: face_up_draft_cards(&session.pools[i]),
             }
         })
@@ -371,9 +745,15 @@ pub fn filter_for_spectator(
     let standings = compute_standings(session);
     let pairings = compute_pairing_views(session);
 
-    let (pools, current_packs) = match visibility {
-        SpectatorVisibility::Public => (None, None),
-        SpectatorVisibility::Omniscient => {
+    let chaos_source = matches!(
+        &session.config.source,
+        DraftSource::Set {
+            layout: SetLayout::Chaos { .. }
+        }
+    );
+    let (pools, current_packs) = match (visibility, chaos_source) {
+        (_, true) | (SpectatorVisibility::Public, false) => (None, None),
+        (SpectatorVisibility::Omniscient, false) => {
             let pools = Some(session.pools.clone());
             let packs = Some(
                 session
@@ -389,14 +769,31 @@ pub fn filter_for_spectator(
     SpectatorDraftView {
         status: session.status,
         kind: session.kind,
+        source: source_view_for_spectator(session),
         current_pack_number: session.current_pack_number,
         pick_number: session.pick_number,
         pass_direction: session.pass_direction,
         seats,
-        cards_per_pack: session.config.cards_per_pack,
+        cards_per_pack: session.cards_in_pack(session.current_pack_number),
+        pack_sizes: session.pack_size_sequence(),
+        pack_set_codes: visible_pack_set_codes(session),
+        pack_pick_steps: session.pack_pick_step_sequence(),
+        pick_steps_per_pack: session
+            .kind
+            .procedure()
+            .pick_steps_per_pack(session.cards_in_pack(session.current_pack_number)),
         pack_count: session.config.pack_count,
         min_deck_size: session.config.min_deck_size,
         addable_cards: session.config.addable_cards.display_names(),
+        // CR 903.13e: read from the latch, never re-derived here.
+        grantable_commander_fillers: matches!(
+            &session.config.source,
+            DraftSource::Set {
+                layout: SetLayout::Chaos { .. }
+            }
+        )
+        .then(Vec::new)
+        .unwrap_or_else(|| session_concessions(session).fillers),
         standings,
         current_round: session.current_round,
         tournament_format: session.config.tournament_format,
@@ -406,6 +803,33 @@ pub fn filter_for_spectator(
         pools,
         current_packs,
     }
+}
+
+/// Split a sealed pool back into the boosters it was opened from.
+///
+/// Sealed pools are stored flat, in opening order. A multi-set sealed event
+/// mixes booster sizes, so the split follows the per-pack sizes the session
+/// recorded rather than a single chunk width. Any remainder (a pool that does
+/// not match the recorded sizes) is returned as a final pack so no card is
+/// silently dropped from the display.
+fn split_by_pack_size(
+    pool: &[DraftCardInstance],
+    session: &DraftSession,
+) -> Vec<Vec<DraftCardInstance>> {
+    let mut packs = Vec::with_capacity(usize::from(session.config.pack_count));
+    let mut rest = pool;
+    for size in session.pack_size_sequence() {
+        if rest.is_empty() {
+            break;
+        }
+        let (pack, remainder) = rest.split_at(usize::from(size).min(rest.len()));
+        packs.push(pack.to_vec());
+        rest = remainder;
+    }
+    if !rest.is_empty() {
+        packs.push(rest.to_vec());
+    }
+    packs
 }
 
 /// Produce a filtered view of the draft session for a specific seat.
@@ -424,20 +848,27 @@ pub fn filter_for_spectator(
 pub fn filter_for_player(session: &DraftSession, seat_index: u8) -> DraftPlayerView {
     let idx = seat_index as usize;
 
-    let current_pack = session
-        .current_pack
-        .get(idx)
-        .and_then(|p| p.as_ref())
-        .map(|p| p.0.clone());
+    let current_pack =
+        session
+            .current_pack
+            .get(idx)
+            .and_then(|p| p.as_ref())
+            .map(|p| match &session.config.source {
+                DraftSource::Set { .. } => set_pack_in_rarity_order(&p.0),
+                DraftSource::Cube { .. } => p.0.clone(),
+            });
 
     let pool = session.pools.get(idx).cloned().unwrap_or_default();
     let draft_effects = face_up_draft_cards(&pool);
-    let sealed_packs = (session.kind == DraftKind::Sealed).then(|| {
-        pool.chunks(usize::from(session.config.cards_per_pack))
-            .map(ToOwned::to_owned)
-            .collect()
-    });
-    let pool_groups = DraftPoolGroups::from_pool(&pool);
+    // Only an all-at-once kind has unopened packs to project onto the view; a
+    // pick-and-pass kind's pool is not chunked into packs. The split follows the
+    // per-pack sizes the session recorded rather than a single uniform chunk
+    // width, because a multi-set event's boosters differ in size.
+    let sealed_packs = match session.kind.procedure().distribution {
+        PackDistribution::AllAtOnce => Some(split_by_pack_size(&pool, session)),
+        PackDistribution::PickAndPass => None,
+    };
+    let pool_groups = DraftPoolGroups::from_pool(&pool, &session.config.source);
 
     let is_drafting = session.status == DraftStatus::Drafting;
 
@@ -480,6 +911,13 @@ pub fn filter_for_player(session: &DraftSession, seat_index: u8) -> DraftPlayerV
                     .map(|pid| session.submitted_decks.contains_key(&pid))
                     .unwrap_or(false),
                 pick_status,
+                active_pack_count: u8::from(
+                    is_drafting
+                        && session.current_pack[i]
+                            .as_ref()
+                            .is_some_and(|pack| !pack.0.is_empty())
+                        && !session.seats_picked_this_round.get(i as u8),
+                ),
                 face_up_draft_cards: face_up_draft_cards(&session.pools[i]),
             }
         })
@@ -494,22 +932,51 @@ pub fn filter_for_player(session: &DraftSession, seat_index: u8) -> DraftPlayerV
     DraftPlayerView {
         status: session.status,
         kind: session.kind,
+        source: source_view_for_player(session, seat_index),
+        launch_capability: session.kind.procedure().launch_capability(),
+        commanders_required: session.kind.procedure().commanders_required,
         current_pack_number: session.current_pack_number,
         pick_number: session.pick_number,
         pass_direction: session.pass_direction,
         current_pack,
+        required_pick_count: required_pick_count(session, seat_index),
+        pick_selection_mode: session.kind.procedure().pick_selection_mode,
         pool,
         draft_effects,
         pool_groups,
         sealed_packs,
         seats,
-        cards_per_pack: session.config.cards_per_pack,
+        cards_per_pack: session.cards_in_pack(session.current_pack_number),
+        pack_sizes: session.pack_size_sequence(),
+        pack_set_codes: visible_pack_set_codes(session),
+        pack_pick_steps: session.pack_pick_step_sequence(),
+        pick_steps_per_pack: session
+            .kind
+            .procedure()
+            .pick_steps_per_pack(session.cards_in_pack(session.current_pack_number)),
         pack_count: session.config.pack_count,
         min_deck_size: session.config.min_deck_size,
         addable_cards: session.config.addable_cards.display_names(),
+        // CR 903.13e: read from the latch, never re-derived here.
+        grantable_commander_fillers: if visible_chaos_concessions(session) {
+            session_concessions(session).fillers
+        } else {
+            Vec::new()
+        },
+        // CR 903.13f(3): the same latch, published for the engine's partner
+        // query. Owned strings because the view is owned.
+        draft_set_codes: if visible_chaos_concessions(session) {
+            concession_set_codes(session)
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        } else {
+            Vec::new()
+        },
         timer_remaining_ms: None,
         standings,
         current_round: session.current_round,
+        next_pairing_round: session.next_pairing_round(),
         tournament_format: session.config.tournament_format,
         pod_policy: session.config.pod_policy,
         pairings,
@@ -553,6 +1020,14 @@ const RARITY_GROUP_ORDER: [DraftPoolGroupKind; 5] = [
     DraftPoolGroupKind::RarityOther,
 ];
 
+const RARITY_CAPABILITY_ORDER: [DraftRarityGroupKind; 5] = [
+    DraftRarityGroupKind::Mythic,
+    DraftRarityGroupKind::Rare,
+    DraftRarityGroupKind::Uncommon,
+    DraftRarityGroupKind::Common,
+    DraftRarityGroupKind::RarityOther,
+];
+
 const CMC_GROUP_ORDER: [DraftPoolGroupKind; 7] = [
     DraftPoolGroupKind::ManaValue0,
     DraftPoolGroupKind::ManaValue1,
@@ -583,6 +1058,61 @@ fn groups_for(
                 total,
                 cards: sorted_entries(cards, sort_by_cmc),
             })
+        })
+        .collect()
+}
+
+fn source_order_groups_for(
+    pool: &[DraftCardInstance],
+    order: &[DraftPoolGroupKind],
+    classify: fn(&DraftCardInstance) -> DraftPoolGroupKind,
+) -> Vec<DraftPoolGroup> {
+    order
+        .iter()
+        .filter_map(|kind| {
+            let cards: Vec<_> = pool
+                .iter()
+                .filter(|card| classify(card) == *kind)
+                .cloned()
+                .collect();
+            let total = cards.len();
+            (!cards.is_empty()).then(|| DraftPoolGroup {
+                kind: *kind,
+                total,
+                cards: source_order_entries(cards),
+            })
+        })
+        .collect()
+}
+
+fn source_order_entries(cards: Vec<DraftCardInstance>) -> Vec<DraftPoolEntry> {
+    let mut entries: Vec<DraftPoolEntry> = Vec::new();
+    for card in cards {
+        if let Some(entry) = entries
+            .last_mut()
+            .filter(|entry| entry.card.name == card.name)
+        {
+            entry.count += 1;
+            entry.instance_ids.push(card.instance_id.clone());
+        } else {
+            let instance_ids = vec![card.instance_id.clone()];
+            entries.push(DraftPoolEntry {
+                card,
+                count: 1,
+                instance_ids,
+            });
+        }
+    }
+    entries
+}
+
+fn set_pack_in_rarity_order(pack: &[DraftCardInstance]) -> Vec<DraftCardInstance> {
+    RARITY_GROUP_ORDER
+        .iter()
+        .flat_map(|kind| {
+            pack.iter()
+                .filter(move |card| rarity_group(card) == *kind)
+                .cloned()
         })
         .collect()
 }
@@ -927,9 +1457,7 @@ mod tests {
 
     fn test_session(pod_size: u8) -> (DraftSession, FixturePackSource) {
         let config = DraftConfig {
-            source: DraftSource::Set {
-                code: "TST".to_string(),
-            },
+            source: DraftSource::single_set("TST".to_string()),
             set_code: "TST".to_string(),
             kind: DraftKind::Premier,
             pod_size,
@@ -966,7 +1494,7 @@ mod tests {
             session,
             DraftAction::Pick {
                 seat: 0,
-                card_instance_id: card_id,
+                card_instance_ids: vec![card_id],
             },
             None,
         )
@@ -991,16 +1519,15 @@ mod tests {
     fn view_contains_viewers_current_pack() {
         let (mut session, source) = test_session(8);
         session::apply(&mut session, DraftAction::StartDraft, Some(&source)).unwrap();
+        let actual_pack = session.current_pack[0].as_ref().unwrap().0.clone();
 
         let view = filter_for_player(&session, 0);
         let pack = view.current_pack.unwrap();
         assert_eq!(pack.len(), 14);
-
-        // Verify it matches the actual session data
-        let actual_pack = &session.current_pack[0].as_ref().unwrap().0;
-        for (i, card) in pack.iter().enumerate() {
-            assert_eq!(card.instance_id, actual_pack[i].instance_id);
-        }
+        assert_eq!(session.current_pack[0].as_ref().unwrap().0, actual_pack);
+        assert!(actual_pack.iter().all(|card| pack
+            .iter()
+            .any(|projected| projected.instance_id == card.instance_id)));
     }
 
     #[test]
@@ -1068,7 +1595,7 @@ mod tests {
             draft_card("Field", &[], 0, "Land"),
         ];
 
-        let groups = DraftPoolGroups::from_pool(&pool);
+        let groups = DraftPoolGroups::from_pool(&pool, &DraftSource::single_set("TST"));
 
         assert_eq!(
             groups
@@ -1115,7 +1642,10 @@ mod tests {
         let common_a = draft_card("Adept", &["W"], 2, "Creature — Wizard");
         let common_b = draft_card("Adept", &["W"], 2, "Creature — Wizard");
 
-        let groups = DraftPoolGroups::from_pool(&[mythic, rare, special, common_a, common_b]);
+        let groups = DraftPoolGroups::from_pool(
+            &[mythic, rare, special, common_a, common_b],
+            &DraftSource::single_set("TST"),
+        );
 
         assert_eq!(
             groups
@@ -1133,6 +1663,133 @@ mod tests {
         );
         assert_eq!(groups.rarity_groups[2].cards[0].count, 2);
         assert_eq!(groups.rarity_groups[2].total, 2);
+    }
+
+    #[test]
+    fn set_and_cube_workspace_capabilities_are_source_owned() {
+        let mut adept_first = draft_card("Adept", &["W"], 2, "Artifact Creature — Wizard");
+        adept_first.instance_id = "Adept-1".to_string();
+        let bolt = draft_card("Bolt", &["R"], 1, "Instant");
+        let mut adept_second = draft_card("Adept", &["W"], 2, "Artifact Creature — Wizard");
+        adept_second.instance_id = "Adept-2".to_string();
+        let mut relic = draft_card("Relic", &[], 2, "Artifact");
+        relic.rarity = "rare".to_string();
+        let mut dragon = draft_card("Dragon", &["R"], 6, "Creature — Dragon");
+        dragon.rarity = "mythic".to_string();
+        let mut charm = draft_card("Charm", &["U"], 3, "Instant");
+        charm.rarity = "uncommon".to_string();
+        let mut oddity = draft_card("Oddity", &["U"], 4, "Sorcery");
+        oddity.rarity = "special".to_string();
+        let field = draft_card("Field", &[], 0, "Land");
+        let pack = vec![
+            adept_first.clone(),
+            relic.clone(),
+            bolt.clone(),
+            oddity.clone(),
+            dragon.clone(),
+            charm.clone(),
+        ];
+        let pool = vec![
+            adept_first,
+            bolt,
+            adept_second,
+            relic,
+            dragon,
+            charm,
+            oddity,
+            field,
+        ];
+
+        let (mut set_session, _) = test_session(1);
+        set_session.current_pack[0] = Some(DraftPack(pack.clone()));
+        set_session.pools[0] = pool.clone();
+        let set_view = filter_for_player(&set_session, 0);
+
+        assert_eq!(
+            set_view
+                .current_pack
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|card| card.instance_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Dragon", "Relic", "Charm", "Adept-1", "Bolt", "Oddity"]
+        );
+        assert_eq!(set_session.current_pack[0].as_ref().unwrap().0, pack);
+        assert_eq!(
+            set_view
+                .pool_groups
+                .workspace_capabilities
+                .rarity_group_order,
+            Some(RARITY_CAPABILITY_ORDER.to_vec())
+        );
+        assert_eq!(
+            set_view
+                .pool_groups
+                .rarity_groups
+                .iter()
+                .map(|group| group.kind)
+                .collect::<Vec<_>>(),
+            RARITY_GROUP_ORDER
+        );
+        let common = set_view
+            .pool_groups
+            .rarity_groups
+            .iter()
+            .find(|group| group.kind == DraftPoolGroupKind::Common)
+            .unwrap();
+        assert_eq!(
+            common
+                .cards
+                .iter()
+                .map(|entry| entry.card.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Adept", "Bolt", "Adept", "Field"]
+        );
+        assert_eq!(common.cards[0].instance_ids, vec!["Adept-1"]);
+        assert_eq!(common.cards[2].instance_ids, vec!["Adept-2"]);
+        assert_eq!(
+            common
+                .cards
+                .iter()
+                .flat_map(|entry| entry.instance_ids.iter().map(String::as_str))
+                .collect::<Vec<_>>(),
+            vec!["Adept-1", "Bolt", "Adept-2", "Field"]
+        );
+        assert_eq!(
+            set_view
+                .pool_groups
+                .workspace_row_classification
+                .creature_instance_ids,
+            vec!["Adept-1", "Adept-2", "Dragon"]
+        );
+        assert_eq!(
+            set_view
+                .pool_groups
+                .workspace_row_classification
+                .noncreature_instance_ids,
+            vec!["Bolt", "Relic", "Charm", "Oddity", "Field"]
+        );
+
+        let mut cube_session = set_session;
+        cube_session.config.source = DraftSource::Cube {
+            id: "cube-1".to_string(),
+            name: "Test Cube".to_string(),
+        };
+        let cube_view = filter_for_player(&cube_session, 0);
+        assert_eq!(cube_view.current_pack.unwrap(), pack);
+        assert!(cube_view.pool_groups.rarity_groups.is_empty());
+        assert_eq!(
+            cube_view
+                .pool_groups
+                .workspace_capabilities
+                .rarity_group_order,
+            None
+        );
+        assert_eq!(
+            cube_view.pool_groups.workspace_row_classification,
+            set_view.pool_groups.workspace_row_classification
+        );
     }
 
     #[test]
@@ -1277,7 +1934,7 @@ mod tests {
         // The engine-owned option list offers every membership, in engine
         // order — while the exclusive presentation axis keeps one bucket per
         // card (the Artifact Land sorts under Artifact, not Land).
-        let groups = DraftPoolGroups::from_pool(&pool);
+        let groups = DraftPoolGroups::from_pool(&pool, &DraftSource::single_set("TST"));
         assert_eq!(
             groups.type_filter_options,
             vec![
@@ -1334,7 +1991,7 @@ mod tests {
 
         // The option list offers every membership; the sorted display keeps
         // its exclusive shape (Charm sorts under Multicolor alone).
-        let groups = DraftPoolGroups::from_pool(&pool);
+        let groups = DraftPoolGroups::from_pool(&pool, &DraftSource::single_set("TST"));
         assert_eq!(
             groups.color_filter_options,
             vec![
@@ -1445,6 +2102,14 @@ mod tests {
         let groups: DraftPoolGroups = serde_json::from_str(old).expect("old shape deserializes");
         assert!(groups.rarity_groups.is_empty());
         assert!(groups.type_groups[0].cards[0].instance_ids.is_empty());
+        assert_eq!(
+            groups.workspace_capabilities,
+            DraftWorkspaceCapabilities::default()
+        );
+        assert_eq!(
+            groups.workspace_row_classification,
+            DraftWorkspaceRowClassification::default()
+        );
     }
 
     #[test]
@@ -1458,7 +2123,7 @@ mod tests {
         rare.instance_id = "adept-rare".to_string();
         rare.rarity = "rare".to_string();
 
-        let groups = DraftPoolGroups::from_pool(&[common, rare]);
+        let groups = DraftPoolGroups::from_pool(&[common, rare], &DraftSource::single_set("TST"));
 
         assert_eq!(
             groups
@@ -1479,6 +2144,291 @@ mod tests {
             vec!["adept-common".to_string(), "adept-rare".to_string()]
         );
         assert_eq!(groups.type_groups[0].cards[0].count, 2);
+        assert_eq!(
+            groups.workspace_row_classification.creature_instance_ids,
+            vec!["adept-common", "adept-rare"]
+        );
+        assert!(groups
+            .workspace_row_classification
+            .noncreature_instance_ids
+            .is_empty());
+    }
+
+    #[test]
+    fn the_player_view_publishes_the_shape_and_set_of_every_booster() {
+        let (mut session, source) = test_session(2);
+        session.config.source = DraftSource::Set {
+            layout: SetLayout::UniformByRound {
+                codes: vec!["AAA".to_string(), "BBB".to_string(), "AAA".to_string()],
+            },
+        };
+        session::apply(&mut session, DraftAction::StartDraft, Some(&source)).unwrap();
+        // Pretend the table has moved on to the second booster.
+        session.pack_sizes = vec![15, 14, 15];
+        session.current_pack_number = 1;
+
+        let view = filter_for_player(&session, 0);
+
+        assert_eq!(view.pack_sizes, vec![15, 14, 15]);
+        assert_eq!(
+            view.pack_set_codes,
+            vec!["AAA".to_string(), "BBB".to_string(), "AAA".to_string()]
+        );
+        // `cards_per_pack` tracks the booster in play, not a session-wide size.
+        assert_eq!(view.cards_per_pack, 14);
+    }
+
+    #[test]
+    fn chaos_source_views_publish_only_viewer_scoped_assignment_metadata() {
+        let (mut session, source) = test_session(2);
+        session.config.source = DraftSource::Set {
+            layout: SetLayout::Chaos {
+                candidate_codes: vec!["AAA".to_string(), "BBB".to_string()],
+                assignments: vec![
+                    vec!["AAA".to_string(), "BBB".to_string(), "AAA".to_string()],
+                    vec!["BBB".to_string(), "AAA".to_string(), "BBB".to_string()],
+                ],
+            },
+        };
+
+        let lobby = filter_for_player(&session, 0);
+        assert!(lobby.pack_set_codes.is_empty());
+        assert!(matches!(
+            lobby.source,
+            DraftSourceView::Set {
+                layout: SetLayoutView::Chaos {
+                    current_pack_code: None,
+                    completed_own_pack_codes: None,
+                    actual_set_codes: None,
+                    ..
+                }
+            }
+        ));
+
+        session::apply(&mut session, DraftAction::StartDraft, Some(&source)).unwrap();
+        session.current_pack_number = 1;
+        let player_zero = filter_for_player(&session, 0);
+        let player_one = filter_for_player(&session, 1);
+        let source_for = |view: DraftPlayerView| match view.source {
+            DraftSourceView::Set {
+                layout:
+                    SetLayoutView::Chaos {
+                        candidate_codes,
+                        current_pack_code,
+                        completed_own_pack_codes,
+                        actual_set_codes,
+                    },
+            } => (
+                candidate_codes,
+                current_pack_code,
+                completed_own_pack_codes,
+                actual_set_codes,
+            ),
+            _ => panic!("expected a Chaos source view"),
+        };
+        let (candidate_codes, current_pack_code, completed_codes, actual_codes) =
+            source_for(player_zero);
+        assert_eq!(candidate_codes, vec!["AAA".to_string(), "BBB".to_string()]);
+        assert_eq!(current_pack_code, Some("BBB".to_string()));
+        assert_eq!(completed_codes, None);
+        assert_eq!(actual_codes, None);
+        assert_eq!(source_for(player_one).1, Some("AAA".to_string()));
+
+        session.current_pack[0] = None;
+        session.current_pack_origins[0] = None;
+        let after_pick = filter_for_player(&session, 0);
+        assert!(matches!(
+            after_pick.source,
+            DraftSourceView::Set {
+                layout: SetLayoutView::Chaos {
+                    current_pack_code: None,
+                    ..
+                }
+            }
+        ));
+        session.current_pack[0] = session.current_pack[1].clone();
+        session.current_pack_origins[0] = session.current_pack_origins[1];
+
+        let spectator = filter_for_spectator(&session, SpectatorVisibility::Public);
+        assert!(spectator.pack_set_codes.is_empty());
+        assert!(matches!(
+            spectator.source,
+            DraftSourceView::Set {
+                layout: SetLayoutView::Chaos {
+                    current_pack_code: None,
+                    completed_own_pack_codes: None,
+                    actual_set_codes: None,
+                    ..
+                }
+            }
+        ));
+        let omniscient = filter_for_spectator(&session, SpectatorVisibility::Omniscient);
+        assert!(omniscient.pools.is_none());
+        assert!(omniscient.current_packs.is_none());
+        assert!(matches!(
+            omniscient.source,
+            DraftSourceView::Set {
+                layout: SetLayoutView::Chaos {
+                    current_pack_code: None,
+                    completed_own_pack_codes: None,
+                    actual_set_codes: None,
+                    ..
+                }
+            }
+        ));
+
+        session.status = DraftStatus::Deckbuilding;
+        let deckbuilder = filter_for_player(&session, 0);
+        match &deckbuilder.source {
+            DraftSourceView::Set {
+                layout:
+                    SetLayoutView::Chaos {
+                        completed_own_pack_codes,
+                        actual_set_codes,
+                        ..
+                    },
+            } => {
+                assert_eq!(
+                    completed_own_pack_codes,
+                    &Some(vec![
+                        "AAA".to_string(),
+                        "BBB".to_string(),
+                        "AAA".to_string()
+                    ])
+                );
+                assert_eq!(
+                    actual_set_codes,
+                    &Some(vec!["AAA".to_string(), "BBB".to_string()])
+                );
+            }
+            _ => panic!("expected a Chaos source view"),
+        }
+
+        let serialized = serde_json::to_value(deckbuilder).expect("serialize player view");
+        assert!(
+            serialized
+                .pointer("/source/data/layout/Chaos/assignments")
+                .is_none(),
+            "the source view must have no assignment matrix to leak"
+        );
+    }
+
+    #[test]
+    fn chaos_commander_concessions_wait_for_the_deckbuilding_view() {
+        let (mut session, _) = test_session(2);
+        session.kind = DraftKind::CommanderDraft;
+        session.config.kind = DraftKind::CommanderDraft;
+        session.config.source = DraftSource::Set {
+            layout: SetLayout::Chaos {
+                candidate_codes: vec!["CMM".to_string(), "CLB".to_string()],
+                assignments: vec![
+                    vec!["CMM".to_string(), "CLB".to_string(), "CMM".to_string()],
+                    vec!["CLB".to_string(), "CMM".to_string(), "CLB".to_string()],
+                ],
+            },
+        };
+        session.status = DraftStatus::Drafting;
+
+        let drafting = filter_for_player(&session, 0);
+        assert!(drafting.draft_set_codes.is_empty());
+        assert!(drafting.grantable_commander_fillers.is_empty());
+
+        session.status = DraftStatus::Deckbuilding;
+        let deckbuilding = filter_for_player(&session, 0);
+        assert_eq!(
+            deckbuilding.draft_set_codes,
+            vec!["CMM".to_string(), "CLB".to_string()]
+        );
+        assert_eq!(
+            deckbuilding.grantable_commander_fillers,
+            engine::game::deck_validation::draft_set_concessions_for(["CMM", "CLB"]).fillers
+        );
+
+        let spectator = filter_for_spectator(&session, SpectatorVisibility::Public);
+        assert!(
+            spectator.grantable_commander_fillers.is_empty(),
+            "a spectator is not a deckbuilding owner"
+        );
+    }
+
+    #[test]
+    fn chaos_current_pack_code_follows_the_packs_opening_seat_after_a_pass() {
+        let (mut session, source) = test_session(2);
+        session.config.source = DraftSource::Set {
+            layout: SetLayout::Chaos {
+                candidate_codes: vec!["AAA".to_string(), "BBB".to_string()],
+                assignments: vec![
+                    vec!["AAA".to_string(), "AAA".to_string(), "AAA".to_string()],
+                    vec!["BBB".to_string(), "BBB".to_string(), "BBB".to_string()],
+                ],
+            },
+        };
+        session::apply(&mut session, DraftAction::StartDraft, Some(&source)).unwrap();
+
+        let current_code = |view: DraftPlayerView| match view.source {
+            DraftSourceView::Set {
+                layout:
+                    SetLayoutView::Chaos {
+                        current_pack_code: Some(code),
+                        ..
+                    },
+            } => code,
+            _ => panic!("expected a current Chaos pack code"),
+        };
+        assert_eq!(current_code(filter_for_player(&session, 0)), "AAA");
+        assert_eq!(current_code(filter_for_player(&session, 1)), "BBB");
+
+        for seat in 0..2 {
+            let card_instance_id = session.current_pack[seat]
+                .as_ref()
+                .expect("each seat begins with a pack")
+                .0[0]
+                .instance_id
+                .clone();
+            session::apply(
+                &mut session,
+                DraftAction::Pick {
+                    seat: seat as u8,
+                    card_instance_ids: vec![card_instance_id],
+                },
+                None,
+            )
+            .expect("the second pick passes both boosters");
+        }
+
+        assert_eq!(session.current_pack_origins, vec![Some(1), Some(0)]);
+        assert_eq!(
+            current_code(filter_for_player(&session, 0)),
+            "BBB",
+            "seat 0 now holds the booster that seat 1 opened"
+        );
+        assert_eq!(
+            current_code(filter_for_player(&session, 1)),
+            "AAA",
+            "seat 1 now holds the booster that seat 0 opened"
+        );
+    }
+
+    #[test]
+    fn a_mixed_size_sealed_pool_splits_back_into_the_boosters_it_came_from() {
+        let (mut session, source) = test_session(2);
+        session.kind = DraftKind::Sealed;
+        session.config.kind = DraftKind::Sealed;
+        session.config.pack_count = SEALED_PACK_COUNT;
+        session::apply(&mut session, DraftAction::StartDraft, Some(&source)).unwrap();
+        // Sealed pools are stored flat; only the recorded sizes say where one
+        // booster ended and the next began.
+        session.pack_sizes = vec![20, 20, 20, 8, 8, 8];
+
+        let view = filter_for_player(&session, 0);
+
+        let packs = view
+            .sealed_packs
+            .expect("sealed events publish their packs");
+        assert_eq!(
+            packs.iter().map(Vec::len).collect::<Vec<_>>(),
+            [20, 20, 20, 8, 8, 8]
+        );
     }
 
     #[test]
@@ -1562,7 +2512,7 @@ mod tests {
             &mut session,
             DraftAction::Pick {
                 seat: 1,
-                card_instance_id: card_id,
+                card_instance_ids: vec![card_id],
             },
             None,
         )
@@ -1643,6 +2593,7 @@ mod tests {
             DraftAction::SubmitDeck {
                 seat: 0,
                 main_deck: main_deck.clone(),
+                commanders: Vec::new(),
             },
             None,
         )
@@ -1682,9 +2633,7 @@ mod tests {
     #[test]
     fn view_bot_seat_shows_as_bot() {
         let config = DraftConfig {
-            source: DraftSource::Set {
-                code: "TST".to_string(),
-            },
+            source: DraftSource::single_set("TST".to_string()),
             set_code: "TST".to_string(),
             kind: DraftKind::Quick,
             pod_size: 8,
@@ -1738,7 +2687,7 @@ mod tests {
             &mut session,
             DraftAction::Pick {
                 seat: 0,
-                card_instance_id: card_id,
+                card_instance_ids: vec![card_id],
             },
             None,
         )
@@ -1760,17 +2709,83 @@ mod tests {
     }
 
     #[test]
+    fn public_active_pack_count_tracks_the_actual_pick_and_pass_round() {
+        let (mut session, source) = test_session(2);
+        session::apply(&mut session, DraftAction::StartDraft, Some(&source)).unwrap();
+
+        let assert_counts = |session: &DraftSession, expected: &[u8]| {
+            assert_eq!(
+                filter_for_player(session, 0)
+                    .seats
+                    .iter()
+                    .map(|seat| seat.active_pack_count)
+                    .collect::<Vec<_>>(),
+                expected,
+            );
+            assert_eq!(
+                filter_for_spectator(session, SpectatorVisibility::Public)
+                    .seats
+                    .iter()
+                    .map(|seat| seat.active_pack_count)
+                    .collect::<Vec<_>>(),
+                expected,
+            );
+        };
+
+        assert_counts(&session, &[1, 1]);
+
+        let seat_zero_card = session.current_pack[0].as_ref().unwrap().0[0]
+            .instance_id
+            .clone();
+        session::apply(
+            &mut session,
+            DraftAction::Pick {
+                seat: 0,
+                card_instance_ids: vec![seat_zero_card],
+            },
+            None,
+        )
+        .unwrap();
+        // The pack remains until every seat picks, but seat 0 no longer has an
+        // active pack in this round.
+        assert_counts(&session, &[0, 1]);
+
+        let seat_one_card = session.current_pack[1].as_ref().unwrap().0[0]
+            .instance_id
+            .clone();
+        session::apply(
+            &mut session,
+            DraftAction::Pick {
+                seat: 1,
+                card_instance_ids: vec![seat_one_card],
+            },
+            None,
+        )
+        .unwrap();
+        // The real pass resets the per-seat picked flags for the next round.
+        assert_counts(&session, &[1, 1]);
+
+        // A present-but-empty pack is not active either.
+        session.current_pack[0].as_mut().unwrap().0.clear();
+        assert_counts(&session, &[0, 1]);
+
+        // A stale current_pack is not an active pack once drafting has ended.
+        session.status = DraftStatus::Deckbuilding;
+        for seat in filter_for_player(&session, 0).seats {
+            assert_eq!(seat.active_pack_count, 0);
+        }
+        for seat in filter_for_spectator(&session, SpectatorVisibility::Public).seats {
+            assert_eq!(seat.active_pack_count, 0);
+        }
+    }
+
+    #[test]
     fn view_standings_after_pairings() {
         let (mut session, _) = test_session(8);
         session.status = DraftStatus::Deckbuilding;
 
         // Generate pairings
-        session::apply(
-            &mut session,
-            DraftAction::GeneratePairings { round: 1 },
-            None,
-        )
-        .unwrap();
+        session::apply(&mut session, DraftAction::GeneratePairings, None).unwrap();
 
         let winner_pid = session
             .pairings
@@ -1814,12 +2829,7 @@ mod tests {
             name: "Bot 7".to_string(),
         };
 
-        session::apply(
-            &mut session,
-            DraftAction::GeneratePairings { round: 1 },
-            None,
-        )
-        .unwrap();
+        session::apply(&mut session, DraftAction::GeneratePairings, None).unwrap();
 
         let view = filter_for_player(&session, 0);
         let bot_standing = view
@@ -1844,6 +2854,9 @@ mod tests {
         assert_eq!(view.tournament_format, TournamentFormat::Swiss);
         assert_eq!(view.pod_policy, PodPolicy::Competitive);
         assert_eq!(view.current_round, 0);
+        // Pins the engine's `>= 1` guarantee at the lobby state. NOT
+        // discriminating on its own: a hard-coded `1` satisfies it too.
+        assert_eq!(view.next_pairing_round, 1);
         assert!(view.timer_remaining_ms.is_none());
     }
 
@@ -1852,15 +2865,12 @@ mod tests {
         let (mut session, _) = test_session(8);
         session.status = DraftStatus::Deckbuilding;
 
-        session::apply(
-            &mut session,
-            DraftAction::GeneratePairings { round: 1 },
-            None,
-        )
-        .unwrap();
+        session::apply(&mut session, DraftAction::GeneratePairings, None).unwrap();
 
         let view = filter_for_player(&session, 0);
         assert_eq!(view.pairings.len(), 4);
+        assert_eq!(view.current_round, 1);
+        assert_eq!(view.next_pairing_round, 2);
         for pv in &view.pairings {
             assert_eq!(pv.round, 1);
             assert_eq!(pv.status, PairingStatus::Pending);
@@ -1873,12 +2883,7 @@ mod tests {
         let (mut session, _) = test_session(8);
         session.status = DraftStatus::Deckbuilding;
 
-        session::apply(
-            &mut session,
-            DraftAction::GeneratePairings { round: 1 },
-            None,
-        )
-        .unwrap();
+        session::apply(&mut session, DraftAction::GeneratePairings, None).unwrap();
 
         let pairing = session
             .pairings
@@ -1911,12 +2916,7 @@ mod tests {
         let (mut session, _) = test_session(8);
         session.status = DraftStatus::Deckbuilding;
 
-        session::apply(
-            &mut session,
-            DraftAction::GeneratePairings { round: 1 },
-            None,
-        )
-        .unwrap();
+        session::apply(&mut session, DraftAction::GeneratePairings, None).unwrap();
 
         let pairing = session
             .pairings
@@ -2008,15 +3008,327 @@ mod tests {
         let (mut session, _) = test_session(8);
         session.status = DraftStatus::Deckbuilding;
 
-        session::apply(
-            &mut session,
-            DraftAction::GeneratePairings { round: 1 },
-            None,
-        )
-        .unwrap();
+        session::apply(&mut session, DraftAction::GeneratePairings, None).unwrap();
 
         let view = filter_for_spectator(&session, SpectatorVisibility::Public);
         assert_eq!(view.pairings.len(), 4);
         assert!(view.pools.is_none());
+    }
+
+    /// U7 row 14 -- CR 903.13e: the grant is PUBLISHED on both views, on one
+    /// axis with opposite verdicts.
+    ///
+    /// Both builders are asserted because one correctly-wired builder must not
+    /// be able to vouch for the other. The `Some` half is the reach guard:
+    /// without it, "the field is `None`" is satisfied by a builder that
+    /// hard-codes `None`, which is exactly the mis-wiring this row exists to
+    /// catch. And the `Some` half asserts EQUALITY WITH THE TABLE rather than
+    /// naming a card, which additionally proves the builder reads the latch
+    /// instead of constructing its own value.
+    ///
+    /// Rendering landed in phase 8 -- `PoolPanel`'s grant line and
+    /// `LimitedDeckBuilder`'s addable list -- while this test still pins the
+    /// publishing half.
+    #[test]
+    fn both_views_publish_the_latched_commander_filler() {
+        fn commander_draft_session(set_code: &str) -> DraftSession {
+            let (mut session, _) = test_session(4);
+            session.kind = DraftKind::CommanderDraft;
+            session.config.kind = DraftKind::CommanderDraft;
+            session.config.source = DraftSource::single_set(set_code);
+            session
+        }
+
+        let granting = commander_draft_session("CMM");
+        let expected = engine::game::deck_validation::draft_set_concessions("CMM").fillers;
+        assert!(
+            !expected.is_empty(),
+            "reach guard: CR 903.13e names Commander Masters as a granting set"
+        );
+
+        assert_eq!(
+            filter_for_player(&granting, 0).grantable_commander_fillers,
+            expected
+        );
+        assert_eq!(
+            filter_for_spectator(&granting, SpectatorVisibility::default())
+                .grantable_commander_fillers,
+            expected
+        );
+
+        let non_granting = commander_draft_session("NEO");
+        assert!(filter_for_player(&non_granting, 0)
+            .grantable_commander_fillers
+            .is_empty());
+        assert!(
+            filter_for_spectator(&non_granting, SpectatorVisibility::default())
+                .grantable_commander_fillers
+                .is_empty()
+        );
+
+        // CR 903.13e: a mixed-set draft publishes EVERY contained set's grant.
+        // Both builders read one latch, so both must carry the union -- a
+        // builder that published only the first would red on this pair.
+        let mut mixed = commander_draft_session("CMM");
+        mixed.config.source = DraftSource::Set {
+            layout: SetLayout::UniformByRound {
+                codes: vec!["CMM".to_string(), "CLB".to_string()],
+            },
+        };
+        let union =
+            engine::game::deck_validation::draft_set_concessions_for(["CMM", "CLB"]).fillers;
+        assert_eq!(
+            union.len(),
+            2,
+            "reach guard: CR 903.13e names DIFFERENT cards for CMM and CLB"
+        );
+        assert_eq!(
+            filter_for_player(&mixed, 0).grantable_commander_fillers,
+            union
+        );
+        assert_eq!(
+            filter_for_spectator(&mixed, SpectatorVisibility::default())
+                .grantable_commander_fillers,
+            union
+        );
+    }
+
+    /// V4 -- CR 903.13f(3): `DraftPlayerView.draft_set_codes` publishes the
+    /// LATCHED concession set codes, and publishes them only for a Commander
+    /// Draft whose source is a set.
+    ///
+    /// Four rows on one axis, because a single non-empty row is satisfied by
+    /// `session.config.source.set_code()` -- which returns the CUBE ID for a
+    /// cube, a code for every kind, and the JOINED `"CMM+CLB"` label for a
+    /// mixed draft -- and would publish a grant CR 903.13 does not make, or a
+    /// token no set-code lookup can match. Row (i) carries a reach guard
+    /// (`grantable_commander_fillers` is non-empty) so the two empty rows
+    /// cannot be vacuous greens from a fixture that concedes nothing in the
+    /// first place.
+    #[test]
+    fn publishes_the_latched_concession_set_codes_only_for_a_commander_draft_from_a_set() {
+        fn session_with(kind: DraftKind, source: DraftSource) -> DraftSession {
+            let (mut session, _) = test_session(4);
+            session.kind = kind;
+            session.config.kind = kind;
+            session.config.source = source;
+            session
+        }
+
+        // (i) Commander Draft from a granting set: the latch is published.
+        let from_set = session_with(DraftKind::CommanderDraft, DraftSource::single_set("CMM"));
+        let from_set_view = filter_for_player(&from_set, 0);
+        assert!(
+            !from_set_view.grantable_commander_fillers.is_empty(),
+            "reach guard: CR 903.13e names Commander Masters as a granting set, \
+             so this fixture really is a conceding session"
+        );
+        assert_eq!(from_set_view.draft_set_codes, vec!["CMM".to_string()]);
+
+        // (i-b) A mixed Commander Draft publishes EVERY set it contained, as
+        // separate codes. The `"CMM+CLB"` label `DraftSource::set_code()`
+        // builds is a DISPLAY string that no concession lookup can match, so
+        // publishing it here would silently disable both grants.
+        let mixed = session_with(
+            DraftKind::CommanderDraft,
+            DraftSource::Set {
+                layout: SetLayout::UniformByRound {
+                    codes: vec!["CMM".to_string(), "CLB".to_string(), "CMM".to_string()],
+                },
+            },
+        );
+        assert_eq!(
+            filter_for_player(&mixed, 0).draft_set_codes,
+            vec!["CMM".to_string(), "CLB".to_string()],
+            "CR 903.13e/f ask what the draft CONTAINED, and it contained both"
+        );
+
+        // (ii) A cube contains no draft boosters from any set. `set_code()`
+        // would answer with the cube ID here, which is the wrong answer.
+        let from_cube = session_with(
+            DraftKind::CommanderDraft,
+            DraftSource::Cube {
+                id: "CMM".to_string(),
+                name: "Test Cube".to_string(),
+            },
+        );
+        assert!(filter_for_player(&from_cube, 0).draft_set_codes.is_empty());
+
+        // (iii) CR 903.13 scopes both concessions to Commander Draft.
+        let sealed = session_with(DraftKind::Sealed, DraftSource::single_set("CMM"));
+        assert!(filter_for_player(&sealed, 0).draft_set_codes.is_empty());
+    }
+    /// VM row 3 — PF3 / U25. CR 903.13b: the published pick-step count, folded
+    /// over every kind in the procedure table.
+    ///
+    /// `pick_number` counts STEPS, not cards, so a 14-card Commander pack is
+    /// SEVEN steps. Revert the publication and the field is gone (a compile
+    /// error); publish `cards_per_pack` instead and the CommanderDraft row
+    /// reds at 14 against an expected 7.
+    ///
+    /// The fold is its own reach-guard: it asserts a nonzero, per-kind value
+    /// for all five kinds, so an all-zeros field cannot pass it. The four
+    /// CR 905.1a kinds are the reach-guard against a field that is only
+    /// correct for CommanderDraft — for them the value EQUALS `cards_per_pack`,
+    /// so a field that merely echoed `cards_per_pack` would pass 4/5 and fail
+    /// only on the fifth.
+    #[test]
+    fn the_published_pick_step_count_is_per_kind_and_matches_the_procedure_table() {
+        for kind in DraftKind::ALL {
+            let (mut session, _) = test_session(4);
+            session.kind = kind;
+            session.config.kind = kind;
+
+            let procedure = kind.procedure();
+            let cards_per_pack = session.config.cards_per_pack;
+
+            // The divisor invariant §Rust Idioms relies on, pinned rather than
+            // defended with a `.max(1)`: a future table row that set `0` here
+            // reds this assertion instead of dividing by zero.
+            assert!(
+                procedure.cards_per_pick >= 1,
+                "{kind:?}: every kind takes at least one card per pick step"
+            );
+
+            let expected = cards_per_pack.div_ceil(procedure.cards_per_pick);
+            assert!(expected >= 1, "{kind:?}: a pack is at least one step");
+
+            assert_eq!(
+                filter_for_player(&session, 0).pick_steps_per_pack,
+                expected,
+                "{kind:?}: the player view must publish the engine's own step count"
+            );
+            assert_eq!(
+                filter_for_spectator(&session, SpectatorVisibility::Public).pick_steps_per_pack,
+                expected,
+                "{kind:?}: the spectator view publishes the same count"
+            );
+        }
+
+        // The values the fold above computes, stated as literals so a reader
+        // can see WHAT is being asserted and not merely that two expressions
+        // agree. A 14-card pack is 14 steps at one card per step (CR 905.1a)
+        // and 7 at two (CR 903.13b).
+        assert_eq!(DraftKind::Premier.procedure().pick_steps_per_pack(14), 14);
+        assert_eq!(
+            DraftKind::CommanderDraft
+                .procedure()
+                .pick_steps_per_pack(14),
+            7
+        );
+        // Rounds UP: an odd pack's final step takes the remainder.
+        assert_eq!(
+            DraftKind::CommanderDraft
+                .procedure()
+                .pick_steps_per_pack(15),
+            8
+        );
+    }
+
+    #[test]
+    fn player_view_publishes_the_procedure_owned_launch_capability() {
+        let (mut session, _) = test_session(4);
+        session.kind = DraftKind::Quick;
+        session.config.kind = DraftKind::Quick;
+        assert_eq!(
+            filter_for_player(&session, 0).launch_capability,
+            DraftLaunchCapability::None,
+            "complete-immediately alone must not authorize a multiplayer pod game"
+        );
+
+        session.kind = DraftKind::CommanderDraft;
+        session.config.kind = DraftKind::CommanderDraft;
+        assert_eq!(
+            filter_for_player(&session, 0).launch_capability,
+            DraftLaunchCapability::CommanderMultiplayer,
+            "the Commander procedure's post-draft and designation axes authorize its pod game"
+        );
+
+        session.kind = DraftKind::Premier;
+        session.config.kind = DraftKind::Premier;
+        assert_eq!(
+            filter_for_player(&session, 0).launch_capability,
+            DraftLaunchCapability::None,
+            "in-session tournament pairings must not expose an external game launch"
+        );
+    }
+
+    #[test]
+    fn player_view_publishes_the_procedure_owned_commander_count() {
+        let (mut session, _) = test_session(4);
+        session.kind = DraftKind::CommanderDraft;
+        session.config.kind = DraftKind::Quick;
+        assert_eq!(
+            filter_for_player(&session, 0).commanders_required,
+            1,
+            "the projection follows the active procedure, not unrelated config identity"
+        );
+
+        session.kind = DraftKind::Premier;
+        session.config.kind = DraftKind::CommanderDraft;
+        assert_eq!(
+            filter_for_player(&session, 0).commanders_required,
+            0,
+            "a CommanderDraft config label must not leak designation into a Premier view"
+        );
+    }
+
+    /// CR 903.13b, per pack. `pack_pick_steps` is the per-pack counterpart of
+    /// the scalar above, and it exists because BOTH axes vary independently: a
+    /// multi-set draft's boosters differ in size, and the kind's procedure
+    /// decides how many cards one step takes.
+    ///
+    /// CommanderDraft is the discriminating kind. At two cards per step
+    /// (CR 903.13b), boosters of 20/14/16 cards are 10/7/8 steps — a triple
+    /// that no competing implementation reproduces:
+    ///   - publishing `pack_sizes` gives [20, 14, 16] (cards, not steps);
+    ///   - broadcasting the scalar `pick_steps_per_pack` gives [7, 7, 7]
+    ///     (the current pack's count, applied to every pack);
+    ///   - halving a session-wide `config.cards_per_pack` gives [7, 7, 7] too.
+    ///
+    /// Each of those reds here while passing every single-set fixture.
+    #[test]
+    fn the_published_per_pack_step_counts_track_each_boosters_own_size() {
+        let (mut session, _) = test_session(4);
+        session.kind = DraftKind::CommanderDraft;
+        session.config.kind = DraftKind::CommanderDraft;
+        session.config.pack_count = 3;
+        // A multi-set Commander draft: three boosters, three sizes.
+        session.pack_sizes = vec![20, 14, 16];
+
+        let player = filter_for_player(&session, 0);
+        assert_eq!(
+            player.pack_pick_steps,
+            vec![10, 7, 8],
+            "each booster is measured in its own pick steps, not its card count"
+        );
+        assert_eq!(
+            filter_for_spectator(&session, SpectatorVisibility::Public).pack_pick_steps,
+            vec![10, 7, 8],
+            "the spectator view publishes the same per-pack counts"
+        );
+
+        // The array and the scalar are one contract: the scalar is the entry
+        // for the booster in play, so a display reading either agrees.
+        for pack in 0..session.config.pack_count {
+            session.current_pack_number = pack;
+            let view = filter_for_player(&session, 0);
+            assert_eq!(
+                view.pick_steps_per_pack,
+                view.pack_pick_steps[usize::from(pack)],
+                "pack {pack}: the scalar must equal this pack's entry"
+            );
+        }
+
+        // Reach-guard for the CR 905.1a kinds: at one card per step the steps
+        // ARE the sizes, so the field still tracks per-pack shape rather than
+        // collapsing to a single number.
+        session.kind = DraftKind::Premier;
+        session.config.kind = DraftKind::Premier;
+        assert_eq!(
+            filter_for_player(&session, 0).pack_pick_steps,
+            vec![20, 14, 16],
+            "one card per step means steps equal cards — still per pack"
+        );
     }
 }

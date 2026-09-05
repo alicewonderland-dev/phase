@@ -413,6 +413,25 @@ describe("PermanentCard", () => {
     expect(screen.getByTestId("keyword-strip")).not.toHaveTextContent("Evoke");
   });
 
+  // CR 708.2 + CR 708.2a: a face-down permanent carries none of the hidden
+  // card's own abilities, so a keyword the engine still reports for it was granted from
+  // outside (Killer's Mask equipped to the creature it manifested) and is public —
+  // the blocker prompt already announces it. The strip must render.
+  it("renders granted keyword badges on a face-down permanent", () => {
+    const gameState = makeState();
+    gameState.objects[1].face_down = true;
+    gameState.objects[1].keywords = [];
+    gameState.derived = {
+      battlefield_keyword_badges: { 1: ["Menace"] },
+    };
+    useGameStore.setState({ gameState, waitingFor: gameState.waiting_for });
+    usePreferencesStore.setState({ showKeywordStrip: true });
+
+    renderPermanent();
+
+    expect(screen.getByTestId("keyword-strip")).toHaveTextContent("Menace");
+  });
+
   // CR 732.2a / CR 701.34a: an accepted counter-growth ∞ loop (Kilo proliferate → Pentad
   // charge) annotates the pumped row in `derived.counter_display`; the pill renders ∞
   // instead of the (still-finite) real count. Matched pair — the ONLY difference between the

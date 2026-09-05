@@ -2,7 +2,6 @@ use futures_util::{
     future::{AbortHandle, AbortRegistration, Abortable},
     SinkExt, StreamExt,
 };
-use serde::Serialize;
 use tauri::ipc::Channel;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::{
@@ -16,30 +15,11 @@ use tokio_tungstenite::{
 };
 
 use crate::native_engine;
+use crate::native_engine_contract::{BridgeEvent, NativeEngineBridgeError};
 
 /// phase-server's WebSocket route. Kept as a named constant so the one place
 /// that dials it reads as a contract rather than an incidental URL suffix.
 const SERVER_WEBSOCKET_PATH: &str = "/ws";
-
-/// Events forwarded from the shell-owned loopback WebSocket to remote content.
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
-pub enum BridgeEvent {
-    Message { text: String },
-    Closed { code: u16, reason: String },
-    Error { detail: String },
-}
-
-/// Structured failures from the pinned bridge commands.
-#[derive(Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum NativeEngineBridgeError {
-    NotRunning { detail: String },
-    Connect { detail: String },
-    UnknownBridge { detail: String },
-    Send { detail: String },
-    Internal { detail: String },
-}
 
 impl NativeEngineBridgeError {
     fn internal(detail: impl Into<String>) -> Self {

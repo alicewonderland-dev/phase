@@ -1,4 +1,4 @@
-import { Channel, invoke } from "@tauri-apps/api/core";
+import { isDesktopTauri } from "./platform";
 
 type BridgeEvent =
   | { type: "message"; text: string }
@@ -6,6 +6,7 @@ type BridgeEvent =
   | { type: "error"; detail: string };
 
 type CloseListener = (event: CloseEvent) => void;
+type MessageListener = (event: MessageEvent<string>) => void;
 
 /**
  * WebSocket-shaped client for the shell-owned native-engine bridge.
@@ -30,15 +31,16 @@ export class NativeEngineSocket {
   onclose: ((event: CloseEvent) => void) | null = null;
 
   private readonly closeListeners = new Map<CloseListener, boolean>();
+  private readonly messageListeners = new Map<MessageListener, boolean>();
   private readonly pendingEvents: BridgeEvent[] = [];
-  private readonly channel = new Channel<BridgeEvent>((event) => {
-    this.handleBridgeEvent(event);
-  });
   private bridgeId: number | null = null;
   private _readyState = NativeEngineSocket.CONNECTING;
 
   constructor() {
-    void this.connect();
+    // Match the browser WebSocket lifecycle: construction returns while the
+    // socket is CONNECTING, giving callers a chance to install terminal-event
+    // handlers before even a platform-boundary failure can be dispatched.
+    queueMicrotask(() => void this.connect());
   }
 
   get readyState(): number {
@@ -49,24 +51,38 @@ export class NativeEngineSocket {
     type: "close",
     listener: CloseListener,
     options?: AddEventListenerOptions | boolean,
+  ): void;
+  addEventListener(
+    type: "message",
+    listener: MessageListener,
+    options?: AddEventListenerOptions | boolean,
+  ): void;
+  addEventListener(
+    type: "close" | "message",
+    listener: CloseListener | MessageListener,
+    options?: AddEventListenerOptions | boolean,
   ): void {
-    if (type !== "close") return;
     const once = typeof options === "object" && options.once === true;
-    this.closeListeners.set(listener, once);
+    if (type === "close") this.closeListeners.set(listener as CloseListener, once);
+    else this.messageListeners.set(listener as MessageListener, once);
   }
 
-  removeEventListener(type: "close", listener: CloseListener): void {
-    if (type !== "close") return;
-    this.closeListeners.delete(listener);
+  removeEventListener(type: "close", listener: CloseListener): void;
+  removeEventListener(type: "message", listener: MessageListener): void;
+  removeEventListener(type: "close" | "message", listener: CloseListener | MessageListener): void {
+    if (type === "close") this.closeListeners.delete(listener as CloseListener);
+    else this.messageListeners.delete(listener as MessageListener);
   }
 
   send(text: string): void {
     if (this.readyState !== NativeEngineSocket.OPEN || this.bridgeId === null) {
       throw new DOMException("WebSocket is not open.", "InvalidStateError");
     }
-    void invoke("native_engine_bridge_send", { id: this.bridgeId, text }).catch((error) => {
-      this.handleBridgeFailure(error);
-    });
+    void this.invokeDesktop("native_engine_bridge_send", { id: this.bridgeId, text }).catch(
+      (error) => {
+        this.handleBridgeFailure(error);
+      },
+    );
   }
 
   close(): void {
@@ -84,8 +100,16 @@ export class NativeEngineSocket {
 
   private async connect(): Promise<void> {
     try {
-      const bridgeId = await invoke<number>("connect_native_engine", {
-        onEvent: this.channel,
+      // Fail before Channel registers a Tauri callback that mobile cannot consume.
+      if (!isDesktopTauri()) {
+        throw new Error("Native engine bridge is available only in the desktop shell.");
+      }
+      const { Channel } = await import("@tauri-apps/api/core");
+      const channel = new Channel<BridgeEvent>((event) => {
+        this.handleBridgeEvent(event);
+      });
+      const bridgeId = await this.invokeDesktop<number>("connect_native_engine", {
+        onEvent: channel,
       });
       this.bridgeId = bridgeId;
       if (this.readyState === NativeEngineSocket.CLOSING) {
@@ -106,9 +130,20 @@ export class NativeEngineSocket {
   }
 
   private closeBridge(bridgeId: number): void {
-    void invoke("native_engine_bridge_close", { id: bridgeId }).catch((error) => {
+    void this.invokeDesktop("native_engine_bridge_close", { id: bridgeId }).catch((error) => {
       this.handleBridgeFailure(error);
     });
+  }
+
+  private async invokeDesktop<T>(
+    command: string,
+    args: Record<string, unknown>,
+  ): Promise<T> {
+    if (!isDesktopTauri()) {
+      throw new Error("Native engine bridge is available only in the desktop shell.");
+    }
+    const { invoke } = await import("@tauri-apps/api/core");
+    return invoke<T>(command, args);
   }
 
   private handleBridgeEvent(event: BridgeEvent): void {
@@ -123,7 +158,12 @@ export class NativeEngineSocket {
     switch (event.type) {
       case "message":
         if (this.readyState === NativeEngineSocket.OPEN) {
-          this.onmessage?.(new MessageEvent("message", { data: event.text }));
+          const message = new MessageEvent<string>("message", { data: event.text });
+          this.onmessage?.(message);
+          for (const [listener, once] of this.messageListeners) {
+            listener(message);
+            if (once) this.messageListeners.delete(listener);
+          }
         }
         break;
       case "error":

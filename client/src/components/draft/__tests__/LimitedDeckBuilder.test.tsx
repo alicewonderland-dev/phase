@@ -1,10 +1,50 @@
-import { useState } from "react";
+import { StrictMode, useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 
+import type { DeckColorDistributionEntry } from "../../../services/deckCompatibility";
+import type { DeckCompatibilityResult } from "../../../services/deckCompatibility";
 import { LimitedDeckBuilder } from "../LimitedDeckBuilder";
+import type { DraftWorkspaceState } from "../workspace/types";
+import { createDefaultDraftWorkspacePreferences } from "../workspace/workspacePreferences";
 
 afterEach(cleanup);
+
+const compatibilityHarness = vi.hoisted(() => ({
+  evaluate: vi.fn(),
+  cardDataCache: new Map<string, { name: string; cmc: number; color_identity: string[] }>(),
+  colorCaptures: [] as DeckColorDistributionEntry[][],
+}));
+
+const compatibleResult = () => ({
+  standard: { compatible: true, reasons: [] },
+  commander: { compatible: true, reasons: [] },
+  bo3_ready: true,
+  unknown_cards: [],
+  selected_format_compatible: true,
+  selected_format_reasons: [],
+  color_identity: [],
+  color_distribution: [],
+} satisfies DeckCompatibilityResult);
+
+compatibilityHarness.evaluate.mockImplementation(async () => compatibleResult());
+
+vi.mock("../../../services/deckCompatibility", () => ({
+  evaluateDeckCompatibility: (...args: unknown[]) => compatibilityHarness.evaluate(...args),
+}));
+
+vi.mock("../../deck-builder/ColorDistribution", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../deck-builder/ColorDistribution")>();
+  return {
+    ColorDistribution: (props: {
+      distribution: readonly DeckColorDistributionEntry[];
+      presentation?: "default" | "compact";
+    }) => {
+      compatibilityHarness.colorCaptures.push([...props.distribution]);
+      return <actual.ColorDistribution {...props} />;
+    },
+  };
+});
 
 vi.mock("../../../stores/draftStore", () => ({
   useDraftStore: (selector: (state: Record<string, unknown>) => unknown) =>
@@ -119,6 +159,35 @@ vi.mock("../../../viewmodel/limitedPoolFilter", async (importOriginal) => {
   };
 });
 
+// CR 903.3 / CR 702.124: the ENGINE is the eligibility and pairing authority.
+// It cannot load under vitest, so both published surfaces are replaced with
+// per-test controllable fakes. Every other engineRuntime export stays real.
+const engineEligible = vi.fn(async (_name: string, _format: string) => false);
+const enginePartnerCandidates = vi.fn(
+  async (_first: string, _candidates: string[], _draftSetCodes: readonly string[]) =>
+    [] as string[],
+);
+vi.mock("../../../services/engineRuntime", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../../services/engineRuntime")>();
+  return {
+    ...actual,
+    isCardCommanderEligibleForFormat: (name: string, format: string) =>
+      engineEligible(name, format),
+    commanderPartnerCandidates: (
+      first: string,
+      candidates: string[],
+      draftSetCodes: readonly string[],
+    ) => enginePartnerCandidates(first, candidates, draftSetCodes),
+  };
+});
+
+vi.mock("../../../hooks/useDeckCardData", () => ({
+  useDeckCardData: () => ({
+    cardDataCache: compatibilityHarness.cardDataCache,
+    cacheCards: () => {},
+  }),
+}));
+
 vi.mock("../../card/HoverCardPreview", () => ({
   HoverCardPreview: ({ card }: { card: { name: string } | null }) => (
     <div data-testid="hover-preview">{card?.name}</div>
@@ -130,10 +199,14 @@ type BuilderView = NonNullable<NonNullable<Parameters<typeof LimitedDeckBuilder>
 const TEST_VIEW: BuilderView = {
   status: "Deckbuilding",
   kind: "Quick",
+  launch_capability: "None",
+  commanders_required: 0,
   current_pack_number: 1,
   pick_number: 1,
   pass_direction: "Left",
   current_pack: null,
+  required_pick_count: 0,
+  pick_selection_mode: "Direct",
   pool: [
     {
       instance_id: "card-1",
@@ -155,15 +228,22 @@ const TEST_VIEW: BuilderView = {
     type_filter_options: [],
     color_filter_options: [],
     color_counts: { white: 0, blue: 1, black: 0, red: 0, green: 0 },
+    workspace_capabilities: { rarity_group_order: [] },
+    workspace_row_classification: { creature_instance_ids: [], noncreature_instance_ids: [] },
   },
   seats: [],
   cards_per_pack: 14,
+  pack_sizes: [14, 14, 14],
+  pack_set_codes: ["TST", "TST", "TST"],
+  pack_pick_steps: [14, 14, 14],
+  pick_steps_per_pack: 14,
   pack_count: 3,
   min_deck_size: 40,
   addable_cards: ["Plains", "Island", "Academy Ruins"],
   timer_remaining_ms: null,
   standings: [],
   current_round: 0,
+  next_pairing_round: 1,
   tournament_format: "Swiss",
   pod_policy: "Competitive",
   pairings: [],
@@ -199,6 +279,10 @@ describe("LimitedDeckBuilder", () => {
   afterEach(() => {
     cleanup();
     vi.useRealTimers();
+    compatibilityHarness.evaluate.mockClear();
+    compatibilityHarness.evaluate.mockImplementation(async () => compatibleResult());
+    compatibilityHarness.cardDataCache.clear();
+    compatibilityHarness.colorCaptures.length = 0;
   });
 
   it("updates mana curve when a card is added from pool", () => {
@@ -239,6 +323,454 @@ describe("LimitedDeckBuilder", () => {
     );
 
     expect(screen.queryByRole("button", { name: "Add Plains" })).not.toBeInTheDocument();
+  });
+
+  it("adds_basic_lands_through_the_phone_compact_lands_picker", () => {
+    const onAddBasicLand = vi.fn();
+    const onAutoSuggestLands = vi.fn();
+    render(
+      <LimitedDeckBuilder
+        local={{
+          view: TEST_VIEW,
+          workspace: {
+            schemaVersion: 1,
+            placements: { "card-1": { zone: "deck", row: 0, column: 0, order: 0 } },
+            virtualBasics: [],
+          },
+          preferences: createDefaultDraftWorkspacePreferences(),
+          interactionLocked: false,
+          onWorkspaceChange: () => {},
+          onPreferencesChange: () => {},
+          onSubmitDeck: () => {},
+          onAddBasicLand,
+          onRemoveBasicLand: () => {},
+          onAutoSuggestLands,
+        }}
+        responsiveLayout="phone-portrait"
+        showSuggestions
+      />,
+    );
+
+    const addLands = screen.getByRole("button", { name: "Add Lands" });
+    fireEvent.click(addLands);
+    expect(addLands).toHaveClass("min-h-11");
+    const picker = screen.getByRole("dialog", { name: "Add Lands" });
+    expect(within(picker).getByRole("button", { name: "Auto Lands" })).toHaveClass("min-h-11");
+    expect(screen.queryAllByRole("button", { name: "Auto Lands" })).toHaveLength(1);
+    fireEvent.click(within(picker).getByRole("button", { name: "Auto Lands" }));
+    expect(onAutoSuggestLands).toHaveBeenCalledOnce();
+    fireEvent.click(within(picker).getByRole("button", { name: "Add Plains" }));
+    fireEvent.click(within(picker).getByRole("button", { name: "Add Lands" }));
+    expect(onAddBasicLand).toHaveBeenCalledWith("Plains");
+  });
+
+  it.each(["tablet-portrait", "tablet-landscape"] as const)(
+    "uses Add lands in %s compact builder",
+    (responsiveLayout) => {
+      const onAutoSuggestLands = vi.fn();
+      render(
+        <LimitedDeckBuilder
+          local={{
+            view: TEST_VIEW,
+            workspace: {
+              schemaVersion: 1,
+              placements: { "card-1": { zone: "deck", row: 0, column: 0, order: 0 } },
+              virtualBasics: [],
+            },
+            preferences: { ...createDefaultDraftWorkspacePreferences(), explicitView: "compact" },
+            interactionLocked: false,
+            onWorkspaceChange: () => {},
+            onPreferencesChange: () => {},
+            onSubmitDeck: () => {},
+            onAddBasicLand: () => {},
+            onRemoveBasicLand: () => {},
+            onAutoSuggestLands,
+          }}
+          responsiveLayout={responsiveLayout}
+        />,
+      );
+
+      const addLands = screen.getByRole("button", { name: "Add Lands" });
+      expect(addLands).toHaveClass("min-h-11");
+      expect(screen.queryByRole("button", { name: "Lands" })).not.toBeInTheDocument();
+      fireEvent.click(addLands);
+      const picker = screen.getByRole("dialog", { name: "Add Lands" });
+      const autoLands = within(picker).getByRole("button", { name: "Auto Lands" });
+      expect(autoLands).toHaveClass("min-h-11");
+      fireEvent.click(autoLands);
+      expect(onAutoSuggestLands).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each([
+    ["phone-portrait", 2, 2, 56],
+    ["phone-landscape", 1, 1, 32],
+    ["tablet-portrait", 3, 3, 72],
+    ["tablet-landscape", 1, 1, 40],
+  ] as const)("uses the shared %s compact-sideboard stack in the builder", (
+    responsiveLayout,
+    columnCount,
+    secondRowCardIndex,
+    exposedStepPx,
+  ) => {
+    const sideboardCards = Array.from({ length: 4 }, (_, index) => ({
+      ...TEST_VIEW.pool[0],
+      instance_id: `side-${index}`,
+      name: `Side ${index}`,
+    }));
+    render(
+      <LimitedDeckBuilder
+        local={{
+          view: { ...TEST_VIEW, pool: sideboardCards },
+          workspace: {
+            schemaVersion: 1,
+            placements: Object.fromEntries(sideboardCards.map((card, index) => [
+              card.instance_id,
+              { zone: "sideboard" as const, row: 0 as const, column: 0, order: index },
+            ])),
+            virtualBasics: [],
+          },
+          preferences: {
+            ...createDefaultDraftWorkspacePreferences(),
+            explicitView: "board",
+            sideboardCollapsed: false,
+            builderPhoneSideboardCollapsed: false,
+          },
+          interactionLocked: false,
+          onWorkspaceChange: () => {},
+          onPreferencesChange: () => {},
+          onSubmitDeck: () => {},
+          onAddBasicLand: () => {},
+          onRemoveBasicLand: () => {},
+        }}
+        responsiveLayout={responsiveLayout}
+      />,
+    );
+
+    const sideboard = screen.getByRole("region", { name: "Compact sideboard" });
+    const stack = sideboard.querySelector<HTMLElement>("[data-card-stack]")!;
+    expect(stack).toHaveAttribute("data-sideboard-column-count", String(columnCount));
+    expect(stack).toHaveClass("relative");
+    expect(stack.querySelector<HTMLElement>(`[data-sideboard-row='1'][data-sideboard-column='0'] [data-instance-id='side-${secondRowCardIndex}']`)!.style.top)
+      .toBe(`${exposedStepPx}px`);
+  });
+
+  it("keeps the tablet portrait generic summary and actions docked while leaving statistics tables on desktop", async () => {
+      const suggestDeck = vi.fn();
+      const rejectSubmission = vi.fn(async () => {
+        throw new Error("submission rejected");
+      });
+      const land = {
+        instance_id: "land-1",
+        name: "Island",
+        set_code: "dmu",
+        collector_number: "259",
+        rarity: "common" as const,
+        colors: [],
+        cmc: 0,
+        type_line: "Basic Land - Island",
+      };
+      const view = {
+        ...TEST_VIEW,
+        min_deck_size: 1,
+        pool: [...TEST_VIEW.pool, land],
+      };
+      const { container } = render(
+        <LimitedDeckBuilder
+          local={{
+            view,
+            workspace: {
+              schemaVersion: 1,
+              placements: {
+                "card-1": { zone: "deck", row: 0, column: 0, order: 0 },
+                "land-1": { zone: "deck", row: 0, column: 1, order: 0 },
+              },
+              virtualBasics: [],
+            },
+            preferences: { ...createDefaultDraftWorkspacePreferences(), explicitView: "compact" },
+            interactionLocked: false,
+            onWorkspaceChange: () => {},
+            onPreferencesChange: () => {},
+            onSubmitDeck: rejectSubmission,
+            onAddBasicLand: () => {},
+            onRemoveBasicLand: () => {},
+            onAutoSuggestDeck: suggestDeck,
+          }}
+          responsiveLayout="tablet-portrait"
+          showSuggestions={false}
+        />,
+      );
+
+      const dock = container.querySelector<HTMLElement>("[data-tablet-builder-dock]")!;
+      expect(container.querySelector("[data-responsive-builder-layout='tablet-portrait']"))
+        .toHaveClass("h-[calc(100dvh_-_4rem)]");
+      expect(container.querySelector("[data-tablet-builder-board]")).toHaveClass("flex-1");
+      expect(dock).toHaveClass("shrink-0");
+      expect(container.querySelector("[data-tablet-builder-summary]")).toHaveClass("grid-cols-4");
+      expect(within(dock).getByText("Mana Curve").closest("section")).toHaveClass("col-span-3");
+      expect(within(dock).getByText("Average Mana Cost").closest("section")).toHaveClass("col-span-1");
+      expect(within(dock).getByText("3.00")).toBeInTheDocument();
+      expect(container.querySelectorAll("table")).toHaveLength(0);
+
+      const suggest = within(dock).getByRole("button", { name: "Suggest Deck" });
+      expect(suggest).toBeDisabled();
+      fireEvent.click(suggest);
+      expect(suggestDeck).not.toHaveBeenCalled();
+
+      const actions = container.querySelector<HTMLElement>("[data-tablet-builder-actions]")!;
+      fireEvent.click(within(actions).getByRole("button", { name: "Submit Deck" }));
+      expect(await screen.findByRole("alert")).toHaveTextContent("submission rejected");
+      expect(container.querySelector("[data-tablet-builder-actions]")).toBe(actions);
+      expect(container.querySelector("[data-tablet-landscape-builder-row]")).not.toBeInTheDocument();
+    });
+
+  it("uses container height unchanged for embedded tablet builders", () => {
+    const { container } = render(
+      <LimitedDeckBuilder
+        local={{
+          view: TEST_VIEW,
+          workspace: { schemaVersion: 1, placements: {}, virtualBasics: [] },
+          preferences: createDefaultDraftWorkspacePreferences(),
+          interactionLocked: false,
+          onWorkspaceChange: () => {},
+          onPreferencesChange: () => {},
+          onSubmitDeck: () => {},
+          onAddBasicLand: () => {},
+          onRemoveBasicLand: () => {},
+        }}
+        responsiveLayout="tablet-landscape"
+        responsiveHeightMode="container"
+      />,
+    );
+
+    expect(container.querySelector("[data-responsive-builder-layout='tablet-landscape']"))
+      .toHaveClass("h-full");
+    expect(container.querySelector("[data-responsive-builder-layout='tablet-landscape']"))
+      .not.toHaveClass("h-[calc(100dvh_-_4rem)]");
+  });
+
+  it("uses one ordered four-cell dock row for the tablet landscape compact and visual builders", async () => {
+    const suggestDeck = vi.fn();
+    const rejectSubmission = vi.fn(async () => {
+      throw new Error("submission rejected");
+    });
+    const preferences = { ...createDefaultDraftWorkspacePreferences(), explicitView: "compact" as const };
+    const onPreferencesChange = vi.fn();
+    const local = {
+      view: { ...TEST_VIEW, min_deck_size: 1 },
+      workspace: {
+        schemaVersion: 1 as const,
+        placements: { "card-1": { zone: "deck" as const, row: 0, column: 0, order: 0 } },
+        virtualBasics: [],
+      },
+      preferences,
+      interactionLocked: false,
+      onWorkspaceChange: () => {},
+      onPreferencesChange,
+      onSubmitDeck: rejectSubmission,
+      onAddBasicLand: () => {},
+      onRemoveBasicLand: () => {},
+      onAutoSuggestDeck: suggestDeck,
+    };
+    const { container, rerender } = render(
+      <LimitedDeckBuilder local={local} responsiveLayout="tablet-landscape" showSuggestions />,
+    );
+
+    const board = container.querySelector<HTMLElement>("[data-tablet-landscape-builder-board]")!;
+    const dock = container.querySelector<HTMLElement>("[data-tablet-landscape-builder-dock]")!;
+    const row = container.querySelector<HTMLElement>("[data-tablet-landscape-builder-row]")!;
+    expect(board).toHaveClass("flex-1");
+    expect(dock).toHaveClass("shrink-0");
+    expect(row).toHaveClass(
+      "grid-cols-[minmax(0,45fr)_minmax(0,15fr)_minmax(0,20fr)_minmax(0,20fr)]",
+    );
+    expect(row).not.toHaveClass("overflow-hidden");
+    expect(Array.from(row.children).map((slot) => slot.getAttribute("data-tablet-landscape-builder-slot")))
+      .toEqual(["curve", "average", "suggest", "submit"]);
+    for (const slot of Array.from(row.children)) expect(slot).toHaveClass("min-w-0");
+    const compactCurve = row.querySelector<HTMLElement>("[data-mana-curve-presentation='compact']")!;
+    expect(compactCurve).toBeInTheDocument();
+    expect(compactCurve.querySelectorAll("[data-mana-curve-count]")).toHaveLength(7);
+    expect(Array.from(compactCurve.querySelectorAll("[data-mana-curve-bucket]"), (bucket) => bucket.textContent))
+      .toEqual(["0", "1", "2", "3", "4", "5", "6+"]);
+    expect(container.querySelector("[data-tablet-builder-summary]")).not.toBeInTheDocument();
+    expect(container.querySelector("[data-tablet-builder-actions]")).not.toBeInTheDocument();
+
+    const compactControls = container.querySelector<HTMLElement>("[data-compact-pool-primary-controls]")!;
+    fireEvent.click(within(compactControls).getByRole("button", { name: "Visual builder" }));
+    expect(onPreferencesChange).toHaveBeenLastCalledWith(expect.objectContaining({ explicitView: "board" }));
+
+    rerender(
+      <LimitedDeckBuilder
+        local={{ ...local, preferences: { ...preferences, explicitView: "board" } }}
+        responsiveLayout="tablet-landscape"
+        showSuggestions
+      />,
+    );
+    expect(container.querySelector("[data-board-columns]")).toBeInTheDocument();
+    expect(container.querySelectorAll("[data-mana-curve-presentation='compact'] [data-mana-curve-bucket]")).toHaveLength(7);
+    fireEvent.click(screen.getByRole("button", { name: "Text builder" }));
+    expect(onPreferencesChange).toHaveBeenLastCalledWith(expect.objectContaining({ explicitView: "compact" }));
+
+    const suggest = within(row).getByRole("button", { name: "Suggest Deck" });
+    expect(suggest).toHaveClass("min-h-11", "px-4", "py-2", "text-sm");
+    fireEvent.click(suggest);
+    expect(suggestDeck).toHaveBeenCalledOnce();
+    const submit = within(row).getByRole("button", { name: "Submit Deck" });
+    expect(submit).toHaveClass("min-h-11", "px-4", "py-2", "text-sm");
+    fireEvent.click(submit);
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("submission rejected");
+    expect(row.compareDocumentPosition(alert) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  });
+
+  it("prevents concurrent workspace deck submissions", async () => {
+    let resolveSubmission!: () => void;
+    const submitDeck = vi.fn(() => new Promise<void>((resolve) => {
+      resolveSubmission = resolve;
+    }));
+    render(
+      <LimitedDeckBuilder
+        local={{
+          view: { ...TEST_VIEW, min_deck_size: 1 },
+          workspace: {
+            schemaVersion: 1,
+            placements: { "card-1": { zone: "deck", row: 0, column: 0, order: 0 } },
+            virtualBasics: [],
+          },
+          preferences: createDefaultDraftWorkspacePreferences(),
+          interactionLocked: false,
+          onWorkspaceChange: () => {},
+          onPreferencesChange: () => {},
+          onSubmitDeck: submitDeck,
+          onAddBasicLand: () => {},
+          onRemoveBasicLand: () => {},
+        }}
+        responsiveLayout="tablet-landscape"
+        showSuggestions={false}
+      />,
+    );
+
+    const submit = screen.getByRole("button", { name: "Submit Deck" });
+    fireEvent.click(submit);
+    expect(submitDeck).toHaveBeenCalledOnce();
+    expect(submit).toBeDisabled();
+    fireEvent.click(submit);
+    expect(submitDeck).toHaveBeenCalledOnce();
+
+    await act(async () => resolveSubmission());
+    expect(submit).not.toBeDisabled();
+  });
+
+  it.each(["tablet-portrait", "phone-portrait", "phone-landscape", "desktop"] as const)(
+    "does not emit tablet landscape markers in %s",
+    (responsiveLayout) => {
+      const { container } = render(
+        <LimitedDeckBuilder
+          local={{
+            view: TEST_VIEW,
+            workspace: {
+              schemaVersion: 1,
+              placements: { "card-1": { zone: "deck", row: 0, column: 0, order: 0 } },
+              virtualBasics: [],
+            },
+            preferences: createDefaultDraftWorkspacePreferences(),
+            interactionLocked: false,
+            onWorkspaceChange: () => {},
+            onPreferencesChange: () => {},
+            onSubmitDeck: () => {},
+            onAddBasicLand: () => {},
+            onRemoveBasicLand: () => {},
+          }}
+          responsiveLayout={responsiveLayout}
+        />,
+      );
+
+      expect(container.querySelector("[data-tablet-landscape-builder-board]")).not.toBeInTheDocument();
+      expect(container.querySelector("[data-tablet-landscape-builder-dock]")).not.toBeInTheDocument();
+      expect(container.querySelector("[data-tablet-landscape-builder-row]")).not.toBeInTheDocument();
+      expect(container.querySelector("[data-tablet-landscape-builder-slot]")).not.toBeInTheDocument();
+      if (responsiveLayout.startsWith("phone")) {
+        const mobileAnalysis = container.querySelector<HTMLElement>("[data-mobile-builder-analysis]")!;
+        expect(mobileAnalysis.querySelector("[data-mana-curve-presentation='compact']"))
+          .toBeInTheDocument();
+        expect(container.querySelector("[data-desktop-builder-analysis]"))
+          .not.toBeInTheDocument();
+      } else {
+        expect(container.querySelector("[data-mana-curve-presentation='compact']"))
+          .not.toBeInTheDocument();
+        for (const curve of container.querySelectorAll("[data-mana-curve-presentation]")) {
+          expect(curve).toHaveAttribute("data-mana-curve-presentation", "default");
+        }
+      }
+    },
+  );
+
+  it("keeps the desktop DeckStatistics average nonland-only for the spell-and-land fixture", () => {
+    const land = {
+      instance_id: "land-1",
+      name: "Island",
+      set_code: "dmu",
+      collector_number: "259",
+      rarity: "common" as const,
+      colors: [],
+      cmc: 0,
+      type_line: "Basic Land - Island",
+    };
+    render(
+      <LimitedDeckBuilder
+        local={{
+          view: { ...TEST_VIEW, min_deck_size: 1, pool: [...TEST_VIEW.pool, land] },
+          workspace: {
+            schemaVersion: 1,
+            placements: {
+              "card-1": { zone: "deck", row: 0, column: 0, order: 0 },
+              "land-1": { zone: "deck", row: 0, column: 1, order: 0 },
+            },
+            virtualBasics: [],
+          },
+          preferences: createDefaultDraftWorkspacePreferences(),
+          interactionLocked: false,
+          onWorkspaceChange: () => {},
+          onPreferencesChange: () => {},
+          onSubmitDeck: () => {},
+          onAddBasicLand: () => {},
+          onRemoveBasicLand: () => {},
+        }}
+        responsiveLayout="desktop"
+      />,
+    );
+
+    expect(screen.getByText("Average Mana Cost")).toBeInTheDocument();
+    expect(screen.getByText("3.00")).toBeInTheDocument();
+  });
+
+  it("disables the tablet suggestion button when the workspace cannot suggest", () => {
+    render(
+      <LimitedDeckBuilder
+        local={{
+          view: { ...TEST_VIEW, min_deck_size: 1 },
+          workspace: {
+            schemaVersion: 1,
+            placements: { "card-1": { zone: "deck", row: 0, column: 0, order: 0 } },
+            virtualBasics: [],
+          },
+          preferences: createDefaultDraftWorkspacePreferences(),
+          interactionLocked: false,
+          onWorkspaceChange: () => {},
+          onPreferencesChange: () => {},
+          onSubmitDeck: () => {},
+          onAddBasicLand: () => {},
+          onRemoveBasicLand: () => {},
+          capabilities: { kind: "editable-pool", suggestions: false },
+          onAutoSuggestDeck: vi.fn(),
+        }}
+        responsiveLayout="tablet-portrait"
+        showSuggestions
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Suggest Deck" })).toBeDisabled();
   });
 
   it("opens a preview on touch long press without moving the card", () => {
@@ -651,5 +1183,1777 @@ describe("LimitedDeckBuilder pool filters", () => {
     } finally {
       failFilterCalls = false;
     }
+  });
+});
+
+// ── P8: CR 903.3 commander designation ──────────────────────────────────
+
+const NO_LANDS: Record<string, number> = {};
+
+const VEHICLE_COMMANDER = {
+  instance_id: "cmd-1",
+  name: "Vehicle Commander",
+  // CR 903.3 admits Vehicles. A `type_line.includes("Legendary Creature")`
+  // client-side check would wrongly refuse this card.
+  type_line: "Legendary Artifact — Vehicle",
+  set_code: "dmu",
+  collector_number: "1",
+  rarity: "rare",
+  colors: ["W"],
+  cmc: 4,
+};
+
+const DECOY_LEGEND = {
+  instance_id: "cmd-2",
+  name: "Decoy Legend",
+  // Reads as a commander to a substring check; the engine says no.
+  type_line: "Legendary Creature — Human",
+  set_code: "dmu",
+  collector_number: "2",
+  rarity: "rare",
+  colors: ["W"],
+  cmc: 2,
+};
+
+const SECOND_COMMANDER = {
+  instance_id: "cmd-3",
+  name: "Second Commander",
+  type_line: "Legendary Creature — Elf",
+  set_code: "dmu",
+  collector_number: "3",
+  rarity: "rare",
+  colors: ["G"],
+  cmc: 3,
+};
+
+const PRISMATIC_PIPER = {
+  instance_id: "cmd-4",
+  // The OTHER CR 903.13e filler. Present in the pool so a pool-derived
+  // implementation offers the wrong filler name (V9).
+  name: "The Prismatic Piper",
+  type_line: "Legendary Creature — Shapeshifter",
+  set_code: "dmu",
+  collector_number: "4",
+  rarity: "common",
+  colors: [],
+  cmc: 3,
+};
+
+const SECOND_PRISMATIC_PIPER = {
+  ...PRISMATIC_PIPER,
+  instance_id: "cmd-5",
+  collector_number: "5",
+};
+
+const COMMANDER_VIEW: BuilderView = {
+  ...TEST_VIEW,
+  kind: "CommanderDraft",
+  commanders_required: 1,
+  min_deck_size: 60,
+  // CR 903.13f(3): the ENGINE-latched tokens. Every pool card below is printed
+  // in "dmu", so an implementation reading a card's printing gets "dmu" here.
+  draft_set_codes: ["CMM"],
+  pool: [
+    ...TEST_VIEW.pool,
+    VEHICLE_COMMANDER,
+    DECOY_LEGEND,
+    SECOND_COMMANDER,
+    PRISMATIC_PIPER,
+  ],
+};
+
+// 60 cards: 59 spells plus one designatable card, all backed by the pool.
+const SIXTY_CARD_DECK = [
+  ...Array.from({ length: 59 }, () => "Wind Drake"),
+  "Vehicle Commander",
+];
+
+function commanderPanelScope() {
+  if (!screen.queryByRole("heading", { name: "Commander", level: 4 })) {
+    fireEvent.click(screen.getByRole("button", { name: "Commander" }));
+  }
+  return within(
+    screen.getByRole("heading", { name: "Commander", level: 4 })
+      .parentElement as HTMLElement,
+  );
+}
+
+function candidateScope() {
+  return within(screen.getByText("Set as commander:").parentElement as HTMLElement);
+}
+
+function sectionScope(headingName: string) {
+  return within(
+    screen.getByRole("heading", { name: headingName }).parentElement as HTMLElement,
+  );
+}
+
+describe("LimitedDeckBuilder — CR 903.3 commander designation", () => {
+  afterEach(() => {
+    cleanup();
+    engineEligible.mockReset();
+    engineEligible.mockResolvedValue(false);
+    enginePartnerCandidates.mockReset();
+    enginePartnerCandidates.mockResolvedValue([]);
+    compatibilityHarness.evaluate.mockClear();
+    compatibilityHarness.evaluate.mockImplementation(async () => compatibleResult());
+    compatibilityHarness.cardDataCache.clear();
+    compatibilityHarness.colorCaptures.length = 0;
+  });
+
+  function onlyVehicleIsEligible() {
+    engineEligible.mockImplementation(async (name: string) => name === "Vehicle Commander");
+  }
+
+  it("preserves controlled duplicates in Commander Draft compatibility and renders raw reasons", async () => {
+    onlyVehicleIsEligible();
+    const submitSpy = vi.fn();
+    const reason = "Cards outside commander's color identity: Wind Drake";
+    compatibilityHarness.evaluate.mockImplementation(async () => ({
+      ...compatibleResult(),
+      selected_format_compatible: false,
+      selected_format_reasons: [reason],
+    }));
+    render(
+      <LimitedDeckBuilder
+        view={COMMANDER_VIEW}
+        mainDeck={SIXTY_CARD_DECK}
+        landCounts={NO_LANDS}
+        onAddToDeck={() => {}}
+        onRemoveFromDeck={() => {}}
+        onSetLandCount={() => {}}
+        onSubmitDeck={submitSpy}
+        showSuggestions={false}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Vehicle Commander" }));
+    await waitFor(() => expect(compatibilityHarness.evaluate).toHaveBeenLastCalledWith(
+      {
+        main: [
+          { name: "Wind Drake", count: 59 },
+          { name: "Vehicle Commander", count: 1 },
+        ],
+        sideboard: [],
+        commander: ["Vehicle Commander"],
+      },
+      { selectedFormat: "CommanderDraft" },
+    ));
+
+    expect(await screen.findByText(reason)).toBeInTheDocument();
+    const submit = screen.getByRole("button", { name: "Submit Deck" });
+    expect(submit).toBeDisabled();
+    fireEvent.click(submit);
+    expect(submitSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "pending",
+      () => new Promise(() => {}),
+      "Checking deck compatibility...",
+    ],
+    [
+      "unavailable",
+      () => Promise.reject(new Error("compatibility unavailable")),
+      "Deck compatibility is unavailable right now — try again before submitting.",
+    ],
+    [
+      "incompatible",
+      () => Promise.resolve({
+        ...compatibleResult(),
+        selected_format_compatible: false,
+        selected_format_reasons: ["Cards outside commander's color identity: Wind Drake"],
+      }),
+      "Cards outside commander's color identity: Wind Drake",
+    ],
+  ])("shows %s compatibility status in the phone submission dock", async (_state, evaluate, message) => {
+    onlyVehicleIsEligible();
+    compatibilityHarness.evaluate.mockImplementation(evaluate);
+    const fixture = workspaceDeckFixture();
+    const { container } = render(
+      <LimitedDeckBuilder
+        local={{
+          view: { ...COMMANDER_VIEW, pool: fixture.cards },
+          workspace: fixture.workspace,
+          preferences: createDefaultDraftWorkspacePreferences(),
+          interactionLocked: false,
+          onWorkspaceChange: () => {},
+          onPreferencesChange: () => {},
+          onSubmitDeck: () => {},
+          onAddBasicLand: () => {},
+          onRemoveBasicLand: () => {},
+        }}
+        responsiveLayout="phone-portrait"
+        showSuggestions={false}
+      />,
+    );
+
+    fireEvent.click(await commanderPanelScope().findByRole("button", { name: "Vehicle Commander" }));
+    const dock = container.querySelector<HTMLElement>("[data-mobile-builder-submit-dock]")!;
+    await waitFor(() => expect(within(dock).getByText(message)).toBeInTheDocument());
+  });
+
+  it("enables controlled submission only for the current strict-true engine result", async () => {
+    onlyVehicleIsEligible();
+    const submitSpy = vi.fn();
+    render(
+      <LimitedDeckBuilder
+        view={COMMANDER_VIEW}
+        mainDeck={SIXTY_CARD_DECK}
+        landCounts={NO_LANDS}
+        onAddToDeck={() => {}}
+        onRemoveFromDeck={() => {}}
+        onSetLandCount={() => {}}
+        onSubmitDeck={submitSpy}
+        showSuggestions={false}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Vehicle Commander" }));
+    const submit = screen.getByRole("button", { name: "Submit Deck" });
+    await waitFor(() => expect(submit).not.toBeDisabled());
+    fireEvent.click(submit);
+    await waitFor(() => expect(submitSpy).toHaveBeenCalledWith(["Vehicle Commander"]));
+  });
+
+  it.each(["Quick", "Sealed", "Premier", "Traditional"] as const)(
+    "keeps %s submission neutral while requesting engine-owned analysis",
+    async (kind) => {
+      const submitSpy = vi.fn();
+      render(
+        <LimitedDeckBuilder
+          view={{ ...TEST_VIEW, kind, min_deck_size: 1 }}
+          mainDeck={["Wind Drake"]}
+          landCounts={NO_LANDS}
+          onAddToDeck={() => {}}
+          onRemoveFromDeck={() => {}}
+          onSetLandCount={() => {}}
+          onSubmitDeck={submitSpy}
+          showSuggestions={false}
+        />,
+      );
+
+      const submit = screen.getByRole("button", { name: "Submit Deck" });
+      expect(submit).not.toBeDisabled();
+      fireEvent.click(submit);
+      await waitFor(() => expect(submitSpy).toHaveBeenCalledWith([]));
+      expect(compatibilityHarness.evaluate).toHaveBeenCalledWith(
+        expect.objectContaining({ main: [{ count: 1, name: "Wind Drake" }] }),
+        { selectedFormat: null },
+      );
+    },
+  );
+
+  it.each([null, undefined])(
+    "fails closed when controlled compatibility is %s",
+    async (selectedFormatCompatible) => {
+      onlyVehicleIsEligible();
+      compatibilityHarness.evaluate.mockImplementation(async () => {
+        const result = compatibleResult();
+        if (selectedFormatCompatible === null) {
+          return { ...result, selected_format_compatible: null };
+        }
+        const { selected_format_compatible: _omitted, ...withoutField } = result;
+        return withoutField;
+      });
+      render(
+        <LimitedDeckBuilder
+          view={COMMANDER_VIEW}
+          mainDeck={SIXTY_CARD_DECK}
+          landCounts={NO_LANDS}
+          onAddToDeck={() => {}}
+          onRemoveFromDeck={() => {}}
+          onSetLandCount={() => {}}
+          onSubmitDeck={() => {}}
+          showSuggestions={false}
+        />,
+      );
+
+      fireEvent.click(await screen.findByRole("button", { name: "Vehicle Commander" }));
+      await waitFor(() => expect(compatibilityHarness.evaluate).toHaveBeenCalledTimes(2));
+      expect(screen.getByRole("button", { name: "Submit Deck" })).toBeDisabled();
+    },
+  );
+
+  function workspaceDeckFixture() {
+    const cards = [
+      ...Array.from({ length: 59 }, (_, index) => ({
+        ...TEST_VIEW.pool[0],
+        instance_id: `wind-${index}`,
+      })),
+      VEHICLE_COMMANDER,
+    ];
+    return {
+      cards,
+      workspace: {
+        schemaVersion: 1 as const,
+        placements: Object.fromEntries(cards.map((card, index) => [
+          card.instance_id,
+          { zone: "deck" as const, row: 0 as const, column: 0, order: index },
+        ])),
+        virtualBasics: [],
+      },
+    };
+  }
+
+  it("preserves workspace instances in compatibility and renders the raw named reason", async () => {
+    onlyVehicleIsEligible();
+    const submitSpy = vi.fn();
+    const reason = "Cards outside commander's color identity: Wind Drake";
+    compatibilityHarness.evaluate.mockImplementation(async () => ({
+      ...compatibleResult(),
+      selected_format_compatible: false,
+      selected_format_reasons: [reason],
+    }));
+    const fixture = workspaceDeckFixture();
+    const { container } = render(
+      <LimitedDeckBuilder
+        local={{
+          view: { ...COMMANDER_VIEW, pool: fixture.cards },
+          workspace: fixture.workspace,
+          preferences: createDefaultDraftWorkspacePreferences(),
+          interactionLocked: false,
+          onWorkspaceChange: () => {},
+          onPreferencesChange: () => {},
+          onSubmitDeck: submitSpy,
+          onAddBasicLand: () => {},
+          onRemoveBasicLand: () => {},
+        }}
+        responsiveLayout="desktop"
+        showSuggestions={false}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Vehicle Commander" }));
+    await waitFor(() => expect(compatibilityHarness.evaluate).toHaveBeenLastCalledWith(
+      {
+        main: [
+          { name: "Wind Drake", count: 59 },
+          { name: "Vehicle Commander", count: 1 },
+        ],
+        sideboard: [],
+        commander: ["Vehicle Commander"],
+      },
+      { selectedFormat: "CommanderDraft" },
+    ));
+    expect(await screen.findByText(reason)).toBeInTheDocument();
+    const submits = within(container).getAllByRole("button", { name: "Submit Deck" });
+    expect(submits.every((button) => button.hasAttribute("disabled"))).toBe(true);
+    submits.forEach((button) => fireEvent.click(button));
+    expect(submitSpy).not.toHaveBeenCalled();
+  });
+
+  it("enables active workspace submission only after a strict-true result", async () => {
+    onlyVehicleIsEligible();
+    const submitSpy = vi.fn();
+    const fixture = workspaceDeckFixture();
+    render(
+      <LimitedDeckBuilder
+        local={{
+          view: { ...COMMANDER_VIEW, pool: fixture.cards },
+          workspace: fixture.workspace,
+          preferences: createDefaultDraftWorkspacePreferences(),
+          interactionLocked: false,
+          onWorkspaceChange: () => {},
+          onPreferencesChange: () => {},
+          onSubmitDeck: submitSpy,
+          onAddBasicLand: () => {},
+          onRemoveBasicLand: () => {},
+        }}
+        responsiveLayout="desktop"
+        showSuggestions={false}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Vehicle Commander" }));
+    const submit = screen.getByRole("button", { name: "Submit Deck" });
+    await waitFor(() => expect(submit).not.toBeDisabled());
+    fireEvent.click(submit);
+    await waitFor(() => expect(submitSpy).toHaveBeenCalledWith(["Vehicle Commander"]));
+  });
+
+  it("keeps workspace submission neutral when the engine requires no commanders", async () => {
+    const submitSpy = vi.fn();
+    const fixture = workspaceDeckFixture();
+    render(
+      <LimitedDeckBuilder
+        local={{
+          view: {
+            ...COMMANDER_VIEW,
+            commanders_required: 0,
+            min_deck_size: 1,
+            pool: fixture.cards,
+          },
+          workspace: fixture.workspace,
+          preferences: createDefaultDraftWorkspacePreferences(),
+          interactionLocked: false,
+          onWorkspaceChange: () => {},
+          onPreferencesChange: () => {},
+          onSubmitDeck: submitSpy,
+          onAddBasicLand: () => {},
+          onRemoveBasicLand: () => {},
+        }}
+        responsiveLayout="desktop"
+        showSuggestions={false}
+      />,
+    );
+
+    const submit = screen.getByRole("button", { name: "Submit Deck" });
+    expect(submit).not.toBeDisabled();
+    fireEvent.click(submit);
+    await waitFor(() => expect(submitSpy).toHaveBeenCalledWith([]));
+    expect(compatibilityHarness.evaluate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        main: [
+          { count: 59, name: "Wind Drake" },
+          { count: 1, name: "Vehicle Commander" },
+        ],
+      }),
+      { selectedFormat: null },
+    );
+  });
+
+  it.each(["resolve", "reject"] as const)(
+    "rejects a stale compatibility %s after the controlled deck key changes",
+    async (settlement) => {
+    onlyVehicleIsEligible();
+    let settleOld!: () => void;
+    compatibilityHarness.evaluate.mockImplementation((deck: { main: Array<{ count: number }> }) => {
+      if (deck.main[0]?.count === 59) {
+        return new Promise((resolve, reject) => {
+          settleOld = settlement === "resolve"
+            ? () => resolve(compatibleResult())
+            : () => reject(new Error("Stale failure"));
+        });
+      }
+      return Promise.resolve({
+        ...compatibleResult(),
+        selected_format_compatible: false,
+        selected_format_reasons: ["Current rejection"],
+      });
+    });
+
+    function CompatibilityLifecycleHarness() {
+      const [windCopies, setWindCopies] = useState(59);
+      return (
+        <>
+          <button onClick={() => setWindCopies(60)}>Change deck</button>
+          <LimitedDeckBuilder
+            view={COMMANDER_VIEW}
+            mainDeck={[
+              ...Array.from({ length: windCopies }, () => "Wind Drake"),
+              "Vehicle Commander",
+            ]}
+            landCounts={NO_LANDS}
+            onAddToDeck={() => {}}
+            onRemoveFromDeck={() => {}}
+            onSetLandCount={() => {}}
+            onSubmitDeck={() => {}}
+            showSuggestions={false}
+          />
+        </>
+      );
+    }
+
+    render(<StrictMode><CompatibilityLifecycleHarness /></StrictMode>);
+    fireEvent.click(await screen.findByRole("button", { name: "Vehicle Commander" }));
+    fireEvent.click(screen.getByRole("button", { name: "Change deck" }));
+    expect(screen.getByRole("button", { name: "Submit Deck" })).toBeDisabled();
+    expect(await screen.findByText("Current rejection")).toBeInTheDocument();
+    await act(async () => settleOld());
+    expect(screen.getByText("Current rejection")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Submit Deck" })).toBeDisabled();
+    },
+  );
+
+  it("renders the engine distribution instead of conflicting cached color metadata", async () => {
+    const azorius = { ...TEST_VIEW.pool[0], instance_id: "azorius", name: "Azorius Pair" };
+    const red = { ...TEST_VIEW.pool[0], instance_id: "red", name: "Red Card" };
+    const uncached = { ...TEST_VIEW.pool[0], instance_id: "uncached", name: "Uncached Card" };
+    const distribution = [
+      { color: "White" as const, count: 2, percentage: 40, display_percentage: 40 },
+      { color: "Blue" as const, count: 2, percentage: 40, display_percentage: 40 },
+      { color: "Red" as const, count: 1, percentage: 20, display_percentage: 20 },
+    ];
+    compatibilityHarness.evaluate.mockResolvedValue({ ...compatibleResult(), color_distribution: distribution });
+    compatibilityHarness.cardDataCache.set("Azorius Pair", { name: "Azorius Pair", cmc: 2, color_identity: ["G"] });
+    compatibilityHarness.cardDataCache.set("Red Card", { name: "Red Card", cmc: 1, color_identity: ["G"] });
+    compatibilityHarness.cardDataCache.set("Wastes", { name: "Wastes", cmc: 0, color_identity: [] });
+    render(
+      <LimitedDeckBuilder
+        view={{ ...TEST_VIEW, pool: [azorius, red, uncached], addable_cards: ["Wastes"] }}
+        mainDeck={["Azorius Pair", "Azorius Pair", "Red Card", "Uncached Card"]}
+        landCounts={{ Wastes: 1 }}
+        onAddToDeck={() => {}}
+        onRemoveFromDeck={() => {}}
+        onSetLandCount={() => {}}
+        onSubmitDeck={() => {}}
+        showSuggestions={false}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(compatibilityHarness.colorCaptures).toContainEqual(distribution);
+    });
+    expect(screen.getByText("W 40%")).toBeInTheDocument();
+    expect(screen.getByText("U 40%")).toBeInTheDocument();
+    expect(screen.getByText("R 20%")).toBeInTheDocument();
+  });
+
+  it.each(["phone-portrait", "phone-landscape", "tablet-landscape", "desktop"] as const)(
+    "forwards the engine distribution unchanged in %s",
+    async (responsiveLayout) => {
+    const azoriusCards = [0, 1].map((index) => ({
+      ...TEST_VIEW.pool[0], instance_id: `azorius-${index}`, name: "Azorius Pair",
+    }));
+    const red = { ...TEST_VIEW.pool[0], instance_id: "red", name: "Red Card" };
+    const uncached = { ...TEST_VIEW.pool[0], instance_id: "uncached", name: "Uncached Card" };
+    const pool = [...azoriusCards, red, uncached];
+    const distribution = [
+      { color: "White" as const, count: 2, percentage: 40, display_percentage: 40 },
+      { color: "Blue" as const, count: 2, percentage: 40, display_percentage: 40 },
+      { color: "Red" as const, count: 1, percentage: 20, display_percentage: 20 },
+    ];
+    compatibilityHarness.evaluate.mockResolvedValue({ ...compatibleResult(), color_distribution: distribution });
+    compatibilityHarness.cardDataCache.set("Azorius Pair", { name: "Azorius Pair", cmc: 2, color_identity: ["G"] });
+    compatibilityHarness.cardDataCache.set("Red Card", { name: "Red Card", cmc: 1, color_identity: ["G"] });
+    compatibilityHarness.cardDataCache.set("Wastes", { name: "Wastes", cmc: 0, color_identity: [] });
+    const placements = Object.fromEntries(pool.map((card, index) => [
+      card.instance_id,
+      { zone: "deck" as const, row: 0 as const, column: 0, order: index },
+    ]));
+    placements.wastes = { zone: "deck", row: 0, column: 0, order: 4 };
+    const { container } = render(
+      <LimitedDeckBuilder
+        local={{
+          view: { ...TEST_VIEW, pool, min_deck_size: 1 },
+          workspace: {
+            schemaVersion: 1,
+            placements,
+            virtualBasics: [{ instanceId: "wastes", name: "Wastes" }],
+          },
+          preferences: createDefaultDraftWorkspacePreferences(),
+          interactionLocked: false,
+          onWorkspaceChange: () => {},
+          onPreferencesChange: () => {},
+          onSubmitDeck: () => {},
+          onAddBasicLand: () => {},
+          onRemoveBasicLand: () => {},
+        }}
+        responsiveLayout={responsiveLayout}
+        showSuggestions={false}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(compatibilityHarness.colorCaptures).toContainEqual(distribution);
+    });
+    const layout = container.querySelector<HTMLElement>("[data-responsive-builder-layout]")!;
+    const phone = responsiveLayout.startsWith("phone");
+    const tablet = responsiveLayout === "tablet-landscape";
+    const responsive = tablet
+      ? layout
+      : layout.querySelector<HTMLElement>("[data-responsive-workspace-layout]")!;
+    const analysis = tablet
+      ? responsive.querySelector<HTMLElement>("[data-mana-curve]")!
+      : responsive.querySelector<HTMLElement>(
+        phone ? "[data-mobile-builder-analysis]" : "[data-desktop-builder-analysis]",
+      )!;
+    const curve = tablet
+      ? analysis
+      : analysis.querySelector<HTMLElement>("[data-mana-curve]")!;
+    const colors = analysis.querySelector<HTMLElement>("[data-color-distribution]")!;
+    expect(container.querySelectorAll("[data-mana-curve]")).toHaveLength(1);
+    expect(container.querySelectorAll("[data-color-distribution]")).toHaveLength(1);
+    if (phone) {
+      expect(container.querySelector("[data-desktop-builder-analysis]")).toBeNull();
+    } else {
+      expect(container.querySelector("[data-mobile-builder-analysis]")).toBeNull();
+      if (tablet) {
+        expect(container.querySelector("[data-desktop-builder-analysis]")).toBeNull();
+      }
+    }
+    expect(responsive.compareDocumentPosition(analysis) & Node.DOCUMENT_POSITION_CONTAINED_BY).not.toBe(0);
+    expect(curve.compareDocumentPosition(colors) & Node.DOCUMENT_POSITION_CONTAINED_BY).not.toBe(0);
+    const dock = container.querySelector<HTMLElement>("[data-mobile-builder-submit-dock]");
+    if (phone) {
+      expect(responsive.compareDocumentPosition(dock!) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    } else {
+      expect(dock).toBeNull();
+    }
+    expect(colors).toHaveTextContent("W 40%");
+    expect(colors).toHaveTextContent("U 40%");
+    expect(colors).toHaveTextContent("R 20%");
+    },
+  );
+
+  /**
+   * V1 — CR 903.3: submission is blocked until a commander is designated, even
+   * though the card count already satisfies `min_deck_size`.
+   *
+   * The "ready to submit" marker is the positive reach-guard: `DeckStatus`
+   * paints it purely on `spells + lands >= min`, so its presence proves the
+   * SIZE gate is already satisfied and it is the DESIGNATION gate refusing.
+   * Without it, `toBeDisabled()` would also pass on a builder whose size gate
+   * simply had not been met.
+   */
+  it("blocks submission of a Commander Draft deck until a commander is designated", async () => {
+    onlyVehicleIsEligible();
+    render(
+      <LimitedDeckBuilder
+        view={COMMANDER_VIEW}
+        mainDeck={SIXTY_CARD_DECK}
+        landCounts={NO_LANDS}
+        onAddToDeck={() => {}}
+        onRemoveFromDeck={() => {}}
+        onSetLandCount={() => {}}
+        onSubmitDeck={() => {}}
+        showSuggestions={false}
+      />,
+    );
+
+    expect(screen.getByText(/ready to submit/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Submit Deck" })).toBeDisabled();
+    expect(
+      screen.getByText("Designate a commander from your pool to submit."),
+    ).toBeInTheDocument();
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Vehicle Commander" }),
+    );
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Submit Deck" })).not.toBeDisabled(),
+    );
+  });
+
+  /**
+   * V2 — CR 903.3 eligibility is the ENGINE's predicate, asked per name, per
+   * format. Reds in BOTH directions on a `type_line.includes("Legendary
+   * Creature")` implementation: it would offer the decoy and hide the Vehicle.
+   */
+  it("offers only the commanders the engine says are eligible", async () => {
+    onlyVehicleIsEligible();
+    render(
+      <LimitedDeckBuilder
+        view={COMMANDER_VIEW}
+        mainDeck={["Vehicle Commander", "Decoy Legend"]}
+        landCounts={NO_LANDS}
+        onAddToDeck={() => {}}
+        onRemoveFromDeck={() => {}}
+        onSetLandCount={() => {}}
+        onSubmitDeck={() => {}}
+        showSuggestions={false}
+      />,
+    );
+
+    // Positive half — the Vehicle IS offered.
+    expect(
+      await screen.findByRole("button", { name: "Vehicle Commander" }),
+    ).toBeInTheDocument();
+    // Negative half, reach-guarded by the positive half in the same render.
+    expect(
+      candidateScope().queryByRole("button", { name: "Decoy Legend" }),
+    ).toBeNull();
+    // The format is passed through, not assumed: "Commander" would be wrong.
+    expect(engineEligible).toHaveBeenCalledWith("Vehicle Commander", "CommanderDraft");
+  });
+
+  /**
+   * V3 — CR 702.124b / CR 903.5a: the designated card stays IN the main deck
+   * (the opposite of the constructed builder, which filters it out of `main`),
+   * and a designation whose last backing copy leaves the deck is dropped.
+   */
+  it("keeps a designated commander inside the main deck and drops it when its last copy leaves", async () => {
+    onlyVehicleIsEligible();
+    const removeSpy = vi.fn();
+
+    function CommanderHarness() {
+      const [mainDeck, setMainDeck] = useState<string[]>(SIXTY_CARD_DECK);
+      return (
+        <LimitedDeckBuilder
+          view={COMMANDER_VIEW}
+          mainDeck={mainDeck}
+          landCounts={NO_LANDS}
+          onAddToDeck={() => {}}
+          onRemoveFromDeck={(cardName) => {
+            removeSpy(cardName);
+            setMainDeck((prev) => {
+              const idx = prev.indexOf(cardName);
+              if (idx < 0) return prev;
+              const next = prev.slice();
+              next.splice(idx, 1);
+              return next;
+            });
+          }}
+          onSetLandCount={() => {}}
+          onSubmitDeck={() => {}}
+          showSuggestions={false}
+        />
+      );
+    }
+
+    render(<CommanderHarness />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Vehicle Commander" }),
+    );
+    await waitFor(() =>
+      expect(commanderPanelScope().getByText("Vehicle Commander")).toBeInTheDocument(),
+    );
+
+    // (a) The designation did not remove the card from the deck.
+    expect(removeSpy).not.toHaveBeenCalled();
+    const deckTile = sectionScope("Main Deck").getByRole("button", {
+      name: /vehicle commander/i,
+    });
+    expect(deckTile).toBeInTheDocument();
+
+    // (b) Removing its last copy drops the designation and re-blocks submit.
+    fireEvent.click(deckTile);
+    await waitFor(() =>
+      expect(screen.getByText("No commander selected")).toBeInTheDocument(),
+    );
+    expect(screen.getByRole("button", { name: "Submit Deck" })).toBeDisabled();
+  });
+
+  /**
+   * V5 — CR 903.13f(3): the partner query receives the VIEW's latched set
+   * codes, never a pool card's printing. Every pool card is printed in "dmu"
+   * while the view says "CMM", so the two authorities disagree on purpose.
+   */
+  it("pairs a second commander under the drafted set's CR 903.13f(3) grant", async () => {
+    engineEligible.mockImplementation(
+      async (name: string) => name === "Vehicle Commander" || name === "Second Commander",
+    );
+    enginePartnerCandidates.mockImplementation(
+      async (_first: string, candidates: string[], draftSetCodes: readonly string[]) =>
+        draftSetCodes.includes("CMM") ? candidates : [],
+    );
+
+    render(
+      <LimitedDeckBuilder
+        view={COMMANDER_VIEW}
+        mainDeck={["Vehicle Commander", "Second Commander"]}
+        landCounts={NO_LANDS}
+        onAddToDeck={() => {}}
+        onRemoveFromDeck={() => {}}
+        onSetLandCount={() => {}}
+        onSubmitDeck={() => {}}
+        showSuggestions={false}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Vehicle Commander" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Second Commander" }));
+
+    await waitFor(() =>
+      expect(commanderPanelScope().getAllByRole("button", { name: "Remove" })).toHaveLength(2),
+    );
+    expect(enginePartnerCandidates).toHaveBeenCalledWith(
+      "Vehicle Commander",
+      ["Second Commander"],
+      ["CMM"],
+    );
+  });
+
+  /**
+   * V5's paired sibling. With no latched set codes the engine grants no
+   * partner, so the second designation SWAPS. Neither row discriminates alone:
+   * without this one a hard-coded `["CMM"]` passes the row above.
+   */
+  it("swaps rather than pairs when the draft grants no partner ability", async () => {
+    engineEligible.mockImplementation(
+      async (name: string) => name === "Vehicle Commander" || name === "Second Commander",
+    );
+    enginePartnerCandidates.mockImplementation(
+      async (_first: string, candidates: string[], draftSetCodes: readonly string[]) =>
+        draftSetCodes.includes("CMM") ? candidates : [],
+    );
+
+    render(
+      <LimitedDeckBuilder
+        view={{ ...COMMANDER_VIEW, draft_set_codes: [] }}
+        mainDeck={["Vehicle Commander", "Second Commander"]}
+        landCounts={NO_LANDS}
+        onAddToDeck={() => {}}
+        onRemoveFromDeck={() => {}}
+        onSetLandCount={() => {}}
+        onSubmitDeck={() => {}}
+        showSuggestions={false}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Vehicle Commander" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Second Commander" }));
+
+    await waitFor(() =>
+      expect(commanderPanelScope().getByText("Second Commander")).toBeInTheDocument(),
+    );
+    expect(commanderPanelScope().getAllByRole("button", { name: "Remove" })).toHaveLength(1);
+    expect(enginePartnerCandidates).toHaveBeenCalledWith(
+      "Vehicle Commander",
+      ["Second Commander"],
+      [],
+    );
+  });
+
+  /**
+  * V6 — green tree: a view whose engine-published commander requirement is
+  * zero renders without designation controls. Reach-guarded by asserting the
+  * pool tile still renders, so a component that crashed could not satisfy the
+  * negative.
+   *
+   * No CR is cited here on purpose. The repo's "four CR 905.1a kinds" idiom is
+   * about cards-per-pick (CR 905.1a: "drafts one card"), which is not what this
+   * row asserts, and CR 905 is the Conspiracy Draft section.
+   */
+  it("shows no commander section for a non-Commander draft", () => {
+    onlyVehicleIsEligible();
+    render(
+      <LimitedDeckBuilder
+        view={TEST_VIEW}
+        mainDeck={Array.from({ length: 40 }, () => "Wind Drake")}
+        landCounts={NO_LANDS}
+        onAddToDeck={() => {}}
+        onRemoveFromDeck={() => {}}
+        onSetLandCount={() => {}}
+        onSubmitDeck={() => {}}
+        showSuggestions={false}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: /wind drake/i })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Commander", level: 4 })).toBeNull();
+    expect(screen.getByRole("button", { name: "Submit Deck" })).not.toBeDisabled();
+    expect(engineEligible).not.toHaveBeenCalled();
+  });
+
+  /**
+   * V9 — CR 903.13e: the filler is offered by the name the ENGINE published.
+   * The pool holds the OTHER filler, so a pool-derived implementation offers
+   * the wrong name and a hard-coded one offers a name the engine did not grant.
+   */
+  it("offers the granted commander filler the engine names", async () => {
+    onlyVehicleIsEligible();
+    render(
+      <LimitedDeckBuilder
+        view={{
+          ...COMMANDER_VIEW,
+          grantable_commander_fillers: [{ card_name: "Faceless One", max_copies: 2 }],
+        }}
+        mainDeck={["Vehicle Commander"]}
+        landCounts={NO_LANDS}
+        onAddToDeck={() => {}}
+        onRemoveFromDeck={() => {}}
+        onSetLandCount={() => {}}
+        onSubmitDeck={() => {}}
+        showSuggestions={false}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Add Faceless One" })).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        "Your pool also includes up to 2 × Faceless One, usable only as your commander.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("offers no filler when the draft's set grants none", async () => {
+    onlyVehicleIsEligible();
+    render(
+      <LimitedDeckBuilder
+        view={COMMANDER_VIEW}
+        mainDeck={["Vehicle Commander"]}
+        landCounts={NO_LANDS}
+        onAddToDeck={() => {}}
+        onRemoveFromDeck={() => {}}
+        onSetLandCount={() => {}}
+        onSubmitDeck={() => {}}
+        showSuggestions={false}
+      />,
+    );
+
+    // Reach-guard: the addable list itself is rendering.
+    expect(screen.getByRole("button", { name: "Add Plains" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Add Faceless One/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Add The Prismatic Piper/ })).toBeNull();
+  });
+
+  /**
+   * V11 — the designation is PASSED to the submit handler.
+   *
+   * This proves the seam exists at THIS surface; it does not itself prove the
+   * value is consumed downstream. It now is: `multiplayerDraftStore.submitDeck`
+   * forwards it to `DraftAction::SubmitDeck.commanders`, which
+   * `submit_deck_inner_carries_the_designation_to_the_session` asserts at the
+   * `draft-wasm` seam.
+   */
+  it("passes the designated commanders to the submit handler", async () => {
+    onlyVehicleIsEligible();
+    const submitSpy = vi.fn();
+    render(
+      <LimitedDeckBuilder
+        view={COMMANDER_VIEW}
+        mainDeck={SIXTY_CARD_DECK}
+        landCounts={NO_LANDS}
+        onAddToDeck={() => {}}
+        onRemoveFromDeck={() => {}}
+        onSetLandCount={() => {}}
+        onSubmitDeck={submitSpy}
+        showSuggestions={false}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Vehicle Commander" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Submit Deck" })).not.toBeDisabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Submit Deck" }));
+
+    await waitFor(() =>
+      expect(submitSpy).toHaveBeenCalledWith(["Vehicle Commander"]),
+    );
+  });
+
+  /**
+   * V13 — CR 903.5a, the composition contract THROUGH the real caller. A
+   * drafted Commander deck is commanders-INSIDE, so a designated card is a
+   * label on a deck card and must be counted ONCE.
+   *
+   * V7 cannot reach this: it renders `CommanderPanel` with literal props in its
+   * own file and never exercises the caller's declared composition.
+   */
+  it("counts a designated commander once, not twice, in the deck-size indicator", async () => {
+    onlyVehicleIsEligible();
+    render(
+      <LimitedDeckBuilder
+        view={COMMANDER_VIEW}
+        mainDeck={SIXTY_CARD_DECK}
+        landCounts={NO_LANDS}
+        onAddToDeck={() => {}}
+        onRemoveFromDeck={() => {}}
+        onSetLandCount={() => {}}
+        onSubmitDeck={() => {}}
+        showSuggestions={false}
+      />,
+    );
+
+    // Reach-guard: the indicator exists and already reads 60/60 undesignated,
+    // so a render with no panel at all cannot pass the assertion below.
+    expect(screen.getByText("60/60 cards")).toBeInTheDocument();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Vehicle Commander" }));
+    await waitFor(() =>
+      expect(commanderPanelScope().getByText("Vehicle Commander")).toBeInTheDocument(),
+    );
+
+    expect(screen.getByText("60/60 cards")).toHaveClass("text-green-400");
+    expect(screen.queryByText("61/60 cards")).toBeNull();
+  });
+
+  /**
+   * V13's false-green sibling. With 59 real cards plus one designation, the
+   * commanders-OUTSIDE arithmetic paints the indicator GREEN at "60/60" while
+   * `deckValid` (59 < 60) keeps Submit disabled — two adjacent indicators
+   * contradicting each other, with the green one wrong.
+   */
+  it("does not let a designation paint an under-sized deck as complete", async () => {
+    onlyVehicleIsEligible();
+    render(
+      <LimitedDeckBuilder
+        view={COMMANDER_VIEW}
+        mainDeck={SIXTY_CARD_DECK.slice(1)}
+        landCounts={NO_LANDS}
+        onAddToDeck={() => {}}
+        onRemoveFromDeck={() => {}}
+        onSetLandCount={() => {}}
+        onSubmitDeck={() => {}}
+        showSuggestions={false}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Vehicle Commander" }));
+    await waitFor(() =>
+      expect(commanderPanelScope().getByText("Vehicle Commander")).toBeInTheDocument(),
+    );
+
+    expect(screen.getByText("59/60 cards")).toHaveClass("text-yellow-400");
+    expect(screen.queryByText("60/60 cards")).toBeNull();
+    expect(screen.getByRole("button", { name: "Submit Deck" })).toBeDisabled();
+  });
+
+  /**
+   * The engine-unavailable path. A silent empty candidate list would leave
+   * Submit permanently un-satisfiable with no explanation — a dead end, which
+   * is worse than a degraded surface. Same standard as the pool filter's
+   * `limitedDeck.filterUnavailable`.
+   */
+  it("announces that commander designation is unavailable when the engine rejects", async () => {
+    engineEligible.mockRejectedValue(new Error("engine unavailable"));
+    render(
+      <LimitedDeckBuilder
+        view={COMMANDER_VIEW}
+        mainDeck={SIXTY_CARD_DECK}
+        landCounts={NO_LANDS}
+        onAddToDeck={() => {}}
+        onRemoveFromDeck={() => {}}
+        onSetLandCount={() => {}}
+        onSubmitDeck={() => {}}
+        showSuggestions={false}
+      />,
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Commander designation is unavailable right now — the card database could not be loaded.",
+    );
+    // Reach-guard: the panel itself rendered; it simply offers nothing.
+    expect(screen.getByText("No commander selected")).toBeInTheDocument();
+  });
+
+  /**
+   * V12 — CR 702.124g: no partner ability or combination of them can ever let a
+   * player have more than two commanders, INCLUDING when two designations race
+   * inside one in-flight partner query.
+   *
+   * Both clicks land while the first query is still unresolved, so both read
+   * the same captured `commanders` and both are answered "pairs". The gate that
+   * runs BEFORE the await cannot see the other click; only a re-check against
+   * live state at commit time can.
+   *
+   * Reach-guarded positively, in the same render, twice over: the query is
+   * asked TWICE (so neither click was swallowed by an eligibility or
+   * already-designated filter), and the first answer genuinely PAIRS to two
+   * commanders (so the append path is the one under test, not a click that
+   * quietly did nothing). A pre-fix build satisfies both guards and then shows
+   * three commanders with Submit enabled.
+   */
+  it("cannot stack a third commander when two designations race one query", async () => {
+    engineEligible.mockImplementation(
+      async (name: string) =>
+        name === "Vehicle Commander" ||
+        name === "Second Commander" ||
+        name === "The Prismatic Piper",
+    );
+    // Hold every partner query open, so both clicks land before either answer.
+    const answer: Array<() => void> = [];
+    enginePartnerCandidates.mockImplementation(
+      (_first: string, candidates: string[]) =>
+        new Promise<string[]>((resolve) => {
+          answer.push(() => resolve(candidates));
+        }),
+    );
+
+    render(
+      <LimitedDeckBuilder
+        view={COMMANDER_VIEW}
+        mainDeck={["Vehicle Commander", "Second Commander", "The Prismatic Piper"]}
+        landCounts={NO_LANDS}
+        onAddToDeck={() => {}}
+        onRemoveFromDeck={() => {}}
+        onSetLandCount={() => {}}
+        onSubmitDeck={() => {}}
+        showSuggestions={false}
+      />,
+    );
+
+    // The first designation takes the free slot: no partner query, no await.
+    fireEvent.click(await screen.findByRole("button", { name: "Vehicle Commander" }));
+    await waitFor(() =>
+      expect(commanderPanelScope().getAllByRole("button", { name: "Remove" })).toHaveLength(1),
+    );
+    expect(enginePartnerCandidates).not.toHaveBeenCalled();
+
+    // Two clicks inside ONE in-flight query. Neither re-renders the panel, so
+    // both handlers close over the same single-commander value.
+    fireEvent.click(screen.getByRole("button", { name: "Second Commander" }));
+    fireEvent.click(screen.getByRole("button", { name: "The Prismatic Piper" }));
+    await waitFor(() => expect(enginePartnerCandidates).toHaveBeenCalledTimes(2));
+
+    // Resolve in reverse request order: the latest intent commits first.
+    await act(async () => {
+      answer[1]();
+    });
+    await waitFor(() =>
+      expect(commanderPanelScope().getByText("The Prismatic Piper")).toBeInTheDocument(),
+    );
+    expect(
+      commanderPanelScope().getAllByRole("button", { name: "Remove" }),
+    ).toHaveLength(2);
+
+    // The older response cannot overwrite that newer committed intent.
+    await act(async () => {
+      answer[0]();
+    });
+    expect(
+      commanderPanelScope().getAllByRole("button", { name: "Remove" })
+        .map((button) => button.parentElement?.textContent),
+    ).toEqual(["Vehicle CommanderRemove", "The Prismatic PiperRemove"]);
+  });
+
+  it("invalidates an in-flight pairing response when its commander is removed", async () => {
+    engineEligible.mockImplementation(
+      async (name: string) => name === "Vehicle Commander" || name === "Second Commander",
+    );
+    let resolvePairing!: () => void;
+    enginePartnerCandidates.mockImplementation(
+      (_first: string, candidates: string[]) => new Promise<string[]>((resolve) => {
+        resolvePairing = () => resolve(candidates);
+      }),
+    );
+
+    render(
+      <LimitedDeckBuilder
+        view={COMMANDER_VIEW}
+        mainDeck={["Vehicle Commander", "Second Commander"]}
+        landCounts={NO_LANDS}
+        onAddToDeck={() => {}}
+        onRemoveFromDeck={() => {}}
+        onSetLandCount={() => {}}
+        onSubmitDeck={() => {}}
+        showSuggestions={false}
+      />,
+    );
+
+    fireEvent.click(await commanderPanelScope().findByRole("button", { name: "Vehicle Commander" }));
+    await waitFor(() => expect(
+      commanderPanelScope().getAllByRole("button", { name: "Remove" }),
+    ).toHaveLength(1));
+    const secondCandidate = await commanderPanelScope().findByRole(
+      "button",
+      { name: "Second Commander" },
+    );
+    fireEvent.click(secondCandidate);
+    await waitFor(() => expect(enginePartnerCandidates).toHaveBeenCalledOnce());
+    fireEvent.click(commanderPanelScope().getByRole("button", { name: "Remove" }));
+    await act(async () => resolvePairing());
+
+    expect(screen.getByText("No commander selected")).toBeInTheDocument();
+    expect(commanderPanelScope().queryByRole("button", { name: "Remove" })).not.toBeInTheDocument();
+  });
+
+  it("rejects an in-flight pairing response after the candidate loses backing", async () => {
+    engineEligible.mockImplementation(
+      async (name: string) => name === "Vehicle Commander" || name === "Second Commander",
+    );
+    let resolvePairing!: () => void;
+    enginePartnerCandidates.mockImplementation(
+      (_first: string, candidates: string[]) => new Promise<string[]>((resolve) => {
+        resolvePairing = () => resolve(candidates);
+      }),
+    );
+
+    function BackingLossHarness() {
+      const [mainDeck, setMainDeck] = useState(["Vehicle Commander", "Second Commander"]);
+      return (
+        <LimitedDeckBuilder
+          view={COMMANDER_VIEW}
+          mainDeck={mainDeck}
+          landCounts={NO_LANDS}
+          onAddToDeck={() => {}}
+          onRemoveFromDeck={(cardName) => setMainDeck((current) => {
+            const index = current.indexOf(cardName);
+            return index < 0
+              ? current
+              : [...current.slice(0, index), ...current.slice(index + 1)];
+          })}
+          onSetLandCount={() => {}}
+          onSubmitDeck={() => {}}
+          showSuggestions={false}
+        />
+      );
+    }
+
+    render(<BackingLossHarness />);
+    fireEvent.click(await commanderPanelScope().findByRole("button", { name: "Vehicle Commander" }));
+    await waitFor(() => expect(
+      commanderPanelScope().getAllByRole("button", { name: "Remove" }),
+    ).toHaveLength(1));
+    const secondCandidate = await commanderPanelScope().findByRole(
+      "button",
+      { name: "Second Commander" },
+    );
+    fireEvent.click(secondCandidate);
+    await waitFor(() => expect(enginePartnerCandidates).toHaveBeenCalledOnce());
+    fireEvent.click(sectionScope("Main Deck").getByRole("button", { name: /second commander/i }));
+    await act(async () => resolvePairing());
+
+    expect(commanderPanelScope().getByText("Vehicle Commander")).toBeInTheDocument();
+    expect(commanderPanelScope().queryByText("Second Commander")).not.toBeInTheDocument();
+    expect(commanderPanelScope().getAllByRole("button", { name: "Remove" })).toHaveLength(1);
+  });
+
+  it("invalidates an in-flight pairing response when designation is suspended and re-entered", async () => {
+    engineEligible.mockImplementation(
+      async (name: string) => name === "Vehicle Commander" || name === "Second Commander",
+    );
+    let resolvePairing!: () => void;
+    enginePartnerCandidates.mockImplementation(
+      (_first: string, candidates: string[]) => new Promise<string[]>((resolve) => {
+        resolvePairing = () => resolve(candidates);
+      }),
+    );
+
+    function LifecycleHarness() {
+      const [designationEnabled, setDesignationEnabled] = useState(true);
+      return (
+        <>
+          <button onClick={() => setDesignationEnabled(false)}>Suspend designation</button>
+          <button onClick={() => setDesignationEnabled(true)}>Resume designation</button>
+          <LimitedDeckBuilder
+            view={designationEnabled
+              ? COMMANDER_VIEW
+              : { ...COMMANDER_VIEW, commanders_required: 0 }}
+            mainDeck={["Vehicle Commander", "Second Commander"]}
+            landCounts={NO_LANDS}
+            onAddToDeck={() => {}}
+            onRemoveFromDeck={() => {}}
+            onSetLandCount={() => {}}
+            onSubmitDeck={() => {}}
+            showSuggestions={false}
+          />
+        </>
+      );
+    }
+
+    render(<StrictMode><LifecycleHarness /></StrictMode>);
+
+    fireEvent.click(await commanderPanelScope().findByRole("button", { name: "Vehicle Commander" }));
+    await waitFor(() => expect(
+      commanderPanelScope().getAllByRole("button", { name: "Remove" }),
+    ).toHaveLength(1));
+    const secondCandidate = await commanderPanelScope().findByRole(
+      "button",
+      { name: "Second Commander" },
+    );
+    fireEvent.click(secondCandidate);
+    await waitFor(() => expect(enginePartnerCandidates).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("button", { name: "Suspend designation" }));
+    expect(screen.queryByText("Choose Commander")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Resume designation" }));
+    await commanderPanelScope().findByText("Vehicle Commander");
+    await act(async () => resolvePairing());
+
+    expect(commanderPanelScope().queryByRole("button", { name: "Remove" })).not.toBeInTheDocument();
+  });
+
+  it.each(["controlled", "workspace"] as const)(
+    "clears commander state when engine authority becomes zero in the %s builder",
+    async (mode) => {
+      onlyVehicleIsEligible();
+      const submitSpy = vi.fn();
+
+      function AuthorityHarness() {
+        const [commandersRequired, setCommandersRequired] = useState(1);
+        const view = {
+          ...COMMANDER_VIEW,
+          commanders_required: commandersRequired,
+          min_deck_size: 1,
+          pool: [VEHICLE_COMMANDER],
+        };
+        return (
+          <>
+            <button onClick={() => setCommandersRequired(0)}>Disable designation</button>
+            <button onClick={() => setCommandersRequired(1)}>Enable designation</button>
+            {mode === "controlled" ? (
+              <LimitedDeckBuilder
+                view={view}
+                mainDeck={["Vehicle Commander"]}
+                landCounts={NO_LANDS}
+                onAddToDeck={() => {}}
+                onRemoveFromDeck={() => {}}
+                onSetLandCount={() => {}}
+                onSubmitDeck={submitSpy}
+                showSuggestions={false}
+              />
+            ) : (
+              <LimitedDeckBuilder
+                local={{
+                  view,
+                  workspace: {
+                    schemaVersion: 1,
+                    placements: {
+                      "cmd-1": { zone: "deck", row: 0, column: 0, order: 0 },
+                    },
+                    virtualBasics: [],
+                  },
+                  preferences: createDefaultDraftWorkspacePreferences(),
+                  interactionLocked: false,
+                  capabilities: { kind: "editable-pool", suggestions: false },
+                  onWorkspaceChange: () => {},
+                  onPreferencesChange: () => {},
+                  onSubmitDeck: submitSpy,
+                  onAddBasicLand: () => {},
+                  onRemoveBasicLand: () => {},
+                }}
+                responsiveLayout="desktop"
+                showSuggestions={false}
+              />
+            )}
+          </>
+        );
+      }
+
+      render(<AuthorityHarness />);
+      fireEvent.click(await commanderPanelScope().findByRole("button", { name: "Vehicle Commander" }));
+      await waitFor(() => expect(
+        commanderPanelScope().getAllByRole("button", { name: "Remove" }),
+      ).toHaveLength(1));
+
+      fireEvent.click(screen.getByRole("button", { name: "Disable designation" }));
+      await waitFor(() => expect(
+        screen.queryByRole("heading", { name: "Commander", level: 4 }),
+      ).not.toBeInTheDocument());
+      const submit = screen.getByRole("button", { name: "Submit Deck" });
+      expect(submit).not.toBeDisabled();
+      fireEvent.click(submit);
+      await waitFor(() => expect(submitSpy).toHaveBeenCalledWith([]));
+
+      fireEvent.click(screen.getByRole("button", { name: "Enable designation" }));
+      expect(commanderPanelScope().queryByRole("button", { name: "Remove" })).not.toBeInTheDocument();
+    },
+  );
+
+  it.each(["desktop", "tablet-portrait", "phone-portrait"] as const)(
+    "designates and submits two backed copies of The Prismatic Piper on %s",
+    async (responsiveLayout) => {
+      engineEligible.mockImplementation(async (name: string) => name === "The Prismatic Piper");
+      enginePartnerCandidates.mockResolvedValue(["The Prismatic Piper"]);
+      const submitSpy = vi.fn();
+      const view = {
+        ...COMMANDER_VIEW,
+        kind: "Premier" as const,
+        commanders_required: 2,
+        min_deck_size: 2,
+        pool: [PRISMATIC_PIPER, SECOND_PRISMATIC_PIPER],
+      };
+
+      function WorkspaceHarness() {
+        const [workspace, setWorkspace] = useState<DraftWorkspaceState>({
+          schemaVersion: 1 as const,
+          placements: {
+            "cmd-4": { zone: "deck" as const, row: 0 as const, column: 0, order: 0 },
+            "cmd-5": { zone: "deck" as const, row: 0 as const, column: 0, order: 1 },
+          },
+          virtualBasics: [],
+        });
+        return (
+          <LimitedDeckBuilder
+            local={{
+              view,
+              workspace,
+              preferences: createDefaultDraftWorkspacePreferences(),
+              interactionLocked: false,
+              capabilities: { kind: "editable-pool", suggestions: false },
+              onWorkspaceChange: setWorkspace,
+              onPreferencesChange: () => {},
+              onSubmitDeck: submitSpy,
+              onAddBasicLand: () => {},
+              onRemoveBasicLand: () => {},
+            }}
+            responsiveLayout={responsiveLayout}
+            showSuggestions={false}
+          />
+        );
+      }
+
+      render(
+        <StrictMode>
+          <WorkspaceHarness />
+        </StrictMode>,
+      );
+      fireEvent.click(await commanderPanelScope().findByRole("button", { name: "The Prismatic Piper" }));
+      await waitFor(() => expect(commanderPanelScope().getAllByRole("button", { name: "Remove" })).toHaveLength(1));
+      const submitButton = responsiveLayout === "phone-portrait"
+        ? within(document.querySelector<HTMLElement>("[data-mobile-builder-submit-dock]")!)
+          .getByRole("button", { name: "Submit Deck" })
+        : screen.getByRole("button", { name: "Submit Deck" });
+      expect(submitButton).toBeDisabled();
+      fireEvent.click(await commanderPanelScope().findByRole("button", { name: "The Prismatic Piper" }));
+      await waitFor(() => expect(commanderPanelScope().getAllByRole("button", { name: "Remove" })).toHaveLength(2));
+      expect(enginePartnerCandidates).toHaveBeenCalledWith(
+        "The Prismatic Piper",
+        ["The Prismatic Piper"],
+        ["CMM"],
+      );
+
+      await waitFor(() => expect(submitButton).not.toBeDisabled());
+      fireEvent.click(submitButton);
+      await waitFor(() => expect(submitSpy).toHaveBeenCalledWith([
+        "The Prismatic Piper",
+        "The Prismatic Piper",
+      ]));
+
+      fireEvent.click(commanderPanelScope().getAllByRole("button", { name: "Remove" })[0]);
+      await waitFor(() => expect(commanderPanelScope().getAllByRole("button", { name: "Remove" })).toHaveLength(1));
+    },
+  );
+
+  it("uses the engine count in the controlled builder independently of draft kind", async () => {
+    engineEligible.mockImplementation(async (name: string) => name === "The Prismatic Piper");
+    enginePartnerCandidates.mockResolvedValue(["The Prismatic Piper"]);
+    const compatibilityResolvers: Array<(
+      result: ReturnType<typeof compatibleResult>,
+    ) => void> = [];
+    compatibilityHarness.evaluate.mockImplementation(() => new Promise((resolve) => {
+      compatibilityResolvers.push(resolve);
+    }));
+    const submitSpy = vi.fn();
+    render(
+      <LimitedDeckBuilder
+        view={{
+          ...COMMANDER_VIEW,
+          kind: "Premier",
+          commanders_required: 2,
+          min_deck_size: 2,
+          pool: [PRISMATIC_PIPER, SECOND_PRISMATIC_PIPER],
+        }}
+        mainDeck={["The Prismatic Piper", "The Prismatic Piper"]}
+        landCounts={NO_LANDS}
+        onAddToDeck={() => {}}
+        onRemoveFromDeck={() => {}}
+        onSetLandCount={() => {}}
+        onSubmitDeck={submitSpy}
+        showSuggestions={false}
+      />,
+    );
+
+    fireEvent.click(await commanderPanelScope().findByRole("button", { name: "The Prismatic Piper" }));
+    await waitFor(() => expect(compatibilityHarness.evaluate).toHaveBeenLastCalledWith(
+      expect.objectContaining({ commander: ["The Prismatic Piper"] }),
+      { selectedFormat: "CommanderDraft" },
+    ));
+    await act(async () => {
+      compatibilityResolvers[compatibilityResolvers.length - 1](compatibleResult());
+    });
+    const submit = screen.getByRole("button", { name: "Submit Deck" });
+    expect(submit).toBeDisabled();
+    fireEvent.click(await commanderPanelScope().findByRole("button", { name: "The Prismatic Piper" }));
+    await waitFor(() => expect(compatibilityHarness.evaluate).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        commander: ["The Prismatic Piper", "The Prismatic Piper"],
+      }),
+      { selectedFormat: "CommanderDraft" },
+    ));
+    await act(async () => {
+      compatibilityResolvers[compatibilityResolvers.length - 1](compatibleResult());
+    });
+    await waitFor(() => expect(submit).not.toBeDisabled());
+    fireEvent.click(submit);
+    await waitFor(() => expect(submitSpy).toHaveBeenCalledWith([
+      "The Prismatic Piper",
+      "The Prismatic Piper",
+    ]));
+  });
+
+  it.each(["controlled", "workspace"] as const)(
+    "fails closed when the engine requires more commanders than %s supports",
+    async (mode) => {
+      engineEligible.mockImplementation(async (name: string) => name === "The Prismatic Piper");
+      enginePartnerCandidates.mockResolvedValue(["The Prismatic Piper"]);
+      const compatibilityResolvers: Array<(
+        result: ReturnType<typeof compatibleResult>,
+      ) => void> = [];
+      compatibilityHarness.evaluate.mockImplementation(() => new Promise((resolve) => {
+        compatibilityResolvers.push(resolve);
+      }));
+      const submitSpy = vi.fn();
+      const view = {
+        ...COMMANDER_VIEW,
+        commanders_required: 3,
+        min_deck_size: 2,
+        pool: [PRISMATIC_PIPER, SECOND_PRISMATIC_PIPER],
+      };
+
+      render(mode === "controlled" ? (
+        <LimitedDeckBuilder
+          view={view}
+          mainDeck={["The Prismatic Piper", "The Prismatic Piper"]}
+          landCounts={NO_LANDS}
+          onAddToDeck={() => {}}
+          onRemoveFromDeck={() => {}}
+          onSetLandCount={() => {}}
+          onSubmitDeck={submitSpy}
+          showSuggestions={false}
+        />
+      ) : (
+        <LimitedDeckBuilder
+          local={{
+            view,
+            workspace: {
+              schemaVersion: 1,
+              placements: {
+                "cmd-4": { zone: "deck", row: 0, column: 0, order: 0 },
+                "cmd-5": { zone: "deck", row: 0, column: 0, order: 1 },
+              },
+              virtualBasics: [],
+            },
+            preferences: createDefaultDraftWorkspacePreferences(),
+            interactionLocked: false,
+            capabilities: { kind: "editable-pool", suggestions: false },
+            onWorkspaceChange: () => {},
+            onPreferencesChange: () => {},
+            onSubmitDeck: submitSpy,
+            onAddBasicLand: () => {},
+            onRemoveBasicLand: () => {},
+          }}
+          responsiveLayout="desktop"
+          showSuggestions={false}
+        />
+      ));
+
+      fireEvent.click(await commanderPanelScope().findByRole("button", { name: "The Prismatic Piper" }));
+      fireEvent.click(await commanderPanelScope().findByRole("button", { name: "The Prismatic Piper" }));
+      await waitFor(() => expect(
+        commanderPanelScope().getAllByRole("button", { name: "Remove" }),
+      ).toHaveLength(2));
+      await waitFor(() => expect(compatibilityHarness.evaluate).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          commander: ["The Prismatic Piper", "The Prismatic Piper"],
+        }),
+        { selectedFormat: "CommanderDraft" },
+      ));
+      await act(async () => {
+        compatibilityResolvers[compatibilityResolvers.length - 1](compatibleResult());
+      });
+      const submit = screen.getByRole("button", { name: "Submit Deck" });
+      expect(submit).toBeDisabled();
+      fireEvent.click(submit);
+      expect(submitSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  it("prunes duplicate designations to the currently backed copy count", async () => {
+    engineEligible.mockImplementation(async (name: string) => name === "The Prismatic Piper");
+    enginePartnerCandidates.mockResolvedValue(["The Prismatic Piper"]);
+    const view = { ...COMMANDER_VIEW, pool: [PRISMATIC_PIPER, SECOND_PRISMATIC_PIPER] };
+
+    function BackingHarness() {
+      const [twoCopies, setTwoCopies] = useState(true);
+      const workspace = {
+        schemaVersion: 1 as const,
+        placements: {
+          "cmd-4": { zone: "deck" as const, row: 0 as const, column: 0, order: 0 },
+          "cmd-5": { zone: (twoCopies ? "deck" : "sideboard") as "deck" | "sideboard", row: 0 as const, column: 0, order: 1 },
+        },
+        virtualBasics: [],
+      };
+      return (
+        <>
+          <button onClick={() => setTwoCopies(false)}>Reduce backing</button>
+          <LimitedDeckBuilder
+            local={{
+              view,
+              workspace,
+              preferences: createDefaultDraftWorkspacePreferences(),
+              interactionLocked: false,
+              capabilities: { kind: "editable-pool", suggestions: false },
+              onWorkspaceChange: () => {},
+              onPreferencesChange: () => {},
+              onSubmitDeck: () => {},
+              onAddBasicLand: () => {},
+              onRemoveBasicLand: () => {},
+            }}
+            responsiveLayout="desktop"
+          />
+        </>
+      );
+    }
+
+    render(<BackingHarness />);
+    fireEvent.click(await commanderPanelScope().findByRole("button", { name: "The Prismatic Piper" }));
+    fireEvent.click(await commanderPanelScope().findByRole("button", { name: "The Prismatic Piper" }));
+    await waitFor(() => expect(commanderPanelScope().getAllByRole("button", { name: "Remove" })).toHaveLength(2));
+    fireEvent.click(screen.getByRole("button", { name: "Reduce backing" }));
+    await waitFor(() => expect(commanderPanelScope().getAllByRole("button", { name: "Remove" })).toHaveLength(1));
+  });
+
+  it("does not let one copy back two designations", async () => {
+    engineEligible.mockImplementation(async (name: string) => name === "The Prismatic Piper");
+    enginePartnerCandidates.mockResolvedValue(["The Prismatic Piper"]);
+    render(
+      <LimitedDeckBuilder
+        local={{
+          view: { ...COMMANDER_VIEW, min_deck_size: 1, pool: [PRISMATIC_PIPER] },
+          workspace: {
+            schemaVersion: 1,
+            placements: { "cmd-4": { zone: "deck", row: 0, column: 0, order: 0 } },
+            virtualBasics: [],
+          },
+          preferences: createDefaultDraftWorkspacePreferences(),
+          interactionLocked: false,
+          capabilities: { kind: "editable-pool", suggestions: false },
+          onWorkspaceChange: () => {},
+          onPreferencesChange: () => {},
+          onSubmitDeck: () => {},
+          onAddBasicLand: () => {},
+          onRemoveBasicLand: () => {},
+        }}
+        responsiveLayout="desktop"
+      />,
+    );
+
+    fireEvent.click(await commanderPanelScope().findByRole("button", { name: "The Prismatic Piper" }));
+    await waitFor(() => expect(commanderPanelScope().getAllByRole("button", { name: "Remove" })).toHaveLength(1));
+    expect(commanderPanelScope().queryByRole("button", { name: "The Prismatic Piper" })).not.toBeInTheDocument();
+    expect(enginePartnerCandidates).not.toHaveBeenCalled();
+  });
+
+  it("shows the commander requirement on phone when deck size is satisfied", async () => {
+    engineEligible.mockImplementation(async (name: string) => name === "The Prismatic Piper");
+    render(
+      <LimitedDeckBuilder
+        local={{
+          view: { ...COMMANDER_VIEW, min_deck_size: 1, pool: [PRISMATIC_PIPER] },
+          workspace: {
+            schemaVersion: 1,
+            placements: { "cmd-4": { zone: "deck", row: 0, column: 0, order: 0 } },
+            virtualBasics: [],
+          },
+          preferences: createDefaultDraftWorkspacePreferences(),
+          interactionLocked: false,
+          capabilities: { kind: "editable-pool", suggestions: false },
+          onWorkspaceChange: () => {},
+          onPreferencesChange: () => {},
+          onSubmitDeck: () => {},
+          onAddBasicLand: () => {},
+          onRemoveBasicLand: () => {},
+        }}
+        responsiveLayout="phone-portrait"
+      />,
+    );
+
+    const status = document.querySelector<HTMLElement>("[data-mobile-deck-remaining]")!;
+    expect(status).toHaveTextContent("Designate a commander from your pool to submit.");
+    expect(status).not.toHaveTextContent("0 more needed");
+  });
+
+  it("counts only removable virtual copies in engine-granted filler controls", () => {
+    const onAddBasicLand = vi.fn();
+    const onRemoveBasicLand = vi.fn();
+    const makeController = (includeVirtual: boolean) => ({
+      view: {
+        ...COMMANDER_VIEW,
+        min_deck_size: 2,
+        pool: [PRISMATIC_PIPER],
+        grantable_commander_fillers: [
+          { card_name: "The Prismatic Piper", max_copies: 2 },
+        ],
+      },
+      workspace: {
+        schemaVersion: 1 as const,
+        placements: {
+          "cmd-4": { zone: "deck" as const, row: 0 as const, column: 0, order: 0 },
+          ...(includeVirtual
+            ? { "piper-virtual-1": { zone: "deck" as const, row: 0 as const, column: 0, order: 1 } }
+            : {}),
+        },
+        virtualBasics: includeVirtual
+          ? [{ instanceId: "piper-virtual-1", name: "The Prismatic Piper" }]
+          : [],
+      },
+      preferences: createDefaultDraftWorkspacePreferences(),
+      interactionLocked: false,
+      capabilities: { kind: "editable-pool" as const, suggestions: false },
+      onWorkspaceChange: () => {},
+      onPreferencesChange: () => {},
+      onSubmitDeck: () => {},
+      onAddBasicLand,
+      onRemoveBasicLand,
+    });
+    const rendered = render(
+      <LimitedDeckBuilder
+        local={makeController(true)}
+        responsiveLayout="desktop"
+      />,
+    );
+
+    expect(screen.getByText(
+      "Your pool also includes up to 2 × The Prismatic Piper, usable only as your commander.",
+    )).toBeInTheDocument();
+    const add = screen.getByRole("button", { name: "Add The Prismatic Piper" });
+    const remove = screen.getByRole("button", { name: "Remove The Prismatic Piper" });
+    expect(within(remove.parentElement!).getByText("1")).toBeInTheDocument();
+    expect(remove).not.toBeDisabled();
+    fireEvent.click(add);
+    fireEvent.click(remove);
+    expect(onAddBasicLand).toHaveBeenCalledWith("The Prismatic Piper");
+    expect(onRemoveBasicLand).toHaveBeenCalledWith("The Prismatic Piper");
+
+    rendered.rerender(
+      <LimitedDeckBuilder local={makeController(false)} responsiveLayout="desktop" />,
+    );
+    const draftedOnlyRemove = screen.getByRole("button", { name: "Remove The Prismatic Piper" });
+    expect(within(draftedOnlyRemove.parentElement!).getByText("0")).toBeInTheDocument();
+    expect(draftedOnlyRemove).toBeDisabled();
+    fireEvent.click(draftedOnlyRemove);
+    expect(onRemoveBasicLand).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * V13 — one deck card, one candidate, when two disjoint SOURCES name it.
+   *
+   * The phase's headline case: the CR 903.13e grant offers *The Prismatic
+   * Piper* as an addable row while the player also drafted a copy into the main
+   * deck. The designation candidates are drawn from `deckGroups` (pool → main
+   * deck) and from the addable rows, which cannot overlap as sources but can
+   * collide by NAME. Unmerged, the same candidate renders twice under one React
+   * key, and the prune effect's name-keyed Map sees only the last of the two.
+   *
+   * Reach-guard, positive and in the same render: a zero would THROW at
+   * `getAllByRole` rather than pass, and the single-source commander beside it
+   * is still offered exactly once — so this cannot go green on a panel that
+   * stopped offering candidates.
+   */
+  it("offers one candidate for a name the deck and the granted filler both hold", async () => {
+    engineEligible.mockImplementation(
+      async (name: string) =>
+        name === "Vehicle Commander" || name === "The Prismatic Piper",
+    );
+
+    render(
+      <LimitedDeckBuilder
+        view={{
+          ...COMMANDER_VIEW,
+          grantable_commander_fillers: [{ card_name: "The Prismatic Piper", max_copies: 1 }],
+        }}
+        mainDeck={["Vehicle Commander", "The Prismatic Piper"]}
+        // The granted copy, taken: the same name from the OTHER source.
+        landCounts={{ "The Prismatic Piper": 1 }}
+        onAddToDeck={() => {}}
+        onRemoveFromDeck={() => {}}
+        onSetLandCount={() => {}}
+        onSubmitDeck={() => {}}
+        showSuggestions={false}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(
+        candidateScope().getAllByRole("button", { name: "The Prismatic Piper" }),
+      ).toHaveLength(1),
+    );
+    expect(
+      candidateScope().getAllByRole("button", { name: "Vehicle Commander" }),
+    ).toHaveLength(1);
+
+    // The merge must SUM across the two sources, not merely dedupe across them,
+    // and that is a separate property from the one above -- measured, not
+    // asserted: making the land loop overwrite (`byName.set(name, count)`)
+    // instead of add reds THIS line alone, with the two candidate assertions
+    // above still green and the other 26 rows in this file untouched. No other
+    // test here fixes a name held by BOTH sources, so nothing else can see it.
+    //
+    // What it protects is `in_deck` -- the quantity draft-core's
+    // `validate_limited_deck` step 5 compares `designated` against. A merge
+    // that dedupes without summing halves it for every collided name and
+    // submits a deck the engine reads as short of copies. The panel renders
+    // that sum directly (`commanders-inside`, so no designation is added on
+    // top): a faithful merge reads 3 -- two main-deck cards plus the one
+    // granted copy of a name the deck already holds -- and a non-summing one
+    // reads 2.
+    expect(screen.getByText("3/60 cards")).toBeInTheDocument();
   });
 });

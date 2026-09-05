@@ -54,6 +54,13 @@ export const ACTIVE_QUICK_DRAFT_KEY = "phase-active-quick-draft";
 /** Key for active draft-pod metadata in localStorage (synchronous resume detection) */
 export const ACTIVE_DRAFT_POD_KEY = "phase-active-draft-pod";
 
+/**
+ * Non-secret pointer to the most recent guest draft. The reconnect capability
+ * itself remains in IndexedDB; this record exists only so a reloaded guest can
+ * find the pod again from its room code.
+ */
+export const ACTIVE_DRAFT_GUEST_KEY = "phase-active-draft-guest";
+
 /** Prefix for quick-draft session blobs in IndexedDB. Full key: `${QUICK_DRAFT_KEY_PREFIX}${draftId}` */
 export const QUICK_DRAFT_KEY_PREFIX = "phase-quick-draft:";
 
@@ -62,6 +69,9 @@ export const DRAFT_RUN_KEY_PREFIX = "phase-draft-run:";
 
 /** localStorage key for the Zustand-persisted preferences store. */
 export const PREFERENCES_KEY = "phase-preferences";
+
+/** localStorage key for personal draft workspace preferences. */
+export const DRAFT_WORKSPACE_PREFERENCES_KEY = "phase-draft-workspace-preferences";
 
 /**
  * Single authority for "is this localStorage key part of the user's portable
@@ -76,6 +86,7 @@ export const PREFERENCES_KEY = "phase-preferences";
 export function isUserOwnedStorageKey(key: string): boolean {
   return (
     key === PREFERENCES_KEY ||
+    key === DRAFT_WORKSPACE_PREFERENCES_KEY ||
     key === DECK_METADATA_KEY ||
     key === DECK_FOLDERS_KEY ||
     key === ACTIVE_DECK_KEY ||

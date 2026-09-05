@@ -16,15 +16,16 @@ use engine::ai_support::{
 };
 use engine::types::ability::{
     AbilityDefinition, ContinuousModification, Duration, Effect, ResolvedAbility, StaticDefinition,
-    TargetFilter,
+    TargetFilter, TargetRef,
 };
 use engine::types::actions::{AlternativeCastDecision, GameAction, MulliganChoice};
 use engine::types::card_type::CoreType;
 use engine::types::game_state::{
-    CastOfferKind, CompanionDeclaration, CostResume, GameState, ManaChoice, ManaChoiceContext,
-    ManaChoicePrompt, MulliganDecisionPhase, PendingMulliganAction, WaitingFor,
+    CastOfferKind, CompanionDeclaration, CostResume, DistributionUnit, GameState, ManaChoice,
+    ManaChoiceContext, ManaChoicePrompt, MulliganDecisionPhase, PendingMulliganAction, WaitingFor,
 };
 use engine::types::identifiers::{ObjectId, ObjectIdentityBinding, ObjectIncarnationRef};
+use engine::types::keywords::Keyword;
 use engine::types::mana::ManaType;
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
@@ -51,7 +52,7 @@ use crate::policies::strategy_helpers::{cmp_sacrifice, sacrifice_key};
 use crate::policies::tutor::score_search_choice_selection;
 use crate::policies::{PolicyId, PolicyRegistry, PolicyVerdict};
 use crate::session::AiSession;
-use crate::tactical_gate::gate_candidates;
+use crate::tactical_gate::{gate_candidates, gate_prepared_candidates};
 use crate::threat_profile::{
     build_threat_profile_multiplayer, ArchetypeBaseProbabilities, ThreatProfile,
 };
@@ -184,6 +185,45 @@ fn pick_lowest_value_sacrifices(
         .collect();
     scored.sort_by(|a, b| cmp_sacrifice(&a.1, &b.1));
     scored.into_iter().take(count).map(|(id, _)| id).collect()
+}
+
+/// Rank the engine-issued sacrifice selections without leaving the decision
+/// contract's finite action domain.
+///
+/// Candidate generation bounds both its input pool and its emitted
+/// combinations. A raw greedy pick can therefore be legal but absent from the
+/// issued actions. Compare each whole selection by its sorted per-permanent
+/// sacrifice keys, then use the canonical action order to make ties stable.
+fn lowest_value_issued_sacrifice<'a>(
+    state: &GameState,
+    actions: impl IntoIterator<Item = &'a GameAction>,
+    penalties: &crate::config::PolicyPenalties,
+) -> Option<GameAction> {
+    let sacrifice_rank = |cards: &[ObjectId]| {
+        let mut keys: Vec<_> = cards
+            .iter()
+            .map(|&id| sacrifice_key(state, id, penalties))
+            .collect();
+        keys.sort_by(cmp_sacrifice);
+        keys
+    };
+
+    actions
+        .into_iter()
+        .filter_map(|action| match action {
+            GameAction::SelectCards { cards } => Some((sacrifice_rank(cards), action)),
+            _ => None,
+        })
+        .min_by(|(left_rank, left), (right_rank, right)| {
+            left_rank
+                .iter()
+                .zip(right_rank)
+                .map(|(left, right)| cmp_sacrifice(left, right))
+                .find(|ordering| !ordering.is_eq())
+                .unwrap_or_else(|| left_rank.len().cmp(&right_rank.len()))
+                .then_with(|| left.cmp_stable(right))
+        })
+        .map(|(_, action)| action.clone())
 }
 
 /// Choose the best action for the AI player given the current game state.
@@ -788,7 +828,7 @@ fn target_filter_interacts_with_stack(filter: &TargetFilter) -> bool {
     ) || filter.extract_zones().contains(&Zone::Stack)
 }
 
-fn ability_is_temporary_combat_modifier(ability: &AbilityDefinition) -> bool {
+pub(crate) fn ability_is_temporary_combat_modifier(ability: &AbilityDefinition) -> bool {
     ability_effect_is_temporary_combat_modifier(ability)
         && ability
             .sub_ability
@@ -875,16 +915,38 @@ fn low_value_priority_pass_from_actions(
         && actions
             .iter()
             .all(|action| priority_action_is_safe_to_defer_on_own_stack(state, action));
+    let only_pass_or_mana = actions
+        .iter()
+        .all(|action| priority_action_is_pass_or_mana(state, action));
     let empty_stack_pass = state.stack.is_empty()
         && actions
             .iter()
             .all(|action| priority_action_is_safe_to_defer_empty_stack(state, action))
-        && (low_value_empty_stack_phase(state.phase)
-            || actions
-                .iter()
-                .all(|action| priority_action_is_pass_or_mana(state, action)));
+        && (low_value_empty_stack_phase(state.phase) || only_pass_or_mana);
 
-    if own_stack_pass || empty_stack_pass {
+    // `only_pass_or_mana` is stack-agnostic on purpose: when every legal
+    // candidate is `PassPriority` or a mana ability, there is nothing to search
+    // for no matter who controls the stack. A MIXED own+foreign stack passes too
+    // — still nothing to respond with.
+    //
+    // CR 605.3b: an activated mana ability doesn't go on the stack, so it can't
+    // be targeted, countered, or otherwise responded to; it resolves immediately
+    // after activation. Producing mana therefore does not interact with a
+    // foreign stack entry at all.
+    //
+    // CR 106.4: each player's mana pool empties at the end of each step and
+    // phase, so mana floated in this window is lost unspent when no candidate
+    // here is castable.
+    //
+    // Two lines are deliberately forgone, exactly as the `own_stack_pass` and
+    // `empty_stack_pass` arms above already forgo them:
+    //   * Float mana in response and cast after the foreign entry resolves
+    //     (Armageddon-style). CR 106.4 bounds how long such a float survives.
+    //   * `is_mana_ability` also admits sacrifice-cost mana abilities (Ashnod's
+    //     Altar / Phyrexian Altar shape). Activating one in response to foreign
+    //     removal is a real pseudo-response: it denies an exile effect its
+    //     object and fires dies triggers.
+    if own_stack_pass || empty_stack_pass || only_pass_or_mana {
         Some(GameAction::PassPriority)
     } else {
         None
@@ -1384,9 +1446,14 @@ pub fn fallback_action(
             up_to,
             effect_kind: engine::types::ability::EffectKind::Sacrifice,
             ..
-        } if !cards.is_empty() && !*up_to && *count > 0 => Some(GameAction::SelectCards {
-            cards: pick_lowest_value_sacrifices(state, cards, *count, &config.policy_penalties),
-        }),
+        } if !cards.is_empty() && !*up_to && *count > 0 => lowest_value_issued_sacrifice(
+            state,
+            contract
+                .candidates
+                .iter()
+                .map(|candidate| &candidate.action),
+            &config.policy_penalties,
+        ),
 
         // CR 608.2d: a selection prompt's legal cardinality is a RUNTIME
         // property, not a property of the variant — "the player can't choose an
@@ -1463,6 +1530,12 @@ pub fn fallback_action(
                                 object_id: *object_id,
                             }
                         }
+                        // CR 400.11b: one pick per opened pack slot.
+                        OutsideGameChoiceSource::BoosterPack { pack_slot, .. } => {
+                            OutsideGameSelection::BoosterPack {
+                                pack_slot: *pack_slot,
+                            }
+                        }
                     })
                 })
                 .take(*count)
@@ -1508,6 +1581,14 @@ pub fn fallback_action(
         }),
 
         // Binary accept/decline decisions: decline is always safe.
+        WaitingFor::ResolutionOptionalPaymentChoice { .. } => issued(|action| {
+            matches!(
+                action,
+                GameAction::ChooseResolutionOptionalPaymentBranch {
+                    choice: engine::types::ResolutionOptionalPaymentChoice::Decline,
+                }
+            )
+        }),
         WaitingFor::OptionalEffectChoice { .. }
         | WaitingFor::OpponentMayChoice { .. }
         | WaitingFor::TributeChoice { .. }
@@ -1692,6 +1773,18 @@ pub fn fallback_action(
         } => Some(GameAction::RippleChoice {
             choice: engine::types::actions::CastChoice::Decline,
         }),
+        // CR 702.60a: Ripple's "you may reveal" — reveal as the default
+        // (burying non-matches is information-neutral for the AI); the candidate
+        // generator still explores declining.
+        WaitingFor::RippleRevealChoice { .. } => Some(GameAction::RippleChoice {
+            choice: engine::types::actions::CastChoice::Cast,
+        }),
+        // CR 702.60a + CR 608.2d: Ripple bottom-order — submit the pile in its
+        // revealed order (any permutation is legal; order at the bottom of the
+        // library carries no tactical weight).
+        WaitingFor::RippleBottomOrder { cards, .. } => Some(GameAction::SelectCards {
+            cards: cards.clone(),
+        }),
         // CR 608.2g + CR 601.2: Invoke Calamity's free-cast window — finish the
         // window (cast nothing) as the conservative default; the candidate
         // generator still explores casting each eligible spell.
@@ -1815,12 +1908,16 @@ pub fn fallback_action(
         }
 
         // Dungeon choices: pick first option.
-        WaitingFor::ChooseDungeon { options, .. } => options
-            .first()
-            .map(|&dungeon| GameAction::ChooseDungeon { dungeon }),
-        WaitingFor::ChooseDungeonRoom { options, .. } => options
-            .first()
-            .map(|&room_index| GameAction::ChooseDungeonRoom { room_index }),
+        WaitingFor::ChooseDungeon { options, .. } => {
+            options.first().map(|option| GameAction::ChooseDungeon {
+                dungeon: option.dungeon,
+            })
+        }
+        WaitingFor::ChooseDungeonRoom { options, .. } => {
+            options.first().map(|option| GameAction::ChooseDungeonRoom {
+                room_index: option.index,
+            })
+        }
         WaitingFor::SpecializeColor { options, .. } => options
             .first()
             .copied()
@@ -1913,10 +2010,12 @@ pub fn fallback_action(
         }
         WaitingFor::AssistPayment { .. } => Some(GameAction::CommitAssistPayment { generic: 0 }),
 
-        // ChooseObjectsIntoTrackedSet: default to declining (empty selection).
-        WaitingFor::ChooseObjectsSelection { .. } => Some(GameAction::SelectTargets {
-            targets: Vec::new(),
-        }),
+        // ChooseObjectsIntoTrackedSet: take an engine-issued selection. This
+        // preserves the empty conservative choice when min is zero and remains
+        // live for required choices where an empty selection is illegal.
+        WaitingFor::ChooseObjectsSelection { .. } => {
+            issued(|action| matches!(action, GameAction::SelectTargets { .. }))
+        }
 
         // CR 101.4 + CR 707.2: EachPlayerCopyChosen selection — an empty pick is
         // illegal (min >= 1), so pick the first `min` eligible objects.
@@ -2072,12 +2171,16 @@ pub fn fallback_action(
             stack_entry_index,
             scope,
             current_targets,
+            slots,
+            slot_pools,
             legal_new_targets,
             ..
         } => retarget_actions(
             state,
             *stack_entry_index,
             scope,
+            slots,
+            slot_pools,
             current_targets,
             legal_new_targets,
         )
@@ -2216,15 +2319,21 @@ pub fn fallback_action(
             Some(GameAction::ChooseKeptPermanents { kept })
         }
 
-        // CR 700.3: Pile-separation fallbacks — empty pile-A partition (every
-        // object goes to derived pile B) is the simplest legal partition, and
-        // pile A is the default choice for the chooser. Tactical AI override
-        // happens through legal_actions; this is the safety net.
+        // CR 700.3 + CR 700.3a: Pile-separation fallbacks. The partition is the
+        // same weight-balanced split `balanced_pile_partition` emits into the
+        // candidate set, so the fallback answer is always a contract member —
+        // and, because the subject and the chooser are adversaries, the
+        // balanced split is also the safest one to hand over blind. Pile A is
+        // the default choice for the chooser. Tactical AI override happens
+        // through legal_actions; this is the safety net.
         WaitingFor::SeparatePilesChooseOpponent { candidates, .. } => candidates
             .first()
             .map(|&opp| GameAction::ChoosePileOpponent { opponent: opp }),
-        WaitingFor::SeparatePilesPartition { .. } => {
-            Some(GameAction::SubmitPilePartition { pile_a: Vec::new() })
+        WaitingFor::SeparatePilesPartition { eligible, .. } => {
+            let eligible: Vec<ObjectId> = eligible.iter().copied().collect();
+            Some(GameAction::SubmitPilePartition {
+                pile_a: engine::ai_support::balanced_pile_partition(state, &eligible),
+            })
         }
         WaitingFor::SeparatePilesChoice { .. } => Some(GameAction::ChoosePile {
             pile: engine::types::game_state::PileSide::A,
@@ -2768,7 +2877,7 @@ fn rank_root_payment_candidates(
             let ranked = prepared
                 .iter()
                 .find(|prepared_candidate| {
-                    prepared_candidate.candidate.action == gated_candidate.candidate.action
+                    prepared_candidate.source_index == gated_candidate.source_index
                 })
                 .and_then(|prepared_candidate| prepared_candidate.payment_successor.clone())
                 .map_or_else(
@@ -3085,17 +3194,11 @@ fn score_candidates_core(
     let mut services =
         PlannerServices::with_deadline(ai_player, config, policies, context, deadline_override);
     let prepared = prepare_payment_candidates(state, ctx.candidates.clone());
-    let candidates = services.validate_candidates(
-        state,
-        prepared
-            .iter()
-            .map(|candidate| candidate.candidate.clone())
-            .collect(),
-    );
-    let gated = gate_candidates(
+    let prepared = services.validate_prepared_candidates(state, prepared);
+    let gated = gate_prepared_candidates(
         state,
         &ctx,
-        candidates,
+        prepared.clone(),
         ai_player,
         config,
         &services.context,
@@ -3477,6 +3580,20 @@ pub(crate) fn deterministic_choice(
         return Some(action);
     }
 
+    // CR 601.2d + CR 704.5g: divided-damage split. `WaitingFor::DistributeAmong`
+    // is the tail of a target-selection sequence the AI has already committed
+    // to, and the engine offers at most two shapes for it (the even split and
+    // `ai_support`'s lethal-first split). Deciding it here on kill count keeps
+    // `quiesce` — which calls `deterministic_choice` with `context: None` —
+    // seeing through the trigger to the board that results, instead of stalling
+    // the rollout on two near-identical distribution vectors. This is the same
+    // call that decides the ROOT prompt (the pre-search early return in
+    // `score_candidates_with_session`), so the arm is context-free by
+    // construction: it reads only `state` and `actions`.
+    if let Some(action) = most_lethal_distribution(state, actions) {
+        return Some(action);
+    }
+
     // CR 103.5 + CR 103.6: Mulligan decisions — defer to the sibling
     // `MulliganRegistry` for structured, feature-aware hand evaluation. All
     // registered `MulliganPolicy` implementations contribute; search can't
@@ -3677,6 +3794,12 @@ pub(crate) fn deterministic_choice(
             && !*up_to
             && *count > 0
         {
+            if let Some(action) =
+                lowest_value_issued_sacrifice(state, actions, &config.policy_penalties)
+            {
+                return Some(action);
+            }
+
             return Some(GameAction::SelectCards {
                 cards: pick_lowest_value_sacrifices(state, cards, *count, &config.policy_penalties),
             });
@@ -4120,6 +4243,79 @@ fn validated_declare_attackers(
     engine::game::combat::complete_attacker_proposal(state, &attacks, &[])
 }
 
+/// CR 704.5g: does `share` of a divided damage pool destroy this target?
+///
+/// CR 702.12b: an indestructible creature ignores the lethal-damage
+/// state-based action, so no share kills it. A body already at 0 or less
+/// toughness is dying to CR 704.5f regardless, and a player or planeswalker is
+/// not a kill at all.
+fn share_is_lethal(state: &GameState, target: &TargetRef, share: u32) -> bool {
+    let TargetRef::Object(id) = target else {
+        return false;
+    };
+    state.objects.get(id).is_some_and(|object| {
+        object.card_types.core_types.contains(&CoreType::Creature)
+            && object.toughness.unwrap_or(0) > 0
+            && !object.has_keyword(&Keyword::Indestructible)
+            // The threshold comes from `combat_damage::lethal_damage_needed`,
+            // the documented single authority for how much a body absorbs; it
+            // already accounts for damage already marked.
+            && share >= engine::game::combat_damage::lethal_damage_needed(state, *id, false)
+    })
+}
+
+/// CR 601.2d: pick the offered damage division that destroys the most creature
+/// targets, keeping the engine's emission order on a tie so the even split —
+/// emitted first by `ai_support::candidate_actions` — stands when no split
+/// kills more.
+///
+/// Only `DistributionUnit::Damage` has a lethality notion; counter and life
+/// divisions fall through to the ordinary scoring path. Deathtouch is not
+/// modelled: `WaitingFor::DistributeAmong` carries no source id, and with a
+/// deathtouch source every share of one or more is lethal (CR 702.2b), so both
+/// offered splits tie and the even split stands anyway.
+fn most_lethal_distribution(state: &GameState, actions: &[GameAction]) -> Option<GameAction> {
+    if !matches!(
+        state.waiting_for,
+        WaitingFor::DistributeAmong {
+            unit: DistributionUnit::Damage,
+            ..
+        }
+    ) {
+        return None;
+    }
+    let divisions: Vec<&GameAction> = actions
+        .iter()
+        .filter(|action| matches!(action, GameAction::DistributeAmong { .. }))
+        .collect();
+    // Strictly additive: this arm exists to break the tie between the engine's
+    // OFFERED divisions. With a single division on the table the candidate set
+    // is whatever it was before the lethal-first split was added, so leave it to
+    // the ordinary pipeline (which may prefer `CancelCast` when a pending cast
+    // makes that an option).
+    if divisions.len() < 2 {
+        return None;
+    }
+    let mut best: Option<(usize, &GameAction)> = None;
+    for action in divisions {
+        let GameAction::DistributeAmong { distribution } = action else {
+            continue;
+        };
+        let kills = distribution
+            .iter()
+            .filter(|(target, share)| share_is_lethal(state, target, *share))
+            .count();
+        let is_better = match best {
+            Some((most, _)) => kills > most,
+            None => true,
+        };
+        if is_better {
+            best = Some((kills, action));
+        }
+    }
+    best.map(|(_, action)| action.clone())
+}
+
 fn prefer_land_drop(
     state: &GameState,
     ai_player: PlayerId,
@@ -4343,6 +4539,7 @@ fn softmax_select_index(
 
 #[cfg(test)]
 mod tests {
+    use engine::types::actions::ResolveAllScope;
     use std::path::Path;
 
     use super::*;
@@ -4716,6 +4913,223 @@ mod tests {
             player: PlayerId(0),
         };
         state
+    }
+
+    /// Regression: the equip announcement opens a real
+    /// `WaitingFor::TargetSelection` (driven here through `engine::apply` —
+    /// production wiring, not a hand-built prompt), and `choose_action` must
+    /// never pick the creature the Equipment is already attached to. Fails on
+    /// revert of the `SelectTarget` arm of `EquipmentPriorityPolicy`.
+    #[test]
+    fn choose_action_never_picks_current_host_at_equip_announcement() {
+        let mut state = make_state();
+        let equip = create_object(
+            &mut state,
+            CardId(9),
+            P0,
+            "Summoner's Grimoire".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let e = state.objects.get_mut(&equip).unwrap();
+            e.card_types.core_types.push(CoreType::Artifact);
+            e.card_types.subtypes.push("Book".to_string());
+            e.card_types.subtypes.push("Equipment".to_string());
+            e.base_card_types = e.card_types.clone();
+            Arc::make_mut(&mut e.abilities).push(AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::Attach {
+                    attachment: TargetFilter::SelfRef,
+                    target: TargetFilter::Typed(
+                        engine::types::ability::TypedFilter::creature()
+                            .controller(ControllerRef::You),
+                    ),
+                },
+            ));
+        }
+        let host = add_creature(&mut state, P0, 1, 1);
+        // A second creature exists — the trivial "no other home" activation
+        // rejection does NOT apply here; the host pick is the only place the
+        // same-host play can be stopped.
+        let upgrade = add_creature(&mut state, P0, 3, 3);
+        state.objects.get_mut(&equip).unwrap().attached_to =
+            Some(engine::game::game_object::AttachTarget::Object(host));
+
+        let announced = engine::game::engine::apply(
+            &mut state,
+            P0,
+            GameAction::ActivateAbility {
+                source_id: equip,
+                ability_index: 0,
+            },
+        )
+        .expect("free equip activation must announce");
+        let WaitingFor::TargetSelection { .. } = &announced.waiting_for else {
+            panic!(
+                "equip activation must open TargetSelection, got {:?}",
+                announced.waiting_for
+            );
+        };
+
+        let config = create_config(AiDifficulty::Medium, Platform::Native);
+        let action = choose_action(&state, P0, &config, &mut SmallRng::seed_from_u64(7))
+            .expect("AI must produce an action at the equip host prompt");
+        assert!(
+            !matches!(
+                action,
+                GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(id)),
+                } if id == host
+            ),
+            "AI must not pick the current equip host at announcement; got {action:?} \
+             (host {host:?}, upgrade {upgrade:?})"
+        );
+
+        // Reach guard — the negative assertion above is a seeded softmax pick;
+        // pin the ground truth so the test fails structurally if the
+        // same-host Reject regresses (e.g. to a soft penalty): the host-pick
+        // candidate at this exact prompt must be in the issued domain and its
+        // EquipmentPriority verdict a hard Reject.
+        let issued = engine::ai_support::legal_actions(&state);
+        assert!(
+            issued.iter().any(
+                |a| matches!(a, GameAction::ChooseTarget { target: Some(TargetRef::Object(id)) }
+                    if *id == host)
+            ),
+            "reach guard: the current host must be a legal equip target at the announcement prompt"
+        );
+        let host_pick = CandidateAction {
+            action: GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(host)),
+            },
+            metadata: ActionMetadata::for_actor(Some(P0), TacticalClass::Utility),
+        };
+        let policy_decision = AiDecisionContext {
+            waiting_for: state.waiting_for.clone(),
+            candidates: Vec::new(),
+        };
+        let policy_context = crate::context::AiContext::empty(&config.weights);
+        let verdicts =
+            crate::policies::registry::PolicyRegistry::shared().verdicts(&PolicyContext {
+                state: &state,
+                decision: &policy_decision,
+                candidate: &host_pick,
+                ai_player: P0,
+                config: &config,
+                context: &policy_context,
+                cast_facts: None,
+                search_depth: crate::policies::context::SearchDepth::Root,
+            });
+        let equip_verdict = verdicts
+            .iter()
+            .find(|(id, _)| *id == crate::policies::registry::PolicyId::EquipmentPriority)
+            .map(|(_, v)| v);
+        assert!(
+            matches!(
+                equip_verdict,
+                Some(crate::policies::registry::PolicyVerdict::Reject { reason })
+                    if reason.kind == "equipment_reequip_same_host"
+            ),
+            "reach guard: picking the current host at the announcement prompt must be \
+             a hard Reject from EquipmentPriorityPolicy; got {equip_verdict:?}"
+        );
+    }
+
+    /// With the Equipment attached to its only creature, the AI must never
+    /// surface the equip activation at priority (pre-existing
+    /// `equipment_no_other_home` rejection — kept as a guard on the activation
+    /// stage).
+    #[test]
+    fn choose_action_never_activates_reequip_without_better_host() {
+        let mut state = make_state();
+        let equip = create_object(
+            &mut state,
+            CardId(9),
+            P0,
+            "Summoner's Grimoire".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let e = state.objects.get_mut(&equip).unwrap();
+            e.card_types.core_types.push(CoreType::Artifact);
+            e.card_types.subtypes.push("Book".to_string());
+            e.card_types.subtypes.push("Equipment".to_string());
+            e.base_card_types = e.card_types.clone();
+            Arc::make_mut(&mut e.abilities).push(AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::Attach {
+                    attachment: TargetFilter::SelfRef,
+                    target: TargetFilter::Any,
+                },
+            ));
+        }
+        let host = add_creature(&mut state, P0, 1, 1);
+        state.objects.get_mut(&equip).unwrap().attached_to =
+            Some(engine::game::game_object::AttachTarget::Object(host));
+        // {3} available for the equip cost — the activation is affordable.
+        add_mana(&mut state, P0, ManaType::Colorless, 3);
+
+        let config = create_config(AiDifficulty::Medium, Platform::Native);
+        let mut rng = SmallRng::seed_from_u64(7);
+        let action =
+            choose_action(&state, P0, &config, &mut rng).expect("AI must produce an action");
+        assert!(
+            !matches!(
+                action,
+                GameAction::ActivateAbility { source_id, .. } if source_id == equip
+            ),
+            "AI must not re-activate equip of an Equipment already attached to its \
+             only host; got {action:?}"
+        );
+
+        // Reach guard — the negative assertion above is vacuous unless the
+        // activation was actually available and hard-rejected by policy. Pin
+        // both so the test flips if the `equipment_no_other_home` guard
+        // regresses to a soft penalty.
+        let issued = engine::ai_support::legal_actions(&state);
+        assert!(
+            issued.iter().any(
+                |a| matches!(a, GameAction::ActivateAbility { source_id, ability_index }
+                    if *source_id == equip && *ability_index == 0)
+            ),
+            "reach guard: the equip activation must be a legal action at priority"
+        );
+        let candidate = CandidateAction {
+            action: GameAction::ActivateAbility {
+                source_id: equip,
+                ability_index: 0,
+            },
+            metadata: ActionMetadata::for_actor(Some(P0), TacticalClass::Ability),
+        };
+        let policy_decision = AiDecisionContext {
+            waiting_for: WaitingFor::Priority { player: P0 },
+            candidates: Vec::new(),
+        };
+        let policy_context = crate::context::AiContext::empty(&config.weights);
+        let verdicts =
+            crate::policies::registry::PolicyRegistry::shared().verdicts(&PolicyContext {
+                state: &state,
+                decision: &policy_decision,
+                candidate: &candidate,
+                ai_player: P0,
+                config: &config,
+                context: &policy_context,
+                cast_facts: None,
+                search_depth: crate::policies::context::SearchDepth::Root,
+            });
+        let equip_verdict = verdicts
+            .iter()
+            .find(|(id, _)| *id == crate::policies::registry::PolicyId::EquipmentPriority)
+            .map(|(_, v)| v);
+        assert!(
+            matches!(
+                equip_verdict,
+                Some(crate::policies::registry::PolicyVerdict::Reject { reason })
+                    if reason.kind == "equipment_no_other_home"
+            ),
+            "reach guard: the no-other-home equip activation must be a hard Reject \
+             from EquipmentPriorityPolicy; got {equip_verdict:?}"
+        );
     }
 
     /// T8 — the combat production wiring at `deterministic_choice`'s combat
@@ -5345,7 +5759,10 @@ mod tests {
         engine::game::engine::apply(
             &mut state,
             P0,
-            GameAction::BeginResolveAll { max_resolutions: 5 },
+            GameAction::BeginResolveAll {
+                max_resolutions: 5,
+                scope: ResolveAllScope::Shared,
+            },
         )
         .expect("the priority holder may propose Resolve All");
 
@@ -5370,7 +5787,10 @@ mod tests {
         engine::game::engine::apply(
             &mut state,
             P0,
-            GameAction::BeginResolveAll { max_resolutions: 5 },
+            GameAction::BeginResolveAll {
+                max_resolutions: 5,
+                scope: ResolveAllScope::Shared,
+            },
         )
         .expect("the priority holder may propose Resolve All");
 
@@ -5408,7 +5828,10 @@ mod tests {
         engine::game::engine::apply(
             &mut state,
             P0,
-            GameAction::BeginResolveAll { max_resolutions: 5 },
+            GameAction::BeginResolveAll {
+                max_resolutions: 5,
+                scope: ResolveAllScope::Shared,
+            },
         )
         .expect("the priority holder may propose Resolve All");
 
@@ -6760,6 +7183,77 @@ mod tests {
         assert_eq!(
             low_value_priority_pass_from_actions(&state, PlayerId(0), &actions),
             None
+        );
+    }
+
+    /// A foreign entry is on the stack and the AI's only candidates are
+    /// `PassPriority` plus a mana ability, so there is nothing to respond with
+    /// and the full search is skipped. Fails on revert of the stack-agnostic
+    /// `only_pass_or_mana` arm: `owns_entire_stack` is false here and the stack
+    /// is non-empty, so both pre-existing arms return `None`.
+    #[test]
+    fn foreign_stack_pass_or_mana_only_passes_without_search() {
+        let mut state = make_state();
+        let source_id = add_creature(&mut state, PlayerId(0), 1, 1);
+        push_mana_ability(&mut state, source_id);
+        let ability_index = state.objects.get(&source_id).unwrap().abilities.len() - 1;
+        state.stack.push_back(no_op_stack_entry(10, PlayerId(1)));
+        let actions = vec![
+            GameAction::PassPriority,
+            GameAction::ActivateAbility {
+                source_id,
+                ability_index,
+            },
+        ];
+
+        assert_eq!(
+            low_value_priority_pass_from_actions(&state, PlayerId(0), &actions),
+            Some(GameAction::PassPriority)
+        );
+    }
+
+    /// The same foreign stack, but a castable spell is available: the AI has a
+    /// real decision to make, so the fast path must decline and let the search
+    /// run.
+    #[test]
+    fn foreign_stack_with_castable_candidate_does_not_fast_pass() {
+        let mut state = make_state();
+        let source_id = add_creature(&mut state, PlayerId(0), 1, 1);
+        push_mana_ability(&mut state, source_id);
+        let ability_index = state.objects.get(&source_id).unwrap().abilities.len() - 1;
+        let spell = add_spell_to_hand(&mut state, PlayerId(0), "Castable Spell", 1);
+        state.stack.push_back(no_op_stack_entry(10, PlayerId(1)));
+        let actions = vec![
+            GameAction::PassPriority,
+            GameAction::ActivateAbility {
+                source_id,
+                ability_index,
+            },
+            GameAction::CastSpell {
+                object_id: spell,
+                card_id: CardId(spell.0),
+                targets: Vec::new(),
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
+            },
+        ];
+
+        assert_eq!(
+            low_value_priority_pass_from_actions(&state, PlayerId(0), &actions),
+            None
+        );
+    }
+
+    /// The degenerate case of the same arm: a foreign entry on the stack and
+    /// `PassPriority` as the only candidate. Also revert-failing.
+    #[test]
+    fn foreign_stack_pass_only_passes() {
+        let mut state = make_state();
+        state.stack.push_back(no_op_stack_entry(10, PlayerId(1)));
+        let actions = vec![GameAction::PassPriority];
+
+        assert_eq!(
+            low_value_priority_pass_from_actions(&state, PlayerId(0), &actions),
+            Some(GameAction::PassPriority)
         );
     }
 
@@ -8307,17 +8801,11 @@ mod tests {
         let services = PlannerServices::with_deadline(P0, &enabled, policies, context, None);
         let decision = build_decision_context(&state);
         let prepared = prepare_payment_candidates(&state, decision.candidates.clone());
-        let validated = services.validate_candidates(
-            &state,
-            prepared
-                .iter()
-                .map(|candidate| candidate.candidate.clone())
-                .collect(),
-        );
-        let gated = gate_candidates(
+        let prepared = services.validate_prepared_candidates(&state, prepared);
+        let gated = gate_prepared_candidates(
             &state,
             &decision,
-            validated,
+            prepared.clone(),
             P0,
             &enabled,
             &services.context,
@@ -8354,6 +8842,36 @@ mod tests {
             .as_ref()
             .is_some_and(|action| expected.contains(action)));
         assert!(calls.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn payment_certificates_remain_bound_to_issued_positions_not_action_equality() {
+        let state = flexible_mana_payment_state();
+        let decision = build_decision_context(&state);
+        let original = decision.candidates[0].clone();
+        let mut equivalent = original.clone();
+        equivalent.metadata.tactical_class = TacticalClass::Utility;
+
+        let prepared = prepare_payment_candidates(&state, vec![original, equivalent]);
+        assert_eq!(
+            prepared
+                .iter()
+                .map(|candidate| candidate.source_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "equivalent raw actions keep distinct engine-issued provenance"
+        );
+        assert!(
+            prepared
+                .iter()
+                .all(|candidate| candidate.payment_successor.is_some()),
+            "both issued positions retain their own cached reducer certificate"
+        );
+        assert_ne!(
+            prepared[0].candidate.metadata.tactical_class,
+            prepared[1].candidate.metadata.tactical_class,
+            "reach-guard: the positions differ in metadata even though their actions match"
+        );
     }
 
     #[test]
@@ -10513,17 +11031,11 @@ mod tests {
     fn build_root_beam(state: &GameState, services: &PlannerServices<'_>) -> Vec<RankedCandidate> {
         let ctx = build_decision_context(state);
         let prepared = prepare_payment_candidates(state, ctx.candidates.clone());
-        let candidates = services.validate_candidates(
-            state,
-            prepared
-                .iter()
-                .map(|candidate| candidate.candidate.clone())
-                .collect(),
-        );
-        let gated = gate_candidates(
+        let prepared = services.validate_prepared_candidates(state, prepared);
+        let gated = gate_prepared_candidates(
             state,
             &ctx,
-            candidates,
+            prepared.clone(),
             services.ai_player,
             services.config,
             &services.context,
@@ -11689,13 +12201,13 @@ mod tests {
         id
     }
 
-    /// Park a mandatory 1-of-N `EffectZoneChoice { Sacrifice }` over `cards`.
+    /// Park a mandatory `EffectZoneChoice { Sacrifice }` over `cards`.
     ///
     /// The order of `cards` is load-bearing: `pick_lowest_value_sacrifices`
     /// sorts *stably*, so at equal scores the first entry is the one given up.
     /// Every tie-boundary fixture below therefore lists the permanent it must
     /// NOT lose first.
-    fn park_forced_sacrifice(state: &mut GameState, cards: Vec<ObjectId>) {
+    fn park_forced_sacrifice_count(state: &mut GameState, cards: Vec<ObjectId>, count: usize) {
         let ai = PlayerId(0);
         let source_card = CardId(state.next_object_id);
         let source = create_object(
@@ -11708,8 +12220,8 @@ mod tests {
         state.waiting_for = WaitingFor::EffectZoneChoice {
             player: ai,
             cards,
-            count: 1,
-            min_count: 1,
+            count,
+            min_count: count,
             up_to: false,
             source_id: source,
             effect_kind: EffectKind::Sacrifice,
@@ -11726,10 +12238,15 @@ mod tests {
             conditional_enter_with_counters: Vec::new(),
             count_param: 0,
             library_position: None,
+            mass_library_order: None,
             is_cost_payment: false,
             enters_modified_if: None,
             duration: None,
         };
+    }
+
+    fn park_forced_sacrifice(state: &mut GameState, cards: Vec<ObjectId>) {
+        park_forced_sacrifice_count(state, cards, 1);
     }
 
     /// Build a mandatory `EffectZoneChoice { Sacrifice }` over an artifact land
@@ -11991,6 +12508,228 @@ mod tests {
         );
     }
 
+    /// CR 700.3 + CR 700.3a: the subject partitions and the *chooser* picks, and
+    /// the two are adversaries by construction — so the empty pile-A vector the
+    /// fallback used to hand over is the worst legal answer, not the simplest.
+    /// The fallback now answers with the same weight-balanced split
+    /// `ai_support::balanced_pile_partition` puts in the candidate set, which is
+    /// also what keeps the answer a contract member.
+    #[test]
+    fn fallback_partition_is_balanced() {
+        let mut state = GameState::new_two_player(42);
+        let eligible: Vec<ObjectId> = [5u32, 4, 3, 2, 1]
+            .into_iter()
+            .enumerate()
+            .map(|(index, mana_value)| {
+                let id = create_object(
+                    &mut state,
+                    CardId(600 + index as u64),
+                    PlayerId(0),
+                    format!("Pile Card {index}"),
+                    Zone::Battlefield,
+                );
+                state.objects.get_mut(&id).unwrap().mana_cost = ManaCost::Cost {
+                    shards: Vec::new(),
+                    generic: mana_value,
+                };
+                id
+            })
+            .collect();
+        state.waiting_for = WaitingFor::SeparatePilesPartition {
+            player: PlayerId(0),
+            eligible: eligible.iter().copied().collect(),
+            remaining_subjects: engine::im::Vector::new(),
+            completed: engine::im::Vector::new(),
+            chooser: PlayerId(1),
+            chosen_pile_effect: Box::new(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Proliferate,
+            )),
+            unchosen_pile_effect: None,
+            source_id: eligible[0],
+            pile_source: engine::types::ability::PileSource::Battlefield,
+        };
+
+        assert_eq!(
+            fallback_action_default(&state),
+            Some(GameAction::SubmitPilePartition {
+                pile_a: vec![eligible[0], eligible[3], eligible[4]],
+            }),
+            "MVs 5,4,3,2,1 balance as 5+2+1 against 4+3"
+        );
+    }
+
+    /// CR 601.2d + CR 704.5g: `WaitingFor::DistributeAmong` is settled
+    /// deterministically on kill count, so `quiesce` (which calls
+    /// `deterministic_choice` with `context: None`) sees the board the division
+    /// actually produces instead of stalling the rollout on two near-identical
+    /// distribution vectors. The 2/3 even split leaves the 3-toughness body
+    /// alive; the 4/1 lethal-first split destroys both.
+    ///
+    /// Second half: when both offered splits kill the same number of targets the
+    /// engine's emission order decides, so the even split (emitted first) wins.
+    #[test]
+    fn distribute_among_deterministic_choice_prefers_lethal_split() {
+        let mut state = GameState::new_two_player(42);
+        let tough = add_creature(&mut state, PlayerId(1), 1, 3);
+        let frail = add_creature(&mut state, PlayerId(1), 1, 1);
+        let targets = vec![TargetRef::Object(tough), TargetRef::Object(frail)];
+        state.waiting_for = WaitingFor::DistributeAmong {
+            player: P0,
+            total: 5,
+            targets: targets.clone(),
+            unit: DistributionUnit::Damage,
+        };
+
+        let even = GameAction::DistributeAmong {
+            distribution: vec![(targets[0].clone(), 2), (targets[1].clone(), 3)],
+        };
+        let lethal_first = GameAction::DistributeAmong {
+            distribution: vec![(targets[0].clone(), 4), (targets[1].clone(), 1)],
+        };
+        let config = AiConfig::default();
+        assert_eq!(
+            deterministic_choice(
+                &state,
+                P0,
+                &config,
+                &[even.clone(), lethal_first.clone()],
+                None
+            ),
+            Some(lethal_first),
+            "the split that destroys both targets must win"
+        );
+
+        // Both splits kill only the 1-toughness body — a tie, so emission order
+        // holds and the even split stands.
+        let tie_a = GameAction::DistributeAmong {
+            distribution: vec![(targets[0].clone(), 2), (targets[1].clone(), 3)],
+        };
+        let tie_b = GameAction::DistributeAmong {
+            distribution: vec![(targets[0].clone(), 1), (targets[1].clone(), 4)],
+        };
+        assert_eq!(
+            deterministic_choice(&state, P0, &config, &[tie_a.clone(), tie_b], None),
+            Some(tie_a),
+            "an equal kill count must keep the engine's emission order"
+        );
+    }
+
+    /// A 13-permanent, mandatory 4-of-N sacrifice. Candidate generation emits
+    /// only the first 64 of C(12, 4) selections; every one includes cards[0],
+    /// while the greedy ideal deliberately does not.
+    fn out_of_contract_sacrifice_state() -> (GameState, Vec<ObjectId>) {
+        let mut state = commander_discard_state();
+        let ai = PlayerId(0);
+        let mut cards = vec![add_creature(&mut state, ai, 10, 10)];
+        cards.extend((0..4).map(|_| add_creature(&mut state, ai, 1, 1)));
+        cards.extend((0..8).map(|_| add_creature(&mut state, ai, 10, 10)));
+        park_forced_sacrifice_count(&mut state, cards.clone(), 4);
+        (state, cards)
+    }
+
+    /// The direct cause behind Ulamog/Kozilek Annihilator prompts: the greedy
+    /// 4-permanent sacrifice was legal but outside the capped decision contract,
+    /// so final proposal gating returned no action. Rank only issued choices;
+    /// retain raw selection for the empty-action quiescence caller.
+    #[test]
+    fn mandatory_sacrifice_ranks_issued_combinations_before_proposal_gating() {
+        let (state, cards) = out_of_contract_sacrifice_state();
+        let ai = PlayerId(0);
+        let config = create_config(AiDifficulty::VeryEasy, Platform::Native);
+        let contract = AiDecisionContract::issue(&state, ai);
+        let raw_ideal = GameAction::SelectCards {
+            cards: cards[1..5].to_vec(),
+        };
+
+        assert_eq!(
+            contract.candidates.len(),
+            64,
+            "fixture premise: the selection output cap must be reached"
+        );
+        assert!(
+            !contract.contains_action(&state, &raw_ideal),
+            "fixture premise: the raw greedy ideal must be excluded by the output cap"
+        );
+
+        let actions: Vec<_> = contract
+            .candidates
+            .iter()
+            .map(|candidate| candidate.action.clone())
+            .collect();
+        let raw_without_contract = deterministic_choice(&state, ai, &config, &[], None);
+        assert_eq!(
+            raw_without_contract,
+            Some(raw_ideal.clone()),
+            "the quiescence caller with no issued actions retains the raw greedy pick"
+        );
+
+        let assert_best_issued = |action: &GameAction| match action {
+            GameAction::SelectCards { cards: chosen } => {
+                assert_eq!(chosen.len(), 4, "the prompt owes exactly four sacrifices");
+                assert!(
+                    chosen.contains(&cards[0]),
+                    "all first 64 four-card combinations contain cards[0]; choosing without it would escape the issued domain"
+                );
+                assert_eq!(
+                    chosen.iter().filter(|id| cards[1..5].contains(id)).count(),
+                    3,
+                    "the best issued choice keeps the forced expensive creature and sacrifices three of the four cheap creatures"
+                );
+            }
+            other => panic!("expected SelectCards, got {other:?}"),
+        };
+
+        let deterministic = deterministic_choice(&state, ai, &config, &actions, None)
+            .expect("the issued sacrifice prompt is answerable");
+        assert!(
+            contract.contains_action(&state, &deterministic),
+            "the deterministic choice must survive exact contract gating"
+        );
+        assert_best_issued(&deterministic);
+
+        let fallback = fallback_action(&state, &config, &contract)
+            .expect("the fallback must choose an issued sacrifice selection");
+        assert!(
+            contract.contains_action(&state, &fallback),
+            "the fallback must never synthesize an unissued selection"
+        );
+        assert_best_issued(&fallback);
+
+        let scored = score_candidates_for_parallel_worker(&state, ai, &config, None);
+        assert!(
+            !scored.is_empty(),
+            "the scoring path must emit an action instead of degrading to no proposal"
+        );
+        assert!(
+            scored
+                .iter()
+                .all(|(action, _)| contract.contains_action(&state, action)),
+            "every scored action must belong to the decision contract"
+        );
+
+        let mut rng = SmallRng::seed_from_u64(17);
+        let action = choose_action(&state, ai, &config, &mut rng)
+            .expect("the public proposal must exist for a mandatory sacrifice");
+        assert!(
+            contract.contains_action(&state, &action),
+            "the public proposal must survive final contract gating"
+        );
+        assert_best_issued(&action);
+
+        let selected = match &action {
+            GameAction::SelectCards { cards } => cards.clone(),
+            _ => unreachable!("assert_best_issued already established SelectCards"),
+        };
+        let mut applied = state.clone();
+        engine::game::engine::apply_as_current(&mut applied, action)
+            .expect("the engine must accept the selected mandatory sacrifices");
+        assert!(
+            selected.iter().all(|id| !applied.battlefield.contains(id)),
+            "the selected permanents must leave the battlefield"
+        );
+    }
+
     /// F9 — the `DigChoice` `up_to` path tests the raw scalar against a literal
     /// `0.1`. That is the only numeric coupling across the twelve former
     /// `evaluate_card_value` sites, so it guards the relocation: any change to
@@ -12214,6 +12953,7 @@ mod tests {
                 up_to: false,
                 constraint: None,
                 source_id: source,
+                reciprocal_role: None,
             }
         });
         push("DiscardChoice", &|state| {
@@ -12253,6 +12993,7 @@ mod tests {
                 conditional_enter_with_counters: Vec::new(),
                 count_param: 0,
                 library_position: None,
+                mass_library_order: None,
                 is_cost_payment: false,
                 enters_modified_if: None,
                 duration: None,
@@ -12676,6 +13417,7 @@ mod tests {
             up_to: true,
             constraint: None,
             source_id: source,
+            reciprocal_role: None,
         };
 
         assert_eq!(
@@ -12683,6 +13425,45 @@ mod tests {
             Some(GameAction::SelectCards { cards: Vec::new() }),
             "an `up_to` prompt legally admits nothing, and the conservative pick \
              is still nothing"
+        );
+    }
+
+    #[test]
+    fn choose_objects_fallback_uses_an_issued_required_selection() {
+        let mut state = make_state();
+        let ai = P0;
+        let first = create_object(
+            &mut state,
+            CardId(90_001),
+            ai,
+            "First required choice".to_string(),
+            Zone::Battlefield,
+        );
+        let second = create_object(
+            &mut state,
+            CardId(90_002),
+            ai,
+            "Second required choice".to_string(),
+            Zone::Battlefield,
+        );
+        state.waiting_for = WaitingFor::ChooseObjectsSelection {
+            player: ai,
+            eligible: vec![TargetRef::Object(first), TargetRef::Object(second)],
+            min: 1,
+            max: Some(2),
+            trigger_event: None,
+        };
+
+        let contract = AiDecisionContract::issue(&state, ai);
+        let action = fallback_action_default(&state)
+            .expect("a required object choice must have a live fallback");
+        assert!(matches!(
+            &action,
+            GameAction::SelectTargets { targets } if !targets.is_empty()
+        ));
+        assert!(
+            contract.contains_action(&state, &action),
+            "fallback must return an engine-issued legal action"
         );
     }
 

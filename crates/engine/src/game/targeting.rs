@@ -808,6 +808,20 @@ pub fn resolved_targets(
             .map(|snap| TargetRef::Object(snap.object_id))
             .collect();
     }
+    // CR 701.47c: "the amassed Army" / "the Army you amassed" — resolves to
+    // the Army creature the current amass instruction chose, threaded via
+    // `ability.amassed_army_object` (stamped by the sub-ability chain walker
+    // in `game/effects/mod.rs` from the `Amass` effect's own resolution).
+    // Mirrors the `CostPaidObject` ladder immediately above: a resolution-local
+    // referent read out of ability state, not the targeting pipeline.
+    if matches!(target_filter, TargetFilter::AmassedArmy) {
+        return ability
+            .amassed_army_object
+            .as_ref()
+            .into_iter()
+            .map(|snap| TargetRef::Object(snap.object_id))
+            .collect();
+    }
     // CR 701.20e: "it" / "that card" after a look-at or reveal instruction.
     if matches!(target_filter, TargetFilter::LastRevealed) {
         return state
@@ -1042,6 +1056,7 @@ fn target_ref_matches_resolved_filter_with_context(
             target_filter,
             *player,
             ctx.source_controller,
+            Some(ctx.source_id),
         ),
     }
 }
@@ -1110,6 +1125,7 @@ pub(crate) fn resolved_object_ids_for_filter_with_context(
         TargetFilter::ParentTargetSlot { index } => {
             resolve_parent_slot_from_root(state, ability, *index)
                 .and_then(|target| target_ref_object(&target))
+                .filter(|id| ability.target_pin_is_current(*id, state))
                 .into_iter()
                 .collect()
         }
@@ -1201,11 +1217,11 @@ pub(crate) fn resolve_event_context_target_for_event_or_state(
             let obj_id = extract_source_from_event(event)?;
             Some(TargetRef::Object(obj_id))
         }
-        // CR 603.2 + CR 120.1: "that creature" / "that permanent" — the object
-        // that *received* the triggering event's damage (recipient counterpart
-        // of `TriggeringSource`). Resolves via the same authority
-        // `ObjectScope::EventTarget` uses so the antecedent is the specific
-        // damaged object, never a generic type filter.
+        // Engine contract: "that creature" / "that permanent" resolves to the
+        // object carried in the triggering event's target slot (the target
+        // counterpart of `TriggeringSource`). Resolves via the same authority
+        // `ObjectScope::EventTarget` uses so the antecedent is a specific event
+        // object, never a generic type filter.
         TargetFilter::EventTarget => {
             let event = event?;
             let obj_id = extract_target_object_from_event(event)?;
@@ -1258,6 +1274,19 @@ pub(crate) fn resolve_event_context_target_for_event_or_state(
                 // creature" anaphor must still inherit the chosen target).
                 crate::types::events::GameEvent::ZoneChanged { object_id, .. }
                     if *object_id != source_id =>
+                {
+                    Some(TargetRef::Object(*object_id))
+                }
+                // CR 701.17c + CR 603.2: "that card" on a mill trigger is the
+                // milled card, when it is not the trigger source itself (the
+                // source keeps its chosen target). CR 701.17c admits the reference
+                // only while the card's destination is a PUBLIC zone — "can find
+                // that card in the zone it moved to from the library, as long as
+                // that zone is a public zone". A replacement that diverts the card
+                // to hand or library leaves nothing this effect may find, so the
+                // reference resolves to no object rather than to a hidden one.
+                crate::types::events::GameEvent::Milled { object_id, to, .. }
+                    if *object_id != source_id && to.is_public() =>
                 {
                     Some(TargetRef::Object(*object_id))
                 }
@@ -1636,6 +1665,11 @@ pub(crate) fn extract_source_from_event(
             ..
         } => Some(*object_id),
         GameEvent::Discarded { object_id, .. } => Some(*object_id),
+        // CR 701.17c: "that card" / "a milled card" is the milled card, and an
+        // effect can find it in the zone it moved to from the library — "as long
+        // as that zone is a public zone". A card diverted to hand or library is
+        // not findable, so it is not projected as the event's subject.
+        GameEvent::Milled { object_id, to, .. } if to.is_public() => Some(*object_id),
         GameEvent::Transformed { object_id } => Some(*object_id),
         // CR 710.4: the flipped permanent is the event's subject.
         GameEvent::Flipped { object_id } => Some(*object_id),
@@ -1703,12 +1737,12 @@ pub(crate) fn extract_sources_from_event(event: &crate::types::events::GameEvent
     }
 }
 
-/// CR 603.2 + CR 120.1: Extract the object that *received* the damage referenced
-/// by the current trigger event — the recipient counterpart to
-/// [`extract_source_from_event`]. Resolves `ObjectScope::EventTarget` ("that
-/// creature" in "deals damage to a creature equal to that creature's
-/// toughness"). Only `DamageDealt` with an object recipient yields a value;
-/// player recipients and non-damage events have no object recipient.
+/// Engine contract: extract the object targeted or receiving the current trigger
+/// event — the target counterpart to [`extract_source_from_event`]. Resolves
+/// `ObjectScope::EventTarget` and `TargetFilter::EventTarget` for event
+/// families that carry an object target. Player targets deliberately yield no
+/// object: generic object/filter/quantity consumers must not coerce a player
+/// into an object reference.
 pub(crate) fn extract_target_object_from_event(
     event: &crate::types::events::GameEvent,
 ) -> Option<ObjectId> {
@@ -1718,7 +1752,150 @@ pub(crate) fn extract_target_object_from_event(
             target: TargetRef::Object(id),
             ..
         } => Some(*id),
-        _ => None,
+        GameEvent::BecomesTarget {
+            target: TargetRef::Object(id),
+            ..
+        } => Some(*id),
+        GameEvent::DamageDealt {
+            target: TargetRef::Player(_),
+            ..
+        }
+        | GameEvent::BecomesTarget {
+            target: TargetRef::Player(_),
+            ..
+        }
+        | GameEvent::GameStarted
+        | GameEvent::MulliganStarted
+        | GameEvent::HiddenSearchViewed { .. }
+        | GameEvent::TurnStarted { .. }
+        | GameEvent::PhaseChanged { .. }
+        | GameEvent::PriorityPassed { .. }
+        | GameEvent::SpellCast { .. }
+        | GameEvent::Mutated { .. }
+        | GameEvent::Augmented { .. }
+        | GameEvent::SpellCopied { .. }
+        | GameEvent::XValueChosen { .. }
+        | GameEvent::AbilityActivated { .. }
+        | GameEvent::ZoneChanged { .. }
+        | GameEvent::LifeChanged { .. }
+        | GameEvent::ManaAdded { .. }
+        | GameEvent::TappedForMana { .. }
+        | GameEvent::ManaAbilityProduced { .. }
+        | GameEvent::ManaPoolEmptied { .. }
+        | GameEvent::ManaRecolored { .. }
+        | GameEvent::PermanentTapped { .. }
+        | GameEvent::CreatureExerted { .. }
+        | GameEvent::CreatureEnlisted { .. }
+        | GameEvent::ArmyAmassed { .. }
+        | GameEvent::Foretold { .. }
+        | GameEvent::BecameForetold { .. }
+        | GameEvent::PlayerLost { .. }
+        | GameEvent::CardsDrawn { .. }
+        | GameEvent::CardDrawn { .. }
+        | GameEvent::PermanentUntapped { .. }
+        | GameEvent::PermanentPhasedOut { .. }
+        | GameEvent::PermanentPhasedIn { .. }
+        | GameEvent::PlayerPhasedOut { .. }
+        | GameEvent::PlayerPhasedIn { .. }
+        | GameEvent::LandPlayed { .. }
+        | GameEvent::StackPushed { .. }
+        | GameEvent::StackResolved { .. }
+        | GameEvent::Discarded { .. }
+        | GameEvent::Milled { .. }
+        | GameEvent::DamageCleared { .. }
+        | GameEvent::GameOver { .. }
+        | GameEvent::ResolutionHalted { .. }
+        | GameEvent::DamagePrevented { .. }
+        | GameEvent::SpellCountered { .. }
+        | GameEvent::CounterAdded { .. }
+        | GameEvent::SagaChapterAbilityResolved { .. }
+        | GameEvent::ObjectIntensified { .. }
+        | GameEvent::Evolved { .. }
+        | GameEvent::CounterRemoved { .. }
+        | GameEvent::TokenCreated { .. }
+        | GameEvent::ObjectConjured { .. }
+        | GameEvent::CreatureDestroyed { .. }
+        | GameEvent::PermanentSacrificed { .. }
+        | GameEvent::ControllerChanged { .. }
+        | GameEvent::EffectResolved { .. }
+        | GameEvent::Unattached { .. }
+        | GameEvent::ContinuousEffectEnded { .. }
+        | GameEvent::AttackersDeclared { .. }
+        | GameEvent::BlockersDeclared { .. }
+        | GameEvent::AttackerBecameBlockedByEffect { .. }
+        | GameEvent::AttackerBecameBlockedByFilteredBlocker { .. }
+        | GameEvent::CombatTaxPaid { .. }
+        | GameEvent::CombatTaxDeclined { .. }
+        | GameEvent::VehicleCrewed { .. }
+        | GameEvent::Stationed { .. }
+        | GameEvent::Saddled { .. }
+        | GameEvent::ReplacementApplied { .. }
+        | GameEvent::Transformed { .. }
+        | GameEvent::Flipped { .. }
+        | GameEvent::Specialized { .. }
+        | GameEvent::DayNightChanged { .. }
+        | GameEvent::TurnedFaceUp { .. }
+        | GameEvent::TurnedFaceDown { .. }
+        | GameEvent::CardsRevealed { .. }
+        | GameEvent::ChosenNumbersRevealed { .. }
+        | GameEvent::CombatDamageDealtToPlayer { .. }
+        | GameEvent::PlayerEliminated { .. }
+        | GameEvent::CrimeCommitted { .. }
+        | GameEvent::Cycled { .. }
+        | GameEvent::PlayerPerformedAction { .. }
+        | GameEvent::CardPredicateGuessMade { .. }
+        | GameEvent::Regenerated { .. }
+        | GameEvent::CreatureSuspected { .. }
+        | GameEvent::CreatureNoLongerSuspected { .. }
+        | GameEvent::Detained { .. }
+        | GameEvent::BecamePrepared { .. }
+        | GameEvent::BecameUnprepared { .. }
+        | GameEvent::CaseSolved { .. }
+        | GameEvent::ClassLevelGained { .. }
+        | GameEvent::MonarchChanged { .. }
+        | GameEvent::CityBlessingGained { .. }
+        | GameEvent::EnduringStoryGained { .. }
+        | GameEvent::DieRolled { .. }
+        | GameEvent::StartingPlayerContest { .. }
+        | GameEvent::CoinFlipped { .. }
+        | GameEvent::RingTemptsYou { .. }
+        | GameEvent::RoomEntered { .. }
+        | GameEvent::RoomDoorUnlocked { .. }
+        | GameEvent::BecomesPlotted { .. }
+        | GameEvent::DungeonCompleted { .. }
+        | GameEvent::Planeswalked { .. }
+        | GameEvent::ChaosEnsued { .. }
+        | GameEvent::PlanarDieRolled { .. }
+        | GameEvent::SchemeSetInMotion { .. }
+        | GameEvent::SchemeAbandoned { .. }
+        | GameEvent::InitiativeTaken { .. }
+        | GameEvent::AttractionOpened { .. }
+        | GameEvent::ContraptionAssembled { .. }
+        | GameEvent::StickerPlaced { .. }
+        | GameEvent::AttractionsRolledToVisit { .. }
+        | GameEvent::AttractionVisited { .. }
+        | GameEvent::ContraptionCranked { .. }
+        | GameEvent::Firebend { .. }
+        | GameEvent::Airbend { .. }
+        | GameEvent::Earthbend { .. }
+        | GameEvent::Waterbend { .. }
+        | GameEvent::CompanionRevealed { .. }
+        | GameEvent::CompanionMovedToHand { .. }
+        | GameEvent::NinjutsuActivated { .. }
+        | GameEvent::KeywordAbilityActivated { .. }
+        | GameEvent::CreatureExploited { .. }
+        | GameEvent::EnergyChanged { .. }
+        | GameEvent::SpeedChanged { .. }
+        | GameEvent::PlayerCounterChanged { .. }
+        | GameEvent::ManaExpended { .. }
+        | GameEvent::Clash { .. }
+        | GameEvent::VoteCast { .. }
+        | GameEvent::VoteResolved { .. }
+        | GameEvent::PowerToughnessChanged { .. }
+        | GameEvent::CascadeMissed { .. }
+        | GameEvent::DebugActionUsed { .. }
+        | GameEvent::DebugPermissionGranted { .. }
+        | GameEvent::DebugPermissionRevoked { .. } => None,
     }
 }
 
@@ -1744,6 +1921,11 @@ pub(crate) fn extract_player_from_event(
         GameEvent::CardsDrawn { player_id, .. } => Some(*player_id),
         GameEvent::CardDrawn { player_id, .. } => Some(*player_id),
         GameEvent::Discarded { player_id, .. } => Some(*player_id),
+        // CR 701.17a: "that player" is the player whose library the card left.
+        // CR 400.3 + CR 401.1: a library holds its owner's cards, so for a
+        // library-resident card owner, controller and milling player coincide —
+        // the same seat the `ZoneChanged` arm's `record.controller` answered.
+        GameEvent::Milled { player_id, .. } => Some(*player_id),
         GameEvent::LandPlayed { player_id, .. } => Some(*player_id),
         GameEvent::SpellCast { controller, .. } => Some(*controller),
         // CR 602.2a: "Its controller is the player who activated the ability."
@@ -1827,6 +2009,8 @@ pub(crate) fn extract_amount_from_event(event: &crate::types::events::GameEvent)
         GameEvent::CounterAdded { count, .. } => Some(*count as i32),
         GameEvent::CounterRemoved { count, .. } => Some(*count as i32),
         GameEvent::Discarded { .. } => Some(1),
+        // CR 603.2c: one milled card per event.
+        GameEvent::Milled { .. } => Some(1),
         // CR 508.1m + CR 603.2c: Batched attack-trigger context stores the
         // attackers that satisfied the trigger subject, so "that many" reads
         // the size of that contextual attack event.
@@ -2057,12 +2241,14 @@ fn stack_entry_controller_matches(
 /// CR 400.3 fixes which zones those are.
 ///
 /// Matching them against `obj.controller` excluded a card from its OWN owner's
-/// query whenever a control-change effect left a stale controller behind — the
-/// state `effects::change_zone` documents for a creature stolen via Mind Control
-/// that dies into its owner's graveyard, where `reset_for_battlefield_exit` does
-/// not reset controller and the layer pass that would skips objects off the
-/// battlefield. Exile keeps controller matching deliberately; see
-/// `filter::is_owner_scoped_zone` for why.
+/// query whenever a control-change effect left a stale controller behind.
+/// `zones::apply_zone_exit_cleanup` already resets `controller` back to the
+/// owner fallback on the way into these zones, but this owner-scoped match is
+/// defence-in-depth for a hand-built or serialized state where the two have
+/// diverged — the state `effects::change_zone` documents at its own site, for a
+/// creature stolen via Mind Control that dies into its owner's graveyard. Exile
+/// keeps controller matching deliberately; see `filter::is_owner_scoped_zone`
+/// for why.
 fn add_zone_targets(
     state: &GameState,
     zone: Zone,
@@ -2199,6 +2385,7 @@ fn stack_spell_entry_matches_filter(
                     constraint,
                     *pid,
                     source_controller_opt,
+                    Some(source_id),
                 ),
             })
         {
@@ -2218,6 +2405,7 @@ fn stack_spell_entry_matches_filter(
                     constraint,
                     *pid,
                     source_controller_opt,
+                    Some(source_id),
                 ),
             })
         {
@@ -2648,6 +2836,27 @@ pub(crate) fn resolve_tracked_set_sentinel(
 #[cfg(test)]
 mod tests {
 
+    #[test]
+    fn extract_target_object_from_event_handles_object_becomes_target_only() {
+        let object = ObjectId(41);
+        let object_event = GameEvent::BecomesTarget {
+            target: TargetRef::Object(object),
+            source_id: ObjectId(7),
+            source_controller: PlayerId(0),
+        };
+        let player_event = GameEvent::BecomesTarget {
+            target: TargetRef::Player(PlayerId(1)),
+            source_id: ObjectId(7),
+            source_controller: PlayerId(0),
+        };
+
+        assert_eq!(
+            extract_target_object_from_event(&object_event),
+            Some(object)
+        );
+        assert_eq!(extract_target_object_from_event(&player_event), None);
+    }
+
     /// A `SpecificPlayer` controller scope matches a stack ability by comparing
     /// the stored player id with the stack entry's stored controller. This is an
     /// engine contract, not a rules behavior, so it carries no CR annotation.
@@ -2728,6 +2937,148 @@ mod tests {
     use crate::types::mana::ManaColor;
     use crate::types::statics::StaticMode;
     use crate::types::zones::Zone;
+
+    /// V15 — CR 701.17a + CR 701.17c + CR 603.2c: the three event-subject
+    /// projections answer for the mill action event instead of abstaining.
+    /// No shipped card reaches the player/amount arms yet, and none of the three
+    /// is compiler-forced, so this row is what keeps them from silently
+    /// answering `None` when the first printing arrives.
+    #[test]
+    fn milled_projects_its_card_its_player_and_one() {
+        let state = GameState::new_two_player(42);
+        let milled = GameEvent::Milled {
+            player_id: PlayerId(1),
+            object_id: ObjectId(7),
+            to: Zone::Exile,
+        };
+        let zone_changed = GameEvent::ZoneChanged {
+            object_id: ObjectId(7),
+            from: Some(Zone::Library),
+            to: Zone::Graveyard,
+            record: Box::new(crate::types::game_state::ZoneChangeRecord::test_minimal(
+                ObjectId(7),
+                Some(Zone::Library),
+                Zone::Graveyard,
+            )),
+        };
+        // An event none of these functions has an object/amount arm for.
+        let tapped = GameEvent::PermanentTapped {
+            object_id: ObjectId(9),
+            caused_by: None,
+        };
+
+        assert_eq!(extract_source_from_event(&milled), Some(ObjectId(7)));
+
+        // CR 400.3 + CR 401.1: the milling player is the seat the `ZoneChanged`
+        // arm's `record.controller` answered for a library-resident card. The
+        // `ZoneChanged` leg is this function's live positive control; `tapped` is
+        // the negative that refuses a blanket `Some`.
+        assert_eq!(
+            extract_player_from_event(&milled, &state),
+            Some(PlayerId(1))
+        );
+        assert!(extract_player_from_event(&zone_changed, &state).is_some());
+        assert_eq!(extract_player_from_event(&tapped, &state), None);
+
+        // `extract_amount_from_event` has no `ZoneChanged` arm, so its live
+        // positive is the answer this arm copies: `Discarded` -> 1.
+        assert_eq!(extract_amount_from_event(&milled), Some(1));
+        assert_eq!(
+            extract_amount_from_event(&GameEvent::Discarded {
+                player_id: PlayerId(1),
+                object_id: ObjectId(7),
+                source_id: None,
+            }),
+            Some(1)
+        );
+        assert_eq!(extract_amount_from_event(&tapped), None);
+    }
+
+    /// V15 — CR 701.17c + CR 603.2: the resolution-time half of the "that card"
+    /// anaphor. The milled card is the referent unless it IS the trigger source,
+    /// in which case the source keeps its chosen target.
+    #[test]
+    fn parent_target_binds_the_milled_card_but_never_the_trigger_source() {
+        let state = GameState::new_two_player(42);
+        let source = ObjectId(3);
+        let resolve = |event: &GameEvent| {
+            resolve_event_context_target_for_event_or_state(
+                &state,
+                &TargetFilter::ParentTarget,
+                source,
+                Some(event),
+            )
+        };
+
+        let milled = |object_id| GameEvent::Milled {
+            player_id: PlayerId(1),
+            object_id,
+            to: Zone::Graveyard,
+        };
+        assert_eq!(
+            resolve(&milled(ObjectId(7))),
+            Some(TargetRef::Object(ObjectId(7)))
+        );
+        assert_eq!(resolve(&milled(source)), None);
+        // Live control: an event with no `ParentTarget` arm still abstains.
+        assert_eq!(
+            resolve(&GameEvent::PermanentTapped {
+                object_id: ObjectId(9),
+                caused_by: None,
+            }),
+            None
+        );
+    }
+
+    /// CR 701.17c — the destination gate on BOTH milled-card projections. An effect
+    /// referring to a milled card can find it "in the zone it moved to from the
+    /// library, as long as that zone is a public zone", so a card a replacement
+    /// diverted to hand or library is findable by nothing and must be projected by
+    /// neither seam. Each pair differs in `to` alone.
+    #[test]
+    fn a_milled_card_is_projected_only_from_a_public_destination() {
+        let state = GameState::new_two_player(42);
+        let source = ObjectId(1);
+        let milled_to = |to| GameEvent::Milled {
+            player_id: PlayerId(1),
+            object_id: ObjectId(7),
+            to,
+        };
+        let resolve = |event: &GameEvent| {
+            resolve_event_context_target_for_event_or_state(
+                &state,
+                &TargetFilter::ParentTarget,
+                source,
+                Some(event),
+            )
+        };
+
+        for public in [Zone::Graveyard, Zone::Exile] {
+            assert_eq!(
+                resolve(&milled_to(public)),
+                Some(TargetRef::Object(ObjectId(7))),
+                "a public destination stays findable: {public:?}"
+            );
+            assert_eq!(
+                extract_source_from_event(&milled_to(public)),
+                Some(ObjectId(7)),
+                "public destination projects as the event subject: {public:?}"
+            );
+        }
+
+        for private in [Zone::Hand, Zone::Library] {
+            assert_eq!(
+                resolve(&milled_to(private)),
+                None,
+                "a card diverted to a hidden zone is findable by no effect: {private:?}"
+            );
+            assert_eq!(
+                extract_source_from_event(&milled_to(private)),
+                None,
+                "and is not projected as the event subject either: {private:?}"
+            );
+        }
+    }
 
     #[test]
     fn extract_amount_from_combat_damage_dealt_to_player_returns_total_damage() {
@@ -5236,12 +5587,15 @@ mod tests {
     /// resolution and the spell fizzles. Fixing only enumeration would leave exactly
     /// that split, so both are asserted here on one state.
     ///
-    /// The fixture stages the divergence CR 400.3 makes reachable: a card goes to its
-    /// OWNER's graveyard, while `reset_for_battlefield_exit` leaves a stale
-    /// `controller` behind from a control-change effect. So `mine` (owner P0,
-    /// controller P1) is in P0's graveyard and must match "creature card in YOUR
-    /// graveyard"; `theirs` (owner P1, controller P0) is in P1's graveyard and must
-    /// not — under controller matching the two verdicts invert exactly.
+    /// The fixture hand-builds the divergence CR 400.3 makes reachable in principle:
+    /// a card sits in its OWNER's graveyard while `controller` still names a
+    /// different player, as it would if a control-change effect's reset had not
+    /// run (`zones::apply_zone_exit_cleanup` resets it in production; this test
+    /// constructs the divergent state directly, as defence-in-depth coverage). So
+    /// `mine` (owner P0, controller P1) is in P0's graveyard and must match
+    /// "creature card in YOUR graveyard"; `theirs` (owner P1, controller P0) is in
+    /// P1's graveyard and must not — under controller matching the two verdicts
+    /// invert exactly.
     #[test]
     fn owner_scoped_zone_query_agrees_across_selection_and_resolution() {
         let mut state = GameState::new_two_player(42);

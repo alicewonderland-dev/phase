@@ -717,7 +717,8 @@ mod tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        AbilityKind, CardSelectionMode, Chooser, TargetFilter, VoteVisibility, ZoneOwner,
+        AbilityKind, CardSelectionMode, Chooser, PerPlayerScope, TargetFilter, VoteVisibility,
+        ZoneOwner,
     };
     use crate::types::actions::GameAction;
     use crate::types::identifiers::{CardId, ObjectId};
@@ -789,6 +790,7 @@ mod tests {
             },
             targets: vec![],
             source_id: ObjectId(1),
+            cast_occurrence: None,
             source_incarnation: None,
             trigger_source: None,
             trigger_definition_ref: None,
@@ -904,6 +906,7 @@ mod tests {
             },
             targets: vec![],
             source_id: ObjectId(1),
+            cast_occurrence: None,
             source_incarnation: None,
             trigger_source: None,
             trigger_definition_ref: None,
@@ -1163,9 +1166,11 @@ mod tests {
                     count: 1,
                     zone: Zone::Graveyard,
                     additional_zones: Vec::new(),
-                    zone_owner: ZoneOwner::EachPlayer,
+                    zone_owner: ZoneOwner::Each(PerPlayerScope::AllPlayers),
                     filter: None,
-                    chooser: Chooser::Controller,
+                    chooser: Chooser::Controller.into(),
+                    candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                    reciprocal_role: None,
                     up_to: false,
                     constraint: None,
                     selection: CardSelectionMode::Chosen,
@@ -1344,6 +1349,7 @@ mod tests {
             effect: (*parsed_def.effect).clone(),
             targets: vec![],
             source_id: ObjectId(1),
+            cast_occurrence: None,
             source_incarnation: None,
             trigger_source: None,
             trigger_definition_ref: None,
@@ -1516,6 +1522,7 @@ mod tests {
             },
             targets: vec![],
             source_id,
+            cast_occurrence: None,
             source_incarnation: None,
             trigger_source: None,
             trigger_definition_ref: None,

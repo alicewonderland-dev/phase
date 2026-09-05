@@ -1,10 +1,11 @@
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::ability::{
     default_target_filter_permanent, legacy_trigger_entry_list,
@@ -17,10 +18,11 @@ use super::ability::{
     EffectKind, FaceDownProfile, GameRestriction, KeywordAction, KickerVariant, LibraryPosition,
     ModalChoice, PermanentEntryMode, PileSource, QuantityExpr, ResolvedAbility,
     SearchDestinationSplit, SearchOrderingHint, SearchSelectionConstraint, StackAbilityKind,
-    StaticCondition, TapCreaturesAggregate, TargetFilter, TargetRef, ThisWayCause,
-    TriggerBaseSetInstanceRef, TriggerCondition, TriggerDefinition, TriggerDefinitionRef,
-    TriggerEntry,
+    StaticCondition, TapCreaturesSelectionMode, TargetFilter, TargetRef, ThisWayCause,
+    TriggerBaseSetInstanceRef, TriggerCondition, TriggerDefinition, TriggerDefinitionOccurrenceRef,
+    TriggerDefinitionRef, TriggerEntry,
 };
+use super::actions::ResolveAllScope;
 use super::attribution::ObjectAttribution;
 use super::card::{CardFace, PrintedCardRef, TokenImageRef};
 use super::card_type::{CoreType, Supertype};
@@ -68,7 +70,9 @@ use super::resolved_commands::{
 use super::zones::{ChainReferentIntent, EtbTapState};
 use super::zones::{ExileCostSourceZone, Zone};
 
-use crate::analysis::resource::{object_class, CounterClass, ObjectClass, ResourceAxis};
+use crate::analysis::resource::{
+    object_class, CounterClass, ObjectClass, ResourceAxis, UnboundedMarkKind,
+};
 use crate::game::bracket_estimate::CommanderBracketTier;
 use crate::game::combat::{AttackTarget, CombatState};
 use crate::game::deck_loading::DeckEntry;
@@ -235,35 +239,6 @@ mod tuple_key_map {
 
 #[cfg(test)]
 mod legacy_trigger_definition_ref_map {
-    use super::*;
-
-    pub fn serialize<S, H>(
-        map: &HashMap<TriggerDefinitionRef, u32, H>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut entries: Vec<_> = map.iter().collect();
-        entries.sort_unstable_by_key(|(key, _)| *key);
-        entries.serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D>(
-        deserializer: D,
-    ) -> Result<HashMap<TriggerDefinitionRef, u32>, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Vec::<(TriggerDefinitionRef, u32)>::deserialize(deserializer)
-            .map(|entries| entries.into_iter().collect())
-    }
-}
-
-/// Serde adapter for trigger occurrence ledgers. JSON object keys must be
-/// strings, while a `TriggerDefinitionRef` is structured identity; encode the
-/// map as an explicit entry list rather than flattening or guessing a key.
-mod trigger_definition_ref_map {
     use super::*;
 
     pub fn serialize<S, H>(
@@ -1123,6 +1098,14 @@ pub struct ManaSpentSourceSnapshot {
     pub lki: LKISnapshot,
 }
 
+/// CR 601.2i: Stable coordinate of one finalized cast in its caster's
+/// turn-scoped spell-cast journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CastOccurrence {
+    pub caster: PlayerId,
+    pub turn_journal_index: u32,
+}
+
 /// Snapshot of a spell's characteristics at cast time for per-turn history queries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpellCastRecord {
@@ -1146,6 +1129,14 @@ pub struct SpellCastRecord {
     /// the underlying object (which may have left the stack).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub has_x_in_cost: bool,
+    /// CR 715.2a: Whether the spell's cast-time object has the alternative
+    /// characteristics of an Adventure spell, even when the creature face is
+    /// the face being cast. This is false when the Adventure face itself is
+    /// being cast: its alternative characteristics are then the normal face.
+    /// Captured so filtered cast-history queries do not need to inspect the
+    /// spell object after it leaves the stack.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_adventure: bool,
     /// CR 400.1 + CR 601.2a: Zone the spell was cast from, captured at cast-time
     /// so per-turn spell-history conditions can answer "from your hand" after
     /// the spell has moved on from the stack. Per CR 601.2a every cast spell
@@ -1215,6 +1206,7 @@ impl Default for SpellCastRecord {
             colors: Vec::new(),
             mana_value: 0,
             has_x_in_cost: false,
+            has_adventure: false,
             from_zone: Zone::Hand,
             cast_variant: CastingVariant::Normal,
             was_kicked: false,
@@ -1844,9 +1836,141 @@ pub struct MayTriggerAutoChoiceKey {
     pub origin: MayTriggerOrigin,
 }
 
+/// CR 603.5: The breadth of a stored optional-trigger answer. Exact instance
+/// remains the default; same-card is only accepted when the live prompt proves
+/// its direct printed provenance.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(tag = "type")]
+pub enum MayTriggerAutoChoiceScope {
+    #[default]
+    ExactInstance,
+    SameCard,
+}
+
+/// CR 603.5: The identity of a persisted optional-trigger answer.
+///
+/// `SameCard` deliberately carries a printed reference rather than `CardId`:
+/// `CardId` identifies one physical object, while `PrintedCardRef` identifies
+/// the printed face shared by physical copies. The `printed_occurrence` keeps
+/// independently functioning printed triggers separate.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(tag = "type", content = "data")]
+pub enum MayTriggerAutoChoiceSelector {
+    ExactInstance {
+        player: PlayerId,
+        source_id: ObjectId,
+        origin: MayTriggerOrigin,
+    },
+    SameCard {
+        player: PlayerId,
+        printed_ref: PrintedCardRef,
+        printed_occurrence: usize,
+    },
+}
+
+impl MayTriggerAutoChoiceSelector {
+    pub fn player(&self) -> PlayerId {
+        match self {
+            Self::ExactInstance { player, .. } | Self::SameCard { player, .. } => *player,
+        }
+    }
+
+    pub fn for_player(&self, player: PlayerId) -> Self {
+        match self {
+            Self::ExactInstance {
+                source_id, origin, ..
+            } => Self::ExactInstance {
+                player,
+                source_id: *source_id,
+                origin: origin.clone(),
+            },
+            Self::SameCard {
+                printed_ref,
+                printed_occurrence,
+                ..
+            } => Self::SameCard {
+                player,
+                printed_ref: printed_ref.clone(),
+                printed_occurrence: *printed_occurrence,
+            },
+        }
+    }
+
+    pub fn exact(key: MayTriggerAutoChoiceKey) -> Self {
+        Self::ExactInstance {
+            player: key.player,
+            source_id: key.source_id,
+            origin: key.origin,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data")]
+enum MayTriggerAutoChoiceSelectorTagged {
+    ExactInstance {
+        player: PlayerId,
+        source_id: ObjectId,
+        origin: MayTriggerOrigin,
+    },
+    SameCard {
+        player: PlayerId,
+        printed_ref: PrintedCardRef,
+        printed_occurrence: usize,
+    },
+}
+
+impl From<MayTriggerAutoChoiceSelectorTagged> for MayTriggerAutoChoiceSelector {
+    fn from(value: MayTriggerAutoChoiceSelectorTagged) -> Self {
+        match value {
+            MayTriggerAutoChoiceSelectorTagged::ExactInstance {
+                player,
+                source_id,
+                origin,
+            } => Self::ExactInstance {
+                player,
+                source_id,
+                origin,
+            },
+            MayTriggerAutoChoiceSelectorTagged::SameCard {
+                player,
+                printed_ref,
+                printed_occurrence,
+            } => Self::SameCard {
+                player,
+                printed_ref,
+                printed_occurrence,
+            },
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum MayTriggerAutoChoiceSelectorWire {
+    Tagged(MayTriggerAutoChoiceSelectorTagged),
+    LegacyExact(MayTriggerAutoChoiceKey),
+}
+
+impl<'de> Deserialize<'de> for MayTriggerAutoChoiceSelector {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match MayTriggerAutoChoiceSelectorWire::deserialize(deserializer)? {
+            MayTriggerAutoChoiceSelectorWire::Tagged(selector) => Ok(selector.into()),
+            MayTriggerAutoChoiceSelectorWire::LegacyExact(key) => Ok(Self::exact(key)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MayTriggerAutoChoiceRecord {
-    pub key: MayTriggerAutoChoiceKey,
+    /// `key` is accepted only to deserialize pre-selector persisted records.
+    #[serde(alias = "key")]
+    pub selector: MayTriggerAutoChoiceSelector,
     pub choice: AutoMayChoice,
 }
 
@@ -1935,9 +2059,27 @@ pub struct ResolveAllConsentParticipant {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolveAllConsentRun {
     pub epoch: u64,
-    pub max_resolutions: u32,
+    /// Legacy numeric saves use `0` for no cap. The shared resolution-session
+    /// budget keeps that established wire shape while normalizing it in memory.
+    #[serde(default)]
+    pub max_resolutions: StackResolutionBudget,
     pub priority_snapshot: ResolveAllPrioritySnapshot,
+    /// Which seats this run binds. `Own` runs cover only the requester, so the
+    /// live-authority check accepts them as a SUBSET of the current priority
+    /// participants; a `Shared` run is a table-wide proposal and must still
+    /// match the live set exactly, or a seat that became a participant after
+    /// the snapshot would be bound by a consent it never gave (CR 117.3d).
+    /// Defaults to `Own` so a save written before this field existed cannot
+    /// silently acquire table-wide authority.
+    #[serde(default)]
+    pub scope: ResolveAllScope,
     pub participants: Vec<ResolveAllConsentParticipant>,
+    /// The complete sparse auto-pass map captured before a fresh Resolve All
+    /// run installs its temporary shared-resolution overlay. `None` identifies
+    /// a pre-session legacy consent run; `Some(empty)` is a deliberately
+    /// captured empty baseline and must remain distinguishable on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_pass_baseline: Option<BTreeMap<PlayerId, AutoPassMode>>,
 }
 
 impl ResolveAllConsentRun {
@@ -1959,6 +2101,21 @@ impl ResolveAllConsentRun {
             .iter()
             .find(|participant| !participant.granted)
             .map(|participant| participant.representative)
+    }
+
+    /// The single authority for whether a `RespondResolveAllConsent` naming
+    /// `epoch` and `representative` is still answerable.
+    ///
+    /// The public `WaitingFor::ResolveAllConsent` prompt and this private run
+    /// are separate fields, and a run can be absent behind a standing prompt —
+    /// a viewer projection redacts the run (`visibility.rs`) while retaining
+    /// the prompt, so any state reconstructed from one carries the prompt with
+    /// no run behind it. Every producer of the prompt's action domain must ask
+    /// this before offering Grant or Decline: an offer the reducer can only
+    /// reject leaves the representative hammering an unanswerable prompt with
+    /// no other legal action, which no later boundary can undo.
+    pub fn accepts_response_from(&self, epoch: u64, representative: PlayerId) -> bool {
+        self.epoch == epoch && self.next_pending_representative() == Some(representative)
     }
 }
 
@@ -2231,6 +2388,36 @@ pub struct CommanderDamageEntry {
 /// without the other and break the "pause emits the same event as
 /// non-pause" invariant.
 ///
+/// The exact resolution-time Attach instruction that owns an
+/// `EffectZoneChoice`. The operation stays typed across a host choice followed
+/// by an attachment choice; its enclosing continuation frame carries only the
+/// later printed chain tail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingAttachmentChoice {
+    pub operation: Box<ResolvedAbility>,
+}
+
+/// The exact Attach instruction that created an ordinary continuation for its
+/// remaining already-selected attachments. This is distinct from
+/// [`PendingAttachmentChoice`]: no player choice owns this continuation, but
+/// the producer identity proves which Attach instruction already split off its
+/// printed tail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingAttachmentRemainder {
+    pub producer: Box<ResolvedAbility>,
+}
+
+/// Private continuation authority for an interactive player-scope exile
+/// instruction. Keeping the detached tail here makes generated APNAP nodes
+/// explicit without adding runtime provenance to `ResolvedAbility`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingPlayerScopeLinkedExile {
+    pub source_id: ObjectId,
+    pub after_scope: Box<ResolvedAbility>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub batch: Vec<ObjectIncarnationRef>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingContinuation {
     pub chain: Box<ResolvedAbility>,
@@ -2252,9 +2439,48 @@ pub struct PendingContinuation {
     /// paused, then restored before the continuation resumes resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) trigger_firing: Option<TriggerFiring>,
+    /// A child Attach choice owns this operation while its normal continuation
+    /// parent retains only the following instructions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_choice: Option<PendingAttachmentChoice>,
+    /// The producer identity for an ordinary continuation containing only the
+    /// unprocessed members of a selected multi-attachment operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_remainder: Option<PendingAttachmentRemainder>,
+    /// CR 608.2f: exact linked-exile union and detached unscoped tail owned by
+    /// a generated player-scope continuation. Legacy saves default to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) player_scope_linked_exile: Option<PendingPlayerScopeLinkedExile>,
+    /// Private queue terminator for generated player-scope continuations. The
+    /// placeholder `chain` is never resolved when this is set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) player_scope_queue_end: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// CR 608.2c + CR 616.1: Exact progress for an `ExileFromTopUntil` loop whose
+/// current library-to-exile event paused for a replacement choice.
+pub struct PendingExileFromTopUntil {
+    /// Card whose replacement-resolved destination must be classified on resume.
+    pub pending_card: ObjectId,
+    /// Original library snapshot after `pending_card`, in iteration order.
+    pub remaining: Vec<ObjectId>,
+    /// Current-resolution exile incarnations completed before the pause.
+    pub linked_batch: Vec<ObjectIncarnationRef>,
+    /// Cumulative property total completed before the pause.
+    pub cumulative: i32,
 }
 
 impl PendingContinuation {
+    pub(crate) fn player_scope_queue_end(
+        placeholder: Box<ResolvedAbility>,
+        state: &GameState,
+    ) -> Self {
+        let mut pending = Self::new(placeholder, state);
+        pending.player_scope_queue_end = true;
+        pending
+    }
+
     /// Construct a continuation with no parent-kind emission. Used for chains
     /// whose per-node `EffectResolved` events are the full observable story
     /// (targeted damage continuations, Learn rummage, Bolster, Clash, etc.).
@@ -2265,6 +2491,10 @@ impl PendingContinuation {
             search_attach_host: None,
             trigger_context: ResolvingTriggerContext::capture(state),
             trigger_firing: state.resolving_trigger_firing,
+            attachment_choice: None,
+            attachment_remainder: None,
+            player_scope_linked_exile: state.resolving_player_scope_linked_exile.clone(),
+            player_scope_queue_end: false,
         }
     }
 
@@ -2283,6 +2513,10 @@ impl PendingContinuation {
             search_attach_host: None,
             trigger_context: ResolvingTriggerContext::capture(state),
             trigger_firing: state.resolving_trigger_firing,
+            attachment_choice: None,
+            attachment_remainder: None,
+            player_scope_linked_exile: state.resolving_player_scope_linked_exile.clone(),
+            player_scope_queue_end: false,
         }
     }
 }
@@ -3676,15 +3910,16 @@ pub struct PendingCopyTokenBatch {
 /// every seam honest — a new variant will not compile until classified).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PersistentAxisMaterialization {
-    /// CR 707.2 + CR 111.1: mint N tapped copy-tokens of this fodder profile
-    /// (the `TokensCreated` axis). Carries NO per-cycle count because the per-cycle
-    /// fodder count k is STRUCTURALLY ≡ 1: this stash is only registered when
-    /// `materialize_object_growth_shortcut`'s `derived_fodder_class`
-    /// found EXACTLY one new battlefield object per period
-    /// (a two+-object period returns `None` ⇒ no `Tokens` stash), so the boundary
-    /// mint of `count: amount` == k·amount is EXACT. (Contrast `Counters`/`Life`,
-    /// which carry a measured `per_cycle_delta` to handle k>1.)
-    Tokens(Box<CopiableValues>),
+    /// CR 707.2 + CR 111.1: mint `per_cycle_delta × N` tapped copy-tokens of this fodder profile
+    /// (the `TokensCreated` axis). `per_cycle_delta` is the per-cycle fodder count k, which
+    /// `materialize_object_growth_shortcut`'s `derived_fodder_class` proves is a HOMOGENEOUS
+    /// multiset — every member equal under `analysis::resource::fodder_content_eq` AND under
+    /// `game::printed_cards::intrinsic_copiable_values`, so one profile faithfully represents all
+    /// k. A count contributed by a live `CreateToken` replacement is NOT in k: that period routes
+    /// to `DriveSequence` instead (`analysis::resource::token_growth_is_observed`), because this
+    /// arm re-runs the replacement pipeline and would otherwise apply it twice.
+    /// (Mirrors `Counters`/`Life`, which carry the same field.)
+    Tokens(Box<TokenGrowth>),
     /// CR 122.1 / CR 701.34a: apply `per_cycle_delta × N` counters to each captured
     /// target (the beneficial-growable counter axis: Generic / +1/+1 / loyalty / defense).
     Counters(Vec<CounterGrowth>),
@@ -3700,8 +3935,12 @@ pub enum PersistentAxisMaterialization {
     /// The `sequence` is CLONED into the stash (it serializes; round-trip verified) so the
     /// boundary read survives save/reload and does NOT rely on the serde-skipped live
     /// `last_loop_action_sequence` (sidesteps the Kilo FIX-3 drop-on-load scar).
-    /// `collapsed_axes` is the exact ∞-mark set this loop set (== `proposal.unbounded`),
-    /// captured at accept for a scoped clear.
+    /// `collapsed_axes` is the subset of the loop's ∞-mark set that THIS materialization is
+    /// accountable for ending — the `DeferredAccrual` axes, per
+    /// `analysis::resource::ResourceAxis::unbounded_mark_kind`, captured at accept for a scoped
+    /// clear. It is deliberately NOT `proposal.unbounded`: a `StandingCapability` axis (today,
+    /// `Mana(_)`) is already materialized in the pool and its `∞` ends under CR 500.5 + CR 106.4,
+    /// not with this collapse.
     DriveSequence {
         sequence: Vec<LoopActionContext>,
         collapsed_axes: Vec<ResourceAxis>,
@@ -3772,6 +4011,26 @@ pub(crate) fn collapsed_counter_axis(
         .map(|o| object_class(o.card_types.core_types.as_slice()))
         .unwrap_or(ObjectClass::Other);
     ResourceAxis::Counter(CounterClass::from_counter_type(ct), oc)
+}
+
+/// CR 111.3 + CR 707.2: the fodder profile the boundary mint copies, plus the per-cycle count
+/// `k` the certified period reproduces. Mirrors [`CounterGrowth`]'s `per_cycle_delta`; the mint
+/// applies `per_cycle_delta * N` exactly as the `Counters`/`Life` arms do.
+///
+/// CR 111.3, not CR 111.10: a created token's characteristics are the ones the creating spell or
+/// ability defines, and those ARE its copiable values. CR 111.10's scope is predefined tokens
+/// (Treasure, Food, ...) and does not cover this profile.
+///
+/// `per_cycle_delta` is the count the period's OWN effects create. A count contributed by a live
+/// `CreateToken` REPLACEMENT is deliberately NOT in it: the boundary mint re-runs that pipeline
+/// (`game::effects::token_copy::drive_copy_token_batches` -> `ProposedEvent::CreateToken` ->
+/// `replacement::replace_event`), so folding the replacement's multiplication in here would apply
+/// it twice. Such a period never reaches this struct — it routes to `DriveSequence`; see
+/// `analysis::resource::token_growth_is_observed`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenGrowth {
+    pub profile: Box<CopiableValues>,
+    pub per_cycle_delta: u32,
 }
 
 /// CR 122.1: one object's per-cycle beneficial counter growth captured at accept, for
@@ -3902,8 +4161,10 @@ pub struct PendingChooseOneOf {
     pub branches: Vec<AbilityDefinition>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parent_targets: Vec<TargetRef>,
+    /// Boxed to keep the serializable resolution-frame enum compact. `Box` is
+    /// serde-transparent, so suspended-game wire payloads remain unchanged.
     #[serde(default)]
-    pub context: super::ability::SpellContext,
+    pub context: Box<super::ability::SpellContext>,
     /// CR 608.2c: Runtime tail retained until the final queued chooser selects
     /// a branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3952,14 +4213,62 @@ pub struct PendingPerPlayerZoneChoice {
 /// surfaced immediately as `WaitingFor::EffectZoneChoice`; remaining owner
 /// batches drain after each batch completes.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MassLibraryOrderMember {
+    /// The exact object incarnation that was selected for this ordered move.
+    pub identity: ObjectIncarnationRef,
+    /// The zone this member occupied when the mass move created the prompt.
+    pub origin: Zone,
+}
+
+/// One owner's exact members of a mass library-order instruction.
+/// The identity and origin are frozen at prompt creation so a later object with
+/// the same id cannot satisfy an in-flight ordering choice.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MassLibraryOrderBatch {
+    pub owner: PlayerId,
+    pub members: Vec<MassLibraryOrderMember>,
+}
+
+/// Remaining batches of an in-flight mass library order.
+///
+/// The untagged wire preserves the historical tuple-array representation,
+/// while the enum makes its provenance state mutually exclusive at runtime.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PendingMassLibraryOrderBatches {
+    /// Current saves carry exact member identity and origin for every batch.
+    Typed(Vec<MassLibraryOrderBatch>),
+    /// Pre-identity archives carried only `(owner, object_ids)` tuples. These
+    /// may authorize only the narrow migration path before their successor is
+    /// promoted to a typed prompt.
+    Legacy(Vec<(PlayerId, Vec<ObjectId>)>),
+}
+
+impl Default for PendingMassLibraryOrderBatches {
+    fn default() -> Self {
+        Self::Typed(Vec::new())
+    }
+}
+
+impl PendingMassLibraryOrderBatches {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Typed(batches) => batches.is_empty(),
+            Self::Legacy(batches) => batches.is_empty(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingMassLibraryOrderChoice {
     pub source_id: ObjectId,
     pub library_position: crate::types::ability::LibraryPosition,
     pub track_exiled_by_source: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration: Option<crate::types::ability::Duration>,
-    /// Remaining (owner, cards) batches in APNAP order after the current prompt.
-    pub remaining_batches: Vec<(PlayerId, Vec<ObjectId>)>,
+    /// Remaining owner batches in APNAP order after the current prompt.
+    #[serde(default)]
+    pub remaining_batches: PendingMassLibraryOrderBatches,
 }
 
 /// CR 101.4: If players make choices for one instruction, they choose in
@@ -3985,6 +4294,26 @@ pub struct PendingPlayerScopeSacrificeChoice {
     /// continuation can run.
     #[serde(default)]
     pub completion: PendingPlayerScopeSacrificeCompletion,
+}
+
+/// CR 101.4 + CR 118.12a + CR 111.2: An APNAP poll for a player-scoped
+/// token instruction whose declining players receive one aggregate token
+/// creation after every payer has answered. Kept independently of the current
+/// `UnlessPayment`/`WardSacrificeChoice`, which represent only one seat's
+/// decision and may be replaced mid-payment.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PendingPlayerScopeUnlessPayment {
+    /// The unscoped token instruction to resolve exactly once at the terminal
+    /// poll boundary. Its count is replaced with the number of decliners.
+    pub pending_effect: Box<ResolvedAbility>,
+    /// Seats still to answer in APNAP order.
+    pub remaining_players: Vec<PlayerId>,
+    /// Seats that declined the sacrifice payment.
+    pub declining_players: Vec<PlayerId>,
+    /// The seat whose `UnlessPayment` or `WardSacrificeChoice` is live.
+    pub current_player: PlayerId,
+    /// The typed sacrifice cost is retained to re-emit the next existing prompt.
+    pub cost: AbilityCost,
 }
 
 /// CR 101.4 + CR 701.21a: Accumulated terminal state for a simultaneous
@@ -4226,10 +4555,7 @@ pub struct PendingDiscardFanOut {
     /// CR 607.2a: carried across the pause so the terminal publication makes the
     /// same linked-exile decision the un-paused postlude would.
     ///
-    /// ORDERING NOTE for the driver's hand-off (`resolve_chain_body`), recorded
-    /// here rather than at the call site so the CR 603.5 prompt-census pin in
-    /// `engine.rs` — which pins a line coordinate in `effects/mod.rs` BELOW that
-    /// call site — does not have to be re-derived for a comment. The hand-off is
+    /// ORDERING NOTE for the driver's hand-off (`resolve_chain_body`). The hand-off is
     /// placed AFTER `mark_exile_choice_tracks_by_source` so the batch pause route
     /// keeps the exact side-effect the ordinary per-seat leg route already had;
     /// placing it before would make the two pause routes for one clause diverge.
@@ -4925,25 +5251,100 @@ pub struct PendingCounterMoveQueue {
 /// drained one `(counter_type, count)` at a time by
 /// `effects::counters::drain_pending_counter_removals`, which re-parks the queue
 /// when a per-removal replacement surfaces a `ReplacementChoice` mid-batch. When
-/// the queue empties, `total` is stamped into `last_effect_count` so a downstream
+/// the queue empties, `applied_total` is stamped into `last_effect_count` so a downstream
 /// "create that many" / "add that much" rider (Tetravus, storage lands) reading
 /// `QuantityRef::EventContextAmount` picks up the count removed.
 ///
 /// Serialized in the `CounterRemovals` frame so a mid-batch re-park survives the
 /// server→client→server state round-trip a `ReplacementChoice` requires.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingCounterRemoval {
+    pub object_id: ObjectId,
+    pub counter_type: CounterType,
+    pub count: u32,
+}
+
+/// A removal awaiting its replacement-pipeline result. The pre-removal count
+/// lets the queue record the actual clamped or replacement-modified removal
+/// when a `ReplacementChoice` resumes the parked queue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingCounterRemovalInFlight {
+    pub removal: PendingCounterRemoval,
+    pub counter_count_before: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PendingCounterRemovalQueue {
-    /// Remaining per-type removals to apply to `source_id`.
-    pub remaining: Vec<(CounterType, u32)>,
-    /// The object counters are removed from (the effect's single source).
-    pub source_id: ObjectId,
+    /// Remaining per-object counter removals.
+    pub remaining: Vec<PendingCounterRemoval>,
     /// Effect kind for the terminating `EffectResolved` event.
     pub effect_kind: EffectKind,
     /// Ability source object for the terminating `EffectResolved` event.
     pub source_ability_id: ObjectId,
-    /// Total counters requested across all entries; stamped into
-    /// `last_effect_count` when the queue empties.
+    /// Total counters requested across all entries. Retained for diagnostics and
+    /// legacy wire compatibility; use `applied_total` for effect result context.
     pub total: u32,
+    /// Counters actually removed so far, after clamping and replacements.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub applied_total: u32,
+    /// A removal whose replacement pipeline has not settled yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_flight: Option<PendingCounterRemovalInFlight>,
+}
+
+#[derive(Deserialize)]
+struct PendingCounterRemovalQueueWire {
+    remaining: Vec<PendingCounterRemovalWire>,
+    #[serde(default)]
+    source_id: Option<ObjectId>,
+    effect_kind: EffectKind,
+    source_ability_id: ObjectId,
+    total: u32,
+    #[serde(default)]
+    applied_total: u32,
+    #[serde(default)]
+    in_flight: Option<PendingCounterRemovalInFlight>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PendingCounterRemovalWire {
+    Current(PendingCounterRemoval),
+    Legacy((CounterType, u32)),
+}
+
+/// CR 122.1 + CR 614.1: Accept the legacy single-source queue on the wire
+/// while persisting new multi-object removals with their object per entry.
+impl<'de> Deserialize<'de> for PendingCounterRemovalQueue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PendingCounterRemovalQueueWire::deserialize(deserializer)?;
+        let remaining = wire
+            .remaining
+            .into_iter()
+            .map(|entry| match entry {
+                PendingCounterRemovalWire::Current(entry) => Ok(entry),
+                PendingCounterRemovalWire::Legacy((counter_type, count)) => wire
+                    .source_id
+                    .map(|object_id| PendingCounterRemoval {
+                        object_id,
+                        counter_type,
+                        count,
+                    })
+                    .ok_or_else(|| serde::de::Error::missing_field("source_id")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            remaining,
+            effect_kind: wire.effect_kind,
+            source_ability_id: wire.source_ability_id,
+            total: wire.total,
+            applied_total: wire.applied_total,
+            in_flight: wire.in_flight,
+        })
+    }
 }
 
 /// CR 603.10a + CR 616.1: The not-yet-delivered tail of a simultaneous
@@ -5124,6 +5525,195 @@ pub struct CloakExileMember {
     pub attachments: Vec<ObjectId>,
 }
 
+/// CR 614.1 + CR 616.1 + CR 400.7: The settled subset of a Dig's chosen cards.
+/// The choice itself is not an outcome: replacements may redirect or prevent
+/// individual zone changes, so downstream "this way" instructions consume only
+/// selected incarnations that arrived at the requested destination.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DigKeptDeliveryOutcome {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected: Vec<ObjectIncarnationRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed: Vec<ObjectIncarnationRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<Zone>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub settled: bool,
+}
+
+impl DigKeptDeliveryOutcome {
+    pub fn pending(state: &GameState, selected: Vec<ObjectId>, destination: Zone) -> Self {
+        Self {
+            selected: selected
+                .into_iter()
+                .filter_map(|id| {
+                    state
+                        .objects
+                        .get(&id)
+                        .map(ObjectIncarnationRef::from_object)
+                })
+                .collect(),
+            completed: Vec::new(),
+            destination: Some(destination),
+            settled: false,
+        }
+    }
+
+    /// CR 614.1 + CR 616.1 + CR 400.7: Records only selected incarnations whose
+    /// final, settled zone is the requested destination after replacements.
+    pub fn settle_from_logical_group(&mut self, state: &GameState, group: &LogicalZoneChangeGroup) {
+        let Some(destination) = self.destination.filter(|_| !self.settled) else {
+            return;
+        };
+        let moved: BTreeSet<_> = group
+            .all_origin_occurrences
+            .iter()
+            .filter_map(|occurrence| match &occurrence.event {
+                // A replacement can leave an intermediate `ZoneChanged` event
+                // behind while ultimately redirecting the card elsewhere. The
+                // settled object's current zone is therefore the authority for
+                // the requested-destination arrival, not that intermediate
+                // event alone.
+                GameEvent::ZoneChanged { object_id, to, .. }
+                    if *to == destination
+                        && state
+                            .objects
+                            .get(object_id)
+                            .is_some_and(|object| object.zone == destination) =>
+                {
+                    Some(*object_id)
+                }
+                _ => None,
+            })
+            .collect();
+        self.completed = self
+            .selected
+            .iter()
+            .copied()
+            .filter(|identity| moved.contains(&identity.object_id))
+            .collect();
+        self.settled = true;
+    }
+
+    pub fn selected_ids(&self) -> Vec<ObjectId> {
+        self.selected
+            .iter()
+            .map(|identity| identity.object_id)
+            .collect()
+    }
+
+    pub fn completed_ids(&self) -> Vec<ObjectId> {
+        self.completed
+            .iter()
+            .map(|identity| identity.object_id)
+            .collect()
+    }
+}
+
+/// The settled subset of a Dig's unkept rest pile. This is deliberately
+/// independent from [`DigKeptDeliveryOutcome`]: the two zone-change groups can
+/// settle at different times and replacements can redirect either group.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DigRestDeliveryOutcome {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected: Vec<ObjectIncarnationRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed: Vec<ObjectIncarnationRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<Zone>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub settled: bool,
+}
+
+impl DigRestDeliveryOutcome {
+    pub fn pending(state: &GameState, selected: Vec<ObjectId>, destination: Zone) -> Self {
+        Self {
+            selected: selected
+                .into_iter()
+                .filter_map(|id| {
+                    state
+                        .objects
+                        .get(&id)
+                        .map(ObjectIncarnationRef::from_object)
+                })
+                .collect(),
+            completed: Vec::new(),
+            destination: Some(destination),
+            settled: false,
+        }
+    }
+
+    pub fn settle_from_logical_group(&mut self, state: &GameState, group: &LogicalZoneChangeGroup) {
+        let Some(destination) = self.destination.filter(|_| !self.settled) else {
+            return;
+        };
+        let moved: BTreeSet<_> = group
+            .all_origin_occurrences
+            .iter()
+            .filter_map(|occurrence| match &occurrence.event {
+                GameEvent::ZoneChanged { object_id, to, .. }
+                    if *to == destination
+                        && state
+                            .objects
+                            .get(object_id)
+                            .is_some_and(|object| object.zone == destination) =>
+                {
+                    Some(*object_id)
+                }
+                _ => None,
+            })
+            .collect();
+        self.completed = self
+            .selected
+            .iter()
+            .copied()
+            .filter(|identity| moved.contains(&identity.object_id))
+            .collect();
+        self.settled = true;
+    }
+
+    pub fn completed_ids(&self) -> Vec<ObjectId> {
+        self.completed
+            .iter()
+            .map(|identity| identity.object_id)
+            .collect()
+    }
+}
+
+/// Identifies which half of a Dig is settling through a shared rest-pile
+/// completion. A kept delivery can pause before the rest-pile routing begins,
+/// while each half needs its own settled-object outcome.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DigDeliveryStage {
+    Kept,
+    #[default]
+    Rest,
+}
+
+/// CR 614.1 + CR 616.1 + CR 400.7: Stamp a Dig delivery completion with its
+/// exact settled destination arrivals. Only the zone pipeline owns a complete
+/// logical group, so this is the single seam where a selected pile becomes an
+/// actual delivery outcome.
+pub(crate) fn settle_dig_delivery_outcome(
+    completion: &mut BatchCompletion,
+    state: &GameState,
+    group: &LogicalZoneChangeGroup,
+) {
+    match completion {
+        BatchCompletion::RevealRestPile {
+            delivery_stage: DigDeliveryStage::Kept,
+            kept_delivery,
+            ..
+        } => kept_delivery.settle_from_logical_group(state, group),
+        BatchCompletion::RevealRestPile {
+            delivery_stage: DigDeliveryStage::Rest,
+            rest_delivery,
+            ..
+        } => rest_delivery.settle_from_logical_group(state, group),
+        _ => {}
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BatchCompletion {
     /// CR 303.4g + CR 614.1 + CR 616.1: A return-as-Aura host had no legal
@@ -5262,20 +5852,6 @@ pub enum BatchCompletion {
         /// Normalized placement requested by the original instruction.
         library_position: LibraryPosition,
     },
-    /// CR 614.1 + CR 616.1 + CR 608.2c: A Dig kept-card batch settled outside
-    /// the battlefield. Its rest routing, tracked-set publication, and
-    /// continuation drain must follow the delivery, while the published set and
-    /// parent-target continuation set remain independently typed.
-    DigKeptDeliveryComplete {
-        player: PlayerId,
-        source_id: Option<ObjectId>,
-        rest_cards: Vec<ObjectId>,
-        rest_destination: Zone,
-        #[serde(default)]
-        rest_order: DigRestOrder,
-        publish_tracked_set: Vec<ObjectId>,
-        continuation_targets: Vec<ObjectId>,
-    },
     /// CR 701.13a + CR 614.1 + CR 616.1: A per-category exile member has
     /// settled, so its tracked-set extension and next-member prompt can run.
     ForEachCategoryExileComplete {
@@ -5300,6 +5876,18 @@ pub enum BatchCompletion {
     SurveilKeepOnTop {
         player: PlayerId,
         top_cards: Vec<ObjectId>,
+        /// CR 608.2c + CR 701.25a: the looked-at cards the surveil choice put
+        /// into the graveyard (everything NOT in `top_cards`) — published to
+        /// `state.last_zone_changed_ids` before the paused ability chain
+        /// resumes, so a "this way" rider on the surveil (Chandra, Chill of
+        /// Compliance: "If you put a noncreature, nonland card into your
+        /// graveyard this way, put that card into your hand") can check
+        /// whether one of them actually arrived there. Defaults to empty on
+        /// deserialize of an older save so a stale record degrades to "the
+        /// gate never fires" rather than a panic — never worse than the
+        /// pre-fix behavior.
+        #[serde(default)]
+        graveyard_bound: Vec<ObjectId>,
     },
     /// Manifest dread: after the non-manifested cards reach the graveyard, clear
     /// the reveal markers on every looked-at card.
@@ -5313,6 +5901,10 @@ pub enum BatchCompletion {
     /// runs exactly once after the kept delivery settles — otherwise the rest
     /// cards strand in the library (the early-`return` bug).
     RevealRestPile {
+        /// A Dig first carries the kept delivery through this completion, then
+        /// changes to `Rest` before it routes the deferred unkept pile.
+        #[serde(default)]
+        delivery_stage: DigDeliveryStage,
         /// The player whose continuation drains after the pile lands.
         player: PlayerId,
         /// CR 400.7: The resolving effect's source, preserved so any rest-pile
@@ -5332,17 +5924,29 @@ pub enum BatchCompletion {
         /// CR 701.20b: reveal markers to clear once the cards have moved (the
         /// kept card plus the misses).
         clear_markers: Vec<ObjectId>,
-        /// Dig only: `Some(kept)` publishes the kept cards as a fresh tracked set
-        /// and wires them as the continuation's targets (Zimone's Experiment
-        /// class). `None` for reveal-until, which has no tracked-set sub-ability.
+        /// Dig only: `Some(ids)` publishes `ids` as a fresh tracked set and wires
+        /// them as the continuation's targets (Zimone's Experiment class, and —
+        /// paired with `publish_tracked_set_cause` — a downstream count of the
+        /// REST partition, Dihada, Binder of Wills class). `None` for
+        /// reveal-until, which has no tracked-set sub-ability.
         publish_tracked_set: Option<Vec<ObjectId>>,
+        /// CR 608.2c + CR 400.7: when `publish_tracked_set` carries the REST
+        /// (non-selected) partition instead of the default kept partition —
+        /// decided by `dig_continuation_wants_rest_pile_for_count` — every
+        /// published member is stamped with this cause so a downstream
+        /// `QuantityRef::FilteredTrackedSetSize { caused_by: Some(cause), .. }`
+        /// (Dihada's Treasure-per-card-in-graveyard count) can find them.
+        /// `None` for every other publish, including the unchanged
+        /// Zimone's-Experiment-class kept-partition default.
+        #[serde(default)]
+        publish_tracked_set_cause: Option<ThisWayCause>,
         /// `Some(source_id)` emits `EffectResolved { RevealUntil, source_id }`
         /// before draining the continuation — the direct `reveal_until::resolve`
         /// path (no kept-choice) emits it inline at the end, so the deferred path
         /// must too. `None` for the kept-choice / dig paths, which emit their own
         /// `EffectResolved` before the pause (or rely on the continuation).
         emit_reveal_until_resolved: Option<ObjectId>,
-        /// CR 608.2c + CR 701.62a (#7467): a paused manifest-dread entry's
+        /// CR 608.2c + CR 701.62a: a paused manifest-dread entry's
         /// chosen object. The completion drain publishes it as the chain's
         /// fresh tracked set — only once the entry has actually finished
         /// (battlefield gate) and right before the parked consumer drains —
@@ -5352,6 +5956,20 @@ pub enum BatchCompletion {
         /// pile. `None` for every non-manifest rest pile.
         #[serde(default)]
         manifested_for_continuation: Option<ObjectId>,
+        /// Dig's selected-delivery carrier, retained when a battlefield entry
+        /// re-parks the rest-pile completion. Empty for non-Dig callers.
+        #[serde(default)]
+        kept_delivery: DigKeptDeliveryOutcome,
+        /// Dig's ParentTarget continuation inputs. They stay separate from the
+        /// publish set because the latter can intentionally address the rest
+        /// pile while ParentTarget still refers to the kept delivery.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        continuation_targets: Vec<ObjectId>,
+        /// The exact unkept rest identities that completed their requested
+        /// delivery. It is separate from the kept delivery because its logical
+        /// zone-change group can settle later, after a replacement-choice park.
+        #[serde(default)]
+        rest_delivery: DigRestDeliveryOutcome,
     },
     /// CR 608.2c + CR 616.1: The rest half of a deterministic mass Dig settled
     /// after a replacement choice. Resume its selected-card delivery only now,
@@ -5473,6 +6091,19 @@ pub enum BatchCompletion {
     /// second physical card has completed its independently replaceable move,
     /// carrying the originating event's applied-set through every pause.
     MeldRedirect { source_id: ObjectId },
+    /// CR 701.17a + CR 603.2c + CR 616.1: a mill batch settled. One `Milled`
+    /// event is emitted per card that actually left the library, after the whole
+    /// batch has been delivered. A CR 616.1 per-card ordering choice parks the
+    /// undelivered tail and the resume path drains it with a fresh event vector,
+    /// so no single synchronous event window spans the pause — the milling
+    /// context has to ride the batch instead.
+    MilledDeliveryComplete {
+        player_id: PlayerId,
+        /// The cards this instruction asked to mill. Each is emitted only if it
+        /// actually departed the library, so the set is a candidate list rather
+        /// than a result.
+        cards: Vec<ObjectId>,
+    },
 }
 
 /// CR 603.3b + CR 608.2g: terminal settlement that must wait until the
@@ -5870,8 +6501,7 @@ pub enum ZoneDeliveryExileTracking {
 }
 
 /// CR 614.12a + CR 616.1: Which layer drains `post_replacement_continuation`
-/// after a post-replacement zone delivery (Phase-B divergence reconciliation,
-/// PLAN §7). The replacement-choice resume path historically drained the
+/// after a post-replacement zone delivery. The replacement-choice resume path drained the
 /// continuation in its own epilogue — WITH the spell-resolution ctx and with
 /// `post_replacement_source` cleared for zone changes — while the shared
 /// delivery tail drains it ctx-less without the clear. Parameterizing the tail
@@ -5962,7 +6592,7 @@ pub struct DelayedTrigger {
     /// Source permanent that created this delayed trigger.
     pub source_id: ObjectId,
     /// Whether this trigger fires once and is removed (most delayed triggers).
-    /// CR 603.7c.
+    /// CR 603.7b.
     pub one_shot: bool,
     /// Private command-backed installation identity. Legacy delayed triggers
     /// continue through the normal rules lifecycle without receipt or
@@ -6497,11 +7127,18 @@ pub struct ManaAbilityCostCursor {
 /// replacement-paused sacrifice cost. Selected sacrifices remove their
 /// activation-cost component; a SelfRef sacrifice resumes the automatic
 /// additional-cost path without replaying the sacrifice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PendingSacrificeCostCompletion {
     SelectedNonSelf,
     SelfRef,
+    /// CR 118.3 + CR 118.11-12: a resolving optional PayCost branch owns its
+    /// substituted root and exact selected incarnations until every sacrifice
+    /// has reached a terminal replacement outcome.
+    ResolutionOptionalPayment {
+        frame: Box<OptionalEffectFrame>,
+        selected: Vec<ObjectIncarnationRef>,
+    },
 }
 
 /// CR 702.21a + CR 701.21 + CR 616.1: The unpaid work after one ward sacrifice
@@ -6553,7 +7190,10 @@ pub enum PendingCostMoveResume {
     },
     SacrificeForCost {
         player: PlayerId,
-        pending: Box<PendingCast>,
+        /// Cast/activation payments retain their announcement. Resolution-time
+        /// optional payments instead carry their typed tail in `completion`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending: Option<Box<PendingCast>>,
         chosen: Vec<ObjectId>,
         /// Index into `chosen` whose sacrifice completes or is prevented by
         /// the replacement action. Resumption continues at the next index.
@@ -6643,9 +7283,16 @@ pub enum PendingCostMoveResume {
     },
     /// CR 118.12 + CR 122.1 + CR 616.1: A counter-addition unless-cost paused
     /// on a replacement choice. Covers Ward's player-counter payment and the
-    /// source-counter `EffectCost` used by cumulative upkeep. Retains the full
-    /// `WaitingFor::UnlessPayment` payload so Applied completes payment and a
-    /// prevented placement fails it instead of orphaning the pending ability.
+    /// source-counter `EffectCost` used by cumulative upkeep. The resume reads
+    /// `pending_effect` and `trigger_event` to settle the parked payment
+    /// instead of orphaning the pending ability; `cost`, `effect_description`
+    /// and `remaining` complete the serialized checkpoint payload and are read
+    /// on no resume path. CR 118.12: BOTH replacement
+    /// outcomes complete the payment — the "if they don't" clause checks whether
+    /// the player chose to pay, "regardless of what events actually occurred",
+    /// and this record's mere existence IS that choice (it is constructed only
+    /// on the `pay = true` path). The mapping is argued at its consumer,
+    /// `engine_payment_choices::resume_counter_addition_unless_payment`.
     #[serde(alias = "GetPlayerCountersUnlessPayment")]
     CounterAdditionUnlessPayment {
         #[serde(deserialize_with = "crate::types::ability::deserialize_ability_cost_compat")]
@@ -7706,6 +8353,23 @@ pub enum OutsideGameChoiceSource {
     },
     /// CR 406.3: A face-up card the player owns in the exile zone.
     FaceUpExile { object_id: ObjectId },
+    /// CR 400.11 + CR 400.11b: A card in a booster pack `Effect::OpenBoosterPack`
+    /// just opened. The pack's cards are outside the game and in no zone, so —
+    /// like `Sideboard` — the entry carries the full `CardFace` the taken card
+    /// is built from, plus the set the pack came from for display. `pack_slot`
+    /// is the card's position in the opened pack and its only stable identity.
+    BoosterPack {
+        pack_slot: usize,
+        set_code: String,
+        /// Boxed, unlike `Sideboard`'s inline face: `WaitingFor` is stored
+        /// inline in `GameState`, which `phase-server` moves BY VALUE through
+        /// the action + AI path, so this enum's largest variant is multiplied by
+        /// every live `GameState` on a frame chain (see `types/game_state_size.rs`
+        /// and the `game_state_stack_budget` regression). `Sideboard` already
+        /// sets that ceiling; adding a set code beside a second inline face
+        /// would raise it.
+        card: Box<crate::types::card::CardFace>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7720,6 +8384,47 @@ pub struct OutsideGameChoiceEntry {
 
 fn default_one_u32() -> u32 {
     1
+}
+
+/// CR 400.11: the sealed booster products a game can open packs from.
+///
+/// A "shelf" rather than the whole printed corpus: hydrating every set's faces
+/// would clone the entire card database into game state. Instead
+/// `game::boosters::build_shelf` stocks a small, deterministic sample of sets,
+/// and each `Effect::OpenBoosterPack` resolution opens a freshly collated pack
+/// from one of them — so the number of packs a game can open is unbounded while
+/// the resident cost stays proportional to the shelf, not to the corpus.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BoosterShelf {
+    /// Products in deterministic order. Empty when no card in the game opens
+    /// booster packs, or when the loaded card database carries no set that can
+    /// fill a pack.
+    pub products: Vec<BoosterProduct>,
+}
+
+impl BoosterShelf {
+    pub fn is_empty(&self) -> bool {
+        self.products.is_empty()
+    }
+}
+
+/// One set on the [`BoosterShelf`], with its cards bucketed by the pack slot
+/// they can fill. Buckets hold full `CardFace`s because a card taken out of the
+/// pack becomes a real card in the game (CR 400.11b) and there is no card
+/// database at resolution time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BoosterProduct {
+    /// MTGJSON set code, shown to the player as the pack's identity.
+    pub set_code: String,
+    /// Cards printed at common in this set (the ten-card commons run).
+    pub commons: Vec<CardFace>,
+    /// Cards printed at uncommon in this set (three-card run).
+    pub uncommons: Vec<CardFace>,
+    /// Cards printed at rare in this set (the rare slot).
+    pub rares: Vec<CardFace>,
+    /// Cards printed at mythic rare in this set. The rare slot upgrades to a
+    /// mythic at the printed rate when this bucket is non-empty.
+    pub mythics: Vec<CardFace>,
 }
 
 /// CR 103.6: A beginning-of-game ability waiting to resolve after mulligans.
@@ -7807,6 +8512,33 @@ pub struct ReplacementCandidateSummary {
     pub source_id: ObjectId,
     pub source_name: String,
     pub description: String,
+}
+
+/// CR 616.1: Which *kind* of decision a [`WaitingFor::ReplacementChoice`] asks
+/// for. One `WaitingFor` variant serves three structurally different prompts,
+/// and the display layer cannot tell them apart from the candidate list alone
+/// (an accept/decline pair and a two-effect ordering prompt are both "two
+/// candidates"). The engine owns the distinction; the frontend must never
+/// re-derive it by inspecting label text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "type")]
+pub enum ReplacementChoiceKind {
+    /// CR 616.1e: two or more *distinct* applicable replacements whose order is
+    /// material. The player arranges them; per CR 616.1f the engine applies the
+    /// selected one and re-prompts for whatever is still applicable, so the
+    /// effect applied LAST is the one whose write survives.
+    #[default]
+    Order,
+    /// A single optional ("you may") replacement surfaced as two branches of
+    /// one source — index 0 accepts, index 1 declines. This is an engine
+    /// presentation shape, not a CR-numbered category: the yes/no decision
+    /// belongs to whoever the effect's own text gives it to. It is NOT an
+    /// ordering and must never render as a sortable list.
+    OptionalBranch,
+    /// A choice between destinations for a found card. Like `OptionalBranch`
+    /// this is an engine presentation shape: the options are mutually exclusive
+    /// alternatives rather than a sequence, so it renders as plain options.
+    SearchFoundDestination,
 }
 
 /// CR 603.3b + CR 603.7: One completed normal-plus-delayed trigger collection
@@ -8067,7 +8799,7 @@ pub enum AlternativeCastKeyword {
     /// Custom Warp keyword — exile-at-end-step rider; no CR section.
     Warp,
     /// CR 702.74a: ETB + sacrifice trigger fires when the resolving permanent
-    /// was cast for its evoke cost (CR 702.74b).
+    /// was cast for its evoke cost.
     Evoke,
     /// CR 702.119a-c: Emerge alternative cost requires sacrificing the specified
     /// permanent quality while casting and reduces the emerge cost by that
@@ -8193,19 +8925,24 @@ pub enum PayCostKind {
         #[serde(default)]
         selection: CounterCostSelection,
     },
-    /// CR 601.2b: Tap creatures as a cost. `aggregate` distinguishes the two
-    /// `TapCreaturesRequirement` shapes at the interactive payment layer: `None`
-    /// is the fixed-count form (player taps exactly `WaitingFor::PayCost` `count`
-    /// creatures; Conspire/Convoke), while `Some(aggregate)` is the aggregate
-    /// "tap any number satisfying the constraint" form (Crew CR 702.122a / Saddle
-    /// CR 702.171a / Teamwork) — the chosen set may be any size whose total
-    /// positive power (CR 208.1) satisfies `aggregate`'s comparator vs its value.
-    /// Carrying the full `TapCreaturesAggregate` (not just a threshold int) keeps
-    /// the payment validator honoring the advertised comparator instead of
-    /// hard-coding `>=`.
+    /// CR 601.2b: Tap creatures as a cost. `mode` is the single authority for
+    /// which of the three `TapCreaturesRequirement` selection semantics this
+    /// payment carries (CR 107.3a + CR 208.1), computed once at registration
+    /// time via `TapCreaturesRequirement::selection_mode`: `Fixed` is the
+    /// fixed-count form (player taps exactly `WaitingFor::PayCost` `count`
+    /// creatures; Conspire/Convoke), `VariableX` is the "Tap X untapped … you
+    /// control" X-sentinel form whose chosen count *defines* the ability's X,
+    /// and `Aggregate(aggregate)` is the "tap any number satisfying the
+    /// constraint" form (Crew CR 702.122a / Saddle CR 702.171a / Teamwork
+    /// CR 702.194a) — the chosen set may be any size whose total positive power
+    /// (CR 208.1) satisfies `aggregate`'s comparator vs its value. Carrying the
+    /// full `TapCreaturesAggregate` inside the variant (not just a threshold
+    /// int) keeps the payment validator honoring the advertised comparator
+    /// instead of hard-coding `>=`; carrying the mode rather than an
+    /// `Option<TapCreaturesAggregate>` keeps `Fixed` and `VariableX` from
+    /// collapsing into one indistinguishable `None`.
     TapCreatures {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        aggregate: Option<TapCreaturesAggregate>,
+        mode: TapCreaturesSelectionMode,
     },
     Behold {
         action: BeholdCostAction,
@@ -8326,7 +9063,10 @@ pub enum CastOfferKind {
     /// mana cost, or decline. `hit_card` is the matching revealed card being
     /// offered, `remaining_hits` are other same-named cards from the same reveal
     /// still eligible to cast, and `revealed_misses` are revealed cards that
-    /// cannot be cast this way.
+    /// cannot be cast this way. CR 701.20b: every id here names a card that is
+    /// still in the controller's library (the reveal does not move them); the
+    /// hit is cast from the library and the misses are placed on the bottom
+    /// once the offers are exhausted.
     Ripple {
         hit_card: ObjectId,
         remaining_hits: Vec<ObjectId>,
@@ -8338,17 +9078,24 @@ pub enum CastOfferKind {
     /// CR 608.2g + CR 601.2 + CR 118.9: Interactive free-cast window opened by
     /// `Effect::FreeCastFromZones` (Invoke Calamity). The controller repeatedly
     /// chooses one `candidate` to cast for free (or declines to finish), up to
-    /// `remaining_casts` times, while the chosen spells' running total mana
-    /// value stays within `remaining_mv_budget`. After each successful cast the
-    /// window is re-offered with `remaining_casts` decremented, the budget
-    /// reduced, and `candidates` re-filtered to those still affordable.
+    /// `remaining_casts` times — or without a cast limit at all when
+    /// `remaining_casts` is `None` (the printed "any number of spells") — while the
+    /// chosen spells' running total mana value stays within
+    /// `remaining_mv_budget`. After each successful cast the window is
+    /// re-offered with `remaining_casts` decremented (a `None` bound stays
+    /// `None`), the budget reduced, and `candidates` re-filtered to those still
+    /// affordable.
     FreeCastWindow {
         /// CR 601.2a: Instant/sorcery cards (in the controller's graveyard
         /// and/or hand) that match the effect's filter and still fit the
         /// remaining MV budget.
         candidates: Vec<ObjectId>,
-        /// CR 601.2: Casts still available in this window.
-        remaining_casts: u8,
+        /// CR 608.2c: Casts still available in this window, or `None` for the
+        /// unbounded "any number of spells" form. Same encoding as
+        /// `Effect::FreeCastFromZones::count`; the candidate list is then the
+        /// only bound, which is what the printed instruction states.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remaining_casts: Option<u8>,
         /// CR 202.3: Running-total mana-value budget remaining, or `None` for
         /// no MV cap.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -10489,6 +11236,127 @@ fn migrate_legacy_turn_face_up_resume(value: &mut serde_json::Value) -> Result<(
     Ok(())
 }
 
+/// Protocol 36 / P2P 27: `WaitingFor::ChooseDungeon` carried `options: Vec<DungeonId>` and
+/// `WaitingFor::ChooseDungeonRoom` carried `options: Vec<u8>` plus `option_names: Vec<String>`
+/// before each option grew the room's printed name and room-ability text (CR 309.4b-c), so a save
+/// paused at either prompt cannot deserialize into the current shape.
+///
+/// This migrates rather than rejects because the migration is TOTAL: the legacy scalars are
+/// exactly the keys into the static dungeon table. A `DungeonId` resolves its own topmost room
+/// (CR 309.4a) and a room index resolves that room's name and text, so the rebuilt preview equals
+/// what the engine emits at that position; `option_names` is dropped because `RoomPreview::name`
+/// carries it from the same authority. Rebuilt through `dungeon::dungeon_preview` /
+/// `dungeon::room_preview` rather than hand-written JSON, so it cannot drift from the shape the
+/// prompts emit. Idempotent: legacy options are scalars and current ones are objects, so a re-run
+/// matches nothing. An unknown `DungeonId` is a hard error — corrupt state, not a migratable
+/// shape.
+fn migrate_legacy_dungeon_choice_previews(value: &mut serde_json::Value) -> Result<(), String> {
+    use crate::game::dungeon::{dungeon_preview, room_preview, DungeonId};
+    use std::str::FromStr;
+
+    fn parse_dungeon(value: &serde_json::Value, field: &str) -> Result<DungeonId, String> {
+        let name = value
+            .as_str()
+            .ok_or_else(|| format!("legacy dungeon prompt {field} must be a string"))?;
+        DungeonId::from_str(name)
+            .map_err(|_| format!("legacy dungeon prompt {field} names an unknown dungeon: {name}"))
+    }
+
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                migrate_legacy_dungeon_choice_previews(value)?;
+            }
+        }
+        serde_json::Value::Object(object) => {
+            let variant = object.get("type").and_then(serde_json::Value::as_str);
+            match variant {
+                Some("ChooseDungeon") => {
+                    if let Some(data) = object.get_mut("data").and_then(|d| d.as_object_mut()) {
+                        let is_legacy = data
+                            .get("options")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|options| {
+                                options.iter().any(serde_json::Value::is_string)
+                            });
+                        if is_legacy {
+                            let options = data
+                                .get("options")
+                                .and_then(serde_json::Value::as_array)
+                                .expect("checked above")
+                                .clone();
+                            let previews = options
+                                .iter()
+                                .map(|option| {
+                                    let id = parse_dungeon(option, "options entry")?;
+                                    serde_json::to_value(dungeon_preview(id))
+                                        .map_err(|error| error.to_string())
+                                })
+                                .collect::<Result<Vec<_>, String>>()?;
+                            data.insert("options".to_string(), serde_json::Value::Array(previews));
+                        }
+                    }
+                }
+                Some("ChooseDungeonRoom") => {
+                    if let Some(data) = object.get_mut("data").and_then(|d| d.as_object_mut()) {
+                        let is_legacy = data
+                            .get("options")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|options| {
+                                options.iter().any(serde_json::Value::is_number)
+                            })
+                            || data.contains_key("option_names");
+                        if is_legacy {
+                            let dungeon = parse_dungeon(
+                                data.get("dungeon").ok_or_else(|| {
+                                    "legacy ChooseDungeonRoom is missing dungeon".to_string()
+                                })?,
+                                "dungeon",
+                            )?;
+                            let options = data
+                                .get("options")
+                                .and_then(serde_json::Value::as_array)
+                                .ok_or_else(|| {
+                                    "legacy ChooseDungeonRoom options must be an array".to_string()
+                                })?
+                                .clone();
+                            let previews = options
+                                .iter()
+                                .map(|option| {
+                                    let index = option.as_u64().ok_or_else(|| {
+                                        "legacy ChooseDungeonRoom options entry must be a number"
+                                            .to_string()
+                                    })?;
+                                    let index = u8::try_from(index).map_err(|_| {
+                                        format!("legacy ChooseDungeonRoom room index {index} is out of range")
+                                    })?;
+                                    serde_json::to_value(room_preview(dungeon, index))
+                                        .map_err(|error| error.to_string())
+                                })
+                                .collect::<Result<Vec<_>, String>>()?;
+                            // `option_names` is superseded by `RoomPreview::name`.
+                            data.remove("option_names");
+                            data.insert(
+                                "dungeon_name".to_string(),
+                                serde_json::Value::from(
+                                    crate::game::dungeon::get_definition(dungeon).name,
+                                ),
+                            );
+                            data.insert("options".to_string(), serde_json::Value::Array(previews));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for value in object.values_mut() {
+                migrate_legacy_dungeon_choice_previews(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn delayed_trigger_install_command(
     entry: &serde_json::Value,
 ) -> Option<&serde_json::Map<String, serde_json::Value>> {
@@ -10669,6 +11537,53 @@ fn reject_zero_bound_shortcut_offer(state: &GameState) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuses a viewer projection presented as authoritative state.
+///
+/// A projection is not a damaged authority that could be repaired — it is a
+/// different kind of object. `filter_state_for_viewer` zeroes `rng_seed` and
+/// `rng_word_pos`, clears `resolved_rules_journal` and `product_knowledge_state`,
+/// and empties `resolution_stack`; none of that is reconstructible, so a
+/// "repair" could only fabricate rules authority. Refusing is the only sound
+/// answer. `RestoredStackAutomation::Repair` keeps its separate job: an
+/// authoritative state whose stack automation is incoherent.
+///
+/// THIS STRING IS PLAYER-VISIBLE COPY, not a log line. On the WASM restore
+/// route it is wrapped by these frames, innermost outward — named by SYMBOL
+/// rather than counted, because a frame count is exactly the claim that goes
+/// stale:
+///
+///   - `prepare_restored_game_state` (`crates/engine-wasm/src/lib.rs`) —
+///     `format!("Failed to deserialize GameState: {error}")`. A **Rust** frame.
+///   - `gameProvider.resumeReset.restoreFailed` —
+///     `"Could not restore saved game: {{error}}"`, interpolated from
+///     `err.message` by the resume `catch` in
+///     `client/src/providers/GameProvider.tsx`.
+///   - `gamePage.resumeReset.message` — `"{{reason}} A new game was started."`,
+///     rendered by `client/src/pages/GamePage.tsx` in a dismissible notice.
+///
+/// **That list is scoped to that route and is NOT asserted complete for any
+/// other.** Other ingests wrap differently (`GameSession::from_persisted` in
+/// server-core; the bare `impl Deserialize for GameState`), and the
+/// `TrustedEnvelope` arm adds two `serde::de::Error::custom` hops that add no
+/// text of their own.
+///
+/// So this sentence must read correctly BOTH standing alone (a future caller
+/// may drop the Rust prefix) and inside those frames: it must neither repeat
+/// "could not restore" nor announce that a new game is starting, because the
+/// two locale frames already say those. Write for a player; keep seat numbers
+/// and engine vocabulary out of it. The engine-wasm prefix contributes its own
+/// duplicated register and the noun `GameState`; that residue belongs to that
+/// frame, is knowingly accepted here, and is NOT a reason to reword this
+/// sentence — rewording it cannot remove either.
+fn reject_viewer_projection_as_authority(state: &GameState) -> Result<(), String> {
+    match state.viewer_projection {
+        None => Ok(()),
+        Some(_) => Err("This saved game only holds the view that was shown on \
+                        screen, not the full game record."
+            .to_string()),
+    }
+}
+
 impl Serialize for TrustedGameStateEnvelope {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -10738,6 +11653,39 @@ impl TrustedGameStateEnvelope {
 }
 
 impl GameState {
+    /// CR 616.1 load migration: re-derive `ReplacementChoice::kind` from the
+    /// live pending replacement.
+    ///
+    /// `kind` is `#[serde(default)]`, so a save written before the field existed
+    /// deserializes every parked prompt as `Order` — including an optional
+    /// "you may" accept/decline and a search-found destination pick. The
+    /// frontend keys its presentation off `kind`, so a restored legacy save
+    /// would render a sortable ordering list for a yes/no decision.
+    ///
+    /// `replacement_choice_waiting_for` is the single authority that classifies
+    /// a prompt from `pending_replacement`, so re-deriving through it keeps the
+    /// restored value identical to what a live park would have produced. With no
+    /// pending replacement there is nothing to classify and the prompt is left
+    /// untouched (it is already unactionable and handled by the count-0 guard).
+    fn migrate_restored_replacement_choice_kind(&mut self) {
+        let WaitingFor::ReplacementChoice { player, .. } = self.waiting_for else {
+            return;
+        };
+        if self.pending_replacement.is_none() {
+            return;
+        }
+        let rederived = crate::game::replacement::replacement_choice_waiting_for(player, self);
+        if let WaitingFor::ReplacementChoice { kind, .. } = rederived {
+            if let WaitingFor::ReplacementChoice {
+                kind: restored_kind,
+                ..
+            } = &mut self.waiting_for
+            {
+                *restored_kind = kind;
+            }
+        }
+    }
+
     /// CR 732.2a (FIX-3) load migration: `last_loop_action_sequence` is transient loop-detection
     /// bookkeeping that re-accumulates from live play. On restore, DROP it UNLESS the save was
     /// captured inside an object-growth shortcut proposal/response window
@@ -10811,6 +11759,34 @@ impl GameState {
         });
     }
 
+    /// CR 903.3 + CR 111.6 + CR 704.3 + CR 704.5d: a token cannot be the
+    /// commander card named by a command-zone return choice. Older snapshots
+    /// can retain such an impossible choice after a copied commander spell left
+    /// the battlefield, so resume at the normal SBA boundary and let the token
+    /// cease-to-exist sweep remove it.
+    ///
+    /// This is intentionally limited to token-backed choices. A real commander
+    /// card in a graveyard or exile retains its owner-facing CR 903.9a choice.
+    pub fn resume_stale_token_commander_zone_choice(&mut self) {
+        let WaitingFor::CommanderZoneChoice { commander_id, .. } = &self.waiting_for else {
+            return;
+        };
+        if !self
+            .objects
+            .get(commander_id)
+            .is_some_and(|object| object.is_token)
+        {
+            return;
+        }
+
+        crate::game::priority::reset_priority(self);
+        let waiting_for = WaitingFor::Priority {
+            player: self.active_player,
+        };
+        crate::game::public_state::sync_waiting_for(self, &waiting_for);
+        crate::game::sba::check_state_based_actions(self, &mut Vec::new());
+    }
+
     /// CR 732.2a: the seat whose driving period `last_loop_action_sequence` currently records.
     ///
     /// CR 732.2a lets "the player with priority … suggest a shortcut by describing a sequence of
@@ -10848,6 +11824,95 @@ impl GameState {
 pub enum PersistedGameState {
     Raw(Box<GameState>),
     Trusted(Box<TrustedGameStateEnvelope>),
+}
+
+/// Controls when a decoded persisted state may be finalized.
+///
+/// A persisted payload contains only serializable engine state. Callers that
+/// restore runtime-only card data must defer finalization until that data has
+/// been installed; finalizing it first can publish a priority window derived
+/// from incomplete characteristics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistedRestoreFinalization {
+    /// The caller supplies runtime-only state before consuming the prepared
+    /// token with [`PreparedPersistedGameState::finalize_after_rehydration`].
+    DeferUntilRehydrated,
+    /// Compatibility policy for consumers that have no runtime rehydration
+    /// step. This still uses the same checked restore pipeline.
+    Immediate,
+}
+
+/// A decoded persisted game that has passed restore-boundary repair but has
+/// not yet been made externally observable.
+///
+/// The contained game state is deliberately opaque. The only way to mutate it
+/// is the one-shot rehydration closure, followed by the engine-owned finalizer.
+/// This prevents a persistence consumer from accidentally publishing an
+/// intermediate priority state between decode and runtime rehydration.
+#[derive(Debug)]
+pub struct PreparedPersistedGameState {
+    state: GameState,
+    finalization: PersistedRestoreFinalization,
+    recovered_terminal_rest: bool,
+}
+
+/// A persisted state reached a priority window with unresolved resolution
+/// ownership and no exact engine-owned terminal repair.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PersistedRestoreError {
+    #[error("persisted state uses an unsupported format configuration: {0}")]
+    UnsupportedFormat(String),
+    #[error("persisted restore finalization policy mismatch: {0}")]
+    FinalizationPolicyMismatch(&'static str),
+    #[error("persisted state runtime rehydration failed: {0}")]
+    RehydrationFailed(String),
+    #[error("persisted state has unsettled resolution ownership at priority")]
+    UnsettledPriorityResolution,
+    #[error("persisted terminal-rest recovery did not make strict progress")]
+    TerminalRestRecoveryExhausted,
+    #[error("persisted priority state has deferred triggers that could not settle")]
+    DeferredTriggerSettlement,
+    #[error("persisted priority settlement failed: {0}")]
+    PrioritySettlementFailed(String),
+}
+
+impl PreparedPersistedGameState {
+    /// Rehydrate runtime-only state, then run the single restore finalization
+    /// boundary. The closure is intentionally the only mutable access to the
+    /// decoded state and is consumed exactly once with this token.
+    pub fn finalize_after_rehydration(
+        self,
+        rehydrate: impl FnOnce(&mut GameState) -> Result<(), String>,
+    ) -> Result<GameState, PersistedRestoreError> {
+        if self.finalization != PersistedRestoreFinalization::DeferUntilRehydrated {
+            return Err(PersistedRestoreError::FinalizationPolicyMismatch(
+                "prepared for immediate finalization",
+            ));
+        }
+        self.finish_after_rehydration(rehydrate)
+    }
+
+    fn finish_after_rehydration(
+        self,
+        rehydrate: impl FnOnce(&mut GameState) -> Result<(), String>,
+    ) -> Result<GameState, PersistedRestoreError> {
+        let mut state = self.state;
+        rehydrate(&mut state).map_err(PersistedRestoreError::RehydrationFailed)?;
+        crate::game::engine::finalize_persisted_restore(&mut state, self.recovered_terminal_rest)?;
+        Ok(state)
+    }
+
+    /// Finish a checked restore whose consumer has no runtime-only state to
+    /// hydrate. Kept separate from `into_game_state` so every new persistence
+    /// boundary chooses its finalization policy explicitly.
+    pub fn finalize_immediately(self) -> Result<GameState, PersistedRestoreError> {
+        if self.finalization != PersistedRestoreFinalization::Immediate {
+            return Err(PersistedRestoreError::FinalizationPolicyMismatch(
+                "requires runtime rehydration before finalization",
+            ));
+        }
+        self.finish_after_rehydration(|_| Ok(()))
+    }
 }
 
 impl Serialize for PersistedGameState {
@@ -10919,8 +11984,10 @@ impl PersistedGameState {
         Self::Trusted(Box::new(TrustedGameStateEnvelope::capture(state)))
     }
 
-    /// Restores the persisted form through the appropriate trust boundary.
-    pub fn into_game_state(self) -> GameState {
+    /// Decodes the persisted form through the appropriate trust boundary,
+    /// without publishing it. This is private on purpose: every external
+    /// restore must first pass the checked terminal-rest preparation below.
+    fn into_game_state_unchecked(self) -> GameState {
         let mut state = match self {
             Self::Raw(state) => {
                 let mut state = *state;
@@ -10932,6 +11999,12 @@ impl PersistedGameState {
         // CR 732.2a (FIX-3): drop stale transient loop-detection bookkeeping on load unless the save
         // sits in an object-growth shortcut window whose pending resolution still consumes it.
         state.migrate_transient_loop_sequence();
+        // CR 616.1: re-derive a parked replacement prompt's `kind` (see
+        // `migrate_restored_replacement_choice_kind`). Placed at this shared
+        // chokepoint so BOTH the untrusted `Raw` and trusted envelope paths get
+        // the repair — a legacy save restored through either one would
+        // otherwise present an optional or search-found prompt as an ordering.
+        state.migrate_restored_replacement_choice_kind();
         // `pending_trigger_event_batch` is a construction carrier for the
         // corresponding `pending_trigger`. A historical save can retain the
         // carrier after its trigger was dropped; it cannot represent live
@@ -10971,7 +12044,62 @@ impl PersistedGameState {
         //     <saved>, so the next `capture_rng_word_pos` `.expect`-panicked `HighWaterRegression`.
         // Offline tooling (`phase-ai`'s `load_saved_game_state`) simply inherits the repair.
         state.rehydrate_rng();
+        state.resume_stale_token_commander_zone_choice();
         state
+    }
+
+    /// Decode and repair a persisted state before runtime-only data is
+    /// rehydrated. No priority pass, Resolve All resume, or other player action
+    /// is manufactured here.
+    pub fn prepare_for_restore(
+        self,
+        finalization: PersistedRestoreFinalization,
+    ) -> Result<PreparedPersistedGameState, PersistedRestoreError> {
+        let mut state = self.into_game_state_unchecked();
+        state
+            .format_config
+            .reject_unimplemented_range_of_influence()
+            .map_err(PersistedRestoreError::UnsupportedFormat)?;
+        let recovered_terminal_rest =
+            crate::game::engine::recover_terminal_resolution_rest_on_restore(&mut state)?;
+        Ok(PreparedPersistedGameState {
+            state,
+            finalization,
+            recovered_terminal_rest,
+        })
+    }
+
+    /// Checked decode for callers without runtime-only rehydration.
+    ///
+    /// Production persistence boundaries that need runtime-only card data use
+    /// [`Self::prepare_for_restore`] with deferred finalization. This immediate
+    /// variant remains fallible so persisted corruption cannot turn into a
+    /// process panic at a library boundary.
+    pub fn into_game_state(self) -> Result<GameState, PersistedRestoreError> {
+        self.prepare_for_restore(PersistedRestoreFinalization::Immediate)
+            .and_then(PreparedPersistedGameState::finalize_immediately)
+    }
+}
+
+/// A payable root branch advertised by the engine. `index` is its position in
+/// the original `AbilityCost::OneOf`, even when unpayable siblings are omitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolutionOptionalPaymentOption {
+    pub index: usize,
+    pub cost: AbilityCost,
+}
+
+/// Why a controller is selecting an opponent for a zone choice.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ZoneOpponentChooserPurpose {
+    #[default]
+    Ordinary,
+    BindReciprocalConsume,
+}
+
+impl ZoneOpponentChooserPurpose {
+    fn is_ordinary(&self) -> bool {
+        matches!(self, Self::Ordinary)
     }
 }
 
@@ -11265,6 +12393,19 @@ pub enum WaitingFor {
         candidate_count: usize,
         #[serde(default)]
         candidates: Vec<ReplacementCandidateSummary>,
+        /// CR 616.1: which kind of decision this is. Defaults to
+        /// [`ReplacementChoiceKind::Order`] so pre-existing serialized states
+        /// and the many test constructions keep deserializing unchanged.
+        #[serde(default)]
+        kind: ReplacementChoiceKind,
+        /// CR 616.1f: whether the LAST-applied candidate alone decides the
+        /// outcome (every colliding write overwrites the whole field), so the
+        /// UI may name a concrete winning result. False for compositional
+        /// collisions — damage doublers vs adders, count and mana modifiers —
+        /// where both effects apply and there is no single winner. The display
+        /// layer must not assume last-write-wins; this is the engine's answer.
+        #[serde(default)]
+        last_applied_decides: bool,
     },
     /// CR 614.12a: choose the opponent that a permanent enters under before
     /// the zone change is delivered. `candidates` is captured at replacement
@@ -11391,6 +12532,42 @@ pub enum WaitingFor {
     ScryChoice {
         player: PlayerId,
         cards: Vec<ObjectId>,
+    },
+    /// CR 702.60a: "you **may** reveal the top N cards of your library" — the
+    /// initial optional-reveal decision of a resolving Ripple trigger. The
+    /// controller answers with `GameAction::RippleChoice` (`Cast` = reveal,
+    /// `Decline` = don't). On decline nothing is revealed, the library is left
+    /// untouched, and no `CardsRevealed` / `revealed_cards` publication occurs.
+    RippleRevealChoice {
+        player: PlayerId,
+        /// The resolving Ripple ability's source spell (CR 702.60a).
+        source_id: ObjectId,
+        /// N from "Ripple N" — how many cards the reveal would show. Carried for
+        /// the prompt UI; the actual pile is re-read from the live library top
+        /// when the reveal is accepted.
+        count: u32,
+    },
+    /// CR 702.60a + CR 608.2d: "put all revealed cards not cast this way on the
+    /// bottom of your library **in any order**." Once the same-named free-cast
+    /// offers are exhausted (or declined, or there was no hit), the controller
+    /// announces the order for the uncast revealed cards. The response is
+    /// `GameAction::SelectCards { cards }` carrying a permutation of `cards`;
+    /// the engine places them on the library bottom in that submitted order.
+    /// Raised only when 2+ cards remain — a single card has no ordering choice.
+    RippleBottomOrder {
+        player: PlayerId,
+        /// The resolving Ripple ability's source spell (CR 702.60a).
+        source_id: ObjectId,
+        /// The uncast revealed cards awaiting a bottom-placement order. Still in
+        /// the controller's library and still publicly revealed (CR 701.20a)
+        /// until the order is submitted.
+        cards: Vec<ObjectId>,
+        /// CR 603.3b + CR 608.2g: the same-named card cast from the terminal
+        /// free-cast offer, if any. Threaded into
+        /// `BatchCompletion::RippleTerminalComplete` when the order is submitted
+        /// so the parked-trigger / terminal-`SpellCast` settlement still fires.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_cast: Option<ObjectId>,
     },
     /// CR 901.15 + CR 701.22a analogue: Arrange the top N cards of the planar
     /// deck — put exactly `keep_on_top` on top in the submitted order and the
@@ -11558,6 +12735,10 @@ pub enum WaitingFor {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         constraint: Option<ChooseFromZoneConstraint>,
         source_id: ObjectId,
+        /// Reciprocal producer/consumer role carried across the interactive
+        /// pause. Omitted for ordinary zone choices.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reciprocal_role: Option<crate::types::ability::ReciprocalZoneChoiceRole>,
     },
     /// CR 701.4a: Behold a [quality] — the resolving player chooses which
     /// beholdable object to reveal-or-choose from a MIXED-ZONE candidate set
@@ -11699,6 +12880,11 @@ pub enum WaitingFor {
         /// preserves bottom/nth placement across the choice round-trip.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         library_position: Option<LibraryPosition>,
+        /// Exact origin/identity snapshot for a fresh
+        /// mass `ChangeZoneAll` library-order prompt. Generic zone choices leave
+        /// this absent and therefore retain their ordinary strict zone check.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mass_library_order: Option<MassLibraryOrderBatch>,
         /// CR 118.3: When true, this choice is for a cost payment (e.g., exile cost)
         /// rather than effect resolution. Cost-payment choices require special
         /// handling for exile-link tracking (push_exiled_with_source_this_turn).
@@ -11784,8 +12970,9 @@ pub enum WaitingFor {
         game_number: u8,
         score: MatchScore,
         /// CR 100.2a / CR 100.5: fewest cards this player's main deck may hold
-        /// when they submit. `deck_size` is a *minimum* — there is no maximum
-        /// deck size — so sideboarding need not be a one-for-one swap.
+        /// when they submit — `deck_size.min_cards()`, the floor of the
+        /// format's `DeckSizeRule`. Under a `Minimum` rule there is no maximum
+        /// deck size, so sideboarding need not be a one-for-one swap.
         ///
         /// Published here (rather than left for the UI to derive) so the
         /// submit gate is the engine's own acceptance predicate. Computed by
@@ -11977,7 +13164,7 @@ pub enum WaitingFor {
     ///   may be recast from exile later (no CR section; rider lives on the
     ///   keyword).
     /// - `Evoke` (CR 702.74a) — creature ETBs and sacrifices itself when cast
-    ///   for the evoke cost (CR 702.74b).
+    ///   for the evoke cost.
     /// - `Overload` (CR 702.96a) — substitutes the overload cost and rewrites
     ///   every "target" in the spell's text to "each" (CR 702.96b-c).
     /// - `Bestow` (CR 702.103a) — substitutes the bestow cost and turns the
@@ -12108,6 +13295,18 @@ pub enum WaitingFor {
         description: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         may_trigger_key: Option<MayTriggerAutoChoiceKey>,
+        /// Engine-issued capability for the optional same-card scope. This is
+        /// deliberately a boolean: clients cannot construct or inspect the
+        /// private printed selector used to persist the answer.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        same_card_may_trigger_choice_available: bool,
+    },
+    /// CR 118.12 + CR 608.2d: the payer may decline or choose one currently
+    /// payable, server-authored branch of a root `PayCost(OneOf)` instruction.
+    ResolutionOptionalPaymentChoice {
+        player: PlayerId,
+        source_id: ObjectId,
+        costs: Vec<ResolutionOptionalPaymentOption>,
     },
     /// CR 702.95a + CR 608.2d: Soulbond partner choice made while the PairWith
     /// effect resolves. The listed objects are legal choices, not targets.
@@ -12374,16 +13573,20 @@ pub enum WaitingFor {
         )>,
     },
     /// CR 701.49a: Player chooses which dungeon to venture into (no active dungeon).
+    /// Each option carries its topmost room (CR 309.4a) so the prompt can show
+    /// what choosing that dungeon immediately does.
     ChooseDungeon {
         player: PlayerId,
-        options: Vec<crate::game::dungeon::DungeonId>,
+        options: Vec<crate::game::dungeon::DungeonPreview>,
     },
     /// CR 309.5a: Player at a branching room chooses which room to advance to.
+    /// Each option carries the room's printed name and effect (CR 309.4b-c).
     ChooseDungeonRoom {
         player: PlayerId,
         dungeon: crate::game::dungeon::DungeonId,
-        options: Vec<u8>,
-        option_names: Vec<String>,
+        /// The dungeon's printed name, so the prompt never has to map the id.
+        dungeon_name: String,
+        options: Vec<crate::game::dungeon::RoomPreview>,
     },
     /// Digital-only Specialize: choose which color specialization to apply.
     SpecializeColor {
@@ -12547,6 +13750,11 @@ pub enum WaitingFor {
         player: PlayerId,
         candidates: Vec<PlayerId>,
         ability: Box<crate::types::ability::ResolvedAbility>,
+        #[serde(
+            default,
+            skip_serializing_if = "ZoneOpponentChooserPurpose::is_ordinary"
+        )]
+        purpose: ZoneOpponentChooserPurpose,
     },
     /// CR 601.2c + CR 115.1: A spell with an "of an opponent's choice" target slot
     /// is being cast in a multiplayer game; the controller (`player`) chooses
@@ -12776,7 +13984,7 @@ pub enum WaitingFor {
         /// The zone the commander is currently in (Graveyard, Exile, Hand, or Library).
         current_zone: Zone,
     },
-    /// CR 310.11 + CR 310.12a + CR 704.5w + CR 704.5x: A battle that isn't being attacked has no
+    /// CR 310.11 + CR 310.12a + CR 704.5x: A battle that isn't being attacked has no
     /// protector, an illegal protector, or (for Sieges) a protector equal to its
     /// controller. The battle's controller (`player`) chooses a legal protector from
     /// `candidates`. Emitted only when `candidates.len() > 1`; the SBA auto-applies
@@ -12806,15 +14014,21 @@ pub enum WaitingFor {
         eligible: Vec<TargetRef>,
         phase: TimeTravelPhase,
     },
-    /// CR 603.7e: The affected player of a `ChooseObjectsIntoTrackedSet` effect
-    /// selects any number of battlefield permanents from `eligible`. The
+    /// CR 608.2d: While applying `ChooseObjectsIntoTrackedSet`, the affected player
+    /// selects `min..=max` battlefield permanents from `eligible`. The
     /// chosen objects are written into a fresh tracked set so a downstream
     /// `PayCost { ScaledMana }` and `IfYouDo`/`Untap` reference the exact
-    /// selection. An empty selection is legal — the player declines.
+    /// selection. An empty selection is legal when `min == 0`.
     ChooseObjectsSelection {
         player: PlayerId,
         /// Eligible battlefield permanents matching the effect's filter.
         eligible: Vec<TargetRef>,
+        /// Minimum number of distinct eligible objects that must be selected.
+        #[serde(default)]
+        min: u32,
+        /// Maximum number selectable (`None` = all eligible objects).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<u32>,
         /// CR 608.2: triggering event of the ability whose `ChooseObjectsIntoTrackedSet`
         /// raised this prompt. Restored around the continuation drain so the stashed
         /// `PayCost { payer: TriggeringPlayer }` resolves to the correct player.
@@ -13063,14 +14277,52 @@ pub enum WaitingFor {
         pending_mana_ability: Option<Box<PendingManaAbility>>,
     },
     /// CR 115.7: Change the target(s) of a spell or ability on the stack.
-    /// Infrastructure ready: handler in engine.rs, AI candidates, continuation match.
-    /// TODO: Add Effect::ChangeTargets variant + resolver in effects/change_targets.rs.
-    /// Requires parser support for "change the target of" Oracle text patterns.
     RetargetChoice {
         player: PlayerId,
         stack_entry_index: usize,
         scope: RetargetScope,
+        /// CR 115.7d: the chain's currently declared targets, flat, in
+        /// `chain_retarget_slots` order and positionally aligned with `slots`
+        /// and `slot_pools`. The submission (`GameAction::RetargetSpell.new_targets`)
+        /// uses the same index space, so the frontend stays width-agnostic and
+        /// learns nothing about chain nodes. Its first `root.targets.len()`
+        /// entries are exactly what this field held before phase-rs/phase#8355,
+        /// so the index space is a backward-compatible prefix extension.
         current_targets: Vec<TargetRef>,
+        /// CR 115.7d: where each position of `current_targets` LIVES — the chain
+        /// node and the slot within it. Validation, pool admission and the
+        /// target-incarnation pin refresh all follow this address, so they reach
+        /// every affected node rather than only the root (phase-rs/phase#8355).
+        ///
+        /// `serde(default)`: `GameState`/`PersistedGameState` cross the
+        /// multiplayer/WASM boundary against a HAND-WRITTEN TS mirror, and a
+        /// peer or a stored state predating this field must still load. An
+        /// empty `slots` is inert — `apply_retarget`'s alignment check trivially
+        /// passes and the per-address write loop visits nothing.
+        #[serde(default)]
+        slots: Vec<RetargetSlotAddress>,
+        /// CR 115.7d, INVARIANT SC: the candidate set for EACH position,
+        /// aligned 1:1 with `slots`. Produced once by
+        /// `change_targets::slot_pool` and thereafter only READ — see that
+        /// function's doc for the single-computation invariant.
+        ///
+        /// EMPTY MEANS TWO DIFFERENT THINGS, deliberately:
+        ///   * an empty OUTER vec = "no per-position refinement was recorded",
+        ///     which is the truth for any payload predating this field. Every
+        ///     consumer then falls back to `legal_new_targets`, which in
+        ///     exactly that case IS BASE's cascade — BASE behaviour by
+        ///     construction, not by convention.
+        ///   * an empty INNER vec = "this position has no legal alternative",
+        ///     and admits nothing. `slot_pools.get(i)` yields `Some(&[])`
+        ///     there, so the fallback correctly does NOT fire. Do not
+        ///     "helpfully" collapse an all-empty `slot_pools` to `Vec::new()`.
+        #[serde(default)]
+        slot_pools: Vec<Vec<TargetRef>>,
+        /// CR 115.7d: the UNION — BASE's cascade verbatim, extended with every
+        /// `slot_pools` member not already present. Read by `interaction.rs`'s
+        /// projection and by the frontend, both of which stay width- and
+        /// node-agnostic. NOT the admission set for any single position: that
+        /// is `slot_pools[i]`. Prefix-identical to BASE's cascade.
         legal_new_targets: Vec<TargetRef>,
     },
     /// CR 508.1d + CR 508.1h + CR 509.1c + CR 509.1d: A combat declaration is paused
@@ -13154,28 +14406,19 @@ pub struct PendingLifelinkGain {
     pub amount: u32,
 }
 
-/// CR 510.2 + CR 616.1 + CR 702.15b: the unfinished tail of ONE simultaneous
-/// combat-damage batch, parked because a lifelink life-gain event met two or
-/// more co-applicable replacement effects and the gaining player must choose
-/// which applies first.
+/// CR 510.2 + CR 616.1 + CR 702.15b: the unfinished tail of ONE simultaneous combat-damage batch,
+/// parked because a lifelink life-gain event met two or more co-applicable replacement effects
+/// and the gaining player must choose which applies first. CR 510.2 forbids *casting spells and
+/// activating abilities* between combat damage being assigned and dealt — a priority window — but
+/// not a CR 616.1 choice made while the event is being applied, which opens no priority window
+/// and puts nothing on the stack. What it *does* forbid is replaying the batch: it is one event,
+/// so the damage is never re-dealt and only the unstarted tail is parked.
 ///
-/// CR 510.2 forbids *casting spells and activating abilities* between combat
-/// damage being assigned and dealt — a priority window. It does NOT forbid a
-/// CR 616.1 choice made while the event is being applied, which opens no
-/// priority window and puts nothing on the stack. The belief that it did is
-/// what dropped the gain: the choice cannot be answered inside the turn-based
-/// action, so 100% of that source's gain — and every later lifelink source in
-/// the same batch — was discarded.
-///
-/// What CR 510.2 *does* forbid is replaying the batch: it is one event. So the
-/// damage is never re-dealt; only the unstarted tail is parked.
-///
-/// The tail is parked whole, in emission order, so the completing batch's event
-/// stream is byte-identical to the un-paused one: per-source gains, then the
-/// per-player `CombatDamageDealtToPlayer` aggregate, then Phase D's prevention
-/// riders. Deferring Phase D rather than hoisting it is what makes it
-/// impossible for a rider's own continuation (CR 615.5) to run while the
-/// CR 616.1 prompt is open.
+/// The tail is parked whole, in emission order, so the completing batch's event stream is
+/// byte-identical to the un-paused one: per-source gains, then the per-player
+/// `CombatDamageDealtToPlayer` aggregate, then Phase D's prevention riders. Deferring Phase D
+/// rather than hoisting it makes it impossible for a rider's own continuation (CR 615.5) to run
+/// while the CR 616.1 prompt is open.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingCombatLifelink {
     /// CR 702.15e: per-source gains still owed, in batch order — separate life
@@ -13202,25 +14445,18 @@ pub struct PendingCombatLifelink {
     /// batch prevented. A `Vec` rather than the producer's `HashMap`: an enum key
     /// is not a JSON map key, and the record is serialized.
     pub prevention_tally: Vec<(AppliedReplacementKey, i32)>,
-    /// CR 732.2a: the pre-batch life totals the loop-detection ring keys on.
+    /// CR 732.2a: the pre-batch life totals the loop-detection ring keys on. Carried here rather
+    /// than re-snapshotted at resume time, which is what buys the PAUSE-path guard call: the
+    /// pause is reached under `PassPriority`, which `apply()` exempts from its blanket ring
+    /// clear, so a pre-batch snapshot lets that call observe the CR 120.3a damage this batch
+    /// already dealt. Re-snapshotting at drain entry makes the comparison vacuous there —
+    /// `parked_batch_invalidates_the_loop_ring_against_the_pre_batch_snapshot` fails when it is.
     ///
-    /// Carried here rather than re-snapshotted at resume time. What that buys is
-    /// the PAUSE-path guard call: the pause is reached under `PassPriority`, which
-    /// `apply()` exempts from its blanket ring clear, so a pre-batch snapshot is
-    /// what lets that call observe the CR 120.3a damage this batch has already
-    /// dealt. Re-snapshotting at drain entry would make the comparison vacuous
-    /// there — `parked_batch_invalidates_the_loop_ring_against_the_pre_batch_snapshot`
-    /// is the fixture that fails when it is.
-    ///
-    /// It buys NOTHING on the resume, and this is MEASURED, not assumed:
-    /// `apply()` clears `loop_detect_ring` for every action that is neither in its
-    /// exemption list nor an answer to a `WaitingFor::is_forced_cascade_window`,
-    /// and `GameAction::ChooseReplacement` / `WaitingFor::ReplacementChoice` are in
-    /// neither set. The ring is therefore already empty before the drain is
-    /// re-entered, so the completion-path call cannot be observed to clear
-    /// anything on that path. Do not write, or rely on, a claim that this window
-    /// "observes the paused source's own gain" — arithmetically it spans it, but
-    /// no observer survives to see it.
+    /// It buys NOTHING on the resume: `apply()` clears `loop_detect_ring` for every action
+    /// neither in its exemption list nor answering a `WaitingFor::is_forced_cascade_window`, and
+    /// `ChooseReplacement` / `ReplacementChoice` are in neither set, so the ring is already empty
+    /// before the drain is re-entered. Do not claim this window "observes the paused source's own
+    /// gain" — arithmetically it spans it, but no observer survives to see it.
     pub lives_before: Vec<i32>,
     /// CR 510.4: which sub-step owns this batch. Snapshotted because
     /// `combat.first_strike_done` mutates during the resume.
@@ -13372,7 +14608,7 @@ impl LoopCollapseAxis {
     /// only the three materializable axes carry a label; every non-materializable axis
     /// maps to `None` explicitly, so a future materializable axis build-breaks here and
     /// forces a conscious classification.
-    fn from_resource_axis(axis: ResourceAxis) -> Option<LoopCollapseAxis> {
+    pub(crate) fn from_resource_axis(axis: ResourceAxis) -> Option<LoopCollapseAxis> {
         match axis {
             ResourceAxis::TokensCreated => Some(LoopCollapseAxis::Tokens),
             // Real value on the observed-growth path is `Counter(Other, Other)`; both
@@ -13406,29 +14642,53 @@ pub enum RetargetScope {
     ForcedTo(TargetRef),
 }
 
-/// CR 103.5 / CR 104.1: who — if anyone — may act in a `WaitingFor` state.
+/// CR 601.2c: one descent step from a stack entry's root `ResolvedAbility`
+/// toward a node that owns declared targets.
 ///
-/// THE single authority behind [`WaitingFor::acting_player`] and
-/// [`WaitingFor::acting_players`]; both are adapters over
-/// [`WaitingFor::acting_authority`], and the exhaustive per-variant match lives
-/// there and nowhere else.
+/// Two variants because `ResolvedAbility` has exactly two child links. The
+/// enumerator (`ability_utils::chain_retarget_slots`) emits only `SubAbility`
+/// today, because `assign_targets_recursive` never descends into
+/// `else_ability` — read-verified; only `stamp_other_batch_source_targets`
+/// visits that branch, and its writes are synthesized rather than declared.
+/// `ElseAbility` exists so that a future else-branch owner is addressed
+/// correctly instead of being silently mis-addressed as a sub-branch one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChainStep {
+    SubAbility,
+    ElseAbility,
+}
+
+/// CR 115.7d: the address of ONE declared-target slot inside a resolved chain.
+/// `path` walks from the stack entry's root ability; `slot` indexes that node's
+/// OWN `targets`. Carried on `WaitingFor::RetargetChoice` so a submission is
+/// validated, admitted and written against the exact slot the prompt offered.
 ///
-/// The type exists so that "nobody acts" cannot be written as a bare `None`.
-/// A state with no acting player is advanced by something OUTSIDE the action
-/// pipeline, and if that something is never called the game hangs with no
-/// player able to move it and no client rendering a prompt. Naming the
-/// advancer in the type is what makes the obligation reviewable; the census in
-/// `tests/integration/waiting_for_actor_authority_census.rs` is what makes it
-/// unskippable.
+/// NOTE: an empty `path` is NOT the same predicate as "BASE already exposes
+/// this position". Under `AdditionalCostPaidInstead` delegation the BASE-exposed
+/// node is the SUB (`assign_targets_recursive:7008-7019` mirrors its targets
+/// onto the parent), so its addresses carry `path == [SubAbility]`. Consumers
+/// must never re-derive the position class from `path`; the enumerator settles
+/// it once, in `SlotEnforcement` (`ability_utils.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetargetSlotAddress {
+    pub path: Vec<ChainStep>,
+    pub slot: usize,
+}
+
+/// CR 103.5 / CR 104.1: who — if anyone — may act in a `WaitingFor` state. THE single authority
+/// behind [`WaitingFor::acting_player`] and [`WaitingFor::acting_players`], which are adapters
+/// over [`WaitingFor::acting_authority`], whose exhaustive per-variant match lives there and
+/// nowhere else.
 ///
-/// INVARIANT THE CENSUS ENFORCES: every arm of `acting_authority` is a bare,
-/// UNGUARDED pattern whose body is exactly one constructor call on this enum —
-/// possibly wrapped by `rustfmt` in a block whose single tail expression is
-/// that call — and the census PINS the constructor set it accepts, so a new
-/// one cannot route its arms past the adjudications while the census still
-/// reports healthy (see that file's `A4c` and `A4d`). A match guard would let
-/// an arm decide the answer somewhere the census cannot read, so guards are
-/// rejected outright — see that file's `A8`.
+/// The type exists so that "nobody acts" cannot be written as a bare `None`. A state with no
+/// acting player is advanced by something OUTSIDE the action pipeline, and if that something is
+/// never called the game hangs with no player able to move it and no client rendering a prompt.
+/// Naming the advancer in the type makes the obligation reviewable; the census in
+/// `tests/integration/waiting_for_actor_authority_census.rs` makes it unskippable. That census
+/// requires every arm of `acting_authority` to be a bare, UNGUARDED pattern whose body is exactly
+/// one constructor call on this enum, PINS the constructor set it accepts (its `A4c` / `A4d`) so a
+/// new one cannot route arms past the adjudications, and rejects guards outright (its `A8`) — a
+/// guard would let an arm decide the answer where the census cannot read it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActingAuthority {
     /// Exactly one player is authorized to submit the next action.
@@ -13513,6 +14773,8 @@ impl WaitingFor {
             WaitingFor::StationTarget { .. } => "StationTarget",
             WaitingFor::SaddleMount { .. } => "SaddleMount",
             WaitingFor::ScryChoice { .. } => "ScryChoice",
+            WaitingFor::RippleRevealChoice { .. } => "RippleRevealChoice",
+            WaitingFor::RippleBottomOrder { .. } => "RippleBottomOrder",
             WaitingFor::ArrangePlanarDeckTopChoice { .. } => "ArrangePlanarDeckTopChoice",
             WaitingFor::RedistributeLifeTotals { .. } => "RedistributeLifeTotals",
             WaitingFor::CoinFlipKeepChoice { .. } => "CoinFlipKeepChoice",
@@ -13554,6 +14816,7 @@ impl WaitingFor {
             WaitingFor::MultiTargetSelection { .. } => "MultiTargetSelection",
             WaitingFor::AbilityModeChoice { .. } => "AbilityModeChoice",
             WaitingFor::OptionalEffectChoice { .. } => "OptionalEffectChoice",
+            WaitingFor::ResolutionOptionalPaymentChoice { .. } => "ResolutionOptionalPaymentChoice",
             WaitingFor::PairChoice { .. } => "PairChoice",
             WaitingFor::TributeChoice { .. } => "TributeChoice",
             WaitingFor::MiracleReveal { .. } => "MiracleReveal",
@@ -13618,21 +14881,17 @@ impl WaitingFor {
         }
     }
 
-    /// THE single authority on who — if anyone — may act in this state.
+    /// THE single authority on who — if anyone — may act in this state. [`Self::acting_player`]
+    /// and [`Self::acting_players`] are adapters over this function; the per-variant match lives
+    /// here and nowhere else.
     ///
-    /// [`Self::acting_player`] and [`Self::acting_players`] are adapters over
-    /// this function; the per-variant match lives here and nowhere else.
-    ///
-    /// Every arm MUST be a bare, UNGUARDED pattern whose body is exactly one
-    /// [`ActingAuthority`] constructor call, from the set that type's census
-    /// pins. No `let`, no early return, no preprocessing before the `match`,
-    /// and no match guard: a guard would let an arm decide the answer
-    /// somewhere that census cannot read it. [`ActingAuthority`]'s doc names
-    /// the census by path; `source_census.rs`'s `EXEMPT` table records that
-    /// path too. If a per-arm condition seems necessary, it belongs either in
-    /// a new `WaitingFor` variant (when it changes WHO acts) or in an adapter
-    /// (when it merely narrows an authority this arm already declares,
-    /// exactly as the CR 103.5 `pending.len() == 1` test does).
+    /// Every arm MUST be a bare, UNGUARDED pattern whose body is exactly one [`ActingAuthority`]
+    /// constructor call, from the set that type's census pins. No `let`, no early return, no
+    /// preprocessing before the `match`, and no match guard: a guard would let an arm decide the
+    /// answer somewhere that census cannot read it. If a per-arm condition seems necessary it
+    /// belongs either in a new `WaitingFor` variant (when it changes WHO acts) or in an adapter
+    /// (when it merely narrows an authority this arm already declares, exactly as the CR 103.5
+    /// `pending.len() == 1` test does).
     pub fn acting_authority(&self) -> ActingAuthority {
         match self {
             WaitingFor::MulliganDecision { pending, .. } => {
@@ -13673,6 +14932,8 @@ impl WaitingFor {
             | WaitingFor::StationTarget { player, .. }
             | WaitingFor::SaddleMount { player, .. }
             | WaitingFor::ScryChoice { player, .. }
+            | WaitingFor::RippleRevealChoice { player, .. }
+            | WaitingFor::RippleBottomOrder { player, .. }
             | WaitingFor::ArrangePlanarDeckTopChoice { player, .. }
             | WaitingFor::RedistributeLifeTotals { player, .. }
             | WaitingFor::CoinFlipKeepChoice { player, .. }
@@ -13725,6 +14986,7 @@ impl WaitingFor {
             | WaitingFor::CollectEvidenceChoice { player, .. }
             | WaitingFor::HarmonizeTapChoice { player, .. }
             | WaitingFor::OptionalEffectChoice { player, .. }
+            | WaitingFor::ResolutionOptionalPaymentChoice { player, .. }
             | WaitingFor::PairChoice { player, .. }
             | WaitingFor::OpponentMayChoice { player, .. }
             | WaitingFor::RespondToShortcut { player, .. }
@@ -13985,7 +15247,7 @@ impl WaitingFor {
     ///   fixpoint before priority is granted.
     /// * [`WaitingFor::BattleProtectorChoice`] — CR 310.11 ("its controller chooses an
     ///   appropriate player to be its protector ... This is a state-based action")
-    ///   + CR 704.5w / CR 704.5x, likewise answered inside the CR 704.3 fixpoint.
+    ///   + CR 704.5x, likewise answered inside the CR 704.3 fixpoint.
     ///
     /// Those SBA members (the commander-zone, legend and battle-protector choices) are
     /// the COMPLETE set of player-choice pauses `game::sba` opens inside the SBA
@@ -14071,7 +15333,7 @@ impl WaitingFor {
     /// `engine_combat::handle_declare_attackers` tax pause are where the class boundary
     /// between "declaring" (a member) and "paying to declare" (not a member) is drawn.
     ///
-    /// FAIL-CLOSED: the other 114 variants fall through to `false`, and `false` keeps
+    /// FAIL-CLOSED: every other variant falls through to `false`, and `false` keeps
     /// the ring-clearing behaviour, so a newly added variant defaults to the safe side
     /// without anyone remembering to update this list.
     pub fn is_forced_cascade_window(&self) -> bool {
@@ -14122,6 +15384,10 @@ impl WaitingFor {
                 | WaitingFor::ArrangePlanarDeckTopChoice { .. }
                 | WaitingFor::SurveilChoice { .. }
                 | WaitingFor::DigChoice { .. }
+                // CR 702.60a: the Ripple bottom-order response is a free
+                // permutation of the offered pile — the candidate enumerator
+                // only lists {identity}, so `apply()` is the real validator.
+                | WaitingFor::RippleBottomOrder { .. }
         )
     }
 
@@ -14204,13 +15470,264 @@ pub enum AutoPassRequest {
     },
 }
 
+/// Per-window continuation rule for a stack-resolution session.
+///
+/// CR 117.3d + CR 117.4: a stack entry resolves only after consecutive passes;
+/// this policy selects the engine's authorized pass behavior without changing
+/// that priority rule.
+///
+/// `Committed` is the historical `UntilStackEmpty` meaning: once a player has
+/// armed it, the engine keeps passing until the stack empties or grows beyond
+/// the captured baseline. `RecheckNoMeaningfulPriorityAction` is reserved for
+/// an AI continuation that reuses a representative's own verified pass while
+/// the exact fenced stack cohort remains active. This is an AI policy choice,
+/// not an inference that the player lacks another legal action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum StackResolutionPolicy {
+    #[default]
+    Committed,
+    RecheckNoMeaningfulPriorityAction,
+}
+
+impl StackResolutionPolicy {
+    fn is_committed(policy: &Self) -> bool {
+        *policy == Self::Committed
+    }
+}
+
+/// A persisted resolution cap. The established `0` wire spelling and an
+/// absent field both mean no cap; nonzero values preserve the exact cap.
+///
+/// CR 117.3d + CR 117.4: the cap bounds automated consecutive passes; it never
+/// changes the rules condition that resolves the top stack entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StackResolutionBudget {
+    #[default]
+    Unlimited,
+    Limited(NonZeroU32),
+}
+
+impl StackResolutionBudget {
+    pub const fn from_legacy_max_resolutions(max_resolutions: u32) -> Self {
+        if max_resolutions == 0 {
+            Self::Unlimited
+        } else {
+            Self::Limited(NonZeroU32::new(max_resolutions).expect("nonzero branch"))
+        }
+    }
+
+    pub const fn max_resolutions(self) -> Option<u32> {
+        match self {
+            Self::Unlimited => None,
+            Self::Limited(max_resolutions) => Some(max_resolutions.get()),
+        }
+    }
+
+    const fn wire_value(self) -> u32 {
+        match self {
+            Self::Unlimited => 0,
+            Self::Limited(max_resolutions) => max_resolutions.get(),
+        }
+    }
+}
+
+impl Serialize for StackResolutionBudget {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u32(self.wire_value())
+    }
+}
+
+impl<'de> Deserialize<'de> for StackResolutionBudget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Self::from_legacy_max_resolutions(u32::deserialize(
+            deserializer,
+        )?))
+    }
+}
+
+/// A complete, entry-local snapshot used to prove that a later stack entry is
+/// the same entry authorized when a resolution session began. It reads only
+/// data stored on the entry; in particular it never rebinds a departed source
+/// through the live object map (CR 400.7 / CR 113.7a).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackResolutionEntryFence {
+    pub entry_id: ObjectId,
+    pub source_id: ObjectId,
+    pub controller: PlayerId,
+    pub provenance: StackResolutionEntryProvenance,
+    /// CR 400.7 / CR 603.7c: delayed-trigger referent pins.
+    pub target_incarnations: Vec<ObjectIncarnationRef>,
+    /// CR 400.7 / CR 601.2c: ordinary selected-target pins.
+    pub selected_target_incarnations: Vec<ObjectIncarnationRef>,
+}
+
+/// Exhaustive provenance of one stack-entry kind. Keeping every field that is
+/// present on the source `StackEntryKind` makes a fence fail closed when a
+/// future kind field changes: the capture match below must be extended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum StackResolutionEntryProvenance {
+    Spell {
+        card_id: CardId,
+        ability: Option<Box<ResolvedAbility>>,
+        casting_variant: CastingVariant,
+        actual_mana_spent: u32,
+    },
+    ActivatedAbility {
+        source_id: ObjectId,
+        ability: Box<ResolvedAbility>,
+    },
+    TriggeredAbility(Box<TriggeredAbilityProvenance>),
+    KeywordAction {
+        action: KeywordAction,
+    },
+}
+
+/// Captured fields for a triggered stack entry. Heap indirection keeps the
+/// provenance enum compact while preserving its exhaustive fence semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriggeredAbilityProvenance {
+    source_id: ObjectId,
+    ability: Box<ResolvedAbility>,
+    condition: Option<TriggerCondition>,
+    trigger_event: Option<GameEvent>,
+    description: Option<String>,
+    source_name: String,
+    subject_match_count: Option<u32>,
+    die_result: Option<i32>,
+    provenance: Option<SyntheticTriggerProvenance>,
+}
+
+impl StackResolutionEntryFence {
+    pub fn capture(entry: &StackEntry) -> Self {
+        let provenance = match &entry.kind {
+            StackEntryKind::Spell {
+                card_id,
+                ability,
+                casting_variant,
+                actual_mana_spent,
+            } => StackResolutionEntryProvenance::Spell {
+                card_id: *card_id,
+                ability: ability.clone(),
+                casting_variant: *casting_variant,
+                actual_mana_spent: *actual_mana_spent,
+            },
+            StackEntryKind::ActivatedAbility { source_id, ability } => {
+                StackResolutionEntryProvenance::ActivatedAbility {
+                    source_id: *source_id,
+                    ability: ability.clone(),
+                }
+            }
+            StackEntryKind::TriggeredAbility {
+                source_id,
+                ability,
+                condition,
+                trigger_event,
+                description,
+                source_name,
+                subject_match_count,
+                die_result,
+                provenance,
+            } => StackResolutionEntryProvenance::TriggeredAbility(Box::new(
+                TriggeredAbilityProvenance {
+                    source_id: *source_id,
+                    ability: ability.clone(),
+                    condition: condition.clone(),
+                    trigger_event: trigger_event.clone(),
+                    description: description.clone(),
+                    source_name: source_name.clone(),
+                    subject_match_count: *subject_match_count,
+                    die_result: *die_result,
+                    provenance: provenance.clone(),
+                },
+            )),
+            StackEntryKind::KeywordAction { action } => {
+                StackResolutionEntryProvenance::KeywordAction {
+                    action: action.clone(),
+                }
+            }
+        };
+        let (target_incarnations, selected_target_incarnations) = entry
+            .ability()
+            .map(|ability| {
+                (
+                    ability.target_incarnations.clone(),
+                    ability.selected_target_incarnations.clone(),
+                )
+            })
+            .unwrap_or_default();
+
+        Self {
+            entry_id: entry.id,
+            source_id: entry.source_id,
+            controller: entry.controller,
+            provenance,
+            target_incarnations,
+            selected_target_incarnations,
+        }
+    }
+
+    /// Compares captured stack data only. This stays correct even when the
+    /// source object has left the battlefield and live LKI lookup is impossible.
+    pub fn matches_captured_entry(&self, entry: &StackEntry) -> bool {
+        self == &Self::capture(entry)
+    }
+}
+
+/// The temporary auto-pass overlay installed for a shared resolution session.
+/// The full sparse map is retained so ending the session can restore the exact
+/// pre-session preferences transactionally.
+///
+/// CR 117.3d + CR 117.4: records only temporary pass preferences, leaving the
+/// engine's ordinary consecutive-pass and stack-resolution procedure intact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackResolutionAutoPassOverlay {
+    pub baseline: BTreeMap<PlayerId, AutoPassMode>,
+}
+
+/// Persisted state for the one ordinary stack-resolution runner shared by
+/// consented human Resolve All and verified AI continuation.
+///
+/// CR 117.3d + CR 117.4: retains the exact cohort and pass policy for an
+/// ordinary priority-driven resolution sequence rather than directly resolving
+/// stack entries outside the rules procedure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackResolutionSession {
+    /// Ordered from the next entry to resolve toward the bottom of the
+    /// authorized stack cohort.
+    pub entries: Vec<StackResolutionEntryFence>,
+    #[serde(default)]
+    pub cursor: usize,
+    pub representatives: BTreeSet<PlayerId>,
+    /// AI representatives whose verified pass is a policy authorization for
+    /// later priority windows in this exact fenced cohort. Absence is
+    /// conservative: that representative must receive an explicit decision.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub verified_pass_representatives: BTreeSet<PlayerId>,
+    #[serde(default)]
+    pub budget: StackResolutionBudget,
+    #[serde(default)]
+    pub policy: StackResolutionPolicy,
+    pub auto_pass_overlay: StackResolutionAutoPassOverlay,
+}
+
 /// What the engine stores for auto-pass (includes captured state).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AutoPassMode {
     /// Auto-pass while stack is non-empty. Clears when stack empties or grows
     /// beyond `initial_stack_len` (the stack size when the flag was set).
-    UntilStackEmpty { initial_stack_len: usize },
+    UntilStackEmpty {
+        initial_stack_len: usize,
+        #[serde(default, skip_serializing_if = "StackResolutionPolicy::is_committed")]
+        policy: StackResolutionPolicy,
+    },
     /// Auto-pass through priority/combat stops until the turn boundary in
     /// `until` is reached — `EndOfCurrentTurn` (the flag dies at the next turn
     /// start, regardless of whose turn it is) or `MyNextTurnStart` (persists
@@ -14229,21 +15746,36 @@ pub enum AutoPassMode {
     },
 }
 
-/// How the engine recommends passing ordinary priority windows for one player.
+/// THE single per-player authority for auto-passing ordinary priority windows,
+/// as a graduated scale from "never" to "skip the low-use ones".
 ///
-/// This is an opt-in interface preference, not a change to priority itself:
-/// every recommended pass is still submitted as `GameAction::PassPriority` and
-/// resolved by the normal CR 117.3d / CR 117.4 engine path. `Standard` preserves
-/// the existing meaningful-action-aware recommendation ladder.
-/// `SkipLowUseWindows` adds a
+/// Two consumers read it, and they differ in force:
+///
+/// - `ai_support::auto_pass_recommended` — a *recommendation* to the frontend.
+///   Every recommended pass is still submitted as `GameAction::PassPriority`
+///   and resolved by the normal CR 117.3d / CR 117.4 path.
+/// - `game::engine`'s `run_auto_pass_loop` — *authoritative*. Passes taken here
+///   never reach a client, which is why `FullControl` has to live in engine
+///   state rather than in a frontend toggle: an auto-pass session installed by
+///   another player (Resolve All, CR 117.3d) drives this loop, and a
+///   client-only preference is invisible to it.
+///
+/// `Standard` is the meaningful-action-aware ladder. `SkipLowUseWindows` adds a
 /// narrow fast path for the active player's empty-stack Upkeep, Draw, and End
-/// priority windows; explicit phase stops, priority yields, and Full Control
-/// remain higher-authority user choices.
+/// windows. `FullControl` never auto-passes at all.
+///
+/// `FullControl` is deliberately NOT expressible as a `phase_stops` entry on
+/// every phase: `GameState::phase_stop_hit` is consulted only for empty-stack
+/// initial windows (`ai_support/mod.rs`), whereas Full Control must also hold a
+/// window while objects are on the stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub enum PriorityPassingMode {
     #[default]
     Standard,
     SkipLowUseWindows,
+    /// CR 117.1: hold every priority window this player receives. Outranks any
+    /// auto-pass session, including one another player installed.
+    FullControl,
 }
 
 /// CR 732.2a: user-controllable gate for the live combo (infinite-loop) detector.
@@ -14755,7 +16287,6 @@ impl CastingVariant {
             | CastingVariant::MoreThanMeetsTheEye
             | CastingVariant::Disturb
             | CastingVariant::Impending
-            | CastingVariant::Prototype
             // CR 702.140a: Mutate replaces the spell's mana cost with the mutate
             // cost — an alternative cost, so only one may apply (CR 118.9a).
             | CastingVariant::Mutate
@@ -14773,6 +16304,12 @@ impl CastingVariant {
             | CastingVariant::Omen
             | CastingVariant::Retrace
             | CastingVariant::Aftermath
+            // CR 718.2 + CR 718.3b: Prototype swaps in an alternative SET OF
+            // CHARACTERISTICS — the prototyped mana cost IS the spell's mana
+            // cost, not an alternative cost (CR 118.9). A prototyped cast can
+            // therefore still combine with one alternative cost (a free-cast
+            // grant or rider).
+            | CastingVariant::Prototype
             // CR 702.133a: Jump-start discards a card as an *additional* cost on
             // top of the normal mana cost — not an alternative cost (CR 118.9a).
             | CastingVariant::JumpStart
@@ -14780,6 +16317,75 @@ impl CastingVariant {
             // cost of both halves — not an alternative cost.
             | CastingVariant::Fuse
             | CastingVariant::GraveyardPermission { .. }
+            | CastingVariant::ExilePermission { .. } => false,
+        }
+    }
+
+    /// CR 118.9a + CR 601.2b: does this variant elect an alternative cost of
+    /// the CARD's own — a keyword rider (Evoke, Bestow, Overload, …) or the
+    /// fixed face-down {3} — INDEPENDENT of whatever zone authority admits
+    /// the cast? Such a rider may only ride a normal-cost route: an
+    /// alternative-cost grant underneath it would be a second alternative
+    /// cost on the same cast.
+    ///
+    /// Distinct from [`CastingVariant::uses_alternative_cost`]: a variant
+    /// whose alternative cost IS its admitting permission's cost (Madness,
+    /// Suspend, Plot, Foretell, the permission elections, the graveyard
+    /// keyword routes) forms ONE casting method with its route — it applies
+    /// one alternative cost total, never a second — so it is `false` here
+    /// while `true` there.
+    pub fn is_independent_alternative_cost_rider(self) -> bool {
+        match self {
+            CastingVariant::Miracle
+            | CastingVariant::Evoke
+            | CastingVariant::Emerge
+            | CastingVariant::Dash
+            | CastingVariant::Blitz
+            | CastingVariant::Spectacle
+            | CastingVariant::Overload
+            | CastingVariant::Bestow
+            | CastingVariant::Awaken
+            | CastingVariant::Cleave
+            | CastingVariant::MoreThanMeetsTheEye
+            | CastingVariant::Impending
+            | CastingVariant::Mutate
+            | CastingVariant::Freerunning
+            | CastingVariant::Prowl
+            | CastingVariant::Surge
+            // CR 702.185a: the warp cost is the HAND-side alternative cost;
+            // the exile return cast is its own `WarpExile` route and never
+            // elects this variant.
+            | CastingVariant::Warp
+            | CastingVariant::Sneak { .. }
+            | CastingVariant::WebSlinging { .. }
+            // CR 601.2b + CR 702.37c / CR 702.168b: the fixed face-down {3}.
+            | CastingVariant::FaceDown => true,
+            CastingVariant::Normal
+            | CastingVariant::Adventure
+            | CastingVariant::Omen
+            // CR 718.2 + CR 718.3b: alternative CHARACTERISTICS, not an
+            // alternative cost — a free grant stacks with the prototype
+            // election (see `uses_alternative_cost`).
+            | CastingVariant::Prototype
+            // CR 702.81a / CR 702.133a / CR 702.102c: additional or combined
+            // printed costs, no alternative cost anywhere.
+            | CastingVariant::Retrace
+            | CastingVariant::JumpStart
+            | CastingVariant::Fuse
+            | CastingVariant::Aftermath
+            // Route-coupled: the variant's alternative cost IS its admitting
+            // permission's or keyword-route's cost — one method (CR 118.9a).
+            | CastingVariant::Madness
+            | CastingVariant::Suspend
+            | CastingVariant::Plot
+            | CastingVariant::Foretell
+            | CastingVariant::Escape
+            | CastingVariant::Flashback
+            | CastingVariant::Harmonize
+            | CastingVariant::Mayhem
+            | CastingVariant::Disturb
+            | CastingVariant::GraveyardPermission { .. }
+            | CastingVariant::HandPermission { .. }
             | CastingVariant::ExilePermission { .. } => false,
         }
     }
@@ -15695,9 +17301,36 @@ declare_game_state! {
     /// one for legacy saves and is minted only by `BeginResolveAll`.
     #[serde(default = "initial_resolve_all_consent_epoch")]
     pub next_resolve_all_consent_epoch: u64,
+    /// Records that this state is a VIEWER PROJECTION, not rules authority.
+    ///
+    /// `None` is an authoritative state. `Some(viewer)` is the display snapshot
+    /// [`crate::game::visibility::filter_state_for_viewer`] produced for `viewer`,
+    /// which blanks ~20 private rules-execution carriers (the Resolve All consent
+    /// run, the stack-resolution session, every pending-resume cursor, the rules
+    /// journal, the RNG seed) while deliberately preserving the public
+    /// `waiting_for` that stands over them — see CR 400.2 for why hidden-zone
+    /// information is stripped in the first place. `viewer` may be a real seat or
+    /// the server's non-seat spectator sentinel.
+    ///
+    /// Serialized on purpose. The confusion this prevents crosses a JSON boundary:
+    /// without a marker on the wire, a projection is byte-identical to an
+    /// authoritative state whose carriers are legitimately absent, and installing
+    /// one leaves a prompt no player can answer (#8193). `skip_serializing_if`
+    /// keeps every authoritative payload byte-identical to what it is today, and
+    /// `default` keeps every pre-existing save loadable as `None`.
+    ///
+    /// NEVER `#[serde(skip)]`: that is defeated by exactly the round-trip this
+    /// exists to catch and would make the gate vacuous.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewer_projection: Option<PlayerId>,
     /// Private protocol ledger behind the public consent/ready waiting states.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolve_all_consent_run: Option<ResolveAllConsentRun>,
+    /// Private authority for an active shared stack-resolution session. Viewer
+    /// projections retain the public stack and priority state, never its frozen
+    /// cohort, target pins, or temporary auto-pass baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack_resolution_session: Option<StackResolutionSession>,
     /// Trusted interaction capability scope. Viewer-filtered copies always
     /// redact this field; only the engine uses it to mint opaque decision IDs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -15914,7 +17547,7 @@ declare_game_state! {
     /// existing CR 704.5a SBA (which already ends every realistic-life drain), so
     /// losing it across a save/load/MP-snapshot boundary only defers the shortcut by a
     /// few resolutions — never changes a winner. Snapshots are `Arc`-shared so the
-    /// frequent `GameState::clone` (AI search, §9 probes) pays O(ring.len()) refcount
+    /// frequent `GameState::clone` (AI search probes) pays O(ring.len()) refcount
     /// bumps, not deep copies. INTENTIONALLY omitted from `impl PartialEq for GameState`
     /// (derived state, like `static_source_index`/`static_gate_truth` — both
     /// `#[serde(skip)]` AND eq-excluded; NOT `public_state_dirty`/`state_revision`/
@@ -16161,6 +17794,10 @@ declare_game_state! {
     /// top-level chain entry (depth == 0) in `resolve_ability_chain`, and — when
     /// the chain is modal — again at each CR 700.2 mode boundary, keyed on
     /// [`Self::resolving_modal_instruction`].
+    ///
+    /// Resolution-scoped, so `normalize_for_loop` clears it for the CR 104.4b
+    /// position comparison: between resolutions it is the previous resolution's
+    /// residue and must not split two identical positions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_tracked_set_id: Option<TrackedSetId>,
 
@@ -16628,7 +18265,7 @@ declare_game_state! {
     #[serde(
         default,
         skip_serializing_if = "HashMap::is_empty",
-        with = "trigger_definition_ref_map"
+        with = "crate::types::deterministic_serde::hash_map_entries"
     )]
     pub trigger_fire_counts_this_turn: HashMap<TriggerDefinitionRef, u32>,
     /// CR 603.2: Tracks per-opponent-per-turn firing for
@@ -16659,6 +18296,24 @@ declare_game_state! {
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub crew_activated_this_turn: HashSet<ObjectIncarnationRef>,
+    /// CR 702.122a: Vehicles whose `KeywordAction::Crew` stack entry has
+    /// RESOLVED this turn — the explicit successful-crew provenance behind the
+    /// AI crew-repeat guard's payoff-in-force predicate
+    /// ([`crate::game::engine::crew_resolved_this_turn_contains`]). Recorded at
+    /// stack RESOLUTION (never at announcement — a countered crew never resolves
+    /// and never sets this, CR 701.6a) in the same arm that installs the UEOT
+    /// `AddType(Creature)` transient, so the marker and the payoff cannot drift.
+    /// Deliberately NOT derivable from `transient_continuous_effects`: a generic
+    /// SelfRef self-animation (Kylox, Voltstrider-class) installs the same
+    /// transient shape with no Crew resolution behind it. Cleared at turn start.
+    ///
+    /// Legacy saves default to an empty set: a save created after a crew already
+    /// resolved restores the UEOT transient without the marker, so the guard may
+    /// permit one bounded redundant crew before the first re-crew writes the
+    /// marker (mirrors the accepted `crew_activated_this_turn` legacy default).
+    #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+    pub crew_resolved_this_turn: HashSet<ObjectIncarnationRef>,
     /// CR 606.1 + CR 606.3 + CR 603.4: Per-player count of loyalty-ability
     /// activations this turn. Incremented in
     /// `planeswalker::finalize_loyalty_activation` whenever any loyalty ability
@@ -16723,7 +18378,8 @@ declare_game_state! {
     /// Empty except mid-declaration; drained by `finish_declare_attackers`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_attack_trigger_events: Vec<crate::types::events::GameEvent>,
-    /// CR 603.4: Per-ability per-turn resolution counter.
+    /// CR 608.2c: Per-ability per-turn resolution counter for ordinary
+    /// resolution-time conditions, not intervening-if conditions under CR 603.4.
     /// Keyed by `(source_id, ability_index)` — identifies a specific printed
     /// ability on a specific source object. Incremented at the top of
     /// `resolve_ability_chain` (depth 0) when the resolving ability has a
@@ -17087,6 +18743,12 @@ declare_game_state! {
     #[serde(skip)]
     pub resolving_continuation_attach_host: Option<AttachTarget>,
 
+    /// Execution-local view of the active generated player-scope continuation.
+    /// The serialized authority lives on `PendingContinuation`; every pause
+    /// re-parks it before control returns to callers.
+    #[serde(skip)]
+    pub(crate) resolving_player_scope_linked_exile: Option<PendingPlayerScopeLinkedExile>,
+
     /// CR 730.3e (second clause): routing override for the card components of a
     /// TOKEN merged permanent leaving the battlefield under a card-scoped
     /// (`NonToken`) `Moved` redirect. "If the merged permanent is a token but
@@ -17128,6 +18790,10 @@ declare_game_state! {
     /// `EffectZoneChoice`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_player_scope_sacrifice_choice: Option<PendingPlayerScopeSacrificeChoice>,
+    /// CR 101.4 + CR 118.12a: player-scoped unless-payment poll retained
+    /// across one-seat sacrifice choices and replacement pauses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_player_scope_unless_payment: Option<Box<PendingPlayerScopeUnlessPayment>>,
     /// CR 608.2c + CR 701.9a: a discard instruction parked by a
     /// replacement-application choice. See [`PendingDiscardBatch`], whose doc
     /// records why CR 616.1 does not govern this path.
@@ -17138,6 +18804,9 @@ declare_game_state! {
     /// box.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_discard_batch: Option<Box<PendingDiscardBatch>>,
+    /// CR 608.2c + CR 616.1: Progress for a replacement-suspended exile loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_exile_from_top_until: Option<Box<PendingExileFromTopUntil>>,
     /// CR 401.4: Remaining per-owner library-order batches for a mass
     /// `ChangeZoneAll` instruction paused on `EffectZoneChoice`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -17203,6 +18872,17 @@ declare_game_state! {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chosen_counter_kind_this_resolution: Option<CounterType>,
 
+    /// CR 608.2d: the colour a PERSISTING chooser bound during the current
+    /// resolution. Separate from `last_named_choice` (set for every named choice,
+    /// persisting or not, and not resolution-scoped) and from the source's
+    /// `ChosenAttribute::Color` history (which CR 607.2d readers own).
+    ///
+    /// Written only on the exact-object binding path, so a `persist: false`
+    /// printed `Choose a color.` — the F1 class — still writes nothing and
+    /// still resolves to a no-op. That gate is what keeps F1 out of this change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chosen_color_this_resolution: Option<crate::types::mana::ManaColor>,
+
     /// CR 609.7a-b: The most recently chosen damage source and its source
     /// filter. Set by `DamageSourceChoice`, consumed by prevention/replacement
     /// continuation effects, and then cleared.
@@ -17248,6 +18928,16 @@ declare_game_state! {
     /// serialization; rebuilt with `momir_pool`.
     #[serde(skip)]
     pub momir_pool_faces: Arc<HashMap<String, CardFace>>,
+
+    /// CR 400.11: the sealed booster products this game can open packs from.
+    /// Populated only when some card in the game carries
+    /// `Effect::OpenBoosterPack` (see `rehydrate_card_db_metadata`); empty
+    /// otherwise, so an ordinary game pays nothing for it. Skipped in
+    /// serialization and rebuilt deterministically per peer from the loaded card
+    /// DB — the pack a resolution actually opens travels in `waiting_for`, so no
+    /// peer needs the shelf to see it.
+    #[serde(skip)]
+    pub booster_shelf: Arc<BoosterShelf>,
 
     /// Display names for log resolution. Set by server; WASM leaves empty (defaults to "Player N").
     /// Skipped in serialization — runtime context only.
@@ -17888,12 +19578,16 @@ impl GameStateDecode {
             .as_object_mut()
             .ok_or_else(|| "persisted game state must be a JSON object".to_string())?;
         match mode {
-            // Historical raw persistence predates the explicit resolution-wire
-            // discriminator. This is the only ingress allowed to stamp v1.
+            // An UNVERSIONED raw payload carries no resolution-wire
+            // discriminator. Raw persistence in general does: the engine's own
+            // raw writer, `PersistedGameState::Raw`'s `Serialize`, routes
+            // through `ResolutionStateWire::to_value`, which always declares
+            // version 2. This is the only ingress allowed to infer a MISSING
+            // discriminator, and `declare_raw_resolution_wire` is the single
+            // authority that does. A payload that declares its own version
+            // keeps it and is handled exactly as any declared payload is.
             GameStateDecodeMode::PersistedRaw => {
-                object
-                    .entry("resolution_state_version".to_string())
-                    .or_insert_with(|| serde_json::Value::from(1));
+                crate::types::resolution::declare_raw_resolution_wire(object)?;
             }
             // Trusted snapshots are written as versioned resolution-wire
             // envelopes and must retain their declared compatibility mode.
@@ -17910,6 +19604,9 @@ impl GameStateDecode {
             .map_err(|error| error.to_string())?;
         validate_restored_zone_change_replay_keys(&state)?;
         normalize_delayed_trigger_allocators(&mut state)?;
+        // The PERSISTED half of the projection gate; `decode` below carries the other.
+        // See the pairing comment there for why one site is not enough.
+        reject_viewer_projection_as_authority(&state)?;
         validate_trigger_firing_coherence(&state)?;
         reject_zero_bound_shortcut_offer(&state)?;
         #[cfg(debug_assertions)]
@@ -17933,14 +19630,25 @@ impl GameStateDecode {
             )?;
         }
         migrate_legacy_turn_face_up_resume(&mut value)?;
+        migrate_legacy_dungeon_choice_previews(&mut value)?;
         let mut state = Self::materialize_prepared(value)?;
         normalize_delayed_trigger_allocators(&mut state)?;
+        // NO viewer-projection guard here, deliberately. This is the TRANSPORT decode
+        // path as much as a restore path: `ServerMessage::GameStarted { state, .. }`
+        // (`server-core/src/protocol.rs`) carries a `filter_state_for_viewer` projection
+        // by design, so a bare `GameState` deserialize is how a viewer legitimately
+        // receives a redacted board. Refusing projections here rejects that broadcast.
+        // The gate lives only on the PERSISTENCE ingress
+        // (`decode_persisted_resolution_state`), which is what a saved game restores
+        // through and where installing a projection as authority is the actual defect.
         validate_trigger_firing_coherence(&state)?;
-        // Both decode entry points guard, because they are genuinely two ingresses:
-        // `decode_persisted_resolution_state` above deserializes `ResolutionStateWire`
-        // itself and never routes through `decode`. Hosting the CR 732.2a bound check on
-        // only one of them leaves the other — the one a bare-`GameState` `impl Deserialize`
-        // reaches — able to revive a zero-bound offer.
+        // The CR 732.2a bound check IS hosted on both decode entry points, because they
+        // are genuinely two ingresses: `decode_persisted_resolution_state` above
+        // deserializes `ResolutionStateWire` itself and never routes through `decode`.
+        // Hosting it on only one leaves the other — the one a bare-`GameState`
+        // `impl Deserialize` reaches — able to revive a zero-bound offer. That argument
+        // is about a value no wire should ever carry; it does NOT extend to the
+        // projection marker, which the transport wire carries on purpose.
         reject_zero_bound_shortcut_offer(&state)?;
         #[cfg(debug_assertions)]
         debug_assert_runtime_resolution_invariants(&state);
@@ -17964,6 +19672,10 @@ impl GameStateDecode {
         migrate_legacy_mana_target_roles(value)?;
         migrate_legacy_tap_effects(value);
         migrate_legacy_turn_face_up_resume(value)?;
+        // Protocol 36: a v2 resolution wire is still accepted, and a v2 save can
+        // be paused at either dungeon prompt, so the compatibility boundary has
+        // to rebuild those payloads before `RawGameStateFields` sees them.
+        migrate_legacy_dungeon_choice_previews(value)?;
         Ok(())
     }
 
@@ -18014,6 +19726,18 @@ pub struct EndEffectPermission {
     pub cost: ManaCost,
 }
 
+/// Exact object bindings captured when a transient continuous effect begins.
+///
+/// CR 400.7 + CR 611.2b: both fields name the particular objects the resolved
+/// effect may affect or whose state may sustain its duration.  They travel in
+/// the same journaled install command as the rest of the effect, rather than
+/// being attached after installation, so replay cannot observe a partial TCE.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransientContinuousEffectBindings {
+    pub affected_recipient: Option<ObjectIncarnationRef>,
+    pub duration_subject: Option<ObjectIncarnationRef>,
+}
+
 /// A runtime-generated continuous effect stored at state level.
 ///
 /// Unlike `StaticDefinition` (which represents intrinsic/printed card text),
@@ -18042,12 +19766,13 @@ pub struct TransientContinuousEffect {
     /// subject diverge — Zygon Infiltrator: the copy modification applies to
     /// the source, but the duration tracks the copy *target*'s tap state.
     /// `None` for the common case where the duration tracks `affected` or the
-    /// source. Set only via [`GameState::set_transient_duration_subject`] on the
-    /// TCE that `add_transient_continuous_effect` just created, so all TCE
-    /// construction stays in one authority. Backward-compatible across the
-    /// WASM/multiplayer serialization boundary.
+    /// source. Captured in the journaled installation command together with
+    /// `affected_recipient`, so replay cannot reconstruct a partial effect.
+    /// Backward-compatible across the WASM/multiplayer serialization boundary:
+    /// the `ObjectIncarnationRef` serde migration converts legacy raw ids to a
+    /// non-current sentinel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub duration_subject: Option<ObjectId>,
+    pub duration_subject: Option<ObjectIncarnationRef>,
     /// CR 116.2c: see [`EndEffectPermission`]. `None` for every effect with no
     /// printed termination permission. Set inside the single construction
     /// authority (`add_transient_continuous_effect_with_end_permission`), so it
@@ -19244,6 +20969,23 @@ impl GameState {
         })
     }
 
+    /// Insert a continuation immediately outside the exact child stack raised
+    /// after `child_stack_start` was captured by its producer.
+    pub fn insert_ability_continuation_parent_at_child_boundary(
+        &mut self,
+        pending: PendingContinuation,
+        child_stack_start: ChildStackDepth,
+    ) -> Result<(), ResolutionStackError> {
+        let choose_zone_trigger_context = pending.trigger_context.clone();
+        self.resolution_stack.insert_parent_at_child_boundary(
+            super::resolution::ResolutionFrame::AbilityContinuation(AbilityContinuationFrame {
+                pending,
+                choose_zone_trigger_context,
+            }),
+            child_stack_start,
+        )
+    }
+
     /// Inserts the continuation outside an active general-drain/draw pair so
     /// the paused `PostReplacement` frame remains the draw's exact immediate
     /// parent until the child draw is complete.
@@ -19294,6 +21036,14 @@ impl GameState {
         &mut self,
     ) -> Result<Option<AbilityContinuationFrame>, ResolutionStackError> {
         self.resolution_stack.take_active_ability_continuation()
+    }
+
+    /// Consume only the continuation that owns the active Attach choice.
+    pub fn take_active_attachment_choice_continuation(
+        &mut self,
+    ) -> Result<Option<AbilityContinuationFrame>, ResolutionStackError> {
+        self.resolution_stack
+            .take_active_attachment_choice_continuation()
     }
 
     /// Clear the active continuation when the enclosing resolution is
@@ -19360,6 +21110,23 @@ impl GameState {
             pending: None,
             devour_eligible_snapshot: Some(snapshot),
         });
+    }
+
+    /// CR 614.12a + CR 614.13a: A Devour-only ChangeZone frame owns the
+    /// pre-entry eligibility snapshot for exactly one completed entry event.
+    /// Once that event's replacement work has returned without parking an
+    /// iteration, retire the now-ownerless frame.
+    pub fn clear_completed_active_devour_snapshot(&mut self) -> bool {
+        if !self.active_change_zone_frame().is_some_and(|frame| {
+            frame.pending.is_none() && frame.devour_eligible_snapshot.is_some()
+        }) {
+            return false;
+        }
+
+        let _ = self
+            .take_active_change_zone_frame()
+            .expect("a completed Devour-only ChangeZone frame must be active");
+        true
     }
 
     /// Parks a newly paused ChangeZone iteration. A Devour-only frame belongs
@@ -20402,26 +22169,27 @@ impl GameState {
             .finish_post_replacement_dispatch(dispatch)
     }
 
-    /// Retires only the exact top general drain whose continuation paused and
-    /// whose MultiDraw child has already completed.
+    /// CR 608.2c + CR 614.1a: Retires the exact top general drain after its
+    /// interrupted instruction completes. An empty Attach replacement pair
+    /// also retires its marked child before generic continuation draining can
+    /// replay that instruction.
     pub fn finish_active_paused_post_replacement_dispatch(&mut self) {
         let finished = self
             .active_post_replacement_drains_mut()
             .and_then(PostReplacementDrainStack::finish_paused_dispatch);
         if finished.is_some() {
-            self.remove_empty_active_post_replacement_frame();
+            if !self
+                .resolution_stack
+                .take_active_empty_post_replacement_attach_choice_pair()
+            {
+                self.remove_empty_active_post_replacement_frame();
+            }
             // CR 614.12a + CR 614.13a: a Devour-only ChangeZone snapshot stays
             // resident while its exact post-replacement child resolves. Once that
             // child is retired, the snapshot is again the active owner and its
             // single-entry lifetime ends. A pending iteration keeps its snapshot
             // for the remaining co-arrivers.
-            if self.active_change_zone_frame().is_some_and(|frame| {
-                frame.pending.is_none() && frame.devour_eligible_snapshot.is_some()
-            }) {
-                let _ = self
-                    .take_active_change_zone_frame()
-                    .expect("a completed Devour-only ChangeZone frame must be active");
-            }
+            self.clear_completed_active_devour_snapshot();
         }
     }
 
@@ -21773,7 +23541,9 @@ impl GameState {
                 player: starting_player,
             },
             next_resolve_all_consent_epoch: initial_resolve_all_consent_epoch(),
+            viewer_projection: None,
             resolve_all_consent_run: None,
+            stack_resolution_session: None,
             interaction_session_id: None,
             interaction_generation: 0,
             next_interaction_serial: default_interaction_serial(),
@@ -21873,6 +23643,7 @@ impl GameState {
             activated_abilities_this_turn: HashMap::new(),
             activated_abilities_this_game: HashMap::new(),
             crew_activated_this_turn: HashSet::new(),
+            crew_resolved_this_turn: HashSet::new(),
             loyalty_abilities_activated_this_turn: HashMap::new(),
             extra_loyalty_activations_this_turn: HashMap::new(),
             exerted_this_turn: std::collections::HashSet::new(),
@@ -21935,10 +23706,13 @@ impl GameState {
             product_knowledge_state: Box::default(),
             resolution_stack: Box::default(),
             resolving_continuation_attach_host: None,
+            resolving_player_scope_linked_exile: None,
             merged_card_component_route: None,
             resolution_coin_flip: None,
             pending_player_scope_sacrifice_choice: None,
+            pending_player_scope_unless_payment: None,
             pending_discard_batch: None,
+            pending_exile_from_top_until: None,
             pending_mass_library_order_choice: None,
             pending_scoped_library_search: None,
             pending_library_search_delivery: None,
@@ -21950,6 +23724,7 @@ impl GameState {
             resolving_begin_game_abilities: false,
             last_named_choice: None,
             chosen_counter_kind_this_resolution: None,
+            chosen_color_this_resolution: None,
             last_chosen_damage_source: None,
             all_creature_types: Vec::new(),
             all_card_names: Arc::from([]),
@@ -21957,6 +23732,7 @@ impl GameState {
             meld_pair_registry: Arc::new(HashMap::new()),
             momir_pool: BTreeMap::new(),
             momir_pool_faces: Arc::new(HashMap::new()),
+            booster_shelf: Arc::new(BoosterShelf::default()),
             log_player_names: Vec::new(),
             last_created_token_ids: Vec::new(),
             last_revealed_ids: Vec::new(),
@@ -22082,11 +23858,84 @@ impl GameState {
         self.next_timestamp = self.next_timestamp.max(timestamp.saturating_add(1));
     }
 
+    /// CR 603.5: Derive the only same-card selector the engine may issue for a
+    /// live optional-trigger prompt. Every provenance or identity mismatch
+    /// fails closed; clients only receive availability, never this selector.
+    pub fn same_card_may_trigger_auto_choice_selector(
+        &self,
+        key: &MayTriggerAutoChoiceKey,
+    ) -> Option<MayTriggerAutoChoiceSelector> {
+        let MayTriggerOrigin::Definition { definition_ref } = &key.origin else {
+            return None;
+        };
+        let TriggerDefinitionOccurrenceRef::Printed { printed_index, .. } =
+            &definition_ref.occurrence
+        else {
+            return None;
+        };
+        if definition_ref.source.object_id != key.source_id {
+            return None;
+        }
+        let source = self.objects.get(&key.source_id)?;
+        if source.incarnation != definition_ref.source.incarnation
+            || !source.is_represented_by_a_card()
+            || !source
+                .trigger_definitions
+                .iter_all()
+                .any(|entry| source.trigger_definition_ref(entry) == *definition_ref)
+        {
+            return None;
+        }
+        Some(MayTriggerAutoChoiceSelector::SameCard {
+            player: key.player,
+            printed_ref: source.base_printed_ref.clone()?,
+            printed_occurrence: *printed_index,
+        })
+    }
+
+    pub fn may_trigger_same_card_choice_available(&self, key: &MayTriggerAutoChoiceKey) -> bool {
+        self.same_card_may_trigger_auto_choice_selector(key)
+            .is_some()
+    }
+
+    /// CR 603.5: Legacy exact-instance lookup. Kept as the compatibility
+    /// boundary for callers that deliberately know only the old key shape.
     pub fn may_trigger_auto_choice(&self, key: &MayTriggerAutoChoiceKey) -> Option<AutoMayChoice> {
+        let selector = MayTriggerAutoChoiceSelector::exact(key.clone());
         self.may_trigger_auto_choices
             .iter()
-            .find(|record| record.key == *key)
+            .find(|record| record.selector == selector)
             .map(|record| record.choice)
+    }
+
+    /// CR 603.5: Exact-instance preferences always win over same-card
+    /// preferences. The caller supplies a selector only after the live prompt
+    /// proved it eligible, so malformed persisted same-card entries never
+    /// manufacture authority.
+    pub fn may_trigger_auto_choice_for_prompt(
+        &self,
+        exact: &MayTriggerAutoChoiceKey,
+        same_card: Option<&MayTriggerAutoChoiceSelector>,
+    ) -> Option<AutoMayChoice> {
+        self.may_trigger_auto_choice(exact).or_else(|| {
+            same_card.and_then(|selector| {
+                self.may_trigger_auto_choices
+                    .iter()
+                    .find(|record| record.selector == *selector)
+                    .map(|record| record.choice)
+            })
+        })
+    }
+
+    /// CR 603.5: Resolve a stored answer for a live prompt. Same-card
+    /// preferences are eligible only when this exact live key derives an
+    /// engine-authorized selector; exact-instance choices always win.
+    pub fn may_trigger_auto_choice_for_live_prompt(
+        &self,
+        key: &MayTriggerAutoChoiceKey,
+    ) -> Option<AutoMayChoice> {
+        let same_card = self.same_card_may_trigger_auto_choice_selector(key);
+        self.may_trigger_auto_choice_for_prompt(key, same_card.as_ref())
     }
 
     pub fn set_may_trigger_auto_choice(
@@ -22094,15 +23943,23 @@ impl GameState {
         key: MayTriggerAutoChoiceKey,
         choice: AutoMayChoice,
     ) {
+        self.set_may_trigger_auto_choice_selector(MayTriggerAutoChoiceSelector::exact(key), choice);
+    }
+
+    pub fn set_may_trigger_auto_choice_selector(
+        &mut self,
+        selector: MayTriggerAutoChoiceSelector,
+        choice: AutoMayChoice,
+    ) {
         if let Some(record) = self
             .may_trigger_auto_choices
             .iter_mut()
-            .find(|record| record.key == key)
+            .find(|record| record.selector == selector)
         {
             record.choice = choice;
         } else {
             self.may_trigger_auto_choices
-                .push(MayTriggerAutoChoiceRecord { key, choice });
+                .push(MayTriggerAutoChoiceRecord { selector, choice });
         }
     }
 
@@ -22110,15 +23967,24 @@ impl GameState {
     /// optional ("may") trigger. The key already scopes to one player, source,
     /// and origin.
     pub fn remove_may_trigger_auto_choice(&mut self, key: &MayTriggerAutoChoiceKey) {
+        self.remove_may_trigger_auto_choice_selector(&MayTriggerAutoChoiceSelector::exact(
+            key.clone(),
+        ));
+    }
+
+    pub fn remove_may_trigger_auto_choice_selector(
+        &mut self,
+        selector: &MayTriggerAutoChoiceSelector,
+    ) {
         self.may_trigger_auto_choices
-            .retain(|record| record.key != *key);
+            .retain(|record| record.selector != *selector);
     }
 
     /// CR 603.5: Revoke all stored "don't ask again" auto-choices belonging to
     /// `player` for optional ("may") triggers.
     pub fn clear_may_trigger_auto_choices(&mut self, player: PlayerId) {
         self.may_trigger_auto_choices
-            .retain(|record| record.key.player != player);
+            .retain(|record| record.selector.player() != player);
     }
 
     /// CR 603.3b: upsert a trigger-ordering [`DecisionTemplate`], replacing any existing
@@ -22346,12 +24212,38 @@ impl GameState {
             modifications,
             condition,
             None,
+            TransientContinuousEffectBindings::default(),
+        )
+    }
+
+    /// Register a transient continuous effect with exact object identities
+    /// captured as part of the same journaled installation command.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_transient_continuous_effect_with_bindings(
+        &mut self,
+        source_id: ObjectId,
+        controller: PlayerId,
+        duration: Duration,
+        affected: TargetFilter,
+        modifications: Vec<ContinuousModification>,
+        condition: Option<StaticCondition>,
+        bindings: TransientContinuousEffectBindings,
+    ) -> u64 {
+        self.add_transient_continuous_effect_inner(
+            source_id,
+            controller,
+            duration,
+            affected,
+            modifications,
+            condition,
+            None,
+            bindings,
         )
     }
 
     /// CR 116.2c: install a continuous effect that carries a pay-to-end
     /// permission. The permission is threaded into the construction authority
-    /// (rather than post-stamped like `duration_subject`) so it rides INSIDE
+    /// together with the exact object bindings, so it rides INSIDE
     /// the journaled `ResolvedContinuousEffectCommand` and survives replay.
     ///
     /// One argument wider than the plain constructor by construction — it is the
@@ -22377,6 +24269,7 @@ impl GameState {
             modifications,
             condition,
             Some(end_permission),
+            TransientContinuousEffectBindings::default(),
         )
     }
 
@@ -22390,6 +24283,7 @@ impl GameState {
         modifications: Vec<ContinuousModification>,
         condition: Option<StaticCondition>,
         end_permission: Option<EndEffectPermission>,
+        bindings: TransientContinuousEffectBindings,
     ) -> u64 {
         let id = self.next_continuous_effect_id;
         self.next_continuous_effect_id += 1;
@@ -22417,10 +24311,10 @@ impl GameState {
                 timestamp,
                 duration,
                 affected,
-                affected_recipient: None,
+                affected_recipient: bindings.affected_recipient,
                 modifications,
                 condition,
-                duration_subject: None,
+                duration_subject: bindings.duration_subject,
                 end_permission,
                 source_name,
             },
@@ -22508,39 +24402,6 @@ impl GameState {
         self.next_timestamp = self.next_timestamp.max(command.resulting_next_timestamp);
         self.layers_dirty.mark_full();
         Ok(())
-    }
-
-    /// Bind a transient effect to the exact recipient resolved by a one-shot
-    /// instruction. Dynamic effects intentionally leave this unset.
-    pub fn set_transient_affected_recipient(&mut self, id: u64, recipient: ObjectIncarnationRef) {
-        if let Some(tce) = self
-            .transient_continuous_effects
-            .iter_mut()
-            .find(|tce| tce.id == id)
-        {
-            tce.affected_recipient = Some(recipient);
-            self.layers_dirty.mark_full();
-        }
-    }
-
-    /// CR 611.2b + CR 110.5d: bind a target-relative `ForAsLongAs` duration to a
-    /// concrete object resolved at effect-resolution time, on the TCE that
-    /// [`Self::add_transient_continuous_effect`] just created (addressed by its
-    /// returned `id`). Used when the duration's tracked subject diverges from the
-    /// effect's `affected` recipient — Zygon Infiltrator: the copy modification
-    /// applies to the source, but the duration tracks the copy *target*'s tap
-    /// state. Keeps construction in one authority (no second constructor); the
-    /// only divergent caller is `effects/become_copy.rs`. Marks layers dirty so
-    /// the duration re-evaluation picks up the binding.
-    pub fn set_transient_duration_subject(&mut self, id: u64, subject: ObjectId) {
-        if let Some(tce) = self
-            .transient_continuous_effects
-            .iter_mut()
-            .find(|tce| tce.id == id)
-        {
-            tce.duration_subject = Some(subject);
-            self.layers_dirty.mark_full();
-        }
     }
 
     /// Migrate the pre-2026-05-09 audit M4 split-slot
@@ -22655,6 +24516,7 @@ impl GameState {
         // following PutChosenCounter, so distinct live values must not share a
         // loop pre-filter fingerprint.
         self.chosen_counter_kind_this_resolution.hash(&mut h);
+        self.chosen_color_this_resolution.hash(&mut h);
         self.stack.len().hash(&mut h);
         self.objects.len().hash(&mut h);
         // im::Vector<ObjectId>: Hash, ordered.
@@ -22732,10 +24594,28 @@ impl GameState {
         // then differ here alone and never confirm a repeated position. It is
         // eq-compared (AI-search dedup legitimately reads it), so it is
         // normalized away HERE rather than excluded from `PartialEq`.
-        // NOTE: its lockstep partner `chain_tracked_set_id` carries the same
-        // residue and is deliberately NOT cleared here — that is pre-existing
-        // behavior with its own follow-up, not something this line may widen.
         clone.resolving_modal_instruction = None;
+        // CR 608.2c + CR 104.4b: the chain tracked-set pointer is that latch's
+        // lockstep partner and is resolution-scoped for the same reason — a chain's
+        // "those cards" anaphor names only what THIS resolution's instructions
+        // produced. Nothing narrows it at chain EXIT (a `repeat_for` drain even
+        // re-enters at depth 1 to preserve it), so between resolutions it still names
+        // the last resolution's set while the arena it points into
+        // (`tracked_object_sets` / `next_tracked_set_id` — real accumulated content,
+        // deliberately left compared) is unchanged. The pointer alone then splits two
+        // identical positions, so neither the CR 104.4b draw confirmation nor the
+        // CR 732.2a recurrence certification that shares this seam can confirm a
+        // repeat.
+        clone.chain_tracked_set_id = None;
+        // CR 104.4b: the journal coordinate is monotonic provenance, while the
+        // caster and Some-vs-None state remain rules-relevant. Canonicalize the
+        // coordinate on both object and stack-ability carriers so derived stack
+        // equality cannot split an otherwise recurring position.
+        for (_, object) in clone.objects.iter_mut() {
+            if let Some(occurrence) = object.cast_occurrence.as_mut() {
+                occurrence.turn_journal_index = 0;
+            }
+        }
         // CR 104.4b + CR 400.7: the all-zone incarnation bump advances a source's
         // epoch on every zone change, so a mandatory loop that cycles its source's
         // zones would otherwise carry a growing `TriggerSourceContext` into loop
@@ -22749,6 +24629,13 @@ impl GameState {
         for entry in clone.stack.iter_mut() {
             if let Some(ability) = entry.ability_mut() {
                 ability.clear_trigger_identity_recursive();
+                ability.normalize_cast_occurrence_for_loop_recursive();
+            }
+        }
+        if let Some(entry) = clone.resolving_stack_entry.as_mut() {
+            if let Some(ability) = entry.ability_mut() {
+                ability.clear_trigger_identity_recursive();
+                ability.normalize_cast_occurrence_for_loop_recursive();
             }
         }
         // `PendingTrigger::timestamp` is a live CR 603.3b ordering key. It is
@@ -23194,7 +25081,7 @@ impl GameState {
 
     /// CR 732.2a: take (remove and return) the whole deferred materialization list for
     /// `controller`, if any. Removing on take is load-bearing for the boundary collapse
-    /// fixpoint (§7): the `LoopCollapse` submit handler must clear the stash — even on
+    /// fixpoint: the `LoopCollapse` submit handler must clear the stash — even on
     /// its error path — so the phase-transition re-drain terminates rather than
     /// re-prompting forever.
     pub fn take_pending_materialization(
@@ -23320,8 +25207,11 @@ impl GameState {
     /// projecting, because the marks and their enablers are still live. This set says nothing
     /// about them — it names what the boundary will REMOVE, not what the display may show.
     ///
-    /// Returns the axes UNFILTERED, including any `Mana(_)` a `DriveSequence` names, because the
-    /// caller MUST remove that axis at the boundary. Note the two axis classes end their `∞` by
+    /// Returns the axes UNFILTERED because filtering is the REGISTRATION site's job, not this
+    /// reader's — `game::engine::materialize_object_growth_shortcut` stores only `DeferredAccrual`
+    /// axes (`analysis::resource::ResourceAxis::unbounded_mark_kind`), so a stored `Mana(_)` can
+    /// now arrive only from a pre-fix save or a deliberate test graft, and this function reports
+    /// faithfully what is stored rather than hiding it. Note the two axis classes end their `∞` by
     /// different routes: `Tokens` / `Counters` / `Life` are DEFERRED and end here, when the
     /// boundary applies the growth; a `Mana(_)` is already materialized in the pool
     /// (`mana_payment::refill_infinite_mana` re-tops it off this very store) and its `∞` ends at
@@ -23336,6 +25226,9 @@ impl GameState {
     /// FAIL-CLOSED: only an axis some REGISTERED item actually collapses is returned, so an
     /// ∞ axis with no registration (a mana engine registers nothing) is never removed here —
     /// it keeps its badge until CR 500.5 ends it.
+    /// The `DriveSequence` arm's verbatim `extend` is correct *because* the stored set is now
+    /// computed at REGISTRATION rather than copied from the loop's whole ∞-mark set — see
+    /// `analysis::resource::ResourceAxis::unbounded_mark_kind`.
     /// EXHAUSTIVE over `PersistentAxisMaterialization` (no wildcard) — a future variant
     /// build-breaks here instead of silently leaking a stale `∞`.
     pub fn scheduled_collapse_axes(
@@ -23388,13 +25281,20 @@ impl GameState {
     ///   its axis + pill).
     /// - `Life { player, .. }` ⇒ remove `ResourceAxis::Life(player)`.
     /// - `DriveSequence { collapsed_axes, .. }` ⇒ remove exactly `collapsed_axes` and the
-    ///   display targets those axes back (the driven loop collapses whole).
+    ///   display targets those axes back (the driven loop collapses its `DeferredAccrual` axes;
+    ///   a `StandingCapability` axis it never named is not collapsed here — see
+    ///   `analysis::resource::ResourceAxis::unbounded_mark_kind`).
     ///
     /// PRESERVES any coexisting NON-collapsed axis (a debug `SetInfiniteMana` `Mana(_)`
     /// axis, or a second uncollapsed loop). The batched `Tokens` / `Counters` / `Life` items
-    /// never name a `Mana(_)` axis, so a batched collapse preserves mana by construction; a
-    /// `DriveSequence` CAN name one (its `collapsed_axes` is the loop's whole `proposal.unbounded`
-    /// set) and then removing it here is correct — that loop's mana really did end with it.
+    /// never name a `Mana(_)` axis, so a batched collapse preserves mana by construction; and NO
+    /// PRODUCTION PATH constructs a `DriveSequence` naming one either —
+    /// `game::engine::materialize_object_growth_shortcut` is the only production registration
+    /// site and it filters `collapsed_axes` to `DeferredAccrual`. So both routes now preserve a
+    /// standing `Mana(_)` capability by the SAME rule, and the preservation promise in
+    /// `game::engine_resolution_choices` holds on both. (Deliberately "no production path", not
+    /// "cannot exist": shipped fixtures graft `Mana(_)`-naming `DriveSequence`s by hand to
+    /// exercise the projection, and this function reports whatever is stored.)
     /// Drops `unbounded_resources[controller]`
     /// (and its `unbounded_loop_enablers` entry in engine-state lockstep, mirroring
     /// `clear_unbounded_mana_loop`) only when its axis set becomes empty. Always removes
@@ -23409,6 +25309,22 @@ impl GameState {
         // The axis set comes from `scheduled_collapse_axes`, so "what a stash schedules" and
         // "what is removed once applied" are one match, never two copies of it.
         let mut axes_to_remove = self.scheduled_collapse_axes(collapsed);
+        // CR 500.5 + CR 106.4: DEFENSE IN DEPTH at the consuming authority.
+        // `game::engine::materialize_object_growth_shortcut` already stores only
+        // `DeferredAccrual` axes, so on a stash from THIS build this retain removes nothing. It
+        // is kept because `ResourceAxis`'s exhaustive `match` build-breaks on a new AXIS, never
+        // on a new REGISTRATION SITE: a future second producer inherits the guarantee only if it
+        // is enforced where the value is USED. Reachability, not an obligation:
+        // `pending_unbounded_materialization` is `#[serde]`-persisted, so a `Mana(_)`-bearing
+        // stash can be grafted by a test or written by an older build (cross-version save
+        // compatibility is EXPRESSLY NOT a goal here), and either route lands ONLY on a
+        // `debug_infinite_mana` seat — `turns::drain_pending_phase_transition_progress`' CR 500.5
+        // loop-mana clear runs before this prompt and excludes exactly those seats. Mirrors the
+        // POSTURE of `derived_views::scheduled_display_axes`, NOT its question, so the predicates
+        // are deliberately NOT unified. Not applied inside `scheduled_collapse_axes`, which must
+        // keep reporting faithfully what a stash stores.
+        axes_to_remove
+            .retain(|axis| axis.unbounded_mark_kind() == UnboundedMarkKind::DeferredAccrual);
         // The token pile drops exactly when the token axis collapses — true for a batched
         // `Tokens` item and for a `DriveSequence` that names `TokensCreated`.
         let drop_token_pile = axes_to_remove.contains(&ResourceAxis::TokensCreated);
@@ -23481,7 +25397,7 @@ impl GameState {
     /// set, drop the player key AND its `unbounded_loop_enablers` entry IN LOCKSTEP (an engine-state
     /// invariant, not a rules requirement):
     /// enablers track the PRESENCE of any unbounded axis, and the `zones.rs` defuse hook
-    /// (`apply_zone_exit_cleanup`, `:534`–`:544`) whole-clears a controller's capability when ANY
+    /// (`apply_zone_exit_cleanup`) whole-clears a controller's capability when ANY
     /// enabler leaves. Leaving enablers orphaned (no backing axis) is a landmine — a later
     /// `SetInfiniteMana` re-marks that controller, then the stale enabler leaving mis-fires
     /// `clear_unbounded_loop`, silently killing the debug toggle. If a coexisting NON-Mana axis
@@ -23536,14 +25452,14 @@ pub(crate) fn objects_content_eq(
 /// comparator for [`objects_content_eq`] and the PR-7 Phase 4a object-growth
 /// cover gate (`analysis::resource::board_covers`, the non-grown complement).
 ///
-/// The compared set is the bucket-(i) partition of §5.2c (see
-/// `_gameobject_partition_is_total`): every per-object field a MANDATORY action can
+/// The compared set is the partition `_gameobject_partition_is_total` names: every per-object
+/// field a MANDATORY action can
 /// change on a stable (same-zone) object between two loop frames. Fields omitted
 /// here are justified by write site, not doc-string — volatile layer identity
 /// (`timestamp`/`incarnation`/`transformation_count`), projected P/T, cast-fact
 /// latches co-variate of a
 /// compared field, monotone-saturating latches (`foretold`/`monstrous`/…), and
-/// layer-derived characteristics (firewall-scanned statics) — see §5.2c.
+/// layer-derived characteristics (firewall-scanned statics).
 ///
 /// Strictness here is FAIL-SAFE for the shared 2p CR 104.4b path: a stricter
 /// equality can only SUPPRESS a wrongful draw, and every compared field represents
@@ -23575,7 +25491,7 @@ pub(crate) fn object_content_eq(x: &GameObject, y: &GameObject) -> bool {
         && x.loyalty == y.loyalty
         && x.defense == y.defense
         && x.name == y.name
-        // §5.2c ADD set (v4): firewall-blind numeric/growable accumulators and
+        // Firewall-blind numeric/growable accumulators and
         // oscillating designations that a loop body can drift on a stable object.
         && x.intensity == y.intensity // Alchemy Intensify accumulator
         && x.perpetual_mods == y.perpetual_mods // perpetual-edit accumulator
@@ -23584,14 +25500,18 @@ pub(crate) fn object_content_eq(x: &GameObject, y: &GameObject) -> bool {
         && x.contraption_sprocket == y.contraption_sprocket
         && x.is_suspected == y.is_suspected // CR 701.60a designation
         && x.prepared == y.prepared // SOS prepare/unprepare toggle
+        && x.prepared_copy_source == y.prepared_copy_source // CR 722.3c linked exile copy
         && x.room_unlocks == y.room_unlocks // CR 709.5c door lock/unlock
-        // §5.2c ADD set (v5, S6): firewall-blind per-iteration accumulators on
+        // Firewall-blind per-iteration accumulators on
         // live battlefield/exile objects.
         && x.chosen_attributes == y.chosen_attributes // CR 205.2 remember/choose accumulator
         && x.goaded_by == y.goaded_by // CR 701.15c goad set
         && x.detained_by == y.detained_by // CR 701.35a detain set
         && x.casting_permissions == y.casting_permissions // CR 715.3d exile-grant Vec
         && x.saddled_by == y.saddled_by // CR 702.171c saddle set
+        // #6865: a cast occurrence is resolution-semantic provenance while the
+        // spell remains on the stack. Comparing it is fail-safe for loop detection.
+        && x.cast_occurrence == y.cast_occurrence
 }
 
 /// CR 104.4b compile-time totality guard for the object-growth cover gate's
@@ -23600,7 +25520,7 @@ pub(crate) fn object_content_eq(x: &GameObject, y: &GameObject) -> bool {
 /// no-`..` destructure breaks the build the instant a GameState field is added,
 /// forcing a reviewer to decide whether `PartialEq` compares it — so no future
 /// field can become a hidden per-cycle accumulator that rides a covering pair to a
-/// false CR 732.2a win. Mirror of `_gameobject_partition_is_total` (§5.2b).
+/// false CR 732.2a win. Mirror of `_gameobject_partition_is_total`.
 #[cfg(test)]
 fn _gamestate_partition_is_total(s: &GameState) {
     let GameState {
@@ -23636,7 +25556,12 @@ fn _gamestate_partition_is_total(s: &GameState) {
         combat: _,
         waiting_for: _,
         next_resolve_all_consent_epoch: _,
+        // `viewer_projection`: COMPARED (fail-safe). It is `None` on every authoritative
+        // state, so every loop-detection sample compares `None == None` and COMPARING it
+        // can never suppress a legitimate CR 104.4b repeat. It is not an accumulator.
+        viewer_projection: _,
         resolve_all_consent_run: _,
+        stack_resolution_session: _,
         interaction_session_id: _,
         interaction_generation: _,
         next_interaction_serial: _,
@@ -23759,6 +25684,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         activated_abilities_this_turn: _,
         activated_abilities_this_game: _,
         crew_activated_this_turn: _,
+        crew_resolved_this_turn: _,
         loyalty_abilities_activated_this_turn: _,
         extra_loyalty_activations_this_turn: _,
         exerted_this_turn: _,
@@ -23821,6 +25747,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         product_knowledge_state: _,
         resolution_stack: _,
         resolving_continuation_attach_host: _,
+        resolving_player_scope_linked_exile: _,
         merged_card_component_route: _,
         resolution_coin_flip: _,
         may_trigger_auto_choices: _,
@@ -23830,6 +25757,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         resolving_begin_game_abilities: _,
         last_named_choice: _,
         chosen_counter_kind_this_resolution: _,
+        chosen_color_this_resolution: _,
         last_chosen_damage_source: _,
         all_creature_types: _,
         all_card_names: _,
@@ -23837,6 +25765,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         meld_pair_registry: _,
         momir_pool: _,
         momir_pool_faces: _,
+        booster_shelf: _,
         log_player_names: _,
         last_created_token_ids: _,
         last_revealed_ids: _,
@@ -23931,7 +25860,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         //     COMPARED — upstream's PartialEq excludes it, but excluding a COUNT from the cover gate
         //     is the fail-DANGEROUS direction, so `eq_except_growable` (resource.rs) compares it
         //     explicitly. It is `None` at every sample beat (cleared whenever `waiting_for ==
-        //     Priority`, effects/mod.rs:759) or a constant direct-assigned count across a real
+        //     Priority`, in `effects/mod.rs`) or a constant direct-assigned count across a real
         //     copy-token loop, so COMPARING never suppresses a legitimate loop's detection.
         //   - `pending_discard_batch`: COMPARED (hand-written `impl PartialEq` conjunct) — a
         //     paused discard-batch interaction state, the direct sibling of
@@ -23940,7 +25869,9 @@ fn _gamestate_partition_is_total(s: &GameState) {
         //     value is correctly not a fixed-point repeat and COMPARING it can never suppress a
         //     legitimate loop's detection.
         pending_player_scope_sacrifice_choice: _,
+        pending_player_scope_unless_payment: _,
         pending_discard_batch: _,
+        pending_exile_from_top_until: _,
         pending_mass_library_order_choice: _,
         pending_scoped_library_search: _,
         pending_library_search_delivery: _,
@@ -24003,7 +25934,9 @@ impl PartialEq for GameState {
             && self.combat == other.combat
             && self.waiting_for == other.waiting_for
             && self.next_resolve_all_consent_epoch == other.next_resolve_all_consent_epoch
+            && self.viewer_projection == other.viewer_projection
             && self.resolve_all_consent_run == other.resolve_all_consent_run
+            && self.stack_resolution_session == other.stack_resolution_session
             && self.lands_played_this_turn == other.lands_played_this_turn
             && self.max_lands_per_turn == other.max_lands_per_turn
             && self.priority_pass_count == other.priority_pass_count
@@ -24084,6 +26017,7 @@ impl PartialEq for GameState {
             && self.activated_abilities_this_turn == other.activated_abilities_this_turn
             && self.activated_abilities_this_game == other.activated_abilities_this_game
             && self.crew_activated_this_turn == other.crew_activated_this_turn
+            && self.crew_resolved_this_turn == other.crew_resolved_this_turn
             && self.loyalty_abilities_activated_this_turn
                 == other.loyalty_abilities_activated_this_turn
             && self.extra_loyalty_activations_this_turn == other.extra_loyalty_activations_this_turn
@@ -24154,7 +26088,10 @@ impl PartialEq for GameState {
             && self.resolution_coin_flip == other.resolution_coin_flip
             && self.pending_player_scope_sacrifice_choice
                 == other.pending_player_scope_sacrifice_choice
+            && self.pending_player_scope_unless_payment
+                == other.pending_player_scope_unless_payment
             && self.pending_discard_batch == other.pending_discard_batch
+            && self.pending_exile_from_top_until == other.pending_exile_from_top_until
             && self.pending_combat_lifelink == other.pending_combat_lifelink
             && self.pending_mass_library_order_choice
                 == other.pending_mass_library_order_choice
@@ -24174,6 +26111,7 @@ impl PartialEq for GameState {
             && self.last_named_choice == other.last_named_choice
             && self.chosen_counter_kind_this_resolution
                 == other.chosen_counter_kind_this_resolution
+            && self.chosen_color_this_resolution == other.chosen_color_this_resolution
             && self.last_revealed_ids == other.last_revealed_ids
             && self.private_look_ids == other.private_look_ids
             && self.private_look_player == other.private_look_player
@@ -24344,6 +26282,7 @@ mod resolved_information_tests {
                 enters_attacking: false,
                 kept_optional_to: None,
                 enters_under: None,
+                kept_destination_if: None,
             },
             vec![],
             ObjectId(101),
@@ -24496,7 +26435,7 @@ mod forced_cascade_window_tests {
     /// CR 603.3b / CR 603.3d / CR 603.5 + CR 608.2d / CR 903.9a / CR 704.5j /
     /// CR 310.11 / CR 703.1 + CR 117.3a: the membership matrix for
     /// [`WaitingFor::is_forced_cascade_window`], asserted in BOTH directions —
-    /// thirteen members and eight non-members, each named.
+    /// thirteen members and nine non-members, each named.
     ///
     /// The class is defined by "no player has priority here", and each half of the
     /// matrix pins a different consequence:
@@ -24585,6 +26524,7 @@ mod forced_cascade_window_tests {
                     source_id: ObjectId(1),
                     description: None,
                     may_trigger_key: None,
+                    same_card_may_trigger_choice_available: false,
                 },
             ),
             (
@@ -24604,7 +26544,7 @@ mod forced_cascade_window_tests {
                 },
             ),
             (
-                "BattleProtectorChoice (CR 310.11 + CR 704.5w / CR 704.5x — likewise an SBA)",
+                "BattleProtectorChoice (CR 310.11 + CR 704.5x — likewise an SBA)",
                 WaitingFor::BattleProtectorChoice {
                     player: PlayerId(0),
                     battle_id: ObjectId(5),
@@ -24675,6 +26615,14 @@ mod forced_cascade_window_tests {
         ];
 
         let not_forced: Vec<(&str, WaitingFor)> = vec![
+            (
+                "ResolutionOptionalPaymentChoice — a Phyrexian branch can MOVE LIFE",
+                WaitingFor::ResolutionOptionalPaymentChoice {
+                    player: PlayerId(0),
+                    source_id: ObjectId(1),
+                    costs: Vec::new(),
+                },
+            ),
             (
                 "Priority{active} — CR 704.3 SBA point, must sample or clear",
                 WaitingFor::Priority {
@@ -25344,8 +27292,10 @@ mod tests {
     use crate::types::deterministic_serde::test_support::ReverseBuildHasher;
     use crate::types::identifiers::{
         CardId, DelayedTriggerInstanceId, DelayedTriggerOrigin, DelayedTriggerToken,
+        LEGACY_INCARNATION,
     };
     use crate::types::resolved_commands::ResolvedDelayedTriggerCommand;
+    use crate::types::triggers::TriggerMode;
 
     #[test]
     fn persisted_legacy_tap_effects_migrate_only_effect_payloads() {
@@ -25389,6 +27339,74 @@ mod tests {
             persisted["unrelated"],
             serde_json::json!({ "type": "Untap" }),
             "only serialized Effect payloads are migrated"
+        );
+    }
+
+    #[test]
+    fn pending_counter_removal_queue_migrates_legacy_single_source_entries() {
+        let source_id = ObjectId(17);
+        let mut legacy_wire = serde_json::to_value(PendingCounterRemovalQueue {
+            remaining: Vec::new(),
+            effect_kind: EffectKind::RemoveCounter,
+            source_ability_id: ObjectId(18),
+            total: 2,
+            applied_total: 0,
+            in_flight: None,
+        })
+        .expect("current counter-removal queue serializes");
+        legacy_wire["source_id"] = serde_json::to_value(source_id).expect("source ID serializes");
+        legacy_wire["remaining"] = serde_json::json!([[
+            serde_json::to_value(CounterType::Plus1Plus1).expect("counter type serializes"),
+            2
+        ]]);
+
+        let restored: PendingCounterRemovalQueue = serde_json::from_value(legacy_wire)
+            .expect("legacy single-source counter-removal queue migrates");
+
+        assert_eq!(
+            restored.remaining,
+            vec![PendingCounterRemoval {
+                object_id: source_id,
+                counter_type: CounterType::Plus1Plus1,
+                count: 2,
+            }],
+            "legacy entries inherit their queue's single source ID"
+        );
+        assert_eq!(
+            restored.applied_total, 0,
+            "queues persisted before applied-count tracking start at zero"
+        );
+        assert!(
+            restored.in_flight.is_none(),
+            "legacy queues never carry a replacement-pipeline in-flight removal"
+        );
+    }
+
+    #[test]
+    fn legacy_duration_subject_id_deserializes_as_a_non_current_incarnation() {
+        let effect = TransientContinuousEffect {
+            id: 1,
+            source_id: ObjectId(1),
+            controller: PlayerId(0),
+            timestamp: 1,
+            duration: Duration::Permanent,
+            affected: TargetFilter::SelfRef,
+            affected_recipient: None,
+            modifications: Vec::new(),
+            condition: None,
+            duration_subject: Some(ObjectIncarnationRef::of(ObjectId(9), 3)),
+            end_permission: None,
+            source_name: String::new(),
+        };
+        let mut legacy = serde_json::to_value(effect).expect("effect serializes");
+        legacy["duration_subject"] = serde_json::json!(9);
+
+        let migrated: TransientContinuousEffect =
+            serde_json::from_value(legacy).expect("legacy raw duration id migrates");
+        assert_eq!(
+            migrated.duration_subject,
+            Some(ObjectIncarnationRef::of(ObjectId(9), LEGACY_INCARNATION)),
+            "a saved raw id cannot prove its old incarnation and must never bind a live object"
         );
     }
 
@@ -25454,7 +27472,8 @@ mod tests {
 
         let restored = serde_json::from_value::<PersistedGameState>(persisted)
             .expect("legacy effect save restores through the persisted boundary")
-            .into_game_state();
+            .into_game_state()
+            .expect("persisted test snapshot satisfies the checked restore contract");
         assert!(matches!(
             restored.objects[&source].abilities[0].effect.as_ref(),
             Effect::SetTapState {
@@ -25512,6 +27531,12 @@ mod tests {
 
     #[derive(Serialize)]
     struct TriggerRefFixture<'a> {
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_map_entries::serialize")]
+        values: &'a HashMap<TriggerDefinitionRef, u32, ReverseBuildHasher>,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyTriggerRefFixture<'a> {
         #[serde(serialize_with = "legacy_trigger_definition_ref_map::serialize")]
         values: &'a HashMap<TriggerDefinitionRef, u32, ReverseBuildHasher>,
     }
@@ -25661,7 +27686,8 @@ mod tests {
 
             let restored = serde_json::from_value::<PersistedGameState>(persisted)
                 .expect("legacy pair marker migrates at the persistence boundary")
-                .into_game_state();
+                .into_game_state()
+                .expect("persisted test snapshot satisfies the checked restore contract");
             assert!(restored.batched_zone_change_trigger_fired.contains(&(
                 definition_ref.clone(),
                 19,
@@ -25710,12 +27736,21 @@ mod tests {
             vec![2, 1, 0],
             "hostile trigger map must expose descending native iteration"
         );
+        let trigger_bytes = serde_json::to_string(&TriggerRefFixture {
+            values: &trigger_values,
+        })
+        .expect("trigger-ref fixture should serialize");
         assert_eq!(
-            serde_json::to_string(&TriggerRefFixture {
+            trigger_bytes,
+            r#"{"values":[[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":0}}},10],[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":1}}},11],[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":2}}},12]]}"#
+        );
+        assert_eq!(
+            trigger_bytes,
+            serde_json::to_string(&LegacyTriggerRefFixture {
                 values: &trigger_values,
             })
-            .expect("trigger-ref fixture should serialize"),
-            r#"{"values":[[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":0}}},10],[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":1}}},11],[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":2}}},12]]}"#
+            .expect("legacy trigger-ref oracle should serialize"),
+            "the shared adapter must preserve the established canonical bytes"
         );
         let trigger_round_trip = legacy_trigger_definition_ref_map::deserialize(
             &mut serde_json::Deserializer::from_str(
@@ -25968,10 +28003,12 @@ mod tests {
 
         let raw = serde_json::from_value::<PersistedGameState>(raw)
             .expect("raw delayed install migrates")
-            .into_game_state();
+            .into_game_state()
+            .expect("persisted test snapshot satisfies the checked restore contract");
         let trusted = serde_json::from_value::<PersistedGameState>(trusted)
             .expect("trusted delayed install migrates")
-            .into_game_state();
+            .into_game_state()
+            .expect("persisted test snapshot satisfies the checked restore contract");
 
         assert_eq!(raw.delayed_triggers, trusted.delayed_triggers);
         assert_eq!(
@@ -26012,6 +28049,175 @@ mod tests {
                 "expected root-alias coherence failure, got {error}"
             );
         }
+    }
+
+    /// Rewrites a captured dungeon prompt back to its pre-protocol-36 payload:
+    /// `ChooseDungeon` held bare `DungeonId`s, and `ChooseDungeonRoom` held bare
+    /// room indices plus a parallel `option_names`, with no `dungeon_name`.
+    fn downgrade_dungeon_prompt_to_legacy(persisted: &mut serde_json::Value) {
+        let state = if persisted.get("state").is_some() {
+            persisted
+                .get_mut("state")
+                .expect("trusted fixture has an inner state")
+        } else {
+            persisted
+        };
+        let waiting = state
+            .get_mut("waiting_for")
+            .expect("fixture is paused at a prompt");
+        let variant = waiting
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .expect("waiting_for is adjacently tagged")
+            .to_string();
+        let data = waiting
+            .get_mut("data")
+            .and_then(|data| data.as_object_mut())
+            .expect("dungeon prompts carry data");
+        let options = data
+            .get("options")
+            .and_then(serde_json::Value::as_array)
+            .expect("dungeon prompts carry options")
+            .clone();
+        match variant.as_str() {
+            "ChooseDungeon" => {
+                let legacy = options
+                    .iter()
+                    .map(|option| option["dungeon"].clone())
+                    .collect();
+                data.insert("options".to_string(), serde_json::Value::Array(legacy));
+            }
+            "ChooseDungeonRoom" => {
+                let names = options
+                    .iter()
+                    .map(|option| option["name"].clone())
+                    .collect();
+                let indices = options
+                    .iter()
+                    .map(|option| option["index"].clone())
+                    .collect();
+                data.remove("dungeon_name");
+                data.insert("option_names".to_string(), serde_json::Value::Array(names));
+                data.insert("options".to_string(), serde_json::Value::Array(indices));
+            }
+            other => panic!("not a dungeon prompt: {other}"),
+        }
+    }
+
+    fn restore_both_envelopes(state: GameState) -> [GameState; 2] {
+        let mut raw = serde_json::to_value(PersistedGameState::Raw(Box::new(state.clone())))
+            .expect("serialize raw fixture");
+        let mut trusted =
+            serde_json::to_value(PersistedGameState::capture(state)).expect("serialize trusted");
+        downgrade_dungeon_prompt_to_legacy(&mut raw);
+        downgrade_dungeon_prompt_to_legacy(&mut trusted);
+        [
+            serde_json::from_value::<PersistedGameState>(raw)
+                .expect("raw legacy dungeon prompt migrates")
+                .into_game_state()
+                .expect("persisted test snapshot satisfies the checked restore contract"),
+            serde_json::from_value::<PersistedGameState>(trusted)
+                .expect("trusted legacy dungeon prompt migrates")
+                .into_game_state()
+                .expect("persisted test snapshot satisfies the checked restore contract"),
+        ]
+    }
+
+    /// Protocol 36: a save paused at `ChooseDungeon` predates `DungeonPreview`.
+    /// The migration must rebuild each option's topmost room (CR 309.4a) rather
+    /// than fail to deserialize, through BOTH persistence ingresses.
+    #[test]
+    fn legacy_choose_dungeon_prompt_migrates_through_both_envelopes() {
+        use crate::game::dungeon::{dungeon_preview, DungeonId};
+
+        let mut state = GameState::new_two_player(42);
+        let expected: Vec<_> = [
+            DungeonId::LostMineOfPhandelver,
+            DungeonId::DungeonOfTheMadMage,
+            DungeonId::TombOfAnnihilation,
+        ]
+        .into_iter()
+        .map(dungeon_preview)
+        .collect();
+        state.waiting_for = WaitingFor::ChooseDungeon {
+            player: PlayerId(0),
+            options: expected.clone(),
+        };
+
+        for restored in restore_both_envelopes(state) {
+            match &restored.waiting_for {
+                WaitingFor::ChooseDungeon { player, options } => {
+                    assert_eq!(*player, PlayerId(0));
+                    // Rebuilt from the static table, so it is not merely
+                    // parseable — it equals what the engine emits today.
+                    assert_eq!(options, &expected);
+                }
+                other => panic!("expected ChooseDungeon, got {other:?}"),
+            }
+        }
+    }
+
+    /// Protocol 36: a save paused at `ChooseDungeonRoom` predates `RoomPreview`,
+    /// `dungeon_name`, and the removal of `option_names`. Room indices resolve
+    /// their own name and printed effect (CR 309.4b-c), so the rebuild is total.
+    #[test]
+    fn legacy_choose_dungeon_room_prompt_migrates_through_both_envelopes() {
+        use crate::game::dungeon::{room_preview, DungeonId};
+
+        let mut state = GameState::new_two_player(42);
+        let expected: Vec<_> = [1, 2]
+            .into_iter()
+            .map(|room| room_preview(DungeonId::LostMineOfPhandelver, room))
+            .collect();
+        state.waiting_for = WaitingFor::ChooseDungeonRoom {
+            player: PlayerId(0),
+            dungeon: DungeonId::LostMineOfPhandelver,
+            dungeon_name: "Lost Mine of Phandelver".to_string(),
+            options: expected.clone(),
+        };
+
+        for restored in restore_both_envelopes(state) {
+            match &restored.waiting_for {
+                WaitingFor::ChooseDungeonRoom {
+                    player,
+                    dungeon,
+                    dungeon_name,
+                    options,
+                } => {
+                    assert_eq!(*player, PlayerId(0));
+                    assert_eq!(*dungeon, DungeonId::LostMineOfPhandelver);
+                    // Recovered from `dungeon`, which the legacy payload kept.
+                    assert_eq!(dungeon_name, "Lost Mine of Phandelver");
+                    assert_eq!(options, &expected);
+                    assert_eq!(options[0].text, "Create a 1/1 red Goblin creature token.");
+                }
+                other => panic!("expected ChooseDungeonRoom, got {other:?}"),
+            }
+        }
+    }
+
+    /// The migration is a rebuild, not a guess: a dungeon name this engine does
+    /// not know is corrupt state and must surface, not silently drop an option.
+    #[test]
+    fn legacy_dungeon_prompt_rejects_an_unknown_dungeon() {
+        use crate::game::dungeon::{dungeon_preview, DungeonId};
+
+        let mut state = GameState::new_two_player(42);
+        state.waiting_for = WaitingFor::ChooseDungeon {
+            player: PlayerId(0),
+            options: vec![dungeon_preview(DungeonId::LostMineOfPhandelver)],
+        };
+        let mut raw = serde_json::to_value(PersistedGameState::Raw(Box::new(state)))
+            .expect("serialize raw fixture");
+        downgrade_dungeon_prompt_to_legacy(&mut raw);
+        raw["waiting_for"]["data"]["options"][0] = serde_json::Value::from("CatacombsOfNowhere");
+
+        let error = serde_json::from_value::<PersistedGameState>(raw)
+            .expect_err("an unknown dungeon must not migrate");
+        assert!(
+            error.to_string().contains("unknown dungeon"),
+            "expected an unknown-dungeon rejection, got {error}"
+        );
     }
 
     fn ordinary_pending_trigger(source: ObjectId, turn_number: u32) -> PendingTrigger {
@@ -26216,7 +28422,8 @@ mod tests {
             erase_persisted_event_occurrence_fields(persisted_state_payload_mut(&mut persisted));
             let restored = serde_json::from_value::<PersistedGameState>(persisted)
                 .expect("unique legacy event records reconcile")
-                .into_game_state();
+                .into_game_state()
+                .expect("persisted test snapshot satisfies the checked restore contract");
             assert_eq!(
                 restored_deferred_zone_change_keys(&restored),
                 vec![(19, 0), (19, 1)]
@@ -26278,7 +28485,8 @@ mod tests {
         erase_persisted_event_occurrence_fields(persisted_state_payload_mut(&mut persisted));
         let restored = serde_json::from_value::<PersistedGameState>(persisted)
             .expect("the parked batch's records reconcile")
-            .into_game_state();
+            .into_game_state()
+            .expect("persisted test snapshot satisfies the checked restore contract");
         let batch = restored
             .pending_discard_batch
             .as_ref()
@@ -26360,6 +28568,8 @@ mod tests {
             player: PlayerId(0),
             candidate_count: 2,
             candidates: Vec::new(),
+            kind: Default::default(),
+            last_applied_decides: false,
         };
         assert!(
             !matches!(state.waiting_for, WaitingFor::Priority { .. }),
@@ -26383,7 +28593,8 @@ mod tests {
 
         let restored = serde_json::from_value::<PersistedGameState>(wire)
             .expect("an absent parked batch defaults to None")
-            .into_game_state();
+            .into_game_state()
+            .expect("persisted test snapshot satisfies the checked restore contract");
         assert!(restored.pending_discard_batch.is_none());
         assert!(
             matches!(
@@ -26464,7 +28675,8 @@ mod tests {
         erase_persisted_event_occurrence_fields(persisted_state_payload_mut(&mut persisted));
         let restored = serde_json::from_value::<PersistedGameState>(persisted)
             .expect("the parked batch's records reconcile")
-            .into_game_state();
+            .into_game_state()
+            .expect("persisted test snapshot satisfies the checked restore contract");
         let parked = restored
             .pending_combat_lifelink
             .as_ref()
@@ -26525,6 +28737,8 @@ mod tests {
             player: PlayerId(0),
             candidate_count: 2,
             candidates: Vec::new(),
+            kind: Default::default(),
+            last_applied_decides: false,
         };
         assert!(
             !matches!(state.waiting_for, WaitingFor::Priority { .. }),
@@ -26543,7 +28757,8 @@ mod tests {
 
         let restored = serde_json::from_value::<PersistedGameState>(wire)
             .expect("an absent parked batch defaults to None")
-            .into_game_state();
+            .into_game_state()
+            .expect("persisted test snapshot satisfies the checked restore contract");
         assert!(restored.pending_combat_lifelink.is_none());
         assert!(
             matches!(
@@ -26576,7 +28791,8 @@ mod tests {
             .expect("fixture serializes");
         let restored = serde_json::from_value::<PersistedGameState>(persisted)
             .expect("unique records repair a stale collision")
-            .into_game_state();
+            .into_game_state()
+            .expect("persisted test snapshot satisfies the checked restore contract");
         assert_eq!(
             restored_deferred_zone_change_keys(&restored),
             vec![(19, 0), (19, 1)]
@@ -26604,7 +28820,8 @@ mod tests {
             .expect("fixture serializes");
         let restored = serde_json::from_value::<PersistedGameState>(persisted)
             .expect("stamped prior-turn event remains valid")
-            .into_game_state();
+            .into_game_state()
+            .expect("persisted test snapshot satisfies the checked restore contract");
         assert_eq!(restored_deferred_zone_change_keys(&restored), vec![(18, 0)]);
     }
 
@@ -26628,7 +28845,8 @@ mod tests {
         erase_persisted_event_occurrence_fields(persisted_state_payload_mut(&mut persisted));
         let restored = serde_json::from_value::<PersistedGameState>(persisted)
             .expect("stale ledger history is pruned before live event reconciliation")
-            .into_game_state();
+            .into_game_state()
+            .expect("persisted test snapshot satisfies the checked restore contract");
 
         assert_eq!(restored.zone_changes_this_turn.len(), 1);
         assert_eq!(
@@ -26815,7 +29033,8 @@ mod tests {
         erase_persisted_event_occurrence_fields(persisted_state_payload_mut(&mut persisted));
         let restored = serde_json::from_value::<PersistedGameState>(persisted)
             .expect("all serialized carrier records reconcile")
-            .into_game_state();
+            .into_game_state()
+            .expect("persisted test snapshot satisfies the checked restore contract");
         let GameEvent::ZoneChanged { record, .. } = &restored
             .pending_player_scope_sacrifice_choice
             .as_ref()
@@ -27064,7 +29283,8 @@ mod tests {
             erase_deferred_and_order_trigger_firing_classifiers(&mut persisted);
             let state = serde_json::from_value::<PersistedGameState>(persisted)
                 .expect("historical omitted Normal classifiers migrate")
-                .into_game_state();
+                .into_game_state()
+                .expect("persisted test snapshot satisfies the checked restore contract");
 
             assert_eq!(state.deferred_triggers[0].firing(), TriggerFiring::Ordinary);
             assert_eq!(
@@ -27144,6 +29364,902 @@ mod tests {
         }
     }
 
+    /// A coherent state parking exactly one `SpellResolution` frame with **no**
+    /// `resolving_stack_entry`. That omission is load-bearing: it is what keeps
+    /// `PersistedRestoreError::UnsettledPriorityResolution` from firing at the
+    /// restore boundary (its guard reads `resolving_stack_entry.is_some()`), so
+    /// the payload exercises the full decode *and* restore path rather than
+    /// stopping at a fail-closed refusal.
+    fn parked_spell_resolution_fixture() -> GameState {
+        let mut state = GameState::new_two_player(42);
+        let spell = create_object(
+            &mut state,
+            CardId(9_101),
+            PlayerId(0),
+            "Parked spell".to_string(),
+            Zone::Stack,
+        );
+        state
+            .resolution_stack
+            .push_spell_resolution(PendingSpellResolution {
+                object_id: spell,
+                controller: PlayerId(0),
+                casting_variant: CastingVariant::Normal,
+                cast_from_zone: None,
+                cast_controller: None,
+                cast_timing_permission: None,
+                spell_targets: Vec::new(),
+                actual_mana_spent: 0,
+                kickers_paid: Vec::new(),
+                additional_cost_payment_count: 0,
+                additional_cost_payments: Vec::new(),
+                convoked_creatures: Vec::new(),
+            });
+        state
+    }
+
+    /// The same parked frame, but resting on a **triggered** `resolving_stack_entry`
+    /// that carries its `TriggerFiring` discriminator. Removing that carrier from
+    /// the serialized value is what the unlabeled-carrier tests below do.
+    fn parked_frame_on_triggered_carrier_fixture() -> GameState {
+        let mut state = parked_spell_resolution_fixture();
+        let source = create_object(
+            &mut state,
+            CardId(9_102),
+            PlayerId(0),
+            "Triggered carrier source".to_string(),
+            Zone::Battlefield,
+        );
+        state.resolving_stack_entry = Some(StackEntry {
+            id: ObjectId(9_103),
+            source_id: source,
+            controller: PlayerId(0),
+            kind: StackEntryKind::TriggeredAbility {
+                source_id: source,
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                    Vec::new(),
+                    source,
+                    PlayerId(0),
+                )),
+                condition: None,
+                trigger_event: None,
+                description: None,
+                source_name: "Triggered carrier source".to_string(),
+                subject_match_count: None,
+                die_result: None,
+                provenance: None,
+            },
+        });
+        state.resolving_trigger_firing = Some(TriggerFiring::Ordinary);
+        state
+    }
+
+    /// V1 + V2. A raw save carrying a live `resolution_stack` decodes AND fully
+    /// restores, with the parked frame preserved rather than discarded.
+    ///
+    /// Red before `declare_raw_resolution_wire`: the raw ingress stamped
+    /// `resolution_state_version = 1` unconditionally, and the v1 branch refuses
+    /// any payload containing `resolution_stack`.
+    #[test]
+    fn raw_round_trip_preserves_a_live_resolution_frame() {
+        let state = parked_spell_resolution_fixture();
+        let parked = state
+            .active_spell_resolution()
+            .expect("the fixture parks a spell resolution")
+            .object_id;
+
+        // `GameState`'s derived `Serialize` — the unversioned raw writer whose
+        // shape `declare_raw_resolution_wire` infers from. NOT
+        // `to_value(PersistedGameState::Raw(..))`, which routes through
+        // `ResolutionStateWire::to_value` and emits a DECLARED v2 wire that would
+        // take the inference's early return and make this test vacuous.
+        let wire = serde_json::to_value(&state).expect("the bare GameState serializes");
+        assert!(
+            wire.get("resolution_stack").is_some(),
+            "the raw writer must emit resolution_stack for a non-empty frame stack; \
+             the inference keys on exactly this field"
+        );
+        assert!(
+            wire.get("resolution_state_version").is_none(),
+            "the raw writer must not declare a resolution wire version"
+        );
+        assert!(
+            wire.get("resolution_frames").is_none(),
+            "the raw writer must not emit the v2 frame carrier"
+        );
+
+        let restored = serde_json::from_value::<PersistedGameState>(wire)
+            .expect("an unversioned raw payload with a live frame stack decodes")
+            .prepare_for_restore(PersistedRestoreFinalization::Immediate)
+            .expect("a parked frame on no resolving carrier is coherent at the restore boundary")
+            .finalize_immediately()
+            .expect("the prepared restore finalizes");
+
+        assert_eq!(
+            restored.resolution_stack.len(),
+            1,
+            "the parked frame must survive the persistence boundary"
+        );
+        assert_eq!(
+            restored.active_spell_resolution().map(|p| p.object_id),
+            Some(parked),
+            "the frame must be PRESERVED, not merely tolerated — this is what \
+             distinguishes the fix from dropping the offending key"
+        );
+    }
+
+    /// V4. The absent-`resolution_stack` sibling: pre-#6269 saves and post-#6269
+    /// saves with an empty frame stack alike keep the legacy v1 treatment.
+    #[test]
+    fn raw_round_trip_without_a_resolution_frame_is_unchanged() {
+        let state = GameState::new_two_player(42);
+        let wire = serde_json::to_value(&state).expect("the bare GameState serializes");
+        assert!(
+            wire.get("resolution_stack").is_none(),
+            "an empty frame stack is omitted by skip_serializing_if, which is what \
+             routes this payload to the legacy v1 branch"
+        );
+
+        let restored = serde_json::from_value::<PersistedGameState>(wire)
+            .expect("an unversioned raw payload without a frame stack still decodes")
+            .into_game_state()
+            .expect("the legacy v1 projection restores");
+
+        assert!(
+            restored.resolution_stack.is_empty(),
+            "the v1 projection yields an empty frame stack, exactly as before"
+        );
+    }
+
+    /// V6 + V7. The unlabeled-carrier allowance is **not** widened to the raw
+    /// ingress by the inference. A raw payload that now classifies as v2 and
+    /// carries a triggered `resolving_stack_entry` with no firing carrier is
+    /// refused, at BOTH a Priority rest and a non-Priority prompt rest.
+    ///
+    /// What this prevents: `migrate_legacy_trigger_firing_carriers` fabricates
+    /// `TriggerFiring::LegacyDelayed` for an unlabeled triggered carrier when
+    /// `allow_unlabeled_v1_carriers` is set. CR 603.7 classifies delayed
+    /// triggered abilities, `TriggerFiring::is_delayed()` returns `true` for
+    /// `LegacyDelayed`, and three production consumers in `game/triggers.rs`
+    /// branch on it — trigger doubling (CR 603.2d), dropped-target re-push
+    /// (CR 603.3d), and ordering-batch grouping. Fabricating that classification
+    /// for an ordinary trigger is a rules error, so the inference must leave the
+    /// allowance exactly where it was.
+    #[test]
+    fn raw_inferred_v2_refuses_an_unlabeled_triggered_carrier() {
+        let priority_rest = parked_frame_on_triggered_carrier_fixture();
+
+        // The non-Priority sibling. `SpellResolution` is an `AfterChild` frame,
+        // so `ResolutionStack::validate` imposes no prompt match on it; what this
+        // case varies is the REST, because `recover_terminal_resolution_rest_on_restore`
+        // short-circuits on any non-Priority `waiting_for`. The refusal must
+        // therefore come from decode, not from the restore-boundary guard.
+        let mut prompt_rest = parked_frame_on_triggered_carrier_fixture();
+        prompt_rest.waiting_for = WaitingFor::ExertChoice {
+            player: PlayerId(0),
+            attacker: ObjectId(9_104),
+            remaining: Vec::new(),
+        };
+
+        for (label, state) in [
+            ("Priority rest", priority_rest),
+            ("prompt rest", prompt_rest),
+        ] {
+            let labeled = serde_json::to_value(&state).expect("the bare GameState serializes");
+            assert!(
+                labeled.get("resolution_stack").is_some(),
+                "{label}: the fixture must reach the inferred-v2 classification"
+            );
+
+            // Paired positive reach-guard, asserted FIRST: the identical payload
+            // WITH the carrier decodes. Without this the refusal below could pass
+            // for an unrelated reason.
+            assert!(
+                labeled
+                    .get("resolving_trigger_firing")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("Ordinary"),
+                "{label}: the fixture must carry the firing discriminator"
+            );
+            serde_json::from_value::<PersistedGameState>(labeled.clone()).unwrap_or_else(|error| {
+                panic!("{label}: the labeled payload must decode, got {error}")
+            });
+
+            let mut unlabeled = labeled;
+            unlabeled
+                .as_object_mut()
+                .expect("the raw payload is a JSON object")
+                .remove("resolving_trigger_firing");
+
+            let error = serde_json::from_value::<PersistedGameState>(unlabeled)
+                .expect_err("an unlabeled triggered carrier must not be admitted");
+            assert!(
+                error
+                    .to_string()
+                    .contains("resolving triggered entry has no firing carrier"),
+                "{label}: expected the fail-closed carrier refusal, got {error}"
+            );
+        }
+    }
+
+    /// V8. A declared `resolution_state_version` always beats the inferred shape,
+    /// and the raw and trusted ingresses agree on identical bytes — the inference
+    /// introduces no origin-dependent behavior anywhere downstream.
+    #[test]
+    fn declared_resolution_state_version_wins_over_inferred_shape() {
+        let state = parked_spell_resolution_fixture();
+        let bare = serde_json::to_value(&state).expect("the bare GameState serializes");
+
+        let declare = |version: u64| {
+            let mut value = bare.clone();
+            value
+                .as_object_mut()
+                .expect("the raw payload is a JSON object")
+                .insert(
+                    "resolution_state_version".to_string(),
+                    serde_json::Value::from(version),
+                );
+            value
+        };
+
+        for (version, expected) in [
+            (
+                1_u64,
+                "v1 resolution state must not contain resolution_stack",
+            ),
+            (2_u64, "v2 resolution state is missing resolution_frames"),
+        ] {
+            let declared = declare(version);
+            let raw_error = serde_json::from_value::<PersistedGameState>(declared.clone())
+                .expect_err("a declared version keeps its own branch's verdict");
+            assert!(
+                raw_error.to_string().contains(expected),
+                "v{version} raw: expected {expected}, got {raw_error}"
+            );
+
+            // The same inner bytes through the TRUSTED ingress must produce the
+            // same verdict. That ingress never stamps a version, so agreement here
+            // is what proves the inference did not invent an origin-dependent path.
+            let mut trusted = serde_json::to_value(PersistedGameState::capture(state.clone()))
+                .expect("the trusted envelope serializes");
+            trusted
+                .as_object_mut()
+                .expect("the trusted envelope is a JSON object")
+                .insert("state".to_string(), declared);
+            let trusted_error = serde_json::from_value::<PersistedGameState>(trusted)
+                .expect_err("the trusted ingress reaches the same declared branch");
+            assert!(
+                trusted_error.to_string().contains(expected),
+                "v{version} trusted: expected {expected}, got {trusted_error}"
+            );
+        }
+    }
+
+    /// V12. Pins the premise `declare_raw_resolution_wire` rests on for the
+    /// entire client-wire population: `client_state_wire_value` must keep
+    /// emitting `resolution_stack`.
+    ///
+    /// That function redacts by an explicit, MUTABLE removal list. Nothing in the
+    /// type system ties it to the inference rule, so if it ever begins stripping
+    /// `resolution_stack`, every client-wire payload silently stops being
+    /// classifiable and no compiler signal fires. This assertion is the signal.
+    ///
+    /// It pins a SECOND premise of the same kind, and for the same reason: the
+    /// client wire must keep declaring NO `resolution_state_version`. Both are
+    /// premises about whether `declare_raw_resolution_wire` is REACHED at all —
+    /// its first statement early-returns on a declared version, and its guard's
+    /// first conjunct is `resolution_stack` present. That is why the version
+    /// premise lives here rather than in
+    /// `client_wire_removes_every_unconditional_projection_field`, whose subject
+    /// is the removal LIST, i.e. whether the guard FIRES once reached. If the
+    /// deferred write-time stamping lands at `client_state_wire_value` on its
+    /// own, every client-wire payload takes that early return, the projection
+    /// guard goes dead for its entire population, and without the assertion
+    /// below no row reddens.
+    #[test]
+    fn client_wire_still_carries_resolution_stack() {
+        let state = parked_spell_resolution_fixture();
+        let bare = serde_json::to_value(&state).expect("the bare GameState serializes");
+        // `viewer: None` performs no viewer filtering, so no projection sentinel
+        // is stamped — the same constructor a client debug export comes through.
+        let wire = serde_json::to_value(crate::game::derived_views::ClientGameStateRef::wrap(
+            &state, None,
+        ))
+        .expect("the client wire envelope serializes");
+
+        // Paired positive reach-guard, asserted FIRST. `next_delayed_trigger_token`
+        // carries `#[serde(default)]` with NO `skip_serializing_if`, so the derived
+        // `Serialize` always emits it and only the redactor can remove it. Without
+        // this, a green below could mean the redactor never ran — i.e. that this
+        // test measured the bare writer instead of the wire.
+        assert!(
+            bare.get("next_delayed_trigger_token").is_some(),
+            "the bare writer always emits next_delayed_trigger_token; if it does not, \
+             this test can no longer prove the redactor ran"
+        );
+        assert!(
+            wire["state"].get("next_delayed_trigger_token").is_none(),
+            "the client redactor must have run — it removes next_delayed_trigger_token"
+        );
+
+        assert!(
+            wire["state"].get("resolution_stack").is_some(),
+            "`client_state_wire_value` no longer preserves `resolution_stack`. \
+             `declare_raw_resolution_wire` (types/resolution.rs) keys on that field, \
+             and its inference rule silently stops applying to every client-wire \
+             payload if the redactor removes it. Fix the redactor or re-derive the \
+             rule — do not delete this assertion."
+        );
+
+        assert!(
+            wire["state"].get("resolution_state_version").is_none(),
+            "`client_state_wire_value` now DECLARES a resolution wire version. \
+             `declare_raw_resolution_wire` (types/resolution.rs) early-returns on \
+             that key, so its client-wire projection guard is now dead for every \
+             payload this writer produces and no other row reddens. If this is the \
+             deferred write-time stamp landing, replace the absence fingerprint with \
+             a positive `wire_projection` check — do not delete this assertion."
+        );
+    }
+
+    /// The three fields `client_state_wire_value` removes that are
+    /// UNCONDITIONALLY serialized. Local mirror of
+    /// `CLIENT_WIRE_UNCONDITIONAL_FIELDS` in `types/resolution.rs`, which is
+    /// private to that module. The mirror is deliberate: it is exactly what
+    /// mutation B of
+    /// `redaction_fingerprint_is_conjunctive_over_every_unconditional_field`
+    /// detects — dropping an entry from the production `const` leaves this list
+    /// three-wide and reddens the loop iteration for the dropped key.
+    const FINGERPRINT_FIELDS: &[&str] = &[
+        "next_delayed_trigger_token",
+        "next_delayed_trigger_instance",
+        "resolved_rules_journal",
+    ];
+
+    /// The distinctive phrase of the client-wire projection refusal raised by
+    /// `declare_raw_resolution_wire` (`types/resolution.rs`). Its FIRST clause:
+    /// the part of that sentence which is a statement about the file, and so is
+    /// true of both populations the guard refuses — a client-wire projection and
+    /// a genuine 2026-07-21..22 build-window save. The trailing hedge clause is
+    /// NOT asserted on anywhere in this module, and deliberately so — note that
+    /// this constant is a SUBSTRING of the sentence the hedge replaced, so no
+    /// row here reddens if that wording is reverted. The single assertion that
+    /// does is in `raw_capture_is_refused_as_a_client_wire_projection`
+    /// (`tests/integration/raw_resolution_stack_restore.rs`), on the reporter's
+    /// real bytes. Do not add a second one here.
+    const CLIENT_WIRE_PROJECTION_REFUSAL: &str =
+        "missing the private rules record for the resolution it was paused in";
+
+    /// The unversioned raw writer the inference keys on: `GameState`'s own
+    /// derived `Serialize`, NOT `to_value(PersistedGameState::Raw(..))` (which
+    /// routes through `ResolutionStateWire::to_value` and declares a version).
+    fn bare_value(state: &GameState) -> serde_json::Value {
+        serde_json::to_value(state).expect("the bare GameState serializes")
+    }
+
+    /// The redacted client-wire projection of the same state. `viewer: None`
+    /// performs no viewer filtering, so no `viewer_projection` sentinel is
+    /// stamped — this is the exact constructor a client debug export comes
+    /// through, and the population `reject_viewer_projection_as_authority`
+    /// cannot see.
+    fn client_wire_value(state: &GameState) -> serde_json::Value {
+        serde_json::to_value(crate::game::derived_views::ClientGameStateRef::wrap(
+            state, None,
+        ))
+        .expect("the client wire envelope serializes")["state"]
+            .clone()
+    }
+
+    fn without_keys(mut value: serde_json::Value, keys: &[&str]) -> serde_json::Value {
+        let object = value
+            .as_object_mut()
+            .expect("the raw payload is a JSON object");
+        for key in keys {
+            object.remove(*key);
+        }
+        value
+    }
+
+    /// The same redacted payload with ONE fingerprint key restored, at the value
+    /// an absent key already decodes to: `next_delayed_trigger_token` carries a
+    /// plain `#[serde(default)]` (so absent means `0`), and
+    /// `normalize_delayed_trigger_allocators` collapses both `0` and the absent
+    /// case to `1` for a payload with no install roots.
+    ///
+    /// So this payload is DECODE-IDENTICAL to the redacted one and differs only
+    /// in whether the guard's conjunction holds. It measures what the same bytes
+    /// do with the projection guard bypassed, without deleting the guard — which
+    /// is what makes the `!contains(…)` clauses below discriminated rather than
+    /// vacuously true of any refusal.
+    fn with_the_projection_guard_bypassed(mut wire: serde_json::Value) -> serde_json::Value {
+        wire.as_object_mut()
+            .expect("the client wire payload is a JSON object")
+            .insert(
+                "next_delayed_trigger_token".to_string(),
+                serde_json::Value::from(0),
+            );
+        wire
+    }
+
+    /// A state parking one `AbilityContinuation` frame and no
+    /// `resolving_stack_entry`.
+    ///
+    /// `stashed` selects the shape:
+    /// * `None` — a legitimately absent firing (a paused spell or
+    ///   activated-ability resolution). Decodes on BOTH sides today.
+    /// * `Some(f)` — the RESIDUAL shape: the continuation holds a firing while
+    ///   the live carrier does not. It is built the way production builds it —
+    ///   the live carrier is set, `PendingContinuation::new` snapshots it
+    ///   (`trigger_firing: state.resolving_trigger_firing`), and then the live
+    ///   carrier is taken, which is exactly
+    ///   `game/stack.rs::finish_resolving_stack_entry`'s
+    ///   `state.resolving_trigger_firing.take()`. The engine puts it back through
+    ///   `game/effects/mod.rs::restore_continuation_trigger_firing`'s
+    ///   `(None, Some(stashed))` arm; this fixture is that state captured
+    ///   mid-flight.
+    ///
+    /// Deliberately NOT built on `parked_frame_on_triggered_carrier_fixture()`:
+    /// that fixture sets a triggered `resolving_stack_entry` AND a live firing,
+    /// so extending it yields the coherent shape, which the client wire already
+    /// refuses without any of this — see
+    /// `raw_inferred_v2_refuses_an_unlabeled_triggered_carrier`.
+    fn parked_continuation_fixture(stashed: Option<TriggerFiring>) -> GameState {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(9_301),
+            PlayerId(0),
+            "Continuation source".to_string(),
+            Zone::Battlefield,
+        );
+        state.resolving_trigger_firing = stashed;
+        let chain = Box::new(ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            Vec::new(),
+            source,
+            PlayerId(0),
+        ));
+        let pending = PendingContinuation::new(chain, &state);
+        state
+            .resolution_stack
+            .push_ability_continuation(AbilityContinuationFrame {
+                pending,
+                choose_zone_trigger_context: None,
+            });
+        // `finish_resolving_stack_entry`'s `.take()`, reproduced.
+        state.resolving_trigger_firing = None;
+        state
+    }
+
+    /// V14. Pins the OTHER half of the premise
+    /// `client_wire_still_carries_resolution_stack` pins: the three fields whose
+    /// absence `declare_raw_resolution_wire` reads as a client-wire redaction
+    /// fingerprint are removed by `client_state_wire_value` and by nothing else.
+    ///
+    /// Mutation (i) — delete any one `root.remove(k)` for these three keys in
+    /// `client_state_wire_value`. Reddens at the WIRE-ABSENT assertion for that
+    /// key; the reach-guard is untouched, because the three siblings it names are
+    /// not in the removal list.
+    ///
+    /// Mutation (ii) — give any of the three declarations a
+    /// `skip_serializing_if`. This is a mutation CLASS, and whether it is
+    /// detected is VALUE-dependent: a predicate that skips the value the fixture
+    /// happens to hold reddens the BARE-PRESENT assertion (which runs before its
+    /// wire-absent sibling), and a predicate that does not skip it leaves this row
+    /// green while the guard's premise has in fact been broken. The
+    /// serde-default control below closes the realistic `is_default` / `is_zero` /
+    /// `is_empty` family for all three fields at once; it does not close an
+    /// arbitrary predicate, and no test can.
+    ///
+    /// Do not delete these assertions: the fingerprint is a fact about a MUTABLE
+    /// removal list, and nothing in the type system ties the two together.
+    #[test]
+    fn client_wire_removes_every_unconditional_projection_field() {
+        let state = parked_spell_resolution_fixture();
+        let bare = bare_value(&state);
+        let wire = client_wire_value(&state);
+
+        // Paired positive reach-guard, asserted FIRST. These three are
+        // unconditionally serialized too but are NOT in the redactor's removal
+        // list, so they must survive on BOTH sides. Without them a green below
+        // could mean "absent everywhere" — the wire value not being a real
+        // `GameState` at all — rather than "the redactor removed exactly these".
+        for sibling in [
+            "next_object_id",
+            "next_pip_id",
+            "next_logical_zone_change_group_id",
+        ] {
+            assert!(
+                bare.get(sibling).is_some(),
+                "the bare writer must emit {sibling}; without it this row cannot \
+                 discriminate a removal from an absence"
+            );
+            assert!(
+                wire.get(sibling).is_some(),
+                "the client redactor must NOT remove {sibling}; it is the control \
+                 that proves the removals below are selective"
+            );
+        }
+
+        for field in FINGERPRINT_FIELDS {
+            assert!(
+                bare.get(*field).is_some(),
+                "the bare writer must always emit {field} — the fingerprint reads \
+                 its absence as a fact about the WRITER, which holds only while the \
+                 field has no skip_serializing_if"
+            );
+            assert!(
+                wire.get(*field).is_none(),
+                "`client_state_wire_value` no longer removes {field}. \
+                 `is_redacted_client_wire_projection` (types/resolution.rs) reads the \
+                 absence of all three as the client-wire redaction fingerprint, and \
+                 that inference silently stops applying if the removal list changes. \
+                 Fix the redactor or re-derive the rule — do not delete this assertion."
+            );
+        }
+
+        // Mutation (ii)'s serde-default control: a state holding exactly the
+        // values an absent key decodes to must STILL emit all three. Any
+        // skip-when-default predicate added to a declaration reddens here.
+        let mut serde_defaults = GameState::new_two_player(7);
+        serde_defaults.next_delayed_trigger_token = 0;
+        serde_defaults.next_delayed_trigger_instance = initial_delayed_trigger_instance_id();
+        serde_defaults.resolved_rules_journal = ResolvedRulesJournal::default();
+        let defaulted = bare_value(&serde_defaults);
+        for field in FINGERPRINT_FIELDS {
+            assert!(
+                defaulted.get(*field).is_some(),
+                "the bare writer must emit {field} even when it holds its serde \
+                 default; a skip-when-default predicate would make its absence \
+                 value-dependent and destroy the fingerprint's premise"
+            );
+        }
+    }
+
+    /// V15. The mechanism row: a payload that decodes cleanly on BOTH sides
+    /// today is newly refused on the redacted side, by name.
+    ///
+    /// Mutation — delete the fingerprint guard in `declare_raw_resolution_wire`.
+    /// The wire payload is MEASURED `DECODE OK (Raw)` today, so with the guard
+    /// gone it decodes. Reddens at the `expect_err` on the wire payload; the
+    /// message `contains` below is never reached under that mutation.
+    #[test]
+    fn raw_ingress_refuses_a_redacted_client_wire_projection() {
+        let state = parked_continuation_fixture(None);
+
+        // Paired positive reach-guard, asserted FIRST: the unredacted payload
+        // decodes through the raw ingress, so the refusal below is attributable
+        // to the redaction and to nothing else in the fixture.
+        let reached = serde_json::from_value::<PersistedGameState>(bare_value(&state))
+            .expect("the unredacted payload decodes at the unversioned raw ingress");
+        assert!(
+            matches!(reached, PersistedGameState::Raw(_)),
+            "the reach-guard must decode through the raw ingress, which is the seam \
+             under test"
+        );
+
+        let error = serde_json::from_value::<PersistedGameState>(client_wire_value(&state))
+            .expect_err(
+                "a redacted client-wire projection must not decode at the unversioned \
+                 raw ingress",
+            )
+            .to_string();
+        assert!(
+            error.contains(CLIENT_WIRE_PROJECTION_REFUSAL),
+            "the refusal must name the projection, got {error}"
+        );
+    }
+
+    /// V16. The discriminating row. UNREDACTED this state is REFUSED; redacted
+    /// it decoded silently, with the CR 603.2 ordinary vs CR 603.7 delayed
+    /// firing classification gone from the parked continuation. The guard
+    /// restores the refusal.
+    ///
+    /// The reach-guard is a REFUSAL, not an admission, and that is the point: the
+    /// claim is not "a payload is refused", it is "the redaction converts a
+    /// refusal into an acceptance". An admission guard would be FALSE for this
+    /// fixture, so the row could not even be written that way.
+    ///
+    /// Mutation A — delete the fingerprint guard. The wire payload is MEASURED
+    /// `DECODE OK (Raw) continuation_firings=[None]` today, so it decodes.
+    /// Reddens at the `expect_err` on the wire payload. The reach-guard is
+    /// unaffected: the guard never fires on the bare payload, whose fingerprint
+    /// is fully present.
+    ///
+    /// Mutation B (message only) — reword the guard's `Err` string. The
+    /// `expect_err` still passes, so this reddens at the projection-message
+    /// `contains`. No other mutation reaches that assertion.
+    ///
+    /// The final `!contains(…)` clause is a "not for the wrong reason" guard that
+    /// NO mutation above reddens (deletion reddens the `expect_err` first, reword
+    /// reddens the `contains`). It is not vacuous, though: the bypass control
+    /// immediately before it shows what these exact bytes do when the guard's
+    /// conjunction is broken — they DECODE, losing the stashed firing, which is
+    /// the defect itself.
+    #[test]
+    fn raw_ingress_refuses_a_redacted_projection_that_would_otherwise_lose_its_stashed_firing() {
+        let state = parked_continuation_fixture(Some(TriggerFiring::Ordinary));
+
+        // REACH-GUARD, asserted FIRST — and it is a REFUSAL.
+        let unredacted = serde_json::from_value::<PersistedGameState>(bare_value(&state))
+            .expect_err(
+                "the unredacted residual shape is REFUSED — that refusal is what the \
+                 redaction converts into a silent restore",
+            )
+            .to_string();
+        assert!(
+            unredacted
+                .contains("paused trigger continuation has no active resolving trigger carrier"),
+            "the unredacted refusal must come from the coherence authority, got {unredacted}"
+        );
+
+        let wire = client_wire_value(&state);
+
+        // The defect, exhibited rather than asserted: with the guard's
+        // conjunction broken by one restored key, these same bytes DECODE, and
+        // the parked continuation's firing is gone.
+        let bypassed = serde_json::from_value::<PersistedGameState>(
+            with_the_projection_guard_bypassed(wire.clone()),
+        )
+        .expect("with the fingerprint incomplete the redacted payload still decodes today");
+        let PersistedGameState::Raw(decoded) = bypassed else {
+            panic!("a bare gameState object decodes through the raw ingress");
+        };
+        assert!(
+            decoded
+                .resolution_stack
+                .ability_continuations()
+                .all(|continuation| continuation.trigger_firing.is_none()),
+            "the redaction is what silently drops the stashed firing — if it no longer \
+             does, this row's premise is gone"
+        );
+
+        let error = serde_json::from_value::<PersistedGameState>(wire)
+            .expect_err("the redacted residual shape must not decode")
+            .to_string();
+        assert!(
+            error.contains(CLIENT_WIRE_PROJECTION_REFUSAL),
+            "the refusal must name the projection, got {error}"
+        );
+        assert!(
+            !error.contains("paused trigger continuation has no active resolving trigger carrier"),
+            "the guard must refuse BEFORE the coherence authority is consulted — after \
+             the redaction that authority has no evidence left to refuse on, got {error}"
+        );
+    }
+
+    /// V17. Multi-authority hostile row: the firing is carried on the live
+    /// resolving entry AND on the parked continuation, while the install root
+    /// that authorises it lives in the `resolved_rules_journal` and in the
+    /// `delayed_triggers` entry's `provenance` — both of which the same redaction
+    /// strips.
+    ///
+    /// Mutation — move the guard to after the decode (e.g. into
+    /// `validate_trigger_firing_coherence`). It cannot be written faithfully,
+    /// and that is the finding: by the time a `GameState` exists the three
+    /// fingerprint fields have already taken their serde defaults and the
+    /// evidence is gone, so a guard placed there is equivalent to no guard. That
+    /// equivalence is what makes the PRE-decode placement load-bearing. With no
+    /// guard the payload is still refused, so the `expect_err` still passes;
+    /// it reddens at the projection-message `contains`, and the string it then
+    /// produces is measured by the bypass control below.
+    #[test]
+    fn raw_ingress_refuses_a_redacted_projection_before_its_delayed_install_roots_are_consulted() {
+        let mut state = parked_frame_on_triggered_carrier_fixture();
+        // `parked_frame_on_triggered_carrier_fixture` returns only a `GameState`,
+        // so the triggered entry's source is read back out of it. CR 603.7: the
+        // continuation's own `chain.source_id` must be THAT object, because
+        // `validate_trigger_firing_coherence` checks the paused continuation's
+        // provenance against its chain source, not merely against the origin.
+        let source = state
+            .resolving_stack_entry
+            .as_ref()
+            .expect("the fixture supplies a triggered resolving entry")
+            .source_id;
+        let origin = DelayedTriggerOrigin {
+            token: DelayedTriggerToken(1),
+            instance: DelayedTriggerInstanceId(1),
+            source_id: source,
+        };
+        // The install root, without which the BARE reach-guard cannot be
+        // established. `register_root` accepts a live delayed trigger's
+        // provenance as a root, so a live entry is sufficient and is far less
+        // construction than a journal command.
+        let mut delayed = DelayedTrigger::new(
+            crate::types::ability::DelayedTriggerCondition::AtNextPhase {
+                phase: Phase::Upkeep,
+            },
+            Box::new(ResolvedAbility::new(
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+                Vec::new(),
+                source,
+                PlayerId(0),
+            )),
+            PlayerId(0),
+            source,
+            true,
+        );
+        delayed.provenance = DelayedInstallIdentity::ReceiptEligible(origin);
+        state.delayed_triggers.push(delayed);
+        // The allocator tail check is `next_delayed_trigger_token <= max_token`,
+        // so both allocators must sit ABOVE the root they authorise.
+        state.next_delayed_trigger_token = 2;
+        state.next_delayed_trigger_instance = 2;
+        state.resolving_trigger_firing = Some(TriggerFiring::ReceiptEligible(origin));
+        let chain = Box::new(ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            Vec::new(),
+            source,
+            PlayerId(0),
+        ));
+        let pending = PendingContinuation::new(chain, &state);
+        state
+            .resolution_stack
+            .push_ability_continuation(AbilityContinuationFrame {
+                pending,
+                choose_zone_trigger_context: None,
+            });
+
+        // Paired positive reach-guard, asserted FIRST: the coherent, unredacted
+        // multi-authority payload decodes.
+        let reached = serde_json::from_value::<PersistedGameState>(bare_value(&state))
+            .expect("the unredacted multi-authority payload decodes at the raw ingress");
+        assert!(
+            matches!(reached, PersistedGameState::Raw(_)),
+            "the reach-guard must decode through the raw ingress, which is the seam \
+             under test"
+        );
+
+        let wire = client_wire_value(&state);
+
+        // Measures the string the ingress produces with the guard bypassed, so
+        // the `!contains` clause below is a discriminated claim rather than a
+        // sentence that is true of any refusal whatsoever.
+        let bypassed = serde_json::from_value::<PersistedGameState>(
+            with_the_projection_guard_bypassed(wire.clone()),
+        )
+        .expect_err("the redaction strips every install root, so the payload is refused")
+        .to_string();
+        assert!(
+            bypassed.contains("resolving triggered entry has no firing carrier"),
+            "with the guard bypassed the redacted payload must fall through to the \
+             carrier refusal, got {bypassed}"
+        );
+
+        let error = serde_json::from_value::<PersistedGameState>(wire)
+            .expect_err("the redacted multi-authority payload must not decode")
+            .to_string();
+        assert!(
+            error.contains(CLIENT_WIRE_PROJECTION_REFUSAL),
+            "the refusal must name the projection, got {error}"
+        );
+        assert!(
+            !error.contains("resolving triggered entry has no firing carrier"),
+            "the projection must be refused at the ingress, before the delayed \
+             install roots are consulted, got {error}"
+        );
+    }
+
+    /// V18. The fingerprint is CONJUNCTIVE over every entry of
+    /// `CLIENT_WIRE_UNCONDITIONAL_FIELDS`. The discriminating population is a
+    /// PARTIALLY absent fingerprint — the real 2026-07-22 to 2026-08-01 build
+    /// shape — because a fully restored one satisfies neither `.all(…)` nor
+    /// `.any(…)` and is blind to every mutation of the conjunction.
+    ///
+    /// Removing two keys does not change the decode for an unrelated reason:
+    /// the serde defaults are `next_delayed_trigger_token → 0`,
+    /// `next_delayed_trigger_instance → 1`, `resolved_rules_journal → default`,
+    /// this fixture holds no delayed triggers and an empty journal, and
+    /// `normalize_delayed_trigger_allocators` collapses both `0` and `1` to `1`
+    /// with no install roots. The decoded state is identical either way.
+    ///
+    /// Mutation A — `.any(…)` instead of `.all(…)` in
+    /// `is_redacted_client_wire_projection`. Every loop iteration has two of the
+    /// three absent, so `any` is true and the guard fires. Reddens at the
+    /// `expect`/`unwrap_or_else` INSIDE the loop, on the first iteration. The
+    /// reach-guard stays green (all three absent means `any` is true too).
+    ///
+    /// Mutation B — drop any one key `k` from `CLIENT_WIRE_UNCONDITIONAL_FIELDS`.
+    /// The iteration whose only present key is `k` then evaluates the conjunction
+    /// over the other two, both of which it removed, so the guard fires. Reddens
+    /// on exactly that iteration; the other two stay green. Together the two
+    /// mutations pin the conjunction AND each of the three entries independently.
+    #[test]
+    fn redaction_fingerprint_is_conjunctive_over_every_unconditional_field() {
+        let base = bare_value(&parked_continuation_fixture(None));
+
+        // Paired positive reach-guard, asserted FIRST: with ALL three absent this
+        // payload family IS refused. Without it the three greens below would be
+        // vacuous — they would pass for a payload the guard could never fire on.
+        let error = serde_json::from_value::<PersistedGameState>(without_keys(
+            base.clone(),
+            FINGERPRINT_FIELDS,
+        ))
+        .expect_err("a fully absent fingerprint must be refused")
+        .to_string();
+        assert!(
+            error.contains(CLIENT_WIRE_PROJECTION_REFUSAL),
+            "the reach-guard must be refused as a projection, got {error}"
+        );
+
+        for present in FINGERPRINT_FIELDS.iter().copied() {
+            let others: Vec<&str> = FINGERPRINT_FIELDS
+                .iter()
+                .copied()
+                .filter(|field| *field != present)
+                .collect();
+            let decoded =
+                serde_json::from_value::<PersistedGameState>(without_keys(base.clone(), &others))
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "a payload still carrying {present} is not a mechanical \
+                             client-wire redaction and must decode, got {error}"
+                        )
+                    });
+            assert!(
+                matches!(decoded, PersistedGameState::Raw(_)),
+                "a payload still carrying {present} must decode through the raw ingress"
+            );
+        }
+    }
+
+    /// V19. The boundary §5.3 deliberately did NOT widen: an unversioned payload
+    /// WITHOUT `resolution_stack` keeps its legacy v1 treatment even when it
+    /// bears the full redaction fingerprint. Those payloads decode today, their
+    /// exposure predates the wire inference, and refusing them would be a real
+    /// availability regression for a defect this ingress did not introduce.
+    ///
+    /// Mutation — drop the `object.contains_key("resolution_stack") &&` conjunct
+    /// from the guard. The no-frames payload then bears the fingerprint and is
+    /// refused. Reddens at the subject's `unwrap_or_else`.
+    #[test]
+    fn unversioned_payload_without_a_frame_stack_keeps_its_legacy_v1_treatment() {
+        // Paired positive reach-guard, asserted FIRST: the SAME fingerprint
+        // removal applied to a payload that DOES carry a frame stack is refused.
+        // So the only difference between the two payloads below is the frame
+        // stack, which is exactly the conjunct under test.
+        let with_frames = without_keys(
+            bare_value(&parked_continuation_fixture(None)),
+            FINGERPRINT_FIELDS,
+        );
+        let error = serde_json::from_value::<PersistedGameState>(with_frames)
+            .expect_err("the frame-stack sibling must be refused as a projection")
+            .to_string();
+        assert!(
+            error.contains(CLIENT_WIRE_PROJECTION_REFUSAL),
+            "the reach-guard must be refused as a projection, got {error}"
+        );
+
+        let bare = bare_value(&GameState::new_two_player(42));
+        assert!(
+            bare.get("resolution_stack").is_none(),
+            "an empty frame stack is omitted by skip_serializing_if, which is what \
+             routes this payload to the legacy v1 branch — without that this row \
+             would pass for the wrong reason"
+        );
+
+        let decoded =
+            serde_json::from_value::<PersistedGameState>(without_keys(bare, FINGERPRINT_FIELDS))
+                .expect("a payload with no frame stack keeps its legacy v1 treatment");
+        assert!(
+            matches!(decoded, PersistedGameState::Raw(_)),
+            "the no-frames payload must still decode through the raw ingress"
+        );
+    }
+
     /// CR 109.5 + CR 611.2a: a restored restriction still carrying the raw
     /// `SourceController` placeholder (which `add_restriction` always lowers to
     /// `SpecificPlayer` at creation, so it can only appear in a corrupt or forged
@@ -27184,7 +30300,8 @@ mod tests {
         for persisted in [raw, trusted] {
             let restored = serde_json::from_value::<PersistedGameState>(persisted)
                 .expect("restriction fixture restores")
-                .into_game_state();
+                .into_game_state()
+                .expect("persisted test snapshot satisfies the checked restore contract");
 
             assert!(
                 !restored.restrictions.iter().any(|restriction| matches!(
@@ -27234,7 +30351,7 @@ mod tests {
 
         let restored = serde_json::from_value::<PersistedGameState>(v1)
             .expect("v1 fixture conservatively restores unlabelled trigger carriers")
-            .into_game_state();
+            .into_game_state_unchecked();
 
         assert_eq!(
             restored.pending_trigger_firing,
@@ -27289,7 +30406,7 @@ mod tests {
 
         let restored = serde_json::from_value::<PersistedGameState>(v1)
             .expect("legacy continuation event reconciles after frame projection")
-            .into_game_state();
+            .into_game_state_unchecked();
         let GameEvent::ZoneChanged { record, .. } = &restored
             .active_ability_continuation()
             .expect("legacy continuation projects into the canonical frame stack")
@@ -27335,7 +30452,7 @@ mod tests {
         erase_persisted_event_occurrence_fields(persisted_state_payload_mut(&mut persisted));
         let restored = serde_json::from_value::<PersistedGameState>(persisted)
             .expect("v2 frame event reconciles before materialization")
-            .into_game_state();
+            .into_game_state_unchecked();
         let GameEvent::ZoneChanged { record, .. } = &restored
             .active_ability_continuation()
             .expect("v2 frame restores as an active continuation")
@@ -27413,6 +30530,74 @@ mod tests {
                 .to_string()
                 .contains("paused trigger continuation has no firing carrier"),
             "expected direct-wire continuation failure, got {continuation_error}"
+        );
+    }
+
+    /// #7799 review follow-up (matthewevans, review 5012075716): `PayCostKind::
+    /// TapCreatures::mode` (added by the selection-mode-discriminator fix) has no
+    /// `#[serde(default)]`, replacing the prior `aggregate: Option<..>` field.
+    /// This is a deliberate wire-compatibility break, backed by
+    /// `lobby_broker::PROTOCOL_VERSION` 36 / `WIRE_PROTOCOL_VERSION` 27 (not a
+    /// backward-compatible decode shim) — the same convention entry 23
+    /// (`PayableResource::ManaGeneric`) established. This test proves the break
+    /// is a clean, non-silent deserialize failure through the actual production
+    /// restore path (`PersistedGameState`, the same type `server-core::session::
+    /// PersistedSession.state` uses), for BOTH prior `TapCreatures` shapes: the
+    /// fixed-count form (`aggregate` omitted/null) and the aggregate form
+    /// (`aggregate: {..}`) — proving the rejection isn't an artifact of one
+    /// particular legacy payload, and specifically that an aggregate-shaped
+    /// legacy payload cannot be silently admitted as a `Fixed` decode.
+    #[test]
+    fn tap_creatures_pre_mode_wire_shape_is_rejected() {
+        let mut state = GameState::new_two_player(42);
+        state.waiting_for = WaitingFor::PayCost {
+            player: PlayerId(0),
+            kind: PayCostKind::TapCreatures {
+                mode: TapCreaturesSelectionMode::Fixed,
+            },
+            choices: vec![ObjectId(1)],
+            count: 1,
+            min_count: 0,
+            resume: CostResume::Resolution,
+        };
+        let base = serde_json::to_value(state).expect("fixture state serializes");
+
+        // Prior fixed-count wire shape: `aggregate` omitted (the old field was
+        // `#[serde(default, skip_serializing_if = "Option::is_none")]`).
+        let mut legacy_fixed = base.clone();
+        legacy_fixed["waiting_for"]["data"]["kind"]
+            .as_object_mut()
+            .expect("kind is a JSON object")
+            .remove("mode");
+        let fixed_error = serde_json::from_value::<PersistedGameState>(legacy_fixed)
+            .expect_err("pre-mode fixed-count TapCreatures payload must fail to deserialize");
+        assert!(
+            fixed_error.to_string().contains("mode"),
+            "expected a missing-`mode` deserialize error, got: {fixed_error}"
+        );
+
+        // Prior aggregate wire shape: `aggregate: {..}` present, `mode` absent.
+        let mut legacy_aggregate = base;
+        let kind = legacy_aggregate["waiting_for"]["data"]["kind"]
+            .as_object_mut()
+            .expect("kind is a JSON object");
+        kind.remove("mode");
+        kind.insert(
+            "aggregate".to_string(),
+            serde_json::json!({
+                "stat": "TotalPower",
+                "comparator": "GE",
+                "value": 3
+            }),
+        );
+        let aggregate_error = serde_json::from_value::<PersistedGameState>(legacy_aggregate)
+            .expect_err(
+                "pre-mode aggregate TapCreatures payload must fail to deserialize, \
+                 not silently decode as a Fixed-mode payment",
+            );
+        assert!(
+            aggregate_error.to_string().contains("mode"),
+            "expected a missing-`mode` deserialize error, got: {aggregate_error}"
         );
     }
 
@@ -28059,8 +31244,129 @@ mod tests {
             )
             .unwrap(),
             AutoPassMode::UntilStackEmpty {
-                initial_stack_len: 3
+                initial_stack_len: 3,
+                policy: StackResolutionPolicy::Committed,
             }
+        );
+    }
+
+    #[test]
+    fn stack_resolution_budget_keeps_the_legacy_numeric_wire_contract() {
+        #[derive(Deserialize)]
+        struct BudgetCarrier {
+            #[serde(default)]
+            budget: StackResolutionBudget,
+        }
+
+        assert_eq!(
+            serde_json::to_string(&StackResolutionBudget::Unlimited).unwrap(),
+            "0"
+        );
+        assert_eq!(
+            serde_json::from_str::<StackResolutionBudget>("0").unwrap(),
+            StackResolutionBudget::Unlimited
+        );
+        assert_eq!(
+            StackResolutionBudget::from_legacy_max_resolutions(0),
+            StackResolutionBudget::Unlimited,
+            "an in-memory legacy zero normalizes before it can acquire a divergent meaning"
+        );
+        assert_eq!(
+            serde_json::from_str::<StackResolutionBudget>("17").unwrap(),
+            StackResolutionBudget::Limited(NonZeroU32::new(17).unwrap())
+        );
+        assert!(
+            NonZeroU32::new(0).is_none(),
+            "a zero cap is not representable"
+        );
+        assert!(
+            serde_json::from_str::<StackResolutionBudget>("null").is_err(),
+            "only the established numeric zero, not null, means unlimited"
+        );
+        assert_eq!(
+            serde_json::from_str::<BudgetCarrier>("{}").unwrap().budget,
+            StackResolutionBudget::Unlimited,
+            "a pre-session save with no cap field is unlimited"
+        );
+    }
+
+    #[test]
+    fn until_stack_empty_uses_committed_policy_for_legacy_and_new_payloads() {
+        let committed = AutoPassMode::UntilStackEmpty {
+            initial_stack_len: 3,
+            policy: StackResolutionPolicy::Committed,
+        };
+        assert_eq!(
+            serde_json::to_string(&committed).unwrap(),
+            r#"{"type":"UntilStackEmpty","initial_stack_len":3}"#,
+            "the default policy retains the old persisted shape"
+        );
+        let rechecking = AutoPassMode::UntilStackEmpty {
+            initial_stack_len: 3,
+            policy: StackResolutionPolicy::RecheckNoMeaningfulPriorityAction,
+        };
+        assert_eq!(
+            serde_json::from_str::<AutoPassMode>(
+                r#"{"type":"UntilStackEmpty","initial_stack_len":3,"policy":"RecheckNoMeaningfulPriorityAction"}"#
+            )
+            .unwrap(),
+            rechecking
+        );
+    }
+
+    #[test]
+    fn stack_resolution_entry_fence_uses_latched_lki_and_both_target_pin_vectors() {
+        let mut ability = ResolvedAbility::new(
+            Effect::NoOp,
+            vec![TargetRef::Object(ObjectId(8))],
+            ObjectId(7),
+            PlayerId(0),
+        );
+        ability.source_incarnation = Some(3);
+        ability.target_incarnations = vec![ObjectIncarnationRef::of(ObjectId(8), 4)];
+        ability.selected_target_incarnations = vec![ObjectIncarnationRef::of(ObjectId(8), 5)];
+        let entry = StackEntry {
+            id: ObjectId(6),
+            source_id: ObjectId(7),
+            controller: PlayerId(0),
+            kind: StackEntryKind::ActivatedAbility {
+                source_id: ObjectId(7),
+                ability: Box::new(ability),
+            },
+        };
+
+        let fence = StackResolutionEntryFence::capture(&entry);
+        assert_eq!(fence.entry_id, ObjectId(6));
+        assert_eq!(fence.source_id, ObjectId(7));
+        assert_eq!(fence.controller, PlayerId(0));
+        assert_eq!(
+            fence.target_incarnations,
+            vec![ObjectIncarnationRef::of(ObjectId(8), 4)]
+        );
+        assert_eq!(
+            fence.selected_target_incarnations,
+            vec![ObjectIncarnationRef::of(ObjectId(8), 5)]
+        );
+        assert!(
+            fence.matches_captured_entry(&entry),
+            "comparison must use the entry's latched source state, without a live source object"
+        );
+
+        let mut changed_lki = entry.clone();
+        changed_lki.ability_mut().unwrap().source_incarnation = Some(9);
+        assert!(
+            !fence.matches_captured_entry(&changed_lki),
+            "a changed LKI source capture invalidates the fence even when ids match"
+        );
+
+        let mut changed_selected_pin = entry;
+        changed_selected_pin
+            .ability_mut()
+            .unwrap()
+            .selected_target_incarnations = vec![ObjectIncarnationRef::of(ObjectId(8), 10)];
+        assert!(
+            !fence.matches_captured_entry(&changed_selected_pin),
+            "ordinary selected-target pins are independently fenced"
         );
     }
 
@@ -28188,7 +31494,113 @@ mod tests {
         );
     }
 
-    /// T-loop (§4 Condition 2): the all-zone incarnation bump advances a source's
+    #[test]
+    fn normalize_for_loop_canonicalizes_cast_coordinates_but_preserves_identity_shape() {
+        fn ability_graph(occurrence: CastOccurrence) -> ResolvedAbility {
+            let mut epic =
+                ResolvedAbility::new(Effect::NoOp, Vec::new(), ObjectId(500), occurrence.caster);
+            epic.sub_ability = Some(Box::new(ResolvedAbility::new(
+                Effect::NoOp,
+                Vec::new(),
+                ObjectId(500),
+                occurrence.caster,
+            )));
+            epic.else_ability = Some(Box::new(ResolvedAbility::new(
+                Effect::NoOp,
+                Vec::new(),
+                ObjectId(500),
+                occurrence.caster,
+            )));
+            let mut root = ResolvedAbility::new(
+                Effect::EpicCopy {
+                    spell: Box::new(epic),
+                },
+                Vec::new(),
+                ObjectId(500),
+                occurrence.caster,
+            );
+            root.sub_ability = Some(Box::new(ResolvedAbility::new(
+                Effect::NoOp,
+                Vec::new(),
+                ObjectId(500),
+                occurrence.caster,
+            )));
+            root.else_ability = Some(Box::new(ResolvedAbility::new(
+                Effect::NoOp,
+                Vec::new(),
+                ObjectId(500),
+                occurrence.caster,
+            )));
+            root.set_cast_occurrence_recursive(Some(occurrence));
+            root
+        }
+
+        fn stack_state(occurrence: CastOccurrence) -> GameState {
+            let mut state = GameState::new_two_player(7);
+            let mut object = GameObject::new(
+                ObjectId(500),
+                CardId(500),
+                occurrence.caster,
+                "Loop Spell".to_string(),
+                Zone::Stack,
+            );
+            object.cast_occurrence = Some(occurrence);
+            state.objects.insert(object.id, object);
+            state.stack.push_back(StackEntry {
+                id: ObjectId(500),
+                source_id: ObjectId(500),
+                controller: occurrence.caster,
+                kind: StackEntryKind::Spell {
+                    card_id: CardId(500),
+                    ability: Some(Box::new(ability_graph(occurrence))),
+                    casting_variant: CastingVariant::Normal,
+                    actual_mana_spent: 0,
+                },
+            });
+            state
+        }
+
+        let earlier = stack_state(CastOccurrence {
+            caster: PlayerId(0),
+            turn_journal_index: 4,
+        });
+        let later = stack_state(CastOccurrence {
+            caster: PlayerId(0),
+            turn_journal_index: 5,
+        });
+        assert!(loop_states_equal(
+            &earlier.normalize_for_loop(),
+            &later.normalize_for_loop()
+        ));
+
+        let mut absent = earlier.clone();
+        absent
+            .objects
+            .get_mut(&ObjectId(500))
+            .unwrap()
+            .cast_occurrence = None;
+        absent
+            .stack
+            .back_mut()
+            .and_then(StackEntry::ability_mut)
+            .unwrap()
+            .set_cast_occurrence_recursive(None);
+        assert!(!loop_states_equal(
+            &earlier.normalize_for_loop(),
+            &absent.normalize_for_loop()
+        ));
+
+        let other_caster = stack_state(CastOccurrence {
+            caster: PlayerId(1),
+            turn_journal_index: 5,
+        });
+        assert!(!loop_states_equal(
+            &earlier.normalize_for_loop(),
+            &other_caster.normalize_for_loop()
+        ));
+    }
+
+    /// T-loop: the all-zone incarnation bump advances a source's
     /// epoch every time it changes zones, so a mandatory loop that cycles its
     /// source's zones would carry a growing `TriggerSourceContext` into loop equality
     /// and never confirm a CR 104.4b draw. `normalize_for_loop` canonicalizes source
@@ -28588,7 +32000,10 @@ mod tests {
         let mut b = a.clone();
         b.register_pending_materialization(
             PlayerId(0),
-            PersistentAxisMaterialization::Tokens(dummy_copiable_profile("Saproling")),
+            PersistentAxisMaterialization::Tokens(Box::new(TokenGrowth {
+                profile: dummy_copiable_profile("Saproling"),
+                per_cycle_delta: 1,
+            })),
         );
         // Sanity: the populated field really does differ between the two states.
         assert_ne!(
@@ -28834,7 +32249,10 @@ mod tests {
         );
         state.register_pending_materialization(
             PlayerId(0),
-            PersistentAxisMaterialization::Tokens(dummy_copiable_profile("Saproling")),
+            PersistentAxisMaterialization::Tokens(Box::new(TokenGrowth {
+                profile: dummy_copiable_profile("Saproling"),
+                per_cycle_delta: 1,
+            })),
         );
         state.register_unbounded_loop_pile(PlayerId(0), BTreeSet::from([ObjectId(1)]));
 
@@ -28875,7 +32293,10 @@ mod tests {
         state.mark_unbounded_loop(PlayerId(0), &[ResourceAxis::TokensCreated]);
         state.register_pending_materialization(
             PlayerId(0),
-            PersistentAxisMaterialization::Tokens(dummy_copiable_profile("Saproling")),
+            PersistentAxisMaterialization::Tokens(Box::new(TokenGrowth {
+                profile: dummy_copiable_profile("Saproling"),
+                per_cycle_delta: 1,
+            })),
         );
 
         let collapsed = state
@@ -29229,7 +32650,10 @@ mod tests {
         );
         state.register_pending_materialization(
             PlayerId(0),
-            PersistentAxisMaterialization::Tokens(dummy_copiable_profile("Saproling")),
+            PersistentAxisMaterialization::Tokens(Box::new(TokenGrowth {
+                profile: dummy_copiable_profile("Saproling"),
+                per_cycle_delta: 1,
+            })),
         );
         state.register_unbounded_loop_pile(PlayerId(0), BTreeSet::from([ObjectId(1)]));
         // Non-vacuity: the pre-state really holds both axes + pile + stash.
@@ -29484,6 +32908,101 @@ mod tests {
             loop_states_equal(&first.normalize_for_loop(), &second.normalize_for_loop()),
             "CR 104.4b: positions differing only in the resolution-scoped mode-boundary \
              latch must confirm as a repeat"
+        );
+    }
+
+    /// CR 608.2c + CR 104.4b: the chain-local tracked-set pointer is resolution-scoped
+    /// and is narrowed only at scope ENTRY, so between resolutions it still names the
+    /// last resolution's set as pure residue. Two identical positions — the SAME
+    /// published set at the SAME counter — must still confirm as a repeated position
+    /// when only the pointer differs.
+    ///
+    /// DISCRIMINATION: delete `clone.chain_tracked_set_id = None;` from
+    /// `normalize_for_loop` and this test FAILS on the equality assertion — the field
+    /// is eq-compared, so the residue alone defeats the repeat. The `!=` assertion is
+    /// the paired non-vacuity witness: it proves the two inputs really do differ
+    /// BEFORE normalization.
+    #[test]
+    fn normalize_for_loop_clears_the_chain_tracked_set_residue() {
+        let mut first = GameState::new_two_player(7);
+        // Content authority identical in both — the published set and the advanced
+        // counter are established BEFORE the clone, so the pointer is the only
+        // difference.
+        first
+            .tracked_object_sets
+            .insert(TrackedSetId(1), Vec::new());
+        first.next_tracked_set_id = 2;
+        let mut second = first.clone();
+        first.chain_tracked_set_id = Some(TrackedSetId(1));
+        second.chain_tracked_set_id = None;
+
+        assert!(
+            first != second,
+            "non-vacuity: the two states must differ before normalization, else the \
+             equality assertion below proves nothing"
+        );
+
+        assert!(
+            loop_states_equal(&first.normalize_for_loop(), &second.normalize_for_loop()),
+            "CR 104.4b: positions naming the same published set must confirm as a repeat \
+             whether or not the resolution-scoped pointer still holds it"
+        );
+    }
+
+    /// CR 104.4b: `tracked_object_sets` and `next_tracked_set_id` are the tracked-set
+    /// CONTENT authority — real accumulated progress, not resolution-scoped residue.
+    /// `normalize_for_loop` neutralizes the chain POINTER into that arena and must
+    /// leave the arena and its mint compared: normalizing them would collapse two
+    /// genuinely different positions into one and draw a game that is still
+    /// progressing.
+    ///
+    /// DISCRIMINATION: this row's failing arrangement is not the clear this change
+    /// adds but a widening of it — add `clone.tracked_object_sets.clear();` or
+    /// `clone.next_tracked_set_id = 0;` to `normalize_for_loop` and the matching
+    /// inequality FAILS. The first assertion is the paired reach-guard: it differs
+    /// only in a field normalization does neutralize, so a normalization that stopped
+    /// running reddens it instead of leaving the inequalities to pass by default.
+    #[test]
+    fn normalize_for_loop_leaves_the_tracked_set_content_authority_compared() {
+        let mut base = GameState::new_two_player(7);
+        base.tracked_object_sets
+            .insert(TrackedSetId(1), vec![ObjectId(90_001)]);
+        base.next_tracked_set_id = 2;
+        base.chain_tracked_set_id = Some(TrackedSetId(1));
+
+        let mut volatile_only = base.clone();
+        volatile_only.state_revision = 99;
+        assert!(
+            loop_states_equal(
+                &base.normalize_for_loop(),
+                &volatile_only.normalize_for_loop()
+            ),
+            "reach guard: holding the arena equal, this pair must still confirm — else the \
+             inequalities below say nothing about the arena"
+        );
+
+        let mut other_members = base.clone();
+        other_members
+            .tracked_object_sets
+            .insert(TrackedSetId(1), vec![ObjectId(90_002)]);
+        assert!(
+            !loop_states_equal(
+                &base.normalize_for_loop(),
+                &other_members.normalize_for_loop()
+            ),
+            "CR 104.4b: differing tracked-set membership is real accumulated content and \
+             must not be normalized into a repeat"
+        );
+
+        let mut other_counter = base.clone();
+        other_counter.next_tracked_set_id = 3;
+        assert!(
+            !loop_states_equal(
+                &base.normalize_for_loop(),
+                &other_counter.normalize_for_loop()
+            ),
+            "CR 104.4b: a further minted tracked set is real accumulated content and must \
+             not be normalized into a repeat"
         );
     }
 
@@ -30374,6 +33893,8 @@ mod tests {
             player: PlayerId(0),
             candidate_count: 2,
             candidates: vec![],
+            kind: Default::default(),
+            last_applied_decides: false,
         }));
         variants.push(Box::new(WaitingFor::ExploreChoice {
             player: PlayerId(0),
@@ -30429,6 +33950,7 @@ mod tests {
             up_to: false,
             constraint: None,
             source_id: ObjectId(100),
+            reciprocal_role: None,
         }));
         variants.push(Box::new(WaitingFor::ChooseOneOfBranch {
             player: PlayerId(0),
@@ -30629,6 +34151,7 @@ mod tests {
             conditional_enter_with_counters: vec![],
             count_param: 0,
             library_position: None,
+            mass_library_order: None,
             is_cost_payment: false,
             enters_modified_if: None,
             duration: None,
@@ -30759,7 +34282,9 @@ mod tests {
         // variant here does not lose mid-cast tracking.
         let tap_mana = WaitingFor::PayCost {
             player: PlayerId(0),
-            kind: PayCostKind::TapCreatures { aggregate: None },
+            kind: PayCostKind::TapCreatures {
+                mode: TapCreaturesSelectionMode::Fixed,
+            },
             choices: vec![ObjectId(1)],
             count: 1,
             min_count: 0,
@@ -30903,6 +34428,39 @@ mod tests {
     }
 
     #[test]
+    fn choose_objects_selection_serializes_bounds_and_defaults_legacy_shape() {
+        use crate::types::ability::TargetRef;
+
+        let waiting = WaitingFor::ChooseObjectsSelection {
+            player: PlayerId(0),
+            eligible: vec![TargetRef::Object(ObjectId(1))],
+            min: 1,
+            max: Some(2),
+            trigger_event: None,
+        };
+        let json = serde_json::to_value(&waiting).expect("serialize bounded prompt");
+        assert_eq!(json["data"]["min"], 1);
+        assert_eq!(json["data"]["max"], 2);
+        assert_eq!(
+            serde_json::from_value::<WaitingFor>(json).expect("roundtrip bounded prompt"),
+            waiting
+        );
+
+        let legacy = r#"{
+            "type":"ChooseObjectsSelection",
+            "data":{"player":0,"eligible":[]}
+        }"#;
+        assert!(matches!(
+            serde_json::from_str::<WaitingFor>(legacy).expect("legacy prompt remains parseable"),
+            WaitingFor::ChooseObjectsSelection {
+                min: 0,
+                max: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn crew_vehicle_legacy_missing_contributions_deserializes() {
         let json = r#"{
             "type":"CrewVehicle",
@@ -30987,6 +34545,13 @@ mod tests {
 
     #[test]
     fn effect_zone_choice_roundtrips() {
+        let mass_library_order = MassLibraryOrderBatch {
+            owner: PlayerId(0),
+            members: vec![MassLibraryOrderMember {
+                identity: ObjectIncarnationRef::of(ObjectId(1), 7),
+                origin: Zone::Battlefield,
+            }],
+        };
         let wf = WaitingFor::EffectZoneChoice {
             player: PlayerId(0),
             cards: vec![ObjectId(1), ObjectId(2)],
@@ -31008,6 +34573,7 @@ mod tests {
             conditional_enter_with_counters: vec![],
             count_param: 0,
             library_position: None,
+            mass_library_order: Some(mass_library_order.clone()),
             is_cost_payment: false,
             enters_modified_if: None,
             duration: None,
@@ -31016,6 +34582,48 @@ mod tests {
         let deserialized: WaitingFor = serde_json::from_str(&json).unwrap();
         assert_eq!(wf, deserialized);
         assert!(json.contains("\"EffectZoneChoice\""));
+        assert!(json.contains("\"mass_library_order\""));
+
+        let mut legacy_wire: serde_json::Value = serde_json::from_str(&json).unwrap();
+        legacy_wire["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("mass_library_order");
+        assert!(matches!(
+            serde_json::from_value::<WaitingFor>(legacy_wire).unwrap(),
+            WaitingFor::EffectZoneChoice {
+                mass_library_order: None,
+                ..
+            }
+        ));
+        assert_eq!(mass_library_order.members.len(), 1);
+    }
+
+    #[test]
+    fn pending_mass_library_order_choice_decodes_legacy_tuple_batches() {
+        let pending = PendingMassLibraryOrderChoice {
+            source_id: ObjectId(10),
+            library_position: LibraryPosition::Bottom,
+            track_exiled_by_source: false,
+            duration: None,
+            remaining_batches: PendingMassLibraryOrderBatches::Typed(Vec::new()),
+        };
+        let mut wire = serde_json::to_value(pending).unwrap();
+        wire["remaining_batches"] = serde_json::json!([[1, [2, 3]]]);
+
+        let decoded: PendingMassLibraryOrderChoice = serde_json::from_value(wire).unwrap();
+        assert!(matches!(
+            decoded.remaining_batches,
+            PendingMassLibraryOrderBatches::Legacy(ref batches)
+                if batches == &vec![(PlayerId(1), vec![ObjectId(2), ObjectId(3)])]
+        ));
+
+        let reserialized = serde_json::to_value(decoded).unwrap();
+        assert_eq!(
+            reserialized["remaining_batches"],
+            serde_json::json!([[1, [2, 3]]]),
+            "a legacy mass-order queue must retain its migration authority across a save"
+        );
     }
 
     /// CR 502.3: the bounded untap-subset prompt must survive serde round-trip
@@ -31560,6 +35168,7 @@ mod tests {
             conditional_enter_with_counters: vec![],
             count_param: 0,
             library_position: None,
+            mass_library_order: None,
             is_cost_payment: false,
             enters_modified_if: None,
             duration: None,
@@ -31630,7 +35239,116 @@ mod tests {
             deserialized.may_trigger_auto_choice(&key),
             Some(AutoMayChoice::Accept)
         );
+        assert!(matches!(
+            deserialized.may_trigger_auto_choices[0].selector,
+            MayTriggerAutoChoiceSelector::ExactInstance { .. }
+        ));
         assert_eq!(state, deserialized);
+    }
+
+    #[test]
+    fn may_trigger_auto_choice_selector_decodes_legacy_key_and_keeps_scopes_independent() {
+        let legacy: MayTriggerAutoChoiceRecord = serde_json::from_value(serde_json::json!({
+            "key": {
+                "player": 0,
+                "source_id": 5,
+                "origin": { "type": "Printed", "trigger_index": 1 }
+            },
+            "choice": { "type": "Accept" }
+        }))
+        .expect("legacy record decodes");
+        assert!(matches!(
+            legacy.selector,
+            MayTriggerAutoChoiceSelector::ExactInstance {
+                player: PlayerId(0),
+                source_id: ObjectId(5),
+                ..
+            }
+        ));
+
+        let exact = MayTriggerAutoChoiceKey {
+            player: PlayerId(0),
+            source_id: ObjectId(5),
+            origin: MayTriggerOrigin::Printed { trigger_index: 1 },
+        };
+        let same = MayTriggerAutoChoiceSelector::SameCard {
+            player: PlayerId(0),
+            printed_ref: PrintedCardRef {
+                oracle_id: "same-card".to_string(),
+                face_name: "Same Card".to_string(),
+            },
+            printed_occurrence: 1,
+        };
+        let mut state = GameState::new_two_player(42);
+        state.set_may_trigger_auto_choice_selector(same.clone(), AutoMayChoice::Decline);
+        state.set_may_trigger_auto_choice(exact.clone(), AutoMayChoice::Accept);
+        assert_eq!(
+            state.may_trigger_auto_choice_for_prompt(&exact, Some(&same)),
+            Some(AutoMayChoice::Accept),
+            "exact-instance choices take precedence over same-card choices"
+        );
+        state.remove_may_trigger_auto_choice(&exact);
+        assert_eq!(
+            state.may_trigger_auto_choice_for_prompt(&exact, Some(&same)),
+            Some(AutoMayChoice::Decline),
+            "removing an exact-instance record leaves the same-card record intact"
+        );
+    }
+
+    #[test]
+    fn same_card_may_trigger_selector_uses_printed_ref_not_per_object_card_id() {
+        let printed_ref = PrintedCardRef {
+            oracle_id: "shared-oracle-id".to_string(),
+            face_name: "Shared Face".to_string(),
+        };
+        let mut state = GameState::new_two_player(42);
+        let make_source = |object_id, card_id| {
+            let mut source = GameObject::new(
+                object_id,
+                card_id,
+                PlayerId(0),
+                "Shared Face".to_string(),
+                Zone::Battlefield,
+            );
+            source.printed_ref = Some(printed_ref.clone());
+            source.base_printed_ref = Some(printed_ref.clone());
+            source.push_printed_trigger(TriggerDefinition::new(TriggerMode::ChangesZone));
+            source
+        };
+        let first = make_source(ObjectId(10), CardId(101));
+        let first_ref = first.trigger_definition_ref(&first.trigger_definitions[0]);
+        let second = make_source(ObjectId(11), CardId(202));
+        let second_ref = second.trigger_definition_ref(&second.trigger_definitions[0]);
+        state.objects.insert(ObjectId(10), first);
+        state.objects.insert(ObjectId(11), second);
+
+        let first_key = MayTriggerAutoChoiceKey {
+            player: PlayerId(0),
+            source_id: ObjectId(10),
+            origin: MayTriggerOrigin::Definition {
+                definition_ref: first_ref,
+            },
+        };
+        let second_key = MayTriggerAutoChoiceKey {
+            player: PlayerId(0),
+            source_id: ObjectId(11),
+            origin: MayTriggerOrigin::Definition {
+                definition_ref: second_ref,
+            },
+        };
+        let first_selector = state
+            .same_card_may_trigger_auto_choice_selector(&first_key)
+            .expect("direct printed trigger on a real card is eligible");
+        let second_selector = state
+            .same_card_may_trigger_auto_choice_selector(&second_key)
+            .expect("another physical copy with the same printed ref is eligible");
+        assert_eq!(first_selector, second_selector);
+
+        state.set_may_trigger_auto_choice_selector(first_selector, AutoMayChoice::Decline);
+        assert_eq!(
+            state.may_trigger_auto_choice_for_prompt(&second_key, Some(&second_selector)),
+            Some(AutoMayChoice::Decline)
+        );
     }
 
     #[test]
@@ -31816,7 +35534,8 @@ mod tests {
         ] {
             let restored = serde_json::from_value::<PersistedGameState>(persisted)
                 .expect("legacy null source ID is the source-less choice mode")
-                .into_game_state();
+                .into_game_state()
+                .expect("persisted test snapshot satisfies the checked restore contract");
             assert!(matches!(
                 restored.waiting_for,
                 WaitingFor::NamedChoice {
@@ -31843,7 +35562,10 @@ mod tests {
 
         let restored = serde_json::from_value::<PersistedGameState>(v1)
             .expect("persistence boundary supplies the v1 discriminator");
-        let resumed = restored.clone().into_game_state();
+        let resumed = restored
+            .clone()
+            .into_game_state()
+            .expect("persisted test snapshot satisfies the checked restore contract");
         assert_eq!(
             resumed.active_draw_sequence().map(|frame| frame.remaining),
             Some(2)
@@ -31880,7 +35602,8 @@ mod tests {
 
         let mut restored = serde_json::from_value::<PersistedGameState>(raw)
             .expect("legacy bare PlayerId extra turn must deserialize")
-            .into_game_state();
+            .into_game_state()
+            .expect("persisted test snapshot satisfies the checked restore contract");
         assert_eq!(
             restored.extra_turns,
             vec![ExtraTurn {
@@ -32147,6 +35870,59 @@ mod tests {
         assert!(!none_json.contains("spell_object_id"));
     }
 
+    #[test]
+    fn legacy_stack_object_and_resolved_ability_default_cast_occurrence_to_none() {
+        let object = crate::game::game_object::GameObject::new(
+            ObjectId(6865),
+            CardId(6865),
+            PlayerId(0),
+            "Legacy Stack Spell".to_string(),
+            Zone::Stack,
+        );
+        let ability =
+            ResolvedAbility::new(Effect::Investigate, Vec::new(), ObjectId(6865), PlayerId(0));
+
+        let object_json = serde_json::to_value(&object).expect("serialize object");
+        let ability_json = serde_json::to_value(&ability).expect("serialize ability");
+        assert!(object_json.get("cast_occurrence").is_none());
+        assert!(ability_json.get("cast_occurrence").is_none());
+        let legacy_object: crate::game::game_object::GameObject =
+            serde_json::from_value(object_json.clone()).expect("legacy object loads");
+        let legacy_ability: ResolvedAbility =
+            serde_json::from_value(ability_json.clone()).expect("legacy ability loads");
+        assert_eq!(legacy_object.cast_occurrence, None);
+        assert_eq!(legacy_ability.cast_occurrence, None);
+
+        let occurrence = CastOccurrence {
+            caster: PlayerId(1),
+            turn_journal_index: 8,
+        };
+        let mut present_object = object;
+        present_object.cast_occurrence = Some(occurrence);
+        let mut present_ability = ability;
+        present_ability.cast_occurrence = Some(occurrence);
+        let object_round_trip: crate::game::game_object::GameObject = serde_json::from_value(
+            serde_json::to_value(&present_object).expect("serialize present object"),
+        )
+        .expect("present object loads");
+        let ability_round_trip: ResolvedAbility = serde_json::from_value(
+            serde_json::to_value(&present_ability).expect("serialize present ability"),
+        )
+        .expect("present ability loads");
+        assert_eq!(object_round_trip.cast_occurrence, Some(occurrence));
+        assert_eq!(ability_round_trip.cast_occurrence, Some(occurrence));
+
+        let mut malformed_object = object_json;
+        malformed_object["cast_occurrence"] = serde_json::json!("not an occurrence");
+        assert!(
+            serde_json::from_value::<crate::game::game_object::GameObject>(malformed_object)
+                .is_err()
+        );
+        let mut malformed_ability = ability_json;
+        malformed_ability["cast_occurrence"] = serde_json::json!("not an occurrence");
+        assert!(serde_json::from_value::<ResolvedAbility>(malformed_ability).is_err());
+    }
+
     /// CR 601.2a: A snapshot with a real `from_zone` value (the modern non-Option
     /// encoding) must deserialize unchanged — the legacy adapter must not
     /// rewrite valid origin zones.
@@ -32161,6 +35937,7 @@ mod tests {
             colors: vec![],
             mana_value: 4,
             has_x_in_cost: false,
+            has_adventure: false,
             from_zone: Zone::Graveyard,
             cast_variant: CastingVariant::Normal,
             was_kicked: false,
@@ -32170,6 +35947,25 @@ mod tests {
         let round_tripped: SpellCastRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(round_tripped, original);
         assert_eq!(round_tripped.from_zone, Zone::Graveyard);
+    }
+
+    /// CR 715.2a + CR 715.2b: The Adventure snapshot field is backward
+    /// compatible, omitted when false, and preserved when true.
+    #[test]
+    fn spell_cast_record_adventure_field_serde_contract() {
+        let legacy_json = serde_json::to_string(&SpellCastRecord::default()).unwrap();
+        let legacy: SpellCastRecord = serde_json::from_str(&legacy_json).unwrap();
+        assert!(!legacy.has_adventure);
+        assert!(!legacy_json.contains("has_adventure"));
+
+        let adventure = SpellCastRecord {
+            has_adventure: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&adventure).unwrap();
+        assert!(json.contains("has_adventure"));
+        let round_tripped: SpellCastRecord = serde_json::from_str(&json).unwrap();
+        assert!(round_tripped.has_adventure);
     }
 
     // ---- CR 117.3d priority-yield accessors ----
@@ -33157,8 +36953,8 @@ mod tests {
     ///   head-only shape `evaluate_schedule` uses to RESOLVE, and therefore the plausible
     ///   wrong reading ⇒ arm (b)'s same-head/different-tail pair compares EQUAL ⇒ no latch ⇒
     ///   **arm (b) FAILS while arms (a) and (c) stay green**, because (a)'s heads already
-    ///   differ. The tail is the NEXT episode's pre-declaration, so two proposals agreeing
-    ///   only about this episode are not the same answer;
+    ///   differ. The recorded answer is the whole announcement sequence, so two proposals
+    ///   agreeing only on the head are not the same answer;
     /// * hand-write `impl PartialEq for AnnouncementSubject` with `(Seat(_), Seat(_)) => true`
     ///   ⇒ two DIFFERENT seats compare equal ⇒ arm (a)'s own reach-guard fires first and
     ///   names the vacuity by hand, which is the reach-guard doing its job rather than the
@@ -33212,8 +37008,8 @@ mod tests {
 
         // ── (b) SAME head, DIFFERENT tail ⇒ still Conflicted ──
         //
-        // The tail is a pre-declaration for the NEXT episode (CR 732.2a), not decoration, so
-        // two proposals that agree only about this episode are not the same answer. This is
+        // The recorded answer is the whole announcement sequence (CR 732.2a), not just the
+        // head, so two proposals that agree only on the head are not the same answer. This is
         // the arm a head-only equality would lose.
         let slot_b = DecisionSlot::target(journal_source(914));
         let head1_tail2 = ranked(vec![seat(1), seat(2)]);
@@ -33228,8 +37024,8 @@ mod tests {
         assert_eq!(
             state.loop_answer(&slot_b, PlayerId(0)),
             Some(LoopAnswer::Conflicted),
-            "equality over a `Ranking` is STRUCTURAL, not head-only: the tail is the next \
-             episode's pre-declaration, so differing tails are differing answers"
+            "equality over a `Ranking` is STRUCTURAL, not head-only: the recorded answer is \
+             the whole announcement sequence, so differing tails are differing answers"
         );
 
         // ── (c) the SAME ranking twice ⇒ still Uniform ──
@@ -33241,6 +37037,137 @@ mod tests {
             Some(aimed_at_1),
             "the latch fires on DISAGREEMENT, not on repetition — without this arm an \
              always-false equality would satisfy (a) and (b)"
+        );
+    }
+
+    #[test]
+    fn resolve_all_consent_baseline_distinguishes_legacy_missing_from_captured_empty() {
+        let run = ResolveAllConsentRun {
+            epoch: 1,
+            max_resolutions: StackResolutionBudget::Unlimited,
+            scope: ResolveAllScope::Own,
+            priority_snapshot: ResolveAllPrioritySnapshot {
+                waiting_player: PlayerId(0),
+                priority_player: PlayerId(0),
+                priority_pass_count: 0,
+                priority_passes: BTreeSet::new(),
+            },
+            participants: vec![ResolveAllConsentParticipant {
+                representative: PlayerId(0),
+                authorized_submitter: PlayerId(0),
+                granted: true,
+            }],
+            auto_pass_baseline: Some(BTreeMap::new()),
+        };
+        let captured_empty = serde_json::to_value(&run).expect("fresh run serializes");
+        assert_eq!(
+            captured_empty["auto_pass_baseline"],
+            serde_json::json!({}),
+            "a fresh empty baseline is persisted rather than collapsed into legacy absence"
+        );
+
+        let mut legacy_wire = captured_empty;
+        legacy_wire
+            .as_object_mut()
+            .expect("run wire is an object")
+            .remove("auto_pass_baseline");
+        let legacy: ResolveAllConsentRun =
+            serde_json::from_value(legacy_wire).expect("legacy run without the new field loads");
+        assert_eq!(legacy.auto_pass_baseline, None);
+    }
+
+    /// **The BATCHABILITY split is load-bearing, not decorative:** every axis a batched `Tokens`
+    /// / `Counters` / `Life` item can produce through [`GameState::scheduled_collapse_axes`] is
+    /// `DeferredAccrual`, and `LoopCollapseAxis::from_resource_axis` returns `Some` for exactly
+    /// those.
+    ///
+    /// REVERT PROBE: flip `TokensCreated` to `StandingCapability` in
+    /// `ResourceAxis::unbounded_mark_kind` ⇒ RED. VACUOUS-UNIVERSAL GUARD: the claim is a `∀`
+    /// over the produced set, which an EMPTY set satisfies trivially — the non-empty assertion
+    /// below forbids that, and also reds this row when a FOURTH batched variant produces an axis
+    /// no materialization is accountable for.
+    #[test]
+    fn every_batched_item_axis_is_deferred_accrual_and_batchable() {
+        use crate::analysis::resource::UnboundedMarkKind;
+        use crate::game::printed_cards::intrinsic_copiable_values;
+
+        let mut state = GameState::new_two_player(7);
+        let bearer = create_object(
+            &mut state,
+            CardId(9001),
+            PlayerId(0),
+            "Counter Bearer".to_string(),
+            Zone::Battlefield,
+        );
+        let profile_host = create_object(
+            &mut state,
+            CardId(9002),
+            PlayerId(0),
+            "Fodder Profile".to_string(),
+            Zone::Battlefield,
+        );
+        let profile = intrinsic_copiable_values(
+            state
+                .objects
+                .get(&profile_host)
+                .expect("the just-created profile host is in `objects`"),
+        );
+
+        // One item of EACH batched kind — the three arms `scheduled_collapse_axes` can take that
+        // are not `DriveSequence`.
+        let batched = [
+            PersistentAxisMaterialization::Tokens(Box::new(TokenGrowth {
+                profile: Box::new(profile),
+                per_cycle_delta: 1,
+            })),
+            PersistentAxisMaterialization::Counters(vec![CounterGrowth {
+                object: bearer,
+                counter: CounterType::Plus1Plus1,
+                per_cycle_delta: 1,
+            }]),
+            PersistentAxisMaterialization::Life {
+                player: PlayerId(0),
+                per_cycle_delta: 1,
+            },
+        ];
+
+        let produced = state.scheduled_collapse_axes(&batched);
+        assert_eq!(
+            produced.len(),
+            3,
+            "reach-guard (vacuous-universal): the three batched kinds must produce three distinct \
+             axes, or the ∀ below is satisfied by an empty set. Got {produced:?}"
+        );
+
+        for axis in &produced {
+            assert_eq!(
+                axis.unbounded_mark_kind(),
+                UnboundedMarkKind::DeferredAccrual,
+                "CR 732.2c: an axis a BATCHED item delivers is by definition growth the collapse \
+                 performs, so it must be DeferredAccrual — otherwise the batched route would \
+                 deliver growth for a mark no materialization is accountable for. Got {axis:?}"
+            );
+            assert!(
+                LoopCollapseAxis::from_resource_axis(*axis).is_some(),
+                "the batchability ledger must carry a prompt label for every axis a batched item \
+                 produces; a `None` here means `from_materializations` would silently fold it into \
+                 `Mixed`. Got {axis:?}"
+            );
+        }
+
+        // The CONVERSE, so this is a partition rather than a one-way implication: the standing
+        // axis is the one the batched items never produce, and it is exactly the one
+        // `from_resource_axis` has no label for.
+        assert_eq!(
+            ResourceAxis::Mana(ManaType::Colorless).unbounded_mark_kind(),
+            UnboundedMarkKind::StandingCapability,
+            "the two classifiers answer DIFFERENT questions, and this is the axis where they \
+             visibly diverge from 'batchable'"
+        );
+        assert!(
+            !produced.contains(&ResourceAxis::Mana(ManaType::Colorless)),
+            "no batched item can schedule a mana axis — which is why a batched collapse preserved \
+             mana by construction long before the DriveSequence route did"
         );
     }
 }

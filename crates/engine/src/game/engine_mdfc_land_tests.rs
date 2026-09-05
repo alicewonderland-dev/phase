@@ -41,6 +41,7 @@ fn make_back_face(
     layout_kind: Option<LayoutKind>,
 ) -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
         name: name.to_string(),
         power: None,
         toughness: None,

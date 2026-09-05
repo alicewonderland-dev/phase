@@ -21,9 +21,12 @@ import { useTranslation } from "react-i18next";
 
 import type { SeatPublicView } from "../../adapter/draft-adapter";
 import { menuButtonClass } from "../menu/buttonStyles";
-import { useMultiplayerDraftStore } from "../../stores/multiplayerDraftStore";
+import { DRAFT_OFFLINE_ERROR, useMultiplayerDraftStore } from "../../stores/multiplayerDraftStore";
 import { useDraftPodStore } from "../../stores/draftPodStore";
+import { useEffectiveOffline } from "../../stores/connectivityStore";
+import { draftKindLabels } from "./draftKind";
 import { BotIndicator } from "./BotIndicator";
+import { copyText } from "../../services/copyText";
 
 // ── Seat Card ─────────────────────────────────────────────────────────
 
@@ -130,6 +133,7 @@ interface DraftPodLobbyProps {
 
 export function DraftPodLobby({ onLeave }: DraftPodLobbyProps) {
   const { t } = useTranslation("draft");
+  const effectiveOffline = useEffectiveOffline();
   const role = useMultiplayerDraftStore((s) => s.role);
   const seats = useMultiplayerDraftStore((s) => s.seats);
   const joined = useMultiplayerDraftStore((s) => s.joined);
@@ -146,10 +150,31 @@ export function DraftPodLobby({ onLeave }: DraftPodLobbyProps) {
   const config = useDraftPodStore((s) => s.config);
   const poolMode = useDraftPodStore((s) => s.poolMode);
   const cubeForm = useDraftPodStore((s) => s.cubeForm);
+  const allowedPodSizes = useDraftPodStore((s) => s.allowedPodSizes);
+
+  // `lobby.draftKind` interpolates the kind into a sentence, so a raw enum reads
+  // "CommanderDraft Draft" once Commander is selectable. `draftKindLabels` is the
+  // single authority for that rendering, shared with the landing page's resume card.
+  //
+  // DEFERRED(out of scope): `config.kind` is HOST INTENT, not the pod's kind. A guest
+  // never populates its local config, so it reads the store's `"Premier"` default
+  // rather than the pod's real kind — pre-existing behaviour (a guest in a Sealed
+  // pod already reads "Premier Draft" today). The engine-published authority is
+  // `multiplayerDraftStore`'s `view.kind`; switching to it is a behavioural change
+  // on a shared surface and is out of scope here.
+  const kindLabel = draftKindLabels(t);
 
   const isHost = role === "host";
   const filledSeats = seats.filter((s) => s.display_name).length;
-  const canStart = isHost && (filledSeats >= 2 || botFillEnabled);
+  // The engine publishes the exact legal seat counts for this procedure and
+  // tournament format. No client-side floor or fallback: `null` disables the
+  // button until the engine answers, while bot fill remains an explicit path
+  // that pads the pod before draft creation.
+  const canStart =
+    !effectiveOffline
+    && isHost
+    && (botFillEnabled || (allowedPodSizes?.includes(filledSeats) ?? false));
+  const errorMessage = error === DRAFT_OFFLINE_ERROR ? t("offline.startUnavailable") : error;
 
   // Build a full 8-seat grid (pad with empty seats if the adapter
   // hasn't sent all seats yet)
@@ -177,9 +202,7 @@ export function DraftPodLobby({ onLeave }: DraftPodLobbyProps) {
 
   const handleCopyCode = useCallback(() => {
     if (roomCode) {
-      navigator.clipboard.writeText(roomCode).catch(() => {
-        // Clipboard API may not be available
-      });
+      void copyText(roomCode);
     }
   }, [roomCode]);
 
@@ -193,7 +216,7 @@ export function DraftPodLobby({ onLeave }: DraftPodLobbyProps) {
             {poolMode === "cube"
               ? cubeForm?.cubeName ?? config.setName
               : config.setName || config.setCode} &mdash;{" "}
-            {t("lobby.draftKind", { kind: config.kind })}
+            {t("lobby.draftKind", { kind: kindLabel[config.kind] })}
           </p>
         </div>
 
@@ -239,9 +262,15 @@ export function DraftPodLobby({ onLeave }: DraftPodLobbyProps) {
       </div>
 
       {/* Error display */}
-      {error && (
+      {effectiveOffline && (
+        <div className="rounded-lg border border-amber-400/20 bg-amber-400/5 px-4 py-3 text-sm text-amber-100">
+          {t("offline.unavailableDescription")}
+        </div>
+      )}
+
+      {errorMessage && (
         <div className="rounded-lg border border-red-400/20 bg-red-400/5 px-4 py-3 text-sm text-red-300">
-          {error}
+          {errorMessage}
         </div>
       )}
 

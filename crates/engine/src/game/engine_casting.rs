@@ -1,5 +1,5 @@
 use crate::types::ability::{
-    AbilityCost, AdditionalCost, BeholdCostAction, TapCreaturesAggregate, TargetFilter,
+    AbilityCost, AdditionalCost, BeholdCostAction, TapCreaturesSelectionMode, TargetFilter,
 };
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
@@ -165,8 +165,9 @@ pub(super) fn handle_tap_creatures_for_spell_cost(
     state: &mut GameState,
     player: PlayerId,
     pending_cast: PendingCast,
+    min_count: usize,
     count: usize,
-    aggregate: Option<TapCreaturesAggregate>,
+    mode: TapCreaturesSelectionMode,
     creatures: &[ObjectId],
     chosen: &[ObjectId],
     events: &mut Vec<GameEvent>,
@@ -175,8 +176,9 @@ pub(super) fn handle_tap_creatures_for_spell_cost(
         state,
         player,
         pending_cast,
+        min_count,
         count,
-        aggregate,
+        mode,
         creatures,
         chosen,
         events,
@@ -206,9 +208,12 @@ pub(super) fn handle_behold_for_cost(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn handle_tap_creatures_for_mana_ability(
     state: &mut GameState,
+    min_count: usize,
     count: usize,
+    mode: TapCreaturesSelectionMode,
     creatures: &[ObjectId],
     pending_mana_ability: &PendingManaAbility,
     chosen: &[ObjectId],
@@ -216,7 +221,9 @@ pub(super) fn handle_tap_creatures_for_mana_ability(
 ) -> Result<WaitingFor, EngineError> {
     mana_abilities::handle_tap_creatures_for_mana_ability(
         state,
+        min_count,
         count,
+        mode,
         creatures,
         pending_mana_ability,
         chosen,

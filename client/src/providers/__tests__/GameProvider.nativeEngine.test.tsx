@@ -55,7 +55,9 @@ const {
   };
   class WebSocketAdapter {
     private listener: ((event: NativeAdapterEvent) => void) | null = null;
-    readonly nativeAiOptions: { aiSeats: Array<{ difficulty: string }> } | undefined;
+    readonly nativeAiOptions:
+      | { aiSeats: Array<{ difficulty: string }>; formatConfig?: { starting_life: number } }
+      | undefined;
     readonly nativePregameOptions: NativePregameReconnect | undefined;
     dispose = vi.fn();
     onEvent = vi.fn((listener: (event: NativeAdapterEvent) => void) => {
@@ -74,7 +76,10 @@ const {
       _reservationToken?: string,
       _displayName?: string,
       options?: {
-        nativeAi?: { aiSeats: Array<{ difficulty: string }> };
+        nativeAi?: {
+          aiSeats: Array<{ difficulty: string }>;
+          formatConfig?: { starting_life: number };
+        };
         nativePregame?: NativePregameReconnect;
       },
     ) {
@@ -150,6 +155,7 @@ const {
   const multiplayerState = {
     displayName: "Player",
     setActionPending: vi.fn(),
+    setActivePlayerId: vi.fn(),
     setConnectionStatus: vi.fn(),
     setIsSpectator: vi.fn(),
     setLatency: vi.fn(),
@@ -314,6 +320,7 @@ vi.mock("../../services/serverDetection", () => ({
   detectServerUrl: vi.fn(async () => "ws://test-server"),
 }));
 
+import type { FormatConfig } from "../../adapter/types";
 import { GameProvider } from "../GameProvider";
 import { AdapterError, AdapterErrorCode } from "../../adapter/types";
 import { clearPromptOverlayState } from "../../game/sessionCleanup";
@@ -591,6 +598,45 @@ describe("GameProvider native AI routing", () => {
     ]);
   });
 
+  // The Tauri solo route writes no resume pointer, so `GameSetupPage` hands its
+  // edited config over on the navigation and `GamePage` reads it back out of
+  // router state. This pins the last hop of that hand-over: whatever config the
+  // route resolved must reach the native adapter, or the sidecar starts the
+  // game on the format's default life instead of the user's.
+  it("passes the route's starting life to the native engine", async () => {
+    // Spelled out rather than spread from `FORMAT_DEFAULTS`: the store is
+    // mocked in this file, so the real registry is not reachable here.
+    const formatConfig: FormatConfig = {
+      format: "Commander",
+      starting_life: 25,
+      min_players: 2,
+      max_players: 4,
+      deck_size: { type: "Exactly", data: 100 },
+      singleton: true,
+      command_zone: true,
+      commander_damage_threshold: 21,
+      range_of_influence: null,
+      team_based: false,
+      sideboard_policy: { type: "Forbidden" },
+      default_deck_copy_limit: { type: "UpTo", data: 1 },
+      uses_commander: true,
+      allow_debug_actions: false,
+    };
+
+    render(
+      <GameProvider gameId="native-starting-life" mode="ai" formatConfig={formatConfig}>
+        <div />
+      </GameProvider>,
+    );
+
+    await waitFor(() => {
+      expect(gameStoreState.setEngineMode).toHaveBeenCalledWith("native");
+      expect(nativeAdapters).toHaveLength(1);
+    });
+
+    expect(nativeAdapters[0]!.nativeAiOptions?.formatConfig?.starting_life).toBe(25);
+  });
+
   async function expectNativeTerminalEvent(event: NativeAdapterEvent) {
     const onWsEvent = vi.fn();
     render(
@@ -704,6 +750,27 @@ describe("GameProvider native AI routing", () => {
     view.unmount();
 
     expect(clearPromptOverlayState).toHaveBeenCalledOnce();
+  });
+
+  // `activePlayerId` is written only from a wire and had no clear, so it
+  // outlived the game that assigned it and the NEXT wire-assigned game read the
+  // previous game's seat until its own assignment landed. `SeatSource` does not
+  // cover this: it is keyed on mode, not on session.
+  it("drops the wire-assigned seat when a draft match unmounts", () => {
+    gameStoreState.gameId = "draft-match";
+    gameStoreState.adapter = {} as never;
+    gameStoreState.gameState = {} as never;
+
+    const view = render(
+      <GameProvider gameId="draft-match" mode="draft-match">
+        <div />
+      </GameProvider>,
+    );
+
+    multiplayerState.setActivePlayerId.mockClear();
+    view.unmount();
+
+    expect(multiplayerState.setActivePlayerId).toHaveBeenCalledWith(null);
   });
 });
 

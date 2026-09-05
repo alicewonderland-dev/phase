@@ -1,5 +1,6 @@
 ---
 source: crates/engine/src/parser/oracle_ir/snapshot_tests.rs
+assertion_line: 1714
 expression: "&ir"
 ---
 {
@@ -34,16 +35,19 @@ expression: "&ir"
                 "value": {
                   "type": "Ref",
                   "qty": {
-                    "type": "Aggregate",
+                    "type": "PropertyAggregate",
                     "function": "Max",
                     "property": "ManaValue",
-                    "filter": {
-                      "type": "Typed",
-                      "type_filters": [
-                        "Artifact"
-                      ],
-                      "controller": "You",
-                      "properties": []
+                    "source": {
+                      "type": "Objects",
+                      "filter": {
+                        "type": "Typed",
+                        "type_filters": [
+                          "Artifact"
+                        ],
+                        "controller": "You",
+                        "properties": []
+                      }
                     }
                   }
                 }
@@ -53,16 +57,19 @@ expression: "&ir"
                 "value": {
                   "type": "Ref",
                   "qty": {
-                    "type": "Aggregate",
+                    "type": "PropertyAggregate",
                     "function": "Max",
                     "property": "ManaValue",
-                    "filter": {
-                      "type": "Typed",
-                      "type_filters": [
-                        "Artifact"
-                      ],
-                      "controller": "You",
-                      "properties": []
+                    "source": {
+                      "type": "Objects",
+                      "filter": {
+                        "type": "Typed",
+                        "type_filters": [
+                          "Artifact"
+                        ],
+                        "controller": "You",
+                        "properties": []
+                      }
                     }
                   }
                 }

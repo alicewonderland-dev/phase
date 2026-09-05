@@ -3,8 +3,9 @@ use rand::seq::IndexedRandom; // rand 0.9: `choose_multiple` on `[T]` lives here
 use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::game::players;
 use crate::types::ability::{
-    ChooseFromZoneConstraint, Chooser, Effect, EffectError, EffectKind, ForEachCategoryAction,
-    ParentTargetMissingReason, ResolvedAbility, TargetFilter, TargetRef, ZoneOwner,
+    ChooseFromZoneConstraint, Effect, EffectError, EffectKind, ForEachCategoryAction,
+    ParentTargetMissingReason, PerPlayerScope, ReciprocalZoneChoiceRole, ResolvedAbility,
+    TargetFilter, TargetRef, ZoneChoiceCandidateSource, ZoneChoiceChooser, ZoneOwner,
 };
 use crate::types::card_type::CoreType;
 use crate::types::events::GameEvent;
@@ -22,47 +23,54 @@ pub fn resolve(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let (count, zone, additional_zones, zone_owner, filter, chooser, up_to, constraint) =
-        match &ability.effect {
-            Effect::ChooseFromZone {
-                count,
-                zone,
-                additional_zones,
-                zone_owner,
-                filter,
-                chooser,
-                up_to,
-                constraint,
-                ..
-            } => (
-                *count as usize,
-                *zone,
-                additional_zones.clone(),
-                *zone_owner,
-                filter.clone(),
-                *chooser,
-                *up_to,
-                constraint.clone(),
-            ),
-            _ => return Err(EffectError::MissingParam("ChooseFromZone".to_string())),
-        };
+    let (
+        count,
+        zone,
+        additional_zones,
+        zone_owner,
+        filter,
+        chooser,
+        candidate_source,
+        reciprocal_role,
+        up_to,
+        constraint,
+    ) = match &ability.effect {
+        Effect::ChooseFromZone {
+            count,
+            zone,
+            additional_zones,
+            zone_owner,
+            filter,
+            chooser,
+            candidate_source,
+            reciprocal_role,
+            up_to,
+            constraint,
+            ..
+        } => (
+            *count as usize,
+            *zone,
+            additional_zones.clone(),
+            *zone_owner,
+            filter.clone(),
+            *chooser,
+            *candidate_source,
+            *reciprocal_role,
+            *up_to,
+            constraint.clone(),
+        ),
+        _ => return Err(EffectError::MissingParam("ChooseFromZone".to_string())),
+    };
 
     // CR 101.4 + CR 608.2c: "For each player, choose ... in that player's zone"
     // iterates every player in APNAP order, parking one choice per player and
     // accumulating each pick into the chain's tracked set. Routed here before
     // the single-pool path so the per-player prompts never collapse into one
     // candidate scan. Building block for Breach the Multiverse.
-    // CR 102.2: `EachOpponent` is the same iteration with the controller
+    // CR 102.3: `Each(OtherPlayers)` is the same iteration with the controller
     // excluded ("for each OTHER player" — Kaya, Spirits' Justice).
-    if matches!(zone_owner, ZoneOwner::EachPlayer | ZoneOwner::EachOpponent) {
-        let players = if matches!(zone_owner, ZoneOwner::EachOpponent) {
-            crate::game::players::apnap_order(state)
-                .into_iter()
-                .filter(|&p| p != ability.controller)
-                .collect()
-        } else {
-            crate::game::players::apnap_order(state)
-        };
+    if let ZoneOwner::Each(scope) = zone_owner {
+        let players = per_player_iteration_population(state, ability, scope);
         // No pick has accumulated yet — the first one must start a fresh set.
         return prompt_next_each_player(state, ability, players, false, events);
     }
@@ -74,7 +82,13 @@ pub fn resolve(
         &additional_zones,
         zone_owner,
         filter.as_ref(),
+        candidate_source,
     )?;
+
+    if matches!(reciprocal_role, Some(ReciprocalZoneChoiceRole::Consume)) {
+        let choosing_player = resolve_chooser(state, ability, chooser)?;
+        return present_bound_reciprocal_consumer(state, ability, cards, choosing_player, events);
+    }
 
     // CR 608.2d: If there are no objects to choose from, skip the choice
     // (a player can't choose an option that's illegal or impossible).
@@ -85,7 +99,7 @@ pub fn resolve(
             source_id: ability.source_id,
             subject: None,
         });
-        return Ok(());
+        return resolve_empty_reciprocal_producer(state, reciprocal_role);
     }
 
     let clamped_count = count.min(cards.len());
@@ -100,7 +114,7 @@ pub fn resolve(
     // choose one of the exiled nonland cards." Pausing on a typed prompt keeps
     // the decision out of APNAP defaults; the handler re-enters through
     // `resolve_with_choosing_player` with the picked opponent.
-    if matches!(chooser, Chooser::Opponent) && !has_targeted_opponent(ability) {
+    if matches!(chooser, ZoneChoiceChooser::Opponent) && !has_targeted_opponent(ability) {
         // CR 608.2d: "The player can't choose an option that's illegal or impossible" —
         // a resolution-time CHOICE, not a target (CR 115.10a), so the candidate list is
         // the CHOOSABLE opponents. The pre-existing `!pl.is_eliminated` re-filter is left
@@ -120,6 +134,7 @@ pub fn resolve(
                 player: ability.controller,
                 candidates,
                 ability: Box::new(ability.clone()),
+                purpose: crate::types::game_state::ZoneOpponentChooserPurpose::Ordinary,
             };
             events.push(GameEvent::EffectResolved {
                 kind: EffectKind::ChooseFromZone,
@@ -129,7 +144,7 @@ pub fn resolve(
             return Ok(());
         }
     }
-    let choosing_player = resolve_chooser(state, ability, chooser);
+    let choosing_player = resolve_chooser(state, ability, chooser)?;
     present_zone_choice(
         state,
         ability,
@@ -138,6 +153,7 @@ pub fn resolve(
         up_to,
         constraint,
         choosing_player,
+        reciprocal_role,
         events,
     )
 }
@@ -154,7 +170,7 @@ pub(crate) fn resolve_with_choosing_player(
     choosing_player: PlayerId,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let (count, zone, additional_zones, zone_owner, filter, up_to, constraint) =
+    let (count, zone, additional_zones, zone_owner, filter, candidate_source, up_to, constraint) =
         match &ability.effect {
             Effect::ChooseFromZone {
                 count,
@@ -162,6 +178,7 @@ pub(crate) fn resolve_with_choosing_player(
                 additional_zones,
                 zone_owner,
                 filter,
+                candidate_source,
                 up_to,
                 constraint,
                 ..
@@ -171,6 +188,7 @@ pub(crate) fn resolve_with_choosing_player(
                 additional_zones.clone(),
                 *zone_owner,
                 filter.clone(),
+                *candidate_source,
                 *up_to,
                 constraint.clone(),
             ),
@@ -183,7 +201,17 @@ pub(crate) fn resolve_with_choosing_player(
         &additional_zones,
         zone_owner,
         filter.as_ref(),
+        candidate_source,
     )?;
+    if matches!(
+        &ability.effect,
+        Effect::ChooseFromZone {
+            reciprocal_role: Some(ReciprocalZoneChoiceRole::Consume),
+            ..
+        }
+    ) {
+        return present_bound_reciprocal_consumer(state, ability, cards, choosing_player, events);
+    }
     // CR 608.2d: The pool can only have shrunk to empty if state changed while
     // paused (it cannot — see above), but fail closed identically to `resolve`.
     if cards.is_empty() || count == 0 {
@@ -204,6 +232,12 @@ pub(crate) fn resolve_with_choosing_player(
         up_to,
         constraint,
         choosing_player,
+        match &ability.effect {
+            Effect::ChooseFromZone {
+                reciprocal_role, ..
+            } => *reciprocal_role,
+            _ => None,
+        },
         events,
     )
 }
@@ -218,6 +252,50 @@ fn has_targeted_opponent(ability: &ResolvedAbility) -> bool {
         .any(|t| matches!(t, TargetRef::Player(id) if *id != ability.controller))
 }
 
+/// Present or settle the already-bound reciprocal consumer. The active
+/// continuation is the authority for its immediate optional tail, so this
+/// validates that exact frame before exposing a prompt or completing an empty
+/// choice.
+pub(crate) fn present_bound_reciprocal_consumer(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    cards: Vec<ObjectId>,
+    choosing_player: PlayerId,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EffectError> {
+    let (count, up_to, constraint) = match &ability.effect {
+        Effect::ChooseFromZone {
+            count,
+            up_to,
+            constraint,
+            reciprocal_role: Some(ReciprocalZoneChoiceRole::Consume),
+            ..
+        } => (*count as usize, *up_to, constraint.clone()),
+        _ => {
+            return Err(EffectError::MissingParam(
+                "expected bound reciprocal ChooseFromZone consumer".to_string(),
+            ))
+        }
+    };
+    super::validate_bound_reciprocal_consumer(state, ability, choosing_player)?;
+    if cards.is_empty() || count == 0 {
+        let ticket = super::reciprocal_no_candidate_ticket(state, choosing_player)?;
+        return super::complete_reciprocal_consume_no_candidates(state, ticket, events);
+    }
+    let clamped_count = count.min(cards.len());
+    present_zone_choice(
+        state,
+        ability,
+        cards,
+        clamped_count,
+        up_to,
+        constraint,
+        choosing_player,
+        Some(ReciprocalZoneChoiceRole::Consume),
+        events,
+    )
+}
+
 /// CR 608.2: Park the interactive `ChooseFromZoneChoice` prompt for
 /// `choosing_player`, preserving the resolving trigger context for the parked
 /// continuation (shared tail of `resolve` and `resolve_with_choosing_player`).
@@ -230,6 +308,7 @@ fn present_zone_choice(
     up_to: bool,
     constraint: Option<ChooseFromZoneConstraint>,
     choosing_player: PlayerId,
+    reciprocal_role: Option<ReciprocalZoneChoiceRole>,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
     // CR 608.2: An ability's resolution is a single ongoing process. This
@@ -254,6 +333,7 @@ fn present_zone_choice(
         up_to,
         constraint,
         source_id: ability.source_id,
+        reciprocal_role,
     };
 
     events.push(GameEvent::EffectResolved {
@@ -379,7 +459,7 @@ fn prompt_next_category_member(
 
         // CR 608.2d: "you may exile" → 0..=1 of that member; `up_to` is true.
         let count = 1usize;
-        let choosing_player = resolve_chooser(state, ability, chooser);
+        let choosing_player = resolve_chooser(state, ability, chooser.into())?;
 
         state.waiting_for = WaitingFor::ChooseFromZoneChoice {
             player: choosing_player,
@@ -388,6 +468,7 @@ fn prompt_next_category_member(
             up_to,
             constraint: None,
             source_id: ability.source_id,
+            reciprocal_role: None,
         };
         state.push_per_category_zone_choice(
             crate::types::game_state::PendingPerCategoryZoneChoice {
@@ -446,6 +527,27 @@ pub(crate) fn drain_active_per_category_zone_choice(
             ..
         }
     ) {
+        // CR 607.2a + CR 601.3: A per-category exile is an ordinary
+        // linked-exile producer. When a LATER instruction of the same source or
+        // chain consumes "the exiled cards" (`TargetFilter::ExiledBySource` and
+        // the rest of `LINKED_EXILE_CONSUMER_TAGS`), these picks must be
+        // recorded as exiled WITH the source, exactly as the general
+        // `ChangeZone`/`ChangeZoneAll` exile path already does via the same
+        // `should_track_exiled_by_source` authority. Without the link the
+        // consumer resolves against an empty ledger: Portent of Calamity's
+        // printed "You may cast a spell from among the exiled cards" found no
+        // batch and silently never presented its cast window.
+        //
+        // Routed through the shared predicate rather than an unconditional
+        // link so unrelated per-category exiles (no linked-exile consumer
+        // anywhere on the source or in the resolving chain) keep contributing
+        // nothing to the source's exile pile — the same containment
+        // `change_zone` relies on.
+        let track_exiled_by_source = crate::game::exile_links::should_track_exiled_by_source(
+            state,
+            ability.source_id,
+            &ability,
+        );
         // CR 701.13a + CR 614.1 + CR 616.1: Each chosen card's exile is an
         // effect-owned zone-change event. Keep the tracked-set extension and
         // next-member prompt on the batch tail so neither can run before a
@@ -453,11 +555,16 @@ pub(crate) fn drain_active_per_category_zone_choice(
         let requests = chosen
             .iter()
             .map(|&card_id| {
-                crate::game::zone_pipeline::ZoneMoveRequest::effect(
+                let request = crate::game::zone_pipeline::ZoneMoveRequest::effect(
                     card_id,
                     Zone::Exile,
                     ability.source_id,
-                )
+                );
+                if track_exiled_by_source {
+                    request.track_exiled_by_source()
+                } else {
+                    request
+                }
             })
             .collect();
         return crate::game::zone_pipeline::move_objects_simultaneously_then(
@@ -619,34 +726,52 @@ pub(crate) fn resolve_random_in_chain(
     ability: &mut ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> bool {
-    let (count, zone, additional_zones, zone_owner, filter) = match &ability.effect {
-        Effect::ChooseFromZone {
-            count,
-            zone,
-            additional_zones,
-            zone_owner,
-            filter,
-            selection,
-            ..
-        } if selection.is_random() => (
-            *count as usize,
-            *zone,
-            additional_zones.clone(),
-            *zone_owner,
-            filter.clone(),
-        ),
-        _ => return false,
-    };
+    let (count, zone, additional_zones, zone_owner, filter, candidate_source) =
+        match &ability.effect {
+            Effect::ChooseFromZone {
+                count,
+                zone,
+                additional_zones,
+                zone_owner,
+                filter,
+                candidate_source,
+                selection,
+                ..
+            } if selection.is_random() => (
+                *count as usize,
+                *zone,
+                additional_zones.clone(),
+                *zone_owner,
+                filter.clone(),
+                *candidate_source,
+            ),
+            _ => return false,
+        };
 
-    let cards = resolve_candidate_cards(
+    // CR 608.2d: `Each` has no single candidate pool, and a per-player random
+    // pick is unbuilt. No parse produces the combination (of the 43 cards whose
+    // text carries per-player wording, none say "at random"), so rather than
+    // build speculative machinery the pool authority rejects the owner up front
+    // and this arm keeps the rejection loud instead of reading it as an empty
+    // pool. Release behavior is a no-op resolution, as before.
+    let cards = match resolve_candidate_cards(
         state,
         ability,
         zone,
         &additional_zones,
         zone_owner,
         filter.as_ref(),
-    )
-    .unwrap_or_default();
+        candidate_source,
+    ) {
+        Ok(cards) => cards,
+        Err(_) => {
+            debug_assert!(
+                !matches!(zone_owner, ZoneOwner::Each(_)),
+                "a random ChooseFromZone with a per-player zone owner has no resolution path"
+            );
+            Vec::new()
+        }
+    };
 
     // CR 609.3: An empty pool (or count 0) does nothing; the chain then skips
     // any continuation that depends on the missing pick.
@@ -733,7 +858,13 @@ fn prompt_next_each_player(
         // CR 101.4 + CR 608.2c: For "for each player, choose ...", the spell's controller is
         // the chooser regardless of whose zone is scanned (Breach the
         // Multiverse). `Chooser::Opponent` would route to an opponent; honor it.
-        let choosing_player = resolve_chooser(state, ability, chooser);
+        // `Chooser::OwningPlayer` binds the choice to THIS iteration's owner —
+        // each player picks from their own (hidden) zone (Kozilek, the Broken
+        // Reality: "target players each manifest two cards from their hands").
+        let choosing_player = match chooser {
+            ZoneChoiceChooser::OwningPlayer => owner,
+            _ => resolve_chooser(state, ability, chooser)?,
+        };
 
         // CR 608.2: The per-player frame is inserted above the continuation
         // that runs after every player has chosen. Capture the live trigger
@@ -752,6 +883,7 @@ fn prompt_next_each_player(
             up_to,
             constraint,
             source_id: ability.source_id,
+            reciprocal_role: None,
         };
         state.push_per_player_zone_choice(crate::types::game_state::PendingPerPlayerZoneChoice {
             ability: Box::new(ability.clone()),
@@ -870,6 +1002,17 @@ fn collect_player_zone_cards(
 /// 2. The latest non-empty tracked set from any prior publish in this game.
 /// 3. Explicit `TargetRef::Object` targets on the ability.
 /// 4. Direct zone scan (`zone` + `additional_zones`).
+///
+/// CR 101.4: a per-player [`ZoneOwner::Each`] has no single pool at all — it
+/// resolves one prompt per player through `prompt_next_each_player` — so it is
+/// rejected here rather than deeper in the owner resolution. The rejection has
+/// to precede the tracked-set fast paths above: those return before the owner
+/// is ever read, which would otherwise hand a per-player choice the whole
+/// global or prior-chain set. No caller reaches this with `Each` on a supported
+/// path (`resolve` returns to the per-player iteration first, and
+/// `resolve_with_choosing_player` is only entered from below that return), so
+/// the arm exists to keep an unsupported combination loud instead of silently
+/// answered.
 fn resolve_candidate_cards(
     state: &GameState,
     ability: &ResolvedAbility,
@@ -877,7 +1020,36 @@ fn resolve_candidate_cards(
     additional_zones: &[Zone],
     zone_owner: ZoneOwner,
     filter: Option<&TargetFilter>,
+    candidate_source: ZoneChoiceCandidateSource,
 ) -> Result<Vec<ObjectId>, EffectError> {
+    if matches!(zone_owner, ZoneOwner::Each(_)) {
+        return Err(EffectError::MissingParam(
+            "ChooseFromZone Each resolves per-player and has no single candidate pool".to_string(),
+        ));
+    }
+
+    match candidate_source {
+        ZoneChoiceCandidateSource::Direct => {
+            return collect_direct_zone_cards(
+                state,
+                ability,
+                zone,
+                additional_zones,
+                zone_owner,
+                filter,
+            );
+        }
+        ZoneChoiceCandidateSource::Tracked => {
+            return Ok(retain_matching_candidates(
+                state,
+                ability,
+                chain_tracked_set_cards(state).unwrap_or_default(),
+                filter,
+            ));
+        }
+        ZoneChoiceCandidateSource::Legacy => {}
+    }
+
     if let Some(cards) = chain_tracked_set_cards(state) {
         return Ok(retain_matching_candidates(state, ability, cards, filter));
     }
@@ -1001,6 +1173,45 @@ fn collect_direct_zone_cards(
         .collect())
 }
 
+/// CR 101.4: The players a [`ZoneOwner::Each`] iteration walks, in APNAP order.
+/// One authority for every population leaf, so a new leaf is a match arm here
+/// rather than a new `ZoneOwner` sibling.
+fn per_player_iteration_population(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    scope: PerPlayerScope,
+) -> Vec<PlayerId> {
+    let apnap = crate::game::players::apnap_order(state);
+    match scope {
+        PerPlayerScope::AllPlayers => apnap,
+        // CR 102.3: "each OTHER player" is every player but the controller.
+        // Deliberately not `players::opponents`: that set is team-relative and
+        // excludes a teammate, whom this wording includes.
+        PerPlayerScope::OtherPlayers => apnap
+            .into_iter()
+            .filter(|&p| p != ability.controller)
+            .collect(),
+        // CR 115.1: the iterated set is the ability's CHOSEN `Player` targets.
+        // CR 601.2c: an "up to N" selection may be empty — the loop then
+        // disposes immediately and the parked continuation runs with an empty
+        // tracked set.
+        PerPlayerScope::TargetedPlayers => {
+            let chosen: Vec<PlayerId> = ability
+                .targets
+                .iter()
+                .filter_map(|t| match t {
+                    TargetRef::Player(pid) => Some(*pid),
+                    _ => None,
+                })
+                .collect();
+            apnap
+                .into_iter()
+                .filter(|pid| chosen.contains(pid))
+                .collect()
+        }
+    }
+}
+
 fn resolve_zone_owner(
     state: &GameState,
     ability: &ResolvedAbility,
@@ -1025,9 +1236,11 @@ fn resolve_zone_owner(
         // CR 101.4: `EachPlayer` / `EachOpponent` resolve a *set* of zone
         // owners, not one — they are handled by `prompt_next_each_player`, which
         // scans each iterated player's zone directly and never routes here.
-        ZoneOwner::EachPlayer | ZoneOwner::EachOpponent => Err(EffectError::MissingParam(
-            "ChooseFromZone EachPlayer/EachOpponent resolves per-player, not via single owner"
-                .to_string(),
+        // CR 101.4: `Each` resolves a *set* of zone owners, not one — it is
+        // handled by `prompt_next_each_player`, which scans each iterated
+        // player's zone directly and never routes here.
+        ZoneOwner::Each(_) => Err(EffectError::MissingParam(
+            "ChooseFromZone Each resolves per-player, not via a single owner".to_string(),
         )),
         // CR 400.1: `AllOwners` scans a zone shared across EVERY owner, not a
         // single one — it is handled by the early return in
@@ -1078,16 +1291,20 @@ fn object_ids_in_player_zone(state: &GameState, player: PlayerId, zone: Zone) ->
 /// CR 608.2c-e: Resolve the `Chooser` enum to an actual `PlayerId`.
 /// For `Opponent`, first checks ability targets for a pre-targeted opponent player
 /// (handles "target opponent chooses"), then falls back to the first opponent in APNAP order.
-fn resolve_chooser(state: &GameState, ability: &ResolvedAbility, chooser: Chooser) -> PlayerId {
+fn resolve_chooser(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    chooser: ZoneChoiceChooser,
+) -> Result<PlayerId, EffectError> {
     match chooser {
-        Chooser::Controller => ability.controller,
-        Chooser::Opponent => {
+        ZoneChoiceChooser::Controller => Ok(ability.controller),
+        ZoneChoiceChooser::Opponent => {
             // Check if an opponent was already targeted by the spell.
             if let Some(targeted_opponent) = ability.targets.iter().find_map(|t| match t {
                 TargetRef::Player(id) if *id != ability.controller => Some(*id),
                 _ => None,
             }) {
-                return targeted_opponent;
+                return Ok(targeted_opponent);
             }
             // Fallback: first opponent in APNAP order (CR-correct for 2-player).
             //
@@ -1103,12 +1320,39 @@ fn resolve_chooser(state: &GameState, ability: &ResolvedAbility, chooser: Choose
             // Empty (every opponent phased out or gone) still degrades to the
             // controller, which is the fail-closed direction and what CR 608.2d asks
             // for — an impossible choice is not offered.
-            players::choosable_opponents(state, ability.controller)
+            Ok(players::choosable_opponents(state, ability.controller)
                 .into_iter()
                 .next()
-                .unwrap_or(ability.controller)
+                .unwrap_or(ability.controller))
         }
+        // CR 608.2c: the resolved zone owner makes the choice. Under an
+        // `Each*` zone owner the per-iteration loop passes the iterated owner
+        // directly (`prompt_next_each_player`) and never routes here; the
+        // single-owner forms resolve through the shared zone-owner authority,
+        // failing closed to the controller (CR 608.2d: an impossible choice is
+        // not offered).
+        ZoneChoiceChooser::OwningPlayer => match &ability.effect {
+            Effect::ChooseFromZone { zone_owner, .. } => {
+                Ok(resolve_zone_owner(state, ability, *zone_owner).unwrap_or(ability.controller))
+            }
+            _ => Ok(ability.controller),
+        },
+        ZoneChoiceChooser::ImmediatePriorSelectedCardOwner { player } => player.ok_or_else(|| {
+            EffectError::MissingParam(
+                "reciprocal ChooseFromZone consumer has no bound card owner".to_string(),
+            )
+        }),
     }
+}
+
+fn resolve_empty_reciprocal_producer(
+    state: &mut GameState,
+    reciprocal_role: Option<ReciprocalZoneChoiceRole>,
+) -> Result<(), EffectError> {
+    if matches!(reciprocal_role, Some(ReciprocalZoneChoiceRole::Produce)) {
+        super::publish_fresh_tracked_set(state, Vec::new());
+    }
+    Ok(())
 }
 
 pub fn selection_satisfies_constraint(
@@ -1185,7 +1429,7 @@ fn assign_distinct_categories(card_options: &[Vec<usize>], used: &mut [bool], id
 mod tests {
     use super::*;
     use crate::game::zones::create_object;
-    use crate::types::ability::{TypeFilter, TypedFilter};
+    use crate::types::ability::{Chooser, TypeFilter, TypedFilter};
     use crate::types::counter::CounterType;
     use crate::types::identifiers::{CardId, TrackedSetId};
     use crate::types::zones::Zone;
@@ -1420,7 +1664,9 @@ mod tests {
                 additional_zones: Vec::new(),
                 zone_owner: ZoneOwner::Controller,
                 filter: None,
-                chooser: Chooser::Controller,
+                chooser: Chooser::Controller.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: false,
                 constraint: None,
                 selection: crate::types::ability::CardSelectionMode::Chosen,
@@ -1512,7 +1758,9 @@ mod tests {
                 additional_zones: Vec::new(),
                 zone_owner: ZoneOwner::AllOwners,
                 filter: Some(TargetFilter::ExiledBySource),
-                chooser: Chooser::Controller,
+                chooser: Chooser::Controller.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: false,
                 constraint: None,
                 selection: crate::types::ability::CardSelectionMode::Chosen,
@@ -1595,7 +1843,9 @@ mod tests {
                 additional_zones: Vec::new(),
                 zone_owner: ZoneOwner::Controller,
                 filter: None,
-                chooser: Chooser::Opponent,
+                chooser: Chooser::Opponent.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: false,
                 constraint: None,
                 selection: crate::types::ability::CardSelectionMode::Chosen,
@@ -1672,7 +1922,9 @@ mod tests {
                 additional_zones: Vec::new(),
                 zone_owner: ZoneOwner::Controller,
                 filter: None,
-                chooser: Chooser::Opponent,
+                chooser: Chooser::Opponent.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: false,
                 constraint: None,
                 selection: crate::types::ability::CardSelectionMode::Chosen,
@@ -1724,7 +1976,9 @@ mod tests {
                 additional_zones: Vec::new(),
                 zone_owner: ZoneOwner::Controller,
                 filter: None,
-                chooser: Chooser::Opponent,
+                chooser: Chooser::Opponent.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: false,
                 constraint: None,
                 selection: crate::types::ability::CardSelectionMode::Chosen,
@@ -1760,7 +2014,9 @@ mod tests {
                 additional_zones: Vec::new(),
                 zone_owner: ZoneOwner::Controller,
                 filter: None,
-                chooser: Chooser::Opponent,
+                chooser: Chooser::Opponent.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: false,
                 constraint: None,
                 selection: crate::types::ability::CardSelectionMode::Chosen,
@@ -1804,7 +2060,9 @@ mod tests {
                 additional_zones: Vec::new(),
                 zone_owner: ZoneOwner::Controller,
                 filter: None,
-                chooser: Chooser::Controller,
+                chooser: Chooser::Controller.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: false,
                 constraint: None,
                 selection: crate::types::ability::CardSelectionMode::Chosen,
@@ -1860,7 +2118,9 @@ mod tests {
                     type_filters: vec![TypeFilter::Creature],
                     ..Default::default()
                 })),
-                chooser: Chooser::Controller,
+                chooser: Chooser::Controller.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: false,
                 constraint: None,
                 selection: crate::types::ability::CardSelectionMode::Chosen,
@@ -1914,7 +2174,9 @@ mod tests {
                 additional_zones: vec![Zone::Hand],
                 zone_owner: ZoneOwner::TargetedPlayer,
                 filter: None,
-                chooser: Chooser::Controller,
+                chooser: Chooser::Controller.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: false,
                 constraint: None,
                 selection: crate::types::ability::CardSelectionMode::Chosen,
@@ -1954,7 +2216,9 @@ mod tests {
                 additional_zones: Vec::new(),
                 zone_owner: ZoneOwner::TargetedPlayer,
                 filter: None,
-                chooser: Chooser::Controller,
+                chooser: Chooser::Controller.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: false,
                 constraint: None,
                 selection: crate::types::ability::CardSelectionMode::Chosen,
@@ -2142,7 +2406,9 @@ mod tests {
                     additional_zones: Vec::new(),
                     zone_owner: ZoneOwner::Controller,
                     filter: None,
-                    chooser: Chooser::Controller,
+                    chooser: Chooser::Controller.into(),
+                    candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                    reciprocal_role: None,
                     up_to: true,
                     constraint: Some(ChooseFromZoneConstraint::DistinctCardTypes { categories }),
                     selection: crate::types::ability::CardSelectionMode::Chosen,
@@ -2238,7 +2504,9 @@ mod tests {
                 additional_zones: Vec::new(),
                 zone_owner: ZoneOwner::Controller,
                 filter: None,
-                chooser: Chooser::Controller,
+                chooser: Chooser::Controller.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: true,
                 constraint: Some(ChooseFromZoneConstraint::DistinctCardTypes { categories }),
                 selection: crate::types::ability::CardSelectionMode::Chosen,
@@ -2358,7 +2626,9 @@ mod tests {
                     additional_zones: Vec::new(),
                     zone_owner: ZoneOwner::Controller,
                     filter: None,
-                    chooser: Chooser::Controller,
+                    chooser: Chooser::Controller.into(),
+                    candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                    reciprocal_role: None,
                     up_to: true,
                     constraint: Some(ChooseFromZoneConstraint::DistinctCardTypes {
                         categories: vec![CoreType::Creature, CoreType::Instant, CoreType::Land],
@@ -2443,7 +2713,9 @@ mod tests {
                 additional_zones: Vec::new(),
                 zone_owner: ZoneOwner::Controller,
                 filter: None,
-                chooser: Chooser::Controller,
+                chooser: Chooser::Controller.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: false,
                 constraint: None,
                 selection: crate::types::ability::CardSelectionMode::Random,
@@ -2479,7 +2751,9 @@ mod tests {
                 additional_zones: Vec::new(),
                 zone_owner: ZoneOwner::Controller,
                 filter: None,
-                chooser: Chooser::Controller,
+                chooser: Chooser::Controller.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: false,
                 constraint: None,
                 selection: crate::types::ability::CardSelectionMode::Chosen,
@@ -3380,9 +3654,11 @@ mod tests {
                 count: 1,
                 zone: Zone::Battlefield,
                 additional_zones: Vec::new(),
-                zone_owner: ZoneOwner::EachOpponent,
+                zone_owner: ZoneOwner::Each(PerPlayerScope::OtherPlayers),
                 filter: None,
-                chooser: Chooser::Controller,
+                chooser: Chooser::Controller.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: true,
                 constraint: None,
                 selection: crate::types::ability::CardSelectionMode::Chosen,
@@ -3461,9 +3737,11 @@ mod tests {
                 count: 1,
                 zone: Zone::Battlefield,
                 additional_zones: Vec::new(),
-                zone_owner: ZoneOwner::EachOpponent,
+                zone_owner: ZoneOwner::Each(PerPlayerScope::OtherPlayers),
                 filter: None,
-                chooser: Chooser::Controller,
+                chooser: Chooser::Controller.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: true,
                 constraint: None,
                 selection: crate::types::ability::CardSelectionMode::Chosen,
@@ -3560,9 +3838,11 @@ mod tests {
                     count: 1,
                     zone: Zone::Graveyard,
                     additional_zones: Vec::new(),
-                    zone_owner: ZoneOwner::EachPlayer,
+                    zone_owner: ZoneOwner::Each(PerPlayerScope::AllPlayers),
                     filter: None,
-                    chooser: Chooser::Controller,
+                    chooser: Chooser::Controller.into(),
+                    candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                    reciprocal_role: None,
                     up_to: false,
                     constraint: None,
                     selection: crate::types::ability::CardSelectionMode::Chosen,
@@ -3634,9 +3914,11 @@ mod tests {
                     count: 1,
                     zone: Zone::Graveyard,
                     additional_zones: Vec::new(),
-                    zone_owner: ZoneOwner::EachPlayer,
+                    zone_owner: ZoneOwner::Each(PerPlayerScope::AllPlayers),
                     filter: None,
-                    chooser: Chooser::Controller,
+                    chooser: Chooser::Controller.into(),
+                    candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                    reciprocal_role: None,
                     up_to: false,
                     constraint: None,
                     selection: crate::types::ability::CardSelectionMode::Chosen,

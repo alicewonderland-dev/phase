@@ -8,6 +8,7 @@ import { useIsCompactHeight } from "../../hooks/useIsCompactHeight.ts";
 import { useCanActForWaitingState } from "../../hooks/usePlayerId.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
+import { cardImageLookup } from "../../services/cardImageLookup.ts";
 import {
   collectObjectActions,
   deriveActivationAffordances,
@@ -132,11 +133,12 @@ function EmblemCard({ group, label }: { group: GroupedEmblem; label: string }) {
   // renders the same chip — but activation identity is resolved per-object
   // below, never from this one.
   const emblem = group.members[0];
-  const printedRef = emblem.emblem_source?.printed_ref ?? null;
-  const { src: artSrc } = useCardImage(group.sourceName ?? "", {
+  const imageLookup = cardImageLookup(emblem);
+  const { src: artSrc, advanceFailedSource } = useCardImage(imageLookup.name, {
     size: "art_crop",
-    oracleId: printedRef?.oracle_id,
-    faceName: printedRef?.face_name,
+    faceIndex: imageLookup.faceIndex,
+    oracleId: imageLookup.oracleId,
+    faceName: imageLookup.faceName,
   });
 
   // CR 114.4 + CR 602.1: an emblem can carry an activated ability (the Momir
@@ -222,6 +224,8 @@ function EmblemCard({ group, label }: { group: GroupedEmblem; label: string }) {
         height: `calc(var(--art-crop-h) * ${EMBLEM_CHIP_SCALE})`,
       }}
       data-testid="emblem-card"
+      data-object-id={activeMember?.id}
+      data-grouped-ids={group.members.map((member) => member.id).join(" ")}
       data-activatable={isActivatable || undefined}
       role={isActivatable ? "button" : undefined}
       tabIndex={isActivatable ? 0 : undefined}
@@ -263,6 +267,7 @@ function EmblemCard({ group, label }: { group: GroupedEmblem; label: string }) {
               alt={group.sourceName ?? label}
               draggable={false}
               className="absolute inset-0 h-full w-full object-cover"
+              onError={() => advanceFailedSource?.(artSrc)}
             />
           ) : (
             // Fallback: gold emblem seal + effect text when source art is absent.

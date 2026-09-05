@@ -224,6 +224,19 @@ pub(crate) fn parse_max_combat_creatures_static(lower: &str) -> Option<StaticMod
             },
             tag::<_, _, OracleError<'_>>(" can attack you each combat"),
         ),
+        // CR 508.5: "...can attack ~ each combat" is a defending-PERMANENT-
+        // scoped cap (The Eternal Wanderer) — only attacks declared against
+        // this static's own source (a planeswalker or battle), not against its
+        // controller's other permanents. Self-ref normalization rewrites the
+        // card's own name to `~` before this parser runs. Must precede the
+        // bare " can attack each combat" arm (longest match first).
+        value(
+            StaticMode::MaxAttackersEachCombat {
+                max,
+                defender: Some(AttackDefenderScope::ThisPermanent),
+            },
+            tag(" can attack ~ each combat"),
+        ),
         value(
             StaticMode::MaxAttackersEachCombat {
                 max,
@@ -1182,7 +1195,16 @@ pub(crate) fn try_split_and_doesnt_untap(text: &str) -> Option<Vec<StaticDefinit
     let affected = defs[0].affected.clone()?;
     // CR 502.3: a trailing "as long as …"/"if …" rider on the untap clause
     // belongs on the CantUntap companion; otherwise inherit the grant's gate.
-    let condition = extract_cant_untap_condition(&lower).or_else(|| defs[0].condition.clone());
+    // An inherited gate has to clear the same untap-step enforceability bar as a
+    // rider — the first conjunct's own enforcement point may supply a binding
+    // authority (a recipient, a combat anchor) that CR 502.3's turn-based untap
+    // never does, so it cannot be copied onto a CantUntap unchecked.
+    let condition = extract_cant_untap_condition(&lower).or_else(|| {
+        defs[0]
+            .condition
+            .clone()
+            .map(|inherited| gate_cant_untap_condition(inherited, text))
+    });
     let mut companion = StaticDefinition::new(StaticMode::CantUntap)
         .affected(affected)
         .description(text.to_string());
@@ -2262,7 +2284,20 @@ pub(crate) fn parse_subject_rule_static(text: &str) -> Option<StaticDefinition> 
                 .affected(affected.clone())
                 .description(text.to_string());
             if let Some(c) = condition {
-                def.condition = Some(c);
+                // `cant_be_blocked_mode`'s fallthrough runs the whole tail
+                // through `nom_condition::parse_condition`, whose `"unless "`
+                // branch can yield a raw CR 118.12a `UnlessPay` (a subject-led
+                // Awesome Presence phrasing reaches here). `CantBeBlocked` has no
+                // block-declaration payment prompt, so the gate defers it to the
+                // inert marker: a gap that evaluated `true` forever would make
+                // the creature UNCONDITIONALLY unblockable — stripping the
+                // defending player's printed escape hatch, not inventing an
+                // evasion out of nothing (the card DOES grant this evasion, but
+                // only while the tax goes unpaid). The inert marker evaluates
+                // `false`, which is exactly what the ungated raw `UnlessPay`
+                // already does at runtime, so deferring the gate leaves
+                // rules-visible behavior unchanged.
+                attach_gated_condition(&mut def, c, clause);
             }
             return Some(def);
         }
@@ -2282,9 +2317,22 @@ pub(crate) fn parse_subject_rule_static(text: &str) -> Option<StaticDefinition> 
         ) {
             let predicate = parse_rule_static_predicate(base.original)?;
             let mut def = lower_rule_static(predicate, None, affected, text);
-            def.condition = Some(StaticCondition::Not {
-                condition: Box::new(control),
-            });
+            // `parse_rule_static_predicate` can yield `RuleStaticPredicate::CantUntap`,
+            // and this branch runs BEFORE the dedicated `CantUntap` arm below —
+            // so for `"doesn't untap … unless you control X"` phrasing it is the
+            // site that decides the gate. It therefore has to clear the same
+            // enforcement-point bar as every other attachment site rather than
+            // assigning straight through. `parse_control_conditions` only ever
+            // emits enforceable leaves today, so the gate is inert here; routing
+            // it anyway is what keeps `attach_gated_condition` an actual single
+            // authority instead of a documented-but-bypassed one.
+            attach_gated_condition(
+                &mut def,
+                StaticCondition::Not {
+                    condition: Box::new(control),
+                },
+                unless.original.trim().trim_end_matches('.'),
+            );
             return Some(def);
         }
     }
@@ -2385,11 +2433,23 @@ pub(crate) fn parse_combat_tax_static(tp: &TextPair<'_>, text: &str) -> Option<S
     let mut def = StaticDefinition::new(mode)
         .affected(affected)
         .description(text.to_string());
-    def.condition = Some(StaticCondition::UnlessPay {
-        cost: base_cost,
-        scaling,
-        defended,
-    });
+    // Routed through the acceptance authority rather than assigned directly, so
+    // the "single authority" claim on `attach_gated_condition` is ENFORCED here
+    // instead of merely documented. This is a provable no-op today:
+    // `parse_combat_tax_body`'s mode `alt` yields only `CantAttackOrBlock` /
+    // `CantAttack` / `CantBlock`, which are exactly the modes
+    // `combat::combat_tax_mode_matches` taxes, so the gate always accepts. It
+    // stops being a no-op the day this parser learns a mode the combat-tax
+    // prompt does not walk — which is the moment the gap must be reported.
+    attach_gated_condition(
+        &mut def,
+        StaticCondition::UnlessPay {
+            cost: base_cost,
+            scaling,
+            defended,
+        },
+        original,
+    );
     Some(def)
 }
 
@@ -2399,6 +2459,52 @@ pub(crate) fn parse_subject_combat_rule_static(text: &str) -> Option<StaticDefin
         &lower,
         parse_combat_rule_static_predicate_with_defended_nom,
     )?;
+    // CR 509.1b + CR 604.1 (#7454): "<subject> can't block or be blocked by
+    // <object>" is a CONJUNCTION of two opposite-direction restrictions sharing
+    // ONE printed object, so it needs one definition per direction and belongs to
+    // `parse_symmetric_block_conjunction_static` on the multi-static path. This
+    // production returns ONE definition, so it is never the owner — decline the
+    // shape here, BEFORE the object is attempted, so an object this grammar
+    // cannot yet express declines too. Without this the object parse fails, the
+    // clause reaches the trailing-`unless` branch at the bottom of this function,
+    // and the whole line lowers to the INVERSE blanket `CantBlock` with the rider
+    // attached: it invents a restriction the card lacks (the subject could never
+    // block anything) and drops the one it prints, while the coverage anchor for
+    // `CantBlock` passes vacuously on the same "can't block" substring.
+    //
+    // The shared marker is applied POSITIONALLY — at the offset where THIS
+    // production's own predicate matched, `subject_lower` being the text before
+    // it — never scanned across the whole line. That distinction is load-bearing,
+    // and the two kinds of line that merely CONTAIN the phrase in a different
+    // clause are protected by DIFFERENT mechanisms:
+    //
+    //  * a quoted granted ability ("Spirits you control have \"This creature
+    //    can't block or be blocked by non-Spirit creatures.\"") is owned by
+    //    `anthem::parse_subject_continuous_static`, dispatched at
+    //    `dispatch.rs:1818` — well before this production at `dispatch.rs:2261` —
+    //    so it has already returned and nothing at THIS seam can reach it. Only a
+    //    line-wide gate hoisted to the TOP of `parse_static_line_inner` would
+    //    endanger it.
+    //  * a sibling `can't attack` sentence is owned by THIS VERY PRODUCTION, not
+    //    by some other arm: "Beasts can't attack unless you control a Wall. Beasts
+    //    can't block or be blocked by Walls." lowers HERE to mode `CantAttack` with
+    //    `affected: Typed(Beast)` plus the rider (measured) — a subject scope the
+    //    SelfRef-only terminal `can't attack` arm cannot produce. It
+    //    survives because `scan_preceded` matches this function's predicate at the
+    //    FIRST word boundary that parses, the `can't attack` offset, and the marker
+    //    check at THAT offset does not match. A line-wide gate here would decline
+    //    the line and destroy this production's own correct output; that, measured,
+    //    is why the check is positional.
+    //
+    // Sibling guard: the terminal blanket `can't block` arm in `dispatch.rs`,
+    // which is inside that arm and so may scan the line — with the one residual
+    // its line-wide scan implies (reversed sentence order, no card impact)
+    // recorded on `parse_cant_block_or_be_blocked_by_marker`'s doc comment.
+    if super::shared::parse_cant_block_or_be_blocked_by_marker(&lower[subject_lower.len()..])
+        .is_ok()
+    {
+        return None;
+    }
     // CR 509.1b: the optional OBJECT of a blocking prohibition — "<subject>
     // can't block <object>" (Gornog, the Red Reaper; Bower Passage; Hinterland
     // Drake). The blocker-side mirror of `defended` (CR 508.1b) on the attack
@@ -2438,11 +2544,25 @@ pub(crate) fn parse_subject_combat_rule_static(text: &str) -> Option<StaticDefin
     if trailing.is_empty() {
         return Some(def);
     }
-    if let Some(unless_cond) = {
-        let tp = TextPair::new(text, &lower);
-        super::shared::parse_unless_static_condition(&tp)
-    } {
-        def.condition = Some(unless_cond);
+    let tp = TextPair::new(text, &lower);
+    if let Some(unless_cond) =
+        super::shared::parse_unless_static_condition(&tp, def.affected.as_ref())
+    {
+        // CR 118.12a: `parse_unless_static_condition` passes an `UnlessPay` leaf
+        // through RAW (no `Not` wrapper), so this site can attach a payment gate
+        // to whatever mode the predicate lowered to — including `BlockRestriction`
+        // (Hipparion: "This creature can't block creatures with power 3 or
+        // greater unless you pay {1}", which `lower_rule_static` turns into
+        // `BlockRestriction { Not(power>=3) }`) and `CantBeBlockedBy`. Neither is
+        // in the combat-tax enforcement set (CR 509.1c is offered only for
+        // `CantAttack`/`CantBlock`/`CantAttackOrBlock`; see
+        // `combat::combat_tax_mode_matches`), so the gate defers those to an
+        // honest gap instead of a condition no player can ever satisfy.
+        let gap_text = tp.split_around(" unless ").map_or_else(
+            || trailing.to_string(),
+            |(_, after)| after.original.trim().trim_end_matches('.').to_string(),
+        );
+        attach_gated_condition(&mut def, unless_cond, &gap_text);
         return Some(def);
     }
     None
@@ -2537,44 +2657,34 @@ fn parse_forced_attack_defender_static_body(text: &str) -> Option<StaticDefiniti
     // between the recurring-combat suffix and `unless` from being silently
     // swallowed — e.g. "... each combat if able <rider> unless <cond>" must decline,
     // not parse as if the rider were absent.
-    tag::<_, _, OracleError<'_>>("unless ").parse(rest).ok()?;
+    let (gap_text, _) = tag::<_, _, OracleError<'_>>("unless ").parse(rest).ok()?;
     let tp = TextPair::new(text, &lower);
-    let condition = super::shared::parse_unless_static_condition(&tp)?;
+    let condition = super::shared::parse_unless_static_condition(&tp, def.affected.as_ref())?;
     // Coverage-honesty gate (CR 604.1): only emit the forced-attack static when the
     // `unless` gate is a FULLY-MODELED condition. `parse_unless_static_condition`
-    // wraps an unrecognized inner clause as `Not(Unrecognized)` — which (a) the
-    // coverage detector's TOP-LEVEL `Unrecognized` check misses, so the card is
-    // falsely reported supported, and (b) evaluates permanently false at runtime
-    // (`Unrecognized` is true; the wrapping `Not` negates it), silently disabling
-    // the whole requirement. Decline instead so the line stays honestly unsupported
-    // (coverage red) rather than shipping a broken static.
-    if static_condition_contains_unrecognized(&condition) {
+    // wraps an unrecognized inner clause as `Not(Unrecognized)` — which (a) would
+    // falsely report the card supported if checked with a top-level-only match, and
+    // (b) evaluates permanently false at runtime (`Unrecognized` is true; the
+    // wrapping `Not` negates it), silently disabling the whole requirement. Decline
+    // instead so the line stays honestly unsupported (coverage red) rather than
+    // shipping a broken static. `contains_unrecognized` (`types/ability.rs`) is the
+    // single shared authority for this recursive check — every coverage/support
+    // gate in the codebase (`game::coverage`) delegates to the same method so this
+    // parser-time decline and the coverage report can never disagree.
+    // The same decline must cover a gate that PARSES cleanly but has no
+    // enforcement-point continuation on `MustAttackDefender` (CR 118.12a
+    // `UnlessPay`: the payment prompt exists only for
+    // `CantAttack`/`CantBlock`/`CantAttackOrBlock`). Routing through the shared
+    // gate first turns such a leaf into the same `Not(Unrecognized)` shape, so
+    // the `contains_unrecognized` decline below catches both classes with one
+    // check instead of letting the un-satisfiable one through.
+    let condition =
+        gate_static_condition(&def.mode, condition, gap_text.trim().trim_end_matches('.'));
+    if condition.contains_unrecognized() {
         return None;
     }
     def.condition = Some(condition);
     Some(def)
-}
-
-/// True when `condition` contains an `Unrecognized` clause ANYWHERE in its tree
-/// (recursing through the `Not` / `And` / `Or` combinators). Used by the
-/// forced-attack parser to decline a not-fully-modeled `unless` gate: the
-/// coverage detector only flags a TOP-LEVEL `Unrecognized`, so a nested one
-/// (`Not(Unrecognized)`, the shape `parse_unless_static_condition` emits for an
-/// unknown clause) would otherwise mark the card supported while its requirement
-/// is permanently inert at runtime.
-fn static_condition_contains_unrecognized(condition: &StaticCondition) -> bool {
-    match condition {
-        StaticCondition::Unrecognized { .. } => true,
-        // The only sub-condition-embedding variants — recurse through them. If a NEW
-        // combinator variant that nests `StaticCondition` is added, extend this match;
-        // the leaf wildcard below would otherwise hide an unrecognized clause inside
-        // it. Every remaining variant is a leaf that cannot contain a nested clause.
-        StaticCondition::Not { condition } => static_condition_contains_unrecognized(condition),
-        StaticCondition::And { conditions } | StaticCondition::Or { conditions } => conditions
-            .iter()
-            .any(static_condition_contains_unrecognized),
-        _ => false,
-    }
 }
 
 /// CR 702.122a / 702.171a / 702.184c: nom parser for the crew/saddle/station

@@ -12,7 +12,8 @@ use crate::game::quantity::{
 use crate::game::replacement::{self, ReplacementResult};
 use crate::types::ability::{
     DamageContextSnapshot, DamageSource, EachDamageRecipient, Effect, EffectError, EffectKind,
-    ExcessRecipient, PlayerFilter, QuantityExpr, ResolvedAbility, TargetFilter, TargetRef,
+    ExcessRecipient, PlayerFilter, QuantityExpr, ResolvedAbility, TargetDamageSourceBinding,
+    TargetFilter, TargetRef,
 };
 use crate::types::card_type::CoreType;
 use crate::types::counter::CounterType;
@@ -151,6 +152,10 @@ fn resolve_effect_recipients(
     // targets while still referring to an earlier slot (Self-Destruct class).
     if let TargetFilter::ParentTargetSlot { index } = target_filter {
         return crate::game::targeting::resolve_parent_slot_from_root(state, ability, *index)
+            .filter(|target| match target {
+                TargetRef::Object(id) => ability.target_pin_is_current(*id, state),
+                TargetRef::Player(_) => true,
+            })
             .into_iter()
             .collect();
     }
@@ -190,6 +195,101 @@ fn resolve_effect_recipients(
         TargetFilter::Controller => vec![TargetRef::Player(ability.controller)],
         _ => vec![],
     }
+}
+
+/// CR 120.1 + CR 608.2b: The single authority for which object deals the damage
+/// of a `DamageSource::Target` clause ("Target creature you control deals
+/// damage equal to its power to any target").
+///
+/// `None` means no object deals it, and the caller must deal NO damage at all —
+/// in particular it must NOT fall back to the spell as the source, which is what
+/// let a subject-less clause still deal damage. CR 120.1: "An object that deals
+/// damage is the source of that damage"; with no such object there is nothing
+/// to be the source. CR 608.2b: "If part of the effect requires information
+/// about an illegal target, it fails to determine any such information. Any
+/// part of the effect that requires that information won't happen." Both the
+/// subject's identity and its power are that information.
+///
+/// Only a subject BOUND by the chain descent is gated this way. A clause that
+/// names its own subject keeps the historical lookup — see the `None` arm.
+///
+/// This mirrors `fight::fight_eligible` (CR 701.14b — "If one or both creatures
+/// instructed to fight are no longer on the battlefield or are no longer
+/// creatures, neither of them fights or deals damage"). A one-sided fight is
+/// half a fight and must gate identically.
+fn target_damage_source(state: &GameState, ability: &ResolvedAbility) -> Option<DamageContext> {
+    let bound_id = match ability.context.target_damage_source {
+        // CR 608.2b: the chain descent saw the declared subject pruned.
+        Some(TargetDamageSourceBinding::Illegal) => return None,
+        // The descent prepended the subject, so the positional contract holds:
+        // `targets[0]` IS the subject.
+        Some(TargetDamageSourceBinding::Bound) => match ability.targets.first() {
+            Some(TargetRef::Object(id)) => *id,
+            _ => return None,
+        },
+        // No binding means this clause names its own subject rather than
+        // receiving one from a parent, and that subject is NOT necessarily a
+        // battlefield creature: Volcanic Vision's `Target` source is the
+        // instant card it just returned to hand. Such shapes carry no
+        // battlefield-creature precondition to enforce, so this arm keeps the
+        // historical lookup — first object anywhere in the list, ability source
+        // as the last resort — unchanged.
+        None => {
+            return Some(
+                ability
+                    .targets
+                    .iter()
+                    .find_map(|t| match t {
+                        TargetRef::Object(id) => DamageContext::from_source(state, *id),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| {
+                        DamageContext::fallback(ability.source_id, ability.controller)
+                    }),
+            )
+        }
+    };
+
+    // CR 400.7 + CR 608.2b: a pinned referent that became a new object is not
+    // the object that was chosen, so it deals nothing.
+    if !ability.target_pin_is_current(bound_id, state)
+        || !ability.selected_target_pin_is_current(bound_id, state)
+    {
+        return None;
+    }
+
+    // A bound subject was chosen by a one-sided-fight parent, whose filter is a
+    // creature filter by construction, so CR 701.14b's battlefield-and-still-a-
+    // creature precondition applies to it specifically.
+    if !damage_source_eligible(state, bound_id) {
+        return None;
+    }
+
+    DamageContext::from_source(state, bound_id)
+}
+
+/// CR 120.1 + CR 701.14b + CR 702.26b: whether an object named as the SUBJECT of
+/// a "<creature> deals damage equal to its power" clause can actually deal it —
+/// still on the battlefield, still a creature, still phased in. A phased-out
+/// permanent is treated as though it does not exist. Same predicate as
+/// `fight::fight_eligible`, asked on the one-sided form.
+fn damage_source_eligible(state: &GameState, source_id: ObjectId) -> bool {
+    state.objects.get(&source_id).is_some_and(|obj| {
+        obj.zone == crate::types::zones::Zone::Battlefield
+            && obj.card_types.core_types.contains(&CoreType::Creature)
+            && obj.is_phased_in()
+    })
+}
+
+/// CR 608.2b: Announce that a `DamageSource::Target` clause resolved without a
+/// subject and therefore dealt nothing, so downstream observers see the no-op
+/// resolution. Mirrors `fight::resolve`'s subject-less `EffectResolved`.
+fn no_damage_source_resolved(ability: &ResolvedAbility, events: &mut Vec<GameEvent>) {
+    events.push(GameEvent::EffectResolved {
+        kind: EffectKind::from(&ability.effect),
+        source_id: ability.source_id,
+        subject: None,
+    });
 }
 
 impl DamageContext {
@@ -1236,16 +1336,18 @@ pub fn resolve(
 
     // CR 120.3: Determine damage source.
     let mut ctx = match damage_source {
-        // "Target creature deals damage..." — the first resolved object target
-        // is the damage source, not the ability source.
-        Some(DamageSource::Target) => ability
-            .targets
-            .iter()
-            .find_map(|t| match t {
-                TargetRef::Object(id) => DamageContext::from_source(state, *id),
-                _ => None,
-            })
-            .unwrap_or_else(|| DamageContext::fallback(ability.source_id, ability.controller)),
+        // CR 120.1 + CR 608.2b: "Target creature deals damage..." — the chosen
+        // subject is the damage source, not the ability source. No subject
+        // means no damage at all; there is deliberately NO fallback to the
+        // spell here, because attributing the damage to the spell would let a
+        // clause whose subject is gone still deal it.
+        Some(DamageSource::Target) => match target_damage_source(state, ability) {
+            Some(ctx) => ctx,
+            None => {
+                no_damage_source_resolved(ability, events);
+                return Ok(());
+            }
+        },
         // "That creature/permanent deals damage..." inside a triggered ability
         // binds the damage source to the triggering event object.
         Some(DamageSource::TriggeringSource) => state
@@ -1468,11 +1570,16 @@ fn resolve_each_target_power_damage(
     // damage is marked, so the simultaneous batch reads the pre-batch power for
     // each member (one source dealing damage must not change another's power, and
     // marking damage on the recipient must not change source powers).
+    //
+    // CR 120.1 + CR 608.2b: a member that can no longer deal damage contributes
+    // NOTHING to the batch. Without this gate the fallback context would keep it
+    // in the batch and `Power{Target}` would read its last known power off LKI,
+    // so a source that left the battlefield would still deal damage.
     let batch: Vec<(ObjectId, DamageContext, u32)> = source_ids
         .iter()
-        .map(|&source_id| {
-            let ctx = DamageContext::from_source(state, source_id)
-                .unwrap_or_else(|| DamageContext::fallback(source_id, ability.controller));
+        .filter(|&&source_id| damage_source_eligible(state, source_id))
+        .filter_map(|&source_id| {
+            let ctx = DamageContext::from_source(state, source_id)?;
             // Resolve the amount against a single-element slice so `Power{Target}`
             // binds to THIS source (CR 120.1: each is an independent source).
             let source_slice = [TargetRef::Object(source_id)];
@@ -1484,7 +1591,7 @@ fn resolve_each_target_power_damage(
                 &source_slice,
             )
             .max(0) as u32;
-            (source_id, ctx, amt)
+            Some((source_id, ctx, amt))
         })
         .collect();
 
@@ -1678,14 +1785,26 @@ pub fn resolve_all(
     // also overrode `source_controller`, which made "you control" resolve
     // against the wrong player whenever the resolved source's controller
     // differs from the caster.
-    let mut ctx = filter::FilterContext::from_ability(ability);
-    if matches!(damage_source, Some(DamageSource::Target)) {
-        if let Some(resolved_source_id) = ability.targets.iter().find_map(|t| match t {
-            TargetRef::Object(id) => Some(*id),
-            _ => None,
-        }) {
-            ctx.source_id = resolved_source_id;
+    //
+    // CR 120.1 + CR 608.2b: resolved ONCE, here, from the same authority the
+    // damage context below uses, so the recipient set and the damage source can
+    // never disagree about which object CR 120.1 says the damage is from. `None`
+    // means the declared subject was an illegal target: the clause deals no
+    // damage at all, so there is no recipient set to enumerate.
+    let target_source_ctx = if matches!(damage_source, Some(DamageSource::Target)) {
+        match target_damage_source(state, ability) {
+            Some(source_ctx) => Some(source_ctx),
+            None => {
+                no_damage_source_resolved(ability, events);
+                return Ok(());
+            }
         }
+    } else {
+        None
+    };
+    let mut ctx = filter::FilterContext::from_ability(ability);
+    if let Some(source_ctx) = target_source_ctx {
+        ctx.source_id = source_ctx.source_id;
     }
     let matching_objects: Vec<_> = state
         .battlefield
@@ -1711,14 +1830,12 @@ pub fn resolve_all(
     // through `apply_damage_to_target` below, which removes defense counters
     // rather than marking damage.
     let ctx = match damage_source {
-        Some(DamageSource::Target) => ability
-            .targets
-            .iter()
-            .find_map(|t| match t {
-                TargetRef::Object(id) => DamageContext::from_source(state, *id),
-                _ => None,
-            })
-            .unwrap_or_else(|| DamageContext::fallback(ability.source_id, ability.controller)),
+        // CR 120.1 + CR 608.2b: already resolved above (and already bailed when
+        // the declared subject was illegal), so the recipient filter and the
+        // damage source share one answer.
+        Some(DamageSource::Target) => {
+            target_source_ctx.expect("Target damage source resolved before the recipient set")
+        }
         Some(DamageSource::TriggeringSource) => state
             .current_trigger_event
             .as_ref()
@@ -2502,17 +2619,45 @@ pub fn resolve_each_source_deals_damage(
         resolve_quantity_with_targets(state, amount, ability).max(0) as u32
     };
 
-    // CR 608.2 + CR 120.1: evaluate the source class against the battlefield at
-    // resolution (mirrors `resolve_all`). Each matching object is an independent
-    // source of its own damage.
-    let resolved_sources = crate::game::effects::resolved_object_filter(ability, sources);
-    let filter_ctx = filter::FilterContext::from_ability(ability);
-    let source_ids: Vec<ObjectId> = state
-        .battlefield
-        .iter()
-        .filter(|id| filter::matches_target_filter(state, **id, &resolved_sources, &filter_ctx))
-        .copied()
-        .collect();
+    // CR 608.2 + CR 120.1: ordinary source classes are evaluated against the
+    // battlefield. A pairwise targeted batch instead uses the exact announced
+    // objects stamped on this damage node; a missing target is absent, and an
+    // object whose incarnation is no longer current or which is no longer on
+    // the battlefield cannot deal damage.
+    let source_ids: Vec<ObjectId> = match recipient {
+        EachDamageRecipient::OtherBatchSource { source_filters } => ability
+            .targets
+            .iter()
+            .zip(source_filters)
+            .filter_map(|(target, source_filter)| {
+                let TargetRef::Object(id) = target else {
+                    return None;
+                };
+                (ability.target_pin_is_current(*id, state)
+                    && ability.selected_target_pin_is_current(*id, state)
+                    && !crate::game::targeting::validate_targets_for_ability(
+                        state,
+                        std::slice::from_ref(target),
+                        source_filter,
+                        ability,
+                    )
+                    .is_empty())
+                .then_some(*id)
+            })
+            .collect(),
+        EachDamageRecipient::Shared(_) | EachDamageRecipient::EachController => {
+            let resolved_sources = crate::game::effects::resolved_object_filter(ability, sources);
+            let filter_ctx = filter::FilterContext::from_ability(ability);
+            state
+                .battlefield
+                .iter()
+                .filter(|id| {
+                    filter::matches_target_filter(state, **id, &resolved_sources, &filter_ctx)
+                })
+                .copied()
+                .collect()
+        }
+    };
 
     // CR 115.1 / CR 608.2c: resolve the shared recipient ONCE (an announced target
     // or a hydrated context anaphor). An empty result (e.g. an "up to one" / fizzled
@@ -2521,7 +2666,9 @@ pub fn resolve_each_source_deals_damage(
         EachDamageRecipient::Shared(filter) => {
             resolve_effect_recipients(state, ability, filter, false)
         }
-        EachDamageRecipient::EachController => Vec::new(),
+        EachDamageRecipient::EachController | EachDamageRecipient::OtherBatchSource { .. } => {
+            Vec::new()
+        }
     };
 
     // Build every (source, context, recipient, amount) entry up front, before any
@@ -2565,6 +2712,19 @@ pub fn resolve_each_source_deals_damage(
                     .unwrap_or(ctx.controller);
                 entries.push((source_id, ctx, TargetRef::Player(controller), amt));
             }
+            // CR 120.1 + CR 608.2c: the relation exists only for an exact
+            // two-object batch. With zero/one surviving choices there is no
+            // "other" object, so this source produces no damage entry.
+            EachDamageRecipient::OtherBatchSource { .. } if source_ids.len() == 2 => {
+                if let Some(other) = source_ids
+                    .iter()
+                    .copied()
+                    .find(|candidate| *candidate != source_id)
+                {
+                    entries.push((source_id, ctx, TargetRef::Object(other), amt));
+                }
+            }
+            EachDamageRecipient::OtherBatchSource { .. } => {}
         }
     }
 
@@ -7047,7 +7207,7 @@ mod tests {
         assert_eq!(state.objects[&opp_b_pw].loyalty, Some(2));
     }
 
-    /// CR 120.3 + CR 119.3a: Pyrohemia / Pestilence runtime behavior — when
+    /// CR 120.3a + CR 120.3e: Pyrohemia / Pestilence runtime behavior — when
     /// `DamageAll { player_filter: Some(PlayerFilter::All) }` resolves, every
     /// creature on the battlefield (including the controller's own) takes
     /// damage AND every player (including the controller) loses life. This

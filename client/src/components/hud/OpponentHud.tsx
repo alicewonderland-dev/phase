@@ -3,18 +3,27 @@ import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 
 import type { PlayerId } from "../../adapter/types.ts";
-import { usePerspectivePlayerId } from "../../hooks/usePlayerId.ts";
+import { useCanActForWaitingState, usePerspectivePlayerId } from "../../hooks/usePlayerId.ts";
 import { useTurnStatus } from "../../hooks/useTurnStatus.ts";
 import { usePlayerDesignations } from "../../hooks/usePlayerDesignations.ts";
 import { getSeatColor } from "../../hooks/useSeatColor.ts";
 import { useIsCompactHeight } from "../../hooks/useIsCompactHeight.ts";
 import { useIsMobile } from "../../hooks/useIsMobile.ts";
+import { usePlayerAvatarImage } from "../../hooks/usePlayerAvatarImage.ts";
+import type { PlayerAvatarIdentity } from "../../services/playerAvatars.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { getOpponentDisplayName, useMultiplayerStore } from "../../stores/multiplayerStore.ts";
 import { usePreferencesStore } from "../../stores/preferencesStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
 import { partitionByType } from "../../viewmodel/battlefieldProps.ts";
-import { getOpponentIds, isOneOnOne, resolveFocusedOpponent } from "../../viewmodel/gameStateView.ts";
+import {
+  getAllOpponentIds,
+  getOpponentIds,
+  getWaitingForClickTargetRefs,
+  getWaitingForPlayerChoiceIds,
+  isOneOnOne,
+  resolveFocusedOpponent,
+} from "../../viewmodel/gameStateView.ts";
 import { LifeTotal } from "../controls/LifeTotal.tsx";
 import { ManaPoolSummary } from "./ManaPoolSummary.tsx";
 import { ScoreBadge } from "../draft/ScoreBadge.tsx";
@@ -65,11 +74,10 @@ export function OpponentHud({
 
   const teamBased = gameState?.format_config?.team_based ?? false;
 
-  const allOpponents = useMemo(() => {
-    if (!gameState) return [];
-    const seatOrder = gameState.seat_order ?? gameState.players.map((p) => p.id);
-    return seatOrder.filter((id) => id !== playerId);
-  }, [gameState, playerId]);
+  const allOpponents = useMemo(
+    () => getAllOpponentIds(gameState, playerId),
+    [gameState, playerId],
+  );
 
   const eliminated = gameState?.eliminated_players ?? [];
   const liveOpponents = useMemo(() => getOpponentIds(gameState, playerId), [gameState, playerId]);
@@ -159,42 +167,21 @@ export function OpponentHud({
 
   const waitingFor = useGameStore((s) => s.waitingFor);
   const dispatch = useGameStore((s) => s.dispatch);
-  const isHumanTargetSelection =
-    (waitingFor?.type === "TargetSelection" || waitingFor?.type === "TriggerTargetSelection")
-    && waitingFor.data.player === playerId;
-  const isCopyRetargetForMe = waitingFor?.type === "CopyRetarget" && waitingFor.data.player === playerId;
-  // CR 115.7: A single-target retarget (Bolt Bend) is chosen on the board, so
-  // opponents are legal click targets when they appear in `legal_new_targets`.
-  const isRetargetChoiceForMe = waitingFor?.type === "RetargetChoice"
-    && waitingFor.data.player === playerId
-    && waitingFor.data.scope.type === "Single";
-  // CR 303.4g + CR 115.1: a returned / non-spell Aura that enchants a player
-  // (a Curse) is hosted by a board pick — opponents are legal click hosts when
-  // they appear in `legal_targets`.
-  const isReturnAsAuraForMe = waitingFor?.type === "ReturnAsAuraTarget"
-    && waitingFor.data.player === playerId;
-  const isTargeting = isHumanTargetSelection || isCopyRetargetForMe || isRetargetChoiceForMe || isReturnAsAuraForMe;
-  const currentLegalTargets = useMemo(() => {
-    if (isHumanTargetSelection) {
-      return waitingFor.data.selection?.current_legal_targets ?? [];
-    }
-    if (isCopyRetargetForMe) {
-      const slot = waitingFor.data.target_slots[waitingFor.data.current_slot ?? 0];
-      return slot?.legal_alternatives ?? [];
-    }
-    if (isRetargetChoiceForMe) {
-      return waitingFor.data.legal_new_targets;
-    }
-    if (isReturnAsAuraForMe) {
-      return waitingFor.data.legal_targets;
-    }
-    return [];
-  }, [isHumanTargetSelection, isCopyRetargetForMe, isRetargetChoiceForMe, isReturnAsAuraForMe, waitingFor]);
+  const canActForWaitingState = useCanActForWaitingState();
+  // `null` = the engine is not asking THIS client to click a target; `[]` = it is
+  // asking but nothing is legal yet. `isTargeting` needs that distinction, which
+  // is why the refs authority is read here rather than a length check. Two tab
+  // behaviours ride on it: the peek popover's targeting presentation (legal
+  // targets sorted to the front, cyan ring) and `showIncomingOnHover`, which
+  // decides whether hovering an attacking tab shows threats or the board peek.
+  const clickTargetRefs = useMemo(
+    () => (canActForWaitingState ? getWaitingForClickTargetRefs(waitingFor) : null),
+    [canActForWaitingState, waitingFor],
+  );
+  const isTargeting = clickTargetRefs !== null;
   const validPlayerTargetIds = useMemo(
-    () => currentLegalTargets
-      .filter((tgt): tgt is { Player: number } => "Player" in tgt)
-      .map((tgt) => tgt.Player),
-    [currentLegalTargets],
+    () => (canActForWaitingState ? getWaitingForPlayerChoiceIds(waitingFor) : []),
+    [canActForWaitingState, waitingFor],
   );
   // Object targets grouped by their controller, so each `OpponentTab` can
   // show only that opponent's legal targets in the peek popover. The set
@@ -203,7 +190,7 @@ export function OpponentHud({
   const legalObjectTargetsByController = useMemo(() => {
     const map = new Map<PlayerId, ObjectId[]>();
     if (!objectsMapForTargets) return map;
-    for (const tgt of currentLegalTargets) {
+    for (const tgt of clickTargetRefs ?? []) {
       if (!("Object" in tgt)) continue;
       const obj = objectsMapForTargets[tgt.Object];
       if (!obj) continue;
@@ -212,7 +199,7 @@ export function OpponentHud({
       map.set(obj.controller, list);
     }
     return map;
-  }, [currentLegalTargets, objectsMapForTargets]);
+  }, [clickTargetRefs, objectsMapForTargets]);
 
   const handlePlayerTarget = useCallback(
     (targetPlayerId: number) => {
@@ -247,7 +234,7 @@ export function OpponentHud({
   const isOnline = connectionStatus !== "disconnected";
   const primaryOpponentId =
     liveOpponents[0] ?? allOpponents[0] ?? (playerId === 0 ? 1 : 0);
-  const primaryOpponentAvatarUrl = useMultiplayerStore(
+  const primaryOpponentAvatarIdentity = useMultiplayerStore(
     (s) => s.playerAvatars.get(primaryOpponentId) ?? null,
   );
   // Always-called hook (rules-of-hooks) — used only on the 1v1 branch below.
@@ -270,7 +257,7 @@ export function OpponentHud({
     const showMatchScore = gameState?.match_config?.match_type === "Bo3";
     const matchScore = showMatchScore ? gameState?.match_score ?? null : null;
     const label = opponentName ?? getOpponentDisplayName(opponentId);
-    const opponentAvatarUrl = primaryOpponentAvatarUrl;
+    const opponentAvatarIdentity = primaryOpponentAvatarIdentity;
     const compact = forceCompactHud;
 
     const hudTone = isValidTarget ? "cyan" : isOpponentTurn ? "rose" : "neutral";
@@ -293,7 +280,7 @@ export function OpponentHud({
           active={isOpponentTurn}
           seatColor={opponentSeatColor}
           underAttack={isOpponentUnderAttack}
-          avatarUrl={opponentAvatarUrl}
+          avatarIdentity={opponentAvatarIdentity}
           playerId={opponentId}
           density={compact ? "compact" : "default"}
           onClick={isValidTarget ? () => handlePlayerTarget(opponentId) : undefined}
@@ -306,8 +293,8 @@ export function OpponentHud({
               {opponentDesignations.hasInitiative ? <InitiativeBadge /> : null}
               {opponentDesignations.hasCityBlessing ? <CityBlessingBadge /> : null}
               {opponentDesignations.hasEnduringStory ? <EnduringStoryBadge /> : null}
-              {opponentDesignations.activeDungeon ? (
-                <DungeonBadge dungeonName={opponentDesignations.activeDungeon} roomIndex={opponentDesignations.currentRoom} />
+              {opponentDesignations.dungeonRoom ? (
+                <DungeonBadge room={opponentDesignations.dungeonRoom} />
               ) : null}
               {isOpponentPhasedOut ? <StatusBadge label={t("player.phasedOut")} tone="neutral" /> : null}
               {opponentDesignations.ringLevel > 0 ? (
@@ -625,7 +612,7 @@ function OpponentTab({
   const player = gameState?.players[playerId];
   const isDisconnected = useMultiplayerStore((s) => s.disconnectedPlayers.has(playerId));
   const isOnline = useMultiplayerStore((s) => s.connectionStatus) !== "disconnected";
-  const avatarUrl = useMultiplayerStore((s) => s.playerAvatars.get(playerId) ?? null);
+  const avatarIdentity = useMultiplayerStore((s) => s.playerAvatars.get(playerId) ?? null);
   const counts = useMemo(() => {
     if (!gameState || compact) return { creatures: 0, lands: 0, other: 0 };
     const objects = gameState.battlefield
@@ -643,7 +630,7 @@ function OpponentTab({
   // Hoisted above the early return (rules-of-hooks).
   const designations = usePlayerDesignations(playerId);
 
-  // Player-attached Auras (Curses, Faith's Fetters, Dictate of Kruphix…).
+  // Player-attached Auras (Curses, Paradox Haze — anything with `Enchant player`).
   // Surfaced as a corner badge so it stays visible in both density modes and
   // never competes with the inline `statusCluster` for width on 3-4 player
   // rails. Hover → portaled `AurasHoverPreview`
@@ -763,8 +750,8 @@ function OpponentTab({
       {designations.hasInitiative ? <InitiativeBadge /> : null}
       {designations.hasCityBlessing ? <CityBlessingBadge /> : null}
       {designations.hasEnduringStory ? <EnduringStoryBadge /> : null}
-      {designations.activeDungeon ? (
-        <DungeonBadge dungeonName={designations.activeDungeon} roomIndex={designations.currentRoom} />
+      {designations.dungeonRoom ? (
+        <DungeonBadge room={designations.dungeonRoom} />
       ) : null}
       {designations.ringLevel > 0 ? (
         <CounterBadge
@@ -846,7 +833,7 @@ function OpponentTab({
       )}
       <OpponentAvatar
         label={label}
-        avatarUrl={avatarUrl}
+        avatarIdentity={avatarIdentity}
         seatColor={seatColor}
         compact={compact}
       />
@@ -972,23 +959,30 @@ function OpponentTab({
 
 function OpponentAvatar({
   label,
-  avatarUrl,
+  avatarIdentity,
   seatColor,
   compact = false,
 }: {
   label: string;
-  avatarUrl: string | null;
+  avatarIdentity: PlayerAvatarIdentity | null;
   seatColor: string;
   compact?: boolean;
 }) {
+  const avatar = usePlayerAvatarImage(avatarIdentity);
+  const activeSrc = avatar.src;
   // Inner avatar visuals: real portrait when known, synthesized
   // seat-color tile with the player's initial otherwise.
-  const inner = avatarUrl ? (
+  const inner = activeSrc ? (
     <>
-      <img src={avatarUrl} alt={label} className="h-full w-full object-cover" />
+      <img
+        src={activeSrc}
+        alt={label}
+        className="h-full w-full object-cover"
+        onError={() => avatar.advanceFailedSource(activeSrc)}
+      />
       <div className="absolute inset-0 bg-gradient-to-b from-white/12 via-transparent to-black/35" />
     </>
-  ) : (
+  ) : avatarIdentity && avatar.isLoading ? null : (
     <>
       <div
         className="flex h-full w-full items-center justify-center text-[11px] font-bold text-white/90 @min-[11rem]:text-sm"
@@ -1013,18 +1007,19 @@ function OpponentAvatar({
     boxShadow: `0 0 0 1px ${seatColor}55, 0 8px 18px rgba(0,0,0,0.32), 0 0 14px ${seatColor}2e`,
   };
 
-  if (!avatarUrl) {
+  if (!activeSrc) {
     return <div className={tileClassName} style={tileStyle} title={label}>{inner}</div>;
   }
 
   return (
     <AvatarHoverPreview
-      avatarUrl={avatarUrl}
+      avatarUrl={activeSrc}
       label={label}
       seatColor={seatColor}
       title={label}
       className={tileClassName}
       style={tileStyle}
+      onAvatarError={avatar.advanceFailedSource}
     >
       {inner}
     </AvatarHoverPreview>

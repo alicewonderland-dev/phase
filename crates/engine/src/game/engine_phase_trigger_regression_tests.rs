@@ -2119,6 +2119,7 @@ fn optional_effect_choice_accept_preserves_nested_effect_zone_choice_continuatio
         source_id,
         description: None,
         may_trigger_key: None,
+        same_card_may_trigger_choice_available: false,
     };
 
     let result = apply_as_current(
@@ -2982,6 +2983,7 @@ fn effect_zone_choice_handler_resolves_sacrifice_and_continuation() {
         conditional_enter_with_counters: vec![],
         count_param: 0,
         library_position: None,
+        mass_library_order: None,
         is_cost_payment: false,
         enters_modified_if: None,
         duration: None,
@@ -3058,6 +3060,7 @@ fn effect_zone_choice_handler_resolves_untap_selection() {
         conditional_enter_with_counters: vec![],
         count_param: 0,
         library_position: None,
+        mass_library_order: None,
         is_cost_payment: false,
         enters_modified_if: None,
         duration: None,
@@ -3109,6 +3112,7 @@ fn effect_zone_choice_up_to_respects_min_count() {
         conditional_enter_with_counters: vec![],
         count_param: 0,
         library_position: None,
+        mass_library_order: None,
         is_cost_payment: false,
         enters_modified_if: None,
         duration: None,
