@@ -1086,6 +1086,7 @@ mod spark_double_as_enters;
 mod spear_of_bashenga_attacks_monarch_5249;
 mod special_action_x_runtime;
 mod specialize_runtime;
+mod spell_cast_trigger_matrix;
 mod spellstutter_sprite_counter_with_x;
 mod sphinx_of_uthuun_etb_pile_separation;
 mod spikeshell_harrier_speed_superlative;
