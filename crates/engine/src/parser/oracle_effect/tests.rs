@@ -112,6 +112,109 @@ fn nested_triggering_batch_aggregate_is_rebound_through_the_source_visitor() {
     assert_eq!((batch, chain, objects, graveyard, leaves), (0, 1, 1, 1, 3));
 }
 
+/// Dawnbreak Reclaimer's entire sequential instruction must lower as one
+/// reciprocal chain: the owner of the first selected creature supplies the
+/// second choice, and only those two selections reach the optional return.
+#[test]
+fn dawnbreak_reclaimer_lowers_to_a_reciprocal_graveyard_choice_chain() {
+    let def = parse_effect_chain(
+        "Choose a creature card in an opponent's graveyard, then that player chooses a creature card in your graveyard. You may return those cards to the battlefield under their owners' control.",
+        AbilityKind::Spell,
+    );
+    let Effect::ChooseFromZone {
+        zone: Zone::Graveyard,
+        chooser: ZoneChoiceChooser::Controller,
+        candidate_source: ZoneChoiceCandidateSource::Direct,
+        reciprocal_role: Some(ReciprocalZoneChoiceRole::Produce),
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!("expected reciprocal producer, got {:?}", def.effect);
+    };
+    let consume = def.sub_ability.expect("reciprocal consumer");
+    let Effect::ChooseFromZone {
+        chooser: ZoneChoiceChooser::ImmediatePriorSelectedCardOwner { player: None },
+        candidate_source: ZoneChoiceCandidateSource::Direct,
+        reciprocal_role: Some(ReciprocalZoneChoiceRole::Consume),
+        ..
+    } = consume.effect.as_ref()
+    else {
+        panic!("expected reciprocal consumer, got {:?}", consume.effect);
+    };
+    assert!(consume.sub_ability.expect("optional return").optional);
+}
+
+/// The reciprocal grammar composes card descriptors independently of the
+/// opponent/your graveyard and owner-controlled return structure.
+#[test]
+fn reciprocal_graveyard_choice_accepts_descriptor_matrix() {
+    for text in [
+        "Choose an artifact card in an opponent's graveyard, then that player chooses an enchantment card in your graveyard. You may return those cards to the battlefield under their owners' control.",
+        "Choose an enchantment card in an opponent's graveyard, then that player chooses an artifact card in your graveyard. You may return those cards to the battlefield under their owners' control.",
+    ] {
+        let def = parse_effect_chain(text, AbilityKind::Spell);
+        assert!(
+            matches!(
+                def.effect.as_ref(),
+                Effect::ChooseFromZone {
+                    reciprocal_role: Some(ReciprocalZoneChoiceRole::Produce),
+                    candidate_source: ZoneChoiceCandidateSource::Direct,
+                    filter: Some(_),
+                    ..
+                }
+            ),
+            "descriptor matrix entry must reach reciprocal lowering: {text}; got {:?}",
+            def.effect
+        );
+        assert!(
+            matches!(
+                def.sub_ability.as_deref().map(|ability| ability.effect.as_ref()),
+                Some(Effect::ChooseFromZone {
+                    reciprocal_role: Some(ReciprocalZoneChoiceRole::Consume),
+                    candidate_source: ZoneChoiceCandidateSource::Direct,
+                    filter: Some(_),
+                    ..
+                })
+            ),
+            "descriptor matrix entry must retain a reciprocal consumer: {text}"
+        );
+    }
+}
+
+/// A different optional-return component is not silently lowered as the
+/// battlefield-under-owner reciprocal class.
+#[test]
+fn reciprocal_graveyard_choice_near_miss_falls_through_honestly() {
+    let text = "Choose a creature card in an opponent's graveyard, then that player chooses a creature card in your graveyard. You may return those cards to your hand.";
+    assert!(
+        parse_reciprocal_graveyard_choice_ir(text, AbilityKind::Spell).is_none(),
+        "a non-owner-controlled return destination must not enter reciprocal lowering"
+    );
+
+    let def = parse_effect_chain(text, AbilityKind::Spell);
+    let mut cursor = Some(&def);
+    let mut has_unimplemented = false;
+    while let Some(ability) = cursor {
+        has_unimplemented |= matches!(ability.effect.as_ref(), Effect::Unimplemented { .. });
+        assert!(
+            !matches!(
+                ability.effect.as_ref(),
+                Effect::ChooseFromZone {
+                    reciprocal_role: Some(_),
+                    ..
+                }
+            ),
+            "near miss must not claim reciprocal semantics: {:?}",
+            ability.effect
+        );
+        cursor = ability.sub_ability.as_deref();
+    }
+    assert!(
+        has_unimplemented,
+        "the unrecognized return component must remain visible, not be swallowed"
+    );
+}
+
 #[test]
 fn nested_triggering_batch_in_non_trigger_chain_is_demoted_honestly() {
     let mut def = AbilityDefinition::new(
@@ -10455,6 +10558,453 @@ fn same_chain_put_exiled_card_keeps_tracked_set() {
     );
 }
 
+// ── Singular battlefield-recall anaphor ──
+//
+// "Exile <self>, then return it to the battlefield" binds the recall leg to
+// `TargetFilter::SelfRef` (CR 608.2c English anaphora + CR 400.7j public-zone
+// findability) instead of the chain tracked set, whose membership picks up
+// unrelated riders (Shiva's Cold Snap tap leg). Plural / chosen-target /
+// delayed / first-clause recalls keep the sentinel binding.
+
+/// B1 — positive: Shiva's chapter III (verbatim FIN back-face Oracle) lowers
+/// to [broadcast tap of opponents' lands, self-exile, self-return front face
+/// up]. Every hostile test below (B4–B8) asserts its full positive chain shape
+/// first, so a parse failure cannot satisfy its negative vacuously.
+#[test]
+fn singular_battlefield_recall_shiva_chapter_iii_binds_self() {
+    let parsed = parse_oracle_text(
+        "(As this Saga enters and after your draw step, add a lore counter.)\n\
+         I, II — Mesmerize — Target creature can't be blocked this turn.\n\
+         III — Cold Snap — Tap all lands your opponents control. Exile Shiva, then return it to the battlefield (front face up).",
+        "Shiva, Warden of Ice",
+        &[],
+        &["Enchantment".to_string(), "Creature".to_string()],
+        &["Saga".to_string(), "Elemental".to_string()],
+    );
+    let chapter_iii = parsed
+        .triggers
+        .iter()
+        .find(|t| t.saga_chapter == Some(3))
+        .expect("Cold Snap must parse as the chapter III trigger");
+    let execute = chapter_iii
+        .execute
+        .as_deref()
+        .expect("chapter III trigger executes");
+    let legs = chain_effects(execute);
+    assert_eq!(legs.len(), 3, "tap/exile/return legs: {legs:?}");
+    assert!(
+        matches!(
+            &legs[0],
+            Effect::SetTapState {
+                scope: EffectScope::All,
+                state: TapStateChange::Tap,
+                target: TargetFilter::Typed(_),
+                ..
+            }
+        ),
+        "leg[0] must be the broadcast tap of opponents' lands: {:?}",
+        legs[0]
+    );
+    assert!(
+        matches!(
+            &legs[1],
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        ),
+        "leg[1] must be the self-exile: {:?}",
+        legs[1]
+    );
+    assert!(
+        matches!(
+            &legs[2],
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                target: TargetFilter::SelfRef,
+                enter_transformed: false,
+                ..
+            }
+        ),
+        "leg[2] must return the source itself front face up: {:?}",
+        legs[2]
+    );
+    assert!(!tree_has_unimplemented(execute));
+}
+
+/// B2 — positive contrast case: Jill's activated ability (verbatim FIN
+/// front-face Oracle) binds the transformed return to SelfRef. This is the
+/// shape the runtime repro exercises end-to-end.
+#[test]
+fn singular_battlefield_recall_jill_activation_binds_self_transformed() {
+    let parsed = parse_oracle_text(
+        "When Jill enters, return up to one other target nonland permanent to its owner's hand.\n\
+         {3}{U}{U}, {T}: Exile Jill, then return it to the battlefield transformed under its owner's control. Activate only as a sorcery.",
+        "Jill, Shiva's Dominant",
+        &[],
+        &["Legendary".to_string(), "Creature".to_string()],
+        &["Human".to_string(), "Noble".to_string(), "Warrior".to_string()],
+    );
+    let activated = parsed
+        .abilities
+        .iter()
+        .find(|a| a.kind == AbilityKind::Activated)
+        .expect("Jill's exile-and-return must parse as an activated ability");
+    let legs = chain_effects(activated);
+    assert_eq!(legs.len(), 2, "exile/return legs: {legs:?}");
+    assert!(
+        matches!(
+            &legs[0],
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        ),
+        "leg[0] must be the self-exile: {:?}",
+        legs[0]
+    );
+    assert!(
+        matches!(
+            &legs[1],
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                target: TargetFilter::SelfRef,
+                enter_transformed: true,
+                ..
+            }
+        ),
+        "leg[1] must return Jill transformed: {:?}",
+        legs[1]
+    );
+    assert!(!tree_has_unimplemented(activated));
+}
+
+/// B3 — positive: Fable of the Mirror-Breaker's chapter III (verbatim Oracle)
+/// "Exile this Saga, then return it to the battlefield transformed" binds
+/// SelfRef + enter_transformed.
+#[test]
+fn singular_battlefield_recall_fable_chapter_iii_binds_self_transformed() {
+    let parsed = parse_oracle_text(
+        "(As this Saga enters and after your draw step, add a lore counter.)\n\
+         I — Create a 2/2 red Goblin Shaman creature token with \"Whenever this token attacks, create a Treasure token.\"\n\
+         II — You may discard up to two cards. If you do, draw that many cards.\n\
+         III — Exile this Saga, then return it to the battlefield transformed under your control.",
+        "Fable of the Mirror-Breaker",
+        &[],
+        &["Enchantment".to_string()],
+        &["Saga".to_string()],
+    );
+    let chapter_iii = parsed
+        .triggers
+        .iter()
+        .find(|t| t.saga_chapter == Some(3))
+        .expect("Fable chapter III must parse as a trigger");
+    let execute = chapter_iii
+        .execute
+        .as_deref()
+        .expect("chapter III trigger executes");
+    let legs = chain_effects(execute);
+    assert_eq!(legs.len(), 2, "exile/return legs: {legs:?}");
+    assert!(
+        matches!(
+            &legs[0],
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        ),
+        "leg[0] must be the self-exile: {:?}",
+        legs[0]
+    );
+    assert!(
+        matches!(
+            &legs[1],
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                target: TargetFilter::SelfRef,
+                enter_transformed: true,
+                ..
+            }
+        ),
+        "leg[1] must return the Saga transformed: {:?}",
+        legs[1]
+    );
+    assert!(!tree_has_unimplemented(execute));
+}
+
+/// B4 — hostile, plural: "return them" after a mass publisher keeps the
+/// chain-set binding on the recall leg. The "Exile them" clause keeps its
+/// ParentTarget (no pronoun detector fires for it; the gate never touches it).
+#[test]
+fn singular_battlefield_recall_plural_after_mass_exile_keeps_tracked_set() {
+    let def = parse_effect_chain(
+        "Exile all creatures you control. Exile them, then return them to the battlefield.",
+        AbilityKind::Spell,
+    );
+    let legs = chain_effects(&def);
+    assert_eq!(
+        legs.len(),
+        3,
+        "mass-exile/their-exile/return legs: {legs:?}"
+    );
+    assert!(
+        matches!(
+            &legs[0],
+            Effect::ChangeZoneAll {
+                destination: Zone::Exile,
+                target: TargetFilter::Typed(_),
+                ..
+            }
+        ),
+        "leg[0] must be the mass exile: {:?}",
+        legs[0]
+    );
+    assert!(
+        matches!(
+            &legs[1],
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::ParentTarget,
+                ..
+            }
+        ),
+        "leg[1] must re-exile the exiled set: {:?}",
+        legs[1]
+    );
+    assert!(
+        matches!(
+            &legs[2],
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                target: TargetFilter::TrackedSet {
+                    id: TrackedSetId(0)
+                },
+                ..
+            }
+        ),
+        "plural recall must keep TrackedSet(0): {:?}",
+        legs[2]
+    );
+}
+
+/// B5 — hostile, chosen antecedent: after "Exile target creature" (a
+/// chosen-target publisher, not a self-move) the singular recall keeps the
+/// chain tracked set.
+#[test]
+fn singular_battlefield_recall_after_chosen_target_exile_keeps_tracked_set() {
+    let def = parse_effect_chain(
+        "Exile target creature, then return it to the battlefield.",
+        AbilityKind::Spell,
+    );
+    let legs = chain_effects(&def);
+    assert_eq!(legs.len(), 2, "exile/return legs: {legs:?}");
+    assert!(
+        matches!(
+            &legs[0],
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::Typed(_),
+                ..
+            }
+        ),
+        "leg[0] must be the chosen-target exile: {:?}",
+        legs[0]
+    );
+    assert!(
+        matches!(
+            &legs[1],
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                target: TargetFilter::TrackedSet {
+                    id: TrackedSetId(0)
+                },
+                ..
+            }
+        ),
+        "recall after a chosen-target publisher must keep TrackedSet(0): {:?}",
+        legs[1]
+    );
+}
+
+/// B6 — hostile, delayed: the rewriter never descends into
+/// CreateDelayedTrigger, so the payload keeps its CR 603.7c ParentTarget
+/// referent with origin pinned to Exile at delayed-trigger creation
+/// (CR 603.7a; Aetherling / Otherworldly Journey shapes).
+#[test]
+fn singular_battlefield_recall_delayed_keeps_parent_target_payload() {
+    let def = parse_effect_chain(
+        "Exile ~, then return it to the battlefield at the beginning of the next end step.",
+        AbilityKind::Spell,
+    );
+    let legs = chain_effects(&def);
+    assert_eq!(legs.len(), 2, "exile/delayed-return legs: {legs:?}");
+    assert!(
+        matches!(
+            &legs[0],
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        ),
+        "leg[0] must be the self-exile: {:?}",
+        legs[0]
+    );
+    let Effect::CreateDelayedTrigger {
+        effect,
+        uses_tracked_set,
+        ..
+    } = &legs[1]
+    else {
+        panic!("expected CreateDelayedTrigger, got {:?}", legs[1]);
+    };
+    let Effect::ChangeZone {
+        origin: Some(Zone::Exile),
+        destination: Zone::Battlefield,
+        target: TargetFilter::ParentTarget,
+        ..
+    } = &*effect.effect
+    else {
+        panic!(
+            "delayed payload must keep ParentTarget with origin Exile, got {:?}",
+            effect.effect
+        );
+    };
+    assert!(*uses_tracked_set);
+}
+
+/// B7 — positive, nearest-publisher axis: The Great Work's chapter III
+/// (verbatim) has an earlier targeted exile, but the NEAREST publisher before
+/// the recall is the self-exile, so the recall binds SelfRef.
+#[test]
+fn singular_battlefield_recall_nearest_publisher_self_move_binds_self() {
+    let parsed = parse_oracle_text(
+        "(As this Saga enters and after your draw step, add a lore counter.)\n\
+         I — This Saga deals 3 damage to target opponent and each creature they control.\n\
+         II — Create three Treasure tokens.\n\
+         III — Until end of turn, you may cast instant and sorcery spells from any graveyard. If a spell cast this way would be put into a graveyard, exile it instead. Exile this Saga, then return it to the battlefield (front face up).",
+        "The Great Work",
+        &[],
+        &["Enchantment".to_string()],
+        &["Saga".to_string()],
+    );
+    let chapter_iii = parsed
+        .triggers
+        .iter()
+        .find(|t| t.saga_chapter == Some(3))
+        .expect("The Great Work chapter III must parse as a trigger");
+    let execute = chapter_iii
+        .execute
+        .as_deref()
+        .expect("chapter III trigger executes");
+    let legs = chain_effects(execute);
+    assert_eq!(legs.len(), 4, "cast/exile/self-exile/return legs: {legs:?}");
+    assert!(
+        matches!(
+            &legs[2],
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        ),
+        "leg[2] must be the self-exile publisher: {:?}",
+        legs[2]
+    );
+    assert!(
+        matches!(
+            &legs[3],
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        ),
+        "nearest publisher is the self-exile, so the recall binds SelfRef: {:?}",
+        legs[3]
+    );
+    assert!(!tree_has_unimplemented(execute));
+}
+
+/// B7-negative — with a typed-target leg as the NEAREST publisher, the
+/// singular recall keeps the chain tracked set (nearest-first scan does not
+/// see the earlier self-exile).
+#[test]
+fn singular_battlefield_recall_nearest_publisher_typed_target_keeps_tracked_set() {
+    let def = parse_effect_chain(
+        "Exile ~. Exile target creature, then return it to the battlefield.",
+        AbilityKind::Spell,
+    );
+    let legs = chain_effects(&def);
+    assert_eq!(
+        legs.len(),
+        3,
+        "self-exile/typed-exile/return legs: {legs:?}"
+    );
+    assert!(
+        matches!(
+            &legs[0],
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        ),
+        "leg[0] must be the self-exile: {:?}",
+        legs[0]
+    );
+    assert!(
+        matches!(
+            &legs[1],
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::Typed(_),
+                ..
+            }
+        ),
+        "leg[1] must be the chosen-target exile: {:?}",
+        legs[1]
+    );
+    assert!(
+        matches!(
+            &legs[2],
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                target: TargetFilter::TrackedSet {
+                    id: TrackedSetId(0)
+                },
+                ..
+            }
+        ),
+        "nearest publisher is the typed exile, so recall keeps TrackedSet(0): {:?}",
+        legs[2]
+    );
+}
+
+/// B8 — hostile, first clause: with no prior publisher the gate never fires
+/// and the recall keeps its unbound ParentTarget.
+#[test]
+fn singular_battlefield_recall_first_clause_without_publisher_stays_parent_target() {
+    let def = parse_effect_chain("Return it to the battlefield.", AbilityKind::Spell);
+    let legs = chain_effects(&def);
+    assert_eq!(legs.len(), 1, "single leg: {legs:?}");
+    assert!(
+        matches!(
+            &legs[0],
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                target: TargetFilter::ParentTarget,
+                ..
+            }
+        ),
+        "unbound first-clause recall must stay ParentTarget: {:?}",
+        legs[0]
+    );
+}
+
 #[test]
 fn effect_draw() {
     let e = parse_effect("Draw two cards");
@@ -10600,6 +11150,7 @@ fn effect_chain_lose_life_and_amass_keeps_both_clauses() {
         Effect::Amass {
             ref subtype,
             ref count,
+            ..
         } => {
             assert_eq!(subtype, "Zombie");
             assert!(
@@ -10609,6 +11160,20 @@ fn effect_chain_lose_life_and_amass_keeps_both_clauses() {
         }
         other => panic!("expected chained Amass{{Zombie, 1}}, got {other:?}"),
     }
+}
+
+#[test]
+fn effect_target_player_amasses_surfaces_the_player_target() {
+    let effect = parse_effect("target player amasses Goblins 2");
+    assert_eq!(
+        effect,
+        Effect::Amass {
+            subtype: "Goblin".to_string(),
+            count: QuantityExpr::Fixed { value: 2 },
+            player: TargetFilter::Player,
+        }
+    );
+    assert_eq!(effect.target_filter(), Some(&TargetFilter::Player));
 }
 
 // CR 701.63: Endure — every printed card prefixes a self-referential
@@ -12528,7 +13093,9 @@ fn kozilek_target_players_each_manifest_two_from_their_hands_parses() {
                 count: 2,
                 zone: Zone::Hand,
                 zone_owner: ZoneOwner::Each(PerPlayerScope::TargetedPlayers),
-                chooser: Chooser::OwningPlayer,
+                chooser: ZoneChoiceChooser::OwningPlayer,
+                candidate_source: ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: false,
                 // CR 608.2d: each player CHOOSES — a regression to a random
                 // or non-choice selection mode must fail here.
@@ -19244,6 +19811,7 @@ fn strip_temporal_suffix_your_next_main_phase() {
             phase: Phase::PreCombatMain,
             player: crate::types::player::PlayerId(0),
             gate: crate::types::ability::TurnGate::None,
+            binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
         })
     );
 }
@@ -19289,6 +19857,7 @@ fn strip_temporal_prefix_your_next_main_phase() {
             phase: Phase::PreCombatMain,
             player: crate::types::player::PlayerId(0),
             gate: crate::types::ability::TurnGate::None,
+            binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
         })
     );
 }
@@ -19306,6 +19875,7 @@ fn temporal_end_step_on_your_next_turn_carries_after_creation_gate() {
         phase: Phase::End,
         player: crate::types::player::PlayerId(0),
         gate: TurnGate::AfterCreationTurn,
+        binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
     };
 
     let (rest, cond) = strip_temporal_prefix(
@@ -19334,6 +19904,7 @@ fn your_next_end_step_keeps_none_gate_not_shadowed_by_kav_arm() {
         phase: Phase::End,
         player: crate::types::player::PlayerId(0),
         gate: TurnGate::None,
+        binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
     };
 
     let (rest, cond) = strip_temporal_prefix(
@@ -19420,6 +19991,7 @@ fn kav_landseeker_etb_lowers_to_token_plus_delayed_sacrifice() {
             phase: Phase::End,
             player: crate::types::player::PlayerId(0),
             gate: TurnGate::AfterCreationTurn,
+            binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
         },
         "delayed condition must be End-step gated to the creating player's next turn"
     );
@@ -22540,7 +23112,18 @@ fn cant_be_activated_effect_standalone_targets_creature() {
             duration,
             end_cost: _,
         } => {
-            assert_eq!(*duration, Some(Duration::UntilEndOfTurn));
+            // CR 611.2a: this sentence states NO
+            // window of its own, so the AST must say so. The recognizer used to
+            // inject `Some(UntilEndOfTurn)` here, indistinguishable from a printed
+            // window, which blocked an enclosing sentence's duration from reaching
+            // the clause — Dovin Baan, Edifice of Authority and Mythos of Vadrok each
+            // print "until your next turn" and had this prohibition end a turn early.
+            //
+            // RUNTIME IS UNCHANGED for this standalone form: both carriers are now
+            // `None`, and `game/effects/effect.rs` resolves
+            // `ability.duration.or(embedded).unwrap_or(UntilEndOfTurn)` to the same
+            // window the injection hard-coded.
+            assert_eq!(*duration, None);
             assert_eq!(static_abilities.len(), 1);
             let sd = &static_abilities[0];
             assert!(
@@ -25594,7 +26177,7 @@ fn return_opponents_choice_from_your_graveyard_uses_zone_choice_chain() {
     assert_eq!(*count, 1);
     assert_eq!(*zone, Zone::Graveyard);
     assert_eq!(*zone_owner, ZoneOwner::Controller);
-    assert_eq!(*chooser, Chooser::Opponent);
+    assert_eq!(*chooser, ZoneChoiceChooser::Opponent);
     assert!(!up_to);
     let TargetFilter::Typed(typed) = filter else {
         panic!("expected typed graveyard-card filter, got {filter:?}");
@@ -25651,7 +26234,9 @@ fn parse_impulse_draw_chain() {
             Effect::ChooseFromZone {
                 count: 1,
                 zone: crate::types::zones::Zone::Exile,
-                chooser: crate::types::ability::Chooser::Controller,
+                chooser: ZoneChoiceChooser::Controller,
+                candidate_source: ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: false,
                 constraint: None,
                 ..
@@ -30775,6 +31360,167 @@ fn effect_exchange_control_self_ref_slot() {
     }
 }
 
+// =============================================================================
+// Cross-slot object-relative target binding (backlog root cause #27), Unit A —
+// T6a/T6b/T6c and T8's parser half.
+// =============================================================================
+
+#[test]
+fn t6a_puca_mischief_compound_rebinds_slot_b_referent_to_prior_target() {
+    // Puca's Mischief, verbatim Oracle text.
+    use crate::types::ability::{Comparator, ObjectScope, QuantityExpr, QuantityRef};
+    let e = parse_effect(
+        "exchange control of target nonland permanent you control and target nonland \
+         permanent an opponent controls with equal or lesser mana value",
+    );
+    match e {
+        Effect::ExchangeControl { target_a, target_b } => {
+            let tf_a = match &target_a {
+                TargetFilter::Typed(tf) => tf,
+                _ => panic!("target_a should be Typed, got {target_a:?}"),
+            };
+            assert!(
+                tf_a.properties.is_empty(),
+                "target_a must carry NO Cmc prop — proves only slot B moved: {:?}",
+                tf_a.properties
+            );
+            let tf_b = match &target_b {
+                TargetFilter::Typed(tf) => tf,
+                _ => panic!("target_b should be Typed, got {target_b:?}"),
+            };
+            assert_eq!(
+                tf_b.properties,
+                vec![crate::types::ability::FilterProp::Cmc {
+                    comparator: Comparator::LE,
+                    value: QuantityExpr::Ref {
+                        qty: QuantityRef::ObjectManaValue {
+                            scope: ObjectScope::Target,
+                        },
+                    },
+                }],
+                "target_b must carry Cmc{{LE, ObjectManaValue{{Target}}}} — the compound-slot \
+                 rebind — not the single-referent CostPaidObject default"
+            );
+        }
+        other => panic!("Expected ExchangeControl, got {other:?}"),
+    }
+}
+
+#[test]
+fn t6b_single_referent_relative_mana_value_outside_exchange_family_unaffected() {
+    // The dominant single-referent trigger/cost class (CR 608.2k) — NOT part
+    // of the exchange-control family — must keep defaulting to
+    // ObjectScope::CostPaidObject. Unit A's rebind is scoped to the compound
+    // exchange-control call site only.
+    use crate::types::ability::{Comparator, ObjectScope, QuantityExpr, QuantityRef};
+    let e = parse_effect(
+        "return another target creature card with lesser mana value from your graveyard to the \
+         battlefield",
+    );
+    // Reach-guard (foot-gun #6): the effect must actually be the targeted
+    // ChangeZone, not a swallowed Unimplemented — otherwise the CostPaidObject
+    // assertion below would pass vacuously.
+    let Effect::ChangeZone {
+        target,
+        destination,
+        ..
+    } = &e
+    else {
+        panic!(
+            "expected Effect::ChangeZone, got {e:?} (parse likely fell through to Unimplemented)"
+        );
+    };
+    assert_eq!(*destination, crate::types::zones::Zone::Battlefield);
+    let TargetFilter::Typed(tf) = target else {
+        panic!("expected a Typed target filter, got {target:?}");
+    };
+    assert!(
+        tf.properties.iter().any(|p| matches!(
+            p,
+            crate::types::ability::FilterProp::Cmc {
+                comparator: Comparator::LT,
+                value: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectManaValue {
+                        scope: ObjectScope::CostPaidObject,
+                    },
+                },
+            }
+        )),
+        "single-referent class must still default to ObjectScope::CostPaidObject, got {:?}",
+        tf.properties
+    );
+}
+
+#[test]
+fn t6c_quantified_exchange_control_branch_does_not_rebind() {
+    // The quantified "two target Xs" branch clones ONE parsed filter for both
+    // slots; Unit A's rebind call site sits ONLY in the compound branch, so
+    // this shape must carry no Cmc prop introduced by the rebind machinery.
+    let e = parse_effect("exchange control of two target creatures");
+    match e {
+        Effect::ExchangeControl { target_a, target_b } => {
+            assert_eq!(
+                target_a, target_b,
+                "quantified shape: both filters identical"
+            );
+            let TargetFilter::Typed(tf) = &target_a else {
+                panic!("target_a should be Typed, got {target_a:?}");
+            };
+            assert!(
+                tf.properties.is_empty(),
+                "the quantified branch must introduce no Cmc/threshold prop: {:?}",
+                tf.properties
+            );
+            assert_ne!(target_a, TargetFilter::Any);
+        }
+        other => panic!("Expected ExchangeControl, got {other:?}"),
+    }
+}
+
+#[test]
+fn t8_self_ref_slot_a_guard_suppresses_the_compound_rebind() {
+    // Volatile Stormdrake / Avarice Totem shape with an explicit
+    // relative-mana-value suffix on slot B: "exchange control of this
+    // artifact and target nonland permanent with equal or lesser mana value".
+    // Slot A is SelfRef (no declared object target exists to bind to), so
+    // Unit A's guard must leave slot B's default CostPaidObject scope alone —
+    // rebinding it to ObjectScope::Target would make it resolve to slot B
+    // ITSELF (a self-referential, always-true-or-nonsensical comparison).
+    use crate::types::ability::{Comparator, ObjectScope, QuantityExpr, QuantityRef};
+    let e = parse_effect(
+        "exchange control of this artifact and target nonland permanent with equal or lesser \
+         mana value",
+    );
+    match e {
+        Effect::ExchangeControl { target_a, target_b } => {
+            assert!(
+                matches!(target_a, TargetFilter::SelfRef),
+                "target_a (this artifact) should be SelfRef, got {target_a:?}"
+            );
+            let TargetFilter::Typed(tf_b) = &target_b else {
+                panic!("target_b should be Typed, got {target_b:?}");
+            };
+            assert!(
+                tf_b.properties.iter().any(|p| matches!(
+                    p,
+                    crate::types::ability::FilterProp::Cmc {
+                        comparator: Comparator::LE,
+                        value: QuantityExpr::Ref {
+                            qty: QuantityRef::ObjectManaValue {
+                                scope: ObjectScope::CostPaidObject,
+                            },
+                        },
+                    }
+                )),
+                "with a SelfRef slot A, target_b must stay at the CostPaidObject default \
+                 (never rebound to Target), got {:?}",
+                tf_b.properties
+            );
+        }
+        other => panic!("Expected ExchangeControl, got {other:?}"),
+    }
+}
+
 #[test]
 fn have_redirection_target_creature_gets_pump() {
     // Bare "have target creature get +3/+3" should redirect subject
@@ -33327,8 +34073,8 @@ fn suffix_condition_with_otherwise_integration() {
 
 // --- CR 110.2a controller-override binding (#6691) ---
 
-/// CR 110.2a (docs/MagicCompRules.txt:618) + CR 400.1 (:1933) + CR 400.3
-/// (:1937) + CR 404.1 (:2030) + CR 108.3 (:564): Jailbreak's
+/// CR 110.2a + CR 400.1 + CR 400.3 +
+/// CR 404.1 + CR 108.3: Jailbreak's
 /// "under their control" binds to the moved card's OWNER, because a card in an
 /// opponent's graveyard is in ITS OWNER's graveyard.
 ///
@@ -33408,7 +34154,7 @@ fn under_your_control_still_binds_to_you_after_the_collapse() {
     }
 }
 
-/// CR 110.2 (docs/MagicCompRules.txt:616): owner forms use the existing
+/// CR 110.2: owner forms use the existing
 /// per-moved-object-owner carrier (`None`), rather than a player override, and
 /// specifically must not be misread as the third-person `TheirAnaphor` (B3).
 #[test]
@@ -33610,7 +34356,7 @@ fn return_destination_tapped() {
 fn return_destination_owners_control_not_under_your_control() {
     let (_, dest) = strip_return_destination_ext("it to the battlefield under its owner's control");
     let d = dest.expect("should parse destination");
-    // CR 110.2 (docs/MagicCompRules.txt:616): the owner form is RECOGNIZED as a
+    // CR 110.2: the owner form is RECOGNIZED as a
     // clause but restates the default, so binding it yields
     // `EntersUnderSpec::Default` — never a controller override, and never the
     // third-person `TheirAnaphor`.
@@ -45377,7 +46123,7 @@ fn plargg_and_nassari_full_trigger_chain_choose_then_cast_others() {
     );
     assert_eq!(
         *chooser,
-        Chooser::Opponent,
+        ZoneChoiceChooser::Opponent,
         "CR 608.2d: the \"an opponent\" subject must rebind the chooser"
     );
     let Some(TargetFilter::And { ref filters }) = *filter else {
@@ -45471,7 +46217,7 @@ fn search_for_survivors_opponent_chooses_at_random_in_your_graveyard() {
     );
     assert_eq!(
         *chooser,
-        Chooser::Opponent,
+        ZoneChoiceChooser::Opponent,
         "CR 608.2d: the untargeted \"an opponent\" subject must rebind the chooser"
     );
     assert_eq!(
@@ -53988,6 +54734,7 @@ fn expose_the_culprit_mode2_lowers_to_choose_shuffle_cloak_chain() {
         filter,
         min,
         max,
+        ..
     } = &*head.effect
     else {
         panic!(
@@ -54056,6 +54803,7 @@ fn duneblast_lowers_choose_survivor_then_destroy_rest() {
         filter,
         min,
         max,
+        ..
     } = def.effect.as_ref()
     else {
         panic!("expected tracked-set survivor choice, got {:?}", def.effect);
@@ -54097,6 +54845,7 @@ fn mount_doom_lowers_choose_two_then_destroy_rest() {
         filter,
         min,
         max,
+        ..
     } = def.effect.as_ref()
     else {
         panic!("expected tracked-set survivor choice, got {:?}", def.effect);
@@ -57964,4 +58713,608 @@ fn part_in_friendship_conditional_kept_destination_shape() {
     };
     assert!(lands_typed.type_filters.contains(&TypeFilter::Land));
     assert_eq!(lands_typed.controller, Some(ControllerRef::You));
+}
+
+/// CR 400.11 + CR 400.11b + CR 701.20: Booster Tutor's whole sentence is ONE
+/// effect. Splitting on its commas produced an unmodellable "open" head plus an
+/// orphaned `Reveal` and `ChangeZone` pointed at a nonexistent parent target,
+/// which is why the printed card did nothing.
+#[test]
+fn open_booster_pack_parses_the_whole_sentence_as_one_effect() {
+    let def = parse_effect_chain(
+        "Open a sealed Magic booster pack, reveal the cards, and put one of them into your hand.",
+        AbilityKind::Spell,
+    );
+    assert!(
+        matches!(
+            def.effect.as_ref(),
+            Effect::OpenBoosterPack {
+                filter: TargetFilter::Any,
+                count: QuantityExpr::Fixed { value: 1 },
+                destination: Zone::Hand,
+                reveal: true,
+            }
+        ),
+        "expected a single OpenBoosterPack, got {:?}",
+        def.effect
+    );
+    assert!(
+        def.sub_ability.is_none(),
+        "the reveal and the take are folded into the effect, not chained: {:?}",
+        def.sub_ability
+    );
+}
+
+/// The recognizer is composed one `alt` per axis, so each printed variation of
+/// the head and the take clause reaches the same effect rather than needing its
+/// own spelled-out alternative.
+#[test]
+fn open_booster_pack_accepts_the_printed_phrasing_axes() {
+    for (text, expected_reveal, expected_destination) in [
+        (
+            "Open a booster pack, reveal the cards, and put one of them into your hand.",
+            true,
+            Zone::Hand,
+        ),
+        (
+            "Open a Magic booster pack, reveal those cards, and put one of them into your hand.",
+            true,
+            Zone::Hand,
+        ),
+        (
+            "Open a sealed booster pack and put one of them into your graveyard.",
+            false,
+            Zone::Graveyard,
+        ),
+        (
+            "Open a sealed Magic booster pack, reveal the cards, then put one of those cards onto the battlefield.",
+            true,
+            Zone::Battlefield,
+        ),
+    ] {
+        let def = parse_effect_chain(text, AbilityKind::Spell);
+        let Effect::OpenBoosterPack {
+            destination,
+            reveal,
+            ..
+        } = def.effect.as_ref()
+        else {
+            panic!("expected OpenBoosterPack for {text}, got {:?}", def.effect);
+        };
+        assert_eq!(*reveal, expected_reveal, "reveal axis for {text}");
+        assert_eq!(*destination, expected_destination, "destination for {text}");
+    }
+}
+
+/// "Up to one of them" peels into the choice's up-to flag the same way every
+/// other `QuantityExpr::UpTo` carrier does.
+#[test]
+fn open_booster_pack_carries_an_up_to_take_count() {
+    let def = parse_effect_chain(
+        "Open a sealed Magic booster pack, reveal the cards, and put up to two of them into your hand.",
+        AbilityKind::Spell,
+    );
+    let Effect::OpenBoosterPack { count, .. } = def.effect.as_ref() else {
+        panic!("expected OpenBoosterPack, got {:?}", def.effect);
+    };
+    let (inner, up_to) = count.peel_up_to();
+    assert!(up_to, "an 'up to' take clause must peel as up-to");
+    assert!(matches!(inner, QuantityExpr::Fixed { value: 2 }));
+}
+
+/// A sentence that merely mentions a booster pack must not be swallowed by the
+/// recognizer — it declines and the generic pipeline keeps its own reading.
+#[test]
+fn a_non_open_booster_sentence_is_not_swallowed() {
+    assert!(
+        parse_open_booster_pack_ir(
+            "Draw a card for each booster pack you own.",
+            AbilityKind::Spell,
+            &ParseContext::default(),
+        )
+        .is_none(),
+        "the recognizer must require the open-a-pack head"
+    );
+    // Positive reach-guard: the real sentence DOES reach the recognizer, so the
+    // negative above cannot be passing because the recognizer is unreachable.
+    assert!(
+        parse_open_booster_pack_ir(
+            "Open a sealed Magic booster pack, reveal the cards, and put one of them into your hand.",
+            AbilityKind::Spell,
+            &ParseContext::default(),
+        )
+        .is_some(),
+        "the printed sentence must reach the recognizer"
+    );
+}
+
+// ── Issue #8380: compound damage subjects, player-first ordering ─────────
+//
+// These target `try_parse_compound_player_object_damage` — the BUILDING BLOCK —
+// rather than any one card, so the grammar is pinned across its whole input
+// range. The function is called directly (not through `try_split_damage_compound`)
+// because the decline cases must observe THIS parser's answer: the dispatcher
+// would fall through to the object-first sibling, whose own weaker gate this
+// change deliberately does not touch.
+
+/// Parse a player-first compound damage subject through the unit under test.
+fn compound_player_first(subject: &str) -> Option<ParsedEffectClause> {
+    let mut ctx = ParseContext::default();
+    let text = format!("~ deals 2 damage to {subject}");
+    try_parse_compound_player_object_damage(&text, &mut ctx)
+}
+
+/// Unwrap the `DamageAll` a successful player-first parse must produce.
+fn expect_damage_all(clause: &ParsedEffectClause) -> (&TargetFilter, &Option<PlayerFilter>) {
+    assert!(
+        clause.sub_ability.is_none(),
+        "a conjoined subject is ONE simultaneous action (CR 608.2f), never a chain",
+    );
+    match &clause.effect {
+        Effect::DamageAll {
+            target,
+            player_filter,
+            damage_source: None,
+            ..
+        } => (target, player_filter),
+        other => panic!("expected unified DamageAll, got: {other:?}"),
+    }
+}
+
+fn typed_of(filter: &TargetFilter) -> &TypedFilter {
+    match filter {
+        TargetFilter::Typed(tf) => tf,
+        other => panic!("expected Typed filter, got: {other:?}"),
+    }
+}
+
+#[test]
+fn compound_player_object_matches_object_first_sibling() {
+    // R2: the two orderings are semantically identical and must lower to the
+    // identical `Effect`. Scoped to inputs carrying NO anaphoric possessive —
+    // the object-first sibling resolves "they control" through `parse_target`'s
+    // `ControllerRef::You` fallback, so anaphoric inputs are legitimately
+    // asymmetric today (documented, 0 live cards, not fixed here).
+    let mut ctx = ParseContext::default();
+    let player_first = try_parse_compound_player_object_damage(
+        "~ deals 2 damage to each player and each other creature",
+        &mut ctx,
+    )
+    .expect("player-first ordering must parse");
+    let object_first = try_parse_compound_object_player_damage(
+        "~ deals 2 damage to each other creature and each player",
+        &mut ctx,
+    )
+    .expect("object-first ordering must parse");
+    assert_eq!(
+        player_first.effect, object_first.effect,
+        "both conjunct orderings must lower to the same effect",
+    );
+}
+
+#[test]
+fn compound_player_object_accepts_bare_other_object_conjunct() {
+    // R1 (Exocrine's shape). At HEAD the whitelist rejected a bare object
+    // conjunct outright, so the whole clause fell through to `DamageEachPlayer`
+    // and the creatures were never damaged.
+    let clause = compound_player_first("each player and each other creature")
+        .expect("a bare 'each other creature' conjunct must be accepted");
+    let (target, player_filter) = expect_damage_all(&clause);
+    assert_eq!(*player_filter, Some(PlayerFilter::All));
+    let tf = typed_of(target);
+    assert!(tf.type_filters.contains(&TypeFilter::Creature));
+    assert!(
+        tf.properties.contains(&FilterProp::Another),
+        "'each OTHER creature' must exclude the source",
+    );
+    assert_eq!(
+        tf.controller, None,
+        "an unqualified object conjunct names no controller",
+    );
+}
+
+#[test]
+fn compound_player_object_all_scope_possessive_is_unrestricted() {
+    // Rip to Pieces. "those players" refers back to the `each player` conjunct,
+    // and since every player controls their own permanents the union is
+    // unrestricted — `controller: None`, not a narrowing.
+    let clause = compound_player_first("each player and each creature those players control")
+        .expect("an anaphoric possessive on an All scope must be accepted");
+    let (target, player_filter) = expect_damage_all(&clause);
+    assert_eq!(*player_filter, Some(PlayerFilter::All));
+    assert_eq!(
+        typed_of(target).controller,
+        None,
+        "'those players' over EVERY player restricts nothing",
+    );
+}
+
+#[test]
+fn compound_player_object_binds_anaphoric_possessive_across_or_leaves() {
+    // R3, verbatim Goblin Chainwhirler. The `Or` recursion is load-bearing: the
+    // real card produces two typed leaves, and a non-recursive binding would
+    // drop the relation on one of them. Measured unchanged from HEAD.
+    let clause =
+        compound_player_first("each opponent and each creature and planeswalker they control")
+            .expect("Goblin Chainwhirler must keep parsing");
+    let (target, player_filter) = expect_damage_all(&clause);
+    assert_eq!(*player_filter, Some(PlayerFilter::Opponent));
+    match target {
+        TargetFilter::Or { filters } => {
+            assert_eq!(filters.len(), 2, "creature and planeswalker are two leaves");
+            for f in filters {
+                assert_eq!(
+                    typed_of(f).controller,
+                    Some(ControllerRef::Opponent),
+                    "EVERY Or leaf must carry the anaphoric binding",
+                );
+            }
+        }
+        other => panic!("expected Or filter, got: {other:?}"),
+    }
+}
+
+#[test]
+fn compound_player_object_binds_anaphoric_possessive_single_typed() {
+    // The single-`Typed` sibling (Soul Immolation, Delayed Blast Fireball).
+    let clause = compound_player_first("each opponent and each creature they control")
+        .expect("the single-typed anaphoric form must keep parsing");
+    let (target, _) = expect_damage_all(&clause);
+    assert_eq!(typed_of(target).controller, Some(ControllerRef::Opponent));
+}
+
+#[test]
+fn compound_player_object_does_not_over_bind_controller() {
+    // R4 — the multi-authority fixture. Two candidate authorities are in scope:
+    // the `Opponent` player conjunct, and the object conjunct's own unrestricted
+    // scope. The correct answer is the object's own — proven by the object-first
+    // twin, which yields `controller: null` for the same subject.
+    //
+    // This is exactly what the deleted blanket `set_opponent_controller` got
+    // wrong: it narrowed the blast to opponents' creatures only.
+    let clause =
+        compound_player_first("each opponent and each other creature").expect("must parse");
+    let (target, player_filter) = expect_damage_all(&clause);
+    assert_eq!(*player_filter, Some(PlayerFilter::Opponent));
+    assert_eq!(
+        typed_of(target).controller,
+        None,
+        "'each other creature' means EVERY other creature, not only opponents'",
+    );
+}
+
+#[test]
+fn compound_player_object_preserves_battle_protector() {
+    // Joyful Stormsculptor, through the de-verbatimized path. At HEAD this shape
+    // was produced by a literal string comparison against the whole phrase;
+    // the same AST must now come out of the combinator.
+    let clause = compound_player_first("each opponent and each battle they protect")
+        .expect("the battle-protector form must keep parsing");
+    let (target, player_filter) = expect_damage_all(&clause);
+    assert_eq!(*player_filter, Some(PlayerFilter::Opponent));
+    let tf = typed_of(target);
+    assert!(tf.type_filters.contains(&TypeFilter::Battle));
+    assert!(
+        tf.properties.contains(&FilterProp::ProtectorMatches {
+            controller: ControllerRef::Opponent,
+        }),
+        "CR 310.9e: 'they protect' binds the battle's PROTECTOR, not its controller",
+    );
+    assert_eq!(
+        tf.controller, None,
+        "the protector relation must not also set the controller field",
+    );
+}
+
+#[test]
+fn compound_player_object_preserves_you_dont_control_arm() {
+    // Omnath, Locus of Creation — the sole live card on the " you don't control"
+    // whitelist arm, and the one arm the probe table never exercised. Without
+    // this, Unit 1's deletion of `set_opponent_controller` is unguarded on it.
+    let clause = compound_player_first("each opponent and each planeswalker you don't control")
+        .expect("Omnath must keep parsing");
+    let (target, player_filter) = expect_damage_all(&clause);
+    assert_eq!(*player_filter, Some(PlayerFilter::Opponent));
+    let tf = typed_of(target);
+    assert!(tf.type_filters.contains(&TypeFilter::Planeswalker));
+    assert_eq!(
+        tf.controller,
+        Some(ControllerRef::Opponent),
+        "'you don't control' is an EXPLICIT possessive owned by parse_target",
+    );
+}
+
+#[test]
+fn compound_player_object_preserves_your_opponents_control_arm() {
+    // Sarkhan, Dragonsoul — the third whitelist arm.
+    let clause = compound_player_first("each opponent and each creature your opponents control")
+        .expect("Sarkhan must keep parsing");
+    let (target, player_filter) = expect_damage_all(&clause);
+    assert_eq!(*player_filter, Some(PlayerFilter::Opponent));
+    assert_eq!(typed_of(target).controller, Some(ControllerRef::Opponent),);
+}
+
+#[test]
+fn compound_player_object_accepts_bare_you_opener() {
+    // R9 — Sorrow's Path / Splintering Wind. Measured at HEAD as a bare
+    // `DealDamage{Controller}` with the object conjunct dropped entirely, so
+    // this assertion flips the moment the opener `alt` is reverted.
+    let clause = compound_player_first("you and each creature you control")
+        .expect("the bare 'you' opener must be accepted");
+    let (target, player_filter) = expect_damage_all(&clause);
+    assert_eq!(
+        *player_filter,
+        Some(PlayerFilter::Controller),
+        "CR 109.5: a bare 'you' recipient is the ability's controller",
+    );
+    assert_eq!(
+        typed_of(target).controller,
+        Some(ControllerRef::You),
+        "the object half's explicit 'you control' is owned by parse_target",
+    );
+}
+
+#[test]
+fn compound_player_object_you_opener_requires_the_connector() {
+    // R9's hostile half. The bare "you" arm is gated on a following
+    // " and each " connector; without that gate it would fire inside a
+    // continuation clause and inside the "you" of "your opponents control".
+    assert!(
+        compound_player_first("you and you gain 2 life").is_none(),
+        "'you gain 2 life' is a continuation clause, not a damage recipient",
+    );
+
+    // The "you inside your" guard. This one must still PARSE — it is a valid
+    // object-first subject reaching the player-first parser's own text — and it
+    // must be unchanged from HEAD, with the object half keeping `ctrl:Opponent`.
+    let mut ctx = ParseContext::default();
+    let clause = try_parse_compound_object_player_damage(
+        "~ deals 2 damage to each creature your opponents control and each player",
+        &mut ctx,
+    )
+    .expect("the object-first reading must be unchanged");
+    let (target, player_filter) = expect_damage_all(&clause);
+    assert_eq!(*player_filter, Some(PlayerFilter::All));
+    assert_eq!(
+        typed_of(target).controller,
+        Some(ControllerRef::Opponent),
+        "the 'you' inside 'your opponents control' must not be read as an opener",
+    );
+}
+
+#[test]
+fn compound_player_object_declines_player_predicate_continuation() {
+    // R7 hostile. "each player draws a card" is a continuation clause, not an
+    // object conjunct; the empty-remainder gate is what rejects it.
+    assert!(
+        compound_player_first("each opponent and each player draws a card").is_none(),
+        "a player predicate continuation must not be claimed as an object conjunct",
+    );
+
+    // REACH GUARD (positive control), through `parse_oracle_text` — the real
+    // production entry for a whole Oracle line. Deliberately NOT
+    // `try_split_damage_compound`: that internal splitter is one layer below the
+    // line router, and for this text production never reaches it, so a guard
+    // anchored there would measure a path the card does not take.
+    let parsed = parse_oracle_text(
+        "~ deals 2 damage to each opponent and each player draws a card.",
+        "Test Card",
+        &[],
+        &["Instant".to_string()],
+        &[],
+    );
+    let def = parsed
+        .abilities
+        .first()
+        .expect("the line must still produce an ability");
+    assert!(
+        matches!(*def.effect, Effect::DamageEachPlayer { .. }),
+        "expected DamageEachPlayer primary, got: {:?}",
+        def.effect,
+    );
+    let sub = def.sub_ability.as_ref().expect("the draw must chain");
+    assert!(
+        matches!(*sub.effect, Effect::Draw { .. }),
+        "expected a chained Draw, got: {:?}",
+        sub.effect,
+    );
+}
+
+#[test]
+fn compound_player_object_declines_amount_chain() {
+    // R8 hostile — Dagger Caster. A conjunct that begins a fresh amount is a
+    // CHAIN segment; collapsing it into one effect would deal the wrong amounts.
+    assert!(
+        compound_player_first("each opponent and 1 damage to each creature your opponents control")
+            .is_none(),
+        "a separately-amounted segment must not be folded into one effect",
+    );
+
+    // REACH GUARD: the full pipeline still produces the two-effect chain.
+    let mut ctx = ParseContext::default();
+    let clause = try_split_damage_compound(
+        "~ deals 1 damage to each opponent and 1 damage to each creature your opponents control",
+        &mut ctx,
+    )
+    .expect("the two-amount chain must still parse");
+    assert!(matches!(clause.effect, Effect::DamageEachPlayer { .. }));
+    let sub = clause
+        .sub_ability
+        .as_ref()
+        .expect("second segment must chain");
+    assert!(
+        matches!(*sub.effect, Effect::DamageAll { .. }),
+        "expected a chained DamageAll, got: {:?}",
+        sub.effect,
+    );
+}
+
+#[test]
+fn compound_player_object_declines_nway_conjunction() {
+    // An inner " and each " is a three-way conjunction this two-conjunct grammar
+    // does not model. Fail closed rather than silently dropping a conjunct.
+    assert!(
+        compound_player_first("each player and each creature and each planeswalker").is_none(),
+        "an N-way conjunction must be declined, not partially claimed",
+    );
+}
+
+#[test]
+fn compound_player_object_declines_player_shaped_object_conjunct() {
+    // HOSTILE — this is the only thing holding the Step 3 content gate.
+    //
+    // `parse_target("each player")` returns `TargetFilter::Typed` with an EMPTY
+    // `type_filters` vec. An enum-shape gate (`matches!(.., TargetFilter::Typed)`)
+    // accepts that, and `filter.rs`'s `for tf in type_filters` loop is a no-op on
+    // an empty vec — so the resulting filter matches EVERY permanent on the
+    // battlefield rather than none. The gate must therefore require that the
+    // filter NAMES A TYPE, not merely that it is `Typed`.
+    let clause = compound_player_first("each opponent and each player");
+    assert!(
+        clause.is_none(),
+        "a player-shaped object conjunct must be declined, not lowered to an \
+         empty-typed filter that matches every permanent; got {clause:?}",
+    );
+}
+
+// ── Issue #8380 Unit 3: the amount-form axis ─────────────────────────────
+
+#[test]
+fn compound_amount_suffix_object_first_keeps_player_half() {
+    // R11 — Rupture / Magmasaur. At HEAD the amount-suffix spelling made BOTH
+    // compound parsers decline, and the fall-through lift dropped the player half
+    // because the trailing "without flying" made `parse_target` consume past the
+    // connector. `player_filter` is absent at HEAD, so this flips on revert.
+    let mut ctx = ParseContext::default();
+    let clause = try_parse_compound_object_player_damage(
+        "~ deals damage equal to that creature's power to each creature without flying and each player",
+        &mut ctx,
+    )
+    .expect("the amount-suffix spelling must reach the compound grammar");
+    let (target, player_filter) = expect_damage_all(&clause);
+    assert_eq!(
+        *player_filter,
+        Some(PlayerFilter::All),
+        "the player half must survive the amount-suffix spelling",
+    );
+    let tf = typed_of(target);
+    assert!(tf.type_filters.contains(&TypeFilter::Creature));
+    assert!(
+        tf.properties.contains(&FilterProp::WithoutKeyword {
+            value: Keyword::Flying
+        }),
+        "the 'without flying' restriction must survive, got: {:?}",
+        tf.properties,
+    );
+}
+
+#[test]
+fn compound_amount_suffix_player_first_keeps_object_half() {
+    // The same defect in the player-first ordering. No live card carries this
+    // spelling today; the test pins the AXIS rather than waiting for a printing.
+    let mut ctx = ParseContext::default();
+    let clause = try_parse_compound_player_object_damage(
+        "~ deals damage equal to that creature's power to each player and each other creature",
+        &mut ctx,
+    )
+    .expect("the amount-suffix spelling must reach the player-first grammar too");
+    let (target, player_filter) = expect_damage_all(&clause);
+    assert_eq!(*player_filter, Some(PlayerFilter::All));
+    let tf = typed_of(target);
+    assert!(tf.type_filters.contains(&TypeFilter::Creature));
+    assert!(tf.properties.contains(&FilterProp::Another));
+}
+
+#[test]
+fn compound_amount_suffix_controls_unchanged() {
+    // Unit 3's one real regression risk: three shapes that ALREADY reached the
+    // right answer via `lower.rs`'s remainder lift, and which this change moves
+    // onto the compound path. Their ASTs must be unchanged.
+    //
+    // The mechanism by which they could differ is named, not hand-waved: the old
+    // route calls `parse_target_with_ctx` plus `refine_damage_target_remainder`,
+    // while the compound parsers call the context-free `parse_target`.
+    for (subject, expect_controller) in [
+        ("each creature and each player", None),
+        ("each red creature and each player", None),
+        (
+            "each creature you control and each player",
+            Some(ControllerRef::You),
+        ),
+    ] {
+        let mut ctx = ParseContext::default();
+        let text =
+            format!("~ deals damage equal to the number of time counters on it to {subject}");
+        let clause = try_parse_compound_object_player_damage(&text, &mut ctx)
+            .unwrap_or_else(|| panic!("'{subject}' must parse"));
+        let (target, player_filter) = expect_damage_all(&clause);
+        assert_eq!(
+            *player_filter,
+            Some(PlayerFilter::All),
+            "'{subject}' must keep its player half",
+        );
+        let tf = typed_of(target);
+        assert!(
+            tf.type_filters.contains(&TypeFilter::Creature),
+            "'{subject}' must still name Creature",
+        );
+        assert_eq!(
+            tf.controller, expect_controller,
+            "'{subject}' controller must be unchanged",
+        );
+    }
+}
+
+#[test]
+fn compound_amount_prefix_unchanged() {
+    // The axis control: the PREFIX spelling of the same subject already worked
+    // and must be untouched, proving Unit 3's change is scoped to the suffix form.
+    let mut ctx = ParseContext::default();
+    let clause = try_parse_compound_object_player_damage(
+        "~ deals 3 damage to each creature without flying and each player",
+        &mut ctx,
+    )
+    .expect("the prefix spelling must be unchanged");
+    let (target, player_filter) = expect_damage_all(&clause);
+    assert_eq!(*player_filter, Some(PlayerFilter::All));
+    assert!(typed_of(target)
+        .properties
+        .iter()
+        .any(|p| matches!(p, FilterProp::WithoutKeyword { .. })));
+}
+
+// ── Issue #8380 Unit 4: the partitive player scope ───────────────────────
+
+#[test]
+fn damage_each_player_scope_accepts_the_partitive_spelling() {
+    // `Aurelia, the Law Above`. At HEAD "each of your opponents" matched no arm,
+    // so the whole player scope declined and the recipient fell through to
+    // `parse_target`, yielding `Typed{type_filters: []}` — a filter naming NO
+    // type, which `filter.rs` then treats as matching EVERY permanent.
+    assert_eq!(
+        parse_damage_each_player_scope("each of your opponents"),
+        Some(PlayerFilter::Opponent),
+        "CR 109.5: 'your' resolves to the ability's controller, so the \
+         partitive names that controller's opponents — the same set the bare \
+         'each opponent' spelling already lowers to",
+    );
+    // The singular spelling is unchanged.
+    assert_eq!(
+        parse_damage_each_player_scope("each opponent"),
+        Some(PlayerFilter::Opponent),
+    );
+    // And the plural bare spelling, which the new `opt(tag("s"))` also admits.
+    assert_eq!(
+        parse_damage_each_player_scope("each opponents"),
+        Some(PlayerFilter::Opponent),
+    );
+    // The anaphoric partitive is deliberately NOT accepted: "their opponents"
+    // binds to some antecedent player rather than to the controller, and mapping
+    // it onto the static controller-relative filter would install a
+    // wrong-referent rule with no card driving it.
+    assert_eq!(
+        parse_damage_each_player_scope("each of their opponents"),
+        None,
+        "the anaphoric partitive must decline rather than guess a referent",
+    );
 }

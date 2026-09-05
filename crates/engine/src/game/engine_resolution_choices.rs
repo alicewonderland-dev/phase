@@ -5,7 +5,8 @@ use rand::seq::SliceRandom;
 
 use crate::types::ability::{
     AbilityCost, ChoiceType, ChosenAttribute, DigRestOrder, Effect, EffectKind, GuessOutcome,
-    LibraryPosition, QuantityExpr, QuantityRef, ResolvedAbility, TargetRef,
+    LibraryPosition, QuantityExpr, QuantityRef, ReciprocalZoneChoiceRole, ResolvedAbility,
+    TargetRef,
 };
 use crate::types::actions::{GameAction, LearnOption, OutsideGameSelection};
 use crate::types::events::GameEvent;
@@ -13,6 +14,7 @@ use crate::types::game_state::{
     ActionResult, CastOfferKind, ChosenDamageSource, CopyChosenSelection, GameState,
     OutsideGameChoiceSource, PayableResource, PendingContinuation,
     PendingPlayerScopeSacrificeCompletion, PersistentAxisMaterialization, WaitingFor,
+    ZoneOpponentChooserPurpose,
 };
 use crate::types::identifiers::{ObjectId, TrackedSetId};
 use crate::types::resolved_commands::{
@@ -3337,6 +3339,7 @@ pub(super) fn handle_resolution_choice(
                 player,
                 candidates,
                 ability,
+                purpose,
             },
             GameAction::ChooseZoneOpponentChooser { opponent },
         ) => {
@@ -3346,6 +3349,27 @@ pub(super) fn handle_resolution_choice(
                 return Err(EngineError::InvalidAction(format!(
                     "Chosen zone-choice opponent {opponent:?} is not a legal opponent"
                 )));
+            }
+            if matches!(purpose, ZoneOpponentChooserPurpose::BindReciprocalConsume) {
+                effects::bind_reciprocal_consumer_from_picker(state, opponent)
+                    .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
+                let consumer = state
+                    .active_ability_continuation()
+                    .ok_or_else(|| {
+                        EngineError::InvalidAction(
+                            "bound reciprocal consumer disappeared".to_string(),
+                        )
+                    })?
+                    .chain
+                    .as_ref()
+                    .clone();
+                effects::choose_from_zone::resolve_with_choosing_player(
+                    state, &consumer, opponent, events,
+                )
+                .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
+                return Ok(ResolutionChoiceOutcome::WaitingFor(
+                    state.waiting_for.clone(),
+                ));
             }
             // CR 608.2d: Present the parked zone selection to the picked
             // opponent. This re-enters the standard `ChooseFromZoneChoice`
@@ -4051,8 +4075,11 @@ pub(super) fn handle_resolution_choice(
             // post-loop work) is carried as the batch completion so it runs
             // exactly once whether the pile lands synchronously or across a CR
             // 616.1 pause.
-            let completion =
-                crate::types::game_state::BatchCompletion::SurveilKeepOnTop { player, top_cards };
+            let completion = crate::types::game_state::BatchCompletion::SurveilKeepOnTop {
+                player,
+                top_cards,
+                graveyard_bound: to_graveyard,
+            };
             crate::game::zone_pipeline::move_objects_simultaneously_then(
                 state,
                 reqs,
@@ -4402,6 +4429,8 @@ pub(super) fn handle_resolution_choice(
             let mut sideboard_counts: HashMap<usize, usize> = HashMap::new();
             let mut exile_seen: std::collections::HashSet<ObjectId> =
                 std::collections::HashSet::new();
+            let mut pack_slots_seen: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
             for selection in &selections {
                 match selection {
                     OutsideGameSelection::Sideboard { sideboard_index } => {
@@ -4411,6 +4440,15 @@ pub(super) fn handle_resolution_choice(
                         if !exile_seen.insert(*object_id) {
                             return Err(EngineError::InvalidAction(
                                 "Same face-up exile card selected more than once".to_string(),
+                            ));
+                        }
+                    }
+                    // CR 400.11b: each slot of an opened pack is one physical
+                    // card, so a slot can be taken at most once.
+                    OutsideGameSelection::BoosterPack { pack_slot } => {
+                        if !pack_slots_seen.insert(*pack_slot) {
+                            return Err(EngineError::InvalidAction(
+                                "Same booster pack card selected more than once".to_string(),
                             ));
                         }
                     }
@@ -4444,6 +4482,18 @@ pub(super) fn handle_resolution_choice(
                     ));
                 }
             }
+            for pack_slot in &pack_slots_seen {
+                if !choices.iter().any(|choice| match &choice.source {
+                    OutsideGameChoiceSource::BoosterPack {
+                        pack_slot: slot, ..
+                    } => slot == pack_slot,
+                    _ => false,
+                }) {
+                    return Err(EngineError::InvalidAction(
+                        "Selected booster pack card not in outside-game choices".to_string(),
+                    ));
+                }
+            }
 
             let mut chosen_ids = Vec::new();
             for selection in selections {
@@ -4458,6 +4508,34 @@ pub(super) fn handle_resolution_choice(
                             )
                             .map_err(|error| EngineError::InvalidAction(format!("{error:?}")))?;
                         chosen_ids.push(object_id);
+                    }
+                    // CR 400.11b: the pack's card is not in any zone, so it is
+                    // materialized from the `CardFace` the choice entry carries
+                    // — the same path the sideboard pool uses — rather than
+                    // moved through the `ChangeZone` replacement pipeline.
+                    OutsideGameSelection::BoosterPack { pack_slot } => {
+                        let card = choices
+                            .iter()
+                            .find_map(|choice| match &choice.source {
+                                OutsideGameChoiceSource::BoosterPack {
+                                    pack_slot: slot,
+                                    card,
+                                    ..
+                                } if *slot == pack_slot => Some(card.clone()),
+                                _ => None,
+                            })
+                            .ok_or_else(|| {
+                                EngineError::InvalidAction(
+                                    "Selected booster pack card not in outside-game choices"
+                                        .to_string(),
+                                )
+                            })?;
+                        chosen_ids.push(effects::search_outside_game::put_outside_game_face_into(
+                            state,
+                            player,
+                            &card,
+                            destination,
+                        ));
                     }
                     OutsideGameSelection::FaceUpExile { object_id } => {
                         match effects::search_outside_game::put_face_up_exile_into(
@@ -4526,6 +4604,7 @@ pub(super) fn handle_resolution_choice(
                 count,
                 up_to,
                 constraint,
+                reciprocal_role,
                 ..
             },
             GameAction::SelectCards { cards: chosen },
@@ -4550,6 +4629,11 @@ pub(super) fn handle_resolution_choice(
                     ));
                 }
             }
+            if chosen.len() != chosen.iter().copied().collect::<HashSet<_>>().len() {
+                return Err(EngineError::InvalidAction(
+                    "A zone-choice card may be selected only once".to_string(),
+                ));
+            }
             if !effects::choose_from_zone::selection_satisfies_constraint(
                 state,
                 &chosen,
@@ -4557,6 +4641,49 @@ pub(super) fn handle_resolution_choice(
             ) {
                 return Err(EngineError::InvalidAction(
                     "Selected cards do not satisfy the tracked-set choice constraint".to_string(),
+                ));
+            }
+
+            if matches!(reciprocal_role, Some(ReciprocalZoneChoiceRole::Produce)) {
+                let first = *chosen.first().ok_or_else(|| {
+                    EngineError::InvalidAction(
+                        "reciprocal producer requires one selected card".to_string(),
+                    )
+                })?;
+                let owner = state
+                    .objects
+                    .get(&first)
+                    .map(|object| object.owner)
+                    .ok_or_else(|| {
+                        EngineError::InvalidAction(
+                            "reciprocal producer selected a missing card".to_string(),
+                        )
+                    })?;
+                effects::bind_reciprocal_consumer_from_producer(state, owner, first)
+                    .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
+                let consumer = state
+                    .active_ability_continuation()
+                    .ok_or_else(|| {
+                        EngineError::InvalidAction(
+                            "bound reciprocal consumer disappeared".to_string(),
+                        )
+                    })?
+                    .chain
+                    .as_ref()
+                    .clone();
+                effects::choose_from_zone::resolve_with_choosing_player(
+                    state, &consumer, owner, events,
+                )
+                .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
+                return Ok(ResolutionChoiceOutcome::WaitingFor(
+                    state.waiting_for.clone(),
+                ));
+            }
+            if matches!(reciprocal_role, Some(ReciprocalZoneChoiceRole::Consume)) {
+                effects::complete_reciprocal_consume_selection(state, player, chosen, events)
+                    .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
+                return Ok(ResolutionChoiceOutcome::WaitingFor(
+                    state.waiting_for.clone(),
                 ));
             }
 
@@ -4656,7 +4783,7 @@ pub(super) fn handle_resolution_choice(
             if let Some(frame) = state.active_ability_continuation_frame_mut() {
                 let cont = &mut frame.pending;
                 if let Some(snapshot) = counter_kind_choice {
-                    if let crate::types::ability::Effect::ChooseCounterKind { target } =
+                    if let crate::types::ability::Effect::ChooseCounterKind { target, .. } =
                         &mut cont.chain.effect
                     {
                         *target = crate::types::ability::TargetFilter::SpecificObject {
@@ -8306,7 +8433,23 @@ pub(crate) fn run_batch_completion(
             );
             crate::game::zone_pipeline::BatchMoveResult::Done
         }
-        BatchCompletion::SurveilKeepOnTop { player, top_cards } => {
+        BatchCompletion::SurveilKeepOnTop {
+            player,
+            top_cards,
+            graveyard_bound,
+        } => {
+            // CR 608.2c + CR 701.25a: publish the surveil's graveyard-bound
+            // cards BEFORE resuming the paused ability chain below, mirroring
+            // the sibling `BatchCompletion::RevealRestPile` completion's own
+            // `state.last_zone_changed_ids = kept_completed` / `rest_completed`
+            // publish elsewhere in this function — a `ZoneChangedThisWay
+            // { destination: Some(Zone::Graveyard), .. }` rider (Chandra,
+            // Chill of Compliance) reads this to check whether one of them
+            // actually arrived there; the runtime evaluator itself re-checks
+            // each object's CURRENT zone, so a redirected card (Rest in
+            // Peace) correctly fails the gate without any extra bookkeeping
+            // here.
+            state.last_zone_changed_ids = graveyard_bound;
             surveil_keep_on_top(state, player, &top_cards);
             finish_with_continuation(state, player, events);
             crate::game::zone_pipeline::BatchMoveResult::Done

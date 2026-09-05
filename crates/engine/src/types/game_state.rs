@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::ability::{
     default_target_filter_permanent, legacy_trigger_entry_list,
@@ -22,6 +22,7 @@ use super::ability::{
     TriggerBaseSetInstanceRef, TriggerCondition, TriggerDefinition, TriggerDefinitionOccurrenceRef,
     TriggerDefinitionRef, TriggerEntry,
 };
+use super::actions::ResolveAllScope;
 use super::attribution::ObjectAttribution;
 use super::card::{CardFace, PrintedCardRef, TokenImageRef};
 use super::card_type::{CoreType, Supertype};
@@ -238,35 +239,6 @@ mod tuple_key_map {
 
 #[cfg(test)]
 mod legacy_trigger_definition_ref_map {
-    use super::*;
-
-    pub fn serialize<S, H>(
-        map: &HashMap<TriggerDefinitionRef, u32, H>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut entries: Vec<_> = map.iter().collect();
-        entries.sort_unstable_by_key(|(key, _)| *key);
-        entries.serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D>(
-        deserializer: D,
-    ) -> Result<HashMap<TriggerDefinitionRef, u32>, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Vec::<(TriggerDefinitionRef, u32)>::deserialize(deserializer)
-            .map(|entries| entries.into_iter().collect())
-    }
-}
-
-/// Serde adapter for trigger occurrence ledgers. JSON object keys must be
-/// strings, while a `TriggerDefinitionRef` is structured identity; encode the
-/// map as an explicit entry list rather than flattening or guessing a key.
-mod trigger_definition_ref_map {
     use super::*;
 
     pub fn serialize<S, H>(
@@ -2092,6 +2064,15 @@ pub struct ResolveAllConsentRun {
     #[serde(default)]
     pub max_resolutions: StackResolutionBudget,
     pub priority_snapshot: ResolveAllPrioritySnapshot,
+    /// Which seats this run binds. `Own` runs cover only the requester, so the
+    /// live-authority check accepts them as a SUBSET of the current priority
+    /// participants; a `Shared` run is a table-wide proposal and must still
+    /// match the live set exactly, or a seat that became a participant after
+    /// the snapshot would be bound by a consent it never gave (CR 117.3d).
+    /// Defaults to `Own` so a save written before this field existed cannot
+    /// silently acquire table-wide authority.
+    #[serde(default)]
+    pub scope: ResolveAllScope,
     pub participants: Vec<ResolveAllConsentParticipant>,
     /// The complete sparse auto-pass map captured before a fresh Resolve All
     /// run installs its temporary shared-resolution overlay. `None` identifies
@@ -5270,25 +5251,100 @@ pub struct PendingCounterMoveQueue {
 /// drained one `(counter_type, count)` at a time by
 /// `effects::counters::drain_pending_counter_removals`, which re-parks the queue
 /// when a per-removal replacement surfaces a `ReplacementChoice` mid-batch. When
-/// the queue empties, `total` is stamped into `last_effect_count` so a downstream
+/// the queue empties, `applied_total` is stamped into `last_effect_count` so a downstream
 /// "create that many" / "add that much" rider (Tetravus, storage lands) reading
 /// `QuantityRef::EventContextAmount` picks up the count removed.
 ///
 /// Serialized in the `CounterRemovals` frame so a mid-batch re-park survives the
 /// server→client→server state round-trip a `ReplacementChoice` requires.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingCounterRemoval {
+    pub object_id: ObjectId,
+    pub counter_type: CounterType,
+    pub count: u32,
+}
+
+/// A removal awaiting its replacement-pipeline result. The pre-removal count
+/// lets the queue record the actual clamped or replacement-modified removal
+/// when a `ReplacementChoice` resumes the parked queue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingCounterRemovalInFlight {
+    pub removal: PendingCounterRemoval,
+    pub counter_count_before: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PendingCounterRemovalQueue {
-    /// Remaining per-type removals to apply to `source_id`.
-    pub remaining: Vec<(CounterType, u32)>,
-    /// The object counters are removed from (the effect's single source).
-    pub source_id: ObjectId,
+    /// Remaining per-object counter removals.
+    pub remaining: Vec<PendingCounterRemoval>,
     /// Effect kind for the terminating `EffectResolved` event.
     pub effect_kind: EffectKind,
     /// Ability source object for the terminating `EffectResolved` event.
     pub source_ability_id: ObjectId,
-    /// Total counters requested across all entries; stamped into
-    /// `last_effect_count` when the queue empties.
+    /// Total counters requested across all entries. Retained for diagnostics and
+    /// legacy wire compatibility; use `applied_total` for effect result context.
     pub total: u32,
+    /// Counters actually removed so far, after clamping and replacements.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub applied_total: u32,
+    /// A removal whose replacement pipeline has not settled yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_flight: Option<PendingCounterRemovalInFlight>,
+}
+
+#[derive(Deserialize)]
+struct PendingCounterRemovalQueueWire {
+    remaining: Vec<PendingCounterRemovalWire>,
+    #[serde(default)]
+    source_id: Option<ObjectId>,
+    effect_kind: EffectKind,
+    source_ability_id: ObjectId,
+    total: u32,
+    #[serde(default)]
+    applied_total: u32,
+    #[serde(default)]
+    in_flight: Option<PendingCounterRemovalInFlight>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PendingCounterRemovalWire {
+    Current(PendingCounterRemoval),
+    Legacy((CounterType, u32)),
+}
+
+/// CR 122.1 + CR 614.1: Accept the legacy single-source queue on the wire
+/// while persisting new multi-object removals with their object per entry.
+impl<'de> Deserialize<'de> for PendingCounterRemovalQueue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PendingCounterRemovalQueueWire::deserialize(deserializer)?;
+        let remaining = wire
+            .remaining
+            .into_iter()
+            .map(|entry| match entry {
+                PendingCounterRemovalWire::Current(entry) => Ok(entry),
+                PendingCounterRemovalWire::Legacy((counter_type, count)) => wire
+                    .source_id
+                    .map(|object_id| PendingCounterRemoval {
+                        object_id,
+                        counter_type,
+                        count,
+                    })
+                    .ok_or_else(|| serde::de::Error::missing_field("source_id")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            remaining,
+            effect_kind: wire.effect_kind,
+            source_ability_id: wire.source_ability_id,
+            total: wire.total,
+            applied_total: wire.applied_total,
+            in_flight: wire.in_flight,
+        })
+    }
 }
 
 /// CR 603.10a + CR 616.1: The not-yet-delivered tail of a simultaneous
@@ -5820,6 +5876,18 @@ pub enum BatchCompletion {
     SurveilKeepOnTop {
         player: PlayerId,
         top_cards: Vec<ObjectId>,
+        /// CR 608.2c + CR 701.25a: the looked-at cards the surveil choice put
+        /// into the graveyard (everything NOT in `top_cards`) — published to
+        /// `state.last_zone_changed_ids` before the paused ability chain
+        /// resumes, so a "this way" rider on the surveil (Chandra, Chill of
+        /// Compliance: "If you put a noncreature, nonland card into your
+        /// graveyard this way, put that card into your hand") can check
+        /// whether one of them actually arrived there. Defaults to empty on
+        /// deserialize of an older save so a stale record degrades to "the
+        /// gate never fires" rather than a panic — never worse than the
+        /// pre-fix behavior.
+        #[serde(default)]
+        graveyard_bound: Vec<ObjectId>,
     },
     /// Manifest dread: after the non-manifested cards reach the graveyard, clear
     /// the reveal markers on every looked-at card.
@@ -8285,6 +8353,23 @@ pub enum OutsideGameChoiceSource {
     },
     /// CR 406.3: A face-up card the player owns in the exile zone.
     FaceUpExile { object_id: ObjectId },
+    /// CR 400.11 + CR 400.11b: A card in a booster pack `Effect::OpenBoosterPack`
+    /// just opened. The pack's cards are outside the game and in no zone, so —
+    /// like `Sideboard` — the entry carries the full `CardFace` the taken card
+    /// is built from, plus the set the pack came from for display. `pack_slot`
+    /// is the card's position in the opened pack and its only stable identity.
+    BoosterPack {
+        pack_slot: usize,
+        set_code: String,
+        /// Boxed, unlike `Sideboard`'s inline face: `WaitingFor` is stored
+        /// inline in `GameState`, which `phase-server` moves BY VALUE through
+        /// the action + AI path, so this enum's largest variant is multiplied by
+        /// every live `GameState` on a frame chain (see `types/game_state_size.rs`
+        /// and the `game_state_stack_budget` regression). `Sideboard` already
+        /// sets that ceiling; adding a set code beside a second inline face
+        /// would raise it.
+        card: Box<crate::types::card::CardFace>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -8299,6 +8384,47 @@ pub struct OutsideGameChoiceEntry {
 
 fn default_one_u32() -> u32 {
     1
+}
+
+/// CR 400.11: the sealed booster products a game can open packs from.
+///
+/// A "shelf" rather than the whole printed corpus: hydrating every set's faces
+/// would clone the entire card database into game state. Instead
+/// `game::boosters::build_shelf` stocks a small, deterministic sample of sets,
+/// and each `Effect::OpenBoosterPack` resolution opens a freshly collated pack
+/// from one of them — so the number of packs a game can open is unbounded while
+/// the resident cost stays proportional to the shelf, not to the corpus.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BoosterShelf {
+    /// Products in deterministic order. Empty when no card in the game opens
+    /// booster packs, or when the loaded card database carries no set that can
+    /// fill a pack.
+    pub products: Vec<BoosterProduct>,
+}
+
+impl BoosterShelf {
+    pub fn is_empty(&self) -> bool {
+        self.products.is_empty()
+    }
+}
+
+/// One set on the [`BoosterShelf`], with its cards bucketed by the pack slot
+/// they can fill. Buckets hold full `CardFace`s because a card taken out of the
+/// pack becomes a real card in the game (CR 400.11b) and there is no card
+/// database at resolution time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BoosterProduct {
+    /// MTGJSON set code, shown to the player as the pack's identity.
+    pub set_code: String,
+    /// Cards printed at common in this set (the ten-card commons run).
+    pub commons: Vec<CardFace>,
+    /// Cards printed at uncommon in this set (three-card run).
+    pub uncommons: Vec<CardFace>,
+    /// Cards printed at rare in this set (the rare slot).
+    pub rares: Vec<CardFace>,
+    /// Cards printed at mythic rare in this set. The rare slot upgrades to a
+    /// mythic at the printed rate when this bucket is non-empty.
+    pub mythics: Vec<CardFace>,
 }
 
 /// CR 103.6: A beginning-of-game ability waiting to resolve after mulligans.
@@ -8386,6 +8512,33 @@ pub struct ReplacementCandidateSummary {
     pub source_id: ObjectId,
     pub source_name: String,
     pub description: String,
+}
+
+/// CR 616.1: Which *kind* of decision a [`WaitingFor::ReplacementChoice`] asks
+/// for. One `WaitingFor` variant serves three structurally different prompts,
+/// and the display layer cannot tell them apart from the candidate list alone
+/// (an accept/decline pair and a two-effect ordering prompt are both "two
+/// candidates"). The engine owns the distinction; the frontend must never
+/// re-derive it by inspecting label text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "type")]
+pub enum ReplacementChoiceKind {
+    /// CR 616.1e: two or more *distinct* applicable replacements whose order is
+    /// material. The player arranges them; per CR 616.1f the engine applies the
+    /// selected one and re-prompts for whatever is still applicable, so the
+    /// effect applied LAST is the one whose write survives.
+    #[default]
+    Order,
+    /// A single optional ("you may") replacement surfaced as two branches of
+    /// one source — index 0 accepts, index 1 declines. This is an engine
+    /// presentation shape, not a CR-numbered category: the yes/no decision
+    /// belongs to whoever the effect's own text gives it to. It is NOT an
+    /// ordering and must never render as a sortable list.
+    OptionalBranch,
+    /// A choice between destinations for a found card. Like `OptionalBranch`
+    /// this is an engine presentation shape: the options are mutually exclusive
+    /// alternatives rather than a sequence, so it renders as plain options.
+    SearchFoundDestination,
 }
 
 /// CR 603.3b + CR 603.7: One completed normal-plus-delayed trigger collection
@@ -11497,6 +11650,39 @@ impl TrustedGameStateEnvelope {
 }
 
 impl GameState {
+    /// CR 616.1 load migration: re-derive `ReplacementChoice::kind` from the
+    /// live pending replacement.
+    ///
+    /// `kind` is `#[serde(default)]`, so a save written before the field existed
+    /// deserializes every parked prompt as `Order` — including an optional
+    /// "you may" accept/decline and a search-found destination pick. The
+    /// frontend keys its presentation off `kind`, so a restored legacy save
+    /// would render a sortable ordering list for a yes/no decision.
+    ///
+    /// `replacement_choice_waiting_for` is the single authority that classifies
+    /// a prompt from `pending_replacement`, so re-deriving through it keeps the
+    /// restored value identical to what a live park would have produced. With no
+    /// pending replacement there is nothing to classify and the prompt is left
+    /// untouched (it is already unactionable and handled by the count-0 guard).
+    fn migrate_restored_replacement_choice_kind(&mut self) {
+        let WaitingFor::ReplacementChoice { player, .. } = self.waiting_for else {
+            return;
+        };
+        if self.pending_replacement.is_none() {
+            return;
+        }
+        let rederived = crate::game::replacement::replacement_choice_waiting_for(player, self);
+        if let WaitingFor::ReplacementChoice { kind, .. } = rederived {
+            if let WaitingFor::ReplacementChoice {
+                kind: restored_kind,
+                ..
+            } = &mut self.waiting_for
+            {
+                *restored_kind = kind;
+            }
+        }
+    }
+
     /// CR 732.2a (FIX-3) load migration: `last_loop_action_sequence` is transient loop-detection
     /// bookkeeping that re-accumulates from live play. On restore, DROP it UNLESS the save was
     /// captured inside an object-growth shortcut proposal/response window
@@ -11810,6 +11996,12 @@ impl PersistedGameState {
         // CR 732.2a (FIX-3): drop stale transient loop-detection bookkeeping on load unless the save
         // sits in an object-growth shortcut window whose pending resolution still consumes it.
         state.migrate_transient_loop_sequence();
+        // CR 616.1: re-derive a parked replacement prompt's `kind` (see
+        // `migrate_restored_replacement_choice_kind`). Placed at this shared
+        // chokepoint so BOTH the untrusted `Raw` and trusted envelope paths get
+        // the repair — a legacy save restored through either one would
+        // otherwise present an optional or search-found prompt as an ordering.
+        state.migrate_restored_replacement_choice_kind();
         // `pending_trigger_event_batch` is a construction carrier for the
         // corresponding `pending_trigger`. A historical save can retain the
         // carrier after its trigger was dropped; it cannot represent live
@@ -11892,6 +12084,20 @@ impl PersistedGameState {
 pub struct ResolutionOptionalPaymentOption {
     pub index: usize,
     pub cost: AbilityCost,
+}
+
+/// Why a controller is selecting an opponent for a zone choice.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ZoneOpponentChooserPurpose {
+    #[default]
+    Ordinary,
+    BindReciprocalConsume,
+}
+
+impl ZoneOpponentChooserPurpose {
+    fn is_ordinary(&self) -> bool {
+        matches!(self, Self::Ordinary)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -12184,6 +12390,19 @@ pub enum WaitingFor {
         candidate_count: usize,
         #[serde(default)]
         candidates: Vec<ReplacementCandidateSummary>,
+        /// CR 616.1: which kind of decision this is. Defaults to
+        /// [`ReplacementChoiceKind::Order`] so pre-existing serialized states
+        /// and the many test constructions keep deserializing unchanged.
+        #[serde(default)]
+        kind: ReplacementChoiceKind,
+        /// CR 616.1f: whether the LAST-applied candidate alone decides the
+        /// outcome (every colliding write overwrites the whole field), so the
+        /// UI may name a concrete winning result. False for compositional
+        /// collisions — damage doublers vs adders, count and mana modifiers —
+        /// where both effects apply and there is no single winner. The display
+        /// layer must not assume last-write-wins; this is the engine's answer.
+        #[serde(default)]
+        last_applied_decides: bool,
     },
     /// CR 614.12a: choose the opponent that a permanent enters under before
     /// the zone change is delivered. `candidates` is captured at replacement
@@ -12477,6 +12696,10 @@ pub enum WaitingFor {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         constraint: Option<ChooseFromZoneConstraint>,
         source_id: ObjectId,
+        /// Reciprocal producer/consumer role carried across the interactive
+        /// pause. Omitted for ordinary zone choices.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reciprocal_role: Option<crate::types::ability::ReciprocalZoneChoiceRole>,
     },
     /// CR 701.4a: Behold a [quality] — the resolving player chooses which
     /// beholdable object to reveal-or-choose from a MIXED-ZONE candidate set
@@ -13488,6 +13711,11 @@ pub enum WaitingFor {
         player: PlayerId,
         candidates: Vec<PlayerId>,
         ability: Box<crate::types::ability::ResolvedAbility>,
+        #[serde(
+            default,
+            skip_serializing_if = "ZoneOpponentChooserPurpose::is_ordinary"
+        )]
+        purpose: ZoneOpponentChooserPurpose,
     },
     /// CR 601.2c + CR 115.1: A spell with an "of an opponent's choice" target slot
     /// is being cast in a multiplayer game; the controller (`player`) chooses
@@ -15471,21 +15699,36 @@ pub enum AutoPassMode {
     },
 }
 
-/// How the engine recommends passing ordinary priority windows for one player.
+/// THE single per-player authority for auto-passing ordinary priority windows,
+/// as a graduated scale from "never" to "skip the low-use ones".
 ///
-/// This is an opt-in interface preference, not a change to priority itself:
-/// every recommended pass is still submitted as `GameAction::PassPriority` and
-/// resolved by the normal CR 117.3d / CR 117.4 engine path. `Standard` preserves
-/// the existing meaningful-action-aware recommendation ladder.
-/// `SkipLowUseWindows` adds a
+/// Two consumers read it, and they differ in force:
+///
+/// - `ai_support::auto_pass_recommended` — a *recommendation* to the frontend.
+///   Every recommended pass is still submitted as `GameAction::PassPriority`
+///   and resolved by the normal CR 117.3d / CR 117.4 path.
+/// - `game::engine`'s `run_auto_pass_loop` — *authoritative*. Passes taken here
+///   never reach a client, which is why `FullControl` has to live in engine
+///   state rather than in a frontend toggle: an auto-pass session installed by
+///   another player (Resolve All, CR 117.3d) drives this loop, and a
+///   client-only preference is invisible to it.
+///
+/// `Standard` is the meaningful-action-aware ladder. `SkipLowUseWindows` adds a
 /// narrow fast path for the active player's empty-stack Upkeep, Draw, and End
-/// priority windows; explicit phase stops, priority yields, and Full Control
-/// remain higher-authority user choices.
+/// windows. `FullControl` never auto-passes at all.
+///
+/// `FullControl` is deliberately NOT expressible as a `phase_stops` entry on
+/// every phase: `GameState::phase_stop_hit` is consulted only for empty-stack
+/// initial windows (`ai_support/mod.rs`), whereas Full Control must also hold a
+/// window while objects are on the stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub enum PriorityPassingMode {
     #[default]
     Standard,
     SkipLowUseWindows,
+    /// CR 117.1: hold every priority window this player receives. Outranks any
+    /// auto-pass session, including one another player installed.
+    FullControl,
 }
 
 /// CR 732.2a: user-controllable gate for the live combo (infinite-loop) detector.
@@ -17975,7 +18218,7 @@ declare_game_state! {
     #[serde(
         default,
         skip_serializing_if = "HashMap::is_empty",
-        with = "trigger_definition_ref_map"
+        with = "crate::types::deterministic_serde::hash_map_entries"
     )]
     pub trigger_fire_counts_this_turn: HashMap<TriggerDefinitionRef, u32>,
     /// CR 603.2: Tracks per-opponent-per-turn firing for
@@ -18627,6 +18870,16 @@ declare_game_state! {
     /// serialization; rebuilt with `momir_pool`.
     #[serde(skip)]
     pub momir_pool_faces: Arc<HashMap<String, CardFace>>,
+
+    /// CR 400.11: the sealed booster products this game can open packs from.
+    /// Populated only when some card in the game carries
+    /// `Effect::OpenBoosterPack` (see `rehydrate_card_db_metadata`); empty
+    /// otherwise, so an ordinary game pays nothing for it. Skipped in
+    /// serialization and rebuilt deterministically per peer from the loaded card
+    /// DB — the pack a resolution actually opens travels in `waiting_for`, so no
+    /// peer needs the shelf to see it.
+    #[serde(skip)]
+    pub booster_shelf: Arc<BoosterShelf>,
 
     /// Display names for log resolution. Set by server; WASM leaves empty (defaults to "Player N").
     /// Skipped in serialization — runtime context only.
@@ -23399,6 +23652,7 @@ impl GameState {
             meld_pair_registry: Arc::new(HashMap::new()),
             momir_pool: BTreeMap::new(),
             momir_pool_faces: Arc::new(HashMap::new()),
+            booster_shelf: Arc::new(BoosterShelf::default()),
             log_player_names: Vec::new(),
             last_created_token_ids: Vec::new(),
             last_revealed_ids: Vec::new(),
@@ -25417,6 +25671,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         meld_pair_registry: _,
         momir_pool: _,
         momir_pool_faces: _,
+        booster_shelf: _,
         log_player_names: _,
         last_created_token_ids: _,
         last_revealed_ids: _,
@@ -26993,6 +27248,46 @@ mod tests {
     }
 
     #[test]
+    fn pending_counter_removal_queue_migrates_legacy_single_source_entries() {
+        let source_id = ObjectId(17);
+        let mut legacy_wire = serde_json::to_value(PendingCounterRemovalQueue {
+            remaining: Vec::new(),
+            effect_kind: EffectKind::RemoveCounter,
+            source_ability_id: ObjectId(18),
+            total: 2,
+            applied_total: 0,
+            in_flight: None,
+        })
+        .expect("current counter-removal queue serializes");
+        legacy_wire["source_id"] = serde_json::to_value(source_id).expect("source ID serializes");
+        legacy_wire["remaining"] = serde_json::json!([[
+            serde_json::to_value(CounterType::Plus1Plus1).expect("counter type serializes"),
+            2
+        ]]);
+
+        let restored: PendingCounterRemovalQueue = serde_json::from_value(legacy_wire)
+            .expect("legacy single-source counter-removal queue migrates");
+
+        assert_eq!(
+            restored.remaining,
+            vec![PendingCounterRemoval {
+                object_id: source_id,
+                counter_type: CounterType::Plus1Plus1,
+                count: 2,
+            }],
+            "legacy entries inherit their queue's single source ID"
+        );
+        assert_eq!(
+            restored.applied_total, 0,
+            "queues persisted before applied-count tracking start at zero"
+        );
+        assert!(
+            restored.in_flight.is_none(),
+            "legacy queues never carry a replacement-pipeline in-flight removal"
+        );
+    }
+
+    #[test]
     fn legacy_duration_subject_id_deserializes_as_a_non_current_incarnation() {
         let effect = TransientContinuousEffect {
             id: 1,
@@ -27141,6 +27436,12 @@ mod tests {
 
     #[derive(Serialize)]
     struct TriggerRefFixture<'a> {
+        #[serde(serialize_with = "crate::types::deterministic_serde::hash_map_entries::serialize")]
+        values: &'a HashMap<TriggerDefinitionRef, u32, ReverseBuildHasher>,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyTriggerRefFixture<'a> {
         #[serde(serialize_with = "legacy_trigger_definition_ref_map::serialize")]
         values: &'a HashMap<TriggerDefinitionRef, u32, ReverseBuildHasher>,
     }
@@ -27340,12 +27641,21 @@ mod tests {
             vec![2, 1, 0],
             "hostile trigger map must expose descending native iteration"
         );
+        let trigger_bytes = serde_json::to_string(&TriggerRefFixture {
+            values: &trigger_values,
+        })
+        .expect("trigger-ref fixture should serialize");
         assert_eq!(
-            serde_json::to_string(&TriggerRefFixture {
+            trigger_bytes,
+            r#"{"values":[[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":0}}},10],[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":1}}},11],[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":2}}},12]]}"#
+        );
+        assert_eq!(
+            trigger_bytes,
+            serde_json::to_string(&LegacyTriggerRefFixture {
                 values: &trigger_values,
             })
-            .expect("trigger-ref fixture should serialize"),
-            r#"{"values":[[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":0}}},10],[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":1}}},11],[{"source":{"object_id":7,"incarnation":3},"occurrence":{"type":"Printed","data":{"base_set":1,"printed_index":2}}},12]]}"#
+            .expect("legacy trigger-ref oracle should serialize"),
+            "the shared adapter must preserve the established canonical bytes"
         );
         let trigger_round_trip = legacy_trigger_definition_ref_map::deserialize(
             &mut serde_json::Deserializer::from_str(
@@ -28163,6 +28473,8 @@ mod tests {
             player: PlayerId(0),
             candidate_count: 2,
             candidates: Vec::new(),
+            kind: Default::default(),
+            last_applied_decides: false,
         };
         assert!(
             !matches!(state.waiting_for, WaitingFor::Priority { .. }),
@@ -28330,6 +28642,8 @@ mod tests {
             player: PlayerId(0),
             candidate_count: 2,
             candidates: Vec::new(),
+            kind: Default::default(),
+            last_applied_decides: false,
         };
         assert!(
             !matches!(state.waiting_for, WaitingFor::Priority { .. }),
@@ -33484,6 +33798,8 @@ mod tests {
             player: PlayerId(0),
             candidate_count: 2,
             candidates: vec![],
+            kind: Default::default(),
+            last_applied_decides: false,
         }));
         variants.push(Box::new(WaitingFor::ExploreChoice {
             player: PlayerId(0),
@@ -33539,6 +33855,7 @@ mod tests {
             up_to: false,
             constraint: None,
             source_id: ObjectId(100),
+            reciprocal_role: None,
         }));
         variants.push(Box::new(WaitingFor::ChooseOneOfBranch {
             player: PlayerId(0),
@@ -36541,8 +36858,8 @@ mod tests {
     ///   head-only shape `evaluate_schedule` uses to RESOLVE, and therefore the plausible
     ///   wrong reading ⇒ arm (b)'s same-head/different-tail pair compares EQUAL ⇒ no latch ⇒
     ///   **arm (b) FAILS while arms (a) and (c) stay green**, because (a)'s heads already
-    ///   differ. The tail is the NEXT episode's pre-declaration, so two proposals agreeing
-    ///   only about this episode are not the same answer;
+    ///   differ. The recorded answer is the whole announcement sequence, so two proposals
+    ///   agreeing only on the head are not the same answer;
     /// * hand-write `impl PartialEq for AnnouncementSubject` with `(Seat(_), Seat(_)) => true`
     ///   ⇒ two DIFFERENT seats compare equal ⇒ arm (a)'s own reach-guard fires first and
     ///   names the vacuity by hand, which is the reach-guard doing its job rather than the
@@ -36596,8 +36913,8 @@ mod tests {
 
         // ── (b) SAME head, DIFFERENT tail ⇒ still Conflicted ──
         //
-        // The tail is a pre-declaration for the NEXT episode (CR 732.2a), not decoration, so
-        // two proposals that agree only about this episode are not the same answer. This is
+        // The recorded answer is the whole announcement sequence (CR 732.2a), not just the
+        // head, so two proposals that agree only on the head are not the same answer. This is
         // the arm a head-only equality would lose.
         let slot_b = DecisionSlot::target(journal_source(914));
         let head1_tail2 = ranked(vec![seat(1), seat(2)]);
@@ -36612,8 +36929,8 @@ mod tests {
         assert_eq!(
             state.loop_answer(&slot_b, PlayerId(0)),
             Some(LoopAnswer::Conflicted),
-            "equality over a `Ranking` is STRUCTURAL, not head-only: the tail is the next \
-             episode's pre-declaration, so differing tails are differing answers"
+            "equality over a `Ranking` is STRUCTURAL, not head-only: the recorded answer is \
+             the whole announcement sequence, so differing tails are differing answers"
         );
 
         // ── (c) the SAME ranking twice ⇒ still Uniform ──
@@ -36633,6 +36950,7 @@ mod tests {
         let run = ResolveAllConsentRun {
             epoch: 1,
             max_resolutions: StackResolutionBudget::Unlimited,
+            scope: ResolveAllScope::Own,
             priority_snapshot: ResolveAllPrioritySnapshot {
                 waiting_player: PlayerId(0),
                 priority_player: PlayerId(0),

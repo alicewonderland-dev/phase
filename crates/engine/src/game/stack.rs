@@ -2352,33 +2352,34 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                                 });
                             }
                         }
-                        // CR 709.5d: a Room permanent enters with the unlocked
-                        // designation for whichever half was cast as a spell — the
-                        // right door when its right half was cast, otherwise the
-                        // left. `room::live_face_door` reads `modal_back_face`
-                        // (still set on the battlefield, see zones.rs), the shared
-                        // orientation authority with the unlock-cost lookup.
-                        let cast_door = state
+                        // CR 709.5d: give the entering permanent the
+                        // designation for the half that was CAST. The single
+                        // authority reads the PRINTED type line, so an
+                        // enter-as-copy replacement that just turned this spell
+                        // into a Room permanent does not answer for it. `None`
+                        // is that rule's last sentence: neither half was cast,
+                        // so it enters with neither designation.
+                        if let Some(cast_door) = state
                             .objects
                             .get(&entry.id)
-                            .map(super::room::live_face_door)
-                            .unwrap_or(crate::game::game_object::RoomDoor::Left);
-                        // CR 709.5d: the designation follows WHICH HALF was cast
-                        // (`room::live_face_door`), not who controls anything — there is
-                        // no choice and no legality test here. This argument's only
-                        // consumer is the `GameEvent::RoomDoorUnlocked { player_id }`
-                        // label.
-                        // KNOWN LIMITATION: to the extent that label should follow
-                        // anything it is the PERMANENT's controller, which the ETB
-                        // `controller_override` path already settles; it is not the
-                        // resolving spell's controller.
-                        super::room::unlock_door_designation(
-                            state,
-                            entry.id,
-                            entry.controller,
-                            cast_door,
-                            events,
-                        );
+                            .and_then(super::room::cast_half_designation)
+                        {
+                            // CR 709.5d: designation follows WHICH HALF was cast
+                            // (`cast_half_designation`), not who controls anything.
+                            // `None` is that rule's last sentence: neither half was
+                            // cast (enter-as-copy of a Room), so it enters with
+                            // neither designation.
+                            // KNOWN LIMITATION: the event's player_id label follows
+                            // `entry.controller` here; the permanent's controller is
+                            // settled by the ETB `controller_override` path.
+                            super::room::unlock_door_designation(
+                                state,
+                                entry.id,
+                                entry.controller,
+                                cast_door,
+                                events,
+                            );
+                        }
                     }
                     // CR 614.12a post-replacement drain runs AFTER CR 608.3c Aura
                     // attach below — PersistChosenAttribute needs `attached_to`
@@ -4771,7 +4772,7 @@ fn batch_run_key<'a>(state: &'a GameState, entry: &'a StackEntry) -> Option<Batc
     if !flatten_targets_in_chain(ability).is_empty() {
         return None;
     }
-    // CR 603.4 (verified docs/MagicCompRules.txt:2588): an entry-level
+    // CR 603.4: an entry-level
     // intervening-if is rechecked per entry at resolution and skips the effect
     // once it flips. The batch path does not recheck per entry, so refuse to
     // group any entry carrying one — it becomes a singleton run and falls back
