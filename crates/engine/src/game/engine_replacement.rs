@@ -8513,10 +8513,13 @@ mod tests {
         );
 
         let mut events = Vec::new();
+        // Self-scoped ETB replacement: the land is both the affected object and
+        // the replacing ability's source, so `affected_only` keeps "you" on the
+        // land's controller (P1), not `state.active_player` (P0).
         let waiting = apply_post_replacement_effect(
             &mut state,
             &effect_def,
-            Some(land),
+            ContinuationSubjects::affected_only(Some(land)),
             None,
             None,
             HashSet::new(),
