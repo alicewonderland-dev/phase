@@ -11188,7 +11188,6 @@ mod tests {
     /// F4 — the preview is budgeted like every other outbound list on the shortcut spec, at
     /// all THREE of the levels it now has: the count-keyed element list, each element's
     /// entries, and each element's allocation.
-
     ///
     /// Each leg is sized so that exactly ONE of the three charges is what tips the budget over,
     /// which is what separates them: the element list against a budget that fits every entry,
