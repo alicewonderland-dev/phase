@@ -28,13 +28,16 @@
 //! REVERTING the parser change flips rows 1, 2 and 4. Row 3 is a labelled
 //! characterization row and a live positive control — see its own doc comment.
 //!
-//! WHEN DW#5 LANDS, flipping row 3's `true` to `false` is NOT the only edit the
-//! file needs. Once a DECLINED reveal stops writing the reveal ledger, reach
-//! guard 2 (`last_revealed_ids.len() == 1`) fails on ALL THREE runtime rows and
-//! rows 1 and 2 stop discriminating. That is deliberate — the file goes loudly
-//! red rather than silently vacuous — but the DW#5 fixer must re-anchor that
-//! guard on a signal the declined path still produces (or move these rows to
-//! the ACCEPT side), not just edit row 3.
+//! WHEN DW#5 LANDS — DW#5 being the deferred fix for the residual defect row 3
+//! records: a DECLINED optional reveal still writes the reveal ledger, so the
+//! `"…is revealed this way"` gate is satisfied by a card no player was ever
+//! shown (CR 701.20a + CR 608.2d) — flipping row 3's `true` to `false` is NOT
+//! the only edit the file needs. Once a DECLINED reveal stops writing the
+//! reveal ledger, reach guard 2 (`last_revealed_ids.len() == 1`) fails on ALL
+//! THREE runtime rows and rows 1 and 2 stop discriminating. That is deliberate
+//! — the file goes loudly red rather than silently vacuous — but the DW#5 fixer
+//! must re-anchor that guard on a signal the declined path still produces (or
+//! move these rows to the ACCEPT side), not just edit row 3.
 //!
 //! `DEFERRED(DW#5, Appendix A + PR body)` is scoped to the DECLINE rows only.
 //! The Phase-2 ACCEPT rows below are unaffected by it: the reveal ledger is
@@ -84,10 +87,13 @@
 //! never happened. `crates/engine/src/game/effects/transform_effect.rs` now
 //! resolves the subject through `targeting::resolved_targets` (CR 201.5).
 //!
-//! MEASURED ACCEPT-SIDE ROWS, at PHASE_BASE (`86fe7cbb6`, i.e. Phase 1 already
-//! in the tree) and after that change:
+//! MEASURED ACCEPT-SIDE ROWS, taken BEFORE this PR's engine commit and after
+//! it. "Before" means the state this PR's Phase 1 leaves behind, and is how the
+//! discrimination is reproduced: revert
+//! `crates/engine/src/game/effects/transform_effect.rs` alone to its pre-PR
+//! state, keeping Phase 1's parser fix in the tree.
 //!
-//! | row | shape | PHASE_BASE | after Phase 2 |
+//! | row | shape | before Phase 2 | after Phase 2 |
 //! |---|---|---|---|
 //! | `runo_transforms_when_top_card_is_a_creature_with_mana_value_six` | MV6 creature, ACCEPT | `false` | **`true`** |
 //! | `runo_accepting_a_reveal_below_the_mana_value_gate_does_not_transform` | MV2 creature, ACCEPT | `false` | `false` |
@@ -643,19 +649,26 @@ fn runo_declining_a_reveal_of_a_noncreature_does_not_transform() {
 /// happen.
 ///
 /// This assertion is EXPECTED TO BE FLIPPED by deferred work:
-/// `DEFERRED(DW#5, Appendix A + PR body)` — DW#5, chartered in the run charter,
-/// Appendix A; disclosed in the PR body under `Deferred / known-remaining`.
-/// Whoever closes DW#5 should change `true` to `false` here and delete this
-/// paragraph.
+/// `DEFERRED(DW#5, Appendix A + PR body)` — DW#5 is the deferred fix for exactly
+/// the residual this row records: a DECLINED optional reveal still writes the
+/// reveal ledger, so the `"…is revealed this way"` gate is satisfied by a card
+/// no player was ever shown. Chartered in the run charter, Appendix A; disclosed
+/// in the PR body under `Deferred / known-remaining`. Whoever closes DW#5 should
+/// change `true` to `false` here and delete this paragraph.
 ///
-/// WHY IT IS HERE ANYWAY. It is the file's only LIVE positive control at this
-/// seam: no Runo accept-side row transforms yet, so without it the two
-/// discriminators above would be indistinguishable from a broken fixture. It
-/// runs through the same `setup` and the same `drive_upkeep` as rows 1 and 2,
-/// differing only in the top card's mana value, and so proves — live — that the
-/// trigger fires, the optional is offered, `last_revealed_ids` is written, the
-/// `Transform` node is reachable, and this object can in fact turn over. Note
-/// the name reach guard is INVERTED here (back face, not front): a
+/// WHY IT IS HERE ANYWAY. It is the file's only positive control ON THE DECLINE
+/// DRIVE PATH. Phase 2 landed in this same PR, so
+/// `runo_transforms_when_top_card_is_a_creature_with_mana_value_six` is a live
+/// accept-side positive control now — but that row drives
+/// `UpkeepDrive::AnswerOptional { accept: true }`, and nothing else in this file
+/// shows that an `accept: false` drive reaches the seam at all. Without this row
+/// the two DECLINE discriminators above would be indistinguishable from a
+/// fixture whose declined path never gets there. It runs through the same
+/// `setup` and the same `drive_upkeep` as rows 1 and 2, differing only in the
+/// top card's mana value, and so proves — live, on the DECLINED drive — that the
+/// trigger fires, the optional is offered and answered, `last_revealed_ids` is
+/// written, the `Transform` node is reachable, and this object can in fact turn
+/// over. Note the name reach guard is INVERTED here (back face, not front): a
 /// same-direction copy-paste from rows 1 and 2 would make this row vacuous.
 #[test]
 fn runo_declining_a_qualifying_reveal_still_transforms_residual_defect() {
@@ -776,9 +789,10 @@ fn assert_synthetic_parses_to_a_printed_self_transform(oracle: &str) {
 /// PHASE-2 DISCRIMINATOR #1 — **the issue's headline defect**. Top card is a
 /// mana value 6 creature and the reveal is ACCEPTED: Runo must transform.
 ///
-/// Measured `false` at PHASE_BASE (`86fe7cbb6`, i.e. with Phase 1 already in the
-/// tree) and `true` after the `transform_effect.rs` subject-resolution fix.
-/// REVERTING that file alone flips this row red.
+/// Measured `false` before this PR's engine commit — that is, with
+/// `transform_effect.rs` reverted to its pre-PR state and Phase 1's parser fix
+/// still in the tree — and `true` after the subject-resolution fix. REVERTING
+/// that file alone flips this row red.
 ///
 /// WHY IT WAS FALSE. `Dig{count:1,keep_count:0}` -> `Reveal{ParentTarget}`
 /// propagates the looked-at LIBRARY card down the chain, the old positional
@@ -814,10 +828,11 @@ fn runo_transforms_when_top_card_is_a_creature_with_mana_value_six() {
 /// value 2 creature and the reveal is ACCEPTED: the gate Phase 1 restored is
 /// unsatisfied (CR 202.3), so nothing transforms.
 ///
-/// Measured `false` at PHASE_BASE and `false` after this change — it does NOT
-/// flip, which is the point. It is also the DURABLE PHASE-1 DISCRIMINATOR now
-/// that Phase 2 is in the tree: with the subject fix but WITHOUT the parser
-/// gate, this row was measured `true` (wrong).
+/// Measured `false` with `transform_effect.rs` reverted to its pre-PR state and
+/// `false` after this change — it does NOT flip, which is the point. It is also
+/// the DURABLE PHASE-1 DISCRIMINATOR now that Phase 2 is in the tree: with the
+/// subject fix but WITHOUT the parser gate, this row was measured `true`
+/// (wrong).
 #[test]
 fn runo_accepting_a_reveal_below_the_mana_value_gate_does_not_transform() {
     let (mut runner, runo) = setup(
@@ -845,9 +860,9 @@ fn runo_accepting_a_reveal_below_the_mana_value_gate_does_not_transform() {
 /// value 6 instant and the reveal is ACCEPTED: it clears the mana-value floor
 /// but is not a creature card.
 ///
-/// Measured `false` at PHASE_BASE and `false` after this change. Same durable
-/// Phase-1 discriminator note as the row above: `true` (wrong) with Phase 2
-/// alone.
+/// Measured `false` with `transform_effect.rs` reverted to its pre-PR state and
+/// `false` after this change. Same durable Phase-1 discriminator note as the
+/// row above: `true` (wrong) with Phase 2 alone.
 #[test]
 fn runo_accepting_a_reveal_of_a_noncreature_does_not_transform() {
     let (mut runner, runo) = setup(
@@ -877,9 +892,10 @@ fn runo_accepting_a_reveal_of_a_noncreature_does_not_transform() {
 /// Delver's gate carries NO `additional_filter` ("If an instant or sorcery card
 /// is revealed this way"), so Phase 1's postnominal-property slot is not
 /// involved at all and this row can only move on the subject-resolution fix.
-/// Measured `false` at PHASE_BASE, `true` after it. Delver's self-reference is
-/// `"transform this creature"`, which is NAME-INDEPENDENT, so this row is also
-/// free of Runo's misnaming foot-gun.
+/// Measured `false` with `transform_effect.rs` reverted to its pre-PR state,
+/// `true` after it. Delver's self-reference is `"transform this creature"`,
+/// which is NAME-INDEPENDENT, so this row is also free of Runo's misnaming
+/// foot-gun.
 #[test]
 fn delver_of_secrets_transforms_when_top_card_is_an_instant() {
     let (mut runner, delver) = setup(
@@ -934,7 +950,8 @@ fn delver_of_secrets_does_not_transform_when_top_card_is_a_creature() {
 /// gated on `ZoneChangedThisWay` rather than on `RevealedHasCardType`. Its
 /// displaced subject is the card its own `ChangeZone` parent already moved to
 /// HAND, not a library card — the same defect reached through a different
-/// parent. Measured `false` at PHASE_BASE, `true` after this change.
+/// parent. Measured `false` with `transform_effect.rs` reverted to its pre-PR
+/// state, `true` after this change.
 ///
 /// THE HAND-DELTA GUARD IS A REACH GUARD, NOT A DISCRIMINATOR.
 /// CR 400.7 / CR 701.20a: the accept branch actually MOVED the looked-at card,
@@ -1011,8 +1028,8 @@ fn sidequest_catch_a_fish_does_not_transform_when_the_reveal_is_declined() {
 
 /// PHASE-2 DISCRIMINATOR #4 — **the issue's own bisect row (row 2 of #8586).**
 /// A bare `look at the top card` followed by a printed self-transform, with NO
-/// optional and NO gate. Measured `false` at PHASE_BASE, `true` after this
-/// change.
+/// optional and NO gate. Measured `false` with `transform_effect.rs` reverted to
+/// its pre-PR state, `true` after this change.
 ///
 /// Its job is to prove the fix belongs at the CONSUMER seam, not at the chain
 /// site: the chain layer's propagation is legitimate (CR 608.2c) and this row

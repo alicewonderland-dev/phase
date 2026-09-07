@@ -104,7 +104,14 @@ pub fn resolve(
     //     source's own pin is current), the guard does NOT fire, and the
     //     transform happens — also correct.
     // Do not "strengthen" this into a provenance check: there is no provenance
-    // to read, and the two branches above are already exhaustive.
+    // to read. Those two bullets are the shapes this guard EXISTS for, but they
+    // are NOT an exhaustive partition: `self_ref_is_current` can report a
+    // LATCHED trigger source as current while the pinned incarnation read here
+    // is already stale, which is a third shape neither bullet describes. That
+    // shape is SAFE rather than impossible — it lands on a conservative no-op,
+    // either here or at the `stale_self_transform` check below, which re-tests
+    // the source through `source_is_current` (CR 400.7). So there is no defect,
+    // but do not reason from the two bullets as if nothing else can occur.
     //
     // PLACEMENT IS STILL LOAD-BEARING, in the mirrored direction: for a subject
     // that DID come from `ability.targets`, this must NO-OP rather than REBIND.
@@ -122,10 +129,40 @@ pub fn resolve(
     //
     // Scoped to `EffectScope::Single` by construction: the `All` branch returned
     // above into `resolve_all`, a non-targeting battlefield sweep with no
-    // referent to pin. `flip_permanent.rs` (CR 701.28a: converting follows
-    // CR 701.27a–f) still carries the un-migrated positional shape — the two
-    // modules deliberately DIVERGE after this change; see the PR body's
-    // `## Deferred / known-remaining`, DW#2.
+    // referent to pin.
+    //
+    // `flip_permanent.rs` (CR 701.28a: converting follows CR 701.27a–f) CARRIES
+    // THE SAME DEFECT, STILL LIVE. This is a DEFERRAL, NOT A DIVERGENCE: the two
+    // modules are not making different choices, one of them simply has not been
+    // fixed yet. It is the SAME MECHANISM, not an analogous one —
+    // `effects/mod.rs`'s `inject_last_revealed_targets` writes
+    // `last_revealed_ids` into any sub's `targets`, and `flip_permanent.rs` then
+    // reads `ability.targets.as_slice()` POSITIONALLY, so an injected
+    // off-battlefield card displaces the printed self-reference exactly as it
+    // did here. `game::flip::flip_permanent` no-ops on an object that is not on
+    // the battlefield (CR 710.2), so the printed flip is silently lost.
+    //
+    // MEASURED, with the bare two-instruction probe:
+    //   "At the beginning of your upkeep, look at the top card of your library.
+    //    Flip this creature."                     -> flipped = false  (DEFECT)
+    //   "At the beginning of your upkeep, put a +1/+1 counter on this creature.
+    //    Flip this creature."                     -> flipped = true   (control)
+    // Both runs reached the seam (trigger fired, drive stopped in the upkeep
+    // step, `back_face` installed; the defect run looked at exactly one card),
+    // so the `false` is a real miss and not an unreached fixture.
+    //
+    // CORPUS CARDS with the vulnerable shape — `FlipPermanent { target: SelfRef }`
+    // sequenced after an instruction that binds an object target — are
+    // NEZUMI GRAVEROBBER ("Exile target card from an opponent's graveyard. If no
+    // cards are in that graveyard, flip this creature.") and BUDOKA GARDENER
+    // ("You may put a land card from your hand onto the battlefield. If you
+    // control ten or more lands, flip this creature."). Both were identified BY
+    // PARSE SHAPE, not by an end-to-end run — they are candidates the probe
+    // above makes credible, not separately measured failures.
+    //
+    // Deferred rather than fixed here: see the PR body's
+    // `## Deferred / known-remaining`, DW#2 (migrate `flip_permanent.rs` onto
+    // `targeting::resolved_targets` the same way this module now does).
     let subject_came_from_declared_targets = subjects
         .iter()
         .all(|id| ability.targets.contains(&TargetRef::Object(*id)));
@@ -141,8 +178,10 @@ pub fn resolve(
     // CR 701.27c: If a spell or ability instructs a player to transform a
     // permanent that isn't represented by a DOUBLE-FACED TOKEN OR A double-faced
     // card, nothing happens. (The `?` on `transform_permanent` below is retained
-    // deliberately — DW#6 in the PR body. This change alters WHICH object can
-    // reach that error: for Runo / Delver / Sidequest it REMOVES one, because
+    // deliberately — DW#6 in the PR body, the deferred question of whether a
+    // non-double-faced subject should keep propagating an error here or become
+    // the silent CR 701.27c no-op the rule describes. This change alters WHICH
+    // object can reach that error: for Runo / Delver / Sidequest it REMOVES one, because
     // the old positional subject was an off-battlefield card (the library for
     // Runo and Delver, the hand for Sidequest). The suite-wide scan found
     // no new reachability, which is evidence for the defer, not proof.)
