@@ -1747,11 +1747,18 @@ pub fn mark_simultaneous_departure_records(
 }
 
 /// CR 603.10a: Filter `ids` to those whose object has actually left the
-/// battlefield (now resides in some other zone). Producers that accumulate a
-/// candidate ID list — bounce, change-zone, sacrifice, destroy — pass that list
-/// through this filter before `mark_simultaneous_departures` so that a member
-/// which never actually departed (regenerated, sacrifice-prevented, bounce
-/// guarded out) is excluded from every survivor's `co_departed` group.
+/// battlefield (now resides in some other zone, or no longer exists at all).
+/// Producers that accumulate a candidate ID list — bounce, change-zone,
+/// sacrifice, destroy — pass that list through this filter before
+/// `mark_simultaneous_departures` so that a member which never actually
+/// departed (regenerated, sacrifice-prevented, bounce guarded out) is excluded
+/// from every survivor's `co_departed` group.
+///
+/// CR 704.5d: a token has no `Zone::Battlefield` object to compare against
+/// once it has ceased to exist — `cease_object` removes it from `state.objects`
+/// entirely rather than moving it. An absent object can only mean it departed
+/// and then ceased to exist (a still-on-battlefield object cannot go missing),
+/// so `None` counts as departed exactly like `Some(zone != Battlefield)`.
 pub fn departed_subset(state: &GameState, ids: &[ObjectId]) -> Vec<ObjectId> {
     ids.iter()
         .copied()
@@ -1759,7 +1766,7 @@ pub fn departed_subset(state: &GameState, ids: &[ObjectId]) -> Vec<ObjectId> {
             state
                 .objects
                 .get(id)
-                .is_some_and(|o| o.zone != Zone::Battlefield)
+                .is_none_or(|o| o.zone != Zone::Battlefield)
         })
         .collect()
 }
@@ -1767,7 +1774,12 @@ pub fn departed_subset(state: &GameState, ids: &[ObjectId]) -> Vec<ObjectId> {
 /// CR 603.10a: Stamp simultaneous departure on a slice of events produced by a
 /// sweep that does not expose an explicit ID list (e.g. `sacrifice_unchosen`
 /// internal loops). Collects every battlefield-origin `ZoneChanged` in `slice`
-/// whose object is now off-battlefield, then groups them as co-departed.
+/// whose object is now off-battlefield (or gone entirely — see
+/// `departed_subset`'s CR 704.5d note: a token that ceased to exist earlier in
+/// the same SBA pass, e.g. via a co-departing Aura's CR 704.5m sweep running
+/// after `check_creature_deaths` but before this stamp, must not be dropped
+/// from the group merely because it can no longer be looked up), then groups
+/// them as co-departed.
 pub fn stamp_simultaneous_from_slice(state: &GameState, slice: &mut [GameEvent]) {
     let departed: Vec<ObjectId> = slice
         .iter()
@@ -1779,7 +1791,7 @@ pub fn stamp_simultaneous_from_slice(state: &GameState, slice: &mut [GameEvent])
             } if state
                 .objects
                 .get(object_id)
-                .is_some_and(|o| o.zone != Zone::Battlefield) =>
+                .is_none_or(|o| o.zone != Zone::Battlefield) =>
             {
                 Some(*object_id)
             }
