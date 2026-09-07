@@ -1303,19 +1303,54 @@ pub(super) fn card_type_condition_as_target_match(
     })
 }
 
-/// CR 608.2c: "If an instant or sorcery card is revealed this way, ..."
-/// (Delver of Secrets class) — gates a sub_ability on the last revealed card's type.
+/// CR 701.20a: `"If a[n] <types> card [<property>] is revealed this way, …"` —
+/// gates a sub_ability on the card the preceding look/reveal step produced.
+/// CR 701.20a ("To reveal a card, show that card to all players…") is the
+/// AUTHORIZING rule for the `"this way"` anaphor this head parses.
+///
+/// Supporting rules, at their own authority levels — deliberately NOT joined to
+/// the line above:
+/// * CR 608.2c (LAYERING) orders the instructions the anaphor points back at.
+/// * CR 202.3 (DEFINITION) defines the mana value the property slot most often
+///   bounds.
+/// * CR 701.20e (EXPLANATION ONLY, never this head's authority) — "Looking at a
+///   card follows the same rules as revealing a card, except that the card is
+///   revealed only to the specified player". The ledger this condition reads at
+///   runtime is currently written by the enclosing look as well as by the
+///   reveal, which is the known residual disclosed as DW#5. This head does not,
+///   and must not, try to fix it.
+///
+/// Delver of Secrets carries no property; Runo Stromkirk's "creature card with
+/// mana value 6 or greater" carries `FilterProp::Cmc { GE, Fixed 6 }`. The
+/// property slot delegates to `parse_revealed_card_gate_suffix`, the same
+/// combinator `parse_if_exiled_card_type_conditional` uses — this head simply
+/// welded `" card"` to `" is revealed this way"` and had nowhere to put it.
 fn parse_if_revealed_card_type_conditional(text: &str) -> Option<(AbilityCondition, String)> {
     let lower = text.to_lowercase();
-    let (type_filters, remainder) = nom_on_lower(text, &lower, |input| {
+    let mut ctx = ParseContext::default();
+    let ((type_filters, additional_filter), remainder) = nom_on_lower(text, &lower, |input| {
         let (rest, _) = alt((
             tag::<_, _, OracleError<'_>>("if an "),
             tag::<_, _, OracleError<'_>>("if a "),
         ))
         .parse(input)?;
         let (rest, type_filters) = nom_quantity::parse_type_filter_list(rest)?;
-        let (rest, _) = tag::<_, _, OracleError<'_>>(" card is revealed this way").parse(rest)?;
-        Ok((rest, type_filters))
+        let (rest, _) = tag::<_, _, OracleError<'_>>(" card").parse(rest)?;
+        // CR 202.3 + CR 205.3m: optional postnominal property slot, shared
+        // verbatim with `parse_if_exiled_card_type_conditional`. Called INSIDE
+        // this closure, on the lowercased slice, because the mandatory anchor
+        // below must be matched on the SAME slice for `nom_on_lower`'s
+        // remainder mapping to hold — the exiled head can call it after the
+        // bridge returns, on ORIGINAL-case text, only because its suffix is
+        // that head's LAST step. Running it on lowercased text here is correct
+        // and deliberate, not an oversight: every branch it reaches is a
+        // lowercase-expecting nom parser, so the two heads MUST NOT be
+        // "harmonised" onto one call site.
+        // Safe between these two tags because the helper CONSUMES NOTHING WHEN
+        // IT DOES NOT MATCH (see the invariant recorded on the helper itself).
+        let (rest, additional_filter) = parse_revealed_card_gate_suffix(rest, &mut ctx);
+        let (rest, _) = tag::<_, _, OracleError<'_>>(" is revealed this way").parse(rest)?;
+        Ok((rest, (type_filters, additional_filter)))
     })?;
     let core_types: Vec<CoreType> = type_filters
         .iter()
@@ -1327,7 +1362,7 @@ fn parse_if_revealed_card_type_conditional(text: &str) -> Option<(AbilityConditi
     Some((
         AbilityCondition::RevealedHasCardType {
             card_types: core_types,
-            additional_filter: None,
+            additional_filter,
             subtype_filter: None,
         },
         remainder_after_optional_comma(remainder).to_string(),
@@ -1367,9 +1402,34 @@ fn parse_if_exiled_card_type_conditional(text: &str) -> Option<(AbilityCondition
     ))
 }
 
-/// CR 202.3 + CR 205.3m: Optional property suffix after a revealed-card type gate
-/// (`" with mana value N or less"`, `" of the chosen type"`). Shared by the
-/// exiled-card demonstrative gate and the `"it's a/an … card"` gate body.
+/// CR 202.3 + CR 205.3m: Optional property suffix after a revealed-card type
+/// gate (`" with mana value N or less"`, `" of the chosen type"`). Shared by
+/// the exiled-card demonstrative gate (CR 406.6), the `"it's a/an … card"`
+/// look-head gate body (CR 701.20e), and the `"…is revealed this way"` reveal
+/// head (CR 701.20a).
+///
+/// INVARIANT — load-bearing for `parse_if_revealed_card_type_conditional`:
+/// this helper must CONSUME NOTHING when it does not match. That caller runs it
+/// between `tag(" card")` and a MANDATORY `tag(" is revealed this way")`, so a
+/// branch that consumed without a determiner head would swallow the anchor, the
+/// trailing tag would fail, and that card would lose its ENTIRE condition — the
+/// exact defect this head was fixed for, reintroduced on a different card.
+///
+/// The invariant holds because every consuming branch is fronted by a
+/// determiner: `" of the chosen type"` as a literal here, and inside
+/// `parse_mana_value_suffix` either `parse_suffix_subject_head`
+/// (`"with "`/`"that have "`/`"that each have "`, the parity, elliptical-
+/// possessive and numeric branches), `parse_relative_mana_value_suffix`'s own
+/// `tag("with ")`, or `nom_filter::parse_superlative_property_head`'s
+/// `tag("with the ")`. Note the last two are NOT routed through
+/// `parse_suffix_subject_head` — enumerate all three heads when auditing this.
+///
+/// Consequently, for any input the reveal head accepted before the property
+/// slot existed, the slice handed here begins `" is revealed this way"`, which
+/// no branch above can consume: byte-identity for those cards is a PROOF, not a
+/// measurement. Any change HERE or in `parse_mana_value_suffix` /
+/// `parse_suffix_subject_head` must re-run the card-data structural diff (no
+/// card carrying "is revealed this way" may move except by intent).
 fn parse_revealed_card_gate_suffix<'a>(
     after_type: &'a str,
     ctx: &mut ParseContext,
@@ -9772,6 +9832,121 @@ mod tests {
             })
         );
         assert_eq!(body, "transform this creature.");
+    }
+
+    /// CR 701.20a + CR 202.3: issue #8586 — Runo Stromkirk's upkeep gate.
+    /// "If a creature card WITH MANA VALUE 6 OR GREATER is revealed this way"
+    /// welded `" card"` to `" is revealed this way"` as one `tag()`, leaving no
+    /// slot for the postnominal property, so the whole condition was dropped
+    /// (`condition: null`) and the Transform ran ungated.
+    ///
+    /// DISCRIMINATOR: at BASE this head returns `None` and
+    /// `strip_card_type_conditional` falls through every sibling head, so `cond`
+    /// is `None` and `body` is the entire input — both the `let … else` and the
+    /// `body` equality below fail on revert.
+    #[test]
+    fn issue_8586_revealed_creature_card_with_mana_value_floor() {
+        let (cond, body) = strip_card_type_conditional(
+            "If a creature card with mana value 6 or greater is revealed this way, transform ~.",
+        );
+        assert_eq!(body, "transform ~.");
+        let Some(AbilityCondition::RevealedHasCardType {
+            card_types,
+            additional_filter,
+            subtype_filter,
+        }) = cond
+        else {
+            panic!("expected RevealedHasCardType, got {cond:?}");
+        };
+        assert_eq!(card_types, vec![CoreType::Creature]);
+        assert_eq!(
+            additional_filter,
+            Some(FilterProp::Cmc {
+                comparator: Comparator::GE,
+                value: QuantityExpr::Fixed { value: 6 },
+            })
+        );
+        assert_eq!(subtype_filter, None);
+    }
+
+    /// CR 202.3: class evidence, not an issue-#8586 special case — the property
+    /// slot is the SHARED `parse_revealed_card_gate_suffix`, so the opposite
+    /// comparator arrives through the same head with no extra parser work.
+    ///
+    /// DISCRIMINATOR: `None` with the whole input as `body` at BASE.
+    #[test]
+    fn revealed_card_gate_carries_a_mana_value_ceiling_suffix() {
+        let (cond, body) = strip_card_type_conditional(
+            "If a creature card with mana value 3 or less is revealed this way, draw a card.",
+        );
+        assert_eq!(body, "draw a card.");
+        let Some(AbilityCondition::RevealedHasCardType {
+            card_types,
+            additional_filter,
+            ..
+        }) = cond
+        else {
+            panic!("expected RevealedHasCardType, got {cond:?}");
+        };
+        assert_eq!(card_types, vec![CoreType::Creature]);
+        assert_eq!(
+            additional_filter,
+            Some(FilterProp::Cmc {
+                comparator: Comparator::LE,
+                value: QuantityExpr::Fixed { value: 3 },
+            })
+        );
+    }
+
+    /// CR 205.3m: class evidence on a SECOND suffix branch — the chosen-type
+    /// literal, which lives in `parse_revealed_card_gate_suffix` itself rather
+    /// than in `parse_mana_value_suffix`. Together with the two mana-value rows
+    /// this proves the slot admits the whole shared cross-product, not one
+    /// comparator.
+    ///
+    /// DISCRIMINATOR: `None` with the whole input as `body` at BASE.
+    #[test]
+    fn revealed_card_gate_carries_a_chosen_type_suffix() {
+        let (cond, body) = strip_card_type_conditional(
+            "If a creature card of the chosen type is revealed this way, draw a card.",
+        );
+        assert_eq!(body, "draw a card.");
+        let Some(AbilityCondition::RevealedHasCardType {
+            card_types,
+            additional_filter,
+            ..
+        }) = cond
+        else {
+            panic!("expected RevealedHasCardType, got {cond:?}");
+        };
+        assert_eq!(card_types, vec![CoreType::Creature]);
+        assert_eq!(additional_filter, Some(FilterProp::IsChosenCreatureType));
+    }
+
+    /// CR 701.20a: HOSTILE FIXTURE for the mandatory `" is revealed this way"`
+    /// anchor — NOT a discriminator, and deliberately so. It passes identically
+    /// at BASE and after the property slot landed (measured on both sides).
+    ///
+    /// Its job is the suffix helper's INVARIANT (recorded on
+    /// `parse_revealed_card_gate_suffix`): the helper must consume NOTHING when
+    /// it does not match. If a future branch there ever consumed without a
+    /// determiner head, it would swallow this input's anchor, the trailing
+    /// `tag(" is revealed this way")` would fail, and Delver of Secrets' entire
+    /// class would silently lose its condition. This row fails the moment that
+    /// happens.
+    #[test]
+    fn revealed_card_gate_without_a_suffix_keeps_additional_filter_none() {
+        let (cond, body) =
+            strip_card_type_conditional("If a creature card is revealed this way, draw a card.");
+        assert_eq!(body, "draw a card.");
+        assert_eq!(
+            cond,
+            Some(AbilityCondition::RevealedHasCardType {
+                card_types: vec![CoreType::Creature],
+                additional_filter: None,
+                subtype_filter: None,
+            })
+        );
     }
 
     /// CR 205.3m + CR 608.2c: "that creature is a Mutant, Ninja, or Turtle"
