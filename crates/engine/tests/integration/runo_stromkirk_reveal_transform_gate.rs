@@ -484,15 +484,14 @@ fn drive_upkeep(runner: &mut GameRunner, drive: UpkeepDrive) -> bool {
             _ => break,
         }
     }
+    let complete = runner.state().stack.is_empty()
+        && !matches!(
+            runner.state().waiting_for,
+            WaitingFor::OptionalEffectChoice { .. }
+        );
     match drive {
-        UpkeepDrive::AnswerOptional { .. } => {
-            answered
-                && !matches!(
-                    runner.state().waiting_for,
-                    WaitingFor::OptionalEffectChoice { .. }
-                )
-        }
-        UpkeepDrive::NoOptional => !offered,
+        UpkeepDrive::AnswerOptional { .. } => answered && complete,
+        UpkeepDrive::NoOptional => !offered && complete,
     }
 }
 
