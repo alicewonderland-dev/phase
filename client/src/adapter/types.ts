@@ -63,6 +63,45 @@ export interface DungeonRoomView {
   room: RoomPreview;
   /** Total rooms on the dungeon card, for "room 3 of 7". */
   room_count: number;
+  /** The printed dungeon card's Scryfall identity. */
+  card: DungeonCardView;
+  /** Every room on the card in printed order, with edges and card geometry. */
+  rooms: DungeonRoomNodeView[];
+}
+
+// Mirrors `engine::game::derived_views::DungeonCardView`.
+//
+// Two ids, because the five dungeons are NOT indexed uniformly by the client's
+// Scryfall sidecars. Four are `layout: "normal"` and resolve from
+// `scryfall-data.json` by `oracle_id`; Undercity is printed as the
+// double-faced `Undercity // The Initiative`, a layout that
+// `gen-scryfall-images.sh` excludes as non-playable, so it exists ONLY in
+// `scryfall-token-images.json`, keyed by printing id. Callers try the card
+// table and fall back to the token table.
+export interface DungeonCardView {
+  oracle_id: string;
+  scryfall_id: string;
+  /** Selects the dungeon face of the double-faced Undercity printing. */
+  face_name: string;
+}
+
+// Mirrors `engine::game::derived_views::DungeonRoomNodeView`. `RoomPreview` is
+// flattened into this by serde, so `index`/`name`/`text` sit alongside the
+// edges and geometry rather than under a nested key.
+export interface DungeonRoomNodeView extends RoomPreview {
+  /** Rooms the venture marker may move to from here (CR 309.5a); empty for
+   *  the bottommost room. */
+  next_rooms: number[];
+  /** Where this room is drawn on the card face. */
+  marker: RoomMarkerPoint;
+}
+
+// Mirrors `engine::game::dungeon::RoomMarkerPoint`. Permille (0-1000) of the
+// card image rather than a fraction, so the engine's derived views can keep
+// deriving `Eq` (f32 is not `Eq`).
+export interface RoomMarkerPoint {
+  x_permille: number;
+  y_permille: number;
 }
 
 // ── Game Format ─────────────────────────────────────────────────────────
@@ -2103,7 +2142,7 @@ export type WaitingFor =
   | { type: "ReplacementChoice"; data: { player: PlayerId; candidate_count: number; candidates?: ReplacementCandidateSummary[]; kind?: ReplacementChoiceKind; last_applied_decides?: boolean } }
   | { type: "EntryControllerChoice"; data: { player: PlayerId; candidates: PlayerId[] } }
   | { type: "OrderTriggers"; data: { player: PlayerId; triggers: PendingTriggerSummary[] } }
-  | { type: "CopyTargetChoice"; data: { player: PlayerId; source_id: ObjectId; valid_targets: ObjectId[]; max_mana_value?: number | null; purpose?: { type: "BecomeCopy" | "PersistChosenAttribute" } } }
+  | { type: "CopyTargetChoice"; data: { player: PlayerId; source_id: ObjectId; valid_targets: ObjectId[]; max_mana_value?: number | null; purpose?: { type: "BecomeCopy" | "PersistChosenAttribute" | "CopyTokenSource" } } }
   | { type: "ExploreChoice"; data: { player: PlayerId; source_id: ObjectId; choosable: ObjectId[]; remaining: ObjectId[]; pending_effect: unknown } }
   | { type: "ReturnAsAuraTarget"; data: { player: PlayerId; source_id: ObjectId; returned_id: ObjectId; legal_targets: TargetRef[]; pending_effect: unknown } }
   | { type: "EquipTarget"; data: { player: PlayerId; equipment_id: ObjectId; valid_targets: ObjectId[] } }
@@ -4512,6 +4551,11 @@ export interface EngineAdapter {
   resumeRestoredGameState?(): Promise<RestoredGameStateResult | null>;
   /** Returns an opaque, exact member of the current engine-issued decision domain. */
   getAiActionProposal?(difficulty: string, playerId: number): Promise<AiActionProposal | null> | AiActionProposal | null;
+  /**
+   * Returns an engine-issued tactical proposal without optional deep search.
+   * Used only to recover an AI seat whose normal proposal repeatedly failed.
+   */
+  getAiTacticalActionProposal?(difficulty: string, playerId: number): Promise<AiActionProposal | null> | AiActionProposal | null;
   /** Applies a proposal only if its authority token and exact action remain current. */
   submitAiActionProposal?(proposal: AiActionProposal): Promise<AiProposalSubmission> | AiProposalSubmission;
   restoreState(state: PersistedGameState): void | Promise<void>;
@@ -4733,6 +4777,12 @@ export interface PlayerSummary {
  * pairing (2 seats), a full or short pod (up to `arity`), and a bye (1 seat).
  * `outcome` is emitted with **no** `skip_serializing_if`, so a pending pairing
  * arrives as an explicit `"outcome": null`.
+ *
+ * NOTE (protocol v6, client-render deferred): the wire struct now also carries
+ * a required `report_gate` (broker-owned per-pairing report legality). It is
+ * intentionally not mirrored here yet — the client-rendering follow-up adds the
+ * field and consumes it. Received unknown fields are ignored by `JSON.parse`,
+ * so omitting it is inert. The Rust line citations below predate the v6 shift.
  */
 export interface TournamentPairingView {
   id: PairingId;
@@ -4742,8 +4792,27 @@ export interface TournamentPairingView {
 }
 
 /**
+ * The role selector carried by the wire's `RenewTournamentCredential` (protocol
+ * v6). Mirrors `lobby_broker::tournament::TournamentRole`, which has no
+ * `rename_all` and so serializes as `"Organizer"` / `"Player"`.
+ *
+ * Deliberately NOT named `TournamentRole`: `stores/multiplayerStore` already
+ * exports a lowercase display-role `TournamentRole = "organizer" | "player"`,
+ * and the two spellings are wire-incompatible. The credential-renewal sender (a
+ * follow-up) must send THESE capitalized values, or the broker rejects the
+ * frame with a serde unknown-variant error.
+ */
+export type TournamentCredentialRole = "Organizer" | "Player";
+
+/**
  * One row of the tournament list. Mirrors
- * `crates/lobby-broker/src/protocol.rs:507-528`.
+ * `crates/lobby-broker/src/protocol.rs:507-528` (citation predates the v6 shift).
+ *
+ * NOTE (protocol v6, client-render deferred): the wire struct now also carries
+ * a required `scoring` (resolved `ScoringPolicy`) and `open_actions`
+ * (broker-owned set of legal tournament actions). Both are intentionally not
+ * mirrored here yet — the client-rendering follow-up adds and consumes them.
+ * Unknown received fields are ignored by `JSON.parse`, so omitting them is inert.
  */
 export interface TournamentSummary {
   code: string;
@@ -4767,6 +4836,17 @@ export interface TournamentSummary {
    */
   total_rounds: number;
   created_at: number;
+  /**
+   * The event's game-format label (Standard, Commander, …), a display label
+   * only — the tournament enforces no deck legality. Typed `| null` because the
+   * Rust field is `#[serde(default)] Option<GameFormat>` with NO
+   * `skip_serializing_if`, so `None` arrives as an explicit `"format": null`,
+   * not a missing key — the common "organizer named none" path. `undefined`
+   * only against a pre-v7 broker that omits the field entirely (lobby protocol
+   * 7 added it). Guard with `!= null` to cover both. Mirrors the `format` a
+   * {@link LobbyGame} listing carries; resolve its label through `FORMAT_REGISTRY`.
+   */
+  format?: GameFormat | null;
 }
 
 /**
@@ -4787,8 +4867,13 @@ export interface TournamentView {
 
 /**
  * `LobbyServerMessage::TournamentCreated`'s payload
- * (`crates/lobby-broker/src/protocol.rs:830-834`). A point reply only —
- * `organizer_token` is minted here and is never broadcast.
+ * (`crates/lobby-broker/src/protocol.rs:830-834`; citation predates the v6 shift).
+ * A point reply only — `organizer_token` is minted here and is never broadcast.
+ *
+ * NOTE (protocol v6, client-render deferred): the wire payload now also carries
+ * a required `expires_at_ms` beside the token (credential expiry). It is
+ * intentionally not mirrored here yet — the credential-rotation client
+ * follow-up adds and consumes it; the unknown field is ignored on parse.
  */
 export interface TournamentCreatedReply {
   code: string;
@@ -4798,8 +4883,13 @@ export interface TournamentCreatedReply {
 
 /**
  * `LobbyServerMessage::TournamentJoined`'s payload
- * (`crates/lobby-broker/src/protocol.rs:837-841`). A point reply only —
- * `player_token` is minted here and is never broadcast.
+ * (`crates/lobby-broker/src/protocol.rs:837-841`; citation predates the v6 shift).
+ * A point reply only — `player_token` is minted here and is never broadcast.
+ *
+ * NOTE (protocol v6, client-render deferred): the wire payload now also carries
+ * a required `expires_at_ms` beside the token (credential expiry). It is
+ * intentionally not mirrored here yet — the credential-rotation client
+ * follow-up adds and consumes it; the unknown field is ignored on parse.
  */
 export interface TournamentJoinedReply {
   code: string;

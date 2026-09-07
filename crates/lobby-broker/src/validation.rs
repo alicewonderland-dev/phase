@@ -259,18 +259,32 @@ pub const MAX_GAME_WINS_ENTRIES: usize = 128;
 
 pub struct CreateTournamentFields<'a> {
     pub name: &'a str,
+    /// The organizer's EXACT round-count override.
+    pub total_rounds: Option<u32>,
+    /// The "automatic + N" round addend.
+    pub plus_rounds: Option<u32>,
 }
 
 pub fn validate_create_tournament_fields(fields: CreateTournamentFields<'_>) -> Result<(), String> {
     // A tournament name is a display label broadcast to every subscriber in
     // `TournamentSummary`, so it gets the same treatment as a room name.
     validate_required_label("name", fields.name, MAX_ROOM_NAME_LEN)?;
-    // `total_rounds` is deliberately unbounded here beyond PR1's own
-    // `Some(0)` rejection in `TournamentManager::create_tournament`. It is a
-    // `u32` (no unbounded allocation to guard) and nothing loops over it: the
-    // round ceiling is compared against, never counted to, so even `u32::MAX`
-    // costs a comparison. A ceiling would be a tournament-policy judgment,
-    // which is `crate::tournament`'s to make, not this module's.
+    // `total_rounds` (an exact count) and `plus_rounds` (auto default + N) are
+    // two different answers to "how many rounds", so accepting both would leave
+    // the resolver to silently pick one and discard the other — a
+    // configuration the organizer cannot see the outcome of. Reject the
+    // contradiction at the boundary instead. Neither value is otherwise
+    // bounded: both are `u32` (no unbounded allocation to guard) and nothing
+    // loops over them — the round ceiling is compared against, never counted to,
+    // so even `u32::MAX` costs a comparison. A ceiling would be a
+    // tournament-policy judgment, which is `crate::tournament`'s to make.
+    if fields.total_rounds.is_some() && fields.plus_rounds.is_some() {
+        return Err(
+            "total_rounds and plus_rounds are mutually exclusive: set an exact \
+             round count or an automatic-plus-N addend, not both"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -356,6 +370,21 @@ pub fn validate_end_tournament_fields(fields: EndTournamentFields<'_>) -> Result
     Ok(())
 }
 
+pub struct RenewTournamentCredentialFields<'a> {
+    pub code: &'a str,
+    pub token: &'a str,
+}
+
+/// `role` is deliberately absent: it is a two-variant enum serde already
+/// refuses anything else for, so there is no size or shape left to bound.
+pub fn validate_renew_tournament_credential_fields(
+    fields: RenewTournamentCredentialFields<'_>,
+) -> Result<(), String> {
+    validate_token("code", fields.code, MAX_GAME_CODE_LEN)?;
+    validate_token("token", fields.token, MAX_TOKEN_LEN)?;
+    Ok(())
+}
+
 /// Validate every client-supplied field of a parsed lobby message against the
 /// size/shape bounds above. Returns the first violation as a human-readable
 /// reason suitable for an `Error` reply. Server-populated reply types
@@ -436,8 +465,17 @@ pub fn validate_lobby_message(msg: &crate::protocol::LobbyClientMessage) -> Resu
         M::UnregisterLobby { game_code } => {
             validate_unregister_lobby_fields(game_code)?;
         }
-        M::CreateTournament { name, .. } => {
-            validate_create_tournament_fields(CreateTournamentFields { name })?;
+        M::CreateTournament {
+            name,
+            total_rounds,
+            plus_rounds,
+            ..
+        } => {
+            validate_create_tournament_fields(CreateTournamentFields {
+                name,
+                total_rounds: *total_rounds,
+                plus_rounds: *plus_rounds,
+            })?;
         }
         M::JoinTournament {
             code,
@@ -502,6 +540,19 @@ pub fn validate_lobby_message(msg: &crate::protocol::LobbyClientMessage) -> Resu
             validate_end_tournament_fields(EndTournamentFields {
                 code,
                 organizer_token,
+            })?;
+        }
+        // `role: _` for the same reason the four arms above bind
+        // `request_id: _`: it is a closed enum with nothing to bound, and
+        // binding it explicitly shows the next reader it was considered here.
+        M::RenewTournamentCredential {
+            code,
+            role: _,
+            token,
+        } => {
+            validate_renew_tournament_credential_fields(RenewTournamentCredentialFields {
+                code,
+                token,
             })?;
         }
         // No client-supplied bounded fields.
@@ -768,16 +819,18 @@ mod tests {
 
     // -- Tournament organizer ----------------------------------------------
 
-    use crate::tournament::{BracketShape, MatchArity, PodOutcome, ScoringPolicy};
+    use crate::tournament::{BracketShape, MatchArity, PodOutcome, ScoringPolicy, TournamentRole};
     use std::collections::HashMap;
 
     fn create_tournament_with(name: &str) -> M {
         M::CreateTournament {
             name: name.to_string(),
             arity: MatchArity::HEAD_TO_HEAD,
-            scoring: ScoringPolicy::default(),
+            scoring: Some(ScoringPolicy::default()),
             bracket: BracketShape::Swiss,
             total_rounds: None,
+            plus_rounds: None,
+            format: None,
         }
     }
 
@@ -853,6 +906,16 @@ mod tests {
                 organizer_token: "tok".into(),
                 request_id: None,
             },
+            M::RenewTournamentCredential {
+                code: "TOUR01".into(),
+                role: TournamentRole::Organizer,
+                token: "tok".into(),
+            },
+            M::RenewTournamentCredential {
+                code: "TOUR01".into(),
+                role: TournamentRole::Player,
+                token: "tok".into(),
+            },
         ];
         for msg in valid {
             assert!(
@@ -871,6 +934,43 @@ mod tests {
     #[test]
     fn create_tournament_rejects_blank_name() {
         assert!(validate_lobby_message(&create_tournament_with("   ")).is_err());
+    }
+
+    #[test]
+    fn create_tournament_rejects_total_rounds_and_plus_rounds_together() {
+        // Each alone is accepted; only the contradiction is refused.
+        let exact = M::CreateTournament {
+            name: "Friday Night".to_string(),
+            arity: MatchArity::HEAD_TO_HEAD,
+            scoring: Some(ScoringPolicy::default()),
+            bracket: BracketShape::Swiss,
+            total_rounds: Some(5),
+            plus_rounds: None,
+            format: None,
+        };
+        let plus = M::CreateTournament {
+            name: "Friday Night".to_string(),
+            arity: MatchArity::HEAD_TO_HEAD,
+            scoring: Some(ScoringPolicy::default()),
+            bracket: BracketShape::Swiss,
+            total_rounds: None,
+            plus_rounds: Some(1),
+            format: None,
+        };
+        assert!(validate_lobby_message(&exact).is_ok());
+        assert!(validate_lobby_message(&plus).is_ok());
+
+        let both = M::CreateTournament {
+            name: "Friday Night".to_string(),
+            arity: MatchArity::HEAD_TO_HEAD,
+            scoring: Some(ScoringPolicy::default()),
+            bracket: BracketShape::Swiss,
+            total_rounds: Some(5),
+            plus_rounds: Some(1),
+            format: None,
+        };
+        let err = validate_lobby_message(&both).expect_err("both set is rejected");
+        assert!(err.contains("mutually exclusive"), "{err}");
     }
 
     #[test]
@@ -912,6 +1012,21 @@ mod tests {
                 code: "TOUR01".into(),
                 organizer_token: long.clone(),
                 request_id: None,
+            },
+            // Lobby protocol 6's rotation frame is token-gated too, and its
+            // token is client-supplied, so it takes the same bound. Without
+            // this row the new `validate_lobby_message` arm would be reachable
+            // only by the accept-path test above, which cannot tell a real
+            // bound apart from an arm that returns `Ok(())` unconditionally.
+            M::RenewTournamentCredential {
+                code: "TOUR01".into(),
+                role: TournamentRole::Organizer,
+                token: long.clone(),
+            },
+            M::RenewTournamentCredential {
+                code: "t".repeat(MAX_GAME_CODE_LEN + 1),
+                role: TournamentRole::Player,
+                token: "tok".into(),
             },
         ] {
             assert!(validate_lobby_message(&msg).is_err(), "{msg:?}");

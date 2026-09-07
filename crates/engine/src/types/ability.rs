@@ -728,8 +728,7 @@ pub enum ChoiceType {
     /// CR 205.3m: A choice among creature types. `options`, when non-empty,
     /// narrows the offered set below the full creature-type list to an explicit
     /// Oracle-listed candidate set (e.g. A Killer Among Us' "secretly choose
-    /// Human, Merfolk, or Goblin") — mirrors the `Color { excluded }` /
-    /// `CardType { excluded }` restriction axis. Empty ⇒ all creature types
+    /// Human, Merfolk, or Goblin"). Empty ⇒ all creature types
     /// (Morophon / Changeling), which keeps existing card-data JSON byte-stable.
     CreatureType {
         options: Vec<String>,
@@ -743,12 +742,12 @@ pub enum ChoiceType {
     },
     OddOrEven,
     BasicLandType,
-    /// CR 205.2a: A choice among card types. `excluded` narrows the offered
-    /// set below the full seven-type list (e.g. Archon of Valor's Reach
-    /// excludes Creature and Land, leaving "artifact, enchantment, instant,
-    /// sorcery, or planeswalker") — mirrors the `Color { excluded }` axis.
+    /// CR 205.2a: A choice among card types. The full rule has more card types
+    /// than the engine's generic policy offers; empty `options` therefore means
+    /// `CoreType::CHOOSABLE_TYPES`, while non-empty options are the exact
+    /// Oracle-listed legal domain in printed order.
     CardType {
-        excluded: Vec<CoreType>,
+        options: Vec<CoreType>,
     },
     CardName,
     /// "Choose a number between X and Y" — generates string options "0", "1", ..., "Y".
@@ -924,12 +923,24 @@ impl ChoiceType {
 
     pub fn card_type() -> Self {
         Self::CardType {
-            excluded: Vec::new(),
+            options: Vec::new(),
         }
     }
 
-    pub fn card_type_excluding(excluded: Vec<CoreType>) -> Self {
-        Self::CardType { excluded }
+    /// Card-type choice restricted to an explicit Oracle-listed candidate set.
+    pub fn card_type_from(options: Vec<CoreType>) -> Self {
+        Self::CardType { options }
+    }
+
+    /// The authoritative legal domain for a `CardType` prompt. Empty options
+    /// are the generic engine policy; non-empty options are already exact.
+    pub fn legal_card_type_options(options: &[CoreType]) -> Vec<CoreType> {
+        if options.is_empty() {
+            &CoreType::CHOOSABLE_TYPES
+        } else {
+            options
+        }
+        .to_vec()
     }
 
     /// Unrestricted "choose an opponent" (CR 102.3), independent of any other
@@ -1115,16 +1126,13 @@ impl Serialize for ChoiceType {
             Self::BasicLandType => {
                 serializer.serialize_unit_variant("ChoiceType", 3, "BasicLandType")
             }
-            // Serialize the unrestricted form as the legacy unit variant
-            // "CardType" so existing card-data JSON stays byte-stable; only
-            // emit the struct form when a restriction is present.
-            Self::CardType { excluded } => {
-                if excluded.is_empty() {
+            Self::CardType { options } => {
+                if options.is_empty() {
                     serializer.serialize_unit_variant("ChoiceType", 4, "CardType")
                 } else {
                     let mut variant =
                         serializer.serialize_struct_variant("ChoiceType", 4, "CardType", 1)?;
-                    variant.serialize_field("excluded", excluded)?;
+                    variant.serialize_field("options", options)?;
                     variant.end()
                 }
             }
@@ -1282,6 +1290,10 @@ impl<'de> Deserialize<'de> for ChoiceType {
             },
             CardType {
                 #[serde(default)]
+                options: Vec<CoreType>,
+                // Compatibility-only legacy wire form. It is normalized to a
+                // positive, ordered domain below and is never re-serialized.
+                #[serde(default)]
                 excluded: Vec<CoreType>,
             },
             NumberRange {
@@ -1365,7 +1377,28 @@ impl<'de> Deserialize<'de> for ChoiceType {
             ChoiceTypeRepr::Data(data) => match data {
                 ChoiceTypeData::CreatureType { options } => Ok(Self::CreatureType { options }),
                 ChoiceTypeData::Color { excluded } => Ok(Self::Color { excluded }),
-                ChoiceTypeData::CardType { excluded } => Ok(Self::CardType { excluded }),
+                ChoiceTypeData::CardType { options, excluded } => {
+                    if !options.is_empty() && !excluded.is_empty() {
+                        return Err(de::Error::custom(
+                            "CardType options and legacy excluded cannot be combined",
+                        ));
+                    }
+                    if excluded.is_empty() {
+                        Ok(Self::card_type_from(options))
+                    } else {
+                        let options = CoreType::CHOOSABLE_TYPES
+                            .iter()
+                            .copied()
+                            .filter(|card_type| !excluded.contains(card_type))
+                            .collect::<Vec<_>>();
+                        if options.is_empty() {
+                            return Err(de::Error::custom(
+                                "legacy CardType exclusions leave no legal choices",
+                            ));
+                        }
+                        Ok(Self::card_type_from(options))
+                    }
+                }
                 ChoiceTypeData::NumberRange {
                     min,
                     max,
@@ -2006,13 +2039,16 @@ impl CastFromZoneDriver {
     }
 
     /// CR 611.2a: Reconcile this driver with a durational scope the parser
-    /// stamped on the grant AFTER the clause body was lowered (a leading
-    /// "Until end of turn, …" via `with_clause_duration`, or a stripped trailing
-    /// "… this turn"). A stated duration means the controller casts at a LATER
-    /// priority window, which is the defining property of a lingering
-    /// permission — so a resolution-scoped window degrades to one. The two
-    /// single-card mechanisms are unchanged here; the paid-cast downgrade has
-    /// its own narrower guard at the clause seam.
+    /// stamped on the grant AFTER the clause body was lowered — a leading
+    /// "Until end of turn, …", a stripped trailing "… this turn", or a duration
+    /// carried onto a coordinated cast conjunct. Every seam that stamps one
+    /// calls this. A stated duration means the controller casts at a LATER
+    /// priority window (CR 117.1a), which is the defining property of a
+    /// lingering permission — so both resolution-scoped mechanisms are asked to
+    /// degrade, the batch window and the single card alike. CR 118.9 governs
+    /// what the permission costs, never when it is exercised, so payment is not
+    /// part of this question. Only the batch window can REFUSE, and only when it
+    /// carries a bound; see the next paragraph.
     ///
     /// `None` is a REFUSAL, and the fallible return type is the point: the
     /// degrade is expressed as `for_batch_bounds(LingeringPermission, …)`, so a
@@ -2028,12 +2064,24 @@ impl CastFromZoneDriver {
             CastFromZoneDriver::ResolutionWindow { bounds } => {
                 Self::for_batch_bounds(CastMechanism::LingeringPermission, bounds)
             }
-            // CR 608.2g: the two single-card mechanisms carry no batch bound to
-            // lose, so a stated duration leaves them untouched (the paid
-            // `DuringResolution` → lingering move for a chosen single target
-            // — Emry, Lurker in the Loch — has its own narrower guard at the
-            // trailing-duration seam, which runs before this call).
-            other => Some(other),
+            // CR 608.2g + CR 117.1a: a during-resolution cast happens AS the
+            // ability resolves, with no priority window in between. A stated
+            // lifetime says the opposite, so the two are mutually exclusive and
+            // the single-card mechanism degrades as well — carrying no batch
+            // bound, it can never refuse. This arm used to answer
+            // `Some(DuringResolution)`, with the degrade hand-written at ONE
+            // seam behind a `without_paying_mana_cost: false` guard, so every
+            // FREE single-card grant with a printed lifetime kept a one-shot
+            // mechanism its own text contradicts. CR 118.9 governs what the
+            // permission COSTS, not when it is exercised. The affected cards are
+            // measured in the double parse cited by the change that moved this
+            // arm, not listed here, where the list would go stale unnoticed.
+            CastFromZoneDriver::DuringResolution => Some(CastFromZoneDriver::LingeringPermission),
+            // Already the lingering mechanism; a stated duration only stamps its
+            // lifetime.
+            CastFromZoneDriver::LingeringPermission => {
+                Some(CastFromZoneDriver::LingeringPermission)
+            }
         }
     }
 }
@@ -2308,9 +2356,11 @@ impl ChoiceValue {
             ChoiceType::BasicLandType => {
                 value.parse::<BasicLandType>().ok().map(Self::BasicLandType)
             }
-            ChoiceType::CardType { excluded } => {
+            ChoiceType::CardType { options } => {
                 let core_type = value.parse::<CoreType>().ok()?;
-                (!excluded.contains(&core_type)).then_some(Self::CardType(core_type))
+                ChoiceType::legal_card_type_options(options)
+                    .contains(&core_type)
+                    .then_some(Self::CardType(core_type))
             }
             ChoiceType::OddOrEven => value.parse::<Parity>().ok().map(Self::OddOrEven),
             ChoiceType::CardName => Some(Self::CardName(value.to_string())),
@@ -13603,6 +13653,113 @@ pub enum CopyManaValueLimit {
     AmountSpentToCastSource,
 }
 
+/// CR 707.2 + CR 115.1 + CR 611.2c: WHICH object(s) become the copy.
+///
+/// A bare `TargetFilter` cannot express this axis, because the two non-source
+/// readings are spelled with the SAME filter shape and differ only in whether
+/// the object is announced as a target:
+///
+/// - Shuri, Wakandan Inventor — "**Target** artifact you control becomes a copy
+///   of a second target artifact you control" — recipient `Typed(Artifact, You)`,
+///   **announced** (CR 115.1: declared as the ability is put on the stack, so it
+///   takes a target slot and is rechecked for legality on resolution per
+///   CR 608.2b).
+/// - Mirrorweave — "**Each other** creature becomes a copy of target
+///   nonlegendary creature" — recipient `Typed(Creature, [Other])`, **not
+///   announced**; the set is determined as the spell resolves (CR 611.2c).
+///
+/// Collapsing both onto `TargetFilter` forced the parser to throw one of them
+/// away, which is exactly the defect this axis fixes. `SubjectApplication`
+/// already draws this trichotomy at parse time; it previously had nowhere to
+/// record it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "type", content = "filter")]
+pub enum CopyRecipient {
+    /// CR 707.2: the ability's own source — `~`, or an anaphoric "it"/"this
+    /// creature" naming it. Every self-copy card (Mirage Mirror, Thespian's
+    /// Stage, Lazav, Volrath, Clone-style ETB replacements, …). This is the
+    /// default and is skipped during serialization, so those cards round-trip
+    /// byte-identically.
+    #[default]
+    Source,
+    /// CR 115.1: an announced target, declared BEFORE the copy source in the
+    /// printed order (CR 601.2c). Shuri, True Polymorph, Shapesharer, Saheeli
+    /// Sublime Artificer, The Animus, Reflection Net, Kaya Spirits' Justice.
+    Target(TargetFilter),
+    /// CR 611.2c: an untargeted recipient set, determined only as the effect
+    /// resolves and then locked. Covers mass subjects (Mirrorweave, Mirrorform,
+    /// Niko's "Shards you control") and untargeted single-object anaphors such
+    /// as `AttachedTo` (Assimilation Aegis' enchanted/equipped host).
+    Untargeted(TargetFilter),
+}
+
+impl CopyRecipient {
+    /// The recipient's selection filter, when it has one. `Source` carries no
+    /// filter — it names the ability source directly.
+    pub fn filter(&self) -> Option<&TargetFilter> {
+        match self {
+            CopyRecipient::Source => None,
+            CopyRecipient::Target(filter) | CopyRecipient::Untargeted(filter) => Some(filter),
+        }
+    }
+
+    /// CR 115.1: the filter that is ANNOUNCED as a target slot, if any.
+    ///
+    /// `Target` is *defined* as the announced reading, so this is unconditional
+    /// for that variant. Six authorities key off this one function — both slot
+    /// builders, both target assigners, the chain target-sink predicate, and
+    /// the resolver's copy-source index — and they are consistent only if all
+    /// six agree on whether slot 0 is the recipient. A predicate that could
+    /// decline a `Target` here (e.g. a context-ref guard) would silently
+    /// collapse the recipient and the copy source onto the same declared
+    /// object, so the context-ref case is excluded by [`Self::targeted`]
+    /// instead — at construction and on deserialization, never here.
+    pub fn announced_filter(&self) -> Option<&TargetFilter> {
+        match self {
+            CopyRecipient::Target(filter) => Some(filter),
+            CopyRecipient::Source | CopyRecipient::Untargeted(_) => None,
+        }
+    }
+
+    /// CR 115.1 + CR 608.2k: build the recipient for a DECLARED-target subject,
+    /// routing a context ref to [`Self::Untargeted`].
+    ///
+    /// A context ref (`SelfRef`, `TriggeringSource`, `ParentTarget`, …) resolves
+    /// from chain or event context rather than a player's announcement, so it
+    /// can never occupy a target slot. This constructor is the single place that
+    /// decision is made, which is what lets [`Self::announced_filter`] stay
+    /// unconditional; see its doc for why a guard there would be wrong.
+    pub fn targeted(filter: TargetFilter) -> Self {
+        if filter.is_context_ref() {
+            CopyRecipient::Untargeted(filter)
+        } else {
+            CopyRecipient::Target(filter)
+        }
+    }
+
+    pub fn is_source(&self) -> bool {
+        matches!(self, CopyRecipient::Source)
+    }
+}
+
+/// CR 115.1: re-apply [`CopyRecipient::targeted`]'s invariant on the way in.
+///
+/// The parser can never emit a context-ref `Target`, but `Deserialize` is a
+/// second entry point: a hand-edited or corrupted mid-resolution snapshot could
+/// otherwise introduce `Target(TriggeringSource)`, which would collapse the
+/// recipient and the copy source onto one declared object across all six
+/// authorities. Normalizing here keeps the invariant a property of the type
+/// rather than of one construction site.
+fn deserialize_copy_recipient<'de, D>(deserializer: D) -> Result<CopyRecipient, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match CopyRecipient::deserialize(deserializer)? {
+        CopyRecipient::Target(filter) => CopyRecipient::targeted(filter),
+        other => other,
+    })
+}
+
 /// CR 702.179c-d: Direction of a speed change. Typed (not a bool) so the
 /// `Effect::ChangeSpeed` handler dispatches exhaustively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -15221,17 +15378,19 @@ pub enum Effect {
     BecomeCopy {
         #[serde(default = "default_target_filter_any")]
         target: TargetFilter,
-        /// CR 707.2 + CR 611.2c: the object(s) that BECOME the copy. `SelfRef`
-        /// (default) = the source `~` (all existing single-subject cards,
-        /// byte-identical). A typed group filter ("Shards you control", Niko) or
-        /// `ParentTarget` selects a mass recipient set, snapshotted to concrete
-        /// ids at resolution (locked per 611.2c). Mirrors
-        /// `GainActivatedAbilitiesOfTarget.recipient`.
+        /// CR 707.2 + CR 115.1 + CR 611.2c: the object(s) that BECOME the copy.
+        /// `Source` (default) = the ability's own source `~` — every existing
+        /// single-subject copy card, byte-identical. `Target(..)` is an
+        /// announced recipient declared BEFORE the copy source (Shuri, True
+        /// Polymorph); `Untargeted(..)` is a resolution-time recipient set
+        /// (Mirrorweave, Niko's "Shards you control", Assimilation Aegis'
+        /// attached host). See [`CopyRecipient`].
         #[serde(
-            default = "default_target_filter_self_ref",
-            skip_serializing_if = "target_filter_is_self_ref"
+            default,
+            skip_serializing_if = "CopyRecipient::is_source",
+            deserialize_with = "deserialize_copy_recipient"
         )]
-        recipient: TargetFilter,
+        recipient: CopyRecipient,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration: Option<Duration>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -17858,9 +18017,9 @@ fn default_distinct_names() -> Vec<SharedQuality> {
 /// the current reading first, that collision can only ever mis-read a LEGACY
 /// payload, and no legacy writer emitted either shape here. The two legacy
 /// producers were `parse_number_of_distinct_colors_among_permanents_tail`
-/// (craft materials → `And { [ExiledBySource, Typed] }`, or a `parse_type_phrase`
+/// (craft materials → `And { [ExiledBySource, Typed] }`, or a `parse_type_phrase_folding`
 /// object filter) and `parse_for_each_distinct_colors_among_permanents`
-/// (`parse_type_phrase` only) — neither can yield a BARE `ExiledBySource` /
+/// (`parse_type_phrase_folding` only) — neither can yield a BARE `ExiledBySource` /
 /// `TrackedSet` filter.
 fn deserialize_distinct_colors_population<'de, D>(
     deserializer: D,
@@ -25695,13 +25854,18 @@ pub enum ReplacementCondition {
     /// shared `GameState::players_who_created_token_this_turn` primitive: it is
     /// consumed by the first token the controller creates this turn, so a source
     /// that enters mid-turn AFTER an earlier creation does NOT fire (official
-    /// ruling). `player` carries the reusable you/opponent axis (`ControllerRef`),
-    /// mirroring the other controller-relative conditions; the eval arm ignores it
-    /// because ownership is enforced by the replacement's `token_owner_scope`, but
-    /// keeping the field preserves the you/opponent axis for a future
-    /// opponent-scoped "first time an opponent would create…" variant (which would
-    /// also parameterize the eval's player resolution) rather than adding a sibling.
-    FirstTokenCreationEachTurn { player: ControllerRef },
+    /// ruling). `active_player_req` optionally scopes the window to whose turn it is
+    /// (CR 102.1: the active player is the player whose turn it is): `None` = any
+    /// turn (Moonlit Meditation's bare "each turn"); `Some(You)` = the controller's
+    /// own turns only ("during each of your turns"). The orthogonal WHOSE-TOKENS
+    /// axis is owned by the replacement's `token_owner_scope`, which is why there is
+    /// no second `ControllerRef` here: the window key is the event's creating player
+    /// (`players_who_created_token_this_turn`), which is a `PlayerId`, not a
+    /// `ControllerRef`.
+    FirstTokenCreationEachTurn {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_player_req: Option<ControllerRef>,
+    },
     /// CR 121.1 + CR 504.1 + CR 614.6: "except the first one you draw in each
     /// of your draw steps" — the replacement applies to every card-draw EXCEPT
     /// the draw step's mandatory first draw (the active player's CR 504.1
@@ -27574,6 +27738,39 @@ pub enum PostReplacementContinuation {
     Resolved(Box<ResolvedAbility>),
 }
 
+/// CR 611.2c vs CR 613.1: where a `ReplacementDefinition` on an object came from.
+///
+/// CR 613.1 determines the values of an object's CHARACTERISTICS, starting from
+/// the printed card — so the layer engine reseeds `replacement_definitions` from
+/// `base_replacement_definitions` every pass. CR 611.2c settles that a prevention
+/// shield is not one of those characteristics; its example says so outright:
+/// "An effect that reads 'Prevent all damage creatures would deal this turn'
+/// doesn't modify any object's characteristics, so it's modifying the rules of
+/// the game."
+///
+/// A continuous effect created by the RESOLUTION of a spell or ability (CR 611.2a)
+/// is merely STORED on a host object so the replacement pipeline can find it. It
+/// lasts as long as the ability stated (CR 611.2a) and ends when it is used up or
+/// its duration expires (CR 615.3) — not at the next layer pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ReplacementOrigin {
+    /// A printed/copiable characteristic (CR 613.1), or a per-pass static
+    /// derivation. Reset away and re-derived by every layer pass.
+    #[default]
+    Characteristic,
+    /// A continuous effect created by resolution (CR 611.2a). Survives the
+    /// CR 613.1 reset; removed only by an expiry prune or a zone change.
+    Resolution,
+}
+
+impl ReplacementOrigin {
+    /// `skip_serializing_if` predicate: the default origin emits no key, so every
+    /// pre-existing serialized `ReplacementDefinition` is byte-identical.
+    pub fn is_characteristic(&self) -> bool {
+        matches!(self, ReplacementOrigin::Characteristic)
+    }
+}
+
 /// Replacement effect definition with typed fields. Zero params HashMap.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplacementDefinition {
@@ -27758,6 +27955,83 @@ pub struct ReplacementDefinition {
     /// as before (every object-attached replacement; unchanged).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_controller: Option<crate::types::player::PlayerId>,
+    /// CR 113.7a + CR 109.1: Installing SOURCE anchor for global pending damage
+    /// replacements whose filters, conditions, or exclusions are HOST-RELATIVE.
+    ///
+    /// The object half of `source_controller` (directly above), added for the same
+    /// reason and by the same mechanism. Global replacements live in
+    /// `pending_damage_replacements` under the sentinel `ObjectId(0)`, which has no
+    /// entry in `state.objects`, so every host-relative reference silently
+    /// mis-resolves there: `TargetFilter::SelfRef` in `damage_source_filter`
+    /// (Mercenaries, "the next time THIS CREATURE would deal damage to you"),
+    /// `SourceExclusion::Exclude` in `DamageTargetFilter::PlayerOrPermanentsControlledBy`
+    /// ("you and OTHER permanents you control"), `DamageTargetPlayerScope::SourceChosenPlayer`,
+    /// and every `ReplacementCondition` that reads its source object.
+    ///
+    /// CR 113.7a: "Once activated or triggered, an ability exists on the stack
+    /// independently of its source. Destruction or removal of the source after that
+    /// time won't affect the ability. ... if the source is no longer in the zone
+    /// it's expected to be in at that time, its last known information is used."
+    /// The effect is independent of its source but still REFERS to it, so the
+    /// reference must be carried rather than dropped.
+    ///
+    /// NOT last-known information, despite the clause the quote above ends on.
+    /// This field carries an ID, not a snapshot of the object's characteristics:
+    /// once the anchored object is gone, `state.objects.get(anchor)` is `None`, so
+    /// IDENTITY comparisons keep working on the id alone (`TargetFilter::SelfRef`
+    /// -> `object_matches_trigger_source`; `SourceExclusion::Exclude`'s
+    /// `*oid != repl_source`) while PROPERTY-READING filters and conditions fail
+    /// CLOSED. The CR 113.7a quote is cited here for its source-independence half;
+    /// implementing LKI itself is out of scope and is not claimed.
+    ///
+    /// Set at install time by `effects::install_floating_damage_replacement`, and
+    /// ONLY when the source is an object in the zone set that caller passed as
+    /// `anchor_zones` -- which is exactly the zone set THAT CALLER used to decide
+    /// object-hosting before the authority existed: `Zone::Battlefield` for
+    /// `prevent_damage::resolve`'s untargeted branch, `Zone::Battlefield |
+    /// Zone::Command` for `push_player_scoped_shield`, and EMPTY for
+    /// `create_damage_replacement`'s already-registry arm. A shield created by a
+    /// resolving instant never had a host, so it has no host identity to anchor and
+    /// keeps `None`; so does an untargeted shield from a Command-zone emblem, which
+    /// that branch already routed to the registry before this field existed.
+    /// `None` therefore reproduces the pre-anchor sentinel behavior exactly, for
+    /// every replacement that existed before this field.
+    ///
+    /// Consumed by the pending scan in `game::replacement::find_applicable_replacements`,
+    /// which fills with `source_object.unwrap_or(ObjectId(0))` every argument
+    /// position that `object_replacement_candidate_applies` fills with `obj.id`.
+    /// `ReplacementId::source` is NOT this field: it stays `ObjectId(0)`, because it
+    /// is the STORAGE discriminator that routes ~14 downstream consumers to the
+    /// registry rather than to `state.objects`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_object: Option<ObjectId>,
+    /// CR 611.2a + CR 611.2c + CR 613.1: provenance of this definition — a printed
+    /// characteristic (or per-pass derived grant) versus a continuous effect
+    /// created by the resolution of a spell or ability. See [`ReplacementOrigin`].
+    ///
+    /// Stamped ONLY by `GameObject::install_resolution_replacement`, which is the
+    /// single authority for resolution-time object installs; every parser/printed
+    /// construction leaves the `Characteristic` default. Read by
+    /// `game_object::reseed_replacements_carrying_resolution_effects` (the CR 613.1
+    /// carry-over) and `layers::settle_resolution_replacements_to_tail`.
+    ///
+    /// `origin` participates in the derived `PartialEq`, and that is LOAD-BEARING.
+    /// `layers.rs` dedups both per-pass derivation sites by whole-definition
+    /// structural equality over the LIVE set (the Riot as-enters derivation and the
+    /// `ContinuousModification::GrantReplacement` arm, both
+    /// `replacement_definitions.iter_all().any(|r| r == &replacement)`). Without
+    /// `origin` in that comparison, a CARRIED resolution shield could compare equal
+    /// to a per-pass derived grant and SUPPRESS it — the grant would silently stop
+    /// being installed while its static was still active. The dual consequence is
+    /// accepted deliberately: in the structurally-identical-but-for-`origin` case
+    /// the dedup necessarily leaves TWO entries. In practice `expiry` already
+    /// discriminates (a resolution shield carries `Some(..)`, a derived grant
+    /// `None`), so that case is synthetic; the hostile fixture
+    /// `carried_resolution_def_does_not_suppress_an_identical_derived_grant`
+    /// (`layers.rs`) pins it anyway. `source_object` (directly above) joins
+    /// `PartialEq` on exactly the same terms.
+    #[serde(default, skip_serializing_if = "ReplacementOrigin::is_characteristic")]
+    pub origin: ReplacementOrigin,
     /// CR 614.1a: For `AddCounter` replacements, whether `valid_player` scopes by
     /// the counter *recipient* (default — prevention/affected-controller doublers)
     /// or by the *actor* putting the counters (Vorinclex/Halving Season, per the
@@ -27863,6 +28137,8 @@ impl ReplacementDefinition {
             counter_match: None,
             enters_under: None,
             source_controller: None,
+            source_object: None,
+            origin: ReplacementOrigin::Characteristic,
             counter_replacement_subject: CounterReplacementSubject::Recipient,
         }
     }
@@ -27965,6 +28241,14 @@ impl ReplacementDefinition {
             self.stamp_default_turn_expiry();
         }
         self
+    }
+
+    /// CR 611.2a + CR 611.2c: was this definition created by the RESOLUTION of a
+    /// spell or ability (rather than being a printed characteristic or a per-pass
+    /// derived grant)? Such a definition is carried across the CR 613.1 layer
+    /// reset by `game_object::reseed_replacements_carrying_resolution_effects`.
+    pub fn is_resolution_installed(&self) -> bool {
+        self.origin == ReplacementOrigin::Resolution
     }
 
     pub fn combat_scope(mut self, scope: CombatDamageScope) -> Self {
@@ -28227,7 +28511,9 @@ pub struct LatchedCopiableSnapshot {
 /// enter-as-a-copy waits) resolves the entering object into a copy of the
 /// chosen permanent. `PersistChosenAttribute` (Metamorphic Alteration) latches
 /// the chosen permanent's copiable values onto the source Aura and installs a
-/// copy effect on the Aura's enchanted host instead.
+/// copy effect on the Aura's enchanted host instead. `CopyTokenSource` (Esix,
+/// Fractal Bloom) uses the chosen permanent as the copy SOURCE for a token-creation
+/// substitution, transforming nothing and latching nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "type")]
 pub enum CopyTargetPurpose {
@@ -28240,6 +28526,11 @@ pub enum CopyTargetPurpose {
     /// latched and applied to a *separate* recipient (the source Aura's host)
     /// rather than to the entering object. Metamorphic Alteration.
     PersistChosenAttribute,
+    /// CR 707.1 + CR 614.1a: the chosen permanent is the **copy source** for a
+    /// token-creation substitution — the replacement creates that many tokens
+    /// that are copies of it (Esix, Fractal Bloom). Unlike `BecomeCopy`, nothing
+    /// is transformed; unlike `PersistChosenAttribute`, nothing is latched.
+    CopyTokenSource,
 }
 
 /// CR 702.143d + CR 702 (alternative-cost cast-from-off-zone family): how a
@@ -30627,6 +30918,43 @@ mod tests {
     use crate::types::mana::ZoneSpendPolarity;
     use crate::types::zones::Zone;
 
+    /// Issue #8485: `origin` and `source_object` are additive and wire-compatible.
+    ///
+    /// Both carry `#[serde(default, skip_serializing_if = ..)]`, so a plain printed
+    /// definition emits NEITHER key (every existing serialized state, including
+    /// `card-data.json`, stays byte-identical) and an old payload carrying neither
+    /// loads as `Characteristic` / `None`.
+    #[test]
+    fn replacement_origin_and_source_object_are_wire_compatible() {
+        let plain =
+            ReplacementDefinition::new(crate::types::replacements::ReplacementEvent::DamageDone);
+        let json = serde_json::to_string(&plain).expect("serializes");
+        assert!(
+            !json.contains("origin"),
+            "a Characteristic def must emit no `origin` key: {json}"
+        );
+        assert!(
+            !json.contains("source_object"),
+            "an unanchored def must emit no `source_object` key: {json}"
+        );
+
+        // An old payload with neither key loads as Characteristic / None.
+        let loaded: ReplacementDefinition = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(loaded.origin, ReplacementOrigin::Characteristic);
+        assert_eq!(loaded.source_object, None);
+        assert!(!loaded.is_resolution_installed());
+
+        // A Resolution def with an anchor round-trips faithfully.
+        let mut stamped = plain.clone();
+        stamped.origin = ReplacementOrigin::Resolution;
+        stamped.source_object = Some(ObjectId(42));
+        let round_tripped: ReplacementDefinition =
+            serde_json::from_str(&serde_json::to_string(&stamped).expect("serializes"))
+                .expect("deserializes");
+        assert_eq!(round_tripped, stamped);
+        assert!(round_tripped.is_resolution_installed());
+    }
+
     #[test]
     fn attach_target_bindings_keep_spell_context_construction_and_wire_shape_stable() {
         let external_style = SpellContext {
@@ -32395,6 +32723,90 @@ mod tests {
             ChoiceValue::from_choice(&ChoiceType::color_excluding(vec![ManaColor::White]), "Blue"),
             Some(ChoiceValue::Color(ManaColor::Blue))
         );
+    }
+
+    #[test]
+    fn card_type_choice_serde_preserves_legacy_and_explicit_domains() {
+        let generic: ChoiceType = serde_json::from_str(r#""CardType""#).unwrap();
+        assert_eq!(generic, ChoiceType::card_type());
+        assert_eq!(serde_json::to_string(&generic).unwrap(), r#""CardType""#);
+
+        let old_restricted = r#"{"CardType":{"excluded":["Creature","Land"]}}"#;
+        let decoded: ChoiceType = serde_json::from_str(old_restricted).unwrap();
+        assert_eq!(
+            decoded,
+            ChoiceType::CardType {
+                options: vec![
+                    CoreType::Artifact,
+                    CoreType::Enchantment,
+                    CoreType::Instant,
+                    CoreType::Planeswalker,
+                    CoreType::Sorcery,
+                ],
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&decoded).unwrap(),
+            r#"{"CardType":{"options":["Artifact","Enchantment","Instant","Planeswalker","Sorcery"]}}"#
+        );
+
+        let explicit = r#"{"CardType":{"options":["Sorcery","Artifact"]}}"#;
+        let decoded: ChoiceType = serde_json::from_str(explicit).unwrap();
+        assert_eq!(
+            decoded,
+            ChoiceType::CardType {
+                options: vec![CoreType::Sorcery, CoreType::Artifact],
+            }
+        );
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), explicit);
+
+        assert!(serde_json::from_str::<ChoiceType>(
+            r#"{"CardType":{"options":["Artifact"],"excluded":["Land"]}}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<ChoiceType>(
+            r#"{"CardType":{"excluded":["Artifact","Creature","Enchantment","Instant","Land","Planeswalker","Sorcery"]}}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn card_type_choice_value_uses_the_authoritative_legal_domain() {
+        let generic = ChoiceType::card_type();
+        let ChoiceType::CardType { options } = &generic else {
+            panic!("card_type() must construct CardType");
+        };
+        assert_eq!(
+            ChoiceType::legal_card_type_options(options),
+            CoreType::CHOOSABLE_TYPES.to_vec()
+        );
+        assert_eq!(
+            ChoiceValue::from_choice(&generic, "Battle"),
+            None,
+            "generic engine policy must reject Battle"
+        );
+        assert_eq!(
+            ChoiceValue::from_choice(&generic, "Kindred"),
+            None,
+            "generic engine policy must reject Kindred"
+        );
+
+        let explicit = ChoiceType::CardType {
+            options: vec![CoreType::Sorcery, CoreType::Artifact],
+        };
+        assert_eq!(
+            ChoiceType::legal_card_type_options(&[CoreType::Sorcery, CoreType::Artifact]),
+            vec![CoreType::Sorcery, CoreType::Artifact]
+        );
+        assert_eq!(
+            ChoiceValue::from_choice(&explicit, "Sorcery"),
+            Some(ChoiceValue::CardType(CoreType::Sorcery))
+        );
+        assert_eq!(
+            ChoiceValue::from_choice(&explicit, "Artifact"),
+            Some(ChoiceValue::CardType(CoreType::Artifact))
+        );
+        assert_eq!(ChoiceValue::from_choice(&explicit, "Land"), None);
     }
 
     #[test]

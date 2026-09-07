@@ -16486,7 +16486,7 @@ mod myriad_runtime_tests {
         // Make Muddle become a copy of the target "except it has myriad".
         let copy_ability = ResolvedAbility::new(
             Effect::BecomeCopy {
-                recipient: TargetFilter::SelfRef,
+                recipient: crate::types::ability::CopyRecipient::Source,
                 target: TargetFilter::Any,
                 duration: Some(Duration::UntilEndOfTurn),
                 mana_value_limit: None,

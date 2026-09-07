@@ -8,6 +8,7 @@ import { DraftSteps } from "../draft/DraftSteps";
 import { WhatsNewModal } from "../modal/WhatsNewModal";
 import { CardDataLoadingBar } from "./CardDataLoadingBar";
 import { ChromeControls } from "./ChromeControls";
+import { OfflineModeBadge } from "./OfflineModeBadge";
 import { Rail } from "./Rail";
 import { DraftShellChromeProvider, ShellProvider, type DraftShellChromeConfig } from "./ShellContext";
 import { SocialBar } from "./SocialBar";
@@ -160,6 +161,7 @@ export function AppShell() {
                 <SocialBar />
               ) : null}
             </div>
+            <OfflineModeBadge />
             {/* Inner Suspense so a lazy route's load swaps ONLY the content area —
                 the rail/scene persist (true SPA feel). */}
             <main className={`shell-content min-h-0 min-w-0 flex-1 ${responsiveDraftChrome ? "overflow-hidden" : "max-[820px]:pb-[76px]"}`}>

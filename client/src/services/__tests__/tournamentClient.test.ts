@@ -96,9 +96,11 @@ class MockWebSocket extends EventTarget {
  * override below.
  *
  * NOTE the deliberate asymmetry with the gate itself, which reads the frozen
- * floor `MIN_LOBBY_PROTOCOL_FOR_TOURNAMENT_ACK`. Both constants are 5 today and
- * diverge at the next lobby bump; each site is written against the one that
- * answers its own question.
+ * floor `MIN_LOBBY_PROTOCOL_FOR_TOURNAMENT_ACK`. The two constants have already
+ * diverged — the current version is 6 and the frozen ack floor is still 5 —
+ * which is exactly the state this asymmetry was written for: each site is
+ * written against the constant that answers its own question, so neither has to
+ * move again when the next bump widens the gap further.
  */
 function makePhaseSocket(
   ws: MockWebSocket,
@@ -283,7 +285,7 @@ const HELPERS: HelperCase[] = [
         opts,
       ),
     frame:
-      '{"type":"CreateTournament","data":{"name":"Friday Night","arity":2,"scoring":{"win_points":3,"draw_points":1,"loss_points":0},"bracket":"Swiss","total_rounds":3}}',
+      '{"type":"CreateTournament","data":{"name":"Friday Night","arity":2,"scoring":{"win_points":3,"draw_points":1,"loss_points":0},"bracket":"Swiss","total_rounds":3,"plus_rounds":null,"format":null}}',
     gated: false,
     reply: CREATED_REPLY,
   },
@@ -392,7 +394,34 @@ describe("tournament request frames", () => {
 
     // `Option<u32>` with `#[serde(default)]` and no `skip_serializing_if`.
     expect(ws.send).toHaveBeenCalledWith(
-      '{"type":"CreateTournament","data":{"name":"Friday Night","arity":4,"scoring":{"win_points":7,"draw_points":1,"loss_points":0},"bracket":"Swiss","total_rounds":null}}',
+      '{"type":"CreateTournament","data":{"name":"Friday Night","arity":4,"scoring":{"win_points":7,"draw_points":1,"loss_points":0},"bracket":"Swiss","total_rounds":null,"plus_rounds":null,"format":null}}',
+    );
+
+    controller.abort();
+    await expect(promise).resolves.toMatchObject({ ok: false, reason: "aborted" });
+  });
+
+  // Protocol v7: an event-format label and an "automatic + N" round addend ride
+  // the frame as `format` and `plus_rounds`, in that declaration order.
+  it("puts format and plus_rounds on the wire when supplied", async () => {
+    const ws = new MockWebSocket();
+    const controller = new AbortController();
+    const promise = createTournamentOver(
+      makePhaseSocket(ws),
+      {
+        name: "Friday Night",
+        arity: 2,
+        scoring: { win_points: 3, draw_points: 1, loss_points: 0 },
+        bracket: "Swiss",
+        totalRounds: null,
+        plusRounds: 2,
+        format: "Commander",
+      },
+      { signal: controller.signal },
+    );
+
+    expect(ws.send).toHaveBeenCalledWith(
+      '{"type":"CreateTournament","data":{"name":"Friday Night","arity":2,"scoring":{"win_points":3,"draw_points":1,"loss_points":0},"bracket":"Swiss","total_rounds":null,"plus_rounds":2,"format":"Commander"}}',
     );
 
     controller.abort();
@@ -838,12 +867,14 @@ describe("gated actions against a broker that cannot answer them", () => {
 
   // V22 — the threshold is a FLOOR frozen at the version that introduced the
   // ack, not an equality against whatever this client currently speaks. The
-  // `6` row is the one that matters: a newer, fully-compatible broker must NOT
-  // be refused.
+  // `7` row is the one that matters: a newer, fully-compatible broker must NOT
+  // be refused. It has to sit strictly ABOVE the current version (6) to say
+  // that — a row at the current version only proves the client accepts its own
+  // generation, which an equality gate would pass too.
   it.each([
     ["one below the floor", 4, false],
     ["exactly at the floor", 5, true],
-    ["above the floor (a future broker)", 6, true],
+    ["above the floor (a future broker)", 7, true],
   ] as const)(
     "a peer %s reaches the correlated path = %s (V22)",
     async (_label, lobbyProtocolVersion, correlated) => {
@@ -1138,13 +1169,23 @@ describe("tournamentClient source-level boundaries", () => {
   // The tripwire for the D8.2 latent bug, and it has to be a STATIC one.
   //
   // The runtime V22 rows catch a gate written as an EQUALITY against the
-  // current version — the `lobbyProtocolVersion: 6` fixture fails immediately
-  // under that mistake. They cannot catch a gate written as
-  // `< LOBBY_PROTOCOL_VERSION`: measured, that form passes all three V22 rows
-  // today, because the floor and the current version are both 5, and only
-  // starts refusing fully-compatible brokers at the next lobby bump. This
-  // assertion closes exactly that window — it fails at the moment the mistake
-  // is made rather than months later, in a release, against servers that work.
+  // current version — the "above the floor" fixture, which sits strictly above
+  // what this client speaks, fails immediately under that mistake.
+  //
+  // The `< LOBBY_PROTOCOL_VERSION` form is the one this assertion exists for,
+  // and its history is the argument for keeping it. While the ack floor and the
+  // current version were both 5, that form passed all three V22 rows and would
+  // only have begun refusing fully-compatible brokers at the next lobby bump —
+  // a bug latent in a green suite, which is precisely the window this tripwire
+  // closed. Now that the current version has moved to 6 over a floor frozen at
+  // 5 the window is open rather than latent, so the "exactly at the floor" row
+  // would fail under that form too. The tripwire stays, and stays static, for
+  // the reason it was static to begin with: it is scoped to the SOURCE FORM, so
+  // it names the mistake at the moment it is written rather than inferring it
+  // from behavior, it survives any future rewrite of the V22 table, and it
+  // closes the identical latent window for the NEXT floor frozen at a
+  // then-current version — which `MIN_LOBBY_PROTOCOL_FOR_DEFAULT_SCORING`,
+  // born at 6, now is.
   it("never gates the ack on the version this client currently speaks", () => {
     expect(SOURCE.match(GATE_AGAINST_CURRENT_VERSION)).toBeNull();
 

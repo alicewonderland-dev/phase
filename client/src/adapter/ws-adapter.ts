@@ -208,6 +208,15 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 67 — DerivedViews.dungeon_rooms entries gained required `card` and `rooms`
+ *      fields, carrying the dungeon card's Scryfall identity and the whole
+ *      room graph (each room's edges plus its position on the printed card).
+ *      A PARSE bump like 66, not a capability bump like 24: neither field is
+ *      serde-optional, so a v66 peer fails deserialization on any snapshot
+ *      where a player is venturing rather than degrading silently. The
+ *      reverse skew is equally hard — this client destructures `card`
+ *      unconditionally to resolve the card art, so a v66 host would throw in
+ *      render, not merely omit the map panel.
  * 65 — DraftMatchStart now announces the exact Full-session identity for the
  *      spawned match. Draft reconnect attaches the authenticated draft seat
  *      to that Full-session lifetime, and Full follow-up frames carry the key
@@ -441,7 +450,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      into a MulliganDecisionPhase::BottomCards sub-phase on
  *      WaitingFor::MulliganDecision.
  */
-export const PROTOCOL_VERSION = 65;
+export const PROTOCOL_VERSION = 67;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
@@ -471,6 +480,36 @@ export const LOBBY_MIN_SUPPORTED_SERVER_PROTOCOL = PROTOCOL_VERSION - 1;
  * twice for GameState-only changes and the derived lobby window went disjoint
  * from the deployed broker's.
  *
+ * 7 — Tournament game-format label and an "automatic + N" round option. Two
+ *     fields added to CreateTournament, both optional (`#[serde(default)]`):
+ *     `format` (a GameFormat display label, mirroring the one a LobbyGame
+ *     listing already carries) and `plus_rounds` (add N to the auto-derived
+ *     round count — the "Swiss plus N" shape, mutually exclusive with
+ *     `total_rounds`). Separately, the DIFFERENT TournamentSummary message
+ *     gains a `format` echoed back resolved (server → client). Purely ADDITIVE
+ *     in BOTH directions, so MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL below stays at
+ *     2 and — unlike 6's scoring relaxation — NO client-side floor is needed:
+ *     a client sending `format`/`plus_rounds` to a pre-7 broker has them
+ *     ignored as unknown fields (a silent capability loss, not a parse error),
+ *     and a pre-7 broker's summary omitting `format` is inert against this
+ *     client, whose consumer is `JSON.parse`.
+ * 6 — Broker-owned tournament action legality, broker-owned default scoring,
+ *     and expiring/rotating tournament credentials. Two lobby variants added —
+ *     RenewTournamentCredential and TournamentCredentialRenewed — which alone
+ *     makes this bump mandatory. PairingView gains a required report_gate;
+ *     TournamentSummary gains a required open_actions and a required resolved
+ *     scoring; TournamentCreated and TournamentJoined each gain a required
+ *     expires_at_ms beside the token they already carried. All of those are
+ *     server → client, and this client ignores fields it does not name, so
+ *     MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL below deliberately stays at 2 — a
+ *     v2 broker still speaks everything this client already parses.
+ *     CreateTournament.scoring is RELAXED from required to optional, `None`
+ *     meaning "the broker applies its arity default". That direction is NOT
+ *     symmetric: a client that omits scoring against a pre-6 broker gets a
+ *     hard `missing field` parse error, not a degrade. It is gated on the
+ *     CLIENT side by MIN_LOBBY_PROTOCOL_FOR_DEFAULT_SCORING below — capability,
+ *     not parseability, exactly as 5 gated the ack — so a below-floor session
+ *     keeps sending an explicit policy instead of being evicted.
  * 5 — Request-correlated settlement for the four GATED tournament actions.
  *     Two LobbyServerMessage variants added — TournamentActionAck and
  *     TournamentActionRejected — which is what makes this bump mandatory. Both
@@ -506,7 +545,7 @@ export const LOBBY_MIN_SUPPORTED_SERVER_PROTOCOL = PROTOCOL_VERSION - 1;
  * 1 — Initial lobby-owned version, covering the lobby variant set unchanged
  *     since #1880.
  */
-export const LOBBY_PROTOCOL_VERSION = 5;
+export const LOBBY_PROTOCOL_VERSION = 7;
 
 /**
  * Lowest broker LOBBY_PROTOCOL_VERSION this client accepts.
@@ -539,6 +578,41 @@ export const MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL = 2;
  * breaking change requiring its own floor decision.
  */
 export const MIN_LOBBY_PROTOCOL_FOR_TOURNAMENT_ACK = 5;
+
+/**
+ * Lowest broker LOBBY_PROTOCOL_VERSION that accepts a `CreateTournament` with
+ * `scoring` omitted and applies its own arity default.
+ *
+ * A FLOOR frozen at the version that introduced broker-owned default scoring,
+ * on exactly the terms {@link MIN_LOBBY_PROTOCOL_FOR_TOURNAMENT_ACK} above is
+ * frozen — and it must NOT be bumped when LOBBY_PROTOCOL_VERSION moves: a v7
+ * or v8 broker still applies the default, and raising this to match the
+ * current version would push every one of them below the floor and make this
+ * client send an explicit policy forever.
+ *
+ * The gate it guards is sharper than the ack's, which is why the floor exists
+ * at all. Omitting `scoring` against a pre-6 broker is not a missing
+ * capability that degrades — it is a hard `missing field \`scoring\`` parse
+ * error on the broker side. Below this floor the client keeps sending an
+ * explicit policy; at or above it, it may omit one and read the resolved
+ * value back off `TournamentSummary.scoring`.
+ *
+ * Written as a bare integer literal and never as an expression over
+ * LOBBY_PROTOCOL_VERSION — `scripts/check-protocol-version.mjs` matches it
+ * only against a bare integer, so re-deriving it fails the cross-language gate
+ * instead of shipping the latent bug. Like the two floors above there is
+ * deliberately NO ceiling.
+ *
+ * Scope note (protocol v6, wire-contract-only): this floor is the frozen
+ * cross-language contract for the omit-`scoring` capability, and is enforced
+ * today only by `check-protocol-version.mjs`. It has no runtime send-path
+ * consumer yet — `tournamentClient.ts` still always sends an explicit
+ * `ScoringPolicy`, which is the conservative, always-correct direction. The
+ * version-gated omit-path this floor guards lands with the tournament
+ * client-rendering follow-up, alongside reading the resolved value back off
+ * `TournamentSummary.scoring`.
+ */
+export const MIN_LOBBY_PROTOCOL_FOR_DEFAULT_SCORING = 6;
 
 /** Identity advertised by the server in its `ServerHello`. */
 export interface ServerInfo {

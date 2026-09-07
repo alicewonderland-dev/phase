@@ -4036,7 +4036,7 @@ mod tests {
                     AbilityKind::Spell,
                     Effect::BecomeCopy {
                         target: TargetFilter::Typed(TypedFilter::creature()),
-                        recipient: TargetFilter::SelfRef,
+                        recipient: crate::types::ability::CopyRecipient::Source,
                         duration: None,
                         mana_value_limit: None,
                         additional_modifications: Vec::new(),

@@ -34739,7 +34739,7 @@ fn effect_from_the_rubble_chosen_type_graveyard_target() {
 
 /// CR 115.2: An already zone-qualified reanimation target ("return target
 /// creature card from your graveyard to the battlefield") must NOT be
-/// re-scoped by the inferred-origin pass. `parse_type_phrase` already parses
+/// re-scoped by the inferred-origin pass. `parse_type_phrase_folding` already parses
 /// "from your graveyard" into `InZone { Graveyard }` plus a single owner
 /// scope on the filter's `controller` field, so the candidate filter must
 /// carry exactly one owner-`You` scope — guarding against the 905-card
@@ -35645,7 +35645,7 @@ fn passive_cant_be_cast_single_clause_has_no_land_sub_ability() {
 }
 
 /// Pattern-coverage companion: the land-play axis is not limited to "chosen
-/// name" — `parse_type_phrase` resolves any type-phrase subject, so a
+/// name" — `parse_type_phrase_folding` resolves any type-phrase subject, so a
 /// hypothetical type-scoped land-play ban parses the same way (building for
 /// the class, not the single card).
 #[test]
@@ -42766,6 +42766,53 @@ fn labeled_choice_ternary_artifact_creature_land() {
     );
 }
 
+/// CR 205.2a: bare lists remain labels; only the proven as-enters/static
+/// relation promotes Cloud Key and Archon later in document lowering.
+#[test]
+fn bare_core_type_lists_remain_labeled_choices() {
+    assert_eq!(
+        super::try_parse_named_choice(
+            "choose artifact, creature, enchantment, instant, or sorcery"
+        ),
+        Some(ChoiceType::Labeled {
+            options: vec![
+                "Artifact".to_string(),
+                "Creature".to_string(),
+                "Enchantment".to_string(),
+                "Instant".to_string(),
+                "Sorcery".to_string(),
+            ],
+        })
+    );
+}
+
+/// CR 205.2a: Stenn's exclusion is represented as its ordered positive
+/// complement, so prompt generation and answer validation share one domain.
+#[test]
+fn card_type_other_than_uses_ordered_positive_complement() {
+    assert_eq!(
+        super::try_parse_named_choice("choose a card type other than creature or land."),
+        Some(ChoiceType::card_type_from(vec![
+            CoreType::Artifact,
+            CoreType::Enchantment,
+            CoreType::Instant,
+            CoreType::Planeswalker,
+            CoreType::Sorcery,
+        ]))
+    );
+    for malformed in [
+        "choose a card type other than creature or",
+        "choose a card type other than creature, creature",
+        "choose a card type other than battle",
+    ] {
+        assert_eq!(
+            super::try_parse_named_choice(malformed),
+            None,
+            "{malformed}"
+        );
+    }
+}
+
 /// Teferi's Realm — 4-option Oxford-comma labeled choice. Confirms the
 /// generalization is N-ary, not capped at 3.
 #[test]
@@ -44345,8 +44392,14 @@ fn choose_one_of_detects_shared_target_counter_choice() {
 
     // The shared "on up to one other target artifact" is a single cast-time
     // target lifted to a `TargetOnly` head; the up-to-one cap lives on the
-    // head, and the counter choice is the chained sub-ability whose branches
-    // act on `ParentTarget`.
+    // head, and the counter choice is the chained sub-ability.
+    //
+    // The branches name the head's first target SLOT, not a bare parent
+    // anaphor. CR 115.6 allows announcing zero targets for "up to one", and a
+    // bare anaphor with no chosen object falls back to the ability's own source
+    // — which this card excludes by name ("one OTHER target artifact"). See
+    // `inspirit_with_no_other_artifact_puts_no_counter_on_itself`, which
+    // measured a +1/+1 counter landing on the Spacecraft itself.
     assert!(
         matches!(&*ability.effect, Effect::TargetOnly { .. }),
         "expected TargetOnly head, got {:?}",
@@ -44375,7 +44428,7 @@ fn choose_one_of_detects_shared_target_counter_choice() {
         } => {
             assert_eq!(*counter_type, CounterType::Plus1Plus1);
             assert_eq!(*count, QuantityExpr::Fixed { value: 1 });
-            assert_eq!(*target, TargetFilter::ParentTarget);
+            assert_eq!(*target, TargetFilter::ParentTargetSlot { index: 0 });
         }
         other => panic!("expected first branch PutCounter, got {other:?}"),
     }
@@ -44388,7 +44441,7 @@ fn choose_one_of_detects_shared_target_counter_choice() {
         } => {
             assert_eq!(*counter_type, CounterType::Generic("charge".to_string()));
             assert_eq!(*count, QuantityExpr::Fixed { value: 2 });
-            assert_eq!(*target, TargetFilter::ParentTarget);
+            assert_eq!(*target, TargetFilter::ParentTargetSlot { index: 0 });
         }
         other => panic!("expected second branch PutCounter, got {other:?}"),
     }
@@ -44604,6 +44657,120 @@ fn choose_one_of_detects_from_among_counter_choice() {
             other => panic!("expected branch {i} PutCounter, got {other:?}"),
         }
     }
+}
+
+/// CR 122.1a + CR 122.1b + CR 608.2d: Elspeth Resplendent's +1 conjoins a
+/// FIXED counter with a chosen one — "Put a +1/+1 counter and a counter from
+/// among flying, first strike, lifelink, or vigilance on it". Both halves are
+/// already supported apart (Unexpected Fangs prints the conjoined pair of fixed
+/// kinds, Aragorn prints the bare from-among choice); only the combination fell
+/// to `Unimplemented`, so the whole ability did nothing.
+///
+/// Shape follows the card's printed ruling of 2022-04-29: "its controller
+/// chooses flying, first strike, lifelink, or vigilance, then that counter and
+/// the +1/+1 counter are placed on the target creature at the same time." So
+/// the CHOICE sits above both placements and the unconditional counter rides
+/// inside each branch — no player decision separates the two placements.
+#[test]
+fn choose_one_of_detects_fixed_counter_conjoined_with_from_among_choice() {
+    use crate::types::counter::CounterType;
+    use crate::types::keywords::KeywordKind;
+
+    let ability = parse_effect_chain(
+        "Put a +1/+1 counter and a counter from among flying, first strike, lifelink, or vigilance on it.",
+        AbilityKind::Spell,
+    );
+
+    assert!(
+        matches!(&*ability.effect, Effect::TargetOnly { .. }),
+        "expected TargetOnly head, got {:?}",
+        ability.effect
+    );
+
+    let choice = ability
+        .sub_ability
+        .as_deref()
+        .expect("the choice must be chained under the shared target");
+    let Effect::ChooseOneOf { chooser, branches } = &*choice.effect else {
+        panic!(
+            "expected ChooseOneOf directly under the target, got {:?}",
+            choice.effect
+        );
+    };
+    assert_eq!(*chooser, PlayerFilter::Controller);
+    assert_eq!(branches.len(), 4, "four printed kinds");
+
+    let expected = [
+        KeywordKind::Flying,
+        KeywordKind::FirstStrike,
+        KeywordKind::Lifelink,
+        KeywordKind::Vigilance,
+    ];
+    for (i, kind) in expected.iter().enumerate() {
+        match &*branches[i].effect {
+            Effect::PutCounter {
+                counter_type,
+                count,
+                target,
+            } => {
+                assert_eq!(*counter_type, CounterType::Keyword(*kind), "branch {i}");
+                assert_eq!(*count, QuantityExpr::Fixed { value: 1 });
+                // The parent's FIRST target slot, not a bare parent anaphor.
+                // The clause parsed here carries no "up to one" of its own —
+                // the conjoined form always names the slot. The optional-slot
+                // case that motivates it is pinned at runtime by
+                // `elspeth_plus_one_with_no_target_places_nothing`.
+                assert_eq!(*target, TargetFilter::ParentTargetSlot { index: 0 });
+            }
+            other => panic!("expected branch {i} PutCounter, got {other:?}"),
+        }
+
+        // The unconditional half rides inside the branch, after the chosen
+        // kind and with nothing in between.
+        let conjoined = branches[i]
+            .sub_ability
+            .as_deref()
+            .unwrap_or_else(|| panic!("branch {i} must carry the +1/+1 counter"));
+        assert!(
+            matches!(
+                &*conjoined.effect,
+                Effect::PutCounter {
+                    counter_type: CounterType::Plus1Plus1,
+                    target: TargetFilter::ParentTargetSlot { index: 0 },
+                    ..
+                }
+            ),
+            "branch {i} must place the +1/+1 counter on the same slot, got {:?}",
+            conjoined.effect
+        );
+        assert!(
+            conjoined.sub_ability.is_none(),
+            "branch {i} places exactly the two counters"
+        );
+    }
+}
+
+/// The peel is what admits a `FromAmong` list without the "your choice of "
+/// marker. Without a fixed conjunct the marker is still required, so this bare
+/// text must stay unsupported.
+///
+/// This case is green on `main` too — it does not discriminate the fix. It is a
+/// bolt against later widening, and that was measured, not assumed: removing
+/// the `FromAmong` guard in `try_parse_put_counter_choice` makes this text
+/// supported and this test the only one that falls.
+#[test]
+fn from_among_without_marker_or_fixed_conjunct_stays_unsupported() {
+    let ability = parse_effect_chain(
+        "Put a counter from among flying, first strike, lifelink, or vigilance on it.",
+        AbilityKind::Spell,
+    );
+
+    assert!(
+        matches!(&*ability.effect, Effect::Unimplemented { .. }),
+        "\"from among\" without the marker and without a fixed conjunct must stay a \
+         strict gap, got {:?}",
+        ability.effect
+    );
 }
 
 #[test]
@@ -47393,10 +47560,13 @@ fn duration_reconciliation_refuses_a_bound_the_lingering_grant_cannot_carry() {
         Some(LingeringPermission),
         "reach guard: an unbounded window must still degrade to the lingering grant"
     );
-    // The two single-card mechanisms carry no batch bound and are untouched.
+    // The two single-card mechanisms carry no batch bound, so neither can refuse
+    // — but the during-resolution one still DEGRADES: CR 608.2g + CR 117.1a, a
+    // cast that happens as the ability resolves has no later priority window,
+    // which is exactly what a stated lifetime claims.
     assert_eq!(
         CastFromZoneDriver::DuringResolution.with_lingering_duration(),
-        Some(CastFromZoneDriver::DuringResolution)
+        Some(LingeringPermission)
     );
     assert_eq!(
         LingeringPermission.with_lingering_duration(),
@@ -53725,9 +53895,13 @@ fn face_of_boe_clause_folds_suspend_cost_and_during_resolution() {
 /// CR 608.2g vs CR 611.2: the shared filter-form DRIVER authority is
 /// duration-blind — the discriminator is mode + hand-origin + an alternative
 /// casting method (`without_paying` OR an alternative cost). Duration is
-/// intentionally not a parameter: twinning glass (durational, free →
-/// DuringResolution) and Sen Triplets (durational, full-cost → Lingering)
-/// prove the wp/alt axis decides, not duration.
+/// intentionally not a parameter because this authority answers the
+/// NO-DURATION question; a stated lifetime is reconciled afterwards by
+/// `CastFromZoneDriver::with_lingering_duration`, which degrades every
+/// `DuringResolution` it sees. So the rows below are the mechanism a clause
+/// gets BEFORE any duration is stamped, and Sen Triplets (hand-origin,
+/// full-cost → lingering) opposite Brain in a Jar (hand-origin, free →
+/// during-resolution) is what shows the wp/alt axis deciding.
 #[test]
 fn filter_cast_driver_authority_is_duration_blind() {
     let d = super::during_resolution_for_filter_cast_clause;
@@ -53738,7 +53912,7 @@ fn filter_cast_driver_authority_is_duration_blind() {
     assert_eq!(d(Cast, false, false, true), LingeringPermission);
     // Memory Plunder / Tasha: non-hand free pool.
     assert_eq!(d(Cast, true, false, false), LingeringPermission);
-    // Expertise cycle / Brain in a Jar / twinning glass / chandra: hand free.
+    // Expertise cycle / Brain in a Jar / Twinning Glass: hand free.
     assert_eq!(d(Cast, true, false, true), DuringResolution);
     // Xander's Pact: exile-origin alt cost — hand gate, not duration.
     assert_eq!(d(Cast, false, true, false), LingeringPermission);
@@ -54853,7 +55027,7 @@ fn ogre_geargrabber_lose_control_stays_unimplemented() {
 /// regardless of its individual disguise cost.
 #[test]
 fn parse_type_phrase_creatures_you_control_with_disguise() {
-    let (filter, rem) = parse_type_phrase("creatures you control with disguise");
+    let (filter, rem) = parse_type_phrase_folding("creatures you control with disguise");
     assert!(
         rem.trim().is_empty(),
         "must fully consume, leftover: {rem:?}"
@@ -59141,7 +59315,7 @@ fn nested_chosen_color_is_seen_at_every_depth_of_the_filter_closure() {
 /// That `false` is a DATED POOL CENSUS, not a structural property, and the
 /// distinction matters enough to spell out. `FilterProp::IsChosenColor` is
 /// stamped by the printed-qualifier arm inside the GENERAL type-phrase parser
-/// (`parser/oracle_target.rs` `parse_type_phrase_with_ctx`), gated only on
+/// (`parser/oracle_target.rs` `parse_type_phrase_folding_with_ctx`), gated only on
 /// `ChosenColorQualifierScope::ChainBound` — which `oracle_effect/mod.rs` sets
 /// for EVERY chunk of EVERY chain. So the grammar does not forbid the prop from
 /// landing in a sibling mass-effect object filter: `ChangeZoneAll`, `PumpAll`,
@@ -59511,7 +59685,7 @@ fn anaphor_color_cards_are_unchanged_by_the_printed_qualifier_arm() {
 ///
 /// The fixture must be MULTI-CLAUSE: a single-clause refusal cannot reach the
 /// guard, because if the clause lowered to `Unimplemented` then
-/// `parse_type_phrase_with_ctx` generally never ran on it, so
+/// `parse_type_phrase_folding_with_ctx` generally never ran on it, so
 /// `printed_color_choice` is `None` and the injector's `Some(_) | None` arm is
 /// taken instead — indistinguishable from the guard firing. That same argument
 /// is why the guard's own negative arm (the CARRIER itself refused, so
@@ -61326,5 +61500,249 @@ fn subject_anchored_delayed_may_binds_the_named_player_not_the_caster() {
             "the caster's half draws for the caster"
         ),
         other => panic!("expected the caster half to Draw, got {other:?}"),
+    }
+}
+
+/// CR 611.2a + CR 608.2g + CR 117.1a: a stated lifetime and a during-resolution
+/// cast are mutually exclusive, and CR 118.9 (who pays) does not enter the
+/// question. All three free members of the "for as long as it remains exiled"
+/// shape must lower to `LingeringPermission` carrying the printed lifetime.
+///
+/// DISCRIMINATING: before the fix `with_lingering_duration` answered
+/// `Some(DuringResolution)` and the single seam that degraded anyway did so
+/// behind a `without_paying_mana_cost: false` guard, so every row here was
+/// `DuringResolution`. Measured over every card with Oracle text, the free
+/// `mode: Cast` members of this wording are these three plus Gale's Redirection.
+///
+/// PARSER-LEVEL FOR THESE THREE ONLY, and not by choice. The shape's end-to-end
+/// proof is `lasting_play_from_exile_permission::a_free_for_as_long_as_exiled_lifetime_is_not_a_declinable_resolution_offer`,
+/// which drives Gale's Redirection through `GameRunner`. The three here have no
+/// runtime fixture, MEASURED with a probe at `cast_from_zone::resolve`:
+/// Thranduil's Decree and Kheru Spellsnatcher never reach that resolver at all
+/// (the countered card lands in exile and the tracked set holds it, but the
+/// grant clause under the `ZoneChangedThisWay` link never resolves), and
+/// Planeswalker's Mischief reaches it with an empty tracked set (the "reveals a
+/// card at random … exile it" anaphor never binds the revealed card, so nothing
+/// is exiled). Both are separate defects upstream of this seam — issue #7132 is
+/// open on the first — and neither is repaired here.
+#[test]
+fn a_free_cast_grant_with_a_stated_lifetime_is_a_lingering_permission() {
+    // Verbatim Oracle text and printed card types (`client/public/card-data.json`).
+    let cards: [(&str, &str, &[&str], &[&str]); 3] = [
+        (
+            "Thranduil's Decree",
+            "Counter target spell. If a permanent spell is countered this way, exile it instead \
+             of putting it into its owner's graveyard. You may cast that card without paying its \
+             mana cost for as long as it remains exiled.",
+            &["Instant"],
+            &[],
+        ),
+        (
+            "Planeswalker's Mischief",
+            "{3}{U}: Target opponent reveals a card at random from their hand. If it's an \
+             instant or sorcery card, exile it. You may cast it without paying its mana cost for \
+             as long as it remains exiled. At the beginning of the next end step, if you haven't \
+             cast it, return it to its owner's hand. Activate only as a sorcery.",
+            &["Enchantment"],
+            &[],
+        ),
+        (
+            // The turned-face-up trigger alone; the printed Morph reminder line
+            // above it carries no cast grant.
+            "Kheru Spellsnatcher",
+            "When this creature is turned face up, counter target spell. If that spell is \
+             countered this way, exile it instead of putting it into its owner's graveyard. You \
+             may cast that card without paying its mana cost for as long as it remains exiled.",
+            &["Creature"],
+            &["Snake", "Wizard"],
+        ),
+    ];
+    for (name, text, types, subs) in cards {
+        let types: Vec<String> = types.iter().map(|s| s.to_string()).collect();
+        let subs: Vec<String> = subs.iter().map(|s| s.to_string()).collect();
+        let parsed = parse_oracle_text(text, name, &[], &types, &subs);
+        let mut casts = Vec::new();
+        for def in parsed.abilities.iter() {
+            collect_cast_from_zone_defs(def, &mut casts);
+        }
+        for trigger in parsed.triggers.iter() {
+            if let Some(execute) = trigger.execute.as_ref() {
+                collect_cast_from_zone_defs(execute, &mut casts);
+            }
+        }
+        assert_eq!(
+            casts.len(),
+            1,
+            "{name}: reach guard — exactly one cast grant must be produced, got {casts:?}"
+        );
+        let def = &casts[0];
+        let Effect::CastFromZone {
+            without_paying_mana_cost,
+            duration,
+            driver,
+            ..
+        } = &*def.effect
+        else {
+            unreachable!("filtered above");
+        };
+        assert!(
+            *without_paying_mana_cost,
+            "{name}: reach guard — this is the FREE half of the class, the half the removed \
+             `without_paying_mana_cost: false` guard excluded"
+        );
+        assert_eq!(
+            *duration,
+            Some(Duration::ForAsLongAs {
+                condition: crate::types::StaticCondition::Unrecognized {
+                    text: "it remains exiled".to_string(),
+                },
+            }),
+            "{name}: the printed lifetime must reach the effect's own duration slot"
+        );
+        assert_eq!(
+            *driver, LingeringPermission,
+            "{name}: CR 611.2a — a stated lifetime means the permission is exercised at a later \
+             priority window, so the mechanism is the lingering grant"
+        );
+        assert!(
+            !def.optional,
+            "{name}: CR 608.2d — a lingering grant states no resolution-time choice, so the \
+             clause's \"may\" must not become an optional-effect prompt"
+        );
+    }
+}
+
+/// CR 611.2a: the HAND-ORIGIN row of the same reconciliation, which no
+/// integration fixture can reach — its runtime is the named gap below. "Until
+/// end of turn, you may cast spells from your hand without paying their mana
+/// costs" (Chandra, Flame's Catalyst's ultimate) is a hand-origin free cast, so
+/// `during_resolution_for_filter_cast_clause` selects `DuringResolution`, and
+/// the stated lifetime then degrades it.
+///
+/// DISCRIMINATING: this row is why the degrade belongs in
+/// `with_lingering_duration` rather than in an `if let` at one seam. A wider
+/// guard at the trailing-duration block in `lower_imperative_clause` would have
+/// reached the trailing-duration members of the class — MEASURED, a reach
+/// marker there fires over the corpus — but never this one: a sentence-leading
+/// duration is stamped around the body lowering, after `lower_imperative_clause`
+/// has returned, so it never sees that gate. Only the shared authority covers
+/// both.
+///
+/// A PARSE CLAIM, NOT A BEHAVIOUR CLAIM. Chandra is the hand-origin card this
+/// change gives the lingering mechanism to — Twinning Glass is hand-origin too,
+/// but it loses an invented duration and keeps its during-resolution cast — and
+/// at runtime it moves nothing: MEASURED end-to-end
+/// through `GameRunner` with and without the degrade, the ultimate stops at the
+/// same `WaitingFor::EffectZoneChoice { effect_kind: CastFromZone, zone: Hand,
+/// up_to: true, duration: None }` either way — a pick-one-now offer raised
+/// while the ability resolves, with no permission recorded on any hand card and
+/// none castable afterwards. `resolve` consults the driver before that branch —
+/// for the library one-shot and for `window_bounds()` — but neither route's
+/// remaining conditions hold for a hand pool with no resolved targets, and the
+/// branch it does take reads neither the driver nor the duration
+/// (`open_private_zone_cast_selection` writes `duration: None` as a literal).
+/// So the hand-origin half of this class stays as wrong as it is on main;
+/// repairing it is runtime work this change does not do. What the
+/// assertion below buys today is an honest AST and export for that card, and
+/// the one seam through which a later runtime fix can see the lifetime at all.
+#[test]
+fn a_leading_duration_also_degrades_the_cast_mechanism() {
+    // Verbatim Oracle text (`client/public/card-data.json`, key
+    // `chandra, flame's catalyst`), the ultimate alone.
+    let def = parse_effect_chain(
+        "Discard your hand, then draw seven cards. Until end of turn, you may cast spells from \
+         your hand without paying their mana costs.",
+        AbilityKind::Activated,
+    );
+    let mut casts = Vec::new();
+    collect_cast_from_zone_defs(&def, &mut casts);
+    assert_eq!(
+        casts.len(),
+        1,
+        "reach guard — the ultimate must produce exactly one cast grant, got {casts:?}"
+    );
+    let Effect::CastFromZone {
+        without_paying_mana_cost,
+        duration,
+        driver,
+        ..
+    } = &*casts[0].effect
+    else {
+        unreachable!("filtered above");
+    };
+    assert!(
+        *without_paying_mana_cost,
+        "reach guard — the free, hand-origin shape the filter-form authority sends to \
+         `DuringResolution`"
+    );
+    assert_eq!(
+        *duration,
+        Some(Duration::UntilEndOfTurn),
+        "the sentence-leading lifetime must reach the effect's own duration slot"
+    );
+    assert_eq!(
+        *driver, LingeringPermission,
+        "CR 611.2a + CR 117.1a: \"Until end of turn\" means the spells are cast at later \
+         priority windows, not as the ultimate resolves"
+    );
+}
+
+/// CR 608.2i: "a spell that WAS CAST this turn" looks back at a previous game
+/// action; its "this turn" scopes that look-back, not the effect. Twinning
+/// Glass states no duration at all, and `strip_trailing_duration` must not
+/// invent one.
+///
+/// DISCRIMINATING, and the reason this guard ships with the reconciliation
+/// above rather than separately: with the invented `UntilEndOfTurn` in place,
+/// the widened degrade would read it as proof of a later priority window and
+/// turn a during-resolution free cast into a turn-long standing permission —
+/// strictly worse than the bug being fixed. Removing
+/// `spell_history_relative_clause_owns_suffix` flips both assertions.
+///
+/// NOT REPAIRED HERE, and visible in the same parse: the "if it has the same
+/// name as …" condition is still swallowed (`OracleDiagnostic::SwallowedClause`,
+/// detector `Condition_If`), so the clause offers every card in hand rather
+/// than the matching one. That is a separate coverage gap; this test asserts
+/// only the duration and the mechanism.
+#[test]
+fn a_spell_history_lookback_does_not_invent_a_duration() {
+    // Verbatim Oracle text (`client/public/card-data.json`, key
+    // `twinning glass`), the activated ability's effect alone.
+    let def = parse_effect_chain(
+        "You may cast a spell from your hand without paying its mana cost if it has the same \
+         name as a spell that was cast this turn.",
+        AbilityKind::Activated,
+    );
+    let mut casts = Vec::new();
+    collect_cast_from_zone_defs(&def, &mut casts);
+    assert_eq!(
+        casts.len(),
+        1,
+        "reach guard — the clause must still produce its cast grant, got {casts:?}"
+    );
+    let Effect::CastFromZone {
+        duration, driver, ..
+    } = &*casts[0].effect
+    else {
+        unreachable!("filtered above");
+    };
+    assert_eq!(
+        *duration, None,
+        "CR 608.2i: the relative clause owns its \"this turn\"; no duration may be stamped"
+    );
+    assert_eq!(
+        *driver, DuringResolution,
+        "CR 608.2g: with no stated lifetime the hand-origin free cast keeps the \
+         during-resolution mechanism"
+    );
+}
+
+/// Collect every `CastFromZone`-carrying definition in a `sub_ability` chain.
+fn collect_cast_from_zone_defs(def: &AbilityDefinition, out: &mut Vec<AbilityDefinition>) {
+    if matches!(*def.effect, Effect::CastFromZone { .. }) {
+        out.push(def.clone());
+    }
+    if let Some(sub) = def.sub_ability.as_ref() {
+        collect_cast_from_zone_defs(sub, out);
     }
 }

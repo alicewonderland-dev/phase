@@ -5,7 +5,7 @@ use engine::types::ability::AbilityBlockEntry;
 use engine::types::action_rejection::ActionRejection;
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
-use engine::types::format::FormatConfig;
+use engine::types::format::{FormatConfig, GameFormat};
 use engine::types::game_state::GameState;
 use engine::types::identifiers::ObjectId;
 use engine::types::interaction::{
@@ -104,8 +104,8 @@ pub use lobby_broker::protocol::{
 // validated `try_from`/`into` boundaries, so a malformed value is refused at
 // deserialization rather than discovered later inside pairing/scoring logic.
 pub use lobby_broker::tournament::{
-    BracketShape, MatchArity, PairingId, PairingOutcome, PodOutcome, ScoringPolicy,
-    TournamentStanding, TournamentStatus,
+    BracketShape, MatchArity, PairingId, PairingOutcome, PodOutcome, ReportGate, ScoringPolicy,
+    TournamentAction, TournamentRole, TournamentStanding, TournamentStatus,
 };
 
 pub use seat_reducer::types::{DeckChoice, SeatKind, SeatMutation, SeatTeamInfo, SeatView};
@@ -530,10 +530,35 @@ pub enum ClientMessage {
     CreateTournament {
         name: String,
         arity: MatchArity,
-        scoring: ScoringPolicy,
+        /// Relaxed to an `Option` in lockstep with
+        /// [`lobby_broker::LobbyClientMessage::CreateTournament`]'s, `None`
+        /// meaning "the broker applies `ScoringPolicy::default_for_arity`".
+        ///
+        /// The mirror MUST relax with it. Leaving it required here would make
+        /// broker-owned default scoring work over the lobby/Worker socket and
+        /// hard-fail over the native `phase-server` game socket — a functional
+        /// asymmetry in the exact layer this mirror exists to keep identical.
+        /// `to_lobby_client_message`'s arm stays a pass-through; "repairing"
+        /// its compile error with `Some(*scoring)` instead is the defect this
+        /// note exists to foreclose, and
+        /// `tournament_variants_survive_the_canonical_lobby_roundtrip` is what
+        /// fails on it.
+        #[serde(default)]
+        scoring: Option<ScoringPolicy>,
         bracket: BracketShape,
         #[serde(default)]
         total_rounds: Option<u32>,
+        /// "Automatic + N" round addend, mirroring
+        /// [`lobby_broker::LobbyClientMessage::CreateTournament`]'s field in the
+        /// same position with the same serde attribute (added in lockstep for
+        /// lobby protocol 7). Mutually exclusive with `total_rounds`.
+        #[serde(default)]
+        plus_rounds: Option<u32>,
+        /// The event's game-format label, mirroring
+        /// [`lobby_broker::LobbyClientMessage::CreateTournament`]'s field. A
+        /// display label only; the tournament enforces no deck legality.
+        #[serde(default)]
+        format: Option<GameFormat>,
     },
     JoinTournament {
         code: String,
@@ -579,6 +604,15 @@ pub enum ClientMessage {
         organizer_token: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<TournamentRequestId>,
+    },
+    /// Mirrors [`lobby_broker::LobbyClientMessage::RenewTournamentCredential`].
+    /// Present for the same reason the seven above are: a native-socket client
+    /// must be able to rotate a credential the lobby socket can rotate, or the
+    /// two transports diverge in what a holder can recover from.
+    RenewTournamentCredential {
+        code: String,
+        role: TournamentRole,
+        token: String,
     },
 }
 
@@ -1003,11 +1037,19 @@ pub enum ServerMessage {
     TournamentCreated {
         code: String,
         organizer_token: String,
+        /// When `organizer_token` stops being accepted, in epoch
+        /// milliseconds. Mirrors
+        /// [`lobby_broker::LobbyServerMessage::TournamentCreated`]'s, in the
+        /// same position — the position is load-bearing, see the client-mirror
+        /// note above.
+        expires_at_ms: u64,
         view: TournamentView,
     },
     TournamentJoined {
         code: String,
         player_token: String,
+        /// When `player_token` stops being accepted, in epoch milliseconds.
+        expires_at_ms: u64,
         view: TournamentView,
     },
     TournamentUpdate {
@@ -1034,6 +1076,14 @@ pub enum ServerMessage {
     TournamentActionRejected {
         request_id: TournamentRequestId,
         message: String,
+    },
+    /// Point reply carrying a freshly rotated credential. Mirrors
+    /// [`lobby_broker::LobbyServerMessage::TournamentCredentialRenewed`].
+    TournamentCredentialRenewed {
+        code: String,
+        role: TournamentRole,
+        token: String,
+        expires_at_ms: u64,
     },
 }
 
@@ -3155,8 +3205,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_65_for_draft_full_identity() {
-        assert_eq!(PROTOCOL_VERSION, 65);
+    fn protocol_version_is_67_for_dungeon_card_and_room_graph() {
+        assert_eq!(PROTOCOL_VERSION, 67);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3167,7 +3217,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_65_for_draft_full_identity` stays
+    /// `protocol_version_is_67_for_dungeon_card_and_room_graph` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
