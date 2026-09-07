@@ -4916,11 +4916,29 @@ fn collect_pending_triggers_with_collection(
         // creature it is still on the battlefield and the live scan + per-event
         // dedup already cover it.
         if let GameEvent::CreatureExploited { exploiter, .. } = event {
-            if state
-                .objects
-                .get(exploiter)
-                .is_some_and(|o| o.zone != Zone::Battlefield)
-            {
+            // CR 702.110b + CR 603.10a: a self-exploiting creature has already left
+            // the battlefield when `CreatureExploited` fires. This scan sources the
+            // exploiter's abilities from the LIVE object on the next line
+            // (`&state.objects[exploiter]`), so it is narrowed to `DepartedPresent`
+            // for a purely mechanical reason: a ceased exploiter has no live object
+            // to read abilities from, and the index would panic. The variant, not a
+            // comment, is what enforces that.
+            //
+            // That narrowing is an implementation limit, NOT a rules position. The
+            // CR does not exclude a ceased exploiter, and the untested gap it
+            // leaves is real: a token copy of an exploit creature (Sidisi's
+            // Faithful, Silumgar Butcher, Vulturous Aven) that exploits ITSELF
+            // ceases to exist under CR 704.5d before trigger collection runs, so it
+            // classifies as `DepartedCeased` and loses its own exploit trigger that
+            // CR 702.110b + CR 603.10a would have fired. Admitting it needs a
+            // record-driven arm that sources abilities from the departure record's
+            // last-known information rather than from `state.objects` — the shape
+            // the CR 603.10a co-departed observer arm below already uses. Out of
+            // scope here and not addressed by this change.
+            if matches!(
+                super::zones::battlefield_residency(state, *exploiter),
+                super::zones::BattlefieldResidency::DepartedPresent
+            ) {
                 let matched_triggers = {
                     let obj = &state.objects[exploiter];
                     collect_matching_triggers(
@@ -4979,11 +4997,24 @@ fn collect_pending_triggers_with_collection(
                 if observer_id == *moved_id {
                     continue;
                 }
-                if !state
-                    .objects
-                    .get(&observer_id)
-                    .is_some_and(|o| o.zone != Zone::Battlefield)
-                {
+                // CR 603.10a + CR 704.5d: a co-departed observer that ceased to
+                // exist is still an observer. Its object is gone from
+                // `state.objects`, but its ZoneChangeRecord owns its identity and
+                // trigger entries (CR 608.2h), which is what
+                // `collect_observer_triggers_under_lki_attachment` reads below —
+                // exactly as the CR 603.10f arm does. Only an observer still ON the
+                // battlefield is excluded here (the live scan covers it).
+                //
+                // CR 400.7f is the rule that ENTITLES this arm to find the
+                // co-departed Aura: "Abilities that trigger when an enchanted
+                // permanent leaves the battlefield can find the new object that each
+                // Aura enchanting that permanent became in its owner's graveyard if
+                // it was put into that graveyard at the same time the enchanted
+                // permanent left the battlefield. ... (See rule 704.5m.)"
+                // Simultaneity — not attachment identity — is what makes it
+                // findable, which is why this guard reads the co-departure group and
+                // not `record.attached_to`.
+                if !super::zones::battlefield_residency(state, observer_id).has_departed() {
                     continue;
                 }
                 // CR 603.10a + CR 400.7: This observer left in the same
@@ -5053,6 +5084,15 @@ fn collect_pending_triggers_with_collection(
                     collection,
                 );
                 for matched in matched_triggers {
+                    // Pre-existing asymmetry (byte-identical at this change's
+                    // base commit): the sibling arms gate on
+                    // `if !session.record_match(..) { continue; }`, this one
+                    // discards the return. Deferred, not adopted — this change
+                    // routes a new class (ceased co-departed observers) through
+                    // here, but the exactly-one-Griffin assertions in
+                    // `griffin_guide_ceased_token_co_departure` hold, so the
+                    // difference is not observable today. Fixing it is a
+                    // separate change with its own discriminating test.
                     session.record_match(state, &matched, event);
                     if matched.batched {
                         batched_this_pass.insert((observer_id, matched.trig_idx));
@@ -5115,11 +5155,12 @@ fn collect_pending_triggers_with_collection(
                 // what CR 603.10f requires: the departure record (CR 608.2h last
                 // known information) remains the authority for what the observer
                 // was attached to, and it outlives the object itself.
-                if state
-                    .objects
-                    .get(observer_id)
-                    .is_some_and(|o| o.zone == Zone::Battlefield)
-                {
+                //
+                // That rationale now lives in `zones::battlefield_residency`, the
+                // shared authority this guard delegates to: `Remained` is exactly
+                // "present AND still on the battlefield", so `!has_departed()` is
+                // the same predicate this arm has always used.
+                if !super::zones::battlefield_residency(state, *observer_id).has_departed() {
                     continue;
                 }
                 // CR 400.7 + CR 608.2h: the record's own source context — not a
