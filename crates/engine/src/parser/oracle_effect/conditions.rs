@@ -1316,7 +1316,7 @@ pub(super) fn card_type_condition_as_target_match(
 ///   bounds.
 /// * CR 701.20e (EXPLANATION ONLY, never this head's authority) — "Looking at a
 ///   card follows the same rules as revealing a card, except that the card is
-///   revealed only to the specified player". The ledger this condition reads at
+///   shown only to the specified player." The ledger this condition reads at
 ///   runtime is currently written by the enclosing look as well as by the
 ///   reveal, which is the known residual disclosed as DW#5. This head does not,
 ///   and must not, try to fix it.

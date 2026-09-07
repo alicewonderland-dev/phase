@@ -28,10 +28,18 @@
 //! REVERTING the parser change flips rows 1, 2 and 4. Row 3 is a labelled
 //! characterization row and a live positive control — see its own doc comment.
 //!
+//! WHEN DW#5 LANDS, flipping row 3's `true` to `false` is NOT the only edit the
+//! file needs. Once a DECLINED reveal stops writing the reveal ledger, reach
+//! guard 2 (`last_revealed_ids.len() == 1`) fails on ALL THREE runtime rows and
+//! rows 1 and 2 stop discriminating. That is deliberate — the file goes loudly
+//! red rather than silently vacuous — but the DW#5 fixer must re-anchor that
+//! guard on a signal the declined path still produces (or move these rows to
+//! the ACCEPT side), not just edit row 3.
+//!
 //! TWO MEASURED FOOT-GUNS, both closed here on purpose:
 //!   1. The fixture's card NAME must be exactly `"Runo Stromkirk"` — see the
 //!      warning on `RUNO_ORACLE`. A misnamed fixture reports
-//!      `transformed=false, offered=true, last_revealed=1` on BOTH sides: it
+//!      `transformed=false, answered=true, last_revealed=1` on BOTH sides: it
 //!      looks like a healthy negative and measures nothing.
 //!   2. The harness shape must start at `Phase::PreCombatMain` with Runo under
 //!      **P1** and then `advance_to_phase(Phase::Upkeep)`. The phase TRANSITION
@@ -76,7 +84,7 @@ use engine::types::player::PlayerId;
 /// point (`parse_oracle_ir` calls `normalize_card_name_refs` before it splits
 /// the text into lines), so any other name leaves `"transform Runo"`
 /// unnormalized, **no `Effect::Transform` node enters the AST at all**, and
-/// every row in this file reports `transformed=false, offered=true,
+/// every row in this file reports `transformed=false, answered=true,
 /// last_revealed=1` — it looks like a healthy negative and measures nothing.
 /// The parse-level control
 /// `runo_fixture_parses_to_a_transform_gated_on_the_mana_value_floor` exists to
@@ -200,20 +208,29 @@ fn setup(
 /// Drain priority until the upkeep trigger's reveal offer appears, then answer
 /// it with `accept`.
 ///
-/// Returns whether the optional was ACTUALLY offered — the reach guard every
-/// row asserts, negatives included (CR 608.2d: an effect's "you may" is a
+/// Returns whether the optional was offered AND successfully answered AND the
+/// machine then left `OptionalEffectChoice` — the reach guard every row
+/// asserts, negatives included (CR 608.2d: an effect's "you may" is a
 /// resolution-time choice, so "did not transform" is only meaningful if the
 /// choice was genuinely presented and answered).
+///
+/// ⚠ The three conjuncts are load-bearing; do NOT weaken this back to "was an
+/// `OptionalEffectChoice` ever seen". If a later change makes
+/// `DecideOptionalEffect` error at this seam, the machine stalls parked in
+/// `OptionalEffectChoice` — and every OTHER reach guard still passes, because
+/// `last_revealed_ids` was already written by the enclosing look step, the back
+/// face is installed, the name is untouched and `transformed` is `false`. An
+/// offered-only flag would let both negative rows go green while measuring
+/// nothing at all.
 fn drive_upkeep(runner: &mut GameRunner, accept: bool) -> bool {
-    let mut offered = false;
+    let mut answered = false;
     for _ in 0..20 {
         match &runner.state().waiting_for {
             WaitingFor::OptionalEffectChoice { .. } => {
-                offered = true;
-                if runner
+                answered = runner
                     .act(GameAction::DecideOptionalEffect { accept })
-                    .is_err()
-                {
+                    .is_ok();
+                if !answered {
                     break;
                 }
             }
@@ -225,7 +242,11 @@ fn drive_upkeep(runner: &mut GameRunner, accept: bool) -> bool {
             _ => break,
         }
     }
-    offered
+    answered
+        && !matches!(
+            runner.state().waiting_for,
+            WaitingFor::OptionalEffectChoice { .. }
+        )
 }
 
 /// Walk an ability chain (effect + sub_ability + else_ability) for the first
@@ -243,11 +264,16 @@ fn find_transform_node(def: &AbilityDefinition) -> Option<&AbilityDefinition> {
 /// Assert the four reach guards every runtime row shares. `expected_name` is
 /// the name the object must carry AFTER the upkeep resolved — the front face
 /// for a row that must not transform, the back face for one that must.
-fn assert_reach_guards(runner: &GameRunner, subject: ObjectId, offered: bool, expected_name: &str) {
+fn assert_reach_guards(
+    runner: &GameRunner,
+    subject: ObjectId,
+    answered: bool,
+    expected_name: &str,
+) {
     assert!(
-        offered,
+        answered,
         "reach guard (CR 608.2d): the reveal's OptionalEffectChoice must have been \
-         offered and answered, or this row measures nothing"
+         offered and answered (and left behind), or this row measures nothing"
     );
     assert_eq!(
         runner.state().last_revealed_ids.len(),
@@ -290,9 +316,9 @@ fn runo_declining_a_reveal_below_the_mana_value_gate_does_not_transform() {
         2,
         krothuss_back_face(),
     );
-    let offered = drive_upkeep(&mut runner, false);
+    let answered = drive_upkeep(&mut runner, false);
 
-    assert_reach_guards(&runner, runo, offered, "Runo Stromkirk");
+    assert_reach_guards(&runner, runo, answered, "Runo Stromkirk");
     assert!(
         !runner.state().objects[&runo].transformed,
         "a mana-value-2 creature does not satisfy 'mana value 6 or greater' (CR 202.3), \
@@ -320,9 +346,9 @@ fn runo_declining_a_reveal_of_a_noncreature_does_not_transform() {
         6,
         krothuss_back_face(),
     );
-    let offered = drive_upkeep(&mut runner, false);
+    let answered = drive_upkeep(&mut runner, false);
 
-    assert_reach_guards(&runner, runo, offered, "Runo Stromkirk");
+    assert_reach_guards(&runner, runo, answered, "Runo Stromkirk");
     assert!(
         !runner.state().objects[&runo].transformed,
         "an instant card is not a 'creature card' however large its mana value, and a \
@@ -366,9 +392,9 @@ fn runo_declining_a_qualifying_reveal_still_transforms_residual_defect() {
         6,
         krothuss_back_face(),
     );
-    let offered = drive_upkeep(&mut runner, false);
+    let answered = drive_upkeep(&mut runner, false);
 
-    assert_reach_guards(&runner, runo, offered, "Krothuss, Lord of the Deep");
+    assert_reach_guards(&runner, runo, answered, "Krothuss, Lord of the Deep");
     assert!(
         runner.state().objects[&runo].transformed,
         "CHARACTERIZATION (rules-INCORRECT, DW#5): current behavior transforms Runo on a \
