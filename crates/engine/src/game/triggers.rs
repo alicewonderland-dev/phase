@@ -2206,6 +2206,58 @@ fn collect_observer_triggers_under_lki_attachment(
     matched
 }
 
+/// CR 603.10a + CR 608.2h + CR 704.5d/e: the last-known information of an
+/// object that left the battlefield and then CEASED TO EXIST, sourced from the
+/// per-turn departure ledger rather than from `state.objects` (which no longer
+/// holds it at all).
+///
+/// WHY THE LEDGER AND NOT THE EVENT BATCH. The sibling CR 603.10a / CR 603.10f
+/// arms below search `events` because each is *keyed on* a `ZoneChanged` in the
+/// batch by construction. `CreatureExploited` is not: CR 702.110b emits it when
+/// the exploit ability RESOLVES, while the exploiter's own departure was
+/// recorded in an earlier action's batch by the CR 704.3 state-based-action
+/// sweep. Measured on the reachable fixture: at this seam the batch contains no
+/// battlefield-origin `ZoneChanged` for the exploiter, so a batch-local search
+/// finds nothing and the arm would be inert.
+///
+/// WHICH ROW IS AUTHORITATIVE is not decided here. That rule is rules-bearing
+/// (CR 704.5d/e) and shared with `trigger_matchers::subject_filter_matches_with_lki`,
+/// so it lives once in `game_state::terminal_battlefield_departure_row` and
+/// both seams delegate. Two hand-kept copies would have to change in lockstep
+/// with nothing linking them.
+///
+/// FAIL CLOSED on every other shape: no authoritative row, an `Absent`
+/// (context-free legacy) record, or a `Malformed` one all yield `None`, exactly
+/// as the two sibling arms treat the same tri-state.
+///
+/// THE RETURNED `attached_to` IS FORWARD-COMPATIBLE DEAD WEIGHT TODAY, not a
+/// load-bearing value: `collect_observer_triggers_under_lki_attachment`
+/// installs it through `state.objects.get_mut(&observer_id)`, which is `None`
+/// for an object that has ceased — by definition of the arm that calls this.
+/// It is returned anyway so this arm stays byte-for-byte parallel with the
+/// co-departure arm, and so it is already correct if that installer ever
+/// learns to synthesize an absent observer. No test can distinguish it.
+///
+/// Returns the context CLONED: the caller needs the immutable borrow of
+/// `state` to end before `collect_observer_triggers_under_lki_attachment` takes
+/// `&mut GameState`. Only the `DepartedCeased` path pays for it.
+fn ceased_departure_lki(
+    state: &GameState,
+    object_id: ObjectId,
+) -> Option<(
+    TriggerSourceContext,
+    Option<crate::game::game_object::AttachTarget>,
+)> {
+    let record = crate::types::game_state::terminal_battlefield_departure_row(state, object_id)?;
+    match crate::types::game_state::battlefield_departure_source_context_from_record(record) {
+        crate::types::game_state::BattlefieldDepartureSourceContext::Present(context) => {
+            Some((context.clone(), record.attached_to))
+        }
+        crate::types::game_state::BattlefieldDepartureSourceContext::Absent
+        | crate::types::game_state::BattlefieldDepartureSourceContext::Malformed => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_matching_triggers_inner(
     state: &GameState,
@@ -4906,67 +4958,107 @@ fn collect_pending_triggers_with_collection(
             }
         }
 
-        // CR 603.10a: Abilities that trigger when a player sacrifices a permanent
-        // look back in time. An exploit ability emits `CreatureExploited` only
-        // after the sacrifice resolves (CR 702.110b), so a creature that exploits
-        // ITSELF has already left the battlefield when this event fires. Scan the
-        // exploiter with zone_filter=Battlefield (last-known information) so its
-        // own "when ~ exploits a creature" trigger still fires. Guarded to the
-        // off-battlefield case only: when the exploiter sacrificed a DIFFERENT
-        // creature it is still on the battlefield and the live scan + per-event
-        // dedup already cover it.
+        // CR 603.10a: abilities that trigger when a player sacrifices a
+        // permanent look back in time, so an exploiter that is no longer on the
+        // battlefield keeps its own "when ~ exploits a creature" trigger. Which
+        // source that trigger is read from depends on the exploiter's residency;
+        // the per-arm comments below carry that reasoning, and deliberately do
+        // NOT restate it here, so there is one account of it and not two.
         if let GameEvent::CreatureExploited { exploiter, .. } = event {
-            // CR 702.110b + CR 603.10a: a self-exploiting creature has already left
-            // the battlefield when `CreatureExploited` fires. This scan sources the
-            // exploiter's abilities from the LIVE object on the next line
-            // (`&state.objects[exploiter]`), so it is narrowed to `DepartedPresent`
-            // for a purely mechanical reason: a ceased exploiter has no live object
-            // to read abilities from, and the index would panic. The variant, not a
-            // comment, is what enforces that.
+            // CR 702.110b + CR 603.10a: exploit emits `CreatureExploited` only
+            // as the exploit ability RESOLVES, so the exploiter may already
+            // have left the battlefield — CR 603.10a ("abilities that trigger
+            // when a player sacrifices a permanent") is what entitles its own
+            // "When ~ exploits a creature" trigger to fire anyway. The three
+            // residencies need three different sources for the exploiter's
+            // abilities, so this match is EXHAUSTIVE and wildcard-free: a
+            // future `BattlefieldResidency` variant must be a compile error
+            // here, not a silently dropped trigger.
             //
-            // That narrowing is an implementation limit, NOT a rules position. The
-            // CR does not exclude a ceased exploiter, and the untested gap it
-            // leaves is real: a token copy of an exploit creature (Sidisi's
-            // Faithful, Silumgar Butcher, Vulturous Aven) that exploits ITSELF
-            // ceases to exist under CR 704.5d before trigger collection runs, so it
-            // classifies as `DepartedCeased` and loses its own exploit trigger that
-            // CR 702.110b + CR 603.10a would have fired. Admitting it needs a
-            // record-driven arm that sources abilities from the departure record's
-            // last-known information rather than from `state.objects` — the shape
-            // the CR 603.10a co-departed observer arm below already uses. Out of
-            // scope here and not addressed by this change.
-            if matches!(
-                super::zones::battlefield_residency(state, *exploiter),
-                super::zones::BattlefieldResidency::DepartedPresent
-            ) {
-                let matched_triggers = {
-                    let obj = &state.objects[exploiter];
-                    collect_matching_triggers(
-                        state,
-                        event,
-                        events,
-                        obj,
-                        obj.entered_battlefield_turn.unwrap_or(0),
-                        Some(Zone::Battlefield),
-                        &mut batched_this_pass,
-                        &mut registered_this_event,
-                        &active_suppress_triggers,
-                        collection,
-                        TriggerSourceVisit::Observer,
-                    )
-                };
-                for matched in matched_triggers {
-                    if !session.record_match(state, &matched, event) {
-                        continue;
+            // Measured, because the obvious reading is wrong: a token that
+            // exploits ITSELF is `DepartedPresent`, not `DepartedCeased`. Its
+            // battlefield→graveyard move and its `CreatureExploited` land in
+            // the SAME event buffer, and collection runs over that buffer
+            // before the next CR 704.3 check performs the CR 704.5d sweep. The
+            // reachable `DepartedCeased` vector is instead an exploiter killed
+            // by state-based actions in a PRIOR batch while its exploit ETB
+            // trigger waits on the stack with its subject already locked
+            // (CR 603.3d) — a token Vulturous Aven that takes lethal damage
+            // after its trigger is on the stack, and exploits a different
+            // creature when that trigger resolves.
+            //
+            // `DepartedPresent` keeps reading the LIVE object
+            // (`&state.objects[exploiter]`) unchanged. Whether that live
+            // graveyard object is the most faithful source view at all — it is
+            // a new object under CR 400.7, and the departure record is the
+            // CR 608.2h authority — is a PRE-EXISTING question this change
+            // does not answer and does not bless; it is out of scope here.
+            match super::zones::battlefield_residency(state, *exploiter) {
+                // Still on the battlefield: the live scan and the per-event
+                // dedup already cover it (the exploiter sacrificed something
+                // else and survived).
+                super::zones::BattlefieldResidency::Remained => {}
+                super::zones::BattlefieldResidency::DepartedPresent => {
+                    let matched_triggers = {
+                        let obj = &state.objects[exploiter];
+                        collect_matching_triggers(
+                            state,
+                            event,
+                            events,
+                            obj,
+                            obj.entered_battlefield_turn.unwrap_or(0),
+                            Some(Zone::Battlefield),
+                            &mut batched_this_pass,
+                            &mut registered_this_event,
+                            &active_suppress_triggers,
+                            collection,
+                            TriggerSourceVisit::Observer,
+                        )
+                    };
+                    for matched in matched_triggers {
+                        if !session.record_match(state, &matched, event) {
+                            continue;
+                        }
+                        if matched.batched {
+                            batched_this_pass.insert((*exploiter, matched.trig_idx));
+                        }
+                        registered_this_event.insert((*exploiter, matched.trig_idx));
+                        pending.push(PendingTriggerContext::batched(
+                            matched.pending,
+                            matched.trigger_events,
+                        ));
                     }
-                    if matched.batched {
-                        batched_this_pass.insert((*exploiter, matched.trig_idx));
+                }
+                super::zones::BattlefieldResidency::DepartedCeased => {
+                    if let Some((source_context, lki_attached_to)) =
+                        ceased_departure_lki(state, *exploiter)
+                    {
+                        let matched_triggers = collect_observer_triggers_under_lki_attachment(
+                            state,
+                            *exploiter,
+                            lki_attached_to,
+                            event,
+                            events,
+                            &source_context,
+                            &mut batched_this_pass,
+                            &mut registered_this_event,
+                            &active_suppress_triggers,
+                            collection,
+                        );
+                        for matched in matched_triggers {
+                            if !session.record_match(state, &matched, event) {
+                                continue;
+                            }
+                            if matched.batched {
+                                batched_this_pass.insert((*exploiter, matched.trig_idx));
+                            }
+                            registered_this_event.insert((*exploiter, matched.trig_idx));
+                            pending.push(PendingTriggerContext::batched(
+                                matched.pending,
+                                matched.trigger_events,
+                            ));
+                        }
                     }
-                    registered_this_event.insert((*exploiter, matched.trig_idx));
-                    pending.push(PendingTriggerContext::batched(
-                        matched.pending,
-                        matched.trigger_events,
-                    ));
                 }
             }
         }
