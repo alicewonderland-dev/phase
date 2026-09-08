@@ -4,7 +4,7 @@ use crate::parser::oracle_nom::error::{OracleError, OracleResult};
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until, take_while};
 use nom::character::complete::multispace0;
-use nom::combinator::{all_consuming, opt, value};
+use nom::combinator::{all_consuming, map, opt, value};
 use nom::sequence::{preceded, terminated};
 use nom::Parser;
 use serde::{Deserialize, Serialize};
@@ -9683,15 +9683,20 @@ fn parse_activation_turn_window(i: &str) -> OracleResult<'_, ActivationTurnWindo
     .parse(i)
 }
 
-/// CR 602.5b: the composed `during <role> <window>` activation gate — the
+/// CR 602.1b: the composed `during <role> <window>` activation gate — the
 /// shared prefix is consumed once, then each axis by its own sub-combinator.
 fn parse_activation_during_gate(i: &str) -> OracleResult<'_, ActivationRestriction> {
-    let (rest, (role, window)) = preceded(
+    preceded(
         tag::<_, _, OracleError<'_>>("during "),
-        (parse_activation_turn_role, parse_activation_turn_window),
+        alt((
+            value(any_upkeep_activation_restriction(), tag("any upkeep step")),
+            map(
+                (parse_activation_turn_role, parse_activation_turn_window),
+                |(role, window)| activation_turn_gate(role, window),
+            ),
+        )),
     )
-    .parse(i)?;
-    Ok((rest, activation_turn_gate(role, window)))
+    .parse(i)
 }
 
 /// CR 602.5b: map a (role, window) pair onto an EXISTING enforced
@@ -9745,6 +9750,14 @@ fn opponents_upkeep_activation_restriction() -> ActivationRestriction {
                 ParsedCondition::IsDuringUpkeep,
             ],
         }),
+    }
+}
+
+/// CR 602.1b + CR 503.1: activation instructions can restrict activation to
+/// the upkeep step. "Any upkeep" imposes no active-player restriction.
+fn any_upkeep_activation_restriction() -> ActivationRestriction {
+    ActivationRestriction::RequiresCondition {
+        condition: Some(ParsedCondition::IsDuringUpkeep),
     }
 }
 
