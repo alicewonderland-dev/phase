@@ -5176,16 +5176,9 @@ fn collect_pending_triggers_with_collection(
                     collection,
                 );
                 for matched in matched_triggers {
-                    // Pre-existing asymmetry (byte-identical at this change's
-                    // base commit): the sibling arms gate on
-                    // `if !session.record_match(..) { continue; }`, this one
-                    // discards the return. Deferred, not adopted — this change
-                    // routes a new class (ceased co-departed observers) through
-                    // here, but the exactly-one-Griffin assertions in
-                    // `griffin_guide_ceased_token_co_departure` hold, so the
-                    // difference is not observable today. Fixing it is a
-                    // separate change with its own discriminating test.
-                    session.record_match(state, &matched, event);
+                    if !session.record_match(state, &matched, event) {
+                        continue;
+                    }
                     if matched.batched {
                         batched_this_pass.insert((observer_id, matched.trig_idx));
                     }
