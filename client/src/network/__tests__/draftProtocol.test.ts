@@ -390,6 +390,56 @@ describe("draftProtocol", () => {
       );
     });
 
+    // ── draft_pile_decision: the shared-stack turn's wire bound ───────
+    //
+    // A TRANSPORT bound, not a legality check. `validatePileDecision` cannot
+    // see a session, so the only refusals owed here are the ones a payload
+    // alone can earn: a pile index outside the mirrored `MAX_SHARED_STACK_PILES`
+    // ceiling, and a decision outside the two the axis defines. Whether the
+    // named pile is the cursor, and whether this seat may decide at all, is
+    // `shared_stack::refusal_for`'s answer inside the engine.
+
+    it.each([
+      ["Take", 0],
+      ["Decline", 0],
+      ["Take", 2],
+      ["Decline", 2],
+    ] as const)("accepts a %s on pile %i", (decision, pile) => {
+      expect(validateDraftMessage({ type: "draft_pile_decision", pile, decision })).toEqual({
+        type: "draft_pile_decision",
+        pile,
+        decision,
+      });
+    });
+
+    it.each([
+      { pile: 3, decision: "Take" },
+      { pile: 255, decision: "Take" },
+      { pile: -1, decision: "Decline" },
+      { pile: 1.5, decision: "Take" },
+      { pile: "0", decision: "Take" },
+      { pile: undefined, decision: "Take" },
+      { pile: null, decision: "Take" },
+      { pile: Number.NaN, decision: "Take" },
+    ])("rejects an out-of-range pile index", (payload) => {
+      expect(() => validateDraftMessage({ type: "draft_pile_decision", ...payload })).toThrow(
+        "Invalid pile decision: pile must be an integer",
+      );
+    });
+
+    it.each([
+      { pile: 0, decision: "take" },
+      { pile: 0, decision: "Pass" },
+      { pile: 0, decision: "" },
+      { pile: 0, decision: 1 },
+      { pile: 0, decision: undefined },
+      { pile: 0, decision: ["Take"] },
+    ])("rejects a decision outside the two-member axis", (payload) => {
+      expect(() => validateDraftMessage({ type: "draft_pile_decision", ...payload })).toThrow(
+        "Invalid pile decision: decision must be one of",
+      );
+    });
+
     // ── draft_submit_deck: the CR 903.3 designation's wire bound ──────
     //
     // This suite is the ONLY one in client/src that runs

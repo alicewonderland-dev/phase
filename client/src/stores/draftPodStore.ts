@@ -107,7 +107,18 @@ interface DraftPodState {
   procedureCacheKey: ProcedureCacheKey | null;
   /** A deep-link entry may adopt the engine procedure's default seat count once. */
   pendingProcedureDefault: ProcedureCacheKey | null;
-  /** Engine-published pack delivery behavior. `null` until the kind procedure loads. */
+  /**
+   * Engine-published pack delivery behavior. `null` until the kind procedure
+   * loads.
+   *
+   * `PackDistribution` now carries the tagged `{ SharedStackPiles: { … } }`
+   * member as well as its two string members, and every
+   * `packDistribution === "AllAtOnce"` comparison in the client stays both
+   * type-valid and meaning-correct against it: each asks "is this the one-shot
+   * sealed shape?", whose answer for a shared stack is `false`. They are
+   * verified against the widened union, deliberately not rewritten — a
+   * centralizing helper would buy consistency and no compiler force.
+   */
   packDistribution: PackDistribution | null;
   /**
    * The kind's engine-published booster count (`DraftProcedure.packs_per_player`),

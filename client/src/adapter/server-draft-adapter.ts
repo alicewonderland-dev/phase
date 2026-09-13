@@ -33,6 +33,7 @@ import type {
   TournamentFormat,
   PodPolicy,
   DraftKind,
+  SharedStackPileDecision,
 } from "./draft-adapter";
 import type { FullSessionKey, ServerInfo } from "./ws-adapter";
 
@@ -430,6 +431,46 @@ export class ServerDraftAdapter implements EngineAdapter {
           action: {
             type: "Pick",
             data: { seat: this.seatIndex, card_instance_ids: [cardInstanceId] },
+          },
+        },
+      });
+      if (!sent) {
+        this.draftResolve = null;
+        this.draftReject = null;
+        reject(new AdapterError("WS_CLOSED", "Failed to send draft action", true));
+      }
+    });
+  }
+
+  /**
+   * One whole shared-stack turn decision on the server-authoritative path.
+   *
+   * This exists because `CreateDraftSettings.kind` is
+   * `Exclude<DraftKind, "Quick">`, which admits `"Winston"` the moment the
+   * union widens — a creatable kind with no way to send its only action would
+   * be a half-extension. No shipped UI drives this path today (a P2P pod is
+   * where Winston is played), but a wire client and any future UI use it.
+   *
+   * `pile` is the optimistic-concurrency check against the engine's cursor;
+   * legality is `shared_stack::refusal_for`'s, server-side.
+   */
+  async submitSharedStackDecision(
+    pile: number,
+    decision: SharedStackPileDecision,
+  ): Promise<DraftPlayerView> {
+    if (this.seatIndex === null || this.draftCode === null) {
+      throw new AdapterError("PHASE_ERROR", "Not in a draft session", false);
+    }
+    return new Promise<DraftPlayerView>((resolve, reject) => {
+      this.draftResolve = resolve;
+      this.draftReject = reject;
+      const sent = this.send({
+        type: "DraftAction",
+        data: {
+          draft_code: this.draftCode,
+          action: {
+            type: "SharedStackDecision",
+            data: { seat: this.seatIndex, pile, decision },
           },
         },
       });

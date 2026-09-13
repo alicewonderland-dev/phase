@@ -41,5 +41,6 @@ export function draftKindLabels(t: TFunction<"draft">): Record<DraftKind, string
     Traditional: t("podSetup.kindTraditional"),
     Sealed: t("podSetup.kindSealed"),
     CommanderDraft: t("podSetup.kindCommanderDraft"),
+    Winston: t("podSetup.kindWinston"),
   };
 }

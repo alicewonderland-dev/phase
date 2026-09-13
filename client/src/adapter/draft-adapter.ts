@@ -142,7 +142,13 @@ export interface SeatPublicView {
   is_bot: boolean;
   connected: boolean;
   has_submitted_deck: boolean;
-  pick_status: "Pending" | "Picked" | "TimedOut" | "NotDrafting";
+  /**
+   * `"Waiting"` is the shared-stack seat that is not the active seat: no seat
+   * ever holds a `current_pack` under `SharedStackPiles`, so the engine cannot
+   * describe that seat with the pick-and-pass pair. Engine-owned; never derive
+   * it from `active_pack_count`.
+   */
+  pick_status: "Pending" | "Picked" | "Waiting" | "TimedOut" | "NotDrafting";
   /**
    * Engine-owned active-pack presence: exactly 0 or 1, never a card count.
    * Required by P2P draft v24 and the full WebSocket protocol v49.
@@ -162,7 +168,29 @@ export type DraftStatus =
   | "Complete"
   | "Abandoned";
 
-export type DraftKind = "Quick" | "Premier" | "Traditional" | "Sealed" | "CommanderDraft";
+/**
+ * Every draft kind, as one runtime tuple the type is DERIVED from.
+ *
+ * The tuple exists because a type-guard body is not checked against its target
+ * union: `function isDraftKind(v): v is DraftKind` compiles whether the body
+ * enumerates six kinds or two, so a duplicated enumeration beside the union
+ * goes silently narrow the moment a kind is added — and a persisted session of
+ * the new kind is then discarded on resume with no error anywhere. Folding the
+ * guard over this tuple makes the enumeration the type, so the class cannot
+ * recur at the next widening. Never restate these members anywhere else;
+ * derive from `DRAFT_KINDS`.
+ */
+// @sync-with: crates/draft-core/src/types.rs `DraftKind::ALL`
+export const DRAFT_KINDS = [
+  "Quick",
+  "Premier",
+  "Traditional",
+  "Sealed",
+  "CommanderDraft",
+  "Winston",
+] as const;
+
+export type DraftKind = (typeof DRAFT_KINDS)[number];
 
 /**
  * View-safe source metadata from `draft_core::view::DraftSourceView`.
@@ -196,7 +224,22 @@ export type DraftSetLayoutView =
 /** What the engine does after every seat has submitted a deck. */
 export type PostDraftPlay = "CompleteImmediately" | "TournamentPairings";
 /** How the engine procedure distributes packs to seats. */
-export type PackDistribution = "PickAndPass" | "AllAtOnce";
+/**
+ * How the engine procedure distributes packs to seats.
+ *
+ * `SharedStackPiles` is the externally-tagged member, mirroring the Rust
+ * `PackDistribution::SharedStackPiles { pile_count }` — the same spelling
+ * `DraftSetLayoutView` above uses for its data-carrying variants. The two
+ * string members stay bare because their Rust counterparts are unit variants.
+ *
+ * Every existing `distribution === "AllAtOnce"` comparison stays both
+ * type-valid and meaning-correct against this union: each asks "is this the
+ * one-shot sealed shape?", whose answer for a shared stack is `false`.
+ */
+export type PackDistribution =
+  | "PickAndPass"
+  | "AllAtOnce"
+  | { SharedStackPiles: { pile_count: number } };
 /** Engine-authorized game launch for a completed draft procedure. */
 export type DraftLaunchCapability = "None" | "CommanderMultiplayer";
 
@@ -217,6 +260,7 @@ const DRAFT_KIND_WIRE_NUMBER: Record<Exclude<DraftKind, "Quick">, number> = {
   Traditional: 2,
   Sealed: 3,
   CommanderDraft: 4,
+  Winston: 5,
 };
 
 /**
@@ -321,6 +365,76 @@ export interface PairingView {
   score_b: number | null;
 }
 
+/**
+ * Take the pile, or put it back. Mirrors the Rust `SharedStackPileDecision`,
+ * which is deliberately a named axis rather than a boolean so a refusal, a
+ * delta and an i18n key can all key on it.
+ */
+// @sync-with: crates/draft-core/src/types.rs
+export type SharedStackPileDecision = "Take" | "Decline";
+
+/**
+ * Every reason the engine can refuse a shared-stack decision. ONE vocabulary
+ * for the reducer's refusal and the view's publication, so the display layer
+ * renders the engine's reason instead of reinventing it.
+ */
+// @sync-with: crates/draft-core/src/types.rs
+export type SharedStackRefusal = "PileNotActive" | "PileEmpty" | "NoGuaranteedCard";
+
+/**
+ * One decision and the engine's verdict on it. `refusal: null` means legal.
+ *
+ * The reducer converts this same value into `SharedStackDecisionRefused`, so
+ * the published verdict and the enforced one cannot disagree — which is why
+ * nothing in the client may compute legality from `total` or
+ * `main_stack_remaining`.
+ */
+// @sync-with: crates/draft-core/src/view.rs
+export interface SharedStackDecisionView {
+  decision: SharedStackPileDecision;
+  refusal: SharedStackRefusal | null;
+}
+
+/** One shared-stack pile, projected for one viewer. */
+// @sync-with: crates/draft-core/src/view.rs
+export interface SharedStackPileView {
+  /** Position from the left, 0-based. Address a pile by this, not by its index
+   * in `piles`. */
+  index: number;
+  /** How many cards the pile holds. A face-down pile's HEIGHT is public. */
+  total: number;
+  /** The prefix this viewer has looked at this turn; empty for every viewer
+   * that is not the active seat. Never re-derive it from `total`. */
+  revealed: DraftCardInstance[];
+  /** The engine's verdict per decision. Read it; never compute legality. */
+  legality: SharedStackDecisionView[];
+}
+
+/**
+ * The live state of a `SharedStackPiles` turn, projected for ONE viewer.
+ *
+ * Counts are public (a player can count every pile across a physical table);
+ * `revealed` and `active_pile` are gated to the active seat by the engine. The
+ * order of the main stack is published to nobody, which is why this type
+ * carries a remaining COUNT and has no representation for a main-stack card.
+ */
+// @sync-with: crates/draft-core/src/view.rs
+export interface SharedStackView {
+  main_stack_remaining: number;
+  total_cards: number;
+  active_seat: number;
+  /** The pile the active seat is deciding on; `null` for every other viewer. */
+  active_pile: number | null;
+  piles: SharedStackPileView[];
+  /**
+   * Applied decisions since `StartDraft` — a monotone change detector and
+   * nothing else. This is the field an acknowledging client watches, because a
+   * non-final decline adds no card to any pool and therefore cannot be
+   * acknowledged by pool growth.
+   */
+  decisions: number;
+}
+
 // @sync-with: crates/draft-core/src/view.rs
 export interface SpectatorDraftView {
   status: DraftStatus;
@@ -358,6 +472,15 @@ export interface SpectatorDraftView {
   /** Present only for non-Chaos drafts when the host enabled omniscient visibility. */
   pools?: DraftCardInstance[][];
   current_packs?: (DraftCardInstance[] | null)[];
+  /**
+   * The live shared-stack turn, counts-only for a spectator.
+   *
+   * OPTIONAL because the Rust field is
+   * `#[serde(default, skip_serializing_if = "Option::is_none")]`: it is
+   * genuinely absent from every non-Winston frame and from every frame outside
+   * `Drafting`, so `shared_stack != null` means exactly "a pile turn is live".
+   */
+  shared_stack?: SharedStackView | null;
 }
 
 // @sync-with: crates/engine/src/game/deck_validation.rs
@@ -461,6 +584,26 @@ export interface DraftPlayerView {
   pod_policy: PodPolicy;
   pairings: PairingView[];
   match_config: MatchConfig;
+  /**
+   * The live shared-stack turn, projected for this viewer.
+   *
+   * OPTIONAL because the Rust field is
+   * `#[serde(default, skip_serializing_if = "Option::is_none")]`: it is
+   * genuinely absent from every non-Winston frame and from every frame outside
+   * `Drafting`, so `shared_stack != null` is the engine-published
+   * discriminator for "render the pile table", and no kind check is needed.
+   */
+  shared_stack?: SharedStackView | null;
+  /**
+   * The seat that chooses who plays first in the games after the draft, from
+   * the engine's latched starting seat. `null`/absent for pods larger than two
+   * seats and for every kind with no shared stack. Deliberately NOT status
+   * gated — the choice is exercised after the draft.
+   *
+   * ADVISORY: the engine does not enforce it, so this is rendered as an
+   * instruction to the players and never as a control.
+   */
+  play_first_chooser?: number | null;
 }
 
 export type MultiplayerSeatDescriptor =
@@ -713,6 +856,32 @@ export class DraftEngineOperationLease {
     ) as DraftPlayerView;
   }
 
+  /**
+   * One whole shared-stack turn decision for `seat`.
+   *
+   * Routed through `apply_draft_action` rather than a dedicated wasm export,
+   * because `DraftAction::SharedStackDecision` is what the reducer accepts and
+   * there is no pick-shaped export for it. `pile` is an optimistic-concurrency
+   * check, not a selector: the cursor is the ENGINE's, and a second frame that
+   * names a stale pile is refused `PileNotActive` instead of silently applying
+   * to the next pile. Nothing here decides legality.
+   *
+   * Returns the filtered view for THAT seat, the same contract
+   * `submit_pick_for_seat` has — not the host view. `revealed` and
+   * `active_pile` are viewer-scoped, so acknowledging a guest with seat 0's
+   * projection would hand it somebody else's turn.
+   */
+  submitSharedStackDecisionForSeat(
+    seat: number,
+    pile: number,
+    decision: SharedStackPileDecision,
+  ): DraftPlayerView {
+    this.wasm.apply_draft_action(
+      JSON.stringify({ type: "SharedStackDecision", data: { seat, pile, decision } }),
+    );
+    return this.wasm.get_view_for_seat(seat) as DraftPlayerView;
+  }
+
   submitDeckForSeat(
     seat: number,
     mainDeck: string[],
@@ -934,6 +1103,19 @@ export class DraftAdapter {
    */
   async submitPickForSeat(seat: number, cardInstanceIds: string[]): Promise<DraftPlayerView> {
     return withDraftEngineOperation((lease) => lease.submitPickForSeat(seat, cardInstanceIds));
+  }
+
+  /**
+   * One whole shared-stack turn decision for `seat`. See the lease method for
+   * why `pile` travels with the decision and why legality is not asked here.
+   */
+  async submitSharedStackDecisionForSeat(
+    seat: number,
+    pile: number,
+    decision: SharedStackPileDecision,
+  ): Promise<DraftPlayerView> {
+    return withDraftEngineOperation((lease) =>
+      lease.submitSharedStackDecisionForSeat(seat, pile, decision));
   }
 
   /** The engine-owned per-kind procedure axes; never re-derived by the UI. */

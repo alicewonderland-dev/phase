@@ -11,7 +11,7 @@
  */
 
 import { DraftAdapter } from "./draft-adapter";
-import type { DraftKind, DraftPlayerView, PairingView, PodPolicy, PoolInput, SeatPublicView, TournamentFormat } from "./draft-adapter";
+import type { DraftKind, DraftPlayerView, PairingView, PodPolicy, PoolInput, SeatPublicView, SharedStackPileDecision, TournamentFormat } from "./draft-adapter";
 import type { MatchScore } from "./types";
 import { P2PDraftHost, type DraftHostEvent } from "./p2p-draft-host";
 import { hostRoom, type HostResult } from "../network/connection";
@@ -528,6 +528,19 @@ export class DraftPodHostAdapter {
   ): Promise<DraftPlayerView> {
     if (!this.host) throw new Error("Host not initialized");
     return this.host.submitHostPickWithDraftEffect(effectCardInstanceId, cardInstanceIds);
+  }
+
+  /**
+   * One whole shared-stack turn decision for this pod's local seat. Seat-free
+   * at this layer for the same reason `submitPick` is: the adapter owns the
+   * local seat, and the caller states only the pile and the decision.
+   */
+  async submitSharedStackDecision(
+    pile: number,
+    decision: SharedStackPileDecision,
+  ): Promise<DraftPlayerView> {
+    if (!this.host) throw new Error("Host not initialized");
+    return this.host.submitHostSharedStackDecision(pile, decision);
   }
 
   async submitDeck(mainDeck: string[], commanders: string[]): Promise<DraftPlayerView> {

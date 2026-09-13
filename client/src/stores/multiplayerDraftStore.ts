@@ -19,6 +19,7 @@ import type {
   DraftPlayerView,
   PairingView,
   SeatPublicView,
+  SharedStackPileDecision,
   StandingEntry,
 } from "../adapter/draft-adapter";
 import type { EngineAdapter, GameAction, GameEvent, GameLogEntry, MatchScore, SubmitResult } from "../adapter/types";
@@ -350,6 +351,11 @@ interface MultiplayerDraftActions {
   submitPickStep: (cardInstanceIds: readonly string[], destination?: DraftPickDestination, placementHint?: DraftPickPlacementHint) => Promise<DraftPickOutcome>;
   /** Both: submit a pick using a drafted card's draft-time effect. */
   submitPickWithDraftEffect: (effectCardInstanceId: string, cardInstanceIds: readonly [string, string], destination?: DraftPickDestination, placementHint?: DraftPickPlacementHint) => Promise<DraftPickOutcome>;
+  /**
+   * One whole shared-stack turn decision. No destination and no placement
+   * hint: a decision names no cards, so there is nothing to place.
+   */
+  submitSharedStackDecision: (pile: number, decision: SharedStackPileDecision) => Promise<DraftPickOutcome>;
   /** Both: select a card (UI highlight before confirming pick). */
   selectCard: (cardInstanceId: string | null) => void;
   /** Both: confirm the currently selected card as pick. */
@@ -833,6 +839,120 @@ async function performPick(request: MultiplayerPickRequest): Promise<DraftPickOu
     installWorkspace({
       view: acknowledgedView,
       base: workspace,
+      publish: true,
+      patch: {
+        phase: phaseForDraftViewStatus(acknowledgedView.status),
+        selectedCard: null,
+        pendingPickIntent: null,
+        pickInteractionLocked: false,
+      },
+    });
+    return { status: "acknowledged" };
+  } catch {
+    if (!isFresh()) return { status: "ignored", reason: "stale" };
+    cleanup();
+    return { status: "rejected", reason: "adapter" };
+  }
+}
+
+/**
+ * One whole shared-stack turn decision.
+ *
+ * A SIBLING of `performPick`, deliberately, and it must stay one — do not
+ * "simplify" it back into `performPick`. `performPick` acknowledges on
+ * `exactAddedIds`: every requested instance id present exactly once in the
+ * pool afterwards. A shared-stack DECLINE adds ZERO cards to the pool and
+ * names no ids at all, so that predicate can never be satisfied, and
+ * `performPick` refuses a zero-length id list outright before it gets that
+ * far. The engine publishes `shared_stack.decisions` for precisely this
+ * reason: it is a monotone counter of APPLIED decisions, so
+ * `after > before` acknowledges a decline and a take alike.
+ *
+ * Everything else is `performPick`'s machinery unchanged — the
+ * `exclusivePickToken` mutual exclusion, the `lifecycleGeneration` /
+ * adapter-identity `isFresh` guard, and `installWorkspace`. The one further
+ * difference: reconciliation is `reconcileWorkspaceState` ALONE, with no
+ * `applyDestination`. A decision names no cards, so there is no instance to
+ * place into a workspace zone; a take's new pool cards are picked up by
+ * reconciliation as unplaced, exactly as a restored pool is.
+ *
+ * Legality is not consulted here. The engine publishes a per-pile, per-decision
+ * `legality` vector and refuses an illegal decision in the reducer; a client
+ * that re-derived "may this seat take pile 2" from pile sizes would be a second
+ * authority, which Fork 4 forbids.
+ */
+async function performSharedStackDecision(
+  pile: number,
+  decision: SharedStackPileDecision,
+): Promise<DraftPickOutcome> {
+  if (exclusivePickToken) return { status: "ignored", reason: "busy" };
+  if (!Number.isInteger(pile) || pile < 0) {
+    return { status: "rejected", reason: "invalid-request" };
+  }
+  const state = useMultiplayerDraftStore.getState();
+  const adapter = activeWorkspaceAdapter();
+  if (!adapter || !state.view || !state.workspaceState) {
+    return { status: "rejected", reason: "invalid-request" };
+  }
+  // No live pile turn means no decision to make. This is the ENGINE's
+  // discriminator (`shared_stack` is `Some` exactly while a pile turn is
+  // live), not a kind check.
+  const before = state.view.shared_stack;
+  if (!before) return { status: "rejected", reason: "invalid-request" };
+
+  const token = Symbol("shared-stack-decision");
+  exclusivePickToken = token;
+  const generation = lifecycleGeneration;
+  useMultiplayerDraftStore.setState({ pickInteractionLocked: true });
+  const isFresh = () => generation === lifecycleGeneration
+    && exclusivePickToken === token
+    && activeWorkspaceAdapter() === adapter;
+  const cleanup = () => {
+    if (exclusivePickToken !== token) return;
+    exclusivePickToken = null;
+    pendingGuestPick = null;
+    useMultiplayerDraftStore.setState({ pendingPickIntent: null, pickInteractionLocked: false });
+  };
+
+  try {
+    let acknowledgedView: DraftPlayerView | null;
+    if (state.role === "host" && activeHostAdapter === adapter) {
+      acknowledgedView = await adapter.submitSharedStackDecision(pile, decision);
+    } else if (state.role === "guest" && activeGuestAdapter === adapter) {
+      // The host answers with `draft_pick_ack`, which the guest adapter emits
+      // as `pickAcknowledged` — the same correlation slot a pick uses, because
+      // the exclusive token makes at most one of the two outstanding.
+      const acknowledgement = new Promise<DraftPlayerView | null>((resolve) => {
+        pendingGuestPick = { generation, resolve };
+      });
+      await adapter.submitSharedStackDecision(pile, decision);
+      acknowledgedView = await acknowledgement;
+    } else {
+      acknowledgedView = null;
+    }
+    if (!isFresh()) return { status: "ignored", reason: "stale" };
+    if (!acknowledgedView) {
+      cleanup();
+      return { status: "rejected", reason: "adapter" };
+    }
+    const after = acknowledgedView.shared_stack;
+    const applied = after
+      ? after.decisions > before.decisions
+      // The decision that empties the stack also ends the draft, and
+      // `shared_stack` is status-gated to `Drafting` — so the view that
+      // acknowledges the FINAL decision publishes no counter to compare.
+      // A view still in `Drafting` with no shared stack is a genuine failure
+      // and stays one.
+      : acknowledgedView.status !== "Drafting";
+    if (!applied) {
+      cleanup();
+      return { status: "rejected", reason: "unacknowledged" };
+    }
+    exclusivePickToken = null;
+    pendingGuestPick = null;
+    installWorkspace({
+      view: acknowledgedView,
+      base: reconcileWorkspaceState(state.workspaceState, acknowledgedView.pool),
       publish: true,
       patch: {
         phase: phaseForDraftViewStatus(acknowledgedView.status),
@@ -1690,6 +1810,8 @@ export const useMultiplayerDraftStore = create<
   submitPickWithDraftEffect: (effectCardInstanceId, cardInstanceIds, destination = "deck", placementHint) => performPick({
     kind: "draft-effect", effectCardInstanceId, instanceIds: cardInstanceIds, destination, placementHint,
   }),
+
+  submitSharedStackDecision: (pile, decision) => performSharedStackDecision(pile, decision),
 
   selectCard: (cardInstanceId) => {
     if (get().pickInteractionLocked) return;

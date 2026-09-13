@@ -48,6 +48,7 @@ const mockHostAdapter = {
   startDraft: vi.fn(async () => {}),
   submitPick: vi.fn(async () => mockView("Drafting")),
   submitPickWithDraftEffect: vi.fn(async () => mockView("Drafting")),
+  submitSharedStackDecision: vi.fn(async () => mockView("Drafting")),
   submitDeck: vi.fn(async () => mockView("Deckbuilding")),
   suggestLands: vi.fn(async () => ({})),
   updateWorkspace: vi.fn(async () => {}),
@@ -74,6 +75,7 @@ const mockGuestAdapter = {
   initialize: vi.fn(async () => {}),
   submitPick: vi.fn(async () => {}),
   submitPickWithDraftEffect: vi.fn(async () => {}),
+  submitSharedStackDecision: vi.fn(async () => {}),
   submitDeck: vi.fn(async () => {}),
   suggestLands: vi.fn(async () => ({})),
   updateWorkspace: vi.fn(async () => {}),
@@ -1231,6 +1233,152 @@ describe("multiplayerDraftStore", () => {
       await useMultiplayerDraftStore.getState().leave();
       expect(mockGuestAdapter.dispose).toHaveBeenCalledTimes(2);
       expect(useMultiplayerDraftStore.getState()).toMatchObject({ role: null, phase: "idle" });
+    });
+  });
+
+  describe("shared-stack decisions", () => {
+    /**
+     * A Winston-shaped player view. `shared_stack.decisions` is the engine's
+     * monotone counter of APPLIED decisions and is the only acknowledgement
+     * signal a decline can produce — the pool does not move. `legality` is
+     * published by the engine and read, never computed here.
+     */
+    const winstonView = (decisions: number, pool: DraftPlayerView["pool"] = []): DraftPlayerView => ({
+      ...mockView("Drafting"),
+      kind: "Winston",
+      pool,
+      shared_stack: {
+        main_stack_remaining: 40,
+        total_cards: 42,
+        active_seat: 0,
+        active_pile: 0,
+        piles: [0, 1, 2].map((index) => ({
+          index,
+          total: 1,
+          revealed: [],
+          legality: [
+            { decision: "Take" as const, refusal: null },
+            { decision: "Decline" as const, refusal: null },
+          ],
+        })),
+        decisions,
+      },
+      play_first_chooser: 1,
+    });
+
+    const hostWinstonPod = async () => {
+      await useMultiplayerDraftStore.getState().hostDraft({
+        poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
+        kind: "Winston",
+        podSize: 2,
+        hostDisplayName: "Host",
+        tournamentFormat: "Swiss",
+        podPolicy: "Competitive",
+      });
+      capturedHostEventHandler!({ type: "workspaceRestored", workspaceState: null });
+      capturedHostEventHandler!({ type: "viewUpdated", view: winstonView(4) });
+    };
+
+    it.each([
+      ["Take", 1],
+      ["Decline", 2],
+    ] as const)("dispatches a %s on pile %i verbatim through the host adapter", async (decision, pile) => {
+      await hostWinstonPod();
+      mockHostAdapter.submitSharedStackDecision.mockResolvedValueOnce(winstonView(5));
+
+      await expect(useMultiplayerDraftStore.getState().submitSharedStackDecision(pile, decision))
+        .resolves.toEqual({ status: "acknowledged" });
+
+      expect(mockHostAdapter.submitSharedStackDecision).toHaveBeenCalledWith(pile, decision);
+    });
+
+    // THE discriminating case for the sibling: a non-final decline adds ZERO
+    // cards to the pool, so `performPick`'s `exactAddedIds` predicate can never
+    // acknowledge it (and its zero-length id guard would refuse the call
+    // outright). Only the engine's decisions counter can.
+    it("acknowledges a decline that adds no card to the pool", async () => {
+      await hostWinstonPod();
+      mockHostAdapter.submitSharedStackDecision.mockResolvedValueOnce(winstonView(5));
+
+      await expect(useMultiplayerDraftStore.getState().submitSharedStackDecision(0, "Decline"))
+        .resolves.toEqual({ status: "acknowledged" });
+
+      expect(useMultiplayerDraftStore.getState().view?.shared_stack?.decisions).toBe(5);
+      expect(useMultiplayerDraftStore.getState().view?.pool).toEqual([]);
+      expect(useMultiplayerDraftStore.getState().pickInteractionLocked).toBe(false);
+    });
+
+    it("refuses to acknowledge a view whose decision counter did not advance", async () => {
+      await hostWinstonPod();
+      mockHostAdapter.submitSharedStackDecision.mockResolvedValueOnce(winstonView(4));
+
+      await expect(useMultiplayerDraftStore.getState().submitSharedStackDecision(0, "Take"))
+        .resolves.toEqual({ status: "rejected", reason: "unacknowledged" });
+      expect(useMultiplayerDraftStore.getState().pickInteractionLocked).toBe(false);
+    });
+
+    // The final decision empties the stack and ends the draft, and the engine
+    // status-gates `shared_stack` to `Drafting` — so there is no counter left
+    // to compare. A view still in `Drafting` with no shared stack stays a
+    // failure, which is what keeps this arm from being a blanket pass.
+    it("acknowledges the final decision, whose view has left Drafting", async () => {
+      await hostWinstonPod();
+      mockHostAdapter.submitSharedStackDecision.mockResolvedValueOnce({
+        ...mockView("Deckbuilding"),
+        kind: "Winston",
+        pool: [card("last-card")],
+      });
+
+      await expect(useMultiplayerDraftStore.getState().submitSharedStackDecision(2, "Take"))
+        .resolves.toEqual({ status: "acknowledged" });
+    });
+
+    it("refuses a still-drafting view that published no shared stack", async () => {
+      await hostWinstonPod();
+      mockHostAdapter.submitSharedStackDecision.mockResolvedValueOnce({
+        ...mockView("Drafting"),
+        kind: "Winston",
+      });
+
+      await expect(useMultiplayerDraftStore.getState().submitSharedStackDecision(0, "Take"))
+        .resolves.toEqual({ status: "rejected", reason: "unacknowledged" });
+    });
+
+    it("refuses a decision when no pile turn is live", async () => {
+      await useMultiplayerDraftStore.getState().hostDraft({
+        poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
+        kind: "Premier",
+        podSize: 8,
+        hostDisplayName: "Host",
+        tournamentFormat: "Swiss",
+        podPolicy: "Competitive",
+      });
+      capturedHostEventHandler!({ type: "workspaceRestored", workspaceState: null });
+      capturedHostEventHandler!({ type: "viewUpdated", view: mockView("Drafting") });
+      mockHostAdapter.submitSharedStackDecision.mockClear();
+
+      await expect(useMultiplayerDraftStore.getState().submitSharedStackDecision(0, "Take"))
+        .resolves.toEqual({ status: "rejected", reason: "invalid-request" });
+      expect(mockHostAdapter.submitSharedStackDecision).not.toHaveBeenCalled();
+    });
+
+    it("sends the guest decision and settles on the host's pick acknowledgement", async () => {
+      await useMultiplayerDraftStore.getState().joinDraft({
+        kind: "new",
+        roomCode: "ABCDE",
+        displayName: "Alice",
+      });
+      capturedGuestEventHandler!({ type: "workspaceRestored", workspaceState: null });
+      capturedGuestEventHandler!({ type: "viewUpdated", view: winstonView(7) });
+
+      const pending = useMultiplayerDraftStore.getState().submitSharedStackDecision(1, "Decline");
+      await vi.waitFor(() => {
+        expect(mockGuestAdapter.submitSharedStackDecision).toHaveBeenCalledWith(1, "Decline");
+      });
+      capturedGuestEventHandler!({ type: "pickAcknowledged", view: winstonView(8) });
+
+      await expect(pending).resolves.toEqual({ status: "acknowledged" });
+      expect(useMultiplayerDraftStore.getState().view?.shared_stack?.decisions).toBe(8);
     });
   });
 

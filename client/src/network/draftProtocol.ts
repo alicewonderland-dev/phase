@@ -20,6 +20,7 @@ import type {
   DraftRarityGroupKind,
   DraftSourceView,
   SeatPublicView,
+  SharedStackPileDecision,
 } from "../adapter/draft-adapter";
 import type { DeckCardCount, MatchConfig, MatchScore } from "../adapter/types";
 import {
@@ -367,7 +368,7 @@ export interface DraftCommanderLaunch {
  * Discriminated union of all draft-specific P2P messages.
  *
  * Flow:
- *   Guest → Host: `draft_join`, `draft_reconnect`, `draft_pick`, `draft_pick_with_draft_effect`, `draft_submit_deck`,
+ *   Guest → Host: `draft_join`, `draft_reconnect`, `draft_pick`, `draft_pick_with_draft_effect`, `draft_pile_decision`, `draft_submit_deck`,
  *                 `draft_request_advance`, `draft_workspace_update`, `draft_suggest_lands`, `draft_leave`
  *   Host → Guest: `draft_welcome`, `draft_reconnect_ack`, `draft_reconnect_rejected`,
  *                 `draft_state_update`, `draft_pick_ack`, `draft_suggest_lands_result`, `draft_suggest_lands_rejected`, `draft_error`,
@@ -397,6 +398,22 @@ export type DraftP2PMessage =
       type: "draft_pick_with_draft_effect";
       effectCardInstanceId: string;
       cardInstanceIds: string[];
+    }
+  | {
+      /**
+       * One whole shared-stack turn decision. Names NO cards: a decline adds
+       * nothing to any pool, which is exactly why the engine publishes
+       * `shared_stack.decisions` as the acknowledgement detector.
+       */
+      type: "draft_pile_decision";
+      /**
+       * The pile the guest believes it is deciding on. An
+       * optimistic-concurrency check against the ENGINE's cursor, not a
+       * selector: a duplicate frame naming a stale pile is refused
+       * `PileNotActive` rather than silently applied to the next pile.
+       */
+      pile: number;
+      decision: SharedStackPileDecision;
     }
   | {
       type: "draft_submit_deck";
@@ -648,6 +665,7 @@ const VALID_DRAFT_TYPES = new Set([
   "draft_reconnect",
   "draft_pick",
   "draft_pick_with_draft_effect",
+  "draft_pile_decision",
   "draft_submit_deck",
   "draft_workspace_update",
   "draft_suggest_lands",
@@ -714,6 +732,31 @@ const MAX_CARDS_PER_PICK = 2;
  */
 // @sync-with: crates/draft-core/src/types.rs
 const MAX_COMMANDER_DESIGNATIONS = 2;
+
+/**
+ * The largest `PackDistribution::SharedStackPiles::pile_count` over every kind
+ * — the session-free half of a pile decision's bound, mirroring the engine's
+ * `MAX_SHARED_STACK_PILES`.
+ *
+ * A ceiling, not the live pile count: the EXACT pile a decision may name is
+ * the engine's cursor, and `shared_stack::refusal_for` is the single authority
+ * that judges it. What is bounded here is what a message ALONE can state.
+ *
+ * `@sync-with` has no checker; the value is pinned by this module's test
+ * against the engine constant's published figure.
+ */
+// @sync-with: crates/draft-core/src/types.rs `MAX_SHARED_STACK_PILES`
+const MAX_SHARED_STACK_PILES = 3;
+
+/**
+ * Every shared-stack decision a message may name.
+ *
+ * A tuple the type is checked against, so a decision added to
+ * `SharedStackPileDecision` cannot leave this bound silently narrow — the same
+ * device `DRAFT_KINDS` uses, for the same reason.
+ */
+// @sync-with: crates/draft-core/src/types.rs `SharedStackPileDecision::ALL`
+const SHARED_STACK_PILE_DECISIONS: readonly SharedStackPileDecision[] = ["Take", "Decline"];
 
 function requireDraftCardInstanceId(value: unknown, field: string, context: string): string {
   if (
@@ -831,6 +874,38 @@ function validatePick(raw: Record<string, unknown>): DraftP2PMessage {
     throw new Error("Invalid draft pick: cardInstanceIds must be distinct");
   }
   return { ...raw, type: "draft_pick", cardInstanceIds } as DraftP2PMessage;
+}
+
+/**
+ * Bound an untrusted `draft_pile_decision` payload.
+ *
+ * A TRANSPORT bound, not a legality check, and the distinction is the whole
+ * point: this function receives only the message and can never consult the
+ * session, so the EXACT check is `shared_stack::refusal_for`'s, inside the
+ * engine. All that is refused here is a payload no session could make
+ * meaningful — a pile index outside the mirrored ceiling, or a decision that
+ * is not one of the two the axis defines.
+ */
+function validatePileDecision(raw: Record<string, unknown>): DraftP2PMessage {
+  if (
+    typeof raw.pile !== "number"
+    || !Number.isInteger(raw.pile)
+    || raw.pile < 0
+    || raw.pile >= MAX_SHARED_STACK_PILES
+  ) {
+    throw new Error(
+      `Invalid pile decision: pile must be an integer in 0..${MAX_SHARED_STACK_PILES - 1}`,
+    );
+  }
+  if (
+    typeof raw.decision !== "string"
+    || !SHARED_STACK_PILE_DECISIONS.some((decision) => decision === raw.decision)
+  ) {
+    throw new Error(
+      `Invalid pile decision: decision must be one of ${SHARED_STACK_PILE_DECISIONS.join(", ")}`,
+    );
+  }
+  return { ...raw, type: "draft_pile_decision" } as DraftP2PMessage;
 }
 
 function validateSubmitDeck(raw: Record<string, unknown>): DraftP2PMessage {
@@ -1235,6 +1310,9 @@ export function validateDraftMessage(raw: unknown): DraftP2PMessage {
   }
   if (msg.type === "draft_pick") {
     return validatePick(raw as Record<string, unknown>);
+  }
+  if (msg.type === "draft_pile_decision") {
+    return validatePileDecision(raw as Record<string, unknown>);
   }
   if (msg.type === "draft_submit_deck") {
     return validateSubmitDeck(raw as Record<string, unknown>);

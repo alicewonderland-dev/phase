@@ -156,6 +156,7 @@ function PodSetup() {
     Traditional: t("podSetup.kindTraditionalDesc"),
     Sealed: t("podSetup.kindSealedDesc"),
     CommanderDraft: t("podSetup.kindCommanderDraftDesc"),
+    Winston: t("podSetup.kindWinstonDesc"),
   };
   const tournamentDescription = config.tournamentFormat === "Swiss"
     ? t("podSetup.tournamentSwissDesc")

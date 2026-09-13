@@ -8,9 +8,13 @@ const EMPTY_SEATS: SeatPublicView[] = [];
 
 // ── Pick status colors ──────────────────────────────────────────────────
 
+// `Waiting` reads as "drafting, but not this seat's turn" — the shared-stack
+// seat that owes no decision yet. So it takes the same neutral treatment as
+// `Pending` at lower emphasis, sitting between `Pending` and `NotDrafting`.
 const PICK_STATUS_BORDER: Record<SeatPublicView["pick_status"], string> = {
   Pending: "border-white/20",
   Picked: "border-green-400/30",
+  Waiting: "border-white/10",
   TimedOut: "border-red-400/30",
   NotDrafting: "border-white/10",
 };
@@ -18,6 +22,7 @@ const PICK_STATUS_BORDER: Record<SeatPublicView["pick_status"], string> = {
 const PICK_STATUS_DOT: Record<SeatPublicView["pick_status"], string> = {
   Pending: "bg-white/30",
   Picked: "bg-green-400",
+  Waiting: "bg-white/20",
   TimedOut: "bg-red-400",
   NotDrafting: "bg-white/10",
 };

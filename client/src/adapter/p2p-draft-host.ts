@@ -13,7 +13,7 @@ import type Peer from "peerjs";
 import type { DataConnection } from "peerjs";
 
 import { DraftAdapter, EMPTY_DRAFT_POOL_GROUPS } from "./draft-adapter";
-import type { DraftCardInstance, DraftPlayerView, MultiplayerSeatDescriptor, PairingView, PoolInput, SeatPublicView } from "./draft-adapter";
+import type { DraftCardInstance, DraftPlayerView, MultiplayerSeatDescriptor, PairingView, PoolInput, SeatPublicView, SharedStackPileDecision } from "./draft-adapter";
 import type { DraftKind, DraftProcedure, PodPolicy, TournamentFormat } from "./draft-adapter";
 import {
   createDraftPeerSession,
@@ -1026,6 +1026,15 @@ export class P2PDraftHost {
         );
         break;
       }
+      case "draft_pile_decision": {
+        if (!this.canGuestPick(seat)) return;
+        // The seat is the SESSION's, never the payload's — the guest names a
+        // pile, not a seat. Whether this seat may decide at all is the
+        // engine's `shared_stack::refusal_for`, and the reducer's refusal
+        // surfaces as `draft_error` through `handleSharedStackDecision`.
+        await this.handleSharedStackDecision(seat, msg.pile, msg.decision);
+        break;
+      }
       case "draft_submit_deck": {
         if (!this.draftStarted) {
           this.guestSessions.get(seat)?.send({
@@ -1128,6 +1137,14 @@ export class P2PDraftHost {
     const seed = hostDraftSeed();
     this.draftSeed = seed;
     const draftCode = `draft-${seed.toString(16).padStart(8, "0")}`;
+    // A kind whose procedure seats humans in EVERY seat admits no bot fill:
+    // the reducer refuses a bot seat outright, so filling here would turn a
+    // short pod into a guaranteed `createMultiplayerDraft` error instead of a
+    // pod that starts short. The engine refusal remains the authority — this
+    // only avoids walking into it. Read from the procedure, never from `kind`.
+    const procedure = this.procedure
+      ?? await this.adapter.draftProcedure(this.kind, this.tournamentFormat);
+    const botFillAllowed = botFillEmptySeats && procedure.human_seats !== procedure.pod_size;
     const seats: MultiplayerSeatDescriptor[] = [];
     for (let i = 0; i < this.podSize; i++) {
       const displayName = this.seatNames.get(i);
@@ -1137,7 +1154,7 @@ export class P2PDraftHost {
           player_id: i,
           display_name: displayName,
         });
-      } else if (botFillEmptySeats) {
+      } else if (botFillAllowed) {
         seats.push({ type: "Bot", name: this.botNameForSeat(i, seed) });
       }
     }
@@ -1196,6 +1213,15 @@ export class P2PDraftHost {
   ): Promise<DraftPlayerView> {
     return this.enqueueAuthoritativeMutation(() =>
       this.handlePickWithDraftEffect(0, effectCardInstanceId, cardInstanceIds));
+  }
+
+  /** Host submits its own shared-stack turn decision (seat 0). */
+  async submitHostSharedStackDecision(
+    pile: number,
+    decision: SharedStackPileDecision,
+  ): Promise<DraftPlayerView> {
+    return this.enqueueAuthoritativeMutation(() =>
+      this.handleSharedStackDecision(0, pile, decision));
   }
 
   /**
@@ -1344,6 +1370,60 @@ export class P2PDraftHost {
         cardInstanceIds,
       ),
     );
+  }
+
+  /**
+   * Apply one whole shared-stack turn decision.
+   *
+   * A SIBLING of `applyPick`, not a reuse of it, and the differences are all
+   * structural rather than stylistic:
+   *   * there is no round. `picksThisRound` / `allPicksSubmitted` /
+   *     `roundComplete` describe a pick-and-pass step in which every seat owes
+   *     a pick simultaneously; under `SharedStackPiles` exactly one seat owes
+   *     a decision and the turn passes on every applied decision.
+   *   * there are no bot seats to resolve — the reducer refuses a bot seat
+   *     under this distribution, so a Winston pod has none by construction.
+   *   * a decision names no cards, so `pickReceived` (whose payload IS the
+   *     cards) cannot describe it.
+   * Every seat's projection changes on every decision (the active seat moves,
+   * and with it `active_pile` and every `revealed` prefix), so this
+   * broadcasts unconditionally rather than only at a round boundary.
+   *
+   * Legality is the engine's throughout: a refused decision throws out of the
+   * adapter and reaches the deciding seat as `draft_error`, exactly as a
+   * refused pick does.
+   */
+  private async handleSharedStackDecision(
+    seat: number,
+    pile: number,
+    decision: SharedStackPileDecision,
+  ): Promise<DraftPlayerView> {
+    this.assertPickAllowed();
+    try {
+      const view = await this.adapter.submitSharedStackDecisionForSeat(seat, pile, decision);
+
+      // Same fence as `applyPick`: no client may observe an acknowledged
+      // mutation before a host reload can restore the reducer result.
+      await this.persistSessionStrict();
+
+      const session = this.guestSessions.get(seat);
+      if (session) {
+        session.send({ type: "draft_pick_ack", view });
+      }
+
+      await this.broadcastViews();
+
+      const hostView = await this.adapter.getViewForSeat(0);
+      if (hostView.status === "Deckbuilding") {
+        this.clearActiveTimer();
+        this.emit({ type: "draftComplete" });
+      }
+      return hostView;
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      this.guestSessions.get(seat)?.send({ type: "draft_error", reason });
+      throw err;
+    }
   }
 
   private async applyPick(
@@ -1969,6 +2049,12 @@ export class P2PDraftHost {
     }
   }
 
+  /**
+   * Needs no shared-stack branch, and that is a structural fact rather than an
+   * omission: the reducer refuses a bot seat under
+   * `PackDistribution::SharedStackPiles`, so a Winston pod has no `is_bot`
+   * seat for this loop to find and the body is empty by construction.
+   */
   private async resolveBotPicks(options: PickOptions = { emit: true, persist: true }): Promise<void> {
     const hostView = await this.adapter.getViewForSeat(0);
     if (hostView.status !== "Drafting") return;
