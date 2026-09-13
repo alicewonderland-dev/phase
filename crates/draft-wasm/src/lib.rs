@@ -1078,8 +1078,10 @@ pub fn import_draft_session(json: &str, difficulty: u8) -> Result<JsValue, JsVal
     // The resume-seed offset is derived from `cards_in_pack` /
     // `current_pack_number` / `pick_number`, all of which stay `0` for a
     // shared-stack session (it moves none of them). That is harmless: this RNG
-    // seeds BOT PICKS, and a shared-stack pod has no bot seats by engine
-    // refusal.
+    // seeds the PICK-AND-PASS bot, and a shared-stack bot seat never reaches
+    // it. `winston_decision` is deliberately RNG-free -- "same projection =>
+    // same decision" is meant literally -- so a resumed Winston pod's bot
+    // behaviour does not depend on this stream at all.
     let offset = u64::from(session.cards_in_pack(session.current_pack_number))
         * u64::from(session.current_pack_number)
         + u64::from(session.pick_number);
@@ -1385,7 +1387,9 @@ fn draft_kind_from_wire(kind: u8) -> Result<DraftKind, String> {
 /// Create a multiplayer draft session. Used by the P2P host to initialize a
 /// multiplayer draft of any `DraftKind` with a wire number, with human + bot
 /// seats from a Set pool, host-local Chaos candidate pools, or a custom Cube
-/// list. (A shared-stack kind has no bot seats: the reducer refuses them.)
+/// list. A shared-stack kind admits bot seats like any other; their turns are
+/// driven by `resolve_shared_stack_bot_turns`, which the host calls after each
+/// human decision.
 ///
 /// - `pool_input_json`: serialized `PoolInput` discriminated union
 ///   (`{ "type": "Set" | "Chaos" | "Cube", "data": { ... } }`)
@@ -1683,6 +1687,152 @@ pub fn apply_draft_action(action_json: &str) -> Result<JsValue, JsValue> {
     })
 }
 
+/// The termination bound for one shared-stack bot run, DERIVED from the state
+/// rather than chosen, so it tracks the real board instead of a magic constant.
+///
+/// With `U` undrafted cards (main stack plus every pile) and `n` piles, the
+/// bound is `U * (n + 1) + 1`. The proof it comes from, read off
+/// `shared_stack::apply_shared_stack_decision`:
+///
+/// * `Phi = U * (n + 1) + (n - c)` is a non-negative integer (`c <= n - 1`, so
+///   `n - c >= 1`) and STRICTLY DECREASES on every applied decision. A `Take` or
+///   a final-pile `Decline` drops `U` by at least 1, costing at least `n + 1`,
+///   while `(n - c)` can rise by at most `n - 1`; a non-final `Decline` leaves
+///   `U` alone and drops `(n - c)` by exactly 1. So the loop terminates.
+/// * The `Err` branch is unreachable, by a tighter per-turn count: a turn's
+///   cursor starts at 0 and advances by exactly 1 per non-final `Decline`, which
+///   requires `cursor + 1 < n`, so a turn holds at most `n - 1` non-final
+///   declines plus exactly one turn-ender -- **at most `n` decisions per turn**.
+///   Every turn-ender drops `U` by at least 1 and the session leaves `Drafting`
+///   the instant `U` reaches 0, so there are at most `U` turns. Therefore
+///   `applied <= U * n < U * (n + 1) + 1`, with slack `U + 1`.
+///
+/// MEASURED, for scale: a 2-seat 90-card pod gives `U = 90`, `n = 3`, a bound of
+/// 361, a theoretical ceiling of 270 and 74-77 actual decisions; a 4-seat pod's
+/// longest consecutive bot run was 9 decisions against a bound of 720.
+///
+/// Returns 0 for a session with no shared stack -- there is nothing to drive,
+/// and the loop's own `break` handles that case before the bound is consulted.
+fn shared_stack_bot_turn_bound(session: &DraftSession) -> usize {
+    let Some(state) = session.shared_stack.as_ref() else {
+        return 0;
+    };
+    let undrafted = state.main_stack.len() + state.piles.iter().map(Vec::len).sum::<usize>();
+    undrafted
+        .saturating_mul(state.piles.len() + 1)
+        .saturating_add(1)
+}
+
+/// Drive every consecutive shared-stack turn that belongs to a bot seat, from
+/// whatever state the session is in, and stop at the first turn that does not.
+///
+/// A bot's turn is up to `pile_count` decisions and a 3-4 seat pod can have
+/// several bot turns back to back (MEASURED: the longest consecutive run in a
+/// 4-seat/3-bot pod was 9 decisions across three turns), so this re-reads
+/// `active_seat` every iteration. A one-decision-per-call driver would strand
+/// the pod mid-run.
+///
+/// `bound` is a parameter rather than an inline expression ONLY so
+/// `the_loop_fails_loudly_rather_than_spinning` can drive the failure branch
+/// without mutating the production arithmetic; the production caller passes
+/// [`shared_stack_bot_turn_bound`], computed once at entry from the state.
+///
+/// **Loud on violation, never silent.** Three distinct failures get three
+/// distinct `Err`s and none of them is a `break`:
+///
+/// * the bound trips -- an engine invariant broke, and the termination proof
+///   above says this is unreachable from any legal state;
+/// * `winston_decision` returns `None` for the active seat while drafting,
+///   which `some_decision_is_always_legal_for_the_active_seat_while_drafting`
+///   proves cannot happen, so it is a defect rather than a state;
+/// * `session::apply` refuses the decision -- the bot disagreed with the single
+///   legality authority, which `winston_decision_never_returns_a_refused_decision`
+///   says it cannot.
+///
+/// The `break`s are for the three LEGITIMATE exits only: the session is not
+/// drafting, it has no shared stack, or the active seat is human. A `break` on
+/// the bound would strand the pod on a bot's turn with no error anywhere.
+fn drive_shared_stack_bot_turns(
+    session: &mut DraftSession,
+    difficulty: AiDifficulty,
+    card_db: Option<&CardDatabase>,
+    bound: usize,
+) -> Result<Vec<DraftDelta>, String> {
+    let mut deltas = Vec::new();
+    let mut applied = 0usize;
+
+    while session.status == DraftStatus::Drafting {
+        let Some(state) = session.shared_stack.as_ref() else {
+            break;
+        };
+        let seat = state.active_seat;
+        if !matches!(
+            session.seats.get(usize::from(seat)),
+            Some(DraftSeat::Bot { .. })
+        ) {
+            break;
+        }
+
+        applied += 1;
+        if applied > bound {
+            return Err(format!(
+                "shared-stack bot loop exceeded its termination bound of {bound} decisions \
+                 (seat {seat}); the session's undrafted count is not decreasing"
+            ));
+        }
+
+        // THE ONLY INPUT the bot gets. Not the session, not the cell: the same
+        // projection the human seat across the table receives.
+        let view = filter_for_player(session, seat);
+        let (pile, decision) = bot_ai::winston_decision(&view, difficulty, card_db)
+            .ok_or_else(|| format!("no legal shared-stack decision for bot seat {seat}"))?;
+
+        deltas.extend(
+            session::apply(
+                session,
+                DraftAction::SharedStackDecision {
+                    seat,
+                    pile,
+                    decision,
+                },
+                None,
+            )
+            .map_err(|e| format!("bot seat {seat} decision refused: {e}"))?,
+        );
+    }
+
+    Ok(deltas)
+}
+
+/// Pure-Rust core for `resolve_shared_stack_bot_turns`, so the loop, its bound
+/// and its three `Err`s are reachable from `cargo test` without wasm-bindgen --
+/// the same `_inner` split `create_multiplayer_draft_inner` and
+/// `booster_pack_pool_for_game_inner` use.
+fn resolve_shared_stack_bot_turns_inner() -> Result<Vec<DraftDelta>, String> {
+    let difficulty = DIFFICULTY.with(|cell| cell.get());
+    with_draft_mut_inner(|session| {
+        let bound = shared_stack_bot_turn_bound(session);
+        CARD_DB.with(|cell| {
+            let db_borrow = cell.borrow();
+            drive_shared_stack_bot_turns(session, difficulty, db_borrow.as_ref(), bound)
+        })
+    })
+}
+
+/// Resolve every consecutive shared-stack turn owned by a bot seat, and return
+/// the `DraftDelta`s produced (an empty array when the active seat is human, the
+/// draft is over, or the session has no shared stack).
+///
+/// The host calls this after applying a human seat's decision and after starting
+/// a pod whose first seat is a bot. It is a WASM export because the loop, its
+/// bound and its termination proof are engine concerns: the client calls it and
+/// renders what comes back, and computes nothing.
+#[wasm_bindgen]
+pub fn resolve_shared_stack_bot_turns() -> Result<JsValue, JsValue> {
+    let deltas = resolve_shared_stack_bot_turns_inner().map_err(|e| JsValue::from_str(&e))?;
+    Ok(to_js(&deltas))
+}
+
 /// Get a filtered draft view for a specific seat. The P2P host calls this
 /// after each action to produce per-player state snapshots to send over
 /// the P2P channel.
@@ -1698,6 +1848,186 @@ pub fn get_draft_view_for_seat(seat_index: u8) -> Result<JsValue, JsValue> {
 #[wasm_bindgen]
 pub fn get_draft_status() -> Result<JsValue, JsValue> {
     with_draft(|session| to_js(&session.status))
+}
+
+#[cfg(test)]
+mod shared_stack_bot_loop_tests {
+    use super::*;
+    use draft_core::pack_source::FixturePackSource;
+    use engine::types::player::PlayerId;
+
+    const CARDS_PER_PACK: u8 = 15;
+
+    /// A pod of `pod_size` seats where `bot_seats` are bots, started and dealt.
+    ///
+    /// `FixturePackSource`'s cards carry no colours and no database face, which
+    /// is deliberate here: these tests are about the LOOP -- its span, its
+    /// bound and its failure mode -- and the valuation is exercised by
+    /// `bot_ai`'s own tests against a real card database.
+    fn started_pod(pod_size: u8, bot_seats: &[u8], rng_seed: u64) -> DraftSession {
+        let config = DraftConfig {
+            source: DraftSource::single_set("TST".to_string()),
+            set_code: "TST".to_string(),
+            kind: DraftKind::Winston,
+            pod_size,
+            cards_per_pack: CARDS_PER_PACK,
+            pack_count: 3,
+            min_deck_size: 40,
+            addable_cards: DeckAddableCards::standard_basics(),
+            rng_seed,
+            tournament_format: TournamentFormat::Swiss,
+            pod_policy: PodPolicy::Competitive,
+            spectator_visibility: SpectatorVisibility::default(),
+        };
+        let seats: Vec<DraftSeat> = (0..pod_size)
+            .map(|i| {
+                if bot_seats.contains(&i) {
+                    DraftSeat::Bot {
+                        name: format!("Bot {i}"),
+                    }
+                } else {
+                    DraftSeat::Human {
+                        player_id: PlayerId(i),
+                        display_name: format!("Player {i}"),
+                    }
+                }
+            })
+            .collect();
+        let mut session = DraftSession::new(config, seats, "WIN-LOOP".to_string());
+        session::apply(
+            &mut session,
+            DraftAction::StartDraft,
+            Some(&FixturePackSource {
+                set_code: "TST".to_string(),
+                cards_per_pack: CARDS_PER_PACK,
+            }),
+        )
+        .expect("a Winston pod with bot seats starts");
+        session
+    }
+
+    fn active_seat(session: &DraftSession) -> u8 {
+        session
+            .shared_stack
+            .as_ref()
+            .expect("a live pile turn")
+            .active_seat
+    }
+
+    /// Hand the human seat's turn back to the bots, so the fixture is the shape
+    /// production is in when the host calls the driver: a human decision has
+    /// just been applied and the next seat is a bot.
+    fn end_the_humans_turn(session: &mut DraftSession) {
+        let seat = active_seat(session);
+        let pile = session
+            .shared_stack
+            .as_ref()
+            .expect("a live pile turn")
+            .cursor;
+        session::apply(
+            session,
+            DraftAction::SharedStackDecision {
+                seat,
+                pile,
+                decision: SharedStackPileDecision::Take,
+            },
+            None,
+        )
+        .expect("taking a dealt pile is legal at turn start");
+    }
+
+    fn decisions_in(deltas: &[DraftDelta]) -> Vec<u8> {
+        deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                DraftDelta::SharedStackDecisionApplied { seat, .. } => Some(*seat),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One call spans EVERY consecutive bot turn, not one decision and not one
+    /// turn: a 4-seat pod with three bots hands the driver several turns back to
+    /// back, and a one-decision-per-call driver would strand the pod.
+    ///
+    /// Driven through `resolve_shared_stack_bot_turns_inner`, the production
+    /// core, so the thread-local read and the bound derivation are covered too.
+    #[test]
+    fn the_loop_spans_consecutive_bot_turns_and_terminates() {
+        let mut session = started_pod(4, &[1, 2, 3], 20_260_913);
+        if active_seat(&session) == 0 {
+            end_the_humans_turn(&mut session);
+        }
+        assert_ne!(active_seat(&session), 0, "the fixture must start on a bot");
+
+        session_cell::install(session);
+        let deltas = resolve_shared_stack_bot_turns_inner().expect("the loop runs");
+        let seats = decisions_in(&deltas);
+
+        assert!(
+            seats.len() > 3,
+            "one call must cross a turn boundary; it applied {} decisions",
+            seats.len()
+        );
+        let mut distinct: Vec<u8> = seats.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(
+            distinct.len() >= 2,
+            "the run must span more than one seat, got {distinct:?}"
+        );
+        assert!(
+            !seats.contains(&0),
+            "the driver must never act for the human seat"
+        );
+
+        // It STOPPED, and stopped for the right reason: the human's turn.
+        let stopped_on_human = session_cell::with_installed(|session| {
+            session.status != DraftStatus::Drafting || active_seat(session) == 0
+        });
+        assert!(stopped_on_human);
+
+        // A second call from the same state produces nothing at all.
+        let again = resolve_shared_stack_bot_turns_inner().expect("a second call is a no-op");
+        assert!(decisions_in(&again).is_empty());
+
+        session_cell::clear();
+    }
+
+    /// The bound trip is an `Err`, never a `break` and never a hang. A silent
+    /// `break` would strand the pod mid-run with no error anywhere.
+    #[test]
+    fn the_loop_fails_loudly_rather_than_spinning() {
+        let mut session = started_pod(4, &[1, 2, 3], 20_260_913);
+        if active_seat(&session) == 0 {
+            end_the_humans_turn(&mut session);
+        }
+
+        // The bound is DERIVED: `U * (n + 1) + 1` over the undrafted cards.
+        let state = session.shared_stack.as_ref().expect("a live pile turn");
+        let undrafted = state.main_stack.len() + state.piles.iter().map(Vec::len).sum::<usize>();
+        let piles = state.piles.len();
+        assert_eq!(
+            shared_stack_bot_turn_bound(&session),
+            undrafted * (piles + 1) + 1
+        );
+
+        let mut starved = session.clone();
+        let error = drive_shared_stack_bot_turns(&mut starved, AiDifficulty::Medium, None, 1)
+            .expect_err("a bound of 1 must trip on a multi-decision run");
+        assert!(
+            error.contains("termination bound"),
+            "the error must name the bound: {error}"
+        );
+
+        // Paired positive: the SAME state runs clean under the derived bound,
+        // so the `Err` above is the bound tripping and not a broken fixture.
+        let mut healthy = session;
+        let bound = shared_stack_bot_turn_bound(&healthy);
+        let deltas = drive_shared_stack_bot_turns(&mut healthy, AiDifficulty::Medium, None, bound)
+            .expect("the derived bound is not reachable from a legal state");
+        assert!(decisions_in(&deltas).len() > 1);
+    }
 }
 
 #[cfg(test)]

@@ -876,17 +876,12 @@ fn apply_replace_seat_with_bot(
         return Err(DraftError::SeatOutOfRange { seat, pod_size });
     }
 
-    // Dispatched on the distribution, not on `human_seats`: a shared-stack pod
-    // is human-only, and converting a live one into a bot pod one action after
-    // `StartDraft` refused the same thing would make the start-time guard a
-    // formality.
-    match session.kind.procedure().distribution {
-        PackDistribution::SharedStackPiles { .. } => {
-            return Err(DraftError::SharedStackRequiresHumanSeats { seat });
-        }
-        PackDistribution::PickAndPass | PackDistribution::AllAtOnce => {}
-    }
-
+    // NO distribution dispatch here, deliberately. A shared-stack pod admits a
+    // bot seat exactly as every other distribution does: the seat is driven by
+    // `draft_wasm::resolve_shared_stack_bot_turns`, whose decisions go through
+    // `shared_stack::refusal_for` like any seat's. The refusal this arm used to
+    // return (`SharedStackRequiresHumanSeats`) is gone, so a mid-draft swap is
+    // no longer the seam a start-time guard had to be defended at.
     session.seats[seat as usize] = DraftSeat::Bot {
         name: name.unwrap_or_else(|| format!("Seat {}", seat + 1)),
     };
@@ -1003,18 +998,15 @@ fn apply_start_draft(
             // `inspected[0] = piles[0].len()` below with an empty `piles` and
             // panic inside `StartDraft`.
             shared_stack::piles_needed(pile_count)?;
-            // THE authority for "a shared-stack pod is human-only". The
-            // procedure's `human_seats` scalar is necessary but not sufficient:
-            // it is a per-kind constant that stops matching the seat count the
-            // moment a 4-seat pod is created. The frontend's suppression of
-            // bot-fill is a courtesy on top of this refusal, never a substitute.
-            if let Some(seat) = session
-                .seats
-                .iter()
-                .position(|seat| matches!(seat, DraftSeat::Bot { .. }))
-            {
-                return Err(DraftError::SharedStackRequiresHumanSeats { seat: seat as u8 });
-            }
+            // NO seat scan here, deliberately. A shared-stack pod admits BOT
+            // SEATS: a bot's turn is driven by
+            // `draft_wasm::resolve_shared_stack_bot_turns`, which reads only
+            // `view::filter_for_player`'s projection and submits ordinary
+            // `DraftAction::SharedStackDecision`s through
+            // `shared_stack::refusal_for`. There is therefore no seat-composition
+            // rule left to enforce at start time, and the `human_seats` scalar
+            // (`2` for Winston) is a per-kind default rather than an authority --
+            // see `DraftProcedure::human_seats`.
             if session.config.pack_count != procedure.packs_per_player
                 || session.config.min_deck_size != procedure.min_deck_size
             {

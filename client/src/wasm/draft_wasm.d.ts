@@ -147,6 +147,18 @@ export function load_card_database(json_str: string): number;
 export function pool_filter_options(pool_json: string): any;
 
 /**
+ * Resolve every consecutive shared-stack turn owned by a bot seat, and return
+ * the `DraftDelta`s produced (an empty array when the active seat is human, the
+ * draft is over, or the session has no shared stack).
+ *
+ * The host calls this after applying a human seat's decision and after starting
+ * a pod whose first seat is a bot. It is a WASM export because the loop, its
+ * bound and its termination proof are engine concerns: the client calls it and
+ * renders what comes back, and computes nothing.
+ */
+export function resolve_shared_stack_bot_turns(): any;
+
+/**
  * Mark a human seat as connected or disconnected. The host adapter calls
  * this on guest disconnect/reconnect so `DraftPlayerView.seats[*].connected`
  * reflects the runtime state. Rejects bot seats with `SeatIsBot`.
@@ -284,6 +296,7 @@ export interface InitOutput {
     readonly import_draft_session: (a: number, b: number, c: number) => [number, number, number];
     readonly load_card_database: (a: number, b: number) => [number, number, number];
     readonly pool_filter_options: (a: number, b: number) => [number, number, number];
+    readonly resolve_shared_stack_bot_turns: () => [number, number, number];
     readonly set_seat_connected: (a: number, b: number) => [number, number, number];
     readonly start_quick_cube_draft: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number];
     readonly start_quick_draft: (a: number, b: number, c: number, d: number) => [number, number, number];

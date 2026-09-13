@@ -1017,7 +1017,11 @@ mod tests {
         code
     }
 
-    /// A 2-seat Winston pod, human-only by engine refusal.
+    /// A 2-seat Winston pod. Every seat here is human because `start_pod`
+    /// joins human players, not because the engine requires it -- a
+    /// shared-stack pod admits bot seats. `server-core` deliberately seats no
+    /// Winston bot of its own: `pick_random_for_seat` is the timeout/disconnect
+    /// default and stays exactly that.
     fn winston_test_config() -> DraftConfig {
         let procedure = DraftKind::Winston.procedure();
         DraftConfig {

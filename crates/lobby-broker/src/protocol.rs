@@ -68,8 +68,8 @@ pub struct TournamentRequestId(pub u64);
 ///      v70, so no existing Premier/Traditional/Sealed/CommanderDraft pod is
 ///      affected. `DraftDelta::SharedStackDecisionApplied`,
 ///      `DraftError::{SharedStackDecisionRefused,
-///      SharedStackRequiresHumanSeats, InvalidSharedStackConfiguration}` and
-///      `PickStatus::Waiting` ride the same condition.
+///      InvalidSharedStackConfiguration}` and `PickStatus::Waiting` ride the
+///      same condition.
 ///      `DraftPlayerView::{shared_stack, play_first_chooser}`,
 ///      `SpectatorDraftView::shared_stack` and `DraftSession::shared_stack`
 ///      are additive: each is `Option` with `#[serde(default,
@@ -89,7 +89,18 @@ pub struct TournamentRequestId(pub u64);
 ///      `String` whose producer is `format!("{:?}", …)`, so `"Winston"` needs
 ///      no lobby version move — only its doc's label list.
 ///
-///      AMENDED IN PLACE, NOT BUMPED. `SharedStackState::history` and
+///      AMENDED IN PLACE, NOT BUMPED (1/2). The `DraftError` list above lost
+///      `SharedStackRequiresHumanSeats`, which was the engine's refusal of a
+///      bot seat in a shared-stack pod: such a pod now admits bot seats, so the
+///      variant has no producer and is deleted rather than deprecated. Removing
+///      a variant is ordinarily a bump, and this one is not, for the reason the
+///      next paragraph gives at length: 71 is unreleased upstream (upstream is
+///      70), so no peer ever spoke a 71 that carried it, and a second number
+///      would announce a break between two shapes that never coexisted on the
+///      wire. No TypeScript mirror names it -- MEASURED,
+///      `grep -rn SharedStackRequiresHumanSeats client/` is empty.
+///
+///      AMENDED IN PLACE, NOT BUMPED (2/2). `SharedStackState::history` and
 ///      `SharedStackView::history` — vectors of the new
 ///      `SharedStackDecisionRecord` (seat, pile, decision, pile_size; no card,
 ///      deliberately and permanently) — were added after this entry was

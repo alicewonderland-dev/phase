@@ -1,8 +1,80 @@
-use draft_core::types::DraftCardInstance;
+//! The bot decision layer: what a bot seat does with what the ENGINE PUBLISHED
+//! to it.
+//!
+//! Two bots live here, for the two distributions that seat one. The
+//! pick-and-pass bot ([`bot_pick`] / [`bot_picks`]) chooses a card out of a
+//! pack it is handed. The shared-stack bot ([`winston_decision`]) chooses
+//! take-or-decline at the cursor of a Winston turn, scoring with
+//! `phase_ai::winston_eval`.
+//!
+//! # The no-cheating property, and exactly what enforces each half
+//!
+//! > The bot's decision is a function of the projection and nothing else: two
+//! > worlds whose projections for the bot's seat are identical must produce the
+//! > same decision, however they differ underneath.
+//!
+//! There are three channels by which the decision could come to depend on the
+//! hidden main stack or on a pile the bot has not inspected, and each has ONE
+//! named device. No device is claimed to cover a channel it does not:
+//!
+//! 1. **The argument list.** [`winston_decision`] takes a `&DraftPlayerView`,
+//!    and `phase_ai::winston_eval` takes plain card facts plus a slice of pile
+//!    HEIGHTS -- there is no field in either that could carry a card the bot may
+//!    not see. Enforced for the `phase-ai` half by the type system (the hidden
+//!    board is inexpressible there) and for this half by
+//!    `the_bot_ignores_the_world_it_is_not_handed`, which varies the world while
+//!    holding the argument fixed.
+//! 2. **The raw thread-local.** `DRAFT_SESSION` lives in the private sibling
+//!    module `crate::session_cell`, so neither `crate::DRAFT_SESSION` (no such
+//!    path: `error[E0425]`) nor `crate::session_cell::DRAFT_SESSION`
+//!    (`error[E0603]`) resolves from here. Enforced by the COMPILER.
+//! 3. **The `pub(crate)` accessors.** `session_cell::with_draft` and its
+//!    siblings ARE nameable from this module, and Rust has no visibility that
+//!    says "the crate root but not a sibling". Enforced by a TEST, not the
+//!    compiler: `the_bot_ignores_the_world_it_is_not_handed` installs a third,
+//!    independently started session between calls and requires the decision to
+//!    be unchanged. Stated plainly rather than dressed up -- if that test is
+//!    ever weakened, this channel is open.
+//!
+//! There is no RNG anywhere in the shared-stack decision, deliberately: "same
+//! projection => same decision" is meant literally, which is also why every
+//! tally it folds is ordered (`ColorPassTally`'s `BTreeMap`,
+//! `draft_eval::dominant_colors`'s total order).
+//!
+//! # What the bot deliberately does NOT model yet
+//!
+//! - **Cross-turn memory of pile contents across a take-and-refill.**
+//!   [`opponent_read`]'s fold recovers what another seat passed on piles that
+//!   have not been taken since; a human also remembers what a pile held before
+//!   it was taken and refilled, and the projection DID legitimately show them
+//!   those cards, so modelling it would not be cheating. It is deferred because
+//!   it needs bot-local persistent state keyed by seat, with its own storage
+//!   lifecycle in a wasm thread-local and its own invalidation rule -- a second
+//!   feature, not a missing line. Named here so the next author is not scared
+//!   off it by the no-cheating property.
+//! - **The "card type" half of "watch what your opponent passes".**
+//!   `DraftCardInstance` publishes `type_line` and `cmc` beside `colors`, so a
+//!   type tally is recoverable from the IDENTICAL input with no new
+//!   information. Deferred on effort -- it needs its own weight and its own
+//!   two-sided test -- not on an information limit. The design is
+//!   `phase_ai::winston_eval::ColorPassTally` with a type key.
+
+use draft_core::types::{DraftCardInstance, SharedStackPileDecision};
+use draft_core::view::{DraftPlayerView, SharedStackPileView, SharedStackView};
 use engine::database::CardDatabase;
 use phase_ai::config::AiDifficulty;
 use phase_ai::draft_eval;
+use phase_ai::winston_eval::{
+    draft_progress, valuate_turn, CardContext, ColorPassTally, DraftCardFacts, OpponentRead,
+    WinstonStrategy, WinstonTurn,
+};
 use rand::Rng;
+
+/// Cards a Winston bot must hold before its own pool implies a colour
+/// preference at all, matching [`color_preference`]'s floor for the
+/// pick-and-pass bot: one authority for "which colours is this pile of cards
+/// in", one convention for when it has seen enough to answer.
+const MIN_POOL_COLOR_SAMPLE: usize = 3;
 
 /// Select a card index from the pack for a bot to pick.
 ///
@@ -271,6 +343,287 @@ fn curve_bonus(cmc: u8, pick_number: u8) -> i8 {
     }
 }
 
+// ── Shared-stack (Winston) bot ──────────────────────────────────────────────
+
+/// One published card, as the valuation layer wants it.
+///
+/// The only place a `DraftCardInstance` becomes a `DraftCardFacts`: the face
+/// comes from the PUBLIC card database through this bot's own argument, and
+/// every other field rides the card instance the projection published.
+fn card_facts<'a>(
+    card: &'a DraftCardInstance,
+    card_db: Option<&'a CardDatabase>,
+) -> DraftCardFacts<'a> {
+    DraftCardFacts {
+        face: card_db.and_then(|db| db.get_face_by_name(&card.name)),
+        rarity: &card.rarity,
+        cmc: card.cmc,
+        colors: &card.colors,
+    }
+}
+
+/// Whether the ENGINE published this decision as legal on this pile.
+///
+/// `shared_stack::refusal_for` is the single legality authority and this bot is
+/// a CHOOSING layer above it, never a second authority: nothing here looks at
+/// `total`, `main_stack_remaining` or the pile count to decide what is allowed.
+/// A decision the published vector does not mention at all is treated as
+/// illegal, which is the safe direction -- the reducer would refuse it.
+fn published_legal(pile: &SharedStackPileView, decision: SharedStackPileDecision) -> bool {
+    pile.legality
+        .iter()
+        .any(|entry| entry.decision == decision && entry.refusal.is_none())
+}
+
+/// Laplace-smoothed share, `(hits + 1) / (trials + 2)`, so one observation
+/// cannot produce a 0.0 or 1.0 rate the rest of the arithmetic would then
+/// treat as certainty.
+fn laplace_rate(hits: usize, trials: usize) -> f64 {
+    (hits + 1) as f64 / (trials + 2) as f64
+}
+
+/// What the other seats have told the bot about themselves, folded out of the
+/// PUBLISHED decision history and the bot's own PUBLISHED `revealed` prefixes.
+///
+/// Two reads, one input. The pile-size appetite (a seat that snaps up small
+/// piles is bomb-hunting; a seat that takes big ones makes declining expensive)
+/// comes from `stack.history` alone. The colour read -- "watch what your
+/// opponent passes; a colour they keep passing is a colour that is OPEN" --
+/// joins `stack.history` against `stack.piles[..].revealed`.
+///
+/// # The reconstruction rule for the colour read
+///
+/// For each history record `r = (seat != own, pile p, Decline, pile_size s)` at
+/// index `i`:
+///
+/// 1. **Invalidation.** Skip `r` if any record after `i` is `(pile p, Take)`.
+///    A take empties pile `p` and refills it with one fresh card, so the
+///    prefix's identity is destroyed. Declines only append, so they never
+///    invalidate.
+/// 2. **Visibility.** Read `view.shared_stack.piles[p].revealed`, addressed by
+///    `index` and never by vector position. Take
+///    `revealed[.. min(s, revealed.len())]`. `revealed` is non-empty only for
+///    piles at or below the cursor and only for the active viewer -- which is
+///    exactly when the bot is deciding.
+/// 3. **Binding.** **Snapshotted per call**, recomputed from the view each
+///    decision. Nothing is cached across turns; cross-turn bot-local storage
+///    remains the deferral this module's doc names.
+///
+/// It invents nothing: MEASURED across ten seeded walks against ground truth
+/// taken from the reducer's own state, the rule reconstructed 18-41 distinct
+/// passed cards with **zero** false positives, and dropping clause 1 is exactly
+/// what would start inventing them.
+///
+/// Two consequences worth stating rather than discovering. A pile another seat
+/// declined twice contributes its overlapping prefixes twice -- deliberate,
+/// because they did pass those cards twice, and `ColorPassTally` is a tally of
+/// passing events rather than of distinct cards. And a record whose `pile_size`
+/// exceeds the published prefix TRUNCATES rather than panicking: the history is
+/// bounded and the view is rebuilt every decision, so the two can legitimately
+/// disagree at the edges.
+pub fn opponent_read(stack: &SharedStackView, own_seat: u8, split: usize) -> OpponentRead {
+    let mut small_takes = 0usize;
+    let mut small_total = 0usize;
+    let mut large_takes = 0usize;
+    let mut large_total = 0usize;
+    let mut samples = 0usize;
+    let mut passed_colors = ColorPassTally::default();
+
+    for (index, record) in stack.history.iter().enumerate() {
+        // The bot reads OTHER seats. Folding its own decisions in would make it
+        // model itself and call the result an opponent.
+        if record.seat == own_seat {
+            continue;
+        }
+        samples += 1;
+
+        let took = matches!(record.decision, SharedStackPileDecision::Take);
+        if record.pile_size >= split {
+            large_total += 1;
+            large_takes += usize::from(took);
+        } else {
+            small_total += 1;
+            small_takes += usize::from(took);
+        }
+
+        if took {
+            continue;
+        }
+        // Clause 1: a later take on that pile destroys the prefix's identity.
+        let disturbed = stack.history[index + 1..].iter().any(|later| {
+            later.pile == record.pile && matches!(later.decision, SharedStackPileDecision::Take)
+        });
+        if disturbed {
+            continue;
+        }
+        // Clause 2: addressed by `index`, never by vector position, and
+        // truncated to what is actually published.
+        let Some(pile) = stack.piles.iter().find(|pile| pile.index == record.pile) else {
+            continue;
+        };
+        let seen = record.pile_size.min(pile.revealed.len());
+        for card in &pile.revealed[..seen] {
+            passed_colors.observe(&card.colors);
+        }
+    }
+
+    OpponentRead {
+        small_pile_take_rate: laplace_rate(small_takes, small_total),
+        large_pile_take_rate: laplace_rate(large_takes, large_total),
+        passed_colors,
+        samples,
+    }
+}
+
+/// Decide a shared-stack turn: take the cursor pile, or put it back.
+///
+/// Returns `(pile, decision)` for the CURSOR pile, or `None` when there is no
+/// live pile turn in this projection or the engine published no legal decision
+/// at all. The `u8` is the cursor's own published `index`, never a position in
+/// the pile vector and never a pile this function picked out by score: the
+/// cursor belongs to the engine, and a bot that scored all three piles and
+/// returned the best one would be refused `PileNotActive` every time. That is
+/// why the decision axis is take-or-decline AT THE CURSOR and the returned
+/// index is an optimistic-concurrency check rather than a selection.
+///
+/// # Inputs, and only these
+///
+/// `view` is the bot seat's own projection. Everything the decision reads comes
+/// out of it: the cursor pile's `revealed`, every pile's `total` and `index`,
+/// `main_stack_remaining` through `total_cards`, `active_seat`, `active_pile`,
+/// the published `legality` vector, `history`, and the bot's own `pool`. The
+/// main stack's ORDER and the contents of any pile the bot has not inspected
+/// are not in the projection at all, and this function reads nothing else --
+/// see the module doc for which device closes which channel.
+///
+/// `card_db` is the PUBLIC card database. Without one, every card degrades to
+/// its rarity prior (principles 1 and 5 go quiet) and the decision is still
+/// legal and still produced -- pinned by
+/// `winston_decision_degrades_without_a_card_database`.
+///
+/// # Legality is asked, never derived
+///
+/// The bot picks among decisions whose PUBLISHED `refusal` is `None`. It cannot
+/// return a decision the reducer then refuses, because it never forms an
+/// opinion about legality of its own: `shared_stack::refusal_for` decides, this
+/// function chooses.
+pub fn winston_decision(
+    view: &DraftPlayerView,
+    difficulty: AiDifficulty,
+    card_db: Option<&CardDatabase>,
+) -> Option<(u8, SharedStackPileDecision)> {
+    let stack = view.shared_stack.as_ref()?;
+    // BY `index`, never by vector position -- the discipline the pick timer's
+    // `autoDecideSharedStackTurn` already states on the client side.
+    let cursor = stack
+        .piles
+        .iter()
+        .find(|pile| pile.index == stack.active_pile)?;
+
+    let weights = match WinstonStrategy::for_difficulty(difficulty) {
+        // Exactly the move `shared_stack::forced_decision` folds and the pick
+        // timer submits: the first always-legal decision, no evaluation at all.
+        // `SharedStackPileDecision::ALL` is folded rather than the two variants
+        // written out, so this cannot go narrow if the axis ever grows.
+        WinstonStrategy::FirstLegal => {
+            return SharedStackPileDecision::ALL
+                .into_iter()
+                .find(|decision| published_legal(cursor, *decision))
+                .map(|decision| (cursor.index, decision));
+        }
+        WinstonStrategy::Scored(weights) => weights,
+    };
+
+    // The seat whose turn it is. The driver hands this function
+    // `filter_for_player(session, active_seat)`, so "the bot" and "the active
+    // seat" are the same seat by construction; reading it off the projection
+    // rather than taking it as an argument keeps the two from disagreeing.
+    let own_seat = stack.active_seat;
+    let read = opponent_read(stack, own_seat, weights.opponent_size_split);
+
+    let cursor_pile: Vec<DraftCardFacts> = cursor
+        .revealed
+        .iter()
+        .map(|card| card_facts(card, card_db))
+        .collect();
+    let pool: Vec<DraftCardFacts> = view
+        .pool
+        .iter()
+        .map(|card| card_facts(card, card_db))
+        .collect();
+
+    let pool_colors: Vec<&[String]> = view
+        .pool
+        .iter()
+        .map(|card| card.colors.as_slice())
+        .collect();
+    let preferred_colors = draft_eval::dominant_colors(&pool_colors, MIN_POOL_COLOR_SAMPLE);
+
+    // Heights only, in pile order, INCLUSIVE of the last pile: declining onto
+    // the final pile and taking it is the commonest way a Winston turn ends
+    // with a large pile, and a continuation that stopped one pile short would
+    // systematically under-value it. Sorted by the engine's `index` rather than
+    // trusting the vector's order.
+    let mut later: Vec<&SharedStackPileView> = stack
+        .piles
+        .iter()
+        .filter(|pile| pile.index > cursor.index)
+        .collect();
+    later.sort_by_key(|pile| pile.index);
+    let later_pile_sizes: Vec<usize> = later.iter().map(|pile| pile.total).collect();
+
+    // ONLY from the published verdict, never re-derived from
+    // `main_stack_remaining`. The projection publishes a legality verdict for
+    // the CURSOR pile alone (every other pile answers `PileNotActive`), so the
+    // forced draw is priced exactly when the cursor IS the final pile and the
+    // engine published that decline as legal.
+    //
+    // APPROXIMATION, with its direction: from an earlier cursor the bot cannot
+    // know whether the forced draw will still be legal several declines from
+    // now without re-deriving legality from the card counts, so it omits that
+    // stopping point and UNDER-values the continuation there. Never the other
+    // way, which is the direction that would matter: it can only make the bot
+    // take a pile it might have declined, never propose an illegal decline.
+    let forced_draw_legal =
+        later_pile_sizes.is_empty() && published_legal(cursor, SharedStackPileDecision::Decline);
+
+    let turn = WinstonTurn {
+        cursor_pile: &cursor_pile,
+        later_pile_sizes: &later_pile_sizes,
+        forced_draw_legal,
+        pool: &pool,
+        read: &read,
+        context: CardContext {
+            preferred_colors: &preferred_colors,
+            // `total_cards` is the UNDRAFTED count, so this ratio rises
+            // monotonically over the draft. `f64` division lives in
+            // `draft_progress`; nothing here quantises it.
+            progress: draft_progress(view.pool.len(), stack.total_cards, view.seats.len()),
+            passed: &read.passed_colors,
+        },
+    };
+
+    // Preference first, published legality second, and NEVER the other way: the
+    // bot proposes, the authority disposes. Ties inside `prefers_taking` go to
+    // `Take`, matching `SharedStackPileDecision::ALL`'s declaration order and
+    // the order `forced_decision` folds.
+    let preferred = if valuate_turn(&turn, &weights).prefers_taking() {
+        [
+            SharedStackPileDecision::Take,
+            SharedStackPileDecision::Decline,
+        ]
+    } else {
+        [
+            SharedStackPileDecision::Decline,
+            SharedStackPileDecision::Take,
+        ]
+    };
+    preferred
+        .into_iter()
+        .find(|decision| published_legal(cursor, *decision))
+        .map(|decision| (cursor.index, decision))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,6 +701,1000 @@ mod tests {
             bot_pick(&pack, AiDifficulty::Medium, &short, None, &mut rng),
             1
         );
+    }
+
+    // ── Shared-stack (Winston) fixtures ─────────────────────────────────────
+    //
+    // Every fixture below is built from ONE five-card vocabulary with ONE
+    // card-database, so a pile's score is a property of the cards in it rather
+    // than of a fixture written for the test that needed it.
+
+    use draft_core::pack_source::PackSource;
+    use draft_core::session;
+    use draft_core::types::{
+        DeckAddableCards, DraftAction, DraftConfig, DraftKind, DraftPack, DraftSeat, DraftSession,
+        DraftSource, DraftStatus, PodPolicy, SharedStackDecisionRecord, SharedStackRefusal,
+        SpectatorVisibility, TournamentFormat,
+    };
+    use draft_core::view::{filter_for_player, SharedStackDecisionView};
+    use engine::types::ability::{
+        AbilityDefinition, AbilityKind, Effect, PtValue, TargetFilter, TriggerDefinition,
+    };
+    use engine::types::card::CardFace;
+    use engine::types::card_type::{CardType, CoreType};
+    use engine::types::mana::ManaCost;
+    use engine::types::player::PlayerId;
+    use engine::types::triggers::TriggerMode;
+    use engine::types::zones::Zone;
+
+    /// The six `AiDifficulty` rungs, in declaration order.
+    ///
+    /// Hand-written, with [`rung_index`] as the wildcard-free `match` that makes
+    /// a seventh rung an `E0004` right beside it -- the `DraftKind::ALL` idiom.
+    /// Every no-cheating test folds this array rather than naming `Medium`, so
+    /// none of them can go narrow when the ladder grows.
+    const ALL_RUNGS: [AiDifficulty; 6] = [
+        AiDifficulty::VeryEasy,
+        AiDifficulty::Easy,
+        AiDifficulty::Medium,
+        AiDifficulty::Hard,
+        AiDifficulty::VeryHard,
+        AiDifficulty::CEDH,
+    ];
+
+    fn rung_index(difficulty: AiDifficulty) -> usize {
+        match difficulty {
+            AiDifficulty::VeryEasy => 0,
+            AiDifficulty::Easy => 1,
+            AiDifficulty::Medium => 2,
+            AiDifficulty::Hard => 3,
+            AiDifficulty::VeryHard => 4,
+            AiDifficulty::CEDH => 5,
+        }
+    }
+
+    #[test]
+    fn all_rungs_lists_every_difficulty_once() {
+        for (position, rung) in ALL_RUNGS.into_iter().enumerate() {
+            assert_eq!(rung_index(rung), position, "{rung:?}");
+        }
+    }
+
+    const DUAL_LAND: &str = "Test Dual Land";
+    const BEAR: &str = "Test Bear";
+    const FILLER: &str = "Test Filler";
+    const REMOVAL: &str = "Test Removal";
+    const BOMB: &str = "Test Bomb";
+    const VOCABULARY: [&str; 5] = [DUAL_LAND, BEAR, FILLER, REMOVAL, BOMB];
+
+    fn named_face(name: &str, core: Vec<CoreType>) -> CardFace {
+        CardFace {
+            name: name.to_string(),
+            card_type: CardType {
+                core_types: core,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn destroy_ability() -> AbilityDefinition {
+        AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Destroy {
+                target: TargetFilter::Any,
+                cant_regenerate: false,
+            },
+        )
+    }
+
+    /// The five faces, mirroring `phase_ai::winston_eval`'s own fixtures so the
+    /// two layers agree on what a dual land / a removal spell / a body is.
+    fn fixture_faces() -> Vec<CardFace> {
+        let mut dual = named_face(DUAL_LAND, vec![CoreType::Land]);
+        dual.card_type.subtypes = vec!["Plains".to_string(), "Island".to_string()];
+
+        let bear = CardFace {
+            power: Some(PtValue::Fixed(2)),
+            toughness: Some(PtValue::Fixed(2)),
+            mana_cost: ManaCost::generic(2),
+            ..named_face(BEAR, vec![CoreType::Creature])
+        };
+        let filler = CardFace {
+            power: Some(PtValue::Fixed(1)),
+            toughness: Some(PtValue::Fixed(1)),
+            mana_cost: ManaCost::generic(4),
+            ..named_face(FILLER, vec![CoreType::Creature])
+        };
+        let removal = CardFace {
+            mana_cost: ManaCost::generic(2),
+            abilities: vec![destroy_ability()],
+            ..named_face(REMOVAL, vec![CoreType::Instant])
+        };
+        let mut bomb = CardFace {
+            power: Some(PtValue::Fixed(2)),
+            toughness: Some(PtValue::Fixed(2)),
+            mana_cost: ManaCost::generic(4),
+            ..named_face(BOMB, vec![CoreType::Creature])
+        };
+        bomb.triggers = vec![TriggerDefinition::new(TriggerMode::ChangesZone)
+            .valid_card(TargetFilter::SelfRef)
+            .destination(Zone::Battlefield)
+            .execute(destroy_ability())];
+
+        vec![dual, bear, filler, removal, bomb]
+    }
+
+    /// The public card database the bot reads through its own argument list.
+    fn fixture_card_db() -> CardDatabase {
+        let entries: serde_json::Map<String, serde_json::Value> = fixture_faces()
+            .into_iter()
+            .map(|face| {
+                (
+                    face.name.to_lowercase(),
+                    serde_json::to_value(&face).expect("a face serializes"),
+                )
+            })
+            .collect();
+        CardDatabase::from_json_str(&serde_json::Value::Object(entries).to_string())
+            .expect("the fixture export loads")
+    }
+
+    /// One published card instance. The printing's axes (rarity, colours, mana
+    /// value) live here; the face lives in the database.
+    fn fixture_instance(name: &str, instance_id: String) -> DraftCardInstance {
+        let (colors, cmc, rarity): (&[&str], u8, &str) = match name {
+            DUAL_LAND => (&[], 0, "uncommon"),
+            BEAR => (&["W"], 2, "common"),
+            FILLER => (&["G"], 4, "common"),
+            REMOVAL => (&["W"], 2, "uncommon"),
+            BOMB => (&["U"], 4, "rare"),
+            other => panic!("unknown fixture card {other}"),
+        };
+        DraftCardInstance {
+            instance_id,
+            name: name.to_string(),
+            set_code: "TST".to_string(),
+            collector_number: "1".to_string(),
+            rarity: rarity.to_string(),
+            colors: colors.iter().map(|c| (*c).to_string()).collect(),
+            cmc,
+            type_line: String::new(),
+            draft_effect: None,
+        }
+    }
+
+    fn fixture_card(name: &str, id: &str) -> DraftCardInstance {
+        fixture_instance(name, id.to_string())
+    }
+
+    /// A pack source over the fixture vocabulary, so a started session's piles
+    /// hold cards the fixture database actually knows.
+    struct FixtureWinstonSource {
+        cards_per_pack: u8,
+    }
+
+    impl PackSource for FixtureWinstonSource {
+        fn generate_pack(
+            &self,
+            _rng: &mut dyn rand::RngCore,
+            seat: u8,
+            pack_number: u8,
+        ) -> DraftPack {
+            DraftPack(
+                (0..self.cards_per_pack)
+                    .map(|i| {
+                        let name = VOCABULARY[usize::from(i) % VOCABULARY.len()];
+                        fixture_instance(name, format!("TST-{seat}-{pack_number}-{i}"))
+                    })
+                    .collect(),
+            )
+        }
+    }
+
+    const CARDS_PER_PACK: u8 = 15;
+
+    fn winston_session(pod_size: u8, rng_seed: u64, bot_seats: &[u8]) -> DraftSession {
+        let config = DraftConfig {
+            source: DraftSource::single_set("TST".to_string()),
+            set_code: "TST".to_string(),
+            kind: DraftKind::Winston,
+            pod_size,
+            cards_per_pack: CARDS_PER_PACK,
+            pack_count: 3,
+            min_deck_size: 40,
+            addable_cards: DeckAddableCards::standard_basics(),
+            rng_seed,
+            tournament_format: TournamentFormat::Swiss,
+            pod_policy: PodPolicy::Competitive,
+            spectator_visibility: SpectatorVisibility::default(),
+        };
+        let seats: Vec<DraftSeat> = (0..pod_size)
+            .map(|i| {
+                if bot_seats.contains(&i) {
+                    DraftSeat::Bot {
+                        name: format!("Bot {i}"),
+                    }
+                } else {
+                    DraftSeat::Human {
+                        player_id: PlayerId(i),
+                        display_name: format!("Player {i}"),
+                    }
+                }
+            })
+            .collect();
+        DraftSession::new(config, seats, "WIN-BOT".to_string())
+    }
+
+    fn started_winston(pod_size: u8, rng_seed: u64, bot_seats: &[u8]) -> DraftSession {
+        let mut session = winston_session(pod_size, rng_seed, bot_seats);
+        session::apply(
+            &mut session,
+            DraftAction::StartDraft,
+            Some(&FixtureWinstonSource {
+                cards_per_pack: CARDS_PER_PACK,
+            }),
+        )
+        .expect("a Winston pod starts");
+        session
+    }
+
+    fn stack_of(session: &DraftSession) -> &draft_core::types::SharedStackState {
+        session.shared_stack.as_ref().expect("a live pile turn")
+    }
+
+    fn apply_decision(
+        session: &mut DraftSession,
+        decision: SharedStackPileDecision,
+    ) -> Result<(), String> {
+        let (seat, pile) = {
+            let state = stack_of(session);
+            (state.active_seat, state.cursor)
+        };
+        session::apply(
+            session,
+            DraftAction::SharedStackDecision {
+                seat,
+                pile,
+                decision,
+            },
+            None,
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    /// One whole turn of declines, which is what grows the piles past their
+    /// one-card opening shape -- the state the hidden-information fixtures need.
+    fn declined_one_turn(pod_size: u8, rng_seed: u64) -> DraftSession {
+        let mut session = started_winston(pod_size, rng_seed, &[]);
+        for _ in 0..3 {
+            apply_decision(&mut session, SharedStackPileDecision::Decline)
+                .expect("a decline at the start of a full stack is legal");
+        }
+        session
+    }
+
+    /// The same pod with its SECRETS permuted and every published count left
+    /// alone: the main stack reversed, and the contents of every pile strictly
+    /// above the cursor rotated between those piles (lengths preserved).
+    fn permuted_secrets(session: &DraftSession) -> DraftSession {
+        let mut clone = session.clone();
+        let state = clone.shared_stack.as_mut().expect("a live pile turn");
+        state.main_stack.reverse();
+        let cursor = usize::from(state.cursor);
+        let above: Vec<usize> = (cursor + 1..state.piles.len()).collect();
+        assert!(
+            above.len() >= 2,
+            "the permutation needs at least two piles above the cursor"
+        );
+        let first = state.piles[above[0]].clone();
+        for window in above.windows(2) {
+            state.piles[window[0]] = state.piles[window[1]].clone();
+        }
+        let last = *above.last().expect("non-empty");
+        state.piles[last] = first;
+        clone
+    }
+
+    fn pile_signature(session: &DraftSession) -> Vec<Vec<String>> {
+        stack_of(session)
+            .piles
+            .iter()
+            .map(|pile| pile.iter().map(|c| c.instance_id.clone()).collect())
+            .collect()
+    }
+
+    fn stack_top(session: &DraftSession) -> String {
+        stack_of(session)
+            .main_stack
+            .last()
+            .expect("a non-empty main stack")
+            .instance_id
+            .clone()
+    }
+
+    fn legality(
+        take: Option<SharedStackRefusal>,
+        decline: Option<SharedStackRefusal>,
+    ) -> Vec<SharedStackDecisionView> {
+        vec![
+            SharedStackDecisionView {
+                decision: SharedStackPileDecision::Take,
+                refusal: take,
+            },
+            SharedStackDecisionView {
+                decision: SharedStackPileDecision::Decline,
+                refusal: decline,
+            },
+        ]
+    }
+
+    /// Every non-cursor pile answers `PileNotActive`, exactly as
+    /// `shared_stack::refusal_for` does for one.
+    fn idle_pile(index: u8, total: usize) -> SharedStackPileView {
+        SharedStackPileView {
+            index,
+            total,
+            revealed: Vec::new(),
+            legality: legality(
+                Some(SharedStackRefusal::PileNotActive),
+                Some(SharedStackRefusal::PileNotActive),
+            ),
+        }
+    }
+
+    /// A hand-built projection: the cursor pile with its revealed prefix and its
+    /// published verdicts, plus two later piles of a stated height.
+    fn stack_view(
+        revealed: Vec<DraftCardInstance>,
+        verdicts: Vec<SharedStackDecisionView>,
+        later_totals: [usize; 2],
+        history: Vec<SharedStackDecisionRecord>,
+    ) -> SharedStackView {
+        let cursor = SharedStackPileView {
+            index: 0,
+            total: revealed.len(),
+            revealed,
+            legality: verdicts,
+        };
+        let total_cards = cursor.total + later_totals.iter().sum::<usize>();
+        SharedStackView {
+            main_stack_remaining: 40,
+            total_cards: total_cards + 40,
+            active_seat: 0,
+            active_pile: 0,
+            piles: vec![
+                cursor,
+                idle_pile(1, later_totals[0]),
+                idle_pile(2, later_totals[1]),
+            ],
+            decisions: 0,
+            history,
+        }
+    }
+
+    /// A real projection with a hand-built shared stack swapped in, so the ~40
+    /// other view fields are the engine's own rather than invented here.
+    fn view_with(stack: SharedStackView) -> DraftPlayerView {
+        let session = started_winston(2, 5, &[]);
+        let mut view = filter_for_player(&session, stack_of(&session).active_seat);
+        view.pool = Vec::new();
+        view.shared_stack = Some(stack);
+        view
+    }
+
+    fn both_legal() -> Vec<SharedStackDecisionView> {
+        legality(None, None)
+    }
+
+    /// The same projection with its `piles` VECTOR reversed and every pile's
+    /// `index` left alone.
+    ///
+    /// The engine publishes the two in agreement, so this shape is not
+    /// reachable from `shared_stack_view` -- which is exactly why it is built by
+    /// hand here. It is the only fixture that can tell "addressed by `index`"
+    /// apart from "addressed by vector position", and both the cursor lookup and
+    /// the colour read's clause 2 are specified as the former.
+    fn reordered(mut stack: SharedStackView) -> SharedStackView {
+        stack.piles.reverse();
+        stack
+    }
+
+    // ── T-CHEAT-1a ──────────────────────────────────────────────────────────
+
+    /// A FIXTURE-VALIDITY property, not a bot property: the projection really
+    /// does hide what the next test varies. Without this, T-CHEAT-1b could pass
+    /// because the two worlds were never actually different.
+    #[test]
+    fn the_projection_hides_what_the_bot_must_not_see() {
+        let a = declined_one_turn(2, 13);
+        let b = permuted_secrets(&a);
+        let seat = stack_of(&a).active_seat;
+
+        // The hidden halves REALLY differ.
+        assert_ne!(
+            a.shared_stack, b.shared_stack,
+            "the permutation must change the hidden state"
+        );
+        assert_ne!(
+            stack_top(&a),
+            stack_top(&b),
+            "the main stack's top must differ"
+        );
+        let (sig_a, sig_b) = (pile_signature(&a), pile_signature(&b));
+        let cursor = usize::from(stack_of(&a).cursor);
+        for index in cursor + 1..sig_a.len() {
+            assert_ne!(
+                sig_a[index], sig_b[index],
+                "pile {index} above the cursor must really have been permuted"
+            );
+            assert_eq!(
+                sig_a[index].len(),
+                sig_b[index].len(),
+                "the permutation must preserve every published height"
+            );
+        }
+
+        // And the projection is IDENTICAL. `SharedStackView` derives
+        // `PartialEq`, so this half compares directly; `DraftPlayerView` derives
+        // only `Debug, Clone, Serialize, Deserialize`, so the whole-view leg
+        // goes through `serde_json`.
+        let view_a = filter_for_player(&a, seat);
+        let view_b = filter_for_player(&b, seat);
+        assert_eq!(view_a.shared_stack, view_b.shared_stack);
+        assert_eq!(
+            serde_json::to_value(&view_a).unwrap(),
+            serde_json::to_value(&view_b).unwrap()
+        );
+    }
+
+    // ── T-CHEAT-1b ──────────────────────────────────────────────────────────
+
+    /// **The no-cheating test.** The view is built ONCE and the WORLD is varied
+    /// underneath it: three different sessions are installed in the thread-local
+    /// `bot_ai` can still name (`session_cell`'s `pub(crate)` accessors -- Rust
+    /// has no visibility that would close that channel, so this test does), and
+    /// the decision must not move.
+    ///
+    /// Session C is independently started from a different seed, so it differs
+    /// from BOTH the fixture and its permutation in the main stack's top and in
+    /// every pile -- a mutation that reads the installed session cannot survive
+    /// by coincidence.
+    ///
+    /// **These three seeds are load-bearing and were CHOSEN, not picked.** The
+    /// mutation this test exists to catch perturbs a score while the assertion
+    /// is a discrete `Option<(u8, SharedStackPileDecision)>`, so whether a
+    /// main-stack-derived term flips take-vs-decline is a property of the
+    /// fixture. MEASURED: with seeds 11 / permuted(11) / 4242 the maximal
+    /// channel-3 mutation ("if the hidden top card is the bomb, force
+    /// `Decline`") stayed GREEN, because none of those three worlds has the
+    /// bomb on top. Seeds 13 / permuted(13) / 5 put a bomb on exactly ONE of the
+    /// three tops (`Test Filler` / `Test Bomb` / `Test Bear`) against an
+    /// unmutated answer of `Take`, so the mutation reddens. Re-seeding this
+    /// fixture without re-running that mutation would silently retire the test.
+    #[test]
+    fn the_bot_ignores_the_world_it_is_not_handed() {
+        let a = declined_one_turn(2, 13);
+        let b = permuted_secrets(&a);
+        let c = declined_one_turn(2, 5);
+        let db = fixture_card_db();
+
+        // The worlds really are three, not two: pairwise distinct tops and
+        // pairwise distinct piles.
+        let tops = [stack_top(&a), stack_top(&b), stack_top(&c)];
+        assert_ne!(tops[0], tops[1]);
+        assert_ne!(tops[0], tops[2]);
+        assert_ne!(tops[1], tops[2]);
+        let signatures = [pile_signature(&a), pile_signature(&b), pile_signature(&c)];
+        assert_ne!(signatures[0], signatures[1]);
+        assert_ne!(signatures[0], signatures[2]);
+        assert_ne!(signatures[1], signatures[2]);
+
+        let view = filter_for_player(&a, stack_of(&a).active_seat);
+
+        for rung in ALL_RUNGS {
+            let mut decisions = Vec::new();
+            let mut installed_tops = Vec::new();
+            for world in [&a, &b, &c] {
+                crate::session_cell::install(world.clone());
+                // POSITIVE CONTROL that the seeding took: a test that silently
+                // failed to install would pass vacuously.
+                installed_tops.push(crate::session_cell::with_installed(|session| {
+                    session
+                        .shared_stack
+                        .as_ref()
+                        .and_then(|state| state.main_stack.last())
+                        .map(|card| card.instance_id.clone())
+                        .expect("the installed session has a main stack")
+                }));
+                decisions.push(winston_decision(&view, rung, Some(&db)));
+            }
+            crate::session_cell::clear();
+
+            assert_eq!(
+                installed_tops.len(),
+                3,
+                "three worlds must have been installed"
+            );
+            assert_ne!(installed_tops[0], installed_tops[1]);
+            assert_ne!(installed_tops[0], installed_tops[2]);
+            assert_ne!(installed_tops[1], installed_tops[2]);
+
+            assert!(
+                decisions[0].is_some(),
+                "{rung:?} must produce a decision at all"
+            );
+            assert_eq!(
+                decisions[0], decisions[1],
+                "{rung:?} moved with a permuted world"
+            );
+            assert_eq!(
+                decisions[0], decisions[2],
+                "{rung:?} moved with a third, independent world"
+            );
+        }
+    }
+
+    // ── T-CHEAT-2 ───────────────────────────────────────────────────────────
+
+    /// The mandatory paired positive: the bot DOES move when a field it is
+    /// allowed to read moves. Without it, T-CHEAT-1b is satisfied by a constant.
+    ///
+    /// The two views differ in the cursor pile's published `revealed` CONTENTS
+    /// and in nothing else -- same height, same legality, same later piles --
+    /// which is stricter than differing in size as well.
+    #[test]
+    fn bot_does_move_when_a_published_field_moves() {
+        let db = fixture_card_db();
+        let premium = view_with(stack_view(
+            vec![fixture_card(REMOVAL, "premium")],
+            both_legal(),
+            [1, 1],
+            Vec::new(),
+        ));
+        let dross = view_with(stack_view(
+            vec![fixture_card(FILLER, "dross")],
+            both_legal(),
+            [1, 1],
+            Vec::new(),
+        ));
+
+        let on_premium = winston_decision(&premium, AiDifficulty::Medium, Some(&db));
+        let on_dross = winston_decision(&dross, AiDifficulty::Medium, Some(&db));
+        assert_eq!(
+            on_premium,
+            Some((0, SharedStackPileDecision::Take)),
+            "a cheap removal spell is worth taking"
+        );
+        assert_eq!(
+            on_dross,
+            Some((0, SharedStackPileDecision::Decline)),
+            "one sub-replacement common is not"
+        );
+        assert_ne!(on_premium, on_dross);
+    }
+
+    // ── Legality ────────────────────────────────────────────────────────────
+
+    /// The published vector is the authority, and the bot obeys it even when it
+    /// would rather do the other thing. Both fixtures are built so the SCORE
+    /// prefers the refused decision -- a bot that re-derived legality, or that
+    /// checked its preference after choosing, fails both legs.
+    #[test]
+    fn winston_decision_obeys_the_published_legality_vector() {
+        let db = fixture_card_db();
+
+        // A pile the bot would love to take, published as untakeable.
+        let take_refused = view_with(stack_view(
+            vec![
+                fixture_card(REMOVAL, "a"),
+                fixture_card(BOMB, "b"),
+                fixture_card(REMOVAL, "c"),
+            ],
+            legality(Some(SharedStackRefusal::PileEmpty), None),
+            [1, 1],
+            Vec::new(),
+        ));
+        // A pile the bot would rather decline (two nine-card piles ahead of it),
+        // published as undeclinable.
+        let decline_refused = view_with(stack_view(
+            vec![fixture_card(FILLER, "d")],
+            legality(None, Some(SharedStackRefusal::NoGuaranteedCard)),
+            [9, 9],
+            Vec::new(),
+        ));
+
+        for rung in ALL_RUNGS {
+            assert_eq!(
+                winston_decision(&take_refused, rung, Some(&db)),
+                Some((0, SharedStackPileDecision::Decline)),
+                "{rung:?} must decline when the take is refused"
+            );
+            assert_eq!(
+                winston_decision(&decline_refused, rung, Some(&db)),
+                Some((0, SharedStackPileDecision::Take)),
+                "{rung:?} must take when the decline is refused"
+            );
+        }
+
+        // The preference really did point the other way, so each leg above is a
+        // refusal being obeyed rather than a coincidence.
+        let mut both = take_refused.clone();
+        both.shared_stack.as_mut().unwrap().piles[0].legality = both_legal();
+        assert_eq!(
+            winston_decision(&both, AiDifficulty::Medium, Some(&db)),
+            Some((0, SharedStackPileDecision::Take))
+        );
+        let mut both = decline_refused.clone();
+        both.shared_stack.as_mut().unwrap().piles[0].legality = both_legal();
+        assert_eq!(
+            winston_decision(&both, AiDifficulty::Medium, Some(&db)),
+            Some((0, SharedStackPileDecision::Decline))
+        );
+
+        // The cursor pile is found by `index`, never by vector position: with
+        // the piles vector reversed, position 0 is pile 2 (which publishes
+        // `PileNotActive` for both decisions) while the cursor is still pile 0.
+        let reversed = view_with(reordered(stack_view(
+            vec![fixture_card(REMOVAL, "f")],
+            both_legal(),
+            [1, 1],
+            Vec::new(),
+        )));
+        for rung in ALL_RUNGS {
+            assert_eq!(
+                winston_decision(&reversed, rung, Some(&db)),
+                Some((0, SharedStackPileDecision::Take)),
+                "{rung:?} must address the cursor pile by index"
+            );
+        }
+
+        // No legal decision at all is `None`, never an illegal guess.
+        let stuck = view_with(stack_view(
+            vec![fixture_card(FILLER, "e")],
+            legality(
+                Some(SharedStackRefusal::PileEmpty),
+                Some(SharedStackRefusal::NoGuaranteedCard),
+            ),
+            [0, 0],
+            Vec::new(),
+        ));
+        for rung in ALL_RUNGS {
+            assert_eq!(winston_decision(&stuck, rung, Some(&db)), None, "{rung:?}");
+        }
+    }
+
+    /// Drive a whole seeded draft through the bot and the REAL reducer: every
+    /// decision it returns applies without an `Err`.
+    ///
+    /// Reach-guards, because a take-only walk would pass this vacuously: both
+    /// decisions must occur, and the endgame (`main_stack_remaining` down to
+    /// 2/1/0, where the decline adjudication changes) must be reached.
+    #[test]
+    fn winston_decision_never_returns_a_refused_decision() {
+        let db = fixture_card_db();
+        let mut session = started_winston(2, 7, &[]);
+        let mut takes = 0usize;
+        let mut declines = 0usize;
+        let mut min_remaining = usize::MAX;
+        let mut applied = 0usize;
+
+        while session.status == DraftStatus::Drafting {
+            let seat = stack_of(&session).active_seat;
+            let view = filter_for_player(&session, seat);
+            min_remaining = min_remaining.min(
+                view.shared_stack
+                    .as_ref()
+                    .expect("a live pile turn")
+                    .main_stack_remaining,
+            );
+            let (pile, decision) = winston_decision(&view, AiDifficulty::Medium, Some(&db))
+                .expect("the active seat always has a legal decision while drafting");
+            match decision {
+                SharedStackPileDecision::Take => takes += 1,
+                SharedStackPileDecision::Decline => declines += 1,
+            }
+            session::apply(
+                &mut session,
+                DraftAction::SharedStackDecision {
+                    seat,
+                    pile,
+                    decision,
+                },
+                None,
+            )
+            .unwrap_or_else(|e| panic!("the reducer refused the bot's decision: {e}"));
+            applied += 1;
+            assert!(applied < 1000, "the walk must terminate");
+        }
+
+        assert_eq!(session.status, DraftStatus::Deckbuilding);
+        assert!(takes > 0, "a walk that never takes proves nothing");
+        assert!(declines > 0, "a walk that never declines proves nothing");
+        assert!(
+            min_remaining <= 2,
+            "the endgame was never reached (min remaining {min_remaining})"
+        );
+    }
+
+    /// Without a card database the bot still decides, still legally, and is
+    /// still MOVED by the terms that survive the degradation.
+    ///
+    /// A correction to the plan's wording, measured here rather than assumed:
+    /// with no face, a card's whole value is `rarity_prior` (<= 1.5) plus the
+    /// colour ramp (<= `color_commitment_max`, 1.5) plus the pass bonus, which
+    /// cannot reach `replacement_level` (3.0) in any ordinary position -- so
+    /// `playables` is identically zero and it is the DENIAL term that carries
+    /// the decision. That is what the paired positive below pins.
+    #[test]
+    fn winston_decision_degrades_without_a_card_database() {
+        let db = fixture_card_db();
+
+        // The fixing and interaction terms are provably INERT without a face:
+        // a dual land and a filler creature decide the same way. With a
+        // database they decide differently -- the paired positive that makes
+        // this an inertness claim rather than a constant.
+        let fixing = view_with(stack_view(
+            vec![fixture_card(DUAL_LAND, "land")],
+            both_legal(),
+            [1, 1],
+            Vec::new(),
+        ));
+        let vanilla = view_with(stack_view(
+            vec![fixture_card(FILLER, "filler")],
+            both_legal(),
+            [1, 1],
+            Vec::new(),
+        ));
+        assert_eq!(
+            winston_decision(&fixing, AiDifficulty::Medium, None),
+            winston_decision(&vanilla, AiDifficulty::Medium, None),
+            "with no face there is no fixing premium to tell these apart"
+        );
+        assert_ne!(
+            winston_decision(&fixing, AiDifficulty::Medium, Some(&db)),
+            winston_decision(&vanilla, AiDifficulty::Medium, Some(&db)),
+            "with a database the fixing premium must tell them apart"
+        );
+
+        // The denial term still moves it: three cards are worth taking where
+        // one is not, with no database on either side.
+        let one = view_with(stack_view(
+            vec![fixture_card(FILLER, "one")],
+            both_legal(),
+            [1, 1],
+            Vec::new(),
+        ));
+        let three = view_with(stack_view(
+            vec![
+                fixture_card(FILLER, "a"),
+                fixture_card(FILLER, "b"),
+                fixture_card(FILLER, "c"),
+            ],
+            both_legal(),
+            [1, 1],
+            Vec::new(),
+        ));
+        assert_eq!(
+            winston_decision(&one, AiDifficulty::Medium, None),
+            Some((0, SharedStackPileDecision::Decline))
+        );
+        assert_eq!(
+            winston_decision(&three, AiDifficulty::Medium, None),
+            Some((0, SharedStackPileDecision::Take)),
+            "denial must still be able to carry a decision with no database"
+        );
+
+        // And a whole walk with no database stays legal and stays live.
+        let mut session = started_winston(2, 13, &[]);
+        let mut takes = 0usize;
+        let mut declines = 0usize;
+        let mut applied = 0usize;
+        while session.status == DraftStatus::Drafting {
+            let seat = stack_of(&session).active_seat;
+            let view = filter_for_player(&session, seat);
+            let (pile, decision) = winston_decision(&view, AiDifficulty::Medium, None)
+                .expect("a decision is produced without a card database");
+            match decision {
+                SharedStackPileDecision::Take => takes += 1,
+                SharedStackPileDecision::Decline => declines += 1,
+            }
+            session::apply(
+                &mut session,
+                DraftAction::SharedStackDecision {
+                    seat,
+                    pile,
+                    decision,
+                },
+                None,
+            )
+            .unwrap_or_else(|e| panic!("the reducer refused a database-less decision: {e}"));
+            applied += 1;
+            assert!(applied < 1000, "the walk must terminate");
+        }
+        assert_eq!(session.status, DraftStatus::Deckbuilding);
+        assert!(takes > 0 && declines > 0, "both decisions must still occur");
+    }
+
+    // ── P4a, the `bot_ai` leg ───────────────────────────────────────────────
+
+    fn record(
+        seat: u8,
+        pile: u8,
+        decision: SharedStackPileDecision,
+        pile_size: usize,
+    ) -> SharedStackDecisionRecord {
+        SharedStackDecisionRecord {
+            seat,
+            pile,
+            decision,
+            pile_size,
+        }
+    }
+
+    /// The pile-size read folds OTHER seats only, and smooths a single
+    /// observation off certainty.
+    #[test]
+    fn opponent_read_folds_only_other_seats() {
+        let split = 3;
+        // One observation: seat 1 took a five-card pile.
+        let stack = stack_view(
+            Vec::new(),
+            both_legal(),
+            [1, 1],
+            vec![record(1, 0, SharedStackPileDecision::Take, 5)],
+        );
+        let read = opponent_read(&stack, 0, split);
+        assert_eq!(read.samples, 1);
+        // Laplace: 2/3, NOT 1.0 -- one observation is not certainty.
+        assert!(
+            (read.large_pile_take_rate - 2.0 / 3.0).abs() < 1e-9,
+            "large rate was {}",
+            read.large_pile_take_rate
+        );
+        // No small-pile observation at all: the prior, not a zero.
+        assert!((read.small_pile_take_rate - 0.5).abs() < 1e-9);
+
+        // The bot's OWN decisions change nothing, however many there are.
+        let mut with_own = stack.clone();
+        for _ in 0..4 {
+            with_own
+                .history
+                .push(record(0, 0, SharedStackPileDecision::Take, 5));
+        }
+        let own = opponent_read(&with_own, 0, split);
+        assert_eq!(own, read, "the bot must not fold itself into its own read");
+
+        // The two buckets are genuinely separate: an opponent that takes big
+        // piles and declines small ones reads differently on each axis.
+        let mut greedy = stack_view(Vec::new(), both_legal(), [1, 1], Vec::new());
+        for _ in 0..5 {
+            greedy
+                .history
+                .push(record(1, 0, SharedStackPileDecision::Take, 6));
+            greedy
+                .history
+                .push(record(1, 0, SharedStackPileDecision::Decline, 1));
+        }
+        let greedy_read = opponent_read(&greedy, 0, split);
+        assert_eq!(greedy_read.samples, 10);
+        assert!(
+            greedy_read.large_pile_take_rate > greedy_read.small_pile_take_rate,
+            "large {} small {}",
+            greedy_read.large_pile_take_rate,
+            greedy_read.small_pile_take_rate
+        );
+        assert!(greedy_read.large_pile_take_rate > 0.8);
+        assert!(greedy_read.small_pile_take_rate < 0.2);
+        // The split is a parameter, not a constant: read at a higher split, the
+        // six-card piles are still large but the same history re-buckets.
+        let wide = opponent_read(&greedy, 0, 7);
+        assert!(wide.large_pile_take_rate < greedy_read.large_pile_take_rate);
+    }
+
+    // ── P4c-fold ────────────────────────────────────────────────────────────
+
+    /// The colour read's HOSTILE fixture: the reconstruction rule must never
+    /// invent a card.
+    ///
+    /// A pile that was taken after the opponent declined it has been emptied and
+    /// refilled, so the published prefix is no longer the cards they looked at.
+    /// Dropping that clause is exactly the mutation that would produce false
+    /// positives (MEASURED at zero with it).
+    #[test]
+    fn opponent_pass_tally_skips_disturbed_prefixes() {
+        let revealed = vec![
+            fixture_card(BEAR, "w1"),
+            fixture_card(REMOVAL, "w2"),
+            fixture_card(BOMB, "u1"),
+            fixture_card(FILLER, "g1"),
+        ];
+
+        // NEGATIVE: a decline, then somebody takes that pile. Nothing survives.
+        let disturbed = stack_view(
+            revealed.clone(),
+            both_legal(),
+            [1, 1],
+            vec![
+                record(1, 0, SharedStackPileDecision::Decline, 4),
+                record(0, 0, SharedStackPileDecision::Take, 4),
+            ],
+        );
+        assert_eq!(
+            opponent_read(&disturbed, 0, 3).passed_colors.cards(),
+            0,
+            "a taken pile's prefix is not what the opponent looked at"
+        );
+
+        // PAIRED POSITIVE: the same fixture without the take contributes
+        // exactly the four-card prefix, by colour.
+        let intact = stack_view(
+            revealed.clone(),
+            both_legal(),
+            [1, 1],
+            vec![record(1, 0, SharedStackPileDecision::Decline, 4)],
+        );
+        let tally = opponent_read(&intact, 0, 3).passed_colors;
+        assert_eq!(tally.cards(), 4);
+        // Two white, one blue, one green, Laplace-smoothed over five colours.
+        assert!((tally.pass_share("W") - 3.0 / 9.0).abs() < 1e-9);
+        assert!((tally.pass_share("U") - 2.0 / 9.0).abs() < 1e-9);
+        assert!((tally.pass_share("G") - 2.0 / 9.0).abs() < 1e-9);
+        assert!((tally.pass_share("B") - 1.0 / 9.0).abs() < 1e-9);
+
+        // A LATER decline on the same pile does not invalidate: declines only
+        // append, so the prefix survives.
+        let mut redeclined = intact.clone();
+        redeclined
+            .history
+            .push(record(1, 0, SharedStackPileDecision::Decline, 4));
+        assert_eq!(
+            opponent_read(&redeclined, 0, 3).passed_colors.cards(),
+            8,
+            "two declines on an undisturbed pile are two passing events"
+        );
+
+        // OWN SEAT: the bot's own declines are not an opponent read.
+        let mine = stack_view(
+            revealed.clone(),
+            both_legal(),
+            [1, 1],
+            vec![record(0, 0, SharedStackPileDecision::Decline, 4)],
+        );
+        assert_eq!(opponent_read(&mine, 0, 3).passed_colors.cards(), 0);
+
+        // TRUNCATION: a `pile_size` beyond the published prefix truncates
+        // rather than panicking.
+        let overlong = stack_view(
+            revealed.clone(),
+            both_legal(),
+            [1, 1],
+            vec![record(1, 0, SharedStackPileDecision::Decline, 99)],
+        );
+        assert_eq!(opponent_read(&overlong, 0, 3).passed_colors.cards(), 4);
+
+        // ADDRESSED BY `index`, never by vector position: a record naming pile 2
+        // reads pile 2's own prefix, and pile 2 publishes none.
+        let elsewhere = stack_view(
+            revealed.clone(),
+            both_legal(),
+            [1, 1],
+            vec![record(1, 2, SharedStackPileDecision::Decline, 4)],
+        );
+        assert_eq!(opponent_read(&elsewhere, 0, 3).passed_colors.cards(), 0);
+
+        // The same claim from the other side, on the one fixture that can tell
+        // the two spellings apart: with the piles vector reversed, a record
+        // naming pile 0 must still read pile 0's prefix (four cards) and not
+        // whatever sits at position 0 (pile 2, which publishes none).
+        let reversed = reordered(stack_view(
+            revealed,
+            both_legal(),
+            [1, 1],
+            vec![record(1, 0, SharedStackPileDecision::Decline, 4)],
+        ));
+        assert_eq!(opponent_read(&reversed, 0, 3).passed_colors.cards(), 4);
     }
 
     /// CR 903.13b: a bot in a two-card pod must return two usable indices.

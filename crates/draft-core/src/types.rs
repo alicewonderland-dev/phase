@@ -93,9 +93,11 @@ pub enum DraftKind {
     /// Commander game. 1 human + 3 bots by default.
     CommanderDraft,
     /// Winston Draft: a two-player (up to four) draft from one shared
-    /// face-down stack dealt through three take-or-decline piles. Every seat
-    /// is human -- the reducer refuses a bot seat under
-    /// [`PackDistribution::SharedStackPiles`].
+    /// face-down stack dealt through three take-or-decline piles. Any seat may
+    /// be a bot: a bot seat's turn is decided from the same projection a human
+    /// sees (`draft_wasm::bot_ai::winston_decision`) and driven by
+    /// `draft_wasm::resolve_shared_stack_bot_turns`, and its decisions are
+    /// adjudicated by `shared_stack::refusal_for` like anyone's.
     ///
     /// NO Comprehensive Rules section exists for this format; the procedural
     /// authority is Wizards of the Coast, "Casual Formats" (2008-08-11),
@@ -571,19 +573,30 @@ impl DraftKind {
             DraftKind::Winston => DraftProcedure {
                 // WotC: "the two players each supply three booster packs".
                 pod_size: 2,
-                // Equals `pod_size`: a Winston pod has no bot seats. This
-                // scalar is NECESSARY BUT NOT SUFFICIENT -- it stops matching
-                // the seat count the moment a 4-seat pod is created, so the
-                // enforcing authority is `apply_start_draft`'s
-                // `SharedStackRequiresHumanSeats` refusal, not this field.
+                // Equals `pod_size`, and this scalar ENFORCES NOTHING. A
+                // shared-stack pod admits bot seats, exactly as
+                // Premier/Traditional/Sealed do, through the host's opt-in
+                // bot-fill toggle; what the value records is that a Winston pod
+                // is DESIGNED around humans, the way `Quick`'s `1` records that
+                // Quick is designed around one human plus bots.
+                //
+                // It is not a seat-composition rule and must not be read as
+                // one -- it is a per-kind constant that stops matching the seat
+                // count the moment a 4-seat pod is created. MEASURED
+                // (`grep -rn human_seats crates/ client/src`): outside this
+                // table its only consumers are `draft_procedure_dto`'s copy,
+                // that DTO's TypeScript mirror, and tests; no production branch
+                // dispatches on it, because the host dispatches on the
+                // DISTRIBUTION instead.
                 human_seats: 2,
                 min_pod_size: 2,
                 local_cube_min_pod_size: 2,
                 // The requester's ceiling: "playable by up to four".
                 max_pod_size: 4,
                 // No widened local allowance: the local-cube ceiling exists for
-                // bot-filled pods (Quick uses `u8::MAX`) and Winston has no
-                // bots.
+                // pods a single player fills out with bots (Quick uses
+                // `u8::MAX`), and the requester's ceiling for this format is
+                // four seats however they are occupied.
                 local_cube_max_pod_size: 4,
                 // WotC: "the two players each supply three booster packs".
                 packs_per_player: 3,
@@ -1526,12 +1539,6 @@ pub enum DraftError {
         required: u8,
         actual: u8,
     },
-    /// A shared-stack pod is human-only. This refusal -- not the
-    /// `human_seats` scalar -- is the authority: `human_seats` is a per-kind
-    /// constant that stops matching the seat count the moment a 4-seat pod is
-    /// created.
-    #[error("shared-stack drafts require human seats, but seat {seat} is a bot")]
-    SharedStackRequiresHumanSeats { seat: u8 },
     #[error("invalid shared-stack configuration: {reason}")]
     InvalidSharedStackConfiguration { reason: String },
     /// The reducer's rendering of `shared_stack::refusal_for`'s verdict. The

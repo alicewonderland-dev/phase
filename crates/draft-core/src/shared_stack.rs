@@ -833,23 +833,57 @@ mod tests {
         );
     }
 
-    /// V15. The engine, not the frontend, is the authority that a shared-stack
-    /// pod is human-only.
+    /// V15 + V16, inverted: a shared-stack pod ADMITS a bot seat, at both
+    /// seams the two deleted refusal tests guarded.
+    ///
+    /// Replaces `winston_refuses_a_bot_seat` and
+    /// `winston_refuses_replace_seat_with_bot`, and carries both of their
+    /// paired positives forward unchanged -- a Premier pod still admits a bot
+    /// at both seams, and a 4-seat all-human Winston pod still starts with
+    /// three piles (the leg that catches a guard written against the
+    /// `human_seats` scalar, a per-kind `2` that stops matching at pod 4).
+    ///
+    /// The bot seat is not decorative here: `StartDraft` must still deal, and
+    /// the started session must still hand the pod a live turn, so this asserts
+    /// the dealt shape rather than just the absence of an `Err`.
     #[test]
-    fn winston_refuses_a_bot_seat() {
+    fn a_winston_pod_admits_a_bot_seat() {
         let (mut session, source) = winston_session(2, 1);
         session.seats[1] = DraftSeat::Bot {
             name: "Bot".to_string(),
         };
-        assert_eq!(
-            session::apply(&mut session, DraftAction::StartDraft, Some(&source)),
-            Err(DraftError::SharedStackRequiresHumanSeats { seat: 1 })
-        );
-        assert_eq!(session.status, DraftStatus::Lobby);
-        assert!(session.shared_stack.is_none());
+        session::apply(&mut session, DraftAction::StartDraft, Some(&source))
+            .expect("a Winston pod admits a bot seat");
+        assert_eq!(session.status, DraftStatus::Drafting);
+        assert_eq!(state(&session).piles.len(), 3);
+        // Dealt, not merely started: every pile holds its opening card and the
+        // rest of the 90-card pod is face down.
+        assert!(state(&session).piles.iter().all(|pile| pile.len() == 1));
+        assert_eq!(state(&session).main_stack.len(), 90 - 3);
+        // The turn is live and addressed at the cursor, so a bot seat that owns
+        // it has something to decide.
+        assert_eq!(state(&session).cursor, 0);
 
-        // Paired positive 1: the SAME seat list starts fine as a pick-and-pass
-        // kind, so the refusal is about the distribution and not the seats.
+        // A mid-draft swap is accepted too -- the seam `winston_refuses_replace_seat_with_bot`
+        // guarded. A live pod converts, and the converted seat keeps its turn
+        // order.
+        let mut live = started(2, 2);
+        let active_before = state(&live).active_seat;
+        session::apply(
+            &mut live,
+            DraftAction::ReplaceSeatWithBot {
+                seat: 1,
+                name: None,
+            },
+            None,
+        )
+        .expect("a live Winston pod converts a seat to a bot");
+        assert!(matches!(live.seats[1], DraftSeat::Bot { .. }));
+        assert_eq!(state(&live).active_seat, active_before);
+
+        // Paired positive 1 (carried forward): the same seat list starts fine
+        // as a pick-and-pass kind, so nothing about the acceptance is
+        // distribution-specific.
         let (mut premier, premier_source) = winston_session(2, 1);
         premier.kind = DraftKind::Premier;
         premier.config.kind = DraftKind::Premier;
@@ -859,41 +893,6 @@ mod tests {
         session::apply(&mut premier, DraftAction::StartDraft, Some(&premier_source))
             .expect("a Premier pod admits a bot seat");
         assert_eq!(premier.status, DraftStatus::Drafting);
-
-        // Paired positive 2: a 4-seat ALL-HUMAN Winston pod starts fine, which
-        // is the leg that catches a guard written against the `human_seats`
-        // scalar (a per-kind `2` that stops matching at pod 4).
-        let mut four = started(4, 1);
-        assert_eq!(four.status, DraftStatus::Drafting);
-        assert_eq!(state(&four).piles.len(), 3);
-        four.status = DraftStatus::Drafting;
-    }
-
-    /// V16. The same refusal at the mid-draft seam, dispatched on the
-    /// distribution: guarding only `StartDraft` would let a live Winston pod be
-    /// converted into a bot pod one action later.
-    #[test]
-    fn winston_refuses_replace_seat_with_bot() {
-        let mut session = started(2, 2);
-        let seats_before = session.seats.clone();
-        assert_eq!(
-            session::apply(
-                &mut session,
-                DraftAction::ReplaceSeatWithBot {
-                    seat: 1,
-                    name: None
-                },
-                None,
-            ),
-            Err(DraftError::SharedStackRequiresHumanSeats { seat: 1 })
-        );
-        assert_eq!(session.seats, seats_before);
-
-        // Paired positive: Premier still accepts it.
-        let (mut premier, source) = winston_session(2, 2);
-        premier.kind = DraftKind::Premier;
-        premier.config.kind = DraftKind::Premier;
-        session::apply(&mut premier, DraftAction::StartDraft, Some(&source)).unwrap();
         session::apply(
             &mut premier,
             DraftAction::ReplaceSeatWithBot {
@@ -903,7 +902,12 @@ mod tests {
             None,
         )
         .expect("Premier still accepts a bot replacement");
-        assert!(matches!(premier.seats[1], DraftSeat::Bot { .. }));
+
+        // Paired positive 2 (carried forward): a 4-seat ALL-HUMAN Winston pod
+        // still starts, and still with three piles.
+        let four = started(4, 1);
+        assert_eq!(four.status, DraftStatus::Drafting);
+        assert_eq!(state(&four).piles.len(), 3);
     }
 
     /// A `pile_count` of zero is REFUSED, not indexed.
