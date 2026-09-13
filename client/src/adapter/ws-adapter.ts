@@ -209,6 +209,25 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 71 — DraftKind.Winston and DraftAction::SharedStackDecision are serialized
+ *      by draft WebSocket messages. A PARSE bump like 27 and 34, not a
+ *      capability bump like 24 — but a CONDITIONAL one: neither type carries
+ *      a serde fallback variant, so a v70 peer fails deserialization outright
+ *      on "Winston" or on the SharedStackDecision tag, and a v71 peer cannot
+ *      round-trip a frame a v70 peer would have to invent. The break runs in
+ *      BOTH directions and only for a Winston pod's frames — every other
+ *      kind's draft frames are byte-identical to v70.
+ *      DraftDelta::SharedStackDecisionApplied, the three shared-stack
+ *      DraftError variants and PickStatus.Waiting ride the same condition.
+ *      DraftPlayerView.{shared_stack, play_first_chooser},
+ *      SpectatorDraftView.shared_stack and DraftSession.shared_stack are
+ *      additive and serde-optional, which is why their TypeScript mirrors are
+ *      declared optional — they are listed because 71 carries them, not
+ *      because they force it. play_first_chooser is ADVISORY: no engine path
+ *      enforces it, because game one's starting player still comes from
+ *      CR 103.1's contest. Lobby messages are unchanged: draftKind is a
+ *      length-bounded string. See PROTOCOL_VERSION in
+ *      crates/lobby-broker/src/protocol.rs for the full entry.
  * 70 — OutsideGameChoiceSource.BoosterPack replaced set_code with a required
  *      origin: PackOrigin ({ type: "Set", data } or { type: "Cube" }), so an
  *      opened pack's OutsideGameChoice no longer decodes on a v69 peer and a
@@ -469,7 +488,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      into a MulliganDecisionPhase::BottomCards sub-phase on
  *      WaitingFor::MulliganDecision.
  */
-export const PROTOCOL_VERSION = 70;
+export const PROTOCOL_VERSION = 71;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

@@ -163,8 +163,20 @@ import type {
  *       entries as its in-game booster source; a guest authority and public
  *       draft views never receive them.
  *       Older hosts would silently discard the in-game booster source.
+ *  30 — shared-stack pile decisions. `draft_pile_decision` carries a pile
+ *       index and a typed `"Take"`/`"Decline"`, and player views carry
+ *       `shared_stack` (engine-published pile totals, the active seat's
+ *       revealed prefix, and the per-pile per-decision legality the reducer
+ *       enforces) plus the advisory `play_first_chooser`. A CAPABILITY
+ *       addition with a silent-drop hazard, like 27: a v29 host has no arm
+ *       for `draft_pile_decision` and would drop it, leaving the guest's turn
+ *       hung with no error, and a v29 guest reading a v30 view would render a
+ *       Winston pod with no piles. Both directions are refusable only at this
+ *       gate. Other kinds are unaffected: `shared_stack` and
+ *       `play_first_chooser` are absent from every non-Winston view, which is
+ *       also why their TypeScript mirrors are optional.
  */
-export const DRAFT_PROTOCOL_VERSION = 29 as const;
+export const DRAFT_PROTOCOL_VERSION = 30 as const;
 
 /** Canonical multiset fingerprint: deck order is UI-only, card counts are not. */
 export function deckSubmissionFingerprint(mainDeck: readonly string[]): string {
