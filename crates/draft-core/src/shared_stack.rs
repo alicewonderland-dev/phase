@@ -60,6 +60,35 @@ use crate::types::{
     SharedStackState,
 };
 
+/// How many piles a [`PackDistribution::SharedStackPiles`] row deals, or the
+/// refusal a row that declares none deserves.
+///
+/// **Single authority for `pile_count == 0`.** Every site that turns a
+/// `pile_count` into a length goes through here -- `apply_start_draft`'s
+/// pre-flight arm, its dealing arm, and `validate_persisted_snapshot` -- so a
+/// zero is refused once, before anything is built, rather than once per
+/// indexing site.
+///
+/// Unreachable through any kind that exists today: the one
+/// `SharedStackPiles` row is `pile_count: 3`, and
+/// `max_shared_stack_piles_matches_procedure_table` folds `DraftKind::ALL` to
+/// prove it. It exists because the variant is deliberately designed so that a
+/// future row differing only in pile count is a different `pile_count` rather
+/// than a sibling variant -- so a zero is a thing the NEXT author can write,
+/// and what they get for it must be this refusal and not the
+/// `inspected[0] = piles[0].len()` panic that `apply_start_draft` and
+/// `apply_shared_stack_decision`'s turn-end reset would otherwise hand them.
+///
+/// [`PackDistribution::SharedStackPiles`]: crate::types::PackDistribution::SharedStackPiles
+pub fn piles_needed(pile_count: u8) -> Result<usize, DraftError> {
+    if pile_count == 0 {
+        return Err(DraftError::InvalidSharedStackConfiguration {
+            reason: "a shared-stack distribution must deal at least one pile".to_string(),
+        });
+    }
+    Ok(usize::from(pile_count))
+}
+
 /// **Single authority** for shared-stack decision legality.
 ///
 /// A **pure predicate over the state**, with no status term: the refusal for a
@@ -233,8 +262,20 @@ pub fn apply_shared_stack_decision(
         }
     };
 
+    // EVERY APPLIED DECISION, not every completed turn, because that is what
+    // the field's contract says and what its acknowledgement consumer needs:
+    // the predicate is `after.decisions > before.decisions`, and the most
+    // common Winston action -- a non-final decline -- names no cards and adds
+    // nothing to a pool, so this counter is the ONLY thing it moves. Counting
+    // turns here would leave that decision unacknowledgeable.
+    //
+    // Placed after the `match` rather than before it because the `match` is
+    // what APPLIES the decision; a decision refused above returned early and
+    // never reaches this line, so the counter stays a count of applied
+    // decisions and a refusal still leaves the session byte-identical.
+    state.decisions += 1;
+
     if turn_ends {
-        state.decisions += 1;
         // Modulo `seats.len()`, NEVER `config.pod_size`, whose serde default is
         // an unconditional 8 regardless of kind.
         state.active_seat = (state.active_seat + 1) % seat_count;
@@ -243,6 +284,8 @@ pub fn apply_shared_stack_decision(
         // and belong to nobody, so the engine never re-publishes a previous
         // turn's prefix. First write site of the `inspected` contract.
         state.inspected.iter_mut().for_each(|seen| *seen = 0);
+        // Index 0 exists because `piles_needed` refused a zero-pile row at
+        // `StartDraft`, which is the only way a session gets a stack.
         state.inspected[0] = state.piles[0].len();
     }
 
@@ -471,6 +514,19 @@ mod tests {
                 }
                 decisions += 1;
 
+                // The `decisions` contract, asserted after EVERY decision: it
+                // counts APPLIED DECISIONS, so it equals this walk's own count
+                // exactly. Under `DeclineFirst` the FIRST non-turn-ending
+                // decline reds this if the increment sits inside the
+                // turn-ending branch -- which is what an acknowledgement
+                // predicate of `after.decisions > before.decisions` needs,
+                // since that decline moves nothing else observable.
+                assert_eq!(
+                    usize::try_from(state(&session).decisions).unwrap(),
+                    decisions,
+                    "{policy:?}: `decisions` must count every applied decision"
+                );
+
                 let s = state(&session);
                 // V3: the pile-refill invariant, asserted after EVERY decision.
                 if !s.main_stack.is_empty() {
@@ -491,6 +547,14 @@ mod tests {
             );
             assert!(taken > 0, "{policy:?}: no take was ever exercised");
             assert!(declined > 0, "{policy:?}: no decline was ever exercised");
+            // The whole-draft total, with `declined > 0` and `taken > 0` above
+            // as its reach-guards: a walk of nothing but turn-ending decisions
+            // could not tell the two increment sites apart.
+            assert_eq!(
+                usize::try_from(state(&session).decisions).unwrap(),
+                decisions,
+                "{policy:?}: the final count is every applied decision"
+            );
             if policy == WalkPolicy::DeclineFirst {
                 // The branch a take-first walk cannot reach: the forced draw
                 // that a final-pile decline triggers.
@@ -811,10 +875,71 @@ mod tests {
         assert!(matches!(premier.seats[1], DraftSeat::Bot { .. }));
     }
 
-    /// The `inspected` contract's SECOND write site, which is the one that was
-    /// omitted in an earlier draft of this design. A decline that advances the
-    /// cursor must publish the new cursor pile's height, and the card the
-    /// decline appended must sit BEYOND the declined pile's inspected prefix.
+    /// A `pile_count` of zero is REFUSED, not indexed.
+    ///
+    /// A unit test on the authority rather than a `StartDraft` walk, and the
+    /// reason is the point of the guard: no `DraftKind` can declare a zero
+    /// today (`max_shared_stack_piles_matches_procedure_table` folds
+    /// `DraftKind::ALL` and finds the single row at `3`), so there IS no
+    /// production path to drive it down -- which is exactly why the panic it
+    /// replaces would have been the next author's to discover, inside
+    /// `StartDraft`, rather than a refusal at the boundary.
+    ///
+    /// The production path is asserted in the other direction instead: every
+    /// pile count a kind can actually declare goes through this function and
+    /// comes back as the length a started pod really has.
+    #[test]
+    fn a_zero_pile_count_is_refused_rather_than_indexed() {
+        assert_eq!(
+            piles_needed(0),
+            Err(DraftError::InvalidSharedStackConfiguration {
+                reason: "a shared-stack distribution must deal at least one pile".to_string(),
+            })
+        );
+
+        // Paired positive: this refuses ZERO, not the function -- one pile is
+        // as legal as the published three.
+        assert_eq!(piles_needed(1), Ok(1));
+        assert_eq!(piles_needed(u8::MAX), Ok(usize::from(u8::MAX)));
+
+        // Every row the procedure table actually declares, with the fold's own
+        // reach-guard so a table that declared none could not pass vacuously.
+        let mut observed = 0usize;
+        for kind in DraftKind::ALL {
+            if let PackDistribution::SharedStackPiles { pile_count } = kind.procedure().distribution
+            {
+                observed += 1;
+                assert_eq!(
+                    piles_needed(pile_count),
+                    Ok(usize::from(pile_count)),
+                    "{kind:?}"
+                );
+            }
+        }
+        assert!(observed >= 1, "the fold observed no shared-stack kind");
+
+        // And the length a REAL started pod has is the one this function
+        // answers, for both vectors the zero would have made empty.
+        let session = started(2, 17);
+        let s = state(&session);
+        assert_eq!(Ok(s.piles.len()), piles_needed(3));
+        assert_eq!(Ok(s.inspected.len()), piles_needed(3));
+    }
+
+    /// BOTH write sites of the `inspected` contract, in one turn's trajectory,
+    /// because they are one contract: a prefix is published as the cursor
+    /// reaches a pile and LAPSES when the turn ends.
+    ///
+    /// * Legs 1-2 -- the SECOND write site, which is the one that was omitted
+    ///   in an earlier draft of this design: a decline that advances the cursor
+    ///   must publish the new cursor pile's height, and the card the decline
+    ///   appended must sit BEYOND the declined pile's inspected prefix.
+    /// * Leg 3 -- the FIRST write site, at turn end: every prefix this seat
+    ///   earned is zeroed and only the new seat's pile 0 is published. Before
+    ///   this leg existed, deleting that reset left EVERY test in draft-core,
+    ///   server-core, draft-wasm, lobby-broker and phase-server green -- it is
+    ///   the line whose loss has no other symptom until a view projects
+    ///   `revealed` from `inspected`.
     #[test]
     fn a_decline_inspects_the_new_cursor_and_hides_its_own_refill() {
         let mut session = started(2, 9);
@@ -880,6 +1005,50 @@ mod tests {
         assert_eq!(
             s.inspected[1], pile_one_before,
             "the declined pile's prefix still hides its own refill"
+        );
+
+        // THIRD LEG: the TURN-END reset, which is the `inspected` contract's
+        // FIRST write site and the one that makes the previous seat's
+        // entitlement LAPSE. Without it the piles this seat inspected stay
+        // published, and once a view projects `revealed` from `inspected` the
+        // next seat silently inherits the previous seat's prefixes -- a
+        // hidden-information leak with no other symptom, which is why it needs
+        // an assertion of its own rather than riding on a pile-contents check.
+        let previous_seat = s.active_seat;
+        let inspected_before_turn_end = s.inspected.clone();
+        // Reach-guard: the entitlement about to lapse is a REAL one. Zeros
+        // asserted below are meaningless unless something non-zero preceded
+        // them.
+        assert!(
+            inspected_before_turn_end[1] > 0 && inspected_before_turn_end[2] > 0,
+            "this seat really had inspected piles 1 and 2 this turn: {inspected_before_turn_end:?}"
+        );
+
+        decide(&mut session, SharedStackPileDecision::Take)
+            .expect("taking the final pile is legal and ends the turn");
+
+        let s = state(&session);
+        assert_ne!(
+            s.active_seat, previous_seat,
+            "the take ended the turn and passed the seat"
+        );
+        assert_eq!(s.cursor, 0, "the new turn starts at pile 0");
+        // The SECOND reach-guard, and the one that stops the zeros below from
+        // passing vacuously: both later piles are non-empty, so a `0` is a
+        // WITHHELD prefix rather than an empty pile.
+        assert!(
+            !s.piles[1].is_empty() && !s.piles[2].is_empty(),
+            "piles 1 and 2 still hold cards: {:?}",
+            s.piles.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            s.inspected,
+            vec![s.piles[0].len(), 0, 0],
+            "at turn start the new seat sees pile 0 and NOTHING of the previous seat's turn"
+        );
+        assert!(
+            s.inspected[0] > 0,
+            "and the new seat's own pile-0 entitlement was published"
         );
     }
 }

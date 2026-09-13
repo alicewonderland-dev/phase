@@ -286,11 +286,27 @@ describe("P2PDraftHost persistence disposal", () => {
     }
   });
 
+  // A shared-stack (Winston) draft's live state. `main_stack` is the draw
+  // order every pile is dealt from, so publishing it solves the only decision
+  // that format contains. This is the TypeScript half of the same
+  // deny-by-enumeration redaction `server-core`'s `p2p_backup_guard` performs
+  // in Rust; both halves are load-bearing because the host uploads this
+  // projection itself, and only the Rust half had a regression test.
+  const winstonSharedStack = {
+    main_stack: [{ instance_id: "secret-draw-order" }],
+    piles: [[], [], []],
+    starting_seat: 0,
+    active_seat: 0,
+    cursor: 0,
+    inspected: [0, 0, 0],
+    decisions: 0,
+  };
+
   it.each([
-    ["serialized", JSON.stringify({ booster_pack_pool: ["Nested cube"] })],
-    ["object", { booster_pack_pool: ["Nested cube"] }],
+    ["serialized", JSON.stringify({ booster_pack_pool: ["Nested cube"], shared_stack: winstonSharedStack })],
+    ["object", { booster_pack_pool: ["Nested cube"], shared_stack: winstonSharedStack }],
     ["null", null],
-  ])("strips every cube source alias from a %s public backup without changing IndexedDB", async (_shape, draftSessionJson) => {
+  ])("strips every cube source alias and the shared stack from a %s public backup without changing IndexedDB", async (_shape, draftSessionJson) => {
     const originalFetch = globalThis.fetch;
     const fetchMock = vi.fn<typeof fetch>(async () => new Response("", { status: 200 }));
     globalThis.fetch = fetchMock;
@@ -335,15 +351,31 @@ describe("P2PDraftHost persistence disposal", () => {
       expect(publicSnapshot.poolInput.data.cube_list_text).toBeUndefined();
       expect(publicSnapshot.matchLaunches[0].launch.deckPayload.booster_pack_pool).toBeUndefined();
       expect(publicSnapshot.intergameCommands[0].launchPayload.deckPayload.booster_pack_pool).toBeUndefined();
+      // The nested draft-session legs. `booster_pack_pool` is the REACH-GUARD
+      // for `shared_stack`: it proves the nested redactor demonstrably ran on
+      // this fixture, so an absent `shared_stack` is a redaction and not a
+      // field the fixture never carried. The IndexedDB half of each pair is
+      // what proves the authority copy is untouched and still resumable.
       if (typeof snapshot.draftSessionJson === "string") {
         expect(JSON.parse(publicSnapshot.draftSessionJson).booster_pack_pool).toBeUndefined();
+        expect(JSON.parse(publicSnapshot.draftSessionJson).shared_stack).toBeUndefined();
         expect(JSON.parse(snapshot.draftSessionJson).booster_pack_pool).toEqual(["Nested cube"]);
+        expect(JSON.parse(snapshot.draftSessionJson).shared_stack).toEqual(winstonSharedStack);
       } else if (snapshot.draftSessionJson && typeof snapshot.draftSessionJson === "object") {
         expect(publicSnapshot.draftSessionJson.booster_pack_pool).toBeUndefined();
-        expect((snapshot.draftSessionJson as { booster_pack_pool: string[] }).booster_pack_pool).toEqual(["Nested cube"]);
+        expect(publicSnapshot.draftSessionJson.shared_stack).toBeUndefined();
+        const retained = snapshot.draftSessionJson as {
+          booster_pack_pool: string[];
+          shared_stack: typeof winstonSharedStack;
+        };
+        expect(retained.booster_pack_pool).toEqual(["Nested cube"]);
+        expect(retained.shared_stack).toEqual(winstonSharedStack);
       } else {
         expect(publicSnapshot.draftSessionJson).toBeNull();
       }
+      // Whole-projection sentinel: the draw order must not survive ANYWHERE in
+      // the uploaded payload, including a field this test does not enumerate.
+      expect(JSON.stringify(publicSnapshot)).not.toContain("secret-draw-order");
       expect(snapshot.booster_pack_pool).toEqual(["Top level cube"]);
       expect(snapshot.poolInput.data.cube_list_text).toBe("Secret cube");
       expect(snapshot.matchLaunches[0].launch.deckPayload.booster_pack_pool).toEqual(["Launch cube"]);

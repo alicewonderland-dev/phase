@@ -1127,7 +1127,12 @@ pub struct SharedStackState {
     pub starting_seat: u8,
     /// The seat whose decision the reducer will accept.
     pub active_seat: u8,
-    /// The pile `active_seat` must decide on: 0 at turn start, +1 per decline.
+    /// The pile `active_seat` must decide on: 0 at turn start, +1 per decline
+    /// THAT ADVANCES TO A LATER PILE. A final-pile decline does not advance
+    /// it -- that decline takes the forced draw and ENDS the turn, which
+    /// resets this to 0 along with `inspected`. Stated precisely because the
+    /// increment site is inside the "a later pile exists" branch, and "+1 per
+    /// decline" alone would describe a different reducer.
     pub cursor: u8,
     /// Cards of `piles[i]` that `active_seat` has already looked at THIS TURN.
     /// Declines APPEND, so the seen set is always a prefix and a count
@@ -1154,11 +1159,25 @@ pub struct SharedStackState {
     /// without bound. There is no `<= 255` bound to prove, so there is no
     /// narrowing to do.
     pub inspected: Vec<usize>,
-    /// Decisions applied since `StartDraft`. Monotone. Two consumers: the turn
-    /// number a progress display renders, and the client's acknowledgement
-    /// predicate for a decision that names no cards. A third -- the host
-    /// timer's decision-window identity -- is a named deferral; the counter is
-    /// what that follow-up will read, which is why it is `u32`.
+    /// Decisions applied since `StartDraft` -- EVERY applied decision, not
+    /// every completed turn. Monotone, and moved by exactly one site: a
+    /// refused decision returns before it and leaves the session
+    /// byte-identical.
+    ///
+    /// ONE MEANING, deliberately. This is the client's acknowledgement
+    /// predicate (`after.shared_stack.decisions > before.shared_stack.decisions`)
+    /// for a decision that names no cards, and a NON-FINAL DECLINE is exactly
+    /// that case: it adds nothing to any pool, so this counter is the only
+    /// thing an acknowledging store can watch. It is therefore NOT a turn
+    /// number -- a turn costs between one and `pile_count` decisions, so the
+    /// two can never be the same field.
+    ///
+    /// A progress display that wants "turn N" must derive it separately (a
+    /// turn counter of its own, or `pools` totals); that is a named deferral,
+    /// not a second meaning of this counter. The host timer's
+    /// decision-window identity is a second named deferral, and it is the
+    /// per-DECISION reading it needs -- which is why this is a `u32` and not a
+    /// `u8`.
     pub decisions: u32,
 }
 

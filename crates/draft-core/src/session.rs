@@ -45,13 +45,17 @@ impl DraftSession {
     /// which is why `validate_persisted_snapshot` refuses that shape at import.
     ///
     /// Every consumer of this accessor and of `shared_stack::refusal_for`, with
-    /// its `None`/`Err` answer stated so no caller has to guess:
+    /// its `None`/`Err` answer stated so no caller has to guess. Rows marked
+    /// **A-ii** are the ones that DO NOT EXIST YET -- `DraftPlayerView` has no
+    /// `shared_stack` field and `pick_status` is still its unchanged
+    /// two-branch `if` -- so they state the contract the next phase must meet,
+    /// not a call site a reader can go and find today:
     ///
     /// | Consumer | Answer when `shared_stack` is `None` |
     /// |---|---|
     /// | `shared_stack::apply_shared_stack_decision` | this `Err`, surfaced unchanged |
-    /// | `view::filter_for_player` / `filter_for_spectator` | publishes `shared_stack: None`, identical to the status gate's answer |
-    /// | the distribution-dispatched `pick_status` helper | `PickStatus::NotDrafting` |
+    /// | **A-ii** `view::filter_for_player` / `filter_for_spectator` | will publish `shared_stack: None`, identical to the status gate's answer |
+    /// | **A-ii** the distribution-dispatched `pick_status` helper | will answer `PickStatus::NotDrafting` |
     /// | `shared_stack::forced_decision` | `None`, which is a correct answer and not an impossibility |
     /// | `server_core::draft_seats_needing_auto_pick` | an empty `Vec` -- no seat owes a decision on a session with no stack |
     /// | `server_core::pick_random_for_seat` | an `Err` that mutates nothing |
@@ -195,7 +199,7 @@ impl DraftSession {
             // -- needs two snapshot validity rules and a restored session whose
             // card conservation is knowingly false.
             PackDistribution::SharedStackPiles { pile_count } => {
-                let piles = usize::from(pile_count);
+                let piles = shared_stack::piles_needed(pile_count)?;
                 let Some(state) = self.shared_stack.as_ref() else {
                     if self.status == DraftStatus::Drafting {
                         return Err(DraftError::InvalidSharedStackConfiguration {
@@ -955,7 +959,15 @@ fn apply_start_draft(
                 });
             }
         }
-        PackDistribution::SharedStackPiles { .. } => {
+        PackDistribution::SharedStackPiles { pile_count } => {
+            // A distribution that deals no piles has no turn to take: refused
+            // HERE, in the pre-flight arm beside the pack-count and deck-size
+            // refusals, so nothing is generated or dealt before the answer is
+            // known. Unreachable for `Winston` (`pile_count: 3`); it is the
+            // next `SharedStackPiles` row that would otherwise reach
+            // `inspected[0] = piles[0].len()` below with an empty `piles` and
+            // panic inside `StartDraft`.
+            shared_stack::piles_needed(pile_count)?;
             // THE authority for "a shared-stack pod is human-only". The
             // procedure's `human_seats` scalar is necessary but not sufficient:
             // it is a per-kind constant that stops matching the seat count the
@@ -1054,7 +1066,10 @@ fn apply_start_draft(
                 .into_iter()
                 .flat_map(|seat_packs| seat_packs.into_iter().flat_map(|pack| pack.0))
                 .collect();
-            let piles_needed = usize::from(pile_count);
+            // The same single authority the pre-flight arm above already
+            // asked, so the `piles[0]` indexing below rests on a refusal
+            // rather than on a comment.
+            let piles_needed = shared_stack::piles_needed(pile_count)?;
             if main_stack.len() < piles_needed {
                 return Err(DraftError::InsufficientCards {
                     available: main_stack.len(),
@@ -1083,7 +1098,9 @@ fn apply_start_draft(
             }
             let mut inspected = vec![0usize; piles_needed];
             // First write site of the `inspected` contract: at turn start the
-            // active seat is looking at pile 0.
+            // active seat is looking at pile 0. Index 0 exists because
+            // `shared_stack::piles_needed` refused a zero-pile row above, in
+            // the pre-flight arm.
             inspected[0] = piles[0].len();
 
             session.shared_stack = Some(SharedStackState {
@@ -2620,6 +2637,90 @@ mod tests {
             vec![(0, 7), (1, 6), (2, 5), (3, 4)]
         );
         assert_eq!(round_one_pairs(DraftKind::Winston, 4), vec![(0, 3), (1, 2)]);
+    }
+
+    /// A started, drafting 2-seat Winston pod, built through the REAL reducer
+    /// so its shared stack is the shape `StartDraft` produces rather than one
+    /// a test invented.
+    fn winston_started() -> DraftSession {
+        let (mut session, source) = test_session(2);
+        session.kind = DraftKind::Winston;
+        session.config.kind = DraftKind::Winston;
+        apply(&mut session, DraftAction::StartDraft, Some(&source))
+            .expect("a human-only Winston pod starts");
+        assert_eq!(session.status, DraftStatus::Drafting);
+        session
+    }
+
+    /// Every corrupt-shared-stack leg of `validate_persisted_snapshot`, which
+    /// is the IMPORT TRUST BOUNDARY: `import_draft_session` parses
+    /// client-supplied JSON, so each leg here is a hostile snapshot refused
+    /// rather than an internal invariant.
+    ///
+    /// The over-inspection leg is the hidden-information one, and it is why
+    /// the whole set is asserted rather than only the missing-stack leg that
+    /// `draft-wasm` already covers: `inspected[i] > piles[i].len()` is a
+    /// snapshot claiming a seat saw cards the pile does not hold, which is an
+    /// over-reveal the moment a view projects `revealed` from `inspected` --
+    /// and a slice panic before that.
+    #[test]
+    fn a_corrupt_shared_stack_snapshot_is_refused_at_import() {
+        // Paired positive FIRST, so every refusal below is demonstrably about
+        // the corruption and not about Winston.
+        winston_started()
+            .validate_persisted_snapshot()
+            .expect("a real started Winston snapshot restores");
+
+        let reason_for = |mutate: &dyn Fn(&mut DraftSession)| -> String {
+            let mut session = winston_started();
+            mutate(&mut session);
+            match session
+                .validate_persisted_snapshot()
+                .expect_err("a corrupt shared stack is not a restorable snapshot")
+            {
+                DraftError::InvalidSharedStackConfiguration { reason } => reason,
+                other => panic!("expected InvalidSharedStackConfiguration, got {other:?}"),
+            }
+        };
+
+        // A drafting session's whole live state is the stack.
+        assert!(reason_for(&|session| session.shared_stack = None).contains("must carry its stack"));
+        // The two vectors that must both be `pile_count` long -- the piles and
+        // the per-pile inspected prefixes, which are indexed in lockstep.
+        assert!(reason_for(&|session| {
+            session.shared_stack.as_mut().unwrap().piles.pop();
+        })
+        .contains("exactly 3 piles"));
+        assert!(reason_for(&|session| {
+            session.shared_stack.as_mut().unwrap().inspected.pop();
+        })
+        .contains("exactly 3 piles"));
+        // Out-of-range authorities: a cursor past the last pile and a seat
+        // past the last seat.
+        assert!(reason_for(&|session| {
+            session.shared_stack.as_mut().unwrap().cursor = 3;
+        })
+        .contains("cursor must be in range"));
+        assert!(reason_for(&|session| {
+            session.shared_stack.as_mut().unwrap().active_seat = 2;
+        })
+        .contains("cursor must be in range"));
+        // THE HIDDEN-INFORMATION LEG: a prefix longer than the pile it indexes.
+        assert!(reason_for(&|session| {
+            let state = session.shared_stack.as_mut().unwrap();
+            state.inspected[1] = state.piles[1].len() + 1;
+        })
+        .contains("inspected more cards than a pile holds"));
+
+        // The counter-case, so the missing-stack refusal above is keyed on
+        // DRAFTING and not on the kind: a lobby snapshot legitimately has no
+        // stack yet.
+        let mut lobby = winston_started();
+        lobby.shared_stack = None;
+        lobby.status = DraftStatus::Lobby;
+        lobby
+            .validate_persisted_snapshot()
+            .expect("a lobby snapshot carries no stack yet");
     }
 
     /// V22's snapshot half: a non-Winston session's serialized JSON carries NO
