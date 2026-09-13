@@ -334,11 +334,6 @@ describe("DraftPodLobby", () => {
     });
 
     /**
-     * The distribution half of the same fail-closed rule. `botFillEnabled` may
-     * not short-circuit the seat-count test before the engine has said whether
-     * bot seats are legal for this kind at all.
-     */
-    /**
      * The seat GRID reads the same authority as the Start gate. An empty seat
      * in a shared-stack pod must not be labelled "Bot": no bot will ever fill
      * it, and the label is what tells the host the pod is already accounted
@@ -370,6 +365,11 @@ describe("DraftPodLobby", () => {
       expect(screen.queryAllByText("Bot")).toHaveLength(2);
     });
 
+    /**
+     * The distribution half of the same fail-closed rule. `botFillEnabled` may
+     * not short-circuit the seat-count test before the engine has said whether
+     * bot seats are legal for this kind at all.
+     */
     it("disables Start while the engine has not published the distribution", () => {
       mocks.podState.allowedPodSizes = [3, 4, 5, 6, 7, 8];
       mocks.podState.botFillEnabled = true;
@@ -377,6 +377,49 @@ describe("DraftPodLobby", () => {
       render(<DraftPodLobby onLeave={vi.fn()} />);
 
       expect(startButton()).toBeDisabled();
+    });
+
+    /**
+     * The last form of the same defect the Start gate and the seat labels
+     * already close: a control that offers a capability the engine refuses.
+     * `botFillPadsThePod` makes the toggle inert for a shared-stack pod, so
+     * leaving it on screen shows the host a switch that provably does nothing.
+     *
+     * REVERT-FAILING: render the label unconditionally again and the checkbox
+     * reappears in the shared-stack case below.
+     */
+    it("hides the bot-fill toggle for a pod whose procedure refuses bot seats", () => {
+      mocks.podState.packDistribution = { SharedStackPiles: { pile_count: 3 } };
+      render(<DraftPodLobby onLeave={vi.fn()} />);
+
+      expect(screen.queryByText("Fill empty seats with bots")).not.toBeInTheDocument();
+    });
+
+    /**
+     * The paired positive, and the reach-guard for the assertion above: the
+     * same render path DOES show the toggle wherever bot seats are legal, so
+     * "not in the document" is a decision about this procedure rather than a
+     * control this harness never renders at all.
+     */
+    it("keeps the bot-fill toggle for a pod whose procedure seats bots", () => {
+      mocks.podState.packDistribution = "PickAndPass";
+      render(<DraftPodLobby onLeave={vi.fn()} />);
+
+      expect(screen.queryByText("Fill empty seats with bots")).toBeInTheDocument();
+    });
+
+    /**
+     * The `null` sides of the two predicates are deliberately opposite, and
+     * this pins the half that is easy to "tidy" into agreement: with no
+     * procedure loaded the engine has not refused anything, so the control
+     * stays rather than vanishing and reappearing as the procedure arrives.
+     * Start is still gated — that is the test three cases above.
+     */
+    it("keeps the bot-fill toggle while the engine has not published the distribution", () => {
+      mocks.podState.packDistribution = null;
+      render(<DraftPodLobby onLeave={vi.fn()} />);
+
+      expect(screen.queryByText("Fill empty seats with bots")).toBeInTheDocument();
     });
   });
 });

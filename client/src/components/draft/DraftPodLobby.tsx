@@ -189,6 +189,18 @@ export function DraftPodLobby({ onLeave }: DraftPodLobbyProps) {
   //
   // `null` distribution — the procedure has not loaded — falls to the
   // conservative side: no padding is assumed, so the seat-count test decides.
+  // Whether the ENGINE refuses bot seats for this procedure — the question
+  // `apply_start_draft` and `apply_replace_seat_with_bot` both answer. Stated
+  // independently of whether the host has ASKED for bot fill, so it can gate the
+  // control itself as well as the control's effect.
+  //
+  // Its `null` side is deliberately the opposite of `botFillPadsThePod`'s, and
+  // both are the conservative answer to their own question: with no procedure
+  // loaded we must not assume padding WILL happen (so Start stays gated), and we
+  // must not assert the engine REFUSES it (so the control stays visible rather
+  // than vanishing and reappearing as the procedure arrives).
+  const botFillIsRefusedByProcedure =
+    packDistribution !== null && isSharedStackDistribution(packDistribution);
   const botFillPadsThePod =
     botFillEnabled
     && packDistribution !== null
@@ -304,16 +316,25 @@ export function DraftPodLobby({ onLeave }: DraftPodLobbyProps) {
       {/* Host controls */}
       {isHost && (
         <div className="flex items-center gap-4">
-          {/* Bot-fill toggle */}
-          <label className="flex cursor-pointer items-center gap-2 text-sm text-white/70">
-            <input
-              type="checkbox"
-              checked={botFillEnabled}
-              onChange={toggleBotFill}
-              className="accent-emerald-400"
-            />
-            {t("lobby.fillWithBots")}
-          </label>
+          {/* Bot-fill toggle, hidden for a distribution the engine refuses bot
+              seats on. `botFillPadsThePod` already stops this toggle from moving
+              the Start gate or the seat labels, but leaving the control itself
+              on screen is the last form of the same defect: a client offering a
+              capability the engine does not have. Gated on the same predicate as
+              `botFillPadsThePod`, so the control and its effect cannot disagree
+              — including its conservative `null` side, which keeps the control
+              visible while the procedure is still loading. */}
+          {!botFillIsRefusedByProcedure && (
+            <label className="flex cursor-pointer items-center gap-2 text-sm text-white/70">
+              <input
+                type="checkbox"
+                checked={botFillEnabled}
+                onChange={toggleBotFill}
+                className="accent-emerald-400"
+              />
+              {t("lobby.fillWithBots")}
+            </label>
+          )}
 
           <div className="flex-1" />
 
