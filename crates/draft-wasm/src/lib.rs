@@ -17,12 +17,12 @@ use engine::database::CardDatabase;
 use phase_ai::config::AiDifficulty;
 
 mod bot_ai;
+mod session_cell;
 mod suggest;
 
+use crate::session_cell::{with_draft, with_draft_inner, with_draft_mut, with_draft_mut_inner};
+
 thread_local! {
-    /// Draft session state uses Cell<Option<T>> with take/set to avoid RefCell
-    /// borrow poisoning — same panic-resilient pattern as engine-wasm.
-    static DRAFT_SESSION: Cell<Option<DraftSession>> = const { Cell::new(None) };
     static PACK_GEN: Cell<Option<PackGenerator>> = const { Cell::new(None) };
     static DIFFICULTY: Cell<AiDifficulty> = const { Cell::new(AiDifficulty::Medium) };
     static RNG: Cell<Option<ChaCha20Rng>> = const { Cell::new(None) };
@@ -38,62 +38,6 @@ fn to_js<T: Serialize + ?Sized>(value: &T) -> JsValue {
     let json = serde_json::to_string(value)
         .unwrap_or_else(|e| panic!("serde_json serialization failed: {e}"));
     js_sys::JSON::parse(&json).unwrap_or_else(|e| panic!("JSON.parse failed: {e:?}"))
-}
-
-/// Take the draft session out of the Cell, pass it to a closure, then put it back.
-fn with_draft<R>(f: impl FnOnce(&DraftSession) -> R) -> Result<R, JsValue> {
-    DRAFT_SESSION.with(|cell| {
-        let session = cell
-            .take()
-            .ok_or_else(|| JsValue::from_str("Draft not initialized"))?;
-        let result = f(&session);
-        cell.set(Some(session));
-        Ok(result)
-    })
-}
-
-/// Take the draft session out of the Cell, pass it mutably, then put it back.
-fn with_draft_mut<R>(
-    f: impl FnOnce(&mut DraftSession) -> Result<R, JsValue>,
-) -> Result<R, JsValue> {
-    DRAFT_SESSION.with(|cell| {
-        let mut session = cell
-            .take()
-            .ok_or_else(|| JsValue::from_str("Draft not initialized"))?;
-        let result = f(&mut session);
-        cell.set(Some(session));
-        result
-    })
-}
-
-/// `with_draft_mut` for the pure-Rust `_inner` cores: identical take/run/put
-/// dance, but `String` errors so the core is callable from `cargo test` on a
-/// native target, where every `JsValue` operation is unavailable.
-fn with_draft_mut_inner<R>(
-    f: impl FnOnce(&mut DraftSession) -> Result<R, String>,
-) -> Result<R, String> {
-    DRAFT_SESSION.with(|cell| {
-        let mut session = cell.take().ok_or("Draft not initialized")?;
-        let result = f(&mut session);
-        cell.set(Some(session));
-        result
-    })
-}
-
-/// `with_draft` for the pure-Rust `_inner` cores: identical take/run/put dance
-/// over a SHARED borrow, but `String` errors so the core is callable from
-/// `cargo test` on a native target.
-///
-/// The shared sibling of `with_draft_mut_inner`. A read-only `_inner` core must
-/// not reach for the `&mut` helper instead: taking `&mut` for a body that only
-/// reads is the kind of borrow the type system is there to state honestly.
-fn with_draft_inner<R>(f: impl FnOnce(&DraftSession) -> Result<R, String>) -> Result<R, String> {
-    DRAFT_SESSION.with(|cell| {
-        let session = cell.take().ok_or("Draft not initialized")?;
-        let result = f(&session);
-        cell.set(Some(session));
-        result
-    })
 }
 
 /// Preserve Limited-deck validation details across the WASM boundary so the
@@ -462,7 +406,7 @@ pub fn start_quick_draft(
     let view = filter_for_player(&draft_session, 0);
 
     // Store state in thread-locals
-    DRAFT_SESSION.with(|cell| cell.set(Some(draft_session)));
+    session_cell::install(draft_session);
     PACK_GEN.with(|cell| cell.set(Some(pack_gen)));
     DIFFICULTY.with(|cell| cell.set(ai_difficulty));
     RNG.with(|cell| cell.set(Some(ChaCha20Rng::seed_from_u64(seed as u64))));
@@ -516,7 +460,7 @@ pub fn start_sealed_draft(
         .map_err(|e| JsValue::from_str(&format!("Failed to start sealed event: {e}")))?;
     let view = filter_for_player(&draft_session, 0);
 
-    DRAFT_SESSION.with(|cell| cell.set(Some(draft_session)));
+    session_cell::install(draft_session);
     PACK_GEN.with(|cell| cell.set(Some(pack_gen)));
     DIFFICULTY.with(|cell| cell.set(map_difficulty(difficulty)));
     RNG.with(|cell| cell.set(Some(ChaCha20Rng::seed_from_u64(seed as u64))));
@@ -601,7 +545,7 @@ pub fn start_quick_cube_draft(
 
     let view = filter_for_player(&draft_session, 0);
 
-    DRAFT_SESSION.with(|cell| cell.set(Some(draft_session)));
+    session_cell::install(draft_session);
     PACK_GEN.with(|cell| cell.set(None));
     DIFFICULTY.with(|cell| cell.set(ai_difficulty));
     RNG.with(|cell| cell.set(Some(ChaCha20Rng::seed_from_u64(seed as u64))));
@@ -1145,7 +1089,7 @@ pub fn import_draft_session(json: &str, difficulty: u8) -> Result<JsValue, JsVal
     RNG.with(|cell| cell.set(Some(ChaCha20Rng::seed_from_u64(resume_seed))));
 
     let view = filter_for_player(&session, 0);
-    DRAFT_SESSION.with(|cell| cell.set(Some(session)));
+    session_cell::install(session);
 
     Ok(to_js(&view))
 }
@@ -1591,7 +1535,7 @@ fn create_multiplayer_draft_inner(
 
             let view = filter_for_player(&draft_session, 0);
 
-            DRAFT_SESSION.with(|cell| cell.set(Some(draft_session)));
+            session_cell::install(draft_session);
             PACK_GEN.with(|cell| cell.set(Some(pack_gen)));
             RNG.with(|cell| cell.set(Some(ChaCha20Rng::seed_from_u64(seed as u64))));
 
@@ -1628,7 +1572,7 @@ fn create_multiplayer_draft_inner(
 
             let view = filter_for_player(&draft_session, 0);
 
-            DRAFT_SESSION.with(|cell| cell.set(Some(draft_session)));
+            session_cell::install(draft_session);
             PACK_GEN.with(|cell| cell.set(Some(pack_gen)));
             RNG.with(|cell| cell.set(Some(ChaCha20Rng::seed_from_u64(seed as u64))));
 
@@ -1711,7 +1655,7 @@ fn create_multiplayer_draft_inner(
 
             let view = filter_for_player(&draft_session, 0);
 
-            DRAFT_SESSION.with(|cell| cell.set(Some(draft_session)));
+            session_cell::install(draft_session);
             PACK_GEN.with(|cell| cell.set(None));
             RNG.with(|cell| cell.set(Some(ChaCha20Rng::seed_from_u64(seed as u64))));
 
@@ -2132,7 +2076,7 @@ mod create_multiplayer_draft_tests {
     }
 
     fn clear_state() {
-        DRAFT_SESSION.with(|cell| cell.set(None));
+        session_cell::clear();
         PACK_GEN.with(|cell| cell.set(None));
         RNG.with(|cell| cell.set(None));
         CARD_DB.with(|cell| *cell.borrow_mut() = None);
@@ -2185,7 +2129,7 @@ mod create_multiplayer_draft_tests {
         });
         session.pools[0] = vec![colored_spell("Host Blue", "U")];
         session.pools[1] = vec![colored_spell("Guest Red", "R")];
-        DRAFT_SESSION.with(|cell| cell.set(Some(session)));
+        session_cell::install(session);
 
         let lands = suggest_lands_for_seat_inner(1, r#"["Guest Red"]"#)
             .expect("seat-one suggestion should succeed");
@@ -2216,7 +2160,7 @@ mod create_multiplayer_draft_tests {
         let session = persisted_premier_session(SetLayout::UniformByRound {
             codes: vec!["TST".to_string()],
         });
-        DRAFT_SESSION.with(|cell| cell.set(Some(session)));
+        session_cell::install(session);
 
         let error =
             suggest_lands_for_seat_inner(8, "[]").expect_err("out-of-range seat must be rejected");
@@ -2261,7 +2205,7 @@ mod create_multiplayer_draft_tests {
             serialized.pointer("/source/data/layout/Chaos/candidate_codes"),
             Some(&serde_json::json!(["TST"])),
         );
-        DRAFT_SESSION.with(|cell| assert!(cell.take().is_none()));
+        assert!(!session_cell::is_installed());
     }
 
     /// A started, drafting 2-seat Winston session, built through the REAL
@@ -2335,7 +2279,7 @@ mod create_multiplayer_draft_tests {
             error.contains("must carry its stack"),
             "unexpected error: {error}"
         );
-        DRAFT_SESSION.with(|cell| assert!(cell.take().is_none()));
+        assert!(!session_cell::is_installed());
     }
 
     /// V20's own leg. `draft_kind_wire_numbers_round_trip` and
@@ -2376,7 +2320,7 @@ mod create_multiplayer_draft_tests {
         let error = restorable_draft_session_from_json(&snapshot.to_string())
             .expect_err("a public redaction is not a restorable Chaos snapshot");
         assert!(error.contains("Failed to deserialize draft session"));
-        DRAFT_SESSION.with(|cell| assert!(cell.take().is_none()));
+        assert!(!session_cell::is_installed());
     }
 
     #[test]
@@ -2386,14 +2330,14 @@ mod create_multiplayer_draft_tests {
         start_commander_pod(4);
         seat_into_deckbuilding(0, 60);
 
-        let mut snapshot = with_installed_session(|session| {
+        let mut snapshot = session_cell::with_installed(|session| {
             serde_json::to_value(session).expect("serialize Commander snapshot")
         });
         snapshot["config"]["min_deck_size"] = serde_json::json!(59);
         let restored = restorable_draft_session_from_json(&snapshot.to_string())
             .expect("a legacy Commander snapshot restores");
         assert_eq!(restored.config.min_deck_size, 60);
-        DRAFT_SESSION.with(|cell| cell.set(Some(restored)));
+        session_cell::install(restored);
 
         let human_deck = seat_deck(0, 59);
         let error = submit_deck_inner(&json(&human_deck), &json(&["Seat 0 Card 0".to_string()]))
@@ -2481,22 +2425,17 @@ mod create_multiplayer_draft_tests {
             seat: 0,
             card_instance_ids: vec![picked.clone()],
         };
-        DRAFT_SESSION.with(|cell| {
-            let mut session = cell.take().expect("session populated");
-            let deltas = session::apply(&mut session, action, None).expect("pick applies");
+        session_cell::with_installed_mut(|session| {
+            let deltas = session::apply(session, action, None).expect("pick applies");
             assert!(!deltas.is_empty(), "pick should produce deltas");
-            cell.set(Some(session));
         });
 
         // After the human pick, seat 0's pack should no longer contain the picked card
         // (it has been passed; pack will not be visible again until the rotation lands).
-        let post_view = DRAFT_SESSION.with(|cell| {
-            let session = cell.take().expect("session populated");
-            let json = serde_json::to_string(&session).unwrap();
+        let post_view = session_cell::with_installed(|session| {
+            let json = serde_json::to_string(session).unwrap();
             let restored = restorable_draft_session_from_json(&json).unwrap();
-            let v = filter_for_player(&restored, 0);
-            cell.set(Some(session));
-            v
+            filter_for_player(&restored, 0)
         });
         assert_eq!(post_view.pool.len(), 1);
         assert!(serde_json::to_value(&post_view)
@@ -3267,8 +3206,7 @@ mod create_multiplayer_draft_tests {
     /// not be validatable against seat 0's pool, so a wrong-pool read is a hard
     /// `Err` rather than a silent pass.
     fn seat_into_deckbuilding(seat: u8, pool_size: usize) {
-        DRAFT_SESSION.with(|cell| {
-            let mut session = cell.take().expect("a draft session is installed");
+        session_cell::with_installed_mut(|session| {
             session.status = DraftStatus::Deckbuilding;
             session.pools[seat as usize] = (0..pool_size)
                 .map(|i| DraftCardInstance {
@@ -3283,19 +3221,7 @@ mod create_multiplayer_draft_tests {
                     draft_effect: None,
                 })
                 .collect();
-            cell.set(Some(session));
         });
-    }
-
-    /// Read the installed session without disturbing it -- the same take/put
-    /// dance `with_draft_mut_inner` runs.
-    fn with_installed_session<R>(f: impl FnOnce(&DraftSession) -> R) -> R {
-        DRAFT_SESSION.with(|cell| {
-            let session = cell.take().expect("a draft session is installed");
-            let out = f(&session);
-            cell.set(Some(session));
-            out
-        })
     }
 
     /// Start a granting 4-seat Commander pod and put `seat` into deckbuilding.
@@ -3365,7 +3291,7 @@ mod create_multiplayer_draft_tests {
         let commanders = vec!["Seat 0 Card 7".to_string(), "Seat 0 Card 3".to_string()];
         submit_deck_inner(&json(&deck), &json(&commanders)).expect("a legal deck submits");
 
-        with_installed_session(|session| {
+        session_cell::with_installed(|session| {
             // Paired positive reach-guard: the submission INSERTED. A refusal
             // cannot satisfy the assertion below vacuously.
             assert_eq!(
@@ -3415,7 +3341,7 @@ mod create_multiplayer_draft_tests {
         let deck = seat_deck(0, 60);
         submit_deck_inner(&json(&deck), "[]").expect("an undesignated deck submits");
 
-        with_installed_session(|session| {
+        session_cell::with_installed(|session| {
             assert_eq!(
                 session.submitted_decks.len(),
                 1,
@@ -3515,7 +3441,7 @@ mod create_multiplayer_draft_tests {
         // by the deck and the pool, so nothing but the floor changes.
         submit_deck_inner(&json(&deck), &json(&["Seat 0 Card 0".to_string()]))
             .expect("a well-formed payload applies");
-        with_installed_session(|session| {
+        session_cell::with_installed(|session| {
             assert_eq!(session.submitted_decks.len(), 1);
         });
 
@@ -3547,7 +3473,7 @@ mod create_multiplayer_draft_tests {
         // Accepted: two added copies, both designated.
         submit_deck_inner(&json(&deck), &json(&designated))
             .expect("CR 903.13e: added filler copies designated as commanders are legal");
-        with_installed_session(|session| {
+        session_cell::with_installed(|session| {
             let submission = session
                 .submitted_decks
                 .get(&engine::types::player::PlayerId(0))
@@ -3636,7 +3562,7 @@ mod create_multiplayer_draft_tests {
         submit_deck_for_seat_inner(2, &json(&seat2_deck), &json(&seat2_commanders))
             .expect("seat 2 submits from its own pool");
 
-        with_installed_session(|session| {
+        session_cell::with_installed(|session| {
             // Paired positive reach-guard: BOTH submissions inserted. A refused
             // seat-2 call cannot satisfy the assertions below.
             assert_eq!(
@@ -3756,7 +3682,7 @@ mod create_multiplayer_draft_tests {
         assert_eq!(session.current_pack[0].as_ref().unwrap().0.len(), 15);
         let restored =
             restorable_draft_session_from_json(&serde_json::to_string(&session).unwrap()).unwrap();
-        DRAFT_SESSION.with(|cell| cell.set(Some(restored)));
+        session_cell::install(restored);
         let pool = booster_pack_pool_for_game_inner().unwrap().unwrap();
         assert_eq!(pool.len(), 401);
         assert_eq!(pool.last().unwrap(), "Delta");
@@ -3806,10 +3732,8 @@ mod create_multiplayer_draft_tests {
             booster_pack_pool_for_game_inner(),
             Ok(Some(vec!["Alpha".to_string(); 200]))
         );
-        DRAFT_SESSION.with(|cell| {
-            let session = cell.take().expect("Commander cube session is stored");
+        session_cell::with_installed(|session| {
             assert_eq!(session.config.min_deck_size, 60);
-            cell.set(Some(session));
         });
         clear_state();
     }
@@ -3817,10 +3741,8 @@ mod create_multiplayer_draft_tests {
     /// `DraftSession.pools` is `pub`, and seeding a bot seat's pool directly is
     /// the same shape `draft-core`'s own session tests use.
     fn seed_bot_pool(seat: usize, pool: Vec<DraftCardInstance>) {
-        DRAFT_SESSION.with(|cell| {
-            let mut session = cell.take().expect("a session must be installed");
+        session_cell::with_installed_mut(|session| {
             session.pools[seat] = pool;
-            cell.set(Some(session));
         });
     }
 
@@ -3831,10 +3753,8 @@ mod create_multiplayer_draft_tests {
     /// directly on a Set session, so it must not be read as implying the Set
     /// path can produce this configuration.
     fn set_addable_cards(addable: DeckAddableCards) {
-        DRAFT_SESSION.with(|cell| {
-            let mut session = cell.take().expect("a session must be installed");
+        session_cell::with_installed_mut(|session| {
             session.config.addable_cards = addable;
-            cell.set(Some(session));
         });
     }
 
