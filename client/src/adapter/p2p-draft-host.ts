@@ -71,6 +71,13 @@ import { assignAvatarForSeat } from "../services/playerAvatars";
  * which a host can resume. The HTTP backup is reachable by a derivable host
  * peer id, so it is a public projection, never an authority. The server
  * repeats this redaction at its trust boundary.
+ *
+ * That includes a shared-stack draft's `shared_stack`, whose `main_stack` is
+ * the draw order every pile is derived from: publishing it would solve the only
+ * decision that format contains. The engine deliberately refuses to restore a
+ * drafting shared-stack snapshot that has had it removed, so the public backup
+ * is non-resumable for a live shared-stack pod by design — IndexedDB stays the
+ * resumable copy.
  */
 function sanitizePublicBackup(
   snapshot: PersistedDraftHostSession,
@@ -140,6 +147,7 @@ function redactDraftSessionPoolAndChaos(snapshot: Record<string, unknown>): void
 
 function redactDraftSessionObject(session: Record<string, unknown>): void {
   delete session.booster_pack_pool;
+  delete session.shared_stack;
   if (isJsonRecord(session.config)) redactChaosAssignmentsFromSource(session.config.source);
 }
 

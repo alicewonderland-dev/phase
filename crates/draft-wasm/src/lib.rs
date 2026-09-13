@@ -941,7 +941,9 @@ fn suggest_lands_for_seat_inner(
 /// picks): every card the seat drafts this step, as a JSON array of instance
 /// ids. `apply_pick_inner` owns the count contract — one id for the four CR
 /// 905.1a kinds, two for CommanderDraft, dropping to the remainder on an odd
-/// final pick.
+/// final pick. `Winston` has NO PICK STEP AT ALL and never reaches this
+/// function: a shared-stack turn is a whole-pile
+/// `DraftAction::SharedStackDecision`.
 ///
 /// The JSON encoding mirrors `submit_pick_with_draft_effect_for_seat` below
 /// byte for byte. It is deliberately NOT tolerant of a bare id: a bare string
@@ -1129,6 +1131,11 @@ pub fn import_draft_session(json: &str, difficulty: u8) -> Result<JsValue, JsVal
     let session =
         restorable_draft_session_from_json(json).map_err(|error| JsValue::from_str(&error))?;
 
+    // The resume-seed offset is derived from `cards_in_pack` /
+    // `current_pack_number` / `pick_number`, all of which stay `0` for a
+    // shared-stack session (it moves none of them). That is harmless: this RNG
+    // seeds BOT PICKS, and a shared-stack pod has no bot seats by engine
+    // refusal.
     let offset = u64::from(session.cards_in_pack(session.current_pack_number))
         * u64::from(session.current_pack_number)
         + u64::from(session.pick_number);
@@ -1408,6 +1415,9 @@ fn draft_kind_wire_number(kind: DraftKind) -> u8 {
         DraftKind::Sealed => 3,
         // CR 903.13a: the fifth kind.
         DraftKind::CommanderDraft => 4,
+        // The sixth kind. No CR: Winston Draft has no Comprehensive Rules
+        // section -- see `PackDistribution::SharedStackPiles`.
+        DraftKind::Winston => 5,
     }
 }
 
@@ -1429,16 +1439,18 @@ fn draft_kind_from_wire(kind: u8) -> Result<DraftKind, String> {
 }
 
 /// Create a multiplayer draft session. Used by the P2P host to initialize a
-/// Premier, Traditional, Sealed, or Commander draft with human + bot seats from
-/// a Set pool, host-local Chaos candidate pools, or a custom Cube list.
+/// multiplayer draft of any `DraftKind` with a wire number, with human + bot
+/// seats from a Set pool, host-local Chaos candidate pools, or a custom Cube
+/// list. (A shared-stack kind has no bot seats: the reducer refuses them.)
 ///
 /// - `pool_input_json`: serialized `PoolInput` discriminated union
 ///   (`{ "type": "Set" | "Chaos" | "Cube", "data": { ... } }`)
 /// - `seats_json`: JSON array of SeatDescriptors
-/// - `kind`: 0=Quick, 1=Premier, 2=Traditional, 3=Sealed, 4=CommanderDraft
-///   (CR 903.13a). The mapping's single authority is `draft_kind_wire_number`.
-///   Flows through to `DraftConfig.kind` unchanged. Tournament match format is
-///   identical to set drafts.
+/// - `kind`: the wire number for a `DraftKind`. The mapping's single authority
+///   is `draft_kind_wire_number` — read it there rather than restating it here,
+///   which is what keeps a widening from leaving this list stale. Flows through
+///   to `DraftConfig.kind` unchanged. Tournament match format is identical to
+///   set drafts.
 /// - `seed`: RNG seed for deterministic pack generation
 /// - `draft_code`: unique room identifier
 ///
@@ -1633,7 +1645,11 @@ fn create_multiplayer_draft_inner(
                 PackDistribution::AllAtOnce => {
                     return Err("Sealed events require a Set pool".to_string());
                 }
-                PackDistribution::PickAndPass => {}
+                // A shared stack is built by shuffling every opened pack
+                // together, and a cube source generates packs just as a set
+                // source does — so Winston-from-cube is permitted and this arm
+                // falls through with the pick-and-pass one.
+                PackDistribution::PickAndPass | PackDistribution::SharedStackPiles { .. } => {}
             }
             let entries = parse_cube_list(&cube_list_text).map_err(|errors| {
                 format!(
@@ -2248,6 +2264,98 @@ mod create_multiplayer_draft_tests {
         DRAFT_SESSION.with(|cell| assert!(cell.take().is_none()));
     }
 
+    /// A started, drafting 2-seat Winston session, built through the REAL
+    /// reducer so its `shared_stack` is the shape the reducer produces rather
+    /// than one this test invented.
+    fn started_winston_session() -> DraftSession {
+        let source = DraftSource::single_set("TST".to_string());
+        let config = DraftConfig {
+            set_code: source.set_code(),
+            source,
+            kind: DraftKind::Winston,
+            pod_size: 2,
+            cards_per_pack: 15,
+            pack_count: 3,
+            min_deck_size: 40,
+            addable_cards: DeckAddableCards::standard_basics(),
+            rng_seed: 42,
+            tournament_format: TournamentFormat::Swiss,
+            pod_policy: PodPolicy::Competitive,
+            spectator_visibility: SpectatorVisibility::default(),
+        };
+        let seats = (0..2)
+            .map(|seat| DraftSeat::Human {
+                player_id: engine::types::player::PlayerId(seat),
+                display_name: format!("Player {seat}"),
+            })
+            .collect();
+        let mut session = DraftSession::new(config, seats, "winston-draft".to_string());
+        let pack_source = draft_core::pack_source::FixturePackSource {
+            set_code: "TST".to_string(),
+            cards_per_pack: 15,
+        };
+        draft_core::session::apply(
+            &mut session,
+            draft_core::types::DraftAction::StartDraft,
+            Some(&pack_source),
+        )
+        .expect("a human-only Winston pod starts");
+        session
+    }
+
+    /// V26. A public backup strips `shared_stack` at the trust boundary, and
+    /// the result is DELIBERATELY not a restorable Winston snapshot -- the same
+    /// discipline `import_rejects_redacted_chaos_snapshot_that_claims_a_uniform_layout`
+    /// applies to a redacted Chaos layout. The authoritative, resumable copy is
+    /// the host's IndexedDB snapshot.
+    #[test]
+    fn import_rejects_redacted_winston_snapshot_missing_its_stack() {
+        clear_state();
+
+        let session = started_winston_session();
+        assert_eq!(session.status, draft_core::types::DraftStatus::Drafting);
+        let mut snapshot = serde_json::to_value(&session).expect("serialize Winston snapshot");
+        assert!(
+            snapshot.get("shared_stack").is_some(),
+            "the unredacted snapshot carries its stack"
+        );
+
+        // Paired positive FIRST, so the refusal below is demonstrably about the
+        // redaction and not about Winston.
+        restorable_draft_session_from_json(&snapshot.to_string())
+            .expect("an unredacted Winston snapshot restores");
+
+        snapshot
+            .as_object_mut()
+            .expect("a session serializes to an object")
+            .remove("shared_stack");
+        let error = restorable_draft_session_from_json(&snapshot.to_string())
+            .expect_err("a public redaction is not a restorable Winston snapshot");
+        assert!(
+            error.contains("must carry its stack"),
+            "unexpected error: {error}"
+        );
+        DRAFT_SESSION.with(|cell| assert!(cell.take().is_none()));
+    }
+
+    /// V20's own leg. `draft_kind_wire_numbers_round_trip` and
+    /// `draft_procedure_dto_copies_every_axis_unmoved` carry the rest.
+    #[test]
+    fn winston_round_trips_through_the_wire_number() {
+        assert_eq!(draft_kind_wire_number(DraftKind::Winston), 5);
+        assert_eq!(draft_kind_from_wire(5), Ok(DraftKind::Winston));
+        // Negative sibling: an unmapped number is an `Err` naming every known
+        // kind, never a default.
+        let error = draft_kind_from_wire(6).expect_err("6 is unmapped");
+        assert!(error.contains("unknown draft kind 6"), "{error}");
+        for kind in DraftKind::ALL {
+            assert!(
+                error.contains(&format!("{kind:?}")),
+                "{error} omits {kind:?}"
+            );
+        }
+    }
+
     #[test]
     fn import_rejects_redacted_chaos_snapshot_that_claims_a_uniform_layout() {
         clear_state();
@@ -2851,15 +2959,18 @@ mod create_multiplayer_draft_tests {
         let err = create_multiplayer_draft_inner(
             &commander_pool_input_json(),
             COMMANDER_SEATS_JSON,
-            5,
+            // THE RULE, stated durably so the next widening does not repeat
+            // this: the unmapped-kind hostile fixture must name a number BEYOND
+            // the widened table. `5` is `DraftKind::Winston` now.
+            6,
             42,
             "test-room",
             "Swiss",
             "Competitive",
         )
-        .expect_err("kind 5 is unmapped");
+        .expect_err("kind 6 is unmapped");
         assert!(
-            err.contains("unknown draft kind 5"),
+            err.contains("unknown draft kind 6"),
             "unexpected error: {err}"
         );
 
@@ -2989,11 +3100,18 @@ mod create_multiplayer_draft_tests {
     /// `packs_per_player` are BOTH `3`, so a single-kind test — field by field
     /// or not — stays green with exactly those two swapped. Over the whole
     /// table the `u8` columns are pairwise distinct AS COLUMNS, so every
-    /// transposition reddens here. `commanders_required` is `[0, 0, 0, 0, 1]`
-    /// over `DraftKind::ALL` and equals no other column (`pod_size`
-    /// `[8, 8, 8, 8, 4]`, `human_seats` `[1, 8, 8, 8, 1]`, `min_pod_size`
-    /// `[2, 2, 2, 2, 3]`, `packs_per_player` `[3, 3, 3, 6, 3]`, `cards_per_pick`
-    /// `[1, 1, 1, 1, 2]`), so the argument survives its addition.
+    /// transposition reddens here. Recomputed with the `Winston` row:
+    /// `commanders_required` is `[0, 0, 0, 0, 1, 0]` over `DraftKind::ALL` and
+    /// equals no other column (`pod_size` `[8, 8, 8, 8, 4, 2]`, `human_seats`
+    /// `[1, 8, 8, 8, 1, 2]`, `min_pod_size` `[2, 2, 2, 2, 3, 2]`,
+    /// `packs_per_player` `[3, 3, 3, 6, 3, 3]`, `cards_per_pick`
+    /// `[1, 1, 1, 1, 2, 1]`), so the pairwise-distinctness conclusion holds and
+    /// the argument survives the sixth kind.
+    ///
+    /// The `Winston` row has `pod_size == human_seats == min_pod_size == 2`, so
+    /// a single-kind test on that row could not catch a transposition among
+    /// those three. The fold over `ALL` is what keeps that within-row
+    /// transposition red — the same reason the Commander row gave.
     #[test]
     fn draft_procedure_dto_copies_every_axis_unmoved() {
         for kind in DraftKind::ALL {

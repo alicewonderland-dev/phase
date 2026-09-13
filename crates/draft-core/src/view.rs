@@ -378,6 +378,9 @@ pub struct DraftPlayerView {
     /// Published so the display layer never re-derives it: the count is 1 for
     /// the four CR 905.1a kinds, 2 for `CommanderDraft`, and drops to 1 on an
     /// odd pack's final step — a distinction no per-kind lookup can make.
+    /// `Winston` is not a consumer at all: this is a pick-and-pass STEP
+    /// counter, and a shared-stack turn is a whole-pile decision with no pick
+    /// step.
     pub required_pick_count: usize,
     /// Engine-owned selection interaction for this draft procedure. This stays
     /// ordered for Commander Draft's one-card final step, unlike
@@ -867,6 +870,10 @@ pub fn filter_for_player(session: &DraftSession, seat_index: u8) -> DraftPlayerV
     let sealed_packs = match session.kind.procedure().distribution {
         PackDistribution::AllAtOnce => Some(split_by_pack_size(&pool, session)),
         PackDistribution::PickAndPass => None,
+        // A shared stack is not chunked into per-seat boosters at all: the
+        // packs are opened without looking and shuffled into one stack, so
+        // there is nothing per-seat to project.
+        PackDistribution::SharedStackPiles { .. } => None,
     };
     let pool_groups = DraftPoolGroups::from_pool(&pool, &session.config.source);
 
@@ -3172,7 +3179,8 @@ mod tests {
     /// reds at 14 against an expected 7.
     ///
     /// The fold is its own reach-guard: it asserts a nonzero, per-kind value
-    /// for all five kinds, so an all-zeros field cannot pass it. The four
+    /// for every kind in `DraftKind::ALL`, so an all-zeros field cannot pass
+    /// it. The four
     /// CR 905.1a kinds are the reach-guard against a field that is only
     /// correct for CommanderDraft — for them the value EQUALS `cards_per_pack`,
     /// so a field that merely echoed `cards_per_pack` would pass 4/5 and fail

@@ -68,6 +68,17 @@ pub enum DraftKind {
     /// Legends-style packs two cards at a time, then plays one multiplayer
     /// Commander game. 1 human + 3 bots by default.
     CommanderDraft,
+    /// Winston Draft: a two-player (up to four) draft from one shared
+    /// face-down stack dealt through three take-or-decline piles. Every seat
+    /// is human -- the reducer refuses a bot seat under
+    /// [`PackDistribution::SharedStackPiles`].
+    ///
+    /// NO Comprehensive Rules section exists for this format; the procedural
+    /// authority is Wizards of the Coast, "Casual Formats" (2008-08-11),
+    /// <https://magic.wizards.com/en/news/feature/casual-formats-2008-08-11>.
+    /// See [`PackDistribution::SharedStackPiles`] for the full grep-verified
+    /// statement of why CR 905 and CR 903.13 do not apply.
+    Winston,
 }
 
 /// How a draft kind's packs reach the seats.
@@ -82,6 +93,29 @@ pub enum PackDistribution {
     PickAndPass,
     /// Every pack is handed to its own seat unopened; there is no pick step.
     AllAtOnce,
+    /// One shared face-down main stack dealt through `pile_count`
+    /// take-or-decline piles, one active seat at a time. Winston Draft is its
+    /// first consumer; the axis is named for the SHAPE, so a future variant
+    /// that differs only in the number of piles is a different `pile_count`
+    /// rather than a sibling variant.
+    ///
+    /// Winston Draft has NO Comprehensive Rules section. Grep-verified against
+    /// docs/MagicCompRules.txt: CR 905 is Conspiracy Draft and CR 903.13 is
+    /// Commander Draft; neither covers a shared face-down stack dealt through
+    /// take-or-decline piles, and no other section does. The procedural
+    /// authority is Wizards of the Coast, "Casual Formats" (2008-08-11),
+    /// <https://magic.wizards.com/en/news/feature/casual-formats-2008-08-11> --
+    /// deliberately no CR citation, the same discipline
+    /// [`PostDraftPlay::TournamentPairings`] applies to MTR tournament
+    /// structure. Deck construction is the one part the CR does cover:
+    /// CR 100.2b (40-card limited minimum) and CR 100.4b (the rest of the pool
+    /// is the sideboard).
+    ///
+    /// The pile count lives in the payload rather than on [`DraftProcedure`]
+    /// so that "a pile count exists iff piles exist" is a type-level fact: a
+    /// flat field would be readable from `DraftKind::Premier.procedure()`,
+    /// where it can never mean anything.
+    SharedStackPiles { pile_count: u8 },
 }
 
 /// What happens to the draft session once every seat has submitted a deck.
@@ -159,7 +193,10 @@ pub struct DraftProcedure {
     /// literal at a call site: CR 905.1a drafts "one card" per step, and
     /// CR 903.13b drafts "two cards" per step for Commander Draft. Only
     /// meaningful under [`PackDistribution::PickAndPass`]; fixed at `1` under
-    /// [`PackDistribution::AllAtOnce`], which has no pick step at all.
+    /// [`PackDistribution::AllAtOnce`] and
+    /// [`PackDistribution::SharedStackPiles`], neither of which has a pick step
+    /// at all. `procedure()` is the authority for which shape a kind uses --
+    /// read it rather than re-deriving the partition from this sentence.
     /// [`MAX_CARDS_PER_PICK`] is derived from this axis by
     /// `max_cards_per_pick_matches_procedure_table`.
     pub cards_per_pick: u8,
@@ -174,7 +211,8 @@ pub struct DraftProcedure {
     /// the CR 903.13f(1) minimum of 60 cards.
     pub cube_min_deck_size: usize,
     /// CR 903.3: how many commanders each deck built from this kind's pool must
-    /// designate. `0` for the four CR 905.1a kinds; `1` for CommanderDraft, whose
+    /// designate. `0` for every kind whose decks are not Commander decks -- the
+    /// four CR 905.1a kinds and `Winston`; `1` for CommanderDraft, whose
     /// decks are Commander decks (CR 903.13f routes deck construction through
     /// CR 903.5). Not a bool: CR 903.13f(3) + CR 702.124 admit a second commander,
     /// so the count is the axis, not the presence.
@@ -291,6 +329,23 @@ pub const MAX_CARDS_PER_PICK: usize = 2; // CR 903.13b, the CommanderDraft row
 /// list; the two coexist with different values on purpose.
 pub const MAX_COMMANDER_DESIGNATIONS: usize = 2;
 
+/// The largest `PackDistribution::SharedStackPiles::pile_count` over every
+/// [`DraftKind`].
+///
+/// The session-independent half of the `DraftAction::SharedStackDecision`
+/// payload bound in `server-core`'s `guard_draft_action_payload`, which
+/// receives only the action and can never consult the session (so it cannot
+/// check that the index is the ACTIVE pile -- `shared_stack::refusal_for` owns
+/// that). Derived from the procedure table, not chosen: exactly the role
+/// [`MAX_CARDS_PER_PICK`] plays for `DraftAction::Pick`, and
+/// `max_shared_stack_piles_matches_procedure_table` folds [`DraftKind::ALL`]
+/// and fails if this drifts.
+///
+/// No CR: Winston Draft has no Comprehensive Rules section (see
+/// [`PackDistribution::SharedStackPiles`]). The `3` is WotC "Casual Formats"'s
+/// "three stacks face down on the table", by way of the procedure table.
+pub const MAX_SHARED_STACK_PILES: usize = 3;
+
 impl DraftKind {
     /// Every `DraftKind`, in declaration order.
     ///
@@ -299,19 +354,20 @@ impl DraftKind {
     ///
     /// Hand-written, and the guarantees are worth stating precisely because
     /// they are narrower than "compiler-enforced": the wildcard-free `match` in
-    /// `draft_kind_all_lists_every_variant` makes a sixth variant an `E0004`
-    /// **there**, which enforces the *arm set*; the array type `[DraftKind; 5]`
+    /// `draft_kind_all_lists_every_variant` makes a seventh variant an `E0004`
+    /// **there**, which enforces the *arm set*; the array type `[DraftKind; 6]`
     /// enforces the *length*; and the sorted-index assertion catches
     /// *duplication*. A future variant's **membership in this array** is
-    /// enforced by nothing — a sixth variant that adds its `index_of` arm but
+    /// enforced by nothing — a seventh variant that adds its `index_of` arm but
     /// is left out of `ALL` compiles and passes. The `E0004` lands the author
     /// beside this array, and that proximity is the actual guarantee.
-    pub const ALL: [DraftKind; 5] = [
+    pub const ALL: [DraftKind; 6] = [
         DraftKind::Quick,
         DraftKind::Premier,
         DraftKind::Traditional,
         DraftKind::Sealed,
         DraftKind::CommanderDraft,
+        DraftKind::Winston,
     ];
 
     /// The single authority for this kind's procedure.
@@ -454,6 +510,72 @@ impl DraftKind {
                     ..MatchConfig::default()
                 },
             },
+            // Winston Draft has NO Comprehensive Rules section. Grep-verified
+            // against docs/MagicCompRules.txt: CR 905 is Conspiracy Draft and
+            // CR 903.13 is Commander Draft; neither covers a shared face-down
+            // stack dealt through take-or-decline piles, and no other section
+            // does. The procedural authority for every axis below that is not
+            // marked with a CR is Wizards of the Coast, "Casual Formats"
+            // (2008-08-11),
+            // https://magic.wizards.com/en/news/feature/casual-formats-2008-08-11
+            // -- deliberately no CR citation, the same discipline
+            // `PostDraftPlay::TournamentPairings` applies to MTR tournament
+            // structure.
+            DraftKind::Winston => DraftProcedure {
+                // WotC: "the two players each supply three booster packs".
+                pod_size: 2,
+                // Equals `pod_size`: a Winston pod has no bot seats. This
+                // scalar is NECESSARY BUT NOT SUFFICIENT -- it stops matching
+                // the seat count the moment a 4-seat pod is created, so the
+                // enforcing authority is `apply_start_draft`'s
+                // `SharedStackRequiresHumanSeats` refusal, not this field.
+                human_seats: 2,
+                min_pod_size: 2,
+                local_cube_min_pod_size: 2,
+                // The requester's ceiling: "playable by up to four".
+                max_pod_size: 4,
+                // No widened local allowance: the local-cube ceiling exists for
+                // bot-filled pods (Quick uses `u8::MAX`) and Winston has no
+                // bots.
+                local_cube_max_pod_size: 4,
+                // WotC: "the two players each supply three booster packs".
+                packs_per_player: 3,
+                // THIS AXIS DOES NOT DESCRIBE A WINSTON TURN. A take moves
+                // however many cards the pile holds and a decline moves one or
+                // zero; the turn's card count is `SharedStackState`'s, never
+                // this field's. `1` keeps `MAX_CARDS_PER_PICK` at 2 (which
+                // bounds `DraftAction::Pick`, an action Winston never sends)
+                // and keeps `pick_steps_per_pack`'s divisor >= 1.
+                cards_per_pick: 1,
+                // THIS AXIS DOES NOT DESCRIBE A WINSTON TURN either: you take a
+                // whole pile, you do not select cards from it. Winston
+                // publishes no pick step, so the axis has no consumer here.
+                pick_selection_mode: PickSelectionMode::Direct,
+                // WotC: "Player A sets the top three cards from the main pile
+                // in three stacks face down on the table."
+                distribution: PackDistribution::SharedStackPiles { pile_count: 3 },
+                // CR 100.2b: limited decks have a 40-card minimum.
+                min_deck_size: 40,
+                // Ordinary cube floor, same as Premier: Winston-from-cube is
+                // permitted.
+                cube_min_deck_size: 1,
+                // CR 903.3 is scoped to the Commander variant by CR 903.13f;
+                // Winston is outside it, so its decks designate nothing.
+                commanders_required: 0,
+                // Not `CompleteImmediately`: that runs no in-session pairings,
+                // and `commanders_required: 0` authorizes no Commander pod
+                // launch, so the pod would reach `Deckbuilding` with no path to
+                // a match at all. `TournamentPairings` reuses the existing
+                // pairing machinery exactly as a 2-seat Premier pod does.
+                post_draft_play: PostDraftPlay::TournamentPairings,
+                // WotC does not specify. `Bo1` is stated here as the in-tree
+                // default (Quick/Premier/Sealed/CommanderDraft), not as a rules
+                // claim.
+                match_config: MatchConfig {
+                    match_type: MatchType::Bo1,
+                    ..MatchConfig::default()
+                },
+            },
         }
     }
 
@@ -468,7 +590,8 @@ impl DraftKind {
     }
 
     /// CR 903.3: how many commanders a deck built from this kind's pool must
-    /// designate. `0` for the four CR 905.1a kinds.
+    /// designate. `0` for every kind whose decks are not Commander decks -- the
+    /// four CR 905.1a kinds and `Winston`.
     pub fn commanders_required(self) -> u8 {
         self.procedure().commanders_required
     }
@@ -975,7 +1098,115 @@ pub enum DraftPauseReason {
     DisconnectGraceExpired,
 }
 
+/// Live state of a [`PackDistribution::SharedStackPiles`] draft.
+///
+/// One cohesive sub-struct rather than six loose fields on [`DraftSession`],
+/// because the fields share one invariant and are meaningless individually: a
+/// pile is refilled the instant it is taken, so WHILE THE MAIN STACK IS
+/// NON-EMPTY EVERY PILE IS NON-EMPTY. State with a joint invariant is
+/// constructed and mutated together.
+///
+/// No CR: Winston Draft has no Comprehensive Rules section. See
+/// [`PackDistribution::SharedStackPiles`] for the grep-verified statement and
+/// the WotC procedural authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedStackState {
+    /// The face-down main stack. **The LAST element is the top**, so a draw is
+    /// `pop()` -- O(1), and "the top card of the main stack" has exactly one
+    /// spelling in `crate::shared_stack`.
+    ///
+    /// Its ORDER is never published to anyone: it is the `rng_seed`'s secret,
+    /// and publishing it would make every pile predictable.
+    pub main_stack: Vec<DraftCardInstance>,
+    /// The piles, index 0 leftmost. Length is always the distribution's
+    /// `pile_count`.
+    pub piles: Vec<Vec<DraftCardInstance>>,
+    /// The seat that drafted first, LATCHED at `StartDraft`. Never re-derived:
+    /// `active_seat` moves every turn, so it cannot answer who started. This is
+    /// what `play_first_chooser` is derived from.
+    pub starting_seat: u8,
+    /// The seat whose decision the reducer will accept.
+    pub active_seat: u8,
+    /// The pile `active_seat` must decide on: 0 at turn start, +1 per decline.
+    pub cursor: u8,
+    /// Cards of `piles[i]` that `active_seat` has already looked at THIS TURN.
+    /// Declines APPEND, so the seen set is always a prefix and a count
+    /// suffices.
+    ///
+    /// CONTRACT, and it has exactly TWO write sites, both mandatory:
+    ///   1. turn start -- zeroed, then `inspected[0] = piles[0].len()`;
+    ///   2. cursor advance (every decline that does not end the turn) --
+    ///      `inspected[new_cursor] = piles[new_cursor].len()`.
+    ///
+    /// Omitting (2) leaves the active seat's view publishing an empty
+    /// `revealed` for the pile it is inspecting.
+    ///
+    /// STORED, not derived, and the near-miss is where a hidden-information bug
+    /// would live: for `i < cursor` the revealed prefix is `piles[i].len()`
+    /// minus the cards a decline added, and a decline adds one only while the
+    /// stack lasts -- so if the stack is empty now, how many of this turn's
+    /// declines drew is NOT recoverable from current state, and that is exactly
+    /// the endgame the adjudication governs.
+    ///
+    /// `usize`, matching `Vec::len`, NOT `u8`: `CubeDraftSettings.cards_per_pack`
+    /// is client-supplied with no product ceiling, so a 4-seat cube Winston
+    /// admits up to 4 x 3 x 255 cards and a pile grows by one per decline
+    /// without bound. There is no `<= 255` bound to prove, so there is no
+    /// narrowing to do.
+    pub inspected: Vec<usize>,
+    /// Decisions applied since `StartDraft`. Monotone. Two consumers: the turn
+    /// number a progress display renders, and the client's acknowledgement
+    /// predicate for a decision that names no cards. A third -- the host
+    /// timer's decision-window identity -- is a named deferral; the counter is
+    /// what that follow-up will read, which is why it is `u32`.
+    pub decisions: u32,
+}
+
+/// Take the pile, or put it back.
+///
+/// NOT a `bool`: a decision axis gets a named type, and a named axis is what a
+/// refusal, a delta and an i18n key can all key on. Two sibling actions
+/// (`TakePile` / `DeclinePile`) is the same raw-bool smell wearing an enum's
+/// clothes, and would make the legality predicate answer two functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SharedStackPileDecision {
+    Take,
+    Decline,
+}
+
+impl SharedStackPileDecision {
+    /// Every decision, in declaration order. The [`DraftKind::ALL`] idiom:
+    /// folded by `shared_stack::forced_decision` and by the view's totality
+    /// test, so neither can go narrow when the axis grows.
+    pub const ALL: [SharedStackPileDecision; 2] = [
+        SharedStackPileDecision::Take,
+        SharedStackPileDecision::Decline,
+    ];
+}
+
+/// Every reason a shared-stack decision can be refused.
+///
+/// ONE vocabulary for the reducer's refusal and the view's publication, so the
+/// two can never disagree. `shared_stack::refusal_for` is the single authority
+/// that produces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SharedStackRefusal {
+    /// Not this seat's turn, or not the pile the cursor is on.
+    PileNotActive,
+    /// An empty pile cannot be taken.
+    PileEmpty,
+    /// A decline must still guarantee THIS seat a card this turn, and neither a
+    /// later pile nor two main-stack cards remain.
+    NoGuaranteedCard,
+}
+
 /// Actions that can be performed on a draft session.
+///
+/// STANDING REFACTOR NOTE: `Pick`, `PickWithDraftEffect` and
+/// `SharedStackDecision` are three shapes of "this seat commits to cards this
+/// step". A FOURTH pick-shaped action should open a `PickSelection`
+/// parameterization round rather than add a fifth sibling -- three is the
+/// sibling-cluster threshold, and the third is the last one that is cheap.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum DraftAction {
@@ -988,6 +1219,11 @@ pub enum DraftAction {
     /// `1` for the four CR 905.1a kinds and `2` for CommanderDraft, dropping to
     /// the remainder on an odd final pick. `DraftDelta::CardPicked` stays
     /// singular: one delta per card.
+    ///
+    /// `Winston` reports `1` on that axis but takes NO PICK STEP AT ALL: under
+    /// [`PackDistribution::SharedStackPiles`] a turn is a whole-pile decision,
+    /// so this action is refused and [`DraftAction::SharedStackDecision`] is
+    /// the one that moves cards.
     Pick {
         seat: u8,
         card_instance_ids: Vec<String>,
@@ -1037,6 +1273,24 @@ pub enum DraftAction {
         seat: u8,
         connected: bool,
     },
+    /// One whole shared-stack turn decision.
+    ///
+    /// The forced "take the top card of the main stack" that follows a
+    /// final-pile decline is NOT an action -- it is the engine-owned
+    /// consequence of that decline.
+    ///
+    /// No CR: see [`PackDistribution::SharedStackPiles`].
+    SharedStackDecision {
+        seat: u8,
+        /// The pile the client believes it is deciding on. The cursor is the
+        /// ENGINE's; this is an optimistic-concurrency check, not a selector.
+        /// Without it, a double-send during a laggy turn (two `Decline` frames
+        /// from one click) would apply the second to the NEXT pile silently;
+        /// with it, the second frame is refused
+        /// [`SharedStackRefusal::PileNotActive`] and nothing moves.
+        pile: u8,
+        decision: SharedStackPileDecision,
+    },
 }
 
 /// State changes produced by applying a DraftAction.
@@ -1074,6 +1328,14 @@ pub enum DraftDelta {
     SeatConnectionChanged {
         seat: u8,
         connected: bool,
+    },
+    /// One shared-stack turn decision was applied. Names no cards: a decline
+    /// moves one or zero, and a take moves however many the pile held, so the
+    /// card movement is read from the session/view rather than replayed here.
+    SharedStackDecisionApplied {
+        seat: u8,
+        pile: u8,
+        decision: SharedStackPileDecision,
     },
 }
 
@@ -1145,6 +1407,22 @@ pub enum DraftError {
         kind: DraftKind,
         required: u8,
         actual: u8,
+    },
+    /// A shared-stack pod is human-only. This refusal -- not the
+    /// `human_seats` scalar -- is the authority: `human_seats` is a per-kind
+    /// constant that stops matching the seat count the moment a 4-seat pod is
+    /// created.
+    #[error("shared-stack drafts require human seats, but seat {seat} is a bot")]
+    SharedStackRequiresHumanSeats { seat: u8 },
+    #[error("invalid shared-stack configuration: {reason}")]
+    InvalidSharedStackConfiguration { reason: String },
+    /// The reducer's rendering of `shared_stack::refusal_for`'s verdict. The
+    /// predicate is the single authority; this error never re-derives it.
+    #[error("seat {seat} may not act on pile {pile}: {reason:?}")]
+    SharedStackDecisionRefused {
+        seat: u8,
+        pile: u8,
+        reason: SharedStackRefusal,
     },
 }
 
@@ -1289,6 +1567,19 @@ pub struct DraftSession {
     /// Original source name multiset, including copies and entries never dealt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub booster_pack_pool: Option<Vec<String>>,
+    /// Shared-stack pile state. `None` for every distribution without piles,
+    /// which is why `skip_serializing_if` is SEMANTICS and not only a
+    /// compatibility shim -- the same shape `booster_pack_pool` above uses.
+    ///
+    /// Read through [`DraftSession::shared_stack`], which turns `None` into a
+    /// `DraftError` so no call site unwraps. RETAINED, not cleared, at the
+    /// `Drafting -> Deckbuilding` transition: it is the conservation evidence a
+    /// completed draft's audits read, `validate_persisted_snapshot` keys its
+    /// rules on it, and `pick_pass::finish_pick` sets the precedent by leaving
+    /// `current_pack` as `Some(empty)` at the same transition. The VIEW is what
+    /// is status-gated, not the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_stack: Option<SharedStackState>,
     pub draft_code: String,
     pub set_code: String,
     pub kind: DraftKind,
@@ -1681,13 +1972,17 @@ mod tests {
     /// `DraftKind::ALL` must list every variant exactly once.
     ///
     /// What this actually enforces, stated narrowly: the `match` below is
-    /// wildcard-free, so a sixth `DraftKind` is an `E0004` **here**, which
+    /// wildcard-free, so a seventh `DraftKind` is an `E0004` **here**, which
     /// lands the author beside the array that must list it; the array type
-    /// `[DraftKind; 5]` enforces the length; and the sorted-index equality
-    /// catches a duplicated entry. It does **not** enforce that a sixth variant
+    /// `[DraftKind; 6]` enforces the length; and the sorted-index equality
+    /// catches a duplicated entry. It does **not** enforce that a new variant
     /// is added to `ALL` — a variant that adds its arm below and is omitted
     /// from the array still compiles and still passes. The `E0004`'s proximity
     /// is the guarantee, not the assertion.
+    ///
+    /// The index assertion itself is DERIVED from `DraftKind::ALL.len()`, not a
+    /// literal: a hand-written expectation is a sentinel the next widening
+    /// invalidates silently.
     #[test]
     fn draft_kind_all_lists_every_variant() {
         fn index_of(kind: DraftKind) -> usize {
@@ -1697,14 +1992,142 @@ mod tests {
                 DraftKind::Traditional => 2,
                 DraftKind::Sealed => 3,
                 DraftKind::CommanderDraft => 4,
+                DraftKind::Winston => 5,
             }
         }
         let mut indices: Vec<usize> = DraftKind::ALL.into_iter().map(index_of).collect();
         indices.sort_unstable();
+        // DERIVED, not a literal: a hand-written `[0, 1, 2, 3, 4]` is a
+        // sentinel the next widening invalidates silently. Expressing the
+        // expectation as the array's own length means this class of literal
+        // cannot recur.
         assert_eq!(
             indices,
-            [0, 1, 2, 3, 4],
+            (0..DraftKind::ALL.len()).collect::<Vec<_>>(),
             "DraftKind::ALL must list every variant exactly once"
+        );
+    }
+
+    /// V1. A table-ROW shape test by nature; V3-V7 in `shared_stack` carry the
+    /// behavior. Every axis is asserted against the value Fork 7's table states
+    /// with its own reason, so a transposed pair (`pod_size` 2 <-> 3, a 60-card
+    /// minimum) reddens here.
+    ///
+    /// WITHIN-ROW COLLISION, named rather than papered over: `pod_size`,
+    /// `human_seats` and `min_pod_size` are all `2` in this row, so this test
+    /// alone cannot catch a transposition among those three.
+    /// `draft_procedure_dto_copies_every_axis_unmoved`'s fold over
+    /// `DraftKind::ALL` is what does, because the columns stay pairwise
+    /// distinct over the whole table.
+    #[test]
+    fn winston_procedure_row_states_the_format_rules() {
+        let procedure = DraftKind::Winston.procedure();
+        assert_eq!(procedure.pod_size, 2);
+        assert_eq!(procedure.human_seats, 2);
+        assert_eq!(procedure.min_pod_size, 2);
+        assert_eq!(procedure.local_cube_min_pod_size, 2);
+        assert_eq!(procedure.max_pod_size, 4);
+        assert_eq!(procedure.local_cube_max_pod_size, 4);
+        assert_eq!(procedure.packs_per_player, 3);
+        assert_eq!(procedure.cards_per_pick, 1);
+        assert_eq!(procedure.pick_selection_mode, PickSelectionMode::Direct);
+        assert_eq!(
+            procedure.distribution,
+            PackDistribution::SharedStackPiles { pile_count: 3 }
+        );
+        assert_eq!(procedure.min_deck_size, 40);
+        assert_eq!(procedure.cube_min_deck_size, 1);
+        assert_eq!(procedure.commanders_required, 0);
+        assert_eq!(procedure.post_draft_play, PostDraftPlay::TournamentPairings);
+        assert_eq!(procedure.match_config.match_type, MatchType::Bo1);
+        // Non-vacuity sibling: `procedure()` must actually read `self`.
+        assert_ne!(
+            DraftKind::Winston.procedure().distribution,
+            DraftKind::Premier.procedure().distribution
+        );
+    }
+
+    /// V2. `MAX_SHARED_STACK_PILES` is DERIVED from the procedure table, not
+    /// chosen: hardcoding it would let a future 4-pile variant silently exceed
+    /// the wire bound `guard_draft_action_payload` enforces.
+    #[test]
+    fn max_shared_stack_piles_matches_procedure_table() {
+        let mut observed_pile_counts = 0usize;
+        let mut max_pile_count = 0usize;
+        for kind in DraftKind::ALL {
+            match kind.procedure().distribution {
+                PackDistribution::SharedStackPiles { pile_count } => {
+                    observed_pile_counts += 1;
+                    max_pile_count = max_pile_count.max(usize::from(pile_count));
+                }
+                PackDistribution::PickAndPass | PackDistribution::AllAtOnce => {}
+            }
+        }
+        // Reach-guard: a fold that observed no pile-bearing kind would assert
+        // `0 == MAX_SHARED_STACK_PILES` against a constant nobody set.
+        assert!(
+            observed_pile_counts >= 1,
+            "the fold must observe at least one shared-stack kind"
+        );
+        assert_eq!(max_pile_count, MAX_SHARED_STACK_PILES);
+    }
+
+    /// V22 (the action/kind half). The serialized shapes the wire and the i18n
+    /// key path both depend on.
+    #[test]
+    fn winston_action_and_kind_round_trip() {
+        assert_eq!(
+            serde_json::to_string(&DraftKind::Winston).unwrap(),
+            "\"Winston\""
+        );
+        for decision in SharedStackPileDecision::ALL {
+            let json = serde_json::to_string(&decision).unwrap();
+            let back: SharedStackPileDecision = serde_json::from_str(&json).unwrap();
+            assert_eq!(decision, back);
+        }
+        // PascalCase with no boundary conversion: wire == lookup key.
+        assert_eq!(
+            serde_json::to_string(&SharedStackPileDecision::Take).unwrap(),
+            "\"Take\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SharedStackPileDecision::Decline).unwrap(),
+            "\"Decline\""
+        );
+        for refusal in [
+            SharedStackRefusal::PileNotActive,
+            SharedStackRefusal::PileEmpty,
+            SharedStackRefusal::NoGuaranteedCard,
+        ] {
+            let json = serde_json::to_string(&refusal).unwrap();
+            let back: SharedStackRefusal = serde_json::from_str(&json).unwrap();
+            assert_eq!(refusal, back);
+        }
+        let action = DraftAction::SharedStackDecision {
+            seat: 1,
+            pile: 2,
+            decision: SharedStackPileDecision::Decline,
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        let back: DraftAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(action, back);
+        let delta = DraftDelta::SharedStackDecisionApplied {
+            seat: 1,
+            pile: 2,
+            decision: SharedStackPileDecision::Take,
+        };
+        let delta_json = serde_json::to_string(&delta).unwrap();
+        let delta_back: DraftDelta = serde_json::from_str(&delta_json).unwrap();
+        assert_eq!(delta, delta_back);
+        // The distribution's externally tagged struct-variant shape, which the
+        // TypeScript union mirrors. Unit variants are unchanged.
+        assert_eq!(
+            serde_json::to_string(&PackDistribution::SharedStackPiles { pile_count: 3 }).unwrap(),
+            "{\"SharedStackPiles\":{\"pile_count\":3}}"
+        );
+        assert_eq!(
+            serde_json::to_string(&PackDistribution::PickAndPass).unwrap(),
+            "\"PickAndPass\""
         );
     }
 
@@ -1752,12 +2175,12 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_draft_kind() {
-        for kind in [
-            DraftKind::Quick,
-            DraftKind::Premier,
-            DraftKind::Traditional,
-            DraftKind::Sealed,
-        ] {
+        // Folds `DraftKind::ALL` rather than a hand-written array. The previous
+        // hand-written `[Quick, Premier, Traditional, Sealed]` was already
+        // non-total at base (it omitted `CommanderDraft`), which is this
+        // class's silent failure mode: the test compiles, passes, and stops
+        // covering the new wire value.
+        for kind in DraftKind::ALL {
             let json = serde_json::to_string(&kind).unwrap();
             let back: DraftKind = serde_json::from_str(&json).unwrap();
             assert_eq!(kind, back);

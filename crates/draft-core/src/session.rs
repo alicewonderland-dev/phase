@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use rand::seq::SliceRandom;
+use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
@@ -8,6 +9,7 @@ use engine::types::player::PlayerId;
 
 use crate::pack_source::PackSource;
 use crate::pick_pass;
+use crate::shared_stack;
 use crate::types::*;
 use crate::validation::{validate_limited_deck, LimitedDeckError};
 // Deep-path import by design: `engine::game::mod` re-exports `deck_validation`'s
@@ -35,6 +37,33 @@ impl DraftSession {
         self.current_round + 1
     }
 
+    /// The shared-stack state, or the error a session that should have one but
+    /// does not deserves.
+    ///
+    /// EVERY read of `shared_stack` goes through here, so no call site unwraps.
+    /// The `Err` answer is reachable only from a hand-built or corrupt session,
+    /// which is why `validate_persisted_snapshot` refuses that shape at import.
+    ///
+    /// Every consumer of this accessor and of `shared_stack::refusal_for`, with
+    /// its `None`/`Err` answer stated so no caller has to guess:
+    ///
+    /// | Consumer | Answer when `shared_stack` is `None` |
+    /// |---|---|
+    /// | `shared_stack::apply_shared_stack_decision` | this `Err`, surfaced unchanged |
+    /// | `view::filter_for_player` / `filter_for_spectator` | publishes `shared_stack: None`, identical to the status gate's answer |
+    /// | the distribution-dispatched `pick_status` helper | `PickStatus::NotDrafting` |
+    /// | `shared_stack::forced_decision` | `None`, which is a correct answer and not an impossibility |
+    /// | `server_core::draft_seats_needing_auto_pick` | an empty `Vec` -- no seat owes a decision on a session with no stack |
+    /// | `server_core::pick_random_for_seat` | an `Err` that mutates nothing |
+    /// | the wire payload guard | deliberately not a consumer: it can never see a session |
+    pub fn shared_stack(&self) -> Result<&SharedStackState, DraftError> {
+        self.shared_stack
+            .as_ref()
+            .ok_or_else(|| DraftError::InvalidSharedStackConfiguration {
+                reason: "shared-stack state missing on a shared-stack session".to_string(),
+            })
+    }
+
     /// Create a new draft session in Lobby status.
     ///
     /// Timestamps are set to 0 -- callers set them externally since the pure
@@ -43,6 +72,7 @@ impl DraftSession {
         let pod_size = seats.len();
         DraftSession {
             booster_pack_pool: None,
+            shared_stack: None,
             set_code: config.set_code.clone(),
             kind: config.kind,
             status: DraftStatus::Lobby,
@@ -153,6 +183,53 @@ impl DraftSession {
         match procedure.distribution {
             PackDistribution::PickAndPass => return Ok(()),
             PackDistribution::AllAtOnce => {}
+            // A shared-stack session's whole live state is `shared_stack`, so a
+            // snapshot that claims to be drafting without one is not a
+            // restorable session -- it is an unplayable one. THIS IS WHAT MAKES
+            // A REDACTED PUBLIC BACKUP NON-RESUMABLE, deliberately: the
+            // `POST /p2p-draft-backup` projection strips `shared_stack` at the
+            // trust boundary, so the public copy fails here. The authoritative,
+            // resumable copy stays in the host's IndexedDB snapshot, which is
+            // the path that does resume a Winston pod. The alternative -- a
+            // second serialization shape that retains counts without contents
+            // -- needs two snapshot validity rules and a restored session whose
+            // card conservation is knowingly false.
+            PackDistribution::SharedStackPiles { pile_count } => {
+                let piles = usize::from(pile_count);
+                let Some(state) = self.shared_stack.as_ref() else {
+                    if self.status == DraftStatus::Drafting {
+                        return Err(DraftError::InvalidSharedStackConfiguration {
+                            reason: "a drafting shared-stack session must carry its stack"
+                                .to_string(),
+                        });
+                    }
+                    return Ok(());
+                };
+                if state.piles.len() != piles || state.inspected.len() != piles {
+                    return Err(DraftError::InvalidSharedStackConfiguration {
+                        reason: format!("a shared-stack session has exactly {piles} piles"),
+                    });
+                }
+                if usize::from(state.active_seat) >= self.seats.len()
+                    || usize::from(state.cursor) >= piles
+                {
+                    return Err(DraftError::InvalidSharedStackConfiguration {
+                        reason: "active seat and cursor must be in range".to_string(),
+                    });
+                }
+                if state
+                    .inspected
+                    .iter()
+                    .zip(state.piles.iter())
+                    .any(|(seen, pile)| *seen > pile.len())
+                {
+                    return Err(DraftError::InvalidSharedStackConfiguration {
+                        reason: "a seat cannot have inspected more cards than a pile holds"
+                            .to_string(),
+                    });
+                }
+                return Ok(());
+            }
         }
         if !matches!(self.config.source, DraftSource::Set { .. }) {
             return Err(DraftError::SealedRequiresSetSource);
@@ -253,6 +330,11 @@ pub fn apply(
         DraftAction::SetSeatConnected { seat, connected } => {
             apply_set_seat_connected(session, seat, connected)
         }
+        DraftAction::SharedStackDecision {
+            seat,
+            pile,
+            decision,
+        } => shared_stack::apply_shared_stack_decision(session, seat, pile, decision),
     }
 }
 
@@ -491,8 +573,24 @@ fn generate_swiss_pairings(
 
 fn generate_se_pairings(session: &DraftSession, round: u8) -> Vec<DraftPairing> {
     if round == 1 {
-        // Standard seeded bracket: 0v7, 1v6, 2v5, 3v4
-        let bracket_pairs: [(u8, u8); 4] = [(0, 7), (1, 6), (2, 5), (3, 4)];
+        // Standard seeded bracket: highest seed against lowest, inward. This is
+        // MTR bracket policy, not a Comprehensive Rules concept -- there is
+        // deliberately no CR citation here.
+        //
+        // Reproduces the previous hardcoded `[(0, 7), (1, 6), (2, 5), (3, 4)]`
+        // EXACTLY at `n == 8`, and yields `[(0, 3), (1, 2)]` at `n == 4`, which
+        // is what a 4-seat single-elimination pod needs. The old literal
+        // panicked below eight seats.
+        //
+        // An odd `n` would drop the middle seat, and that is unreachable:
+        // `allowed_pod_size_range` forces `pod_size == max_pod_size` under
+        // `SingleElimination`; the only `TournamentPairings` kinds are
+        // Premier / Traditional / Sealed / Winston (Quick and CommanderDraft
+        // are `CompleteImmediately`); their max pod sizes are 8, 8, 8, 4, all
+        // even; and `apply_generate_pairings` guards `seats.len()` against that
+        // same range.
+        let n = session.seats.len() as u8;
+        let bracket_pairs: Vec<(u8, u8)> = (0..n / 2).map(|i| (i, n - 1 - i)).collect();
         bracket_pairs
             .iter()
             .enumerate()
@@ -739,6 +837,17 @@ fn apply_replace_seat_with_bot(
         return Err(DraftError::SeatOutOfRange { seat, pod_size });
     }
 
+    // Dispatched on the distribution, not on `human_seats`: a shared-stack pod
+    // is human-only, and converting a live one into a bot pod one action after
+    // `StartDraft` refused the same thing would make the start-time guard a
+    // formality.
+    match session.kind.procedure().distribution {
+        PackDistribution::SharedStackPiles { .. } => {
+            return Err(DraftError::SharedStackRequiresHumanSeats { seat });
+        }
+        PackDistribution::PickAndPass | PackDistribution::AllAtOnce => {}
+    }
+
     session.seats[seat as usize] = DraftSeat::Bot {
         name: name.unwrap_or_else(|| format!("Seat {}", seat + 1)),
     };
@@ -846,6 +955,30 @@ fn apply_start_draft(
                 });
             }
         }
+        PackDistribution::SharedStackPiles { .. } => {
+            // THE authority for "a shared-stack pod is human-only". The
+            // procedure's `human_seats` scalar is necessary but not sufficient:
+            // it is a per-kind constant that stops matching the seat count the
+            // moment a 4-seat pod is created. The frontend's suppression of
+            // bot-fill is a courtesy on top of this refusal, never a substitute.
+            if let Some(seat) = session
+                .seats
+                .iter()
+                .position(|seat| matches!(seat, DraftSeat::Bot { .. }))
+            {
+                return Err(DraftError::SharedStackRequiresHumanSeats { seat: seat as u8 });
+            }
+            if session.config.pack_count != procedure.packs_per_player
+                || session.config.min_deck_size != procedure.min_deck_size
+            {
+                return Err(DraftError::InvalidSharedStackConfiguration {
+                    reason: format!(
+                        "shared-stack drafts require {} packs per seat and a {}-card minimum deck",
+                        procedure.packs_per_player, procedure.min_deck_size
+                    ),
+                });
+            }
+        }
         PackDistribution::PickAndPass => {}
     }
 
@@ -898,6 +1031,72 @@ fn apply_start_draft(
                     status: DraftStatus::Deckbuilding,
                 },
             ]);
+        }
+        // Every pack is opened without looking at the contents and shuffled
+        // into one shared face-down main stack, which is then dealt through
+        // `pile_count` take-or-decline piles. WotC "Casual Formats": "the two
+        // players each supply three booster packs, which they open without
+        // looking at the contents". No CR -- see
+        // `PackDistribution::SharedStackPiles`.
+        PackDistribution::SharedStackPiles { pile_count } => {
+            let packs_per_seat = usize::from(procedure.packs_per_player);
+            if all_packs.len() != session.seats.len()
+                || all_packs.iter().any(|packs| packs.len() != packs_per_seat)
+            {
+                return Err(DraftError::InvalidSharedStackConfiguration {
+                    reason: format!("pack source did not generate {packs_per_seat} packs per seat"),
+                });
+            }
+            // Seat-major, then pack-major, then index order. Deterministic and
+            // RNG-free: the shuffle below is what makes the stack unpredictable,
+            // so the flatten order must not be a second source of entropy.
+            let mut main_stack: Vec<DraftCardInstance> = all_packs
+                .into_iter()
+                .flat_map(|seat_packs| seat_packs.into_iter().flat_map(|pack| pack.0))
+                .collect();
+            let piles_needed = usize::from(pile_count);
+            if main_stack.len() < piles_needed {
+                return Err(DraftError::InsufficientCards {
+                    available: main_stack.len(),
+                    required: piles_needed,
+                });
+            }
+
+            // THE STREAM'S CONSUMPTION ORDER IS PART OF THE CONTRACT, because
+            // three draws share one `ChaCha20Rng`: `generate_packs` above, then
+            // the shuffle, then the starting-seat draw. SWAPPING THE LAST TWO
+            // changes both the stack order and the starting seat for a given
+            // seed, which is why `same_seed_yields_same_stack_and_starting_seat`
+            // pins a golden pair rather than only asserting determinism.
+            main_stack.shuffle(&mut rng);
+            let starting_seat = rng.random_range(0..seat_count);
+
+            // The LAST element is the top, so seeding pile `i` in ascending `i`
+            // is "deal the top card onto each pile in turn".
+            let mut piles: Vec<Vec<DraftCardInstance>> = vec![Vec::new(); piles_needed];
+            for pile in piles.iter_mut() {
+                pile.push(
+                    main_stack
+                        .pop()
+                        .expect("the stack holds at least `pile_count` cards"),
+                );
+            }
+            let mut inspected = vec![0usize; piles_needed];
+            // First write site of the `inspected` contract: at turn start the
+            // active seat is looking at pile 0.
+            inspected[0] = piles[0].len();
+
+            session.shared_stack = Some(SharedStackState {
+                main_stack,
+                piles,
+                starting_seat,
+                active_seat: starting_seat,
+                cursor: 0,
+                inspected,
+                decisions: 0,
+            });
+            session.status = DraftStatus::Drafting;
+            return Ok(vec![DraftDelta::DraftStarted]);
         }
         PackDistribution::PickAndPass => {}
     }
@@ -973,9 +1172,14 @@ pub(crate) fn concession_set_codes(session: &DraftSession) -> Vec<&str> {
             // A cube contains no draft boosters from any set.
             DraftSource::Cube { .. } => Vec::new(),
         },
-        DraftKind::Quick | DraftKind::Premier | DraftKind::Traditional | DraftKind::Sealed => {
-            Vec::new()
-        }
+        // CR 903.13e is scoped to Commander Draft, so every kind outside
+        // CR 903.13 concedes nothing -- including `Winston`, which carries no
+        // CR section at all.
+        DraftKind::Quick
+        | DraftKind::Premier
+        | DraftKind::Traditional
+        | DraftKind::Sealed
+        | DraftKind::Winston => Vec::new(),
     }
 }
 
@@ -1031,7 +1235,8 @@ fn apply_submit_deck(
         &commanders,
         // CR 903.3: the floor is the kind's, read from the procedure table.
         // This is the line that makes the value kind-derived rather than
-        // assumed -- `0` for the four CR 905.1a kinds, `1` for CommanderDraft.
+        // assumed -- `0` for every kind whose decks are not Commander decks
+        // (the four CR 905.1a kinds and `Winston`), `1` for CommanderDraft.
         usize::from(session.kind.procedure().commanders_required),
     ) {
         return Err(DraftError::ValidationFailed { errors });
@@ -2382,6 +2587,72 @@ mod tests {
         );
         assert_eq!(pairings.len(), 1);
         assert_eq!(unordered(pairings[0].players), unordered([p[0], p[2]]));
+    }
+
+    /// V19. The bracket is seeded for ANY even pod, not just eight seats.
+    ///
+    /// The `n == 8` leg is an EXACT-EQUALITY regression against the literal the
+    /// generalization replaced, seat for seat. The `n == 4` leg is the one a
+    /// 4-seat single-elimination Winston pod needs: the old literal indexed
+    /// seats 4..7 and panicked below eight.
+    #[test]
+    fn se_bracket_is_seeded_for_any_even_pod() {
+        fn round_one_pairs(kind: DraftKind, pod_size: u8) -> Vec<(u8, u8)> {
+            let (mut session, _) = test_session(pod_size);
+            // `allowed_pod_size_range` forces `pod_size == max_pod_size` under
+            // single elimination, so the 4-seat bracket is reachable only for a
+            // kind whose ceiling is 4 -- which is exactly why this row exists.
+            session.kind = kind;
+            session.config.kind = kind;
+            session.config.tournament_format = TournamentFormat::SingleElimination;
+            session.status = DraftStatus::Deckbuilding;
+            apply(&mut session, DraftAction::GeneratePairings, None).unwrap();
+            session
+                .pairings
+                .iter()
+                .filter(|pairing| pairing.round == 1)
+                .map(|pairing| (pairing.players[0].0, pairing.players[1].0))
+                .collect()
+        }
+
+        assert_eq!(
+            round_one_pairs(DraftKind::Premier, 8),
+            vec![(0, 7), (1, 6), (2, 5), (3, 4)]
+        );
+        assert_eq!(round_one_pairs(DraftKind::Winston, 4), vec![(0, 3), (1, 2)]);
+    }
+
+    /// V22's snapshot half: a non-Winston session's serialized JSON carries NO
+    /// `shared_stack` key at all, so `skip_serializing_if` keeps every existing
+    /// snapshot byte-identical.
+    #[test]
+    fn non_winston_sessions_serialize_without_a_shared_stack_key() {
+        let (mut session, source) = test_session(2);
+        let json = serde_json::to_value(&session).unwrap();
+        assert!(json.get("shared_stack").is_none());
+        apply(&mut session, DraftAction::StartDraft, Some(&source)).unwrap();
+        let started = serde_json::to_value(&session).unwrap();
+        assert!(started.get("shared_stack").is_none());
+        // Reach-guard: the serializer demonstrably ran and the session is live.
+        assert_eq!(started["status"], "Drafting");
+        // Paired positive: a Winston session DOES carry the key, so the absence
+        // above is `skip_serializing_if` and not a missing field.
+        let mut winston: DraftSession =
+            serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        winston.shared_stack = Some(SharedStackState {
+            main_stack: Vec::new(),
+            piles: vec![Vec::new(); 3],
+            starting_seat: 0,
+            active_seat: 0,
+            cursor: 0,
+            inspected: vec![0; 3],
+            decisions: 0,
+        });
+        let winston_json = serde_json::to_value(&winston).unwrap();
+        assert!(winston_json.get("shared_stack").is_some());
+        let back: DraftSession =
+            serde_json::from_str(&serde_json::to_string(&winston).unwrap()).unwrap();
+        assert_eq!(back.shared_stack, winston.shared_stack);
     }
 
     #[test]
