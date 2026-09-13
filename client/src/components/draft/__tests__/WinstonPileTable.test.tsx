@@ -72,8 +72,11 @@ function pile(
   };
 }
 
-/** The active seat's own projection: `active_pile` is published, so this is the
- *  viewer whose turn it is. */
+/** The live turn as the engine publishes it. Every field here is PUBLIC —
+ *  including `active_pile`, which every viewer receives — so the same object
+ *  serves the active seat and an onlooker; what distinguishes them is the
+ *  `viewerSeat` the table is rendered with, plus the `revealed` prefixes, which
+ *  are the one viewer-scoped thing. `active_seat` is 0 (Alice). */
 function activeTurn(piles: SharedStackPileView[], activePile: number): SharedStackView {
   return {
     main_stack_remaining: 17,
@@ -87,13 +90,20 @@ function activeTurn(piles: SharedStackPileView[], activePile: number): SharedSta
 
 function renderTable(
   sharedStack: SharedStackView,
-  overrides: { onDecide?: (pile: number, decision: string) => void; interactionLocked?: boolean; playFirstChooser?: number | null } = {},
+  overrides: {
+    onDecide?: (pile: number, decision: string) => void;
+    interactionLocked?: boolean;
+    playFirstChooser?: number | null;
+    /** Defaults to seat 0, which `activeTurn` makes the ACTIVE seat. */
+    viewerSeat?: number | null;
+  } = {},
 ) {
   const onDecide = overrides.onDecide ?? vi.fn();
   const rendered = render(
     <WinstonPileTable
       sharedStack={sharedStack}
       seats={seats}
+      viewerSeat={overrides.viewerSeat === undefined ? 0 : overrides.viewerSeat}
       playFirstChooser={overrides.playFirstChooser ?? null}
       interactionLocked={overrides.interactionLocked ?? false}
       onDecide={onDecide}
@@ -184,31 +194,78 @@ describe("WinstonPileTable", () => {
     expect(onDecide).toHaveBeenCalledWith(1, "Decline");
   });
 
-  it("shows nothing face up for a seat whose turn it is not", () => {
-    // Exactly what `filter_for_player` publishes to the non-active seat: every
-    // `revealed` empty and `active_pile` null. The counts stay public.
+  it("shows nothing face up and offers no control to a seat whose turn it is not", () => {
+    // Exactly what `filter_for_player` publishes to the NON-ACTIVE seat, and the
+    // discriminating detail is what it does NOT withhold: every `revealed` is
+    // empty, but the counts AND `active_pile` are published in full, identical
+    // to the active seat's own projection. The onlooker is seat 1; `active_seat`
+    // is 0. A `null` cursor here would be fiction — the engine publishes it.
     const spectatingSeat: SharedStackView = {
       main_stack_remaining: 17,
       total_cards: 23,
       active_seat: 0,
-      active_pile: null,
+      active_pile: 1,
       piles: [pile(0, 3, [], null, null), pile(1, 1, [], null, null), pile(2, 4, [], null, null)],
       decisions: 4,
     };
-    renderTable(spectatingSeat);
+    renderTable(spectatingSeat, { viewerSeat: 1 });
 
     // Reach guard: the table rendered, and rendered the public counts.
     expect(screen.getByText("17 cards face down in the main stack")).toBeInTheDocument();
     expect(screen.getByText("23 cards left in the draft")).toBeInTheDocument();
-    // Whose turn it is comes from `active_seat`, resolved against the seat list.
+    // Whose turn it is comes from `active_seat` compared against `viewerSeat`,
+    // NOT from `active_pile` — which is non-null here precisely so that a
+    // regression to `active_pile !== null` reds this line.
     expect(screen.getByText("Alice is deciding")).toBeInTheDocument();
     expect(screen.getByText("The piles stay face down until it is your turn.")).toBeInTheDocument();
 
-    // Nothing face up, and no control — even though every published verdict on
-    // this view says the decision is legal for the ACTIVE seat.
+    // The cursor IS rendered to the onlooker: which pile is being handled is
+    // open information at a physical table. This is the positive half — without
+    // it, the "no controls" assertion below could pass on a table that simply
+    // failed to identify the cursor at all.
+    expect(document.querySelector("[data-winston-pile-active='true']"))
+      .toBe(document.querySelector('[data-winston-pile="1"]'));
+
+    // And the secret half: nothing face up, and no control — even though every
+    // published verdict on this view says the decision is legal FOR THE ACTIVE
+    // SEAT, and even though this viewer can see which pile that seat is on.
     expect(document.querySelectorAll("[data-winston-revealed-card]")).toHaveLength(0);
     expect(document.querySelectorAll("[data-winston-decision]")).toHaveLength(0);
-    expect(document.querySelector("[data-winston-pile-active='true']")).toBeNull();
+  });
+
+  /**
+   * The paired positive for the test above, differing ONLY in `viewerSeat`: the
+   * SAME published projection, rendered for the active seat, does offer the
+   * controls. That is what proves the suppression above is a seat comparison
+   * and not a table that never renders controls at all.
+   */
+  it("offers the cursor pile's controls to the seat whose turn it is", () => {
+    const sameProjection: SharedStackView = {
+      main_stack_remaining: 17,
+      total_cards: 23,
+      active_seat: 0,
+      active_pile: 1,
+      piles: [pile(0, 3, [], null, null), pile(1, 1, [], null, null), pile(2, 4, [], null, null)],
+      decisions: 4,
+    };
+    renderTable(sameProjection, { viewerSeat: 0 });
+
+    expect(screen.getByText("Your turn — pile 2")).toBeInTheDocument();
+    expect(document.querySelectorAll("[data-winston-decision]")).toHaveLength(2);
+    expect(decisionButton(1, "Take")).toBeEnabled();
+  });
+
+  /**
+   * A viewer with no assigned seat is NOT the active seat. `null` must fall to
+   * the no-controls side rather than comparing equal to anything.
+   */
+  it("offers no control to a viewer with no assigned seat", () => {
+    renderTable(activeTurn([pile(0, 3, [card("c1", "Ponder")], null, null)], 0), {
+      viewerSeat: null,
+    });
+
+    expect(document.querySelectorAll("[data-winston-decision]")).toHaveLength(0);
+    expect(screen.getByText("Alice is deciding")).toBeInTheDocument();
   });
 
   it("renders the revealed prefix verbatim and the rest as a count", () => {

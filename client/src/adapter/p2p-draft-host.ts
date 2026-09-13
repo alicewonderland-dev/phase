@@ -12,7 +12,7 @@
 import type Peer from "peerjs";
 import type { DataConnection } from "peerjs";
 
-import { DraftAdapter, EMPTY_DRAFT_POOL_GROUPS } from "./draft-adapter";
+import { DraftAdapter, EMPTY_DRAFT_POOL_GROUPS, isSharedStackDistribution } from "./draft-adapter";
 import type { DraftCardInstance, DraftPlayerView, MultiplayerSeatDescriptor, PairingView, PoolInput, SeatPublicView, SharedStackPileDecision } from "./draft-adapter";
 import type { DraftKind, DraftProcedure, PodPolicy, TournamentFormat } from "./draft-adapter";
 import {
@@ -1137,14 +1137,22 @@ export class P2PDraftHost {
     const seed = hostDraftSeed();
     this.draftSeed = seed;
     const draftCode = `draft-${seed.toString(16).padStart(8, "0")}`;
-    // A kind whose procedure seats humans in EVERY seat admits no bot fill:
-    // the reducer refuses a bot seat outright, so filling here would turn a
-    // short pod into a guaranteed `createMultiplayerDraft` error instead of a
-    // pod that starts short. The engine refusal remains the authority — this
-    // only avoids walking into it. Read from the procedure, never from `kind`.
+    // A SHARED-STACK kind admits no bot fill: the reducer refuses a bot seat
+    // outright, so filling here would turn a short pod into a guaranteed
+    // `createMultiplayerDraft` error instead of a pod that starts short. The
+    // engine refusal remains the authority — this only avoids walking into it.
+    //
+    // Dispatched on the DISTRIBUTION, because that is the property the engine
+    // actually refuses on: `apply_start_draft`'s pre-flight arm and
+    // `apply_replace_seat_with_bot` both `match ... PackDistribution::
+    // SharedStackPiles`. The earlier `human_seats !== pod_size` test was a
+    // scalar that merely correlates, and it correlates WRONGLY: the procedure
+    // table seats humans in every seat for Premier, Traditional and Sealed too
+    // (`human_seats == pod_size == 8`), so it suppressed bot fill for three
+    // kinds that permit it. Read from the procedure, never from `kind`.
     const procedure = this.procedure
       ?? await this.adapter.draftProcedure(this.kind, this.tournamentFormat);
-    const botFillAllowed = botFillEmptySeats && procedure.human_seats !== procedure.pod_size;
+    const botFillAllowed = botFillEmptySeats && !isSharedStackDistribution(procedure.distribution);
     const seats: MultiplayerSeatDescriptor[] = [];
     for (let i = 0; i < this.podSize; i++) {
       const displayName = this.seatNames.get(i);
@@ -1417,6 +1425,26 @@ export class P2PDraftHost {
       if (hostView.status === "Deckbuilding") {
         this.clearActiveTimer();
         this.emit({ type: "draftComplete" });
+      } else if (hostView.status === "Drafting") {
+        // RE-ARM, on every applied decision. This is `applyPick`'s
+        // round-boundary restart, relocated to the boundary this distribution
+        // actually has: there is no round here, and every applied decision
+        // either passes the turn or advances the cursor, so each one opens a
+        // fresh decision window. Without this the clock ran exactly once per
+        // draft — it expired into a sweep that could not act and never started
+        // again, leaving a stalled Winston seat with no recovery at all, while
+        // `ReplaceSeatWithBot` is (correctly) refused for this distribution.
+        //
+        // `pick_number` is the same axis `applyPick` passes. It does not
+        // advance under `SharedStackPiles` — no reducer path moves it — so
+        // every Winston decision gets `PICK_TIMER_DURATIONS_MS[0]`. That is
+        // deliberate and is not the escalating pack-pick curve: a Winston turn
+        // is one take-or-decline rather than a pick out of a shrinking pack,
+        // so there is no shrinking window to model. Escalating on
+        // `stack.decisions` instead would bottom out at the 15s floor within
+        // the first dozen decisions of a ~90-decision draft, which would be
+        // inventing a timing policy rather than reusing one.
+        this.startPickTimer(hostView.pick_number);
       }
       return hostView;
     } catch (err) {
@@ -2010,6 +2038,18 @@ export class P2PDraftHost {
   }
 
   private async autoPickAllPending(): Promise<void> {
+    // THE DISPATCH SITS ABOVE the `current_pack` loop below, which is this
+    // function's own dominating conjunct: a shared-stack session leaves
+    // `current_pack` null for EVERY seat, so an arm placed below it would be
+    // dead code and the sweep would silently do nothing. Exactly the placement
+    // and exactly the reason `server-core`'s `pick_random_for_seat` states for
+    // its own `SharedStackPiles` arm; this path is the P2P half of the same
+    // answer, which previously existed only server-side.
+    if (this.procedure !== null && isSharedStackDistribution(this.procedure.distribution)) {
+      await this.autoDecideSharedStackTurn();
+      return;
+    }
+
     // For each seat that still has a current_pack (hasn't picked), auto-pick
     // a random card (D-02). Skip seats already in `picksThisRound` — they've
     // already submitted this round and the engine would reject the duplicate
@@ -2046,6 +2086,53 @@ export class P2PDraftHost {
       if (!allPicked) {
         await this.broadcastViews();
       }
+    }
+  }
+
+  /**
+   * Drive the ACTIVE shared-stack seat's turn with the move the engine itself
+   * calls always-legal, when the pick clock expires on it.
+   *
+   * A FORCED DECISION IS NOT AN AI OPPONENT. Nothing here evaluates a pile or
+   * prefers an outcome: it reads the engine's published `legality` vector and
+   * takes the first entry the engine marked legal. That vector is built from
+   * `SharedStackPileDecision::ALL` in declaration order and answered by
+   * `shared_stack::refusal_for` — the SAME authority, in the SAME order, that
+   * `shared_stack::forced_decision` folds — so this reproduces the engine's
+   * forced move by reading it rather than by re-deriving it. It is the
+   * shared-stack counterpart of the random pick the pick-and-pass sweep submits
+   * for a timed-out seat, and it mirrors `pick_random_for_seat`'s arm.
+   *
+   * Seat 0's view suffices for every field read here: `active_seat`,
+   * `active_pile` and `legality` are all published identically to every viewer
+   * (`legality` is asked for the active seat by construction, and the cursor is
+   * public). Only `revealed` is viewer-scoped, and nothing here reads it —
+   * which is the point, since reading the faces is what would make this an AI.
+   *
+   * `undefined` from the `find` is left as a no-op rather than a thrown error:
+   * the engine's own invariant is that some decision is always legal for the
+   * active seat while drafting, so an empty result means the session is no
+   * longer in that state and forcing anything would be the wrong answer.
+   */
+  private async autoDecideSharedStackTurn(): Promise<void> {
+    try {
+      const hostView = await this.adapter.getViewForSeat(0);
+      if (hostView.status !== "Drafting") return;
+      const stack = hostView.shared_stack;
+      if (!stack) return;
+      // Addressed BY `index`, not by position in `piles`, for the same reason
+      // `verdictFor` looks a decision up by name: the cursor is an address.
+      const cursorPile = stack.piles.find((pile) => pile.index === stack.active_pile);
+      if (cursorPile === undefined) return;
+      const forced = cursorPile.legality.find((entry) => entry.refusal === null)?.decision;
+      if (forced === undefined) return;
+      // Goes through the ordinary decision path, so the timeout-driven turn is
+      // persisted, acknowledged, broadcast and RE-ARMED by exactly the code a
+      // player-driven one is. A second, quieter path here is how the two would
+      // drift.
+      await this.handleSharedStackDecision(stack.active_seat, stack.active_pile, forced);
+    } catch (err) {
+      console.error("[P2PDraftHost] shared-stack forced decision failed:", err);
     }
   }
 

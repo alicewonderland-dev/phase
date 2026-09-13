@@ -19,6 +19,7 @@
 import { useCallback } from "react";
 import { useTranslation } from "react-i18next";
 
+import { isSharedStackDistribution } from "../../adapter/draft-adapter";
 import type { SeatPublicView } from "../../adapter/draft-adapter";
 import { menuButtonClass } from "../menu/buttonStyles";
 import { DRAFT_OFFLINE_ERROR, useMultiplayerDraftStore } from "../../stores/multiplayerDraftStore";
@@ -34,7 +35,14 @@ interface SeatCardProps {
   seat: SeatPublicView;
   isHost: boolean;
   isLocalSeat: boolean;
-  botFillEnabled: boolean;
+  /**
+   * Will an empty seat actually receive a bot? NOT the host's checkbox: under
+   * `PackDistribution::SharedStackPiles` the reducer refuses a bot seat, so
+   * bot fill is enabled and seats nobody. Labelling an empty Winston seat "Bot"
+   * on the strength of the checkbox promises a player that never arrives — and
+   * is the same proxy-for-an-engine-refusal mistake the Start gate had.
+   */
+  botFillWillSeatBots: boolean;
   canKick: boolean;
   onKick: () => void;
 }
@@ -43,14 +51,14 @@ function SeatCard({
   seat,
   isHost,
   isLocalSeat,
-  botFillEnabled,
+  botFillWillSeatBots,
   canKick,
   onKick,
 }: SeatCardProps) {
   const { t } = useTranslation("draft");
   const isEmpty = !seat.display_name;
   const seatLabel = isEmpty
-    ? botFillEnabled
+    ? botFillWillSeatBots
       ? t("lobby.botSeat")
       : t("lobby.waitingSeat")
     : seat.display_name;
@@ -87,7 +95,7 @@ function SeatCard({
           className={`h-2 w-2 rounded-full ${
             seat.connected
               ? "bg-emerald-400"
-              : isEmpty && botFillEnabled
+              : isEmpty && botFillWillSeatBots
                 ? "bg-blue-400/60"
                 : isEmpty
                   ? "bg-white/20"
@@ -151,6 +159,7 @@ export function DraftPodLobby({ onLeave }: DraftPodLobbyProps) {
   const poolMode = useDraftPodStore((s) => s.poolMode);
   const cubeForm = useDraftPodStore((s) => s.cubeForm);
   const allowedPodSizes = useDraftPodStore((s) => s.allowedPodSizes);
+  const packDistribution = useDraftPodStore((s) => s.packDistribution);
 
   // `lobby.draftKind` interpolates the kind into a sentence, so a raw enum reads
   // "CommanderDraft Draft" once Commander is selectable. `draftKindLabels` is the
@@ -166,6 +175,24 @@ export function DraftPodLobby({ onLeave }: DraftPodLobbyProps) {
 
   const isHost = role === "host";
   const filledSeats = seats.filter((s) => s.display_name).length;
+  // Bot fill only stands in for a legal seat count where bot seats are legal at
+  // all. Under `PackDistribution::SharedStackPiles` the reducer refuses a bot
+  // seat outright, so the host's checkbox pads NOTHING and the pod starts at
+  // whatever the humans filled — the same property `startDraftInner` suppresses
+  // bot fill on, asked here so the two cannot answer differently.
+  //
+  // Without this, a lone host in a Winston pod got an ENABLED Start button (the
+  // store defaults `botFillEnabled` to `true`), and `createMultiplayerDraft`
+  // then failed the `min_pod_size` floor. `botFillEnabled` alone is the same
+  // shape of defect the bot-fill guard itself had: a client-side proxy for an
+  // engine refusal that stops tracking it for one kind.
+  //
+  // `null` distribution — the procedure has not loaded — falls to the
+  // conservative side: no padding is assumed, so the seat-count test decides.
+  const botFillPadsThePod =
+    botFillEnabled
+    && packDistribution !== null
+    && !isSharedStackDistribution(packDistribution);
   // The engine publishes the exact legal seat counts for this procedure and
   // tournament format. No client-side floor or fallback: `null` disables the
   // button until the engine answers, while bot fill remains an explicit path
@@ -173,7 +200,7 @@ export function DraftPodLobby({ onLeave }: DraftPodLobbyProps) {
   const canStart =
     !effectiveOffline
     && isHost
-    && (botFillEnabled || (allowedPodSizes?.includes(filledSeats) ?? false));
+    && (botFillPadsThePod || (allowedPodSizes?.includes(filledSeats) ?? false));
   const errorMessage = error === DRAFT_OFFLINE_ERROR ? t("offline.startUnavailable") : error;
 
   // Build a full 8-seat grid (pad with empty seats if the adapter
@@ -254,7 +281,7 @@ export function DraftPodLobby({ onLeave }: DraftPodLobbyProps) {
             seat={seat}
             isHost={isHost}
             isLocalSeat={seat.seat_index === seatIndex}
-            botFillEnabled={botFillEnabled}
+            botFillWillSeatBots={botFillPadsThePod}
             canKick={isHost && seat.seat_index !== 0}
             onKick={() => kickPlayer(seat.seat_index)}
           />

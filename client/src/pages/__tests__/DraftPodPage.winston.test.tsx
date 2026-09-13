@@ -75,6 +75,13 @@ const store = vi.hoisted(() => {
   const state = {
     role: "host",
     phase: "drafting",
+    // THIS viewer's seat, and it matches `sharedStack.active_seat` (0), so the
+    // fixture is the active seat's own screen. Required explicitly rather than
+    // implied by `role: "host"`: `active_pile` is published to EVERY viewer, so
+    // the page identifies whose turn it is by comparing `active_seat` against
+    // the seat the transport assigned — not by the cursor being non-null. Set
+    // this to 1 and every control below correctly disappears.
+    seatIndex: 0,
     view,
     packCards,
     workspaceState: { schemaVersion: 1, placements: {}, virtualBasics: [] },

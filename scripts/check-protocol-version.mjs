@@ -96,6 +96,10 @@ const draftProtocolTestSource = readFileSync(
   resolve(root, "client/src/network/__tests__/draftProtocol.test.ts"),
   "utf8",
 );
+const draftCoreTypesSource = readFileSync(
+  resolve(root, "crates/draft-core/src/types.rs"),
+  "utf8",
+);
 const p2pAdapterTestSource = readFileSync(
   resolve(root, "client/src/adapter/__tests__/p2p-adapter-multiplayer.test.ts"),
   "utf8",
@@ -263,6 +267,55 @@ if (draftProtocolVersion !== EXPECTED_DRAFT_PROTOCOL_VERSION) {
       `A new draft message type or player-view field must bump this number, and the test that pins it moves in the same commit.`,
   );
   process.exit(1);
+}
+
+
+// ── Draft payload BOUNDS: a sixth surface, and a different kind of number ──
+//
+// `draftProtocol.ts` mirrors three engine constants that bound what a draft
+// message may STATE, so the transport can refuse an over-long payload without a
+// session. Each carried a `@sync-with` comment and nothing that reads it, and
+// the pile bound additionally CLAIMED to be "pinned by this module's test
+// against the engine constant's published figure" — which it was not: that test
+// asserts pile 3 rejected and pile 2 accepted, which pins the constant against
+// itself and passes for any value the two sides happen to share.
+//
+// The dangerous direction is the silent one. Each Rust constant is DERIVED and
+// already pinned on its own side (`max_shared_stack_piles_matches_procedure_table`
+// folds `DraftKind::ALL`), so a future 4-pile procedure row moves the Rust value
+// and every Rust test stays green, while the unmoved TypeScript mirror rejects
+// legal pile-3 decisions at the transport — a rules-correct engine reachable
+// only by a message the client refuses to send. Comparing the two literals is
+// the only thing that reds on that edit, and this is the script that already
+// reads Rust constants for exactly this purpose.
+const DRAFT_PAYLOAD_BOUNDS = [
+  "MAX_CARDS_PER_PICK",
+  "MAX_COMMANDER_DESIGNATIONS",
+  "MAX_SHARED_STACK_PILES",
+];
+
+for (const name of DRAFT_PAYLOAD_BOUNDS) {
+  // Both sides require a bare integer right-hand side, for the same reason the
+  // version regexes do: re-deriving either mirror from the other would defeat
+  // the comparison, and an expression trips "Could not find" instead.
+  const rustBound = extractVersion(
+    draftCoreTypesSource,
+    new RegExp(`pub\\s+const\\s+${name}\\s*:\\s*usize\\s*=\\s*(\\d+)\\s*;`),
+    `crates/draft-core/src/types.rs ${name}`,
+  );
+  const clientBound = extractVersion(
+    draftProtocolSource,
+    new RegExp(`const\\s+${name}\\s*=\\s*(\\d+)\\s*;`),
+    `client/src/network/draftProtocol.ts ${name}`,
+  );
+  if (rustBound !== clientBound) {
+    console.error(
+      `Draft payload bound mismatch for ${name}: Rust=${rustBound}, client=${clientBound}. ` +
+        "The engine constant is derived from the procedure table; the transport mirror must move with it, " +
+        "or the client will refuse payloads the reducer accepts.",
+    );
+    process.exit(1);
+  }
 }
 
 // ── Lobby protocol: a SEPARATE surface with its own version ────────────────

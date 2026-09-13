@@ -633,7 +633,6 @@
     "pileTotal_other": "{{count, number}} karty",
     "pileFaceDown": "Zakryte",
     "deciding": "Decyzja o tej kupce",
-    "revealedNone": "Nie zajrzałeś jeszcze do tej kupki",
     "hiddenPiles": "Kupki pozostają zakryte do twojej kolei.",
     "take": "Weź",
     "takeAria": "Weź kupkę {{index}}",

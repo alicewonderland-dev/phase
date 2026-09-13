@@ -240,6 +240,29 @@ export type PackDistribution =
   | "PickAndPass"
   | "AllAtOnce"
   | { SharedStackPiles: { pile_count: number } };
+
+/**
+ * Is this the shared-stack distribution, and if so what is its pile count?
+ *
+ * THE single client-side spelling of that question. The engine refuses a bot
+ * seat by matching `PackDistribution::SharedStackPiles` — `apply_start_draft`'s
+ * pre-flight arm and `apply_replace_seat_with_bot` both dispatch on exactly
+ * that, and `apply_start_draft` says so in place: "the procedure's
+ * `human_seats` scalar is necessary but not sufficient: it is a per-kind
+ * constant that stops matching the seat count the moment a 4-seat pod is
+ * created." So a client guard that wants to avoid walking into that refusal
+ * must ask the same property, never a scalar that merely correlates with it.
+ *
+ * A narrowing predicate rather than a `boolean`, so a caller that needs
+ * `pile_count` gets it from the same test instead of re-destructuring the
+ * union and re-deciding what counts as a shared stack.
+ */
+export function isSharedStackDistribution(
+  distribution: PackDistribution,
+): distribution is { SharedStackPiles: { pile_count: number } } {
+  return typeof distribution === "object" && "SharedStackPiles" in distribution;
+}
+
 /** Engine-authorized game launch for a completed draft procedure. */
 export type DraftLaunchCapability = "None" | "CommanderMultiplayer";
 
@@ -413,18 +436,26 @@ export interface SharedStackPileView {
 /**
  * The live state of a `SharedStackPiles` turn, projected for ONE viewer.
  *
- * Counts are public (a player can count every pile across a physical table);
- * `revealed` and `active_pile` are gated to the active seat by the engine. The
- * order of the main stack is published to nobody, which is why this type
- * carries a remaining COUNT and has no representation for a main-stack card.
+ * Counts are public (a player can count every pile across a physical table),
+ * and so is `active_pile`: at a physical table an opponent watches which pile
+ * you are handling, and the engine's `legality` vector reveals the cursor
+ * anyway (every non-cursor pile answers `PileNotActive`). `revealed` is the ONE
+ * viewer-scoped field — the pile's CONTENTS are the secret. The order of the
+ * main stack is published to nobody, which is why this type carries a remaining
+ * COUNT and has no representation for a main-stack card.
  */
 // @sync-with: crates/draft-core/src/view.rs
 export interface SharedStackView {
   main_stack_remaining: number;
   total_cards: number;
   active_seat: number;
-  /** The pile the active seat is deciding on; `null` for every other viewer. */
-  active_pile: number | null;
+  /**
+   * The pile the active seat is deciding on. Public, and non-nullable: a live
+   * pile turn always has a cursor, and a session with no live turn publishes no
+   * `shared_stack` at all. NEVER read this as "is it my turn" — compare
+   * `active_seat` against the viewer's own seat for that.
+   */
+  active_pile: number;
   piles: SharedStackPileView[];
   /**
    * Applied decisions since `StartDraft` — a monotone change detector and
@@ -473,7 +504,9 @@ export interface SpectatorDraftView {
   pools?: DraftCardInstance[][];
   current_packs?: (DraftCardInstance[] | null)[];
   /**
-   * The live shared-stack turn, counts-only for a spectator.
+   * The live shared-stack turn, with no pile CONTENTS for a spectator. The
+   * counts and `active_pile` are published to spectators in both
+   * visibilities, exactly as to players; only `revealed` is withheld.
    *
    * OPTIONAL because the Rust field is
    * `#[serde(default, skip_serializing_if = "Option::is_none")]`: it is
@@ -867,9 +900,9 @@ export class DraftEngineOperationLease {
    * to the next pile. Nothing here decides legality.
    *
    * Returns the filtered view for THAT seat, the same contract
-   * `submit_pick_for_seat` has — not the host view. `revealed` and
-   * `active_pile` are viewer-scoped, so acknowledging a guest with seat 0's
-   * projection would hand it somebody else's turn.
+   * `submit_pick_for_seat` has — not the host view. `revealed` prefixes are
+   * viewer-scoped, so acknowledging a guest with seat 0's projection would hand
+   * it somebody else's turn.
    */
   submitSharedStackDecisionForSeat(
     seat: number,

@@ -356,9 +356,22 @@ pub fn filter_pool_listing(listing: &[DraftCardInstance], filter: &PoolFilter) -
 /// can count every pile and the main stack across the table, and withholding
 /// those counts would make the endgame adjudication (a final-pile decline needs
 /// two main-stack cards) unverifiable by the very player it constrains. So
-/// every count here is published to every viewer, and the only viewer-scoped
-/// fields are [`SharedStackPileView::revealed`] and
-/// [`SharedStackView::active_pile`].
+/// every count here is published to every viewer, and the ONE viewer-scoped
+/// field is [`SharedStackPileView::revealed`].
+///
+/// **WHICH pile is being decided on is public, and that is deliberate.** At a
+/// physical table an opponent watches you pick pile 1 up, put it back, and move
+/// to pile 2; the cursor is in the open and only the pile's CONTENTS are
+/// hidden. [`SharedStackView::active_pile`] is therefore published to every
+/// viewer, exactly as [`SharedStackView::active_seat`] is. It also could not be
+/// withheld even if the rules wanted it to be: `legality` is asked of
+/// `refusal_for` for the ACTIVE seat, whose first guard answers
+/// [`SharedStackRefusal::PileNotActive`] for every non-cursor pile. The cursor
+/// is therefore the unique pile whose two entries are not both
+/// `PileNotActive`, and a gated `active_pile` would be recoverable from the
+/// published vector in one line. A secret that the same projection hands back
+/// is not a secret; the honest projection is the one that matches the physical
+/// game.
 ///
 /// **The order of the main stack is published to NOBODY.** It is the
 /// `rng_seed`'s secret and publishing it would make every pile predictable —
@@ -375,11 +388,17 @@ pub struct SharedStackView {
     /// The seat whose decision the reducer will accept. Whose turn it is, is
     /// public at a physical table.
     pub active_seat: u8,
-    /// The pile the active seat is deciding on, and `None` for every OTHER
-    /// viewer — not merely `None` for a spectator. Which pile a seat is
-    /// currently looking at is part of what that seat knows and nobody else
-    /// does, so it is gated with `revealed` and not published with the counts.
-    pub active_pile: Option<u8>,
+    /// The pile the active seat is deciding on. PUBLIC — published to every
+    /// viewer, including both spectator visibilities, for the two reasons the
+    /// type doc gives: the cursor is open information at a physical table, and
+    /// the published `legality` vector reveals it anyway.
+    ///
+    /// Not an `Option`, so it cannot be re-gated by accident: a live pile turn
+    /// always has a cursor, and a session with no live turn publishes no
+    /// `SharedStackView` at all (see `shared_stack_view_for`). A display
+    /// layer must NOT read this as "is it my turn" — compare `active_seat`
+    /// against the viewer's own seat for that.
+    pub active_pile: u8,
     /// The piles, index 0 leftmost, always the distribution's `pile_count`
     /// entries.
     pub piles: Vec<SharedStackPileView>,
@@ -426,7 +445,11 @@ pub struct SharedStackPileView {
     /// not an oversight: `PileEmpty` and `NoGuaranteedCard` are both already
     /// derivable from the public counts this same view publishes, so publishing
     /// the verdict to a non-active seat leaks nothing new, while `PileNotActive`
-    /// is a statement about whose turn it is, which is public at a table.
+    /// discloses exactly one thing — WHICH pile is the cursor, since every
+    /// non-cursor pile answers it and the cursor pile does not. That is public
+    /// information, published in its own right as
+    /// [`SharedStackView::active_pile`], so this vector and that field agree
+    /// rather than one silently undoing the other.
     pub legality: Vec<SharedStackDecisionView>,
 }
 
@@ -830,7 +853,10 @@ pub struct SpectatorDraftView {
     pub pools: Option<Vec<Vec<DraftCardInstance>>>,
     /// Populated only in `Omniscient` mode. Each entry is a seat's current pack.
     pub current_packs: Option<Vec<Option<Vec<DraftCardInstance>>>>,
-    /// The live shared-stack turn, COUNTS ONLY, in BOTH visibilities. See
+    /// The live shared-stack turn with NO PILE CONTENTS, in BOTH visibilities.
+    /// The counts and the cursor ([`SharedStackView::active_pile`]) are
+    /// published here as they are to every viewer — both are open information
+    /// at a physical table. What is withheld is `revealed`, and only that. See
     /// [`DraftPlayerView::shared_stack`] for the status gate, which is the
     /// same here.
     ///
@@ -856,11 +882,16 @@ pub struct SpectatorDraftView {
 /// The ONE shared-stack projection, used by every builder and every viewer.
 ///
 /// `viewer_seat` is `Some(seat)` for a player view and `None` for a spectator
-/// view, and that is what makes the spectator's counts-only projection
+/// view, and that is what makes the spectator's contents-free projection
 /// STRUCTURAL: the reveal test below is `viewer_seat == Some(active_seat)`, and
 /// `None` can never satisfy it, so there is no second builder to drift and no
 /// `Omniscient` arm that could one day be taught to reveal (see
 /// [`SpectatorDraftView::shared_stack`] for why it must not be).
+///
+/// That gate now guards `revealed` and nothing else. `active_pile` is public
+/// (see [`SharedStackView::active_pile`]), so `is_active_viewer` has exactly
+/// one consumer below — which is what keeps the secret and the projection in
+/// agreement rather than merely adjacent.
 ///
 /// Legality is READ from `shared_stack::refusal_for`, the single authority the
 /// reducer enforces, and asked for the ACTIVE seat so the vector is identical
@@ -914,7 +945,8 @@ fn shared_stack_view(state: &SharedStackState, viewer_seat: Option<u8>) -> Share
         main_stack_remaining: state.main_stack.len(),
         total_cards: state.main_stack.len() + piles.iter().map(|pile| pile.total).sum::<usize>(),
         active_seat: state.active_seat,
-        active_pile: is_active_viewer.then_some(state.cursor),
+        // Unconditional: the cursor is public. See the field doc.
+        active_pile: state.cursor,
         piles,
         decisions: state.decisions,
     }
@@ -3832,15 +3864,22 @@ mod tests {
         }
     }
 
-    /// VM row V8 — leak direction 1: a NON-ACTIVE seat learns nothing.
+    /// VM row V8 — leak direction 1: a NON-ACTIVE seat learns no pile CONTENTS.
+    ///
+    /// Not "learns nothing": the counts and the cursor are public, and the
+    /// assertions below pin them as EQUAL to the active seat's own values.
     ///
     /// Asserted MID-TURN, after one decline, which is also what makes this a
     /// regression test for the `inspected` cursor-advance write: with that
     /// write missing the paired positive below (the active seat's own two
     /// revealed piles) collapses to one.
     ///
-    /// Revert the viewer gate — publish `revealed`/`active_pile`
-    /// unconditionally — and the onlooker's assertions red.
+    /// Revert the viewer gate — publish `revealed` unconditionally — and the
+    /// onlooker's `revealed` assertions red. `revealed` is the WHOLE of what
+    /// this test pins, because it is the whole of what is secret: `active_pile`
+    /// is public by design and is asserted EQUAL across the two viewers below,
+    /// which is the positive form of that decision rather than the absence of
+    /// an assertion.
     #[test]
     fn non_active_seat_sees_no_pile_cards() {
         let mut session = started_winston(2, 4);
@@ -3863,7 +3902,7 @@ mod tests {
         let active_view = filter_for_player(&session, active)
             .shared_stack
             .expect("a live pile turn publishes its stack");
-        assert_eq!(active_view.active_pile, Some(1));
+        assert_eq!(active_view.active_pile, 1);
         let revealed_piles = active_view
             .piles
             .iter()
@@ -3877,9 +3916,14 @@ mod tests {
         let onlooker_view = filter_for_player(&session, onlooker)
             .shared_stack
             .expect("the counts are public at a physical table");
+        // PUBLIC, and asserted as such: at a physical table the onlooker watches
+        // which pile is being handled. Equal to the active seat's own value —
+        // not merely present — so a future re-gating that published a
+        // placeholder would red here too. The pile's CONTENTS are the secret,
+        // and that is the loop immediately below.
         assert_eq!(
-            onlooker_view.active_pile, None,
-            "which pile the active seat is looking at is not published to anyone else"
+            onlooker_view.active_pile, active_view.active_pile,
+            "which pile is being decided on is open information at the table"
         );
         for pile in &onlooker_view.piles {
             assert!(
@@ -4004,9 +4048,13 @@ mod tests {
                 .shared_stack
                 .as_ref()
                 .expect("the counts are public in both visibilities");
+            // The CURSOR is public in both visibilities, like `active_seat`:
+            // a spectator at the table sees which pile is being handled. What
+            // no spectator gets is the pile's CONTENTS, asserted next.
             assert_eq!(
-                stack.active_pile, None,
-                "{visibility:?}: no spectator learns which pile is being inspected"
+                stack.active_pile,
+                stack_of(&session).cursor,
+                "{visibility:?}: the cursor is public, exactly as the counts are"
             );
             for pile in &stack.piles {
                 assert!(

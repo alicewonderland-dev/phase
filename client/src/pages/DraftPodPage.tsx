@@ -903,6 +903,10 @@ function DraftingPhaseContent({
   const selectCard = useMultiplayerDraftStore((s) => s.selectCard);
   const paused = useMultiplayerDraftStore((s) => s.paused);
   const pauseReason = useMultiplayerDraftStore((s) => s.pauseReason);
+  // THIS viewer's seat, for the shared-stack table's "is it my turn" test. The
+  // engine publishes `active_seat` but no viewer identity, and `active_pile` is
+  // public, so the comparison needs the seat the transport assigned us.
+  const seatIndex = useMultiplayerDraftStore((s) => s.seatIndex);
   const phoneToolbarPinned = phoneLayout && !mobileWorkspaceOpen;
   const handlePreferencesChange = useCallback((next: DraftWorkspacePreferences) => {
     if (useMultiplayerDraftStore.getState().pickInteractionLocked) return;
@@ -1089,6 +1093,7 @@ function DraftingPhaseContent({
             <WinstonPileTable
               sharedStack={sharedStack}
               seats={view.seats}
+              viewerSeat={seatIndex}
               playFirstChooser={view.play_first_chooser}
               interactionLocked={interactionLocked}
               onDecide={handleSharedStackDecision}

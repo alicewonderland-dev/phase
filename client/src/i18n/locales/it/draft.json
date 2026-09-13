@@ -633,7 +633,6 @@
     "pileTotal_other": "{{count, number}} carte",
     "pileFaceDown": "Coperto",
     "deciding": "Decisione su questo mucchio",
-    "revealedNone": "Non hai ancora guardato questo mucchio",
     "hiddenPiles": "I mucchi restano coperti finché non tocca a te.",
     "take": "Prendi",
     "takeAria": "Prendi il mucchio {{index}}",

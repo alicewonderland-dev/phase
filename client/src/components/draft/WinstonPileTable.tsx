@@ -11,10 +11,13 @@
  *     SECOND authority for a question the reducer already answers — and the two
  *     could then disagree, which is the one failure mode the published vector
  *     exists to make impossible;
- *   * whose turn it is comes from `active_seat`;
- *   * WHICH pile this seat is deciding on comes from `active_pile`, which the
- *     engine publishes only to the active seat, so `active_pile === null` IS the
- *     "not your turn" state and needs no seat comparison here;
+ *   * whose turn it is comes from `active_seat`, compared against this viewer's
+ *     own seat. `active_pile` is NOT that answer: the engine publishes the
+ *     cursor to every viewer (it is open information at a physical table, and
+ *     the `legality` vector discloses it regardless), so a non-null
+ *     `active_pile` says nothing about whose turn it is;
+ *   * WHICH pile is being decided on comes from `active_pile`, and is rendered
+ *     for every viewer — an onlooker sees the highlight but gets no controls;
  *   * what may be shown face up comes from `pile.revealed`, rendered verbatim. A
  *     pile whose `revealed` is shorter than its `total` is showing precisely what
  *     this seat is entitled to see this turn: the prefix it has looked at. The
@@ -45,6 +48,12 @@ export interface WinstonPileTableProps {
   sharedStack: SharedStackView;
   /** Seat list from the same view, for naming the seat whose turn it is. */
   seats: readonly SeatPublicView[];
+  /**
+   * This viewer's own seat, from the transport handshake. `null` before a seat
+   * is assigned, which renders as "not your turn" — the safe direction, since
+   * every control is gated on a positive match.
+   */
+  viewerSeat: number | null;
   /** `DraftPlayerView.play_first_chooser` — advisory, rendered as a sentence. */
   playFirstChooser?: number | null;
   /** A decision is in flight, or the pod is paused. Not a legality statement: it
@@ -106,13 +115,20 @@ function RevealedCard({
 
 function Pile({
   pile,
-  isActive,
+  isCursor,
+  canDecide,
   interactionLocked,
   onDecide,
   onCardHover,
 }: {
   pile: SharedStackPileView;
-  isActive: boolean;
+  /** This is the pile being decided on. PUBLIC: every viewer sees the
+   *  highlight, because the cursor is open information at the table. */
+  isCursor: boolean;
+  /** This viewer is the active seat AND this is the cursor pile, so the
+   *  controls belong to them. Strictly narrower than `isCursor` — an onlooker
+   *  must never be offered a button the reducer would refuse. */
+  canDecide: boolean;
   interactionLocked: boolean;
   onDecide: (pile: number, decision: SharedStackPileDecision) => void;
   onCardHover?: (info: CardHoverInfo | null) => void;
@@ -159,9 +175,9 @@ function Pile({
   return (
     <div
       data-winston-pile={pile.index}
-      data-winston-pile-active={isActive ? "true" : "false"}
+      data-winston-pile-active={isCursor ? "true" : "false"}
       className={`flex min-w-0 flex-col gap-3 rounded-[16px] border p-3 ${
-        isActive
+        isCursor
           ? "border-amber-300/40 bg-amber-400/[0.06] shadow-[inset_0_-1px_0_rgba(0,0,0,0.28)]"
           : "border-hairline bg-white/[0.035]"
       }`}
@@ -175,7 +191,7 @@ function Pile({
         </span>
       </div>
 
-      {isActive && (
+      {isCursor && (
         <span className="text-[0.6rem] font-semibold uppercase tracking-[0.18em] text-amber-200/80">
           {t("winston.deciding")}
         </span>
@@ -195,12 +211,18 @@ function Pile({
         {pile.revealed.map((card) => (
           <RevealedCard key={card.instance_id} card={card} onCardHover={onCardHover} />
         ))}
-        {isActive && pile.revealed.length === 0 && (
-          <span className="self-center text-xs text-white/35">{t("winston.revealedNone")}</span>
-        )}
+        {/* No "you have not looked at this pile yet" placeholder, and its
+            absence is load-bearing rather than an omission. BOTH engine write
+            sites of the `inspected` contract set `inspected[cursor] =
+            piles[cursor].len()` (the turn-end reset and the decline's
+            cursor-advance), so at the cursor `revealed.length === total`
+            ALWAYS. An empty `revealed` here therefore means the pile is empty,
+            never "unlooked-at" — and an empty pile is already stated twice
+            over, by the `0` on the face-down box above and by the engine's own
+            `PileEmpty` refusal note below. */}
       </div>
 
-      {isActive && (
+      {canDecide && (
         <div className="flex flex-col gap-1.5">
           <div className="flex gap-2">
             {decisionButton("Take", "emerald")}
@@ -226,6 +248,7 @@ function Pile({
 export function WinstonPileTable({
   sharedStack,
   seats,
+  viewerSeat,
   playFirstChooser,
   interactionLocked,
   onDecide,
@@ -238,9 +261,12 @@ export function WinstonPileTable({
     seats.find((entry) => entry.seat_index === seat)?.display_name
     ?? t("winston.seatFallback", { index: seat + 1 });
 
-  // `active_pile` is published ONLY to the active seat, so this is the engine's own
-  // viewer-scoped answer to "is it my turn" rather than a seat comparison made here.
-  const yourTurn = active_pile !== null;
+  // A seat comparison against the engine's published `active_seat`, which is THE
+  // authority for whose turn it is. Emphatically not `active_pile !== null`: the
+  // cursor is published to every viewer (see `SharedStackView.active_pile`), so
+  // that test would answer "your turn" to onlookers and spectators alike and
+  // hand them controls the reducer refuses.
+  const yourTurn = viewerSeat !== null && viewerSeat === active_seat;
   // A percentage of two published counts, for a bar width only. It answers no
   // question about any control.
   const faceDownPercent = total_cards === 0 ? 0 : (main_stack_remaining / total_cards) * 100;
@@ -286,7 +312,8 @@ export function WinstonPileTable({
           <Pile
             key={pile.index}
             pile={pile}
-            isActive={pile.index === active_pile}
+            isCursor={pile.index === active_pile}
+            canDecide={yourTurn && pile.index === active_pile}
             interactionLocked={interactionLocked}
             onDecide={onDecide}
             onCardHover={onCardHover}

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { PackDistribution } from "../../../adapter/draft-adapter";
 import { useConnectivityStore } from "../../../stores/connectivityStore";
 import { DRAFT_OFFLINE_ERROR } from "../../../stores/multiplayerDraftStore";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -33,6 +34,9 @@ const mocks = vi.hoisted(() => ({
     // The engine-published seat counts the lobby's Start gate reads. The base
     // Premier procedure allows every normal pod size from two through eight.
     allowedPodSizes: [2, 3, 4, 5, 6, 7, 8] as number[] | null,
+    // The engine-published distribution. The Start gate reads it to decide
+    // whether bot fill can pad the pod at all; `null` until the procedure loads.
+    packDistribution: "PickAndPass" as PackDistribution | null,
     config: {
       setCode: "dft",
       setName: "Draft Set",
@@ -222,6 +226,7 @@ describe("DraftPodLobby", () => {
     const baseJoined = mocks.multiplayerState.joined;
     const baseBotFill = mocks.podState.botFillEnabled;
     const baseAllowedPodSizes = mocks.podState.allowedPodSizes;
+    const baseDistribution = mocks.podState.packDistribution;
 
     /** `filled` occupied seats out of four. `DraftPodLobby` counts a seat as
      *  filled by its `display_name`, so the empties carry none. */
@@ -251,6 +256,7 @@ describe("DraftPodLobby", () => {
       mocks.multiplayerState.joined = baseJoined;
       mocks.podState.botFillEnabled = baseBotFill;
       mocks.podState.allowedPodSizes = baseAllowedPodSizes;
+      mocks.podState.packDistribution = baseDistribution;
     });
 
     it("disables Start when two seats are outside Commander Draft's allowed set", () => {
@@ -283,11 +289,93 @@ describe("DraftPodLobby", () => {
       expect(startButton()).toBeEnabled();
     });
 
+    /**
+     * The shared-stack arm of the same gate, and the reason it exists: the
+     * reducer refuses a bot seat under `PackDistribution::SharedStackPiles`, so
+     * the host's bot-fill checkbox pads NOTHING there. Letting it short-circuit
+     * the seat-count test hands the host an enabled Start that fails
+     * `createMultiplayerDraft`'s `min_pod_size` floor.
+     *
+     * REVERT-FAILING: drop the `isSharedStackDistribution` conjunct from
+     * `botFillPadsThePod` and this enables, exactly as it did before the fix.
+     */
+    it("does not let bot-fill enable Start for a shared-stack pod, which seats no bots", () => {
+      mocks.podState.allowedPodSizes = [3, 4, 5, 6, 7, 8];
+      mocks.podState.botFillEnabled = true;
+      mocks.podState.packDistribution = { SharedStackPiles: { pile_count: 3 } };
+      render(<DraftPodLobby onLeave={vi.fn()} />);
+
+      // Reach guard: the same two-seat fixture the PickAndPass case above
+      // renders, so the difference is the distribution and nothing else.
+      expect(screen.getByText("2 / 4 seats filled")).toBeInTheDocument();
+      expect(startButton()).toBeDisabled();
+    });
+
+    /**
+     * The paired positive: a shared-stack pod whose HUMANS already make a legal
+     * seat count still starts. Without this, the assertion above is satisfiable
+     * by a gate that refuses every Winston pod forever.
+     */
+    it("still starts a shared-stack pod once the humans reach an allowed seat count", () => {
+      mocks.podState.allowedPodSizes = [2, 3, 4];
+      mocks.podState.botFillEnabled = true;
+      mocks.podState.packDistribution = { SharedStackPiles: { pile_count: 3 } };
+      render(<DraftPodLobby onLeave={vi.fn()} />);
+
+      expect(startButton()).toBeEnabled();
+    });
+
     it("disables Start while the engine has not answered", () => {
       mocks.podState.allowedPodSizes = null;
       render(<DraftPodLobby onLeave={vi.fn()} />);
 
       // Fail closed: no client-side fallback may reinstate a legal count.
+      expect(startButton()).toBeDisabled();
+    });
+
+    /**
+     * The distribution half of the same fail-closed rule. `botFillEnabled` may
+     * not short-circuit the seat-count test before the engine has said whether
+     * bot seats are legal for this kind at all.
+     */
+    /**
+     * The seat GRID reads the same authority as the Start gate. An empty seat
+     * in a shared-stack pod must not be labelled "Bot": no bot will ever fill
+     * it, and the label is what tells the host the pod is already accounted
+     * for when in fact it is short.
+     *
+     * REVERT-FAILING: pass `botFillEnabled` to `SeatCard` again and the empty
+     * seats read "Bot" here.
+     */
+    it("does not label empty shared-stack seats as bots", () => {
+      mocks.podState.botFillEnabled = true;
+      mocks.podState.packDistribution = { SharedStackPiles: { pile_count: 3 } };
+      render(<DraftPodLobby onLeave={vi.fn()} />);
+
+      // Reach guard: two of the four seats really are empty in this fixture.
+      expect(screen.getByText("2 / 4 seats filled")).toBeInTheDocument();
+      expect(screen.queryAllByText("Bot")).toHaveLength(0);
+      expect(screen.queryAllByText("Waiting...")).toHaveLength(2);
+    });
+
+    /**
+     * The paired positive, same fixture and same checkbox: a PickAndPass pod
+     * does promise bots for its empty seats, because it really gets them.
+     */
+    it("still labels empty seats as bots where bot fill seats them", () => {
+      mocks.podState.botFillEnabled = true;
+      mocks.podState.packDistribution = "PickAndPass";
+      render(<DraftPodLobby onLeave={vi.fn()} />);
+
+      expect(screen.queryAllByText("Bot")).toHaveLength(2);
+    });
+
+    it("disables Start while the engine has not published the distribution", () => {
+      mocks.podState.allowedPodSizes = [3, 4, 5, 6, 7, 8];
+      mocks.podState.botFillEnabled = true;
+      mocks.podState.packDistribution = null;
+      render(<DraftPodLobby onLeave={vi.fn()} />);
+
       expect(startButton()).toBeDisabled();
     });
   });

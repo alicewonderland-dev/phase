@@ -742,8 +742,14 @@ const MAX_COMMANDER_DESIGNATIONS = 2;
  * the engine's cursor, and `shared_stack::refusal_for` is the single authority
  * that judges it. What is bounded here is what a message ALONE can state.
  *
- * `@sync-with` has no checker; the value is pinned by this module's test
- * against the engine constant's published figure.
+ * Pinned against the Rust constant by `scripts/check-protocol-version.mjs`,
+ * which reads BOTH literals and compares them. That is a real cross-language
+ * pin and it is the only one: this module's own test asserts pile 3 rejected
+ * and pile 2 accepted, which pins the constant against ITSELF and would pass at
+ * any value the two sides happened to share. The engine's figure is derived
+ * from the procedure table, so a future 4-pile row moves it with every Rust
+ * test still green — and without the script's comparison the transport would
+ * silently refuse legal pile-3 decisions.
  */
 // @sync-with: crates/draft-core/src/types.rs `MAX_SHARED_STACK_PILES`
 const MAX_SHARED_STACK_PILES = 3;
