@@ -519,6 +519,10 @@ export class P2PDraftHost {
    * exists, every pod deliberately gets Medium rather than a leftover.
    */
   private readonly botDifficulty = 2;
+
+  /** Has this host already fetched the card database for its bot seats? See
+   *  `loadCardDatabaseForSharedStackBots`, which owns the reason. */
+  private cardDatabaseLoaded = false;
   private static readonly BACKUP_INTERVAL_PICKS = 5;
 
   constructor(
@@ -669,11 +673,19 @@ export class P2PDraftHost {
     botSeats: number,
   ): Promise<void> {
     if (!isSharedStackDistribution(distribution) || botSeats === 0) return;
+    // Idempotent: three paths can seat a bot, and a pod that replaces several
+    // seats in turn would otherwise refetch multiple megabytes it already has.
+    // The flag records the FETCH, not the engine's state, which is why it is set
+    // only after `loadCardDatabase` resolves -- a failed load must stay
+    // retryable rather than latch the pod into the degraded scoring
+    // `winston_decision_degrades_without_a_card_database` pins.
+    if (this.cardDatabaseLoaded) return;
     const resp = await fetch(__CARD_DATA_URL__);
     if (!resp.ok) {
       throw new Error(`Failed to load card data: ${resp.status}`);
     }
     await this.adapter.loadCardDatabase(await resp.text());
+    this.cardDatabaseLoaded = true;
   }
 
   // ── Connection handling ────────────────────────────────────────────
@@ -2977,12 +2989,25 @@ export class P2PDraftHost {
       // broadcast, so every seat's next view already shows where the bot chain
       // stopped. The error boundary is the enclosing `catch`, which reports
       // this as the host action it is rather than as a refused player decision.
+      // The bot chain has its OWN error boundary, for the same reason
+      // `handleSharedStackDecision`'s does: the replacement is already applied
+      // and persisted by this point, so a loud failure driving the bot must not
+      // swallow the broadcast that tells every guest the seat changed. Without
+      // this, guests keep a stale view of a replacement that really happened.
       if (stillDrafting) {
-        await this.loadCardDatabaseForSharedStackBots(
-          (await this.ensureProcedure()).distribution,
-          replaced.seats.filter((s) => s.is_bot).length,
-        );
-        await this.resolveBotPicks({ emit: false, persist: true });
+        try {
+          await this.loadCardDatabaseForSharedStackBots(
+            (await this.ensureProcedure()).distribution,
+            replaced.seats.filter((s) => s.is_bot).length,
+          );
+          await this.resolveBotPicks({ emit: false, persist: true });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.emit({
+            type: "error",
+            message: `Seat ${seat} became a bot, but driving its turn failed: ${message}`,
+          });
+        }
       }
 
       await this.broadcastViews();
