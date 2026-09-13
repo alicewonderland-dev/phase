@@ -507,6 +507,18 @@ export class P2PDraftHost {
   private admissionQueue = Promise.resolve();
   private perSeatWorkspaceSnapshots = new Map<number, DraftWorkspaceState>();
   private persistenceClosed = false;
+  /**
+   * The strength this pod's BOT seats play at, as `map_difficulty`'s 0..=4
+   * index — `2` is Medium, the same default (and the same indexing) as
+   * `draftStore`'s `difficulty: 2` and its `DIFFICULTY_NAMES`.
+   *
+   * It is a field rather than a literal at the call site because the engine's
+   * `DIFFICULTY` cell is per-thread and sticky: whatever a pod does NOT say, it
+   * inherits from the last draft this tab ran. One named place to set it is
+   * what a lobby control will need, and that control is a follow-up — until it
+   * exists, every pod deliberately gets Medium rather than a leftover.
+   */
+  private readonly botDifficulty = 2;
   private static readonly BACKUP_INTERVAL_PICKS = 5;
 
   constructor(
@@ -1137,22 +1149,23 @@ export class P2PDraftHost {
     const seed = hostDraftSeed();
     this.draftSeed = seed;
     const draftCode = `draft-${seed.toString(16).padStart(8, "0")}`;
-    // A SHARED-STACK kind admits no bot fill: the reducer refuses a bot seat
-    // outright, so filling here would turn a short pod into a guaranteed
-    // `createMultiplayerDraft` error instead of a pod that starts short. The
-    // engine refusal remains the authority — this only avoids walking into it.
+    // Bot fill is the HOST'S choice and nothing else. Every distribution the
+    // engine ships now admits a bot seat — a shared-stack pod included, where
+    // `resolve_shared_stack_bot_turns` drives the seat the reducer used to
+    // refuse — so there is no procedure-shaped suppression left to apply here.
     //
-    // Dispatched on the DISTRIBUTION, because that is the property the engine
-    // actually refuses on: `apply_start_draft`'s pre-flight arm and
-    // `apply_replace_seat_with_bot` both `match ... PackDistribution::
-    // SharedStackPiles`. The earlier `human_seats !== pod_size` test was a
-    // scalar that merely correlates, and it correlates WRONGLY: the procedure
-    // table seats humans in every seat for Premier, Traditional and Sealed too
-    // (`human_seats == pod_size == 8`), so it suppressed bot fill for three
-    // kinds that permit it. Read from the procedure, never from `kind`.
+    // The lesson that OUTLIVED that refusal, and must not be relearned: any
+    // per-kind question asked here is asked of the DISTRIBUTION, never of the
+    // `human_seats` scalar. That scalar merely correlates, and it correlates
+    // WRONGLY: the procedure table seats humans in every seat for Premier,
+    // Traditional and Sealed too (`human_seats == pod_size == 8`), so a guard
+    // written on it silently suppressed bot fill for three kinds that always
+    // permitted it. `p2pDraftHostBotFill.test.ts` is that lesson's revert-probe
+    // and still carries those three rows. Read from the procedure, never from
+    // `kind`.
     const procedure = this.procedure
       ?? await this.adapter.draftProcedure(this.kind, this.tournamentFormat);
-    const botFillAllowed = botFillEmptySeats && !isSharedStackDistribution(procedure.distribution);
+    const botFillAllowed = botFillEmptySeats;
     const seats: MultiplayerSeatDescriptor[] = [];
     for (let i = 0; i < this.podSize; i++) {
       const displayName = this.seatNames.get(i);
@@ -1166,6 +1179,32 @@ export class P2PDraftHost {
         seats.push({ type: "Bot", name: this.botNameForSeat(i, seed) });
       }
     }
+    // A shared-stack BOT reads card faces, so it needs the WASM CARD_DB: the
+    // Winston valuation prices mana fixing off `produced_color_count` and cheap
+    // interaction off the parsed effect profile, and with no database every
+    // card collapses to its rarity prior — two of the five drafting principles
+    // silently dead, with a bot that still plays and never says so.
+    //
+    // Loaded HERE rather than in `draftPodHostAdapter`'s gate, for two reasons
+    // that are both about what is knowable where. The adapter has only
+    // `config.kind`, and dispatching on kind is exactly the proxy this file
+    // keeps unlearning; the DISTRIBUTION is known only after the procedure
+    // resolves, which happens here. And the BOT-SEAT COUNT is known only after
+    // the descriptor loop above, so a human-vs-human Winston pod — the common
+    // case — pays nothing for a multi-megabyte fetch it would never read.
+    // Widening the adapter's gate instead would also redden its landed
+    // "skips the CARD_DB fetch for Set pods" row, which that gate's own comment
+    // warns about.
+    if (
+      isSharedStackDistribution(procedure.distribution)
+      && seats.some((seat) => seat.type === "Bot")
+    ) {
+      const resp = await fetch(__CARD_DATA_URL__);
+      if (!resp.ok) {
+        throw new Error(`Failed to load card data: ${resp.status}`);
+      }
+      await this.adapter.loadCardDatabase(await resp.text());
+    }
     await this.adapter.createMultiplayerDraft(
       this.poolInput,
       seats,
@@ -1174,6 +1213,7 @@ export class P2PDraftHost {
       draftCode,
       this.tournamentFormat,
       this.podPolicy,
+      this.botDifficulty,
     );
 
     this.draftStarted = true;
@@ -1389,8 +1429,13 @@ export class P2PDraftHost {
    *     `roundComplete` describe a pick-and-pass step in which every seat owes
    *     a pick simultaneously; under `SharedStackPiles` exactly one seat owes
    *     a decision and the turn passes on every applied decision.
-   *   * there are no bot seats to resolve — the reducer refuses a bot seat
-   *     under this distribution, so a Winston pod has none by construction.
+   *   * bot seats ARE resolved here, but not one pick at a time. A shared-stack
+   *     bot owes a whole TURN, and consecutive bot turns chain, so the engine's
+   *     own loop (`resolve_shared_stack_bot_turns`, reached through
+   *     `resolveBotPicks`) runs once after the acknowledgement and before the
+   *     broadcast, with its own persistence fence. `applyPick`'s per-seat sweep
+   *     has no counterpart here because there is no round in which every seat
+   *     owes a move.
    *   * a decision names no cards, so `pickReceived` (whose payload IS the
    *     cards) cannot describe it.
    * Every seat's projection changes on every decision (the active seat moves,
@@ -1419,8 +1464,25 @@ export class P2PDraftHost {
         session.send({ type: "draft_pick_ack", view });
       }
 
+      // The deciding seat's acknowledgement is its own decision's receipt, so
+      // it is sent BEFORE the bots move — exactly the view the reducer
+      // returned for that seat. Everything the bots then do reaches every seat
+      // through the broadcast below, which is why that broadcast is now the one
+      // that must come after this call rather than before it.
+      //
+      // `emit: false` because there is no per-pick event to raise here: a
+      // decision names no cards, so `pickReceived` cannot describe one.
+      // `persist: true` gives the bot turns their OWN fence, and it fires only
+      // when the engine actually moved — the same rule as the fence above: no
+      // client may observe a reducer result a host reload could not restore.
+      await this.resolveBotPicks({ emit: false, persist: true });
+
       await this.broadcastViews();
 
+      // Re-read AFTER the bot turns, deliberately: the bots may have carried
+      // the draft into Deckbuilding, and if they did not, the seat the clock
+      // must be armed against is the HUMAN seat their chain stopped on, not the
+      // seat that was active when this decision was applied.
       const hostView = await this.adapter.getViewForSeat(0);
       if (hostView.status === "Deckbuilding") {
         this.clearActiveTimer();
@@ -1432,8 +1494,10 @@ export class P2PDraftHost {
         // either passes the turn or advances the cursor, so each one opens a
         // fresh decision window. Without this the clock ran exactly once per
         // draft — it expired into a sweep that could not act and never started
-        // again, leaving a stalled Winston seat with no recovery at all, while
-        // `ReplaceSeatWithBot` is (correctly) refused for this distribution.
+        // again, leaving a stalled Winston seat with no recovery at all. The
+        // reducer now accepts `ReplaceSeatWithBot` for this distribution too,
+        // but that is a HOST action; the clock is the recovery that needs
+        // nobody to be watching.
         //
         // `pick_number` is the same axis `applyPick` passes. It does not
         // advance under `SharedStackPiles` — no reducer path moves it — so
@@ -2103,6 +2167,12 @@ export class P2PDraftHost {
    * shared-stack counterpart of the random pick the pick-and-pass sweep submits
    * for a timed-out seat, and it mirrors `pick_random_for_seat`'s arm.
    *
+   * It stays the forced move even now that a Winston BOT exists. The seat this
+   * drives is a HUMAN one that ran out of clock; playing it well on its
+   * occupant's behalf is a policy decision nobody has made, and the engine's
+   * always-legal move is the one that decides nothing. `resolveBotPicks` is
+   * where a seat the engine itself marks `is_bot` gets the evaluated turn.
+   *
    * Seat 0's view suffices for every field read here: `active_seat`,
    * `active_pile` and `legality` are all published identically to every viewer
    * (`legality` is asked for the active seat by construction, and the cursor is
@@ -2137,14 +2207,28 @@ export class P2PDraftHost {
   }
 
   /**
-   * Needs no shared-stack branch, and that is a structural fact rather than an
-   * omission: the reducer refuses a bot seat under
-   * `PackDistribution::SharedStackPiles`, so a Winston pod has no `is_bot`
-   * seat for this loop to find and the body is empty by construction.
+   * Resolve every bot seat's outstanding obligation, whatever shape the
+   * procedure gives it.
+   *
+   * The shared-stack arm sits ABOVE the `current_pack` loop below, which is
+   * that loop's own dominating conjunct: a shared-stack session leaves
+   * `current_pack` null for EVERY seat, so an arm placed below it would be dead
+   * code and a Winston bot would simply never move. Exactly the placement and
+   * exactly the reason `autoPickAllPending` states for its own dispatch, and
+   * the reason `server-core`'s `pick_random_for_seat` states for its.
+   *
+   * Dispatched on the DISTRIBUTION, never on `kind` and never on a
+   * `human_seats` scalar — the two are different questions and only the first
+   * one tracks the turn structure this method has to service.
    */
   private async resolveBotPicks(options: PickOptions = { emit: true, persist: true }): Promise<void> {
     const hostView = await this.adapter.getViewForSeat(0);
     if (hostView.status !== "Drafting") return;
+
+    if (this.procedure !== null && isSharedStackDistribution(this.procedure.distribution)) {
+      await this.resolveSharedStackBotTurns(hostView, options);
+      return;
+    }
 
     for (const seat of hostView.seats) {
       if (!seat.is_bot) continue;
@@ -2161,6 +2245,39 @@ export class P2PDraftHost {
         randomDistinctCards(pack, view.required_pick_count),
         { acknowledge: false, emit: options.emit, persist: options.persist, resolveBots: false },
       );
+    }
+  }
+
+  /**
+   * Hand every consecutive bot-owned shared-stack turn to the engine.
+   *
+   * NOTHING here decides a Winston turn. The pile, the take-or-decline and the
+   * loop that spans consecutive bot seats are all
+   * `resolve_shared_stack_bot_turns`'s, whose bound and termination proof are
+   * compiled and unit-tested in `draft-wasm`; this method forwards the call and
+   * owns only the persistence fence. A second, client-side notion of what a bot
+   * should do is exactly how the two would drift.
+   *
+   * The `is_bot` pre-check is the engine's own published seat flag — the SAME
+   * field the pick-and-pass loop reads — and it is an economy, not a legality
+   * test: the export already returns an empty list when the active seat is
+   * human. It keeps a human-vs-human Winston pod, which is the common shape,
+   * from making an engine round-trip on every single decision.
+   *
+   * Only the LENGTH of the returned deltas is read, and only to decide whether
+   * a fence is owed: an empty list means the engine moved nothing, so there is
+   * no new reducer result to make durable. Views are broadcast by the caller,
+   * which is where the shared-stack path's one broadcast already lives.
+   */
+  private async resolveSharedStackBotTurns(
+    hostView: DraftPlayerView,
+    options: PickOptions,
+  ): Promise<void> {
+    if (!hostView.seats.some((seat) => seat.is_bot)) return;
+    const deltas = await this.adapter.resolveSharedStackBotTurns();
+    if (deltas.length === 0) return;
+    if (options.persist) {
+      await this.persistSessionStrict();
     }
   }
 

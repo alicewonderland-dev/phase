@@ -244,14 +244,24 @@ export type PackDistribution =
 /**
  * Is this the shared-stack distribution, and if so what is its pile count?
  *
- * THE single client-side spelling of that question. The engine refuses a bot
- * seat by matching `PackDistribution::SharedStackPiles` — `apply_start_draft`'s
- * pre-flight arm and `apply_replace_seat_with_bot` both dispatch on exactly
- * that, and `apply_start_draft` says so in place: "the procedure's
- * `human_seats` scalar is necessary but not sufficient: it is a per-kind
- * constant that stops matching the seat count the moment a 4-seat pod is
- * created." So a client guard that wants to avoid walking into that refusal
- * must ask the same property, never a scalar that merely correlates with it.
+ * THE single client-side spelling of that question. The engine no longer
+ * refuses a bot seat under `PackDistribution::SharedStackPiles` — it seats and
+ * drives one (`resolve_shared_stack_bot_turns`) — so this predicate is NOT a
+ * refusal proxy and must never be reintroduced as one. What it still answers is
+ * the only question a shared-stack pod's turn structure poses: is this the
+ * one-active-seat, take-or-decline procedure, whose seats have no
+ * `current_pack` at all? Both surviving consumers ask exactly that —
+ * `autoPickAllPending`'s timeout sweep and `resolveBotPicks`'s bot dispatch,
+ * each of which would otherwise fall through to a `current_pack` loop that is
+ * null for every seat here.
+ *
+ * Ask the DISTRIBUTION, never the `human_seats` scalar. That scalar is a
+ * per-kind constant that merely correlates, and it correlates WRONGLY: the
+ * procedure table seats humans in every seat for Premier, Traditional and
+ * Sealed too (`human_seats == pod_size == 8`), so a guard written on it
+ * silently caught three kinds it was never about. That lesson outlived the
+ * refusal it was learned on, and `p2pDraftHostBotFill.test.ts` is its
+ * revert-probe.
  *
  * A narrowing predicate rather than a `boolean`, so a caller that needs
  * `pile_count` gets it from the same test instead of re-destructuring the
@@ -888,6 +898,14 @@ export class DraftEngineOperationLease {
     return this.wasm.load_card_database(json);
   }
 
+  /**
+   * `difficulty` is LAST, mirroring the wasm export, and must stay last: the
+   * engine reads this boundary positionally and the host's tests read it back
+   * by index. It is the strength this pod's bot seats play at
+   * (`map_difficulty`, 0..=4), and passing it is what stops a pod inheriting
+   * the difficulty of whatever draft this tab ran before it — `DIFFICULTY` is
+   * a per-thread cell in the engine with no reset.
+   */
   createMultiplayerDraft(
     poolInput: PoolInput,
     seats: MultiplayerSeatDescriptor[],
@@ -896,6 +914,7 @@ export class DraftEngineOperationLease {
     draftCode: string,
     tournamentFormat: TournamentFormat,
     podPolicy: PodPolicy,
+    difficulty: number,
   ): DraftPlayerView {
     return this.wasm.create_multiplayer_draft(
       JSON.stringify(poolInput),
@@ -905,6 +924,7 @@ export class DraftEngineOperationLease {
       draftCode,
       tournamentFormat,
       podPolicy,
+      difficulty,
     ) as DraftPlayerView;
   }
 
@@ -951,6 +971,27 @@ export class DraftEngineOperationLease {
       JSON.stringify({ type: "SharedStackDecision", data: { seat, pile, decision } }),
     );
     return this.wasm.get_view_for_seat(seat) as DraftPlayerView;
+  }
+
+  /**
+   * Resolve every consecutive shared-stack turn a BOT seat owns, and report
+   * how many decisions the engine made.
+   *
+   * The loop, its bound and its termination proof are the engine's
+   * (`resolve_shared_stack_bot_turns_inner`); this boundary only forwards the
+   * call. It is deliberately NOT a decision-shaped method: the host cannot
+   * name a pile or a decision here, so there is no second authority over what
+   * a bot seat does.
+   *
+   * Returns the engine's `DraftDelta` list VERBATIM and untyped. There is no
+   * TypeScript spelling of `DraftDelta` in this client and this method does not
+   * introduce one: nothing here reads a delta's contents, and the host uses
+   * only the LENGTH — empty means the engine moved nothing (the active seat is
+   * human, the draft is over, or the session has no shared stack), so no
+   * persistence fence is owed.
+   */
+  resolveSharedStackBotTurns(): unknown[] {
+    return this.wasm.resolve_shared_stack_bot_turns() as unknown[];
   }
 
   submitDeckForSeat(
@@ -1146,6 +1187,7 @@ export class DraftAdapter {
 
   // ── Multi-seat API (P2P Tournament Host) ─────────────────────────────
 
+  /** See the lease method for why `difficulty` is last and what it fixes. */
   async createMultiplayerDraft(
     poolInput: PoolInput,
     seats: MultiplayerSeatDescriptor[],
@@ -1154,6 +1196,7 @@ export class DraftAdapter {
     draftCode: string,
     tournamentFormat: TournamentFormat,
     podPolicy: PodPolicy,
+    difficulty: number,
   ): Promise<DraftPlayerView> {
     return withDraftEngineOperation((lease) =>
       lease.createMultiplayerDraft(
@@ -1164,6 +1207,7 @@ export class DraftAdapter {
         draftCode,
         tournamentFormat,
         podPolicy,
+        difficulty,
       ),
     );
   }
@@ -1187,6 +1231,14 @@ export class DraftAdapter {
   ): Promise<DraftPlayerView> {
     return withDraftEngineOperation((lease) =>
       lease.submitSharedStackDecisionForSeat(seat, pile, decision));
+  }
+
+  /**
+   * Drive every consecutive bot-owned shared-stack turn. See the lease method
+   * for why the engine owns the loop and why the deltas are returned untyped.
+   */
+  async resolveSharedStackBotTurns(): Promise<unknown[]> {
+    return withDraftEngineOperation((lease) => lease.resolveSharedStackBotTurns());
   }
 
   /** The engine-owned per-kind procedure axes; never re-derived by the UI. */

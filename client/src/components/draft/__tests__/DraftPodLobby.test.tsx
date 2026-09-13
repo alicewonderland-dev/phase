@@ -290,18 +290,20 @@ describe("DraftPodLobby", () => {
     });
 
     /**
-     * The shared-stack arm of the same gate, and the reason it exists: the
-     * reducer refuses a bot seat under `PackDistribution::SharedStackPiles`, so
-     * the host's bot-fill checkbox pads NOTHING there. Letting it short-circuit
-     * the seat-count test hands the host an enabled Start that fails
-     * `createMultiplayerDraft`'s `min_pod_size` floor.
+     * RE-AIMED (was: "does not let bot-fill enable Start for a shared-stack
+     * pod, which seats no bots"). The engine refused a bot seat under
+     * `PackDistribution::SharedStackPiles` when that row was written, so the
+     * checkbox padded nothing there and Start had to stay gated in spite of it.
+     * `resolve_shared_stack_bot_turns` now drives a seated Winston bot, so the
+     * suppression is gone and what survives is the OTHER half of the gate: a
+     * short pod whose host has NOT asked for bot fill still cannot start.
      *
-     * REVERT-FAILING: drop the `isSharedStackDistribution` conjunct from
-     * `botFillPadsThePod` and this enables, exactly as it did before the fix.
+     * REVERT-FAILING: drop the `botFillEnabled` conjunct from
+     * `botFillPadsThePod` and this enables on a checkbox nobody ticked.
      */
-    it("does not let bot-fill enable Start for a shared-stack pod, which seats no bots", () => {
+    it("keeps Start gated for a short shared-stack pod when the host declines bot fill", () => {
       mocks.podState.allowedPodSizes = [3, 4, 5, 6, 7, 8];
-      mocks.podState.botFillEnabled = true;
+      mocks.podState.botFillEnabled = false;
       mocks.podState.packDistribution = { SharedStackPiles: { pile_count: 3 } };
       render(<DraftPodLobby onLeave={vi.fn()} />);
 
@@ -309,6 +311,26 @@ describe("DraftPodLobby", () => {
       // renders, so the difference is the distribution and nothing else.
       expect(screen.getByText("2 / 4 seats filled")).toBeInTheDocument();
       expect(startButton()).toBeDisabled();
+    });
+
+    /**
+     * The new leg, and the one the feature turns over: with bot fill ON, the
+     * SAME short shared-stack pod now starts, because the empty seats really do
+     * receive bots. Without this leg the row above is satisfiable by a gate
+     * that refuses every Winston pod forever — which is precisely what the
+     * code did before this change.
+     *
+     * REVERT-FAILING: restore the `!isSharedStackDistribution(packDistribution)`
+     * conjunct on `botFillPadsThePod` and this reds with a disabled Start.
+     */
+    it("lets bot-fill enable Start for a shared-stack pod, whose empty seats now take bots", () => {
+      mocks.podState.allowedPodSizes = [3, 4, 5, 6, 7, 8];
+      mocks.podState.botFillEnabled = true;
+      mocks.podState.packDistribution = { SharedStackPiles: { pile_count: 3 } };
+      render(<DraftPodLobby onLeave={vi.fn()} />);
+
+      expect(screen.getByText("2 / 4 seats filled")).toBeInTheDocument();
+      expect(startButton()).toBeEnabled();
     });
 
     /**
@@ -334,21 +356,37 @@ describe("DraftPodLobby", () => {
     });
 
     /**
-     * The seat GRID reads the same authority as the Start gate. An empty seat
-     * in a shared-stack pod must not be labelled "Bot": no bot will ever fill
-     * it, and the label is what tells the host the pod is already accounted
-     * for when in fact it is short.
+     * INVERTED (was: "does not label empty shared-stack seats as bots"). The
+     * seat GRID still reads the same authority as the Start gate, and that
+     * authority's answer for a shared-stack pod has changed: the empty seats
+     * really are filled with bots now, so labelling them "Bot" is the honest
+     * reading rather than a promise of a player who never arrives.
      *
-     * REVERT-FAILING: pass `botFillEnabled` to `SeatCard` again and the empty
-     * seats read "Bot" here.
+     * REVERT-FAILING: restore the `!isSharedStackDistribution(packDistribution)`
+     * conjunct on `botFillPadsThePod` and these two seats read "Waiting..."
+     * while the engine seats bots in them.
      */
-    it("does not label empty shared-stack seats as bots", () => {
+    it("labels empty shared-stack seats as bots, which is what they now become", () => {
       mocks.podState.botFillEnabled = true;
       mocks.podState.packDistribution = { SharedStackPiles: { pile_count: 3 } };
       render(<DraftPodLobby onLeave={vi.fn()} />);
 
       // Reach guard: two of the four seats really are empty in this fixture.
       expect(screen.getByText("2 / 4 seats filled")).toBeInTheDocument();
+      expect(screen.queryAllByText("Bot")).toHaveLength(2);
+      expect(screen.queryAllByText("Waiting...")).toHaveLength(0);
+    });
+
+    /**
+     * The paired negative for the row above, and the reason the label reads a
+     * DERIVED value rather than the checkbox: with bot fill off, the same
+     * shared-stack fixture's empty seats are still empty.
+     */
+    it("still labels empty shared-stack seats as waiting when the host declines bot fill", () => {
+      mocks.podState.botFillEnabled = false;
+      mocks.podState.packDistribution = { SharedStackPiles: { pile_count: 3 } };
+      render(<DraftPodLobby onLeave={vi.fn()} />);
+
       expect(screen.queryAllByText("Bot")).toHaveLength(0);
       expect(screen.queryAllByText("Waiting...")).toHaveLength(2);
     });
@@ -380,26 +418,41 @@ describe("DraftPodLobby", () => {
     });
 
     /**
-     * The last form of the same defect the Start gate and the seat labels
-     * already close: a control that offers a capability the engine refuses.
-     * `botFillPadsThePod` makes the toggle inert for a shared-stack pod, so
-     * leaving it on screen shows the host a switch that provably does nothing.
+     * INVERTED (was: "hides the bot-fill toggle for a pod whose procedure
+     * refuses bot seats"). The toggle was hidden for a shared-stack pod because
+     * the engine refused the seat it asked for, making it a control that
+     * provably did nothing. The engine seats and drives that bot now, so
+     * hiding the switch would withhold a capability the engine HAS — and this
+     * row is the un-gating's only guard, which is why it is re-aimed rather
+     * than deleted.
      *
-     * REVERT-FAILING: render the label unconditionally again and the checkbox
-     * reappears in the shared-stack case below.
+     * Both halves asserted: the control is RENDERED, and it MOVES the value it
+     * governs (`botFillPadsThePod`, read here through the seat labels the same
+     * render publishes). A toggle that renders but no longer reaches the Start
+     * gate or the grid would pass a bare "is in the document" assertion.
+     *
+     * REVERT-FAILING: restore `{!botFillIsRefusedByProcedure && (` around the
+     * label and the query below finds nothing.
      */
-    it("hides the bot-fill toggle for a pod whose procedure refuses bot seats", () => {
+    it("renders the bot-fill toggle for a shared-stack pod, and it moves the pod", () => {
+      mocks.podState.botFillEnabled = true;
       mocks.podState.packDistribution = { SharedStackPiles: { pile_count: 3 } };
       render(<DraftPodLobby onLeave={vi.fn()} />);
 
-      expect(screen.queryByText("Fill empty seats with bots")).not.toBeInTheDocument();
+      expect(screen.getByText("Fill empty seats with bots")).toBeInTheDocument();
+      // It is the host's own control: clicking it reaches the store.
+      fireEvent.click(screen.getByRole("checkbox"));
+      expect(mocks.toggleBotFill).toHaveBeenCalledOnce();
+      // And its value is live on this render path rather than inert: the two
+      // empty seats read "Bot" precisely because the checkbox is ticked.
+      expect(screen.queryAllByText("Bot")).toHaveLength(2);
     });
 
     /**
-     * The paired positive, and the reach-guard for the assertion above: the
-     * same render path DOES show the toggle wherever bot seats are legal, so
-     * "not in the document" is a decision about this procedure rather than a
-     * control this harness never renders at all.
+     * The pick-and-pass sibling of the row above. Both distributions render the
+     * control, which is the whole claim now that no procedure refuses a bot
+     * seat: kept as the regression guard that a per-kind gate does not creep
+     * back in on the side it was originally written for.
      */
     it("keeps the bot-fill toggle for a pod whose procedure seats bots", () => {
       mocks.podState.packDistribution = "PickAndPass";
@@ -409,11 +462,11 @@ describe("DraftPodLobby", () => {
     });
 
     /**
-     * The `null` sides of the two predicates are deliberately opposite, and
-     * this pins the half that is easy to "tidy" into agreement: with no
-     * procedure loaded the engine has not refused anything, so the control
-     * stays rather than vanishing and reappearing as the procedure arrives.
-     * Start is still gated — that is the test three cases above.
+     * The loading state, which is the one place the control and its EFFECT
+     * still disagree on purpose: `botFillPadsThePod` fails closed while
+     * `packDistribution` is null (Start stays gated — see the case above),
+     * but the control itself stays on screen rather than vanishing and
+     * reappearing as the procedure arrives.
      */
     it("keeps the bot-fill toggle while the engine has not published the distribution", () => {
       mocks.podState.packDistribution = null;

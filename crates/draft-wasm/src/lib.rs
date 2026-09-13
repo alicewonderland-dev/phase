@@ -1401,10 +1401,29 @@ fn draft_kind_from_wire(kind: u8) -> Result<DraftKind, String> {
 ///   set drafts.
 /// - `seed`: RNG seed for deterministic pack generation
 /// - `draft_code`: unique room identifier
+/// - `difficulty`: the bot strength this pod's bot seats play at, through
+///   `map_difficulty` (0..=4, anything else is `Medium`). APPENDED LAST, and it
+///   must stay last: the client's call sites and their test mocks read this
+///   boundary positionally.
+///
+///   It is not cosmetic. `DIFFICULTY` is a per-thread `Cell` with no reset that
+///   outlives the draft that set it, and until now this entry point never wrote
+///   it — so a player who finished a Quick draft at `VeryHard` and then hosted
+///   a pod in the same tab got a `VeryHard` pod bot, silently, with no UI
+///   saying so. Every other entry point that creates a session writes this cell
+///   (`start_quick_draft`, `start_sealed_draft`, `start_quick_cube_draft`,
+///   `import_draft_session`); this one now does too, so the strength a pod
+///   plays at is the strength its host asked for.
 ///
 /// Stores the session in the same thread-local as Quick Draft (one active
 /// draft at a time per WASM instance). Returns the initial DraftPlayerView
 /// for seat 0.
+// The wasm boundary is positional by construction: `#[wasm_bindgen]` maps each
+// parameter to one JS argument, and the host's `.d.ts` and its tests read this
+// call by position. Bundling these eight into a struct would mean serializing a
+// payload across the boundary just to satisfy an arity lint, and would move
+// every existing argument — exactly what appending `difficulty` LAST avoids.
+#[allow(clippy::too_many_arguments)]
 #[wasm_bindgen]
 pub fn create_multiplayer_draft(
     pool_input_json: &str,
@@ -1414,6 +1433,7 @@ pub fn create_multiplayer_draft(
     draft_code: &str,
     tournament_format: &str,
     pod_policy: &str,
+    difficulty: u8,
 ) -> Result<JsValue, JsValue> {
     let view = create_multiplayer_draft_inner(
         pool_input_json,
@@ -1423,6 +1443,7 @@ pub fn create_multiplayer_draft(
         draft_code,
         tournament_format,
         pod_policy,
+        difficulty,
     )
     .map_err(|e| JsValue::from_str(&e))?;
     Ok(to_js(&view))
@@ -1445,6 +1466,18 @@ fn booster_pack_pool_for_game_inner() -> Result<Option<Vec<String>>, String> {
 /// `DraftPlayerView` so this branch is reachable from `cargo test` without
 /// going through `js_sys::JSON::parse`. The WASM export wraps this with
 /// `to_js` and `JsValue::from_str` error mapping.
+///
+/// `difficulty` is written to the `DIFFICULTY` thread-local beside
+/// `session_cell::install` in each pool arm, exactly where `start_sealed_draft`
+/// and the other session-creating entry points write it — ON THE SUCCESS PATH
+/// ONLY. A failed creation leaves any previously installed session in place, so
+/// writing the cell earlier would hand THAT session's bots a strength nobody
+/// chose for it, which is the same cross-draft contamination this parameter
+/// exists to end.
+///
+/// The parameter list mirrors the export's one-for-one; see the note there for
+/// why the arity lint is allowed rather than designed around.
+#[allow(clippy::too_many_arguments)]
 fn create_multiplayer_draft_inner(
     pool_input_json: &str,
     seats_json: &str,
@@ -1453,6 +1486,7 @@ fn create_multiplayer_draft_inner(
     draft_code: &str,
     tournament_format: &str,
     pod_policy: &str,
+    difficulty: u8,
 ) -> Result<draft_core::view::DraftPlayerView, String> {
     let pool_input: PoolInput = serde_json::from_str(pool_input_json)
         .map_err(|e| format!("Failed to parse pool input: {}", e))?;
@@ -1541,6 +1575,7 @@ fn create_multiplayer_draft_inner(
 
             session_cell::install(draft_session);
             PACK_GEN.with(|cell| cell.set(Some(pack_gen)));
+            DIFFICULTY.with(|cell| cell.set(map_difficulty(difficulty)));
             RNG.with(|cell| cell.set(Some(ChaCha20Rng::seed_from_u64(seed as u64))));
 
             Ok(view)
@@ -1578,6 +1613,7 @@ fn create_multiplayer_draft_inner(
 
             session_cell::install(draft_session);
             PACK_GEN.with(|cell| cell.set(Some(pack_gen)));
+            DIFFICULTY.with(|cell| cell.set(map_difficulty(difficulty)));
             RNG.with(|cell| cell.set(Some(ChaCha20Rng::seed_from_u64(seed as u64))));
 
             Ok(view)
@@ -1661,6 +1697,7 @@ fn create_multiplayer_draft_inner(
 
             session_cell::install(draft_session);
             PACK_GEN.with(|cell| cell.set(None));
+            DIFFICULTY.with(|cell| cell.set(map_difficulty(difficulty)));
             RNG.with(|cell| cell.set(Some(ChaCha20Rng::seed_from_u64(seed as u64))));
 
             Ok(view)
@@ -2722,6 +2759,7 @@ mod create_multiplayer_draft_tests {
             "test-room",
             "Swiss",
             "Competitive",
+            2, // Medium; see `a_pod_bot_ignores_a_previous_drafts_difficulty`
         )
         .expect("cube draft should start");
 
@@ -2815,6 +2853,7 @@ mod create_multiplayer_draft_tests {
             "test-room",
             "Swiss",
             "Casual",
+            2, // Medium; see `a_pod_bot_ignores_a_previous_drafts_difficulty`
         )
         .expect("cube draft should start");
 
@@ -2874,6 +2913,7 @@ mod create_multiplayer_draft_tests {
             "test-room",
             "Swiss",
             "Competitive",
+            2, // Medium; see `a_pod_bot_ignores_a_previous_drafts_difficulty`
         )
         .expect("set draft should start");
         assert_eq!(draft_view.cards_per_pack, 3);
@@ -2888,6 +2928,7 @@ mod create_multiplayer_draft_tests {
             "test-room",
             "Swiss",
             "Competitive",
+            2, // Medium; see `a_pod_bot_ignores_a_previous_drafts_difficulty`
         )
         .expect("set sealed should start");
         assert_eq!(sealed_view.cards_per_pack, 3);
@@ -2986,6 +3027,7 @@ mod create_multiplayer_draft_tests {
                 "test-room",
                 "Swiss",
                 "Competitive",
+                2, // Medium; see `a_pod_bot_ignores_a_previous_drafts_difficulty`
             )
             .expect_err("remote Quick Draft must use its public 2..=8 pod range");
 
@@ -3010,6 +3052,7 @@ mod create_multiplayer_draft_tests {
             "test-room",
             "Swiss",
             "Competitive",
+            2, // Medium; see `a_pod_bot_ignores_a_previous_drafts_difficulty`
         )
         .expect("a three-booster Premier pod is a valid multi-set selection");
 
@@ -3040,6 +3083,7 @@ mod create_multiplayer_draft_tests {
             "test-room",
             "Swiss",
             "Competitive",
+            2, // Medium; see `a_pod_bot_ignores_a_previous_drafts_difficulty`
         )
         .expect("a Chaos pod should resolve host-local assignments");
 
@@ -3081,6 +3125,7 @@ mod create_multiplayer_draft_tests {
             "test-room",
             "Swiss",
             "Competitive",
+            2, // Medium; see `a_pod_bot_ignores_a_previous_drafts_difficulty`
         )
         .expect_err("four sets name a booster Premier never opens");
         assert!(err.contains('4'), "unexpected error: {err}");
@@ -3093,6 +3138,7 @@ mod create_multiplayer_draft_tests {
             "test-room",
             "Swiss",
             "Competitive",
+            2, // Medium; see `a_pod_bot_ignores_a_previous_drafts_difficulty`
         )
         .expect("six boosters is a valid Sealed pod selection");
         assert_eq!(sealed.pack_set_codes.len(), 6);
@@ -3112,6 +3158,7 @@ mod create_multiplayer_draft_tests {
             "test-room",
             "Swiss",
             "Competitive",
+            2, // Medium; see `a_pod_bot_ignores_a_previous_drafts_difficulty`
         )
         .expect_err("the sequence names a set with no pool data");
         assert!(err.contains("MISSING"), "unexpected error: {err}");
@@ -3138,6 +3185,7 @@ mod create_multiplayer_draft_tests {
             "test-room",
             "Swiss",
             "Competitive",
+            2, // Medium; see `a_pod_bot_ignores_a_previous_drafts_difficulty`
         )
         .expect("a legacy single-pool pod still starts");
 
@@ -3207,6 +3255,7 @@ mod create_multiplayer_draft_tests {
             "test-room",
             "Swiss",
             "Competitive",
+            2, // Medium; see `a_pod_bot_ignores_a_previous_drafts_difficulty`
         )
         .expect("commander draft should start");
 
@@ -3236,6 +3285,7 @@ mod create_multiplayer_draft_tests {
             "test-room",
             "Swiss",
             "Competitive",
+            2, // Medium; see `a_pod_bot_ignores_a_previous_drafts_difficulty`
         )
         .expect_err("kind 6 is unmapped");
         assert!(
@@ -3244,6 +3294,64 @@ mod create_multiplayer_draft_tests {
         );
 
         clear_state();
+    }
+
+    /// Phase D's discriminating test: a pod bot plays at the strength THIS pod
+    /// asked for, not at whatever the last draft in this tab left behind.
+    ///
+    /// `DIFFICULTY` is a per-thread `Cell` with no reset, and
+    /// `create_multiplayer_draft_inner` never wrote it before this change. So a
+    /// player who ran a Quick draft at `VeryHard` and then hosted a pod in the
+    /// same worker got a `VeryHard` pod bot, silently. That is the contamination
+    /// this asserts against, seeded here exactly as `start_quick_draft` would
+    /// have seeded it.
+    ///
+    /// TWO legs, because one is satisfiable by a function that always writes
+    /// `Medium`: the second call asks for `Hard` from the same contaminated
+    /// starting point and must get it.
+    #[test]
+    fn a_pod_bot_ignores_a_previous_drafts_difficulty() {
+        clear_state();
+        DIFFICULTY.with(|cell| cell.set(AiDifficulty::VeryHard));
+        // Positive control that the seeding took. Without it, a test whose
+        // seeding silently failed would pass on a cell that was already
+        // `Medium` by default.
+        assert_eq!(DIFFICULTY.with(|cell| cell.get()), AiDifficulty::VeryHard);
+
+        create_multiplayer_draft_inner(
+            &commander_pool_input_json(),
+            COMMANDER_SEATS_JSON,
+            4, // CommanderDraft
+            42,
+            "test-room",
+            "Swiss",
+            "Competitive",
+            2, // Medium — what this pod's host asked for.
+        )
+        .expect("the pod should start");
+
+        // REVERT-FAILING: delete the `DIFFICULTY.with(..set..)` line from the
+        // pool arm and this reads `VeryHard`, the previous draft's answer.
+        assert_eq!(DIFFICULTY.with(|cell| cell.get()), AiDifficulty::Medium);
+
+        // The paired leg, from the same contaminated start, asking for a
+        // DIFFERENT rung: an implementation that hardcodes `Medium` reds here.
+        DIFFICULTY.with(|cell| cell.set(AiDifficulty::VeryHard));
+        create_multiplayer_draft_inner(
+            &commander_pool_input_json(),
+            COMMANDER_SEATS_JSON,
+            4, // CommanderDraft
+            42,
+            "test-room",
+            "Swiss",
+            "Competitive",
+            3, // Hard
+        )
+        .expect("the pod should start");
+        assert_eq!(DIFFICULTY.with(|cell| cell.get()), AiDifficulty::Hard);
+
+        clear_state();
+        DIFFICULTY.with(|cell| cell.set(AiDifficulty::Medium));
     }
 
     /// The numeric table is total and injective over every kind, and the decode
@@ -3287,6 +3395,7 @@ mod create_multiplayer_draft_tests {
             "test-room",
             "Swiss",
             "Competitive",
+            2, // Medium; see `a_pod_bot_ignores_a_previous_drafts_difficulty`
         )
         .expect("commander draft should start");
         let pack = view.current_pack.as_ref().expect("seat 0 has a pack");
@@ -3317,6 +3426,7 @@ mod create_multiplayer_draft_tests {
             "test-room",
             "Swiss",
             "Competitive",
+            2, // Medium; see `a_pod_bot_ignores_a_previous_drafts_difficulty`
         )
         .expect("commander draft should start");
         let pack = view.current_pack.as_ref().expect("seat 0 has a pack");
@@ -3564,6 +3674,7 @@ mod create_multiplayer_draft_tests {
             "test-room",
             "Swiss",
             "Competitive",
+            2, // Medium; see `a_pod_bot_ignores_a_previous_drafts_difficulty`
         )
         .expect("commander draft should start");
         seat_into_deckbuilding(seat, pool_size);
@@ -3589,6 +3700,7 @@ mod create_multiplayer_draft_tests {
             "test-room",
             "Swiss",
             "Competitive",
+            2, // Medium; see `a_pod_bot_ignores_a_previous_drafts_difficulty`
         )
         .expect("premier draft should start");
         seat_into_deckbuilding(seat, pool_size);
@@ -4050,6 +4162,7 @@ mod create_multiplayer_draft_tests {
             "commander-cube",
             "Swiss",
             "Competitive",
+            2, // Medium; see `a_pod_bot_ignores_a_previous_drafts_difficulty`
         )
         .expect("Commander cube should start");
 
@@ -4118,6 +4231,7 @@ mod create_multiplayer_draft_tests {
             "test-room",
             "Swiss",
             "Competitive",
+            2, // Medium; see `a_pod_bot_ignores_a_previous_drafts_difficulty`
         )
         .expect("the pod should start");
         seed_bot_pool(1, mono_white_bot_pool());

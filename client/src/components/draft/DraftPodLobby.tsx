@@ -19,7 +19,6 @@
 import { useCallback } from "react";
 import { useTranslation } from "react-i18next";
 
-import { isSharedStackDistribution } from "../../adapter/draft-adapter";
 import type { SeatPublicView } from "../../adapter/draft-adapter";
 import { menuButtonClass } from "../menu/buttonStyles";
 import { DRAFT_OFFLINE_ERROR, useMultiplayerDraftStore } from "../../stores/multiplayerDraftStore";
@@ -36,11 +35,12 @@ interface SeatCardProps {
   isHost: boolean;
   isLocalSeat: boolean;
   /**
-   * Will an empty seat actually receive a bot? NOT the host's checkbox: under
-   * `PackDistribution::SharedStackPiles` the reducer refuses a bot seat, so
-   * bot fill is enabled and seats nobody. Labelling an empty Winston seat "Bot"
-   * on the strength of the checkbox promises a player that never arrives — and
-   * is the same proxy-for-an-engine-refusal mistake the Start gate had.
+   * Will an empty seat actually receive a bot? NOT the host's checkbox, which
+   * is only a request: the answer also needs the engine to have published a
+   * procedure at all, so a seat is never labelled "Bot" on the strength of a
+   * request whose effect is still unknown. Labelling an empty seat "Bot" when
+   * none arrives promises the host a player that never comes, and tells them a
+   * short pod is accounted for when it is not.
    */
   botFillWillSeatBots: boolean;
   canKick: boolean;
@@ -175,36 +175,24 @@ export function DraftPodLobby({ onLeave }: DraftPodLobbyProps) {
 
   const isHost = role === "host";
   const filledSeats = seats.filter((s) => s.display_name).length;
-  // Bot fill only stands in for a legal seat count where bot seats are legal at
-  // all. Under `PackDistribution::SharedStackPiles` the reducer refuses a bot
-  // seat outright, so the host's checkbox pads NOTHING and the pod starts at
-  // whatever the humans filled — the same property `startDraftInner` suppresses
-  // bot fill on, asked here so the two cannot answer differently.
+  // Will bot fill actually pad this pod? The host's checkbox is a REQUEST; this
+  // is the answer, and the two are not the same value. Every distribution the
+  // engine ships now seats bots — a shared-stack pod included, where
+  // `resolve_shared_stack_bot_turns` drives the seat the reducer used to refuse
+  // — so the only thing standing between the request and the answer is whether
+  // the engine has published a procedure yet.
   //
-  // Without this, a lone host in a Winston pod got an ENABLED Start button (the
-  // store defaults `botFillEnabled` to `true`), and `createMultiplayerDraft`
-  // then failed the `min_pod_size` floor. `botFillEnabled` alone is the same
-  // shape of defect the bot-fill guard itself had: a client-side proxy for an
-  // engine refusal that stops tracking it for one kind.
+  // `null` distribution — the procedure has not loaded — is the conservative
+  // side deliberately: assume no padding, so Start stays gated on the humans'
+  // own seat count and no empty seat is labelled "Bot" on a promise the engine
+  // has not yet made. It fails CLOSED for both consumers, the `canStart` gate
+  // below and `SeatCard`'s label.
   //
-  // `null` distribution — the procedure has not loaded — falls to the
-  // conservative side: no padding is assumed, so the seat-count test decides.
-  // Whether the ENGINE refuses bot seats for this procedure — the question
-  // `apply_start_draft` and `apply_replace_seat_with_bot` both answer. Stated
-  // independently of whether the host has ASKED for bot fill, so it can gate the
-  // control itself as well as the control's effect.
-  //
-  // Its `null` side is deliberately the opposite of `botFillPadsThePod`'s, and
-  // both are the conservative answer to their own question: with no procedure
-  // loaded we must not assume padding WILL happen (so Start stays gated), and we
-  // must not assert the engine REFUSES it (so the control stays visible rather
-  // than vanishing and reappearing as the procedure arrives).
-  const botFillIsRefusedByProcedure =
-    packDistribution !== null && isSharedStackDistribution(packDistribution);
-  const botFillPadsThePod =
-    botFillEnabled
-    && packDistribution !== null
-    && !isSharedStackDistribution(packDistribution);
+  // Read from the DISTRIBUTION the engine published, never from `config.kind`
+  // and never from a `human_seats` scalar — that scalar is a per-kind constant
+  // that merely correlates with the question anyone actually wants answered,
+  // and `startDraftInner` carries the same rule for the same reason.
+  const botFillPadsThePod = botFillEnabled && packDistribution !== null;
   // The engine publishes the exact legal seat counts for this procedure and
   // tournament format. No client-side floor or fallback: `null` disables the
   // button until the engine answers, while bot fill remains an explicit path
@@ -316,25 +304,23 @@ export function DraftPodLobby({ onLeave }: DraftPodLobbyProps) {
       {/* Host controls */}
       {isHost && (
         <div className="flex items-center gap-4">
-          {/* Bot-fill toggle, hidden for a distribution the engine refuses bot
-              seats on. `botFillPadsThePod` already stops this toggle from moving
-              the Start gate or the seat labels, but leaving the control itself
-              on screen is the last form of the same defect: a client offering a
-              capability the engine does not have. Gated on the same predicate as
-              `botFillPadsThePod`, so the control and its effect cannot disagree
-              — including its conservative `null` side, which keeps the control
-              visible while the procedure is still loading. */}
-          {!botFillIsRefusedByProcedure && (
-            <label className="flex cursor-pointer items-center gap-2 text-sm text-white/70">
-              <input
-                type="checkbox"
-                checked={botFillEnabled}
-                onChange={toggleBotFill}
-                className="accent-emerald-400"
-              />
-              {t("lobby.fillWithBots")}
-            </label>
-          )}
+          {/* Bot-fill toggle, rendered for EVERY procedure. It was once hidden
+              for a shared-stack pod, on the correct reading of an engine that
+              refused a bot seat there; that refusal is gone and a Winston pod
+              now seats and drives a bot like any other, so hiding the control
+              would be the mirror of the old defect — withholding a capability
+              the engine does have. Nothing per-kind is asked here at all, which
+              is why there is no predicate left to keep in step with
+              `botFillPadsThePod`. */}
+          <label className="flex cursor-pointer items-center gap-2 text-sm text-white/70">
+            <input
+              type="checkbox"
+              checked={botFillEnabled}
+              onChange={toggleBotFill}
+              className="accent-emerald-400"
+            />
+            {t("lobby.fillWithBots")}
+          </label>
 
           <div className="flex-1" />
 

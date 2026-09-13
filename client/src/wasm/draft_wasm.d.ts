@@ -29,25 +29,49 @@ export function apply_draft_action(action_json: string): any;
 export function auto_pick(): any;
 
 /**
+ * Return the host-only original cube multiset for the game launched after a
+ * draft. This deliberately bypasses `DraftPlayerView`: players and spectators
+ * must never receive undealt cube entries or their duplicate counts.
+ */
+export function booster_pack_pool_for_game(): string[] | null;
+
+/**
  * Create a multiplayer draft session. Used by the P2P host to initialize a
- * Premier, Traditional, Sealed, or Commander draft with human + bot seats from
- * a Set pool, host-local Chaos candidate pools, or a custom Cube list.
+ * multiplayer draft of any `DraftKind` with a wire number, with human + bot
+ * seats from a Set pool, host-local Chaos candidate pools, or a custom Cube
+ * list. A shared-stack kind admits bot seats like any other; their turns are
+ * driven by `resolve_shared_stack_bot_turns`, which the host calls after each
+ * human decision.
  *
  * - `pool_input_json`: serialized `PoolInput` discriminated union
  *   (`{ "type": "Set" | "Chaos" | "Cube", "data": { ... } }`)
  * - `seats_json`: JSON array of SeatDescriptors
- * - `kind`: 0=Quick, 1=Premier, 2=Traditional, 3=Sealed, 4=CommanderDraft
- *   (CR 903.13a). The mapping's single authority is `draft_kind_wire_number`.
- *   Flows through to `DraftConfig.kind` unchanged. Tournament match format is
- *   identical to set drafts.
+ * - `kind`: the wire number for a `DraftKind`. The mapping's single authority
+ *   is `draft_kind_wire_number` — read it there rather than restating it here,
+ *   which is what keeps a widening from leaving this list stale. Flows through
+ *   to `DraftConfig.kind` unchanged. Tournament match format is identical to
+ *   set drafts.
  * - `seed`: RNG seed for deterministic pack generation
  * - `draft_code`: unique room identifier
+ * - `difficulty`: the bot strength this pod's bot seats play at, through
+ *   `map_difficulty` (0..=4, anything else is `Medium`). APPENDED LAST, and it
+ *   must stay last: the client's call sites and their test mocks read this
+ *   boundary positionally.
+ *
+ *   It is not cosmetic. `DIFFICULTY` is a per-thread `Cell` with no reset that
+ *   outlives the draft that set it, and until now this entry point never wrote
+ *   it — so a player who finished a Quick draft at `VeryHard` and then hosted
+ *   a pod in the same tab got a `VeryHard` pod bot, silently, with no UI
+ *   saying so. Every other entry point that creates a session writes this cell
+ *   (`start_quick_draft`, `start_sealed_draft`, `start_quick_cube_draft`,
+ *   `import_draft_session`); this one now does too, so the strength a pod
+ *   plays at is the strength its host asked for.
  *
  * Stores the session in the same thread-local as Quick Draft (one active
  * draft at a time per WASM instance). Returns the initial DraftPlayerView
  * for seat 0.
  */
-export function create_multiplayer_draft(pool_input_json: string, seats_json: string, kind: number, seed: number, draft_code: string, tournament_format: string, pod_policy: string): any;
+export function create_multiplayer_draft(pool_input_json: string, seats_json: string, kind: number, seed: number, draft_code: string, tournament_format: string, pod_policy: string, difficulty: number): any;
 
 /**
  * The engine-owned per-kind axes for a numeric draft kind. The display layer
@@ -65,13 +89,6 @@ export function draft_procedure(kind: number, tournament_format: string): any;
  * Chaos layout's complete assignment matrix and must not be sent to guests.
  */
 export function export_draft_session(): string;
-
-/**
- * Get the host-only original cube multiset used to build in-game boosters.
- * Cube sessions return their exact source (including duplicates), legacy Cube
- * sessions return `[]`, and ordinary set sessions return `null`.
- */
-export function booster_pack_pool_for_game(): string[] | null;
 
 /**
  * Narrow a limited-pool listing through the ENGINE's filtering authority
@@ -227,7 +244,9 @@ export function submit_pick(card_instance_id: string): any;
  * picks): every card the seat drafts this step, as a JSON array of instance
  * ids. `apply_pick_inner` owns the count contract — one id for the four CR
  * 905.1a kinds, two for CommanderDraft, dropping to the remainder on an odd
- * final pick.
+ * final pick. `Winston` has NO PICK STEP AT ALL and never reaches this
+ * function: a shared-stack turn is a whole-pile
+ * `DraftAction::SharedStackDecision`.
  *
  * The JSON encoding mirrors `submit_pick_with_draft_effect_for_seat` below
  * byte for byte. It is deliberately NOT tolerant of a bare id: a bare string
@@ -284,7 +303,7 @@ export interface InitOutput {
     readonly apply_draft_action: (a: number, b: number) => [number, number, number];
     readonly auto_pick: () => [number, number, number];
     readonly booster_pack_pool_for_game: () => [number, number, number];
-    readonly create_multiplayer_draft: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number];
+    readonly create_multiplayer_draft: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number) => [number, number, number];
     readonly draft_procedure: (a: number, b: number, c: number) => [number, number, number];
     readonly export_draft_session: () => [number, number, number, number];
     readonly filter_pool_listing: (a: number, b: number, c: number, d: number) => [number, number, number];
@@ -294,6 +313,7 @@ export interface InitOutput {
     readonly get_view: () => [number, number, number];
     readonly get_view_for_seat: (a: number) => [number, number, number];
     readonly import_draft_session: (a: number, b: number, c: number) => [number, number, number];
+    readonly init_panic_hook: () => void;
     readonly load_card_database: (a: number, b: number) => [number, number, number];
     readonly pool_filter_options: (a: number, b: number) => [number, number, number];
     readonly resolve_shared_stack_bot_turns: () => [number, number, number];
@@ -310,7 +330,6 @@ export interface InitOutput {
     readonly suggest_deck: () => [number, number, number];
     readonly suggest_lands: (a: number, b: number) => [number, number, number];
     readonly suggest_lands_for_seat: (a: number, b: number, c: number) => [number, number, number];
-    readonly init_panic_hook: () => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_free: (a: number, b: number, c: number) => void;
