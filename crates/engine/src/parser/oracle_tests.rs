@@ -14128,6 +14128,89 @@ fn for_each_drawn_this_way_sibling_is_not_folded_as_prevention_rider() {
     );
 }
 
+/// #8849 (MED) — GUARD, REAL PARSER PATH. A clause whose LEADING distributive
+/// quantifier names a DRAW must not fold onto a preceding prevention merely
+/// because the clause also contains the words "prevented this way".
+/// `parse_for_each_card_drawn_this_way` lowers to the same
+/// `QuantityRef::EventContextAmount` the prevention grammar does, so before
+/// the anaphor binding this clause folded and then repeated on PREVENTED
+/// DAMAGE rather than on cards drawn. Synthetic text (no printed carrier —
+/// measured: zero corpus cards pair the two anaphors), but it reaches
+/// `parse_oracle_text` -> `parse_effect_chain_ir` -> `lower_effect_chain_ir`
+/// exactly as a card would, not a synthetic predicate call.
+///
+/// SEPARATOR NOTE: the maintainer's example uses a literal `\n` between the
+/// two sentences. Measured this round: a `\n`-separated pair parses to TWO
+/// INDEPENDENT top-level abilities (no `sub_ability` link at all) — the
+/// newline is a harder ability boundary than a period, so that shape was
+/// never at risk of folding in the first place and cannot exercise conjunct
+/// 2. The period-space separator below (matching every real card's printed
+/// style, including Inkshield's own "...this turn. For each...") produces
+/// the actual `sub_ability` chain conjunct 2 gates, and is RED at base with
+/// `sub_link == ContinuationStep` (measured).
+/// CR 615.5 (the additional effect refers to the amount PREVENTED) + CR 608.2c.
+#[test]
+fn mixed_anaphor_for_each_drawn_this_way_rider_is_not_folded_onto_a_prevention() {
+    let oracle = "Prevent all combat damage that would be dealt to you this turn. \
+                   For each card drawn this way, you gain life equal to the damage \
+                   prevented this way.";
+    let parsed = parse_oracle_text(
+        oracle,
+        "Mixed Anaphor Test Card",
+        &[],
+        &["Instant".into()],
+        &[],
+    );
+
+    // Reach-guard 1: zero Effect::Unimplemented anywhere in the parse.
+    for ability in &parsed.abilities {
+        let mut current = Some(ability);
+        while let Some(a) = current {
+            assert!(
+                !matches!(a.effect.as_ref(), Effect::Unimplemented { .. }),
+                "Mixed Anaphor Test Card: parse must not contain Effect::Unimplemented, got {:?}",
+                a.effect
+            );
+            current = a.sub_ability.as_deref();
+        }
+    }
+
+    // Reach-guard 2: the root effect is PreventDamage, so the enclosing gate
+    // guard was satisfied and the predicate really ran.
+    let root = parsed
+        .abilities
+        .iter()
+        .find(|a| matches!(a.effect.as_ref(), Effect::PreventDamage { .. }))
+        .unwrap_or_else(|| {
+            panic!("Mixed Anaphor Test Card: must have a PreventDamage root, got {parsed:?}")
+        });
+    let sub = root
+        .sub_ability
+        .as_deref()
+        .expect("Mixed Anaphor Test Card: PreventDamage root must carry a sub_ability");
+
+    // Reach-guard 3: conjunct 1 (shape) passed — the rider's repeat_for IS
+    // EventContextAmount — so the refusal below is attributable to conjunct 2,
+    // not to a parse failure upstream.
+    assert!(
+        sub.repeat_for.as_ref().is_some_and(|qty| qty
+            .any_ref(&mut |reference| matches!(reference, QuantityRef::EventContextAmount))),
+        "Mixed Anaphor Test Card: rider's repeat_for must still read EventContextAmount, got {:?}",
+        sub.repeat_for
+    );
+
+    // The assertion under test: the mixed-anaphor rider must NOT fold to
+    // ContinuationStep — it must stay SequentialSibling.
+    assert_eq!(
+        sub.sub_link,
+        SubAbilityLink::SequentialSibling,
+        "Mixed Anaphor Test Card: a rider whose LEADING quantifier names a DRAW must not \
+         fold onto a preceding PreventDamage merely because it also mentions \
+         \"prevented this way\", got {:?}",
+        sub.sub_link
+    );
+}
+
 /// #8777 (VM-5) — HOSTILE / scalar sibling: Reverse Damage's rider stays
 /// `SequentialSibling` (charter constraint: this fix must not change its
 /// behaviour). Reverse Damage is measured BROKEN independent of this change

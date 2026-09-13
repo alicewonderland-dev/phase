@@ -50,9 +50,29 @@ use engine::types::identifiers::CardId;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
 
+/// NOTE (#8777, PR #8849): this helper previously hand-filled the rider's `targets` with
+/// `vec![TargetRef::Object(chosen)]`. The real parse path never does — sub-abilities start with
+/// empty targets (`ability_utils::build_resolved_from_def_with_targets`) — so this fixture did
+/// NOT exercise the `runtime_execute` parent-target binding and was green for a reason the card
+/// does not enjoy. That binding is now performed by
+/// `effects::bind_detached_continuation_to_parent` and is covered end to end by
+/// `inkshield_prevented_this_way_token_rider.rs`. Converting this file to a real cast (flash
+/// creature + ETB target choice) is separate work.
+///
+/// MEASURED CONSEQUENCE OF THE HAND-FILL: leaving the old hand-fill in place actively breaks
+/// under the fix, not just masks it — `targeting::parent_chain_referents`' tier 2
+/// (`parent_chain_targets_from_root` → `flatten_targets_in_chain`) concatenates EVERY node's
+/// `targets` across the whole chain. With both `prevent.targets` and `counter_rider.targets` set
+/// to `[chosen]`, flattening returns `[chosen, chosen]`, and the binding (correctly) installs
+/// that duplicate, doubling every counter placement. The fix below — leaving `counter_rider`
+/// with NO pre-set `targets` — is what makes the fixture representative of a real parse (where
+/// only the resolving chain ROOT carries targets) instead of merely not-crashing.
+///
 /// Build the chained `PreventDamage → PutCounter` sub-ability that Gatta and
 /// Luzzu's parser produces, parameterized on `chosen` so each test can wire
-/// the parent target into both `ability.targets` propagation slots.
+/// the parent target into the root `ability.targets` slot only — the sub-ability's `targets`
+/// is left empty, matching what the real parse-and-build pipeline always produces, and is
+/// populated at install time by `bind_detached_continuation_to_parent`.
 fn build_gatta_prevention_chain(
     gatta: engine::types::identifiers::ObjectId,
     chosen: engine::types::identifiers::ObjectId,
@@ -64,7 +84,7 @@ fn build_gatta_prevention_chain(
             count: QuantityExpr::Fixed { value: 1 },
             target: TargetFilter::ParentTarget,
         },
-        vec![TargetRef::Object(chosen)],
+        Vec::new(),
         gatta,
         controller,
     );

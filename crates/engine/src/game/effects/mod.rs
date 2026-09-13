@@ -8460,6 +8460,142 @@ pub(crate) fn ability_refs_parent_target(ability: &ResolvedAbility) -> bool {
             .is_some_and(ability_refs_parent_target)
 }
 
+/// True when any effect in the ability chain references a parent OBJECT anaphor
+/// (including nested sub/else abilities). Mirrors `ability_refs_parent_target`'s
+/// walk over `effect_parent_ref_slots`; narrower in exactly one respect — see
+/// `delayed_trigger::filter_refs_parent_object_anaphor`'s doc.
+pub(crate) fn ability_pins_object_anaphor(ability: &ResolvedAbility) -> bool {
+    effect_parent_ref_slots(&ability.effect)
+        .iter()
+        .any(|filter| delayed_trigger::filter_refs_parent_object_anaphor(filter))
+        || ability
+            .sub_ability
+            .as_deref()
+            .is_some_and(ability_pins_object_anaphor)
+        || ability
+            .else_ability
+            .as_deref()
+            .is_some_and(ability_pins_object_anaphor)
+}
+
+/// CR 608.2c + CR 615.5 + CR 400.7: bind a continuation that is about to be DETACHED from its
+/// parent resolution chain to the parent's selected referent(s).
+///
+/// `build_resolved_from_def_with_targets` gives only the ROOT its targets — sub-abilities start
+/// empty on purpose, because `resolve_ability_chain` applies parent-target propagation as it
+/// walks (`game/ability_utils.rs`). A continuation that is lifted OUT of that walk never sees
+/// the propagation, so its `ParentTarget` / `ParentTargetSlot` / `ParentTargetController` /
+/// `ParentTargetOwner` anaphors resolve against an empty vector and the effect silently does
+/// nothing. This closes that gap at the prevention seam.
+///
+/// SCOPE — this is the REFERENT half of the detach binding, and ONLY that half.
+/// `effects::delayed_trigger::resolve` performs a LARGER binding at its own seam. It ALSO
+/// prefers `context.forwarded_result_context.object_incarnations` over recomputed pins (mirrored
+/// below — see PIN PREFERENCE), suppresses pinning under `condition_names_referent_zone_change`,
+/// and runs `snapshot_parent_dependent_quantities_in_ability_chain` first. The last of these is
+/// deliberately NOT done here. CR 603.7c requires it there because a delayed trigger resolves
+/// after its parent's resolution scope is gone, so parent-dependent quantities must be frozen at
+/// creation. A prevention rider is the opposite: CR 615.5's additional effect "takes place
+/// immediately afterward", per prevented event, and its amount is read live from
+/// `state.last_effect_count` (stamped at `game/combat_damage.rs`). Freezing a parent-dependent
+/// quantity at install would pre-empt that.
+/// MEASURED, so the omission is not load-bearing for today's corpus either:
+/// `snapshot_parent_dependent_quantities` walks only EFFECT quantity fields (Mana count,
+/// DealDamage/DamageAll/DamageEachPlayer/GainLife/LoseLife amount, Draw/Mill/PutCounter count,
+/// Pump/PumpAll P/T, ChangeZone.enter_with_counters) — it never walks `ability.repeat_for` —
+/// and `snapshot_quantity_ref` has no `EventContextAmount` arm (it falls to `_ => None`). So
+/// calling it would change nothing for the current riders; it is omitted for the rule, not for
+/// the symptom. `delayed_trigger::resolve` also runs
+/// `stamp_triggering_source_origins_in_ability_chain`, `rebind_last_created_to_parent_target` and
+/// stamps `scoped_player` — all correctly irrelevant at this seam (none of them touch the
+/// referent or its pin).
+/// **DO NOT unify this function with `delayed_trigger::resolve`'s inline binding.** They share
+/// the referent authority (`targeting::parent_chain_referents`) and the pin preference below;
+/// merging the call sites would silently give a prevention rider the CR 603.7c `TriggeringSource`
+/// fallback and the quantity-freeze, which are different rules.
+///
+/// GATED on `ability_refs_parent_target`: a continuation with no parent anaphor keeps an EMPTY
+/// `targets`, which is what it means. Copying the parent's targets onto every continuation would
+/// lie to `ResolvedAbility::live_object_targets`, `pinned_object_targets_all_stale`, the
+/// CR 608.2b target-legality recheck and every `ObjectScope::Target` reader — for the corpus
+/// riders that carry no anaphor at all (Inkshield's `Token`, Awe Strike's `GainLife`,
+/// Comeuppance's / New Way Forward's `DealDamage`, …).
+///
+/// NO REFERENT IS NOT AN ERROR: when `parent_chain_referents` returns `None` the parent's chain
+/// named no referent (an untargeted parent whose descendant still carries an anaphor — Clay
+/// Pigeon's "Otherwise, sacrifice it"), and the continuation keeps its empty `targets` so the
+/// anaphor resolves to nothing (CR 608.2b). It does NOT fall back to the creation event's
+/// source; that is CR 603.7c, a delayed-trigger rule.
+///
+/// PIN PREFERENCE (CR 400.7): mirrors `delayed_trigger::resolve`'s preference — when the parent
+/// carries a `forwarded_result_context`, its `object_incarnations` were captured WHEN the
+/// forward happened and are the correct pin; recomputing `ObjectIncarnationRef::from_object` from
+/// CURRENT state would pin whatever incarnation the referent holds NOW, which is wrong if it
+/// changed incarnation between forward and install (the opposite of CR 400.7's intent). Falls
+/// back to recomputing from `referents` when there is no forwarded context. Pinning is
+/// restricted to genuine OBJECT anaphors by `ability_pins_object_anaphor` — controller/owner
+/// projections derive a player (CR 608.2h) and are built to survive departure.
+///
+/// Binds `targets` rather than rewriting filters (the `concrete_parent_target_filter` style used
+/// for delayed CONDITIONS) for two reasons: `targets` is what every one of the four
+/// `ParentTarget*` read paths ultimately consults — directly for `ParentTarget`, through
+/// `targeting::resolve_live_parent_slot_from_root` → `resolving_root_ability`'s self-fallback for
+/// `ParentTargetSlot`, and through `targeting::resolve_effect_player_ref` for the two player
+/// projections; and an EMPTY parent set degrades to "no referent, the effect does nothing"
+/// (CR 608.2b) instead of `TargetFilter::Any`, which is the over-application hazard
+/// `delayed_trigger::reaches_bare_parent_target_bind` exists to refuse.
+///
+/// KNOWN LIMITATION (no corpus carrier, so untested): for an OBJECT-HOSTED shield whose rider
+/// uses `ParentTargetSlot`, `resolving_root_ability`'s `entry_carries_ability` match
+/// (`entry.id == ability.source_id || entry.source_id == ability.source_id`) can select an
+/// UNRELATED ability of the same source that happens to be on the stack when the damage is
+/// prevented, flattening a different chain instead of falling back to the rider itself. Every
+/// current carrier uses bare `ParentTarget`, which does not take that path.
+pub(crate) fn bind_detached_continuation_to_parent(
+    state: &GameState,
+    parent: &ResolvedAbility,
+    continuation: &mut ResolvedAbility,
+) {
+    if !ability_refs_parent_target(continuation) {
+        return;
+    }
+    let Some(referents) = crate::game::targeting::parent_chain_referents(state, parent) else {
+        return;
+    };
+    if ability_pins_object_anaphor(continuation) {
+        // CR 400.7: prefer the parent's forwarded-result incarnations over recomputing from
+        // live state. The forwarded context captured them WHEN the forward happened, so a
+        // referent that changed incarnation between forward and install fails the pin rather
+        // than passing it — recomputing would read the new incarnation and wrongly succeed.
+        //
+        // This mirrors `delayed_trigger::resolve`'s preference so the two detach seams share
+        // one referent authority. It is MIRROR-ONLY today: measured over the install
+        // population, no prevention parent carries `forward_result`, and no in-class referent
+        // is a player, so neither this arm nor the `TargetRef::Player(_) => None` arm below is
+        // reached by any current card and no fixture enters them. Kept rather than dropped
+        // because diverging from the sibling seam is what silently breaks the next card that
+        // does forward a result into a prevention.
+        let pins = parent
+            .context
+            .forwarded_result_context
+            .as_ref()
+            .map(|context| context.object_incarnations.clone())
+            .unwrap_or_else(|| {
+                referents
+                    .iter()
+                    .filter_map(|target| match target {
+                        TargetRef::Object(id) => {
+                            state.objects.get(id).map(ObjectIncarnationRef::from_object)
+                        }
+                        TargetRef::Player(_) => None,
+                    })
+                    .collect()
+            });
+        continuation.set_target_incarnations_recursive(pins);
+    }
+    continuation.targets = referents;
+}
+
 /// CR 603.7 + CR 109.5: Replace the first `TargetRef::Object` in a target
 /// slice with the supplied object id. Used by the `repeat_for: TrackedSetSize`
 /// per-iteration rebind so the i-th iteration's parent reference (e.g.,
