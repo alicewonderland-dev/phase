@@ -37,7 +37,15 @@ export function DraftSpectatorDashboard({ view }: DraftSpectatorDashboardProps) 
             >
               <span className="font-medium text-white">{seat.display_name}</span>
               <span className="text-[10px] uppercase tracking-wide text-slate-400">
-                {seat.pick_status}
+                {/* The engine's `PickStatus` is a wire enum, not copy. Rendering it
+                    raw put an untranslated `NotDrafting` in front of every
+                    spectator already, and a new variant reaches the screen the same
+                    way — so the fix is the lookup, keyed on the variant name, and
+                    not one more variant-shaped patch. `react-i18next.d.ts` types
+                    `t`'s key against the English catalog, so a variant with no
+                    `pickStatus.*` entry is a compile error here rather than a
+                    surprise at runtime. */}
+                {t(`pickStatus.${seat.pick_status}`)}
                 {seat.has_submitted_deck ? ` · ${t("spectator.deckSubmitted")}` : ""}
               </span>
             </li>

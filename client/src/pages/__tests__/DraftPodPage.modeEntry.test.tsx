@@ -177,6 +177,51 @@ describe("DraftPodPage ?kind= mode entry", () => {
     ).toBeInTheDocument();
   });
 
+  it("applies the deep-linked Winston kind through the same slug map", async () => {
+    renderAt("/draft-pod?kind=winston");
+
+    // REVERT-FAILING: with no `winston` entry in `DRAFT_KIND_ENTRIES` the slug
+    // resolves to `null` and the kind stays "Premier". `podSize: 6` is the
+    // fixture's, so a hardcoded client default fails the second half.
+    await waitFor(() =>
+      expect(useDraftPodStore.getState().config).toMatchObject({
+        kind: "Winston",
+        podSize: 6,
+      }),
+    );
+    expect(mocks.draftProcedure).toHaveBeenCalledWith("Winston", "Swiss");
+  });
+
+  it("offers Winston in the pod kind selector", async () => {
+    const user = userEvent.setup();
+    renderAt("/draft-pod?kind=winston");
+
+    await user.click(screen.getByRole("button", { name: /Host a Pod/ }));
+
+    // Reach guard: the pre-existing radios rendered.
+    expect(screen.getByRole("radio", { name: "Premier" })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("radio", { name: "Winston" })).toBeChecked());
+    expect(
+      screen.getByText(
+        "Two players draft one shared face-down stack through three piles: on your turn, look at a pile and take it or decline and add a card to it.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("ignores an unknown ?kind= slug instead of failing the route", async () => {
+    const user = userEvent.setup();
+    renderAt("/draft-pod?kind=nonesuch");
+
+    await user.click(screen.getByRole("button", { name: /Host a Pod/ }));
+
+    expect(useDraftPodStore.getState().config.kind).toBe("Premier");
+    expect(screen.getByRole("radio", { name: "Winston" })).not.toBeChecked();
+    await waitFor(() => expect(mocks.draftProcedure).toHaveBeenCalledWith("Premier", "Swiss"));
+    // The witness that no kind-intent effect fired, as in the bare-route case:
+    // the store keeps its own default rather than adopting the fixture's 6.
+    expect(useDraftPodStore.getState().config.podSize).toBe(8);
+  });
+
   it("leaves a bare /draft-pod on the Premier default", async () => {
     const user = userEvent.setup();
     renderAt("/draft-pod");

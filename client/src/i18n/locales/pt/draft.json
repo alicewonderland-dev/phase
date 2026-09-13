@@ -79,6 +79,13 @@
     "label": "Cronômetro de Escolha",
     "seconds": "{{count}}s"
   },
+  "pickStatus": {
+    "Pending": "Escolhendo",
+    "Picked": "Escolhido",
+    "Waiting": "Aguardando",
+    "TimedOut": "Tempo esgotado",
+    "NotDrafting": "Fora do draft"
+  },
   "scoreBadge": {
     "label": "Pontuação: {{count}} vitórias"
   },
@@ -366,6 +373,10 @@
       "title": "Commander Draft",
       "description": "Drafte duas cartas de cada vez em um pod, monte um deck Commander de 60 cartas e depois jogue uma partida multijogador."
     },
+    "winstonDraft": {
+      "title": "Winston Draft",
+      "description": "Dois jogadores compartilham uma pilha virada para baixo em três montes: pegue um monte ou recuse-o, depois monte o deck e jogue."
+    },
     "podInProgress": "Pod Draft em Andamento",
     "guestPodInProgress": "Pod ingressado pronto para reconectar",
     "podLabel": "Pod {{kind}}",
@@ -599,6 +610,42 @@
     "hostLeft": "O anfitrião saiu do draft",
     "connection": "Erro de Conexão",
     "retry": "Tentar reconectar"
+  },
+  "winston": {
+    "heading": "Winston Draft",
+    "yourTurn": "Sua vez — monte {{index}}",
+    "otherSeatTurn": "{{name}} está decidindo",
+    "seatFallback": "Assento {{index}}",
+    "turnHint": "Pegue o monte ou recuse-o. Recusar coloca nele uma carta da pilha principal e leva você ao monte seguinte; se recusar o último, você compra a carta do topo da pilha principal.",
+    "mainStackRemaining_one": "{{count, number}} carta virada para baixo na pilha principal",
+    "mainStackRemaining_few": "{{count, number}} cartas viradas para baixo na pilha principal",
+    "mainStackRemaining_many": "{{count, number}} cartas viradas para baixo na pilha principal",
+    "mainStackRemaining_other": "{{count, number}} cartas viradas para baixo na pilha principal",
+    "cardsLeft_one": "{{count, number}} carta restante no draft",
+    "cardsLeft_few": "{{count, number}} cartas restantes no draft",
+    "cardsLeft_many": "{{count, number}} cartas restantes no draft",
+    "cardsLeft_other": "{{count, number}} cartas restantes no draft",
+    "stackShare": "Proporção das cartas restantes do draft que ainda estão viradas para baixo na pilha principal",
+    "pileLabel": "Monte {{index}}",
+    "pileTotal_one": "{{count, number}} carta",
+    "pileTotal_few": "{{count, number}} cartas",
+    "pileTotal_many": "{{count, number}} cartas",
+    "pileTotal_other": "{{count, number}} cartas",
+    "pileFaceDown": "Virado para baixo",
+    "deciding": "Decidindo sobre este monte",
+    "revealedNone": "Você ainda não olhou este monte",
+    "hiddenPiles": "Os montes ficam virados para baixo até chegar a sua vez.",
+    "take": "Pegar",
+    "takeAria": "Pegar o monte {{index}}",
+    "decline": "Recusar",
+    "declineAria": "Recusar o monte {{index}}",
+    "refusal": {
+      "PileNotActive": "Você não está decidindo sobre este monte.",
+      "PileEmpty": "Este monte está vazio, não há nada para pegar.",
+      "NoGuaranteedCard": "Recusar não pode mais lhe garantir uma carta neste turno, então pegar este monte é sua única jogada legal."
+    },
+    "refusalUnpublished": "O draft não publicou nenhum veredito para esta decisão.",
+    "playFirstChooser": "{{name}} escolhe quem joga primeiro nas partidas após o draft."
   },
   "lobby": {
     "title": "Lobby do Pod de Draft",

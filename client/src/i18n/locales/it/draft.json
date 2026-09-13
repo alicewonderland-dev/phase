@@ -79,6 +79,13 @@
     "label": "Timer di scelta",
     "seconds": "{{count}}s"
   },
+  "pickStatus": {
+    "Pending": "Sceglie",
+    "Picked": "Scelto",
+    "Waiting": "In attesa",
+    "TimedOut": "Tempo scaduto",
+    "NotDrafting": "Non in draft"
+  },
   "scoreBadge": {
     "label": "Punteggio: {{count}} vittorie"
   },
@@ -366,6 +373,10 @@
       "title": "Commander Draft",
       "description": "Drafta due carte alla volta in un pod, costruisci un mazzo Commander da 60 carte, poi gioca una partita multigiocatore."
     },
+    "winstonDraft": {
+      "title": "Winston Draft",
+      "description": "Due giocatori condividono una pila coperta divisa in tre mucchi: prendi un mucchio o rifiutalo, poi costruisci e gioca."
+    },
     "podInProgress": "Pod Draft in corso",
     "guestPodInProgress": "Pod partecipato pronto a riconnettersi",
     "podLabel": "Pod {{kind}}",
@@ -599,6 +610,42 @@
     "hostLeft": "L'host ha abbandonato il draft",
     "connection": "Errore di connessione",
     "retry": "Prova a riconnetterti"
+  },
+  "winston": {
+    "heading": "Winston Draft",
+    "yourTurn": "Tocca a te — mucchio {{index}}",
+    "otherSeatTurn": "{{name}} sta decidendo",
+    "seatFallback": "Posto {{index}}",
+    "turnHint": "Prendi il mucchio oppure rifiutalo. Rifiutandolo vi si aggiunge una carta dalla pila principale e passi al mucchio successivo; se rifiuti l'ultimo, peschi la prima carta della pila principale.",
+    "mainStackRemaining_one": "{{count, number}} carta coperta nella pila principale",
+    "mainStackRemaining_few": "{{count, number}} carte coperte nella pila principale",
+    "mainStackRemaining_many": "{{count, number}} carte coperte nella pila principale",
+    "mainStackRemaining_other": "{{count, number}} carte coperte nella pila principale",
+    "cardsLeft_one": "{{count, number}} carta rimasta nel draft",
+    "cardsLeft_few": "{{count, number}} carte rimaste nel draft",
+    "cardsLeft_many": "{{count, number}} carte rimaste nel draft",
+    "cardsLeft_other": "{{count, number}} carte rimaste nel draft",
+    "stackShare": "Quota delle carte rimaste nel draft ancora coperte nella pila principale",
+    "pileLabel": "Mucchio {{index}}",
+    "pileTotal_one": "{{count, number}} carta",
+    "pileTotal_few": "{{count, number}} carte",
+    "pileTotal_many": "{{count, number}} carte",
+    "pileTotal_other": "{{count, number}} carte",
+    "pileFaceDown": "Coperto",
+    "deciding": "Decisione su questo mucchio",
+    "revealedNone": "Non hai ancora guardato questo mucchio",
+    "hiddenPiles": "I mucchi restano coperti finché non tocca a te.",
+    "take": "Prendi",
+    "takeAria": "Prendi il mucchio {{index}}",
+    "decline": "Rifiuta",
+    "declineAria": "Rifiuta il mucchio {{index}}",
+    "refusal": {
+      "PileNotActive": "Non stai decidendo su questo mucchio.",
+      "PileEmpty": "Questo mucchio è vuoto, non c'è nulla da prendere.",
+      "NoGuaranteedCard": "Rifiutare non può più garantirti una carta in questo turno, quindi prendere questo mucchio è la tua unica mossa legale."
+    },
+    "refusalUnpublished": "Il draft non ha pubblicato alcun verdetto per questa decisione.",
+    "playFirstChooser": "{{name}} sceglie chi gioca per primo nelle partite dopo il draft."
   },
   "lobby": {
     "title": "Lobby del pod di draft",

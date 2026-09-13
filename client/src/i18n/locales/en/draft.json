@@ -79,6 +79,13 @@
     "label": "Pick Timer",
     "seconds": "{{count}}s"
   },
+  "pickStatus": {
+    "Pending": "Picking",
+    "Picked": "Picked",
+    "Waiting": "Waiting",
+    "TimedOut": "Timed out",
+    "NotDrafting": "Not drafting"
+  },
   "scoreBadge": {
     "label": "Score: {{count}} wins"
   },
@@ -374,6 +381,10 @@
       "title": "Commander Draft",
       "description": "Draft two cards at a time in a pod, build a 60-card Commander deck, then play one multiplayer game."
     },
+    "winstonDraft": {
+      "title": "Winston Draft",
+      "description": "Two players share one face-down stack across three piles — take a pile or decline it, then build and play."
+    },
     "podInProgress": "Pod Draft in Progress",
     "guestPodInProgress": "Joined Pod Ready to Reconnect",
     "podLabel": "{{kind}} Pod",
@@ -624,6 +635,42 @@
     "pools": "Pools (omniscient)",
     "poolSize": "{{count}} cards picked",
     "seat": "Seat {{index}}"
+  },
+  "winston": {
+    "heading": "Winston draft",
+    "yourTurn": "Your turn — pile {{index}}",
+    "otherSeatTurn": "{{name}} is deciding",
+    "seatFallback": "Seat {{index}}",
+    "turnHint": "Take the pile, or decline it. Declining puts one card from the main stack onto that pile and moves you to the next one; decline the last pile and you draw the top card of the main stack instead.",
+    "mainStackRemaining_one": "{{count, number}} card face down in the main stack",
+    "mainStackRemaining_few": "{{count, number}} cards face down in the main stack",
+    "mainStackRemaining_many": "{{count, number}} cards face down in the main stack",
+    "mainStackRemaining_other": "{{count, number}} cards face down in the main stack",
+    "cardsLeft_one": "{{count, number}} card left in the draft",
+    "cardsLeft_few": "{{count, number}} cards left in the draft",
+    "cardsLeft_many": "{{count, number}} cards left in the draft",
+    "cardsLeft_other": "{{count, number}} cards left in the draft",
+    "stackShare": "Share of the cards left in the draft that are still face down in the main stack",
+    "pileLabel": "Pile {{index}}",
+    "pileTotal_one": "{{count, number}} card",
+    "pileTotal_few": "{{count, number}} cards",
+    "pileTotal_many": "{{count, number}} cards",
+    "pileTotal_other": "{{count, number}} cards",
+    "pileFaceDown": "Face down",
+    "deciding": "Deciding on this pile",
+    "revealedNone": "You have not looked at this pile yet",
+    "hiddenPiles": "The piles stay face down until it is your turn.",
+    "take": "Take",
+    "takeAria": "Take pile {{index}}",
+    "decline": "Decline",
+    "declineAria": "Decline pile {{index}}",
+    "refusal": {
+      "PileNotActive": "You are not deciding on this pile.",
+      "PileEmpty": "This pile is empty, so there is nothing to take.",
+      "NoGuaranteedCard": "Declining can no longer leave you a card this turn, so taking this pile is your only legal move."
+    },
+    "refusalUnpublished": "The draft published no verdict for this decision.",
+    "playFirstChooser": "{{name}} chooses who plays first in the games after the draft."
   },
   "lobby": {
     "title": "Draft Pod Lobby",

@@ -79,6 +79,13 @@
     "label": "Czas na wybór",
     "seconds": "{{count}}s"
   },
+  "pickStatus": {
+    "Pending": "Wybiera",
+    "Picked": "Wybrano",
+    "Waiting": "Czeka",
+    "TimedOut": "Czas minął",
+    "NotDrafting": "Poza draftem"
+  },
   "scoreBadge": {
     "label": "Wynik: {{count}} wygranych"
   },
@@ -366,6 +373,10 @@
       "title": "Commander Draft",
       "description": "Draftuj po dwie karty naraz w grupie, zbuduj talię Commander z 60 kart, a potem rozegraj jedną grę wieloosobową."
     },
+    "winstonDraft": {
+      "title": "Winston Draft",
+      "description": "Dwóch graczy dzieli jeden zakryty stos na trzy kupki — weź kupkę albo ją odrzuć, a potem zbuduj talię i graj."
+    },
     "podInProgress": "Trwa draft w grupie",
     "guestPodInProgress": "Dołączony pod gotowy do ponownego połączenia",
     "podLabel": "Grupa {{kind}}",
@@ -599,6 +610,42 @@
     "hostLeft": "Gospodarz opuścił draft",
     "connection": "Błąd połączenia",
     "retry": "Spróbuj połączyć ponownie"
+  },
+  "winston": {
+    "heading": "Winston Draft",
+    "yourTurn": "Twoja kolej — kupka {{index}}",
+    "otherSeatTurn": "{{name}} podejmuje decyzję",
+    "seatFallback": "Miejsce {{index}}",
+    "turnHint": "Weź kupkę albo ją odrzuć. Odrzucenie dokłada do niej jedną kartę ze stosu głównego i przechodzisz do następnej kupki; jeśli odrzucisz ostatnią, dobierasz wierzchnią kartę stosu głównego.",
+    "mainStackRemaining_one": "{{count, number}} karta zakryta w stosie głównym",
+    "mainStackRemaining_few": "{{count, number}} karty zakryte w stosie głównym",
+    "mainStackRemaining_many": "{{count, number}} kart zakrytych w stosie głównym",
+    "mainStackRemaining_other": "{{count, number}} karty zakryte w stosie głównym",
+    "cardsLeft_one": "{{count, number}} karta pozostała w drafcie",
+    "cardsLeft_few": "{{count, number}} karty pozostałe w drafcie",
+    "cardsLeft_many": "{{count, number}} kart pozostałych w drafcie",
+    "cardsLeft_other": "{{count, number}} karty pozostałe w drafcie",
+    "stackShare": "Udział kart pozostałych w drafcie, które wciąż leżą zakryte w stosie głównym",
+    "pileLabel": "Kupka {{index}}",
+    "pileTotal_one": "{{count, number}} karta",
+    "pileTotal_few": "{{count, number}} karty",
+    "pileTotal_many": "{{count, number}} kart",
+    "pileTotal_other": "{{count, number}} karty",
+    "pileFaceDown": "Zakryte",
+    "deciding": "Decyzja o tej kupce",
+    "revealedNone": "Nie zajrzałeś jeszcze do tej kupki",
+    "hiddenPiles": "Kupki pozostają zakryte do twojej kolei.",
+    "take": "Weź",
+    "takeAria": "Weź kupkę {{index}}",
+    "decline": "Odrzuć",
+    "declineAria": "Odrzuć kupkę {{index}}",
+    "refusal": {
+      "PileNotActive": "Nie podejmujesz decyzji o tej kupce.",
+      "PileEmpty": "Ta kupka jest pusta, nie ma czego brać.",
+      "NoGuaranteedCard": "Odrzucenie nie może już zapewnić ci karty w tej turze, więc wzięcie tej kupki to twój jedyny legalny ruch."
+    },
+    "refusalUnpublished": "Draft nie opublikował werdyktu dla tej decyzji.",
+    "playFirstChooser": "{{name}} decyduje, kto zaczyna w partiach po drafcie."
   },
   "lobby": {
     "title": "Poczekalnia grupy draftu",

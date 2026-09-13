@@ -79,6 +79,13 @@
     "label": "Pick-Timer",
     "seconds": "{{count}}s"
   },
+  "pickStatus": {
+    "Pending": "Wählt",
+    "Picked": "Gewählt",
+    "Waiting": "Wartet",
+    "TimedOut": "Zeit abgelaufen",
+    "NotDrafting": "Draftet nicht"
+  },
   "scoreBadge": {
     "label": "Punktzahl: {{count}} Siege"
   },
@@ -366,6 +373,10 @@
       "title": "Commander Draft",
       "description": "Draftet zwei Karten gleichzeitig in einem Pod, baut ein Commander-Deck mit 60 Karten und spielt dann eine Mehrspielerpartie."
     },
+    "winstonDraft": {
+      "title": "Winston Draft",
+      "description": "Zwei Spieler teilen sich einen verdeckten Stapel in drei Häufchen — nehmt ein Häufchen oder lehnt es ab, dann baut und spielt."
+    },
     "podInProgress": "Pod Draft läuft",
     "guestPodInProgress": "Beigetretener Pod bereit zum Wiederverbinden",
     "podLabel": "{{kind}}-Pod",
@@ -599,6 +610,42 @@
     "hostLeft": "Der Host hat den Draft verlassen",
     "connection": "Verbindungsfehler",
     "retry": "Erneut verbinden"
+  },
+  "winston": {
+    "heading": "Winston Draft",
+    "yourTurn": "Du bist dran — Häufchen {{index}}",
+    "otherSeatTurn": "{{name}} entscheidet",
+    "seatFallback": "Sitz {{index}}",
+    "turnHint": "Nimm das Häufchen oder lehne es ab. Beim Ablehnen wird eine Karte vom Hauptstapel darauf gelegt und du gehst zum nächsten Häufchen; lehnst du das letzte ab, ziehst du stattdessen die oberste Karte des Hauptstapels.",
+    "mainStackRemaining_one": "{{count, number}} Karte verdeckt im Hauptstapel",
+    "mainStackRemaining_few": "{{count, number}} Karten verdeckt im Hauptstapel",
+    "mainStackRemaining_many": "{{count, number}} Karten verdeckt im Hauptstapel",
+    "mainStackRemaining_other": "{{count, number}} Karten verdeckt im Hauptstapel",
+    "cardsLeft_one": "{{count, number}} Karte im Draft übrig",
+    "cardsLeft_few": "{{count, number}} Karten im Draft übrig",
+    "cardsLeft_many": "{{count, number}} Karten im Draft übrig",
+    "cardsLeft_other": "{{count, number}} Karten im Draft übrig",
+    "stackShare": "Anteil der verbleibenden Draft-Karten, die noch verdeckt im Hauptstapel liegen",
+    "pileLabel": "Häufchen {{index}}",
+    "pileTotal_one": "{{count, number}} Karte",
+    "pileTotal_few": "{{count, number}} Karten",
+    "pileTotal_many": "{{count, number}} Karten",
+    "pileTotal_other": "{{count, number}} Karten",
+    "pileFaceDown": "Verdeckt",
+    "deciding": "Entscheidung über dieses Häufchen",
+    "revealedNone": "Du hast dir dieses Häufchen noch nicht angesehen",
+    "hiddenPiles": "Die Häufchen bleiben verdeckt, bis du an der Reihe bist.",
+    "take": "Nehmen",
+    "takeAria": "Häufchen {{index}} nehmen",
+    "decline": "Ablehnen",
+    "declineAria": "Häufchen {{index}} ablehnen",
+    "refusal": {
+      "PileNotActive": "Du entscheidest nicht über dieses Häufchen.",
+      "PileEmpty": "Dieses Häufchen ist leer, es gibt nichts zu nehmen.",
+      "NoGuaranteedCard": "Ablehnen kann dir in diesem Zug keine Karte mehr sichern, deshalb ist das Nehmen dieses Häufchens dein einziger legaler Zug."
+    },
+    "refusalUnpublished": "Der Draft hat für diese Entscheidung kein Urteil veröffentlicht.",
+    "playFirstChooser": "{{name}} entscheidet, wer in den Partien nach dem Draft beginnt."
   },
   "lobby": {
     "title": "Draft-Pod-Lobby",

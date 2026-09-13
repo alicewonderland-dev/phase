@@ -79,6 +79,13 @@
     "label": "Minuteur de sélection",
     "seconds": "{{count}} s"
   },
+  "pickStatus": {
+    "Pending": "Choisit",
+    "Picked": "A choisi",
+    "Waiting": "En attente",
+    "TimedOut": "Temps écoulé",
+    "NotDrafting": "Hors draft"
+  },
   "scoreBadge": {
     "label": "Score : {{count}} victoires"
   },
@@ -366,6 +373,10 @@
       "title": "Commander Draft",
       "description": "Draftez deux cartes à la fois dans un pod, construisez un deck Commander de 60 cartes, puis jouez une partie multijoueur."
     },
+    "winstonDraft": {
+      "title": "Winston Draft",
+      "description": "Deux joueurs se partagent une pile face cachée répartie en trois tas : prenez un tas ou refusez-le, puis construisez et jouez."
+    },
     "podInProgress": "Pod Draft en cours",
     "guestPodInProgress": "Pod rejoint prêt à se reconnecter",
     "podLabel": "Pod {{kind}}",
@@ -599,6 +610,42 @@
     "hostLeft": "L'hôte a quitté le draft",
     "connection": "Erreur de connexion",
     "retry": "Réessayer la connexion"
+  },
+  "winston": {
+    "heading": "Winston Draft",
+    "yourTurn": "À vous de jouer — tas {{index}}",
+    "otherSeatTurn": "{{name}} décide",
+    "seatFallback": "Siège {{index}}",
+    "turnHint": "Prenez le tas ou refusez-le. Un refus y ajoute une carte de la pile principale et vous passez au tas suivant ; si vous refusez le dernier tas, vous piochez la carte du dessus de la pile principale.",
+    "mainStackRemaining_one": "{{count, number}} carte face cachée dans la pile principale",
+    "mainStackRemaining_few": "{{count, number}} cartes face cachée dans la pile principale",
+    "mainStackRemaining_many": "{{count, number}} cartes face cachée dans la pile principale",
+    "mainStackRemaining_other": "{{count, number}} cartes face cachée dans la pile principale",
+    "cardsLeft_one": "{{count, number}} carte restante dans le draft",
+    "cardsLeft_few": "{{count, number}} cartes restantes dans le draft",
+    "cardsLeft_many": "{{count, number}} cartes restantes dans le draft",
+    "cardsLeft_other": "{{count, number}} cartes restantes dans le draft",
+    "stackShare": "Part des cartes restantes du draft encore face cachée dans la pile principale",
+    "pileLabel": "Tas {{index}}",
+    "pileTotal_one": "{{count, number}} carte",
+    "pileTotal_few": "{{count, number}} cartes",
+    "pileTotal_many": "{{count, number}} cartes",
+    "pileTotal_other": "{{count, number}} cartes",
+    "pileFaceDown": "Face cachée",
+    "deciding": "Décision sur ce tas",
+    "revealedNone": "Vous n'avez pas encore regardé ce tas",
+    "hiddenPiles": "Les tas restent face cachée jusqu'à votre tour.",
+    "take": "Prendre",
+    "takeAria": "Prendre le tas {{index}}",
+    "decline": "Refuser",
+    "declineAria": "Refuser le tas {{index}}",
+    "refusal": {
+      "PileNotActive": "Vous ne décidez pas sur ce tas.",
+      "PileEmpty": "Ce tas est vide, il n'y a rien à prendre.",
+      "NoGuaranteedCard": "Refuser ne peut plus vous garantir une carte ce tour-ci : prendre ce tas est votre seul coup légal."
+    },
+    "refusalUnpublished": "Le draft n'a publié aucun verdict pour cette décision.",
+    "playFirstChooser": "{{name}} choisit qui joue en premier dans les parties qui suivent le draft."
   },
   "lobby": {
     "title": "Salon du Draft Pod",

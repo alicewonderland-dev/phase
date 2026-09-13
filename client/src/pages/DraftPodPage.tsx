@@ -32,14 +32,15 @@ import { HostControls, useHostDraftTopActions } from "../components/draft/HostCo
 import { LimitedDeckBuilder } from "../components/draft/LimitedDeckBuilder";
 import { PackDisplay, type PackDisplayController } from "../components/draft/PackDisplay";
 import { PickTimer } from "../components/draft/PickTimer";
-import { COMMANDER_DRAFT_ENTRY, type DraftKind } from "../components/draft/draftKind";
-import { distinctJoined } from "../adapter/draft-adapter";
+import { draftKindForEntry, type DraftKind } from "../components/draft/draftKind";
+import { distinctJoined, type SharedStackPileDecision } from "../adapter/draft-adapter";
 import { PodIcon } from "../components/draft/PodIcon";
 import { PoolPanel } from "../components/draft/PoolPanel";
 import { ScoreBadge } from "../components/draft/ScoreBadge";
 import { SeatStatusRing } from "../components/draft/SeatStatusRing";
 import { SetSelector } from "../components/draft/SetSelector";
 import { StandingsTable } from "../components/draft/StandingsTable";
+import { WinstonPileTable } from "../components/draft/WinstonPileTable";
 import { PodErrorBanner } from "../components/draft/PodErrorBanner";
 import {
   getResponsiveDraftLayout,
@@ -283,7 +284,7 @@ function PodSetup() {
           <label className="text-sm font-medium text-white/60">
             {t("podSetup.draftType")}
           </label>
-          <div className="flex gap-4">
+          <div className="flex flex-wrap gap-x-4 gap-y-1">
             <label className="flex min-h-11 items-center gap-2 py-2 text-sm text-white/70">
               <input
                 type="radio"
@@ -323,6 +324,16 @@ function PodSetup() {
                 className="accent-emerald-400"
               />
               {t("podSetup.kindCommanderDraft")}
+            </label>
+            <label className="flex items-center gap-2 text-sm text-white/70">
+              <input
+                type="radio"
+                name="draftKind"
+                checked={config.kind === "Winston"}
+                onChange={() => setConfig({ kind: "Winston" })}
+                className="accent-emerald-400"
+              />
+              {t("podSetup.kindWinston")}
             </label>
           </div>
           <p className="text-xs text-white/40">{kindDescription[config.kind]}</p>
@@ -929,6 +940,8 @@ function DraftingPhaseContent({
     );
   }, [workspacePreferences.sideboard.columnCount]);
   const interactionLocked = paused || pickInteractionLocked;
+  // Read once, so the surface selection and the two gates above it cannot drift.
+  const sharedStack = view?.shared_stack ?? null;
   const dragController = useDraftWorkspaceDrag({
     enabled: introDismissed && !interactionLocked,
     workspaceProjectionEnabled: responsiveLayout === "desktop",
@@ -959,6 +972,9 @@ function DraftingPhaseContent({
       : { column: 0 };
     return state.confirmPick(destination, resolvedPlacement);
   }, [workspacePreferences.deck]);
+  const handleSharedStackDecision = useCallback((pile: number, decision: SharedStackPileDecision) => {
+    void useMultiplayerDraftStore.getState().submitSharedStackDecision(pile, decision);
+  }, []);
   const handleAutoPick = useCallback(() => {
     const state = useMultiplayerDraftStore.getState();
     const { view: currentView, workspaceState } = state;
@@ -1054,17 +1070,41 @@ function DraftingPhaseContent({
           ? "w-full min-w-0"
           : "h-full min-h-0 w-full min-w-0 overflow-hidden"}>
           {responsiveLayout === "desktop" && <SeatStatusRing />}
-          {responsiveLayout === "desktop" && <DraftProgress view={view} />}
-          <PickTimer />
-          <PackDisplay
-            controller={packController}
-            presentation={{ packScale: workspacePreferences.packScale, setPackScale }}
-            enableDraftEffects
-            onCardHover={setHoveredCard}
-            responsiveLayout={responsiveLayout}
-            phoneToolbarPinned={phoneToolbarPinned}
-            mobileWorkspaceOpen={mobileWorkspaceOpen}
-          />
+          {/* `DraftProgress` and `PickTimer` describe a PICK-AND-PASS step — a pack
+              number, a pick step out of that pack's total, and the escalating
+              per-pick clock the host starts at each pick boundary. None of the
+              three exists under a shared stack: the turn is a whole-pile decision,
+              the engine publishes no pick step for it, and the host restarts no
+              clock per decision. So they are gated on the SAME engine-published
+              discriminator that selects the surface below, rather than rendering a
+              frozen pack bar and a clock that already ran out beside the piles. */}
+          {responsiveLayout === "desktop" && sharedStack === null && <DraftProgress view={view} />}
+          {sharedStack === null && <PickTimer />}
+          {sharedStack !== null && view !== null ? (
+            /* The ENGINE's discriminator, not a kind check: `shared_stack` is
+               status-gated to `Drafting` and present only under
+               `PackDistribution::SharedStackPiles`, so a non-null value means
+               exactly "a live pile turn", and `current_pack` — which drives
+               `PackDisplay` — is null for every seat in such a draft. */
+            <WinstonPileTable
+              sharedStack={sharedStack}
+              seats={view.seats}
+              playFirstChooser={view.play_first_chooser}
+              interactionLocked={interactionLocked}
+              onDecide={handleSharedStackDecision}
+              onCardHover={setHoveredCard}
+            />
+          ) : (
+            <PackDisplay
+              controller={packController}
+              presentation={{ packScale: workspacePreferences.packScale, setPackScale }}
+              enableDraftEffects
+              onCardHover={setHoveredCard}
+              responsiveLayout={responsiveLayout}
+              phoneToolbarPinned={phoneToolbarPinned}
+              mobileWorkspaceOpen={mobileWorkspaceOpen}
+            />
+          )}
         </div>
         {view && workspaceState && (
           <div className={responsiveLayout === "desktop"
@@ -1387,7 +1427,9 @@ function DraftPodPageContent() {
   const entryGeneration = useRef(0);
   const retryController = useRef<AbortController | null>(null);
   const entry = searchParams.get("entry");
-  const commanderDraftRequested = searchParams.get("kind") === COMMANDER_DRAFT_ENTRY;
+  // One resolver over the slug map instead of a `<kind>Requested` boolean per kind:
+  // the fifth kind adds a map entry in `draftKind.ts` and nothing here.
+  const requestedKind = draftKindForEntry(searchParams.get("kind"));
   const resumeRequested = searchParams.get("resume") === "1";
   const entryMode = entry === "host" || entry === "guest" || entry === "auto"
     ? entry
@@ -1561,9 +1603,9 @@ function DraftPodPageContent() {
     // A resumed pod's kind comes from its persisted session, which is the higher
     // authority — a URL intent must never overwrite it.
     if (resumeRequested) return;
-    if (!commanderDraftRequested) return;
-    void enterKindForEntry("CommanderDraft");
-  }, [commanderDraftRequested, enterKindForEntry, resumeRequested]);
+    if (requestedKind === null) return;
+    void enterKindForEntry(requestedKind);
+  }, [requestedKind, enterKindForEntry, resumeRequested]);
 
   const handleLeave = useCallback(async () => {
     await leave(false);

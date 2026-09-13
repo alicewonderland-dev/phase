@@ -79,6 +79,13 @@
     "label": "Temporizador de elección",
     "seconds": "{{count}}s"
   },
+  "pickStatus": {
+    "Pending": "Eligiendo",
+    "Picked": "Elegido",
+    "Waiting": "Esperando",
+    "TimedOut": "Tiempo agotado",
+    "NotDrafting": "Sin draftear"
+  },
   "scoreBadge": {
     "label": "Puntuación: {{count}} victorias"
   },
@@ -366,6 +373,10 @@
       "title": "Commander Draft",
       "description": "Draftea dos cartas a la vez en un pod, construye un mazo Commander de 60 cartas y juega una partida multijugador."
     },
+    "winstonDraft": {
+      "title": "Winston Draft",
+      "description": "Dos jugadores comparten una pila boca abajo repartida en tres montones: toma un montón o recházalo, luego construye y juega."
+    },
     "podInProgress": "Pod Draft en curso",
     "guestPodInProgress": "Pod unido listo para reconectar",
     "podLabel": "Pod {{kind}}",
@@ -599,6 +610,42 @@
     "hostLeft": "El anfitrión abandonó el draft",
     "connection": "Error de conexión",
     "retry": "Intentar reconectar"
+  },
+  "winston": {
+    "heading": "Winston Draft",
+    "yourTurn": "Tu turno — montón {{index}}",
+    "otherSeatTurn": "{{name}} está decidiendo",
+    "seatFallback": "Asiento {{index}}",
+    "turnHint": "Toma el montón o recházalo. Al rechazarlo se le añade una carta de la pila principal y pasas al siguiente montón; si rechazas el último, robas la carta superior de la pila principal.",
+    "mainStackRemaining_one": "{{count, number}} carta boca abajo en la pila principal",
+    "mainStackRemaining_few": "{{count, number}} cartas boca abajo en la pila principal",
+    "mainStackRemaining_many": "{{count, number}} cartas boca abajo en la pila principal",
+    "mainStackRemaining_other": "{{count, number}} cartas boca abajo en la pila principal",
+    "cardsLeft_one": "{{count, number}} carta restante en el draft",
+    "cardsLeft_few": "{{count, number}} cartas restantes en el draft",
+    "cardsLeft_many": "{{count, number}} cartas restantes en el draft",
+    "cardsLeft_other": "{{count, number}} cartas restantes en el draft",
+    "stackShare": "Proporción de las cartas restantes del draft que siguen boca abajo en la pila principal",
+    "pileLabel": "Montón {{index}}",
+    "pileTotal_one": "{{count, number}} carta",
+    "pileTotal_few": "{{count, number}} cartas",
+    "pileTotal_many": "{{count, number}} cartas",
+    "pileTotal_other": "{{count, number}} cartas",
+    "pileFaceDown": "Boca abajo",
+    "deciding": "Decidiendo sobre este montón",
+    "revealedNone": "Todavía no has mirado este montón",
+    "hiddenPiles": "Los montones permanecen boca abajo hasta que sea tu turno.",
+    "take": "Tomar",
+    "takeAria": "Tomar el montón {{index}}",
+    "decline": "Rechazar",
+    "declineAria": "Rechazar el montón {{index}}",
+    "refusal": {
+      "PileNotActive": "No estás decidiendo sobre este montón.",
+      "PileEmpty": "Este montón está vacío, no hay nada que tomar.",
+      "NoGuaranteedCard": "Rechazar ya no puede darte una carta este turno, así que tomar este montón es tu única jugada legal."
+    },
+    "refusalUnpublished": "El draft no publicó ningún veredicto para esta decisión.",
+    "playFirstChooser": "{{name}} elige quién juega primero en las partidas posteriores al draft."
   },
   "lobby": {
     "title": "Sala de espera del pod de draft",
