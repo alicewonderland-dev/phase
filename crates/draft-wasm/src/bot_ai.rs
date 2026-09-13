@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use draft_core::types::DraftCardInstance;
 use engine::database::CardDatabase;
 use phase_ai::config::AiDifficulty;
@@ -216,32 +214,27 @@ fn rarity_score(rarity: &str) -> u8 {
 }
 
 /// Extract the 1-2 most common colors from prior picks.
-/// Returns empty vec if no clear preference (early draft).
+/// Returns empty vec if no clear preference (fewer than 3 prior picks).
+///
+/// Delegates to [`draft_eval::dominant_colors`], the single authority for
+/// "which colors is this pile of cards in" — shared with the Winston valuation
+/// layer's late color ramp, so the two never drift apart.
+///
+/// **This changes `bot_pick`'s behavior for pools with tied colors**, and that is
+/// the point of the lift. The body that used to live here sorted `HashMap`
+/// entries on count alone; Rust randomizes `HashMap` iteration order per map
+/// instance, so tied colors came out in an arbitrary order and identical inputs
+/// produced different picks. MEASURED: a four-way tie produced 12 distinct
+/// answers over 2000 draws, and a W=3/U=2/B=2 pool was a coin flip between
+/// `["W", "U"]` and `["W", "B"]`. `dominant_colors`'s total order pins it to
+/// `["W", "B"]`. Behavior on strictly ordered pools is unchanged —
+/// `dominant_colors_delegation_preserves_bot_pick_on_a_strictly_ordered_pool`.
 fn color_preference(prior_picks: &[DraftCardInstance]) -> Vec<String> {
-    if prior_picks.len() < 3 {
-        return Vec::new();
-    }
-
-    let mut counts: HashMap<&str, u32> = HashMap::new();
-    for card in prior_picks {
-        for color in &card.colors {
-            *counts.entry(color.as_str()).or_insert(0) += 1;
-        }
-    }
-
-    if counts.is_empty() {
-        return Vec::new();
-    }
-
-    let mut sorted: Vec<(&&str, &u32)> = counts.iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(a.1));
-
-    // Take top 2 colors
-    sorted
+    let colors: Vec<&[String]> = prior_picks
         .iter()
-        .take(2)
-        .map(|(color, _)| color.to_string())
-        .collect()
+        .map(|card| card.colors.as_slice())
+        .collect();
+    draft_eval::dominant_colors(&colors, 3)
 }
 
 /// Mana curve position bonus. Prefer CMC 2-4 creatures, especially early in draft.
@@ -298,6 +291,63 @@ mod tests {
                 draft_effect: None,
             })
             .collect()
+    }
+
+    fn colored(name: &str, colors: &[&str]) -> DraftCardInstance {
+        DraftCardInstance {
+            instance_id: format!("{name}-id"),
+            name: name.to_string(),
+            set_code: "TST".to_string(),
+            collector_number: "1".to_string(),
+            rarity: "common".to_string(),
+            colors: colors.iter().map(|c| c.to_string()).collect(),
+            cmc: 2,
+            type_line: "Creature".to_string(),
+            draft_effect: None,
+        }
+    }
+
+    /// The `dominant_colors` lift is behavior-preserving where the old body was
+    /// deterministic — i.e. on a pool with a STRICT color ordering. The tie case
+    /// deliberately changes (see `color_preference`'s doc and
+    /// `draft_eval::dominant_colors_is_total_on_ties`), so it is pinned there and
+    /// not here.
+    #[test]
+    fn dominant_colors_delegation_preserves_bot_pick_on_a_strictly_ordered_pool() {
+        // W=2, U=1: a strict ordering with no tie to break.
+        let prior = vec![
+            colored("Prior W1", &["W"]),
+            colored("Prior W2", &["W"]),
+            colored("Prior U1", &["U"]),
+        ];
+        assert_eq!(
+            color_preference(&prior),
+            vec!["W".to_string(), "U".to_string()],
+            "a strictly ordered pool keeps its pre-lift preference"
+        );
+
+        // On-color first, off-color second: `max_by_key` returns the LAST maximum,
+        // so an empty preference (which is what a changed sample floor produces)
+        // flips the pick to index 1.
+        let pack = vec![colored("On Color", &["W"]), colored("Off Color", &["G"])];
+        let mut rng = ChaCha20Rng::seed_from_u64(1);
+        for _ in 0..200 {
+            assert_eq!(
+                bot_pick(&pack, AiDifficulty::Medium, &prior, None, &mut rng),
+                0,
+                "the on-color card must win, every time"
+            );
+        }
+
+        // Below the sample floor there is no preference at all, and the tie
+        // resolves the other way — the paired negative that proves the preference
+        // is what drove the pick above.
+        let short = vec![colored("Prior W1", &["W"]), colored("Prior W2", &["W"])];
+        assert!(color_preference(&short).is_empty());
+        assert_eq!(
+            bot_pick(&pack, AiDifficulty::Medium, &short, None, &mut rng),
+            1
+        );
     }
 
     /// CR 903.13b: a bot in a two-card pod must return two usable indices.
