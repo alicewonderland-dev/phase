@@ -2921,6 +2921,13 @@ mod tests {
             pod_policy: PodPolicy::Competitive,
             pairings: Vec::new(),
             match_config: DraftKind::Sealed.match_config(),
+            // Sealed has no shared stack and no Winston play/draw election, so
+            // both are `None` -- which makes this round trip a free
+            // byte-compatibility assertion: with `skip_serializing_if` on both
+            // fields, this message's JSON is byte-identical to the pre-Winston
+            // wire shape.
+            shared_stack: None,
+            play_first_chooser: None,
         };
         let msg = ServerMessage::DraftStateUpdate { view: view.clone() };
         let json = serde_json::to_string(&msg).unwrap();
@@ -3216,6 +3223,9 @@ mod tests {
             match_config: DraftKind::Premier.match_config(),
             pools: None,
             current_packs: None,
+            // Premier has no shared stack; `skip_serializing_if` keeps this
+            // frame byte-identical to the pre-Winston wire shape.
+            shared_stack: None,
         };
         let msg = ServerMessage::DraftSpectatorView { view };
         let json = serde_json::to_string(&msg).unwrap();

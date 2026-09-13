@@ -47,10 +47,34 @@ pub enum PickStatus {
     Pending,
     /// Seat has picked and pack has passed.
     Picked,
+    /// Seat is in a [`PackDistribution::SharedStackPiles`] draft and is NOT the
+    /// active seat: it owes no decision until the turn passes to it.
+    ///
+    /// A distinct status rather than a reuse of `Picked`, because the
+    /// pick-and-pass pair cannot describe a shared-stack seat at all: no seat
+    /// ever holds a `current_pack` under this distribution, so the
+    /// `current_pack[i].is_some()` test that separates `Pending` from `Picked`
+    /// is `false` for EVERY seat and would report the whole pod as `Picked`
+    /// while a turn is live. The active seat is `Pending`; every other seat is
+    /// this.
+    Waiting,
     /// Seat timed out (set by P2P host, not derivable from session state).
     TimedOut,
     /// Not in drafting phase (deckbuilding, match play, etc.).
     NotDrafting,
+}
+
+impl PickStatus {
+    /// Every status, in declaration order. The [`DraftKind::ALL`] idiom: the
+    /// serde round-trip folds this instead of a hand-written array, so a status
+    /// added later cannot ship with its wire encoding uncovered.
+    pub const ALL: [PickStatus; 5] = [
+        PickStatus::Pending,
+        PickStatus::Picked,
+        PickStatus::Waiting,
+        PickStatus::TimedOut,
+        PickStatus::NotDrafting,
+    ];
 }
 
 /// The kind of draft event, modeled after Arena's three draft modes.
@@ -2255,16 +2279,21 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_pick_status() {
-        for status in [
-            PickStatus::Pending,
-            PickStatus::Picked,
-            PickStatus::TimedOut,
-            PickStatus::NotDrafting,
-        ] {
+        // Folds `PickStatus::ALL` rather than a hand-written array: the
+        // hand-written form was already the shape that silently goes narrow at
+        // the next widening (§C7), and `Waiting` is that next widening.
+        for status in PickStatus::ALL {
             let json = serde_json::to_string(&status).unwrap();
             let back: PickStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(status, back);
         }
+        // Reach-guard: the fold must actually observe every declared variant,
+        // so a truncated `ALL` cannot make this test pass by covering nothing.
+        assert_eq!(PickStatus::ALL.len(), 5);
+        assert_eq!(
+            serde_json::to_string(&PickStatus::Waiting).unwrap(),
+            "\"Waiting\""
+        );
     }
 
     #[test]
