@@ -1737,4 +1737,481 @@ mod tests {
             )]
         );
     }
+
+    // ── The published inputs, joined to the decision ─────────────────────────
+    //
+    // `phase_ai::winston_eval` pins every weight and `opponent_read` pins the
+    // fold, but a test on each END of a wire is not a test of the wire. The six
+    // tests below each hold every other published field fixed and move ONE, and
+    // each one's fixture is chosen so the returned `SharedStackPileDecision`
+    // FLIPS -- which is what makes discarding that input at the `WinstonTurn`
+    // construction a red test rather than a silent disconnection.
+    //
+    // Every band below was MEASURED, not estimated: the per-card numbers under
+    // `WinstonWeights::baseline()` are dual land 4.9 / bear 3.5 / filler 1.625 /
+    // removal 7.4 / bomb 8.75, against a `replacement_level` of 3.0, so the
+    // surpluses are 1.9 / 0.5 / 0.0 / 4.4 / 5.75.
+
+    /// The published card counts restated, so a fixture that needs a specific
+    /// `draft_progress` says so in one place instead of leaving
+    /// `stack_view`'s 40-card default to imply it.
+    fn with_totals(
+        mut stack: SharedStackView,
+        main_stack_remaining: usize,
+        total_cards: usize,
+    ) -> SharedStackView {
+        stack.main_stack_remaining = main_stack_remaining;
+        stack.total_cards = total_cards;
+        stack
+    }
+
+    fn with_pool(mut view: DraftPlayerView, pool: Vec<DraftCardInstance>) -> DraftPlayerView {
+        view.pool = pool;
+        view
+    }
+
+    /// The same printing in a different colour. Colour is a property of the
+    /// INSTANCE (`DraftCardInstance.colors`), not of the face, so this varies
+    /// the one published axis the colour terms read while holding card quality,
+    /// rarity and mana value exactly fixed.
+    fn recolored(mut card: DraftCardInstance, colors: &[&str]) -> DraftCardInstance {
+        card.colors = colors.iter().map(|c| (*c).to_string()).collect();
+        card
+    }
+
+    fn pile_of(name: &str, count: usize) -> Vec<DraftCardInstance> {
+        (0..count)
+            .map(|i| fixture_card(name, &format!("{name}-{i}")))
+            .collect()
+    }
+
+    /// A projection whose cursor is the LAST pile, which is the only shape in
+    /// which `later_pile_sizes` is empty and the forced draw off the main stack
+    /// is a stopping point at all.
+    fn final_pile_view(
+        revealed: Vec<DraftCardInstance>,
+        verdicts: Vec<SharedStackDecisionView>,
+        earlier_totals: [usize; 2],
+    ) -> SharedStackView {
+        let cursor = SharedStackPileView {
+            index: 2,
+            total: revealed.len(),
+            revealed,
+            legality: verdicts,
+        };
+        let total_cards = cursor.total + earlier_totals.iter().sum::<usize>() + 40;
+        SharedStackView {
+            main_stack_remaining: 40,
+            total_cards,
+            active_seat: 0,
+            active_pile: 2,
+            piles: vec![
+                idle_pile(0, earlier_totals[0]),
+                idle_pile(1, earlier_totals[1]),
+                cursor,
+            ],
+            decisions: 0,
+            history: Vec::new(),
+        }
+    }
+
+    /// **Principle 4, first half, joined.** `OpponentRead`'s take rates reach the
+    /// decision through `handoff_cost`, and nothing but this test would notice if
+    /// they stopped.
+    ///
+    /// Both legs publish the SAME twenty observations by the same seat on the
+    /// same pile size, so `samples`, the bucket and every other term are equal;
+    /// only the DECISION in those records differs. A seat that keeps taking big
+    /// piles makes each decline expensive (cost 0.739), a seat that keeps
+    /// declining them makes it cheap (0.511), and the two-decline stopping point
+    /// doubles the difference into 3.189 versus 3.644 against a `take_now` of
+    /// 3.5.
+    ///
+    /// The passive leg's records name pile 1, whose published `revealed` is
+    /// empty, so neither leg's colour tally sees anything -- this test moves the
+    /// rates and only the rates.
+    ///
+    /// MUTATION (applied, observed red, reverted): `read: &OpponentRead::default()`
+    /// at the `WinstonTurn` construction takes `samples` to 0, `handoff_cost`
+    /// falls back to the flat 0.5 penalty, and the greedy leg's `Take` becomes
+    /// `Decline`.
+    #[test]
+    fn winston_decision_prices_the_opponents_pile_appetite() {
+        let db = fixture_card_db();
+        // Five fillers (surplus 0.0) and one bear (0.5): playables 0.5 plus
+        // denial 3.0 is a `take_now` of 3.5, and the six-card sample is exactly
+        // `MIN_SURPLUS_SAMPLE`, so `expected` is the measured 0.0833 rather than
+        // the prior.
+        let cursor = || {
+            let mut cards = pile_of(FILLER, 5);
+            cards.push(fixture_card(BEAR, "bear"));
+            cards
+        };
+        let history = |decision| {
+            (0..20)
+                .map(|_| record(1, 1, decision, 6))
+                .collect::<Vec<_>>()
+        };
+
+        let greedy = view_with(stack_view(
+            cursor(),
+            both_legal(),
+            [1, 8],
+            history(SharedStackPileDecision::Take),
+        ));
+        let passive = view_with(stack_view(
+            cursor(),
+            both_legal(),
+            [1, 8],
+            history(SharedStackPileDecision::Decline),
+        ));
+
+        // FIXTURE VALIDITY: the two histories really do read differently, and
+        // neither of them says anything about colour.
+        let greedy_read = opponent_read(
+            greedy.shared_stack.as_ref().unwrap(),
+            0,
+            phase_ai::winston_eval::WinstonWeights::baseline().opponent_size_split,
+        );
+        let passive_read = opponent_read(
+            passive.shared_stack.as_ref().unwrap(),
+            0,
+            phase_ai::winston_eval::WinstonWeights::baseline().opponent_size_split,
+        );
+        assert_eq!(greedy_read.samples, passive_read.samples);
+        assert!(greedy_read.large_pile_take_rate > 0.9);
+        assert!(passive_read.large_pile_take_rate < 0.1);
+        assert_eq!(greedy_read.passed_colors.cards(), 0);
+        assert_eq!(passive_read.passed_colors.cards(), 0);
+
+        assert_eq!(
+            winston_decision(&greedy, AiDifficulty::Medium, Some(&db)),
+            Some((0, SharedStackPileDecision::Take)),
+            "handing a fat pile to a seat that takes fat piles is expensive, so take now"
+        );
+        assert_eq!(
+            winston_decision(&passive, AiDifficulty::Medium, Some(&db)),
+            Some((0, SharedStackPileDecision::Decline)),
+            "against a seat that keeps declining, the same decline is cheap enough to make"
+        );
+    }
+
+    /// **Principle 4, second half, joined.** The `ColorPassTally` folded out of
+    /// the published history reaches the decision through
+    /// `CardContext::passed`, and this is the test that would notice if it
+    /// stopped.
+    ///
+    /// Both legs publish TWO declines by seat 1 of a four-card pile, so
+    /// `samples`, both take rates and `handoff_cost` are identical. They differ
+    /// in the pile those declines NAME: pile 0 is the cursor, whose four white
+    /// cards are published to this viewer, so eight white observations land in
+    /// the tally (share 9/13 against a uniform 0.2); pile 1 publishes no
+    /// `revealed` at all, so the same two declines teach nothing.
+    ///
+    /// MUTATION (applied, observed red, reverted):
+    /// `passed: &ColorPassTally::default()` at the `CardContext` construction
+    /// turns the open-colour leg's `Take` into `Decline`. Note, MEASURED, that
+    /// `read: &OpponentRead::default()` alone does NOT redden this one and
+    /// reddens the pile-appetite test instead: the tally reaches the decision
+    /// through `CardContext::passed`, which is a second wire off the same fold,
+    /// so the two halves of principle 4 need the two tests they have.
+    #[test]
+    fn winston_decision_prices_the_colors_the_opponent_passes() {
+        let db = fixture_card_db();
+        let cursor = || pile_of(BEAR, 4);
+
+        let open = view_with(stack_view(
+            cursor(),
+            both_legal(),
+            [1, 4],
+            vec![
+                record(1, 0, SharedStackPileDecision::Decline, 4),
+                record(1, 0, SharedStackPileDecision::Decline, 4),
+            ],
+        ));
+        let unread = view_with(stack_view(
+            cursor(),
+            both_legal(),
+            [1, 4],
+            vec![
+                record(1, 1, SharedStackPileDecision::Decline, 4),
+                record(1, 1, SharedStackPileDecision::Decline, 4),
+            ],
+        ));
+
+        // FIXTURE VALIDITY: the pile-size half is held FIXED across the two
+        // legs, and only the colour tally moves -- and it clears
+        // `MIN_PASS_SAMPLE`, without which the term is gated to exactly 0.0 and
+        // this test would be pinning nothing.
+        let split = phase_ai::winston_eval::WinstonWeights::baseline().opponent_size_split;
+        let open_read = opponent_read(open.shared_stack.as_ref().unwrap(), 0, split);
+        let unread_read = opponent_read(unread.shared_stack.as_ref().unwrap(), 0, split);
+        assert_eq!(open_read.samples, unread_read.samples);
+        assert_eq!(
+            open_read.large_pile_take_rate,
+            unread_read.large_pile_take_rate
+        );
+        assert_eq!(
+            open_read.small_pile_take_rate,
+            unread_read.small_pile_take_rate
+        );
+        assert!(open_read.passed_colors.cards() >= phase_ai::winston_eval::MIN_PASS_SAMPLE);
+        assert_eq!(unread_read.passed_colors.cards(), 0);
+
+        assert_eq!(
+            winston_decision(&open, AiDifficulty::Medium, Some(&db)),
+            Some((0, SharedStackPileDecision::Take)),
+            "white is the colour they keep passing, so this white pile is worth more"
+        );
+        assert_eq!(
+            winston_decision(&unread, AiDifficulty::Medium, Some(&db)),
+            Some((0, SharedStackPileDecision::Decline)),
+            "the identical pile with no colour read is not worth taking"
+        );
+    }
+
+    /// **The bot's own pool is its estimate of an average card**, and that
+    /// estimate is what prices every pile it cannot see into.
+    ///
+    /// Both legs hold the cursor pile, the pile heights, the history and the
+    /// pool SIZE fixed; only the pool's contents differ. Six bombs put the
+    /// measured mean surplus at 5.2, so an unseen pile is worth more than the
+    /// dual land on the table; six fillers put it at 0.27, so it is worth far
+    /// less.
+    ///
+    /// The cursor card is deliberately COLOURLESS and `draft_progress` is
+    /// asserted below `color_commitment_start`, so neither the colour ramp nor
+    /// the pass bonus can be what moved this -- the two pools differ in colour
+    /// as well as in quality, and this is what makes that difference inert.
+    ///
+    /// MUTATION (applied, observed red, reverted): `pool: &[]` drops the sample
+    /// below `MIN_SURPLUS_SAMPLE`, `expected` falls back to
+    /// `prior_surplus_per_card`, and the bomb-pool leg's `Decline` becomes
+    /// `Take`.
+    #[test]
+    fn winston_decision_prices_unseen_piles_off_its_own_pool() {
+        let db = fixture_card_db();
+        let stack = || {
+            stack_view(
+                vec![fixture_card(DUAL_LAND, "cursor")],
+                both_legal(),
+                [1, 1],
+                Vec::new(),
+            )
+        };
+        let rich = with_pool(view_with(stack()), pile_of(BOMB, 6));
+        let poor = with_pool(view_with(stack()), pile_of(FILLER, 6));
+
+        // FIXTURE VALIDITY: the colour ramp is provably inert at this progress,
+        // so the two pools' different colours cannot be the mover.
+        let progress = draft_progress(
+            rich.pool.len(),
+            rich.shared_stack.as_ref().unwrap().total_cards,
+            rich.seats.len(),
+        );
+        assert!(
+            progress < phase_ai::winston_eval::WinstonWeights::baseline().color_commitment_start,
+            "progress {progress} must sit below the colour ramp's start"
+        );
+        assert_eq!(rich.pool.len(), poor.pool.len());
+
+        assert_eq!(
+            winston_decision(&rich, AiDifficulty::Medium, Some(&db)),
+            Some((0, SharedStackPileDecision::Decline)),
+            "a bot whose own pool says cards are worth 5.2 expects better than a dual land"
+        );
+        assert_eq!(
+            winston_decision(&poor, AiDifficulty::Medium, Some(&db)),
+            Some((0, SharedStackPileDecision::Take)),
+            "a bot whose pool says cards are worth 0.27 takes the dual land"
+        );
+    }
+
+    /// **Principle 2, joined.** The colour ramp is keyed on `draft_progress`,
+    /// and `draft_progress` is computed from published counts.
+    ///
+    /// The two views are identical in every field except the published card
+    /// counts: one is early (progress 0.375, ramp exactly 0.0) and one is late
+    /// (progress 0.833, ramp 1.0). The pool is thirty white cards whose surplus
+    /// stays FLOORED AT ZERO on both legs -- `card_surplus` clamps at
+    /// `replacement_level`, and a 1.625-value filler plus a 1.0 ramp is still
+    /// 2.625 -- so the ramp moves `take_now` without dragging the continuation's
+    /// `expected` up with it. That is what makes the flip attributable to the
+    /// ramp rather than to the sample.
+    ///
+    /// MUTATION (applied, observed red, reverted): `progress: 0.0` at the
+    /// `CardContext` construction makes the late leg score exactly like the
+    /// early one, and its `Take` becomes `Decline`.
+    #[test]
+    fn winston_decision_commits_to_a_color_only_late_in_the_draft() {
+        let db = fixture_card_db();
+        let pool: Vec<DraftCardInstance> = pile_of(FILLER, 30)
+            .into_iter()
+            .map(|card| recolored(card, &["W"]))
+            .collect();
+        let stack = |main_stack_remaining, total_cards| {
+            with_totals(
+                stack_view(
+                    vec![fixture_card(BEAR, "cursor")],
+                    both_legal(),
+                    [4, 4],
+                    Vec::new(),
+                ),
+                main_stack_remaining,
+                total_cards,
+            )
+        };
+        let early = with_pool(view_with(stack(91, 100)), pool.clone());
+        let late = with_pool(view_with(stack(3, 12)), pool.clone());
+
+        // FIXTURE VALIDITY: the two legs really do straddle the ramp's start,
+        // and they differ in nothing else the decision reads.
+        let weights = phase_ai::winston_eval::WinstonWeights::baseline();
+        let early_progress = draft_progress(pool.len(), 100, early.seats.len());
+        let late_progress = draft_progress(pool.len(), 12, late.seats.len());
+        assert!(
+            early_progress < weights.color_commitment_start,
+            "early progress {early_progress}"
+        );
+        assert!(
+            late_progress > weights.color_commitment_start,
+            "late progress {late_progress}"
+        );
+        assert_eq!(
+            draft_eval::dominant_colors(
+                &pool.iter().map(|c| c.colors.as_slice()).collect::<Vec<_>>(),
+                MIN_POOL_COLOR_SAMPLE
+            ),
+            vec!["W".to_string()],
+        );
+
+        assert_eq!(
+            winston_decision(&early, AiDifficulty::Medium, Some(&db)),
+            Some((0, SharedStackPileDecision::Decline)),
+            "early, an on-colour bear is just a bear and the piles ahead are bigger"
+        );
+        assert_eq!(
+            winston_decision(&late, AiDifficulty::Medium, Some(&db)),
+            Some((0, SharedStackPileDecision::Take)),
+            "late, the same bear in the bot's own colour is worth taking"
+        );
+    }
+
+    /// **The bot's colours come off its own published pool**, and a card is
+    /// on-colour or not by the colours the projection prints on it.
+    ///
+    /// Both legs are the LATE fixture above -- same pool, same counts, same
+    /// progress -- and the cursor card is the same printing at the same rarity
+    /// and mana value. Only its published `colors` differ.
+    ///
+    /// MUTATION (applied, observed red, reverted): `preferred_colors: &[]` at
+    /// the `CardContext` construction makes no card on-colour, and the white
+    /// leg's `Take` becomes `Decline`.
+    #[test]
+    fn winston_decision_reads_its_colors_off_its_own_pool() {
+        let db = fixture_card_db();
+        let pool: Vec<DraftCardInstance> = pile_of(FILLER, 30)
+            .into_iter()
+            .map(|card| recolored(card, &["W"]))
+            .collect();
+        let stack = |cursor: DraftCardInstance| {
+            with_totals(
+                stack_view(vec![cursor], both_legal(), [4, 4], Vec::new()),
+                3,
+                12,
+            )
+        };
+        let on_color = with_pool(
+            view_with(stack(recolored(fixture_card(BEAR, "cursor"), &["W"]))),
+            pool.clone(),
+        );
+        let off_color = with_pool(
+            view_with(stack(recolored(fixture_card(BEAR, "cursor"), &["G"]))),
+            pool.clone(),
+        );
+
+        // FIXTURE VALIDITY: one published axis differs, and it is the colour.
+        assert_eq!(
+            on_color.shared_stack.as_ref().unwrap().piles[0].revealed[0].name,
+            off_color.shared_stack.as_ref().unwrap().piles[0].revealed[0].name
+        );
+        assert_ne!(
+            on_color.shared_stack.as_ref().unwrap().piles[0].revealed[0].colors,
+            off_color.shared_stack.as_ref().unwrap().piles[0].revealed[0].colors
+        );
+
+        assert_eq!(
+            winston_decision(&on_color, AiDifficulty::Medium, Some(&db)),
+            Some((0, SharedStackPileDecision::Take)),
+        );
+        assert_eq!(
+            winston_decision(&off_color, AiDifficulty::Medium, Some(&db)),
+            Some((0, SharedStackPileDecision::Decline)),
+            "the same card out of the bot's colours is not worth the same"
+        );
+    }
+
+    /// **The forced draw is a stopping point only when the projection publishes
+    /// that decline as legal**, and pricing it is what makes a thin last pile
+    /// declinable at all.
+    ///
+    /// This is the one fixture shape in which `later_pile_sizes` is empty: the
+    /// cursor is the LAST pile, so the only continuation left is declining onto
+    /// the main stack. With the decline published legal the continuation is
+    /// worth 1.0 against a `take_now` of 0.5, so the bot declines; the paired
+    /// positive shows the comparison is live rather than a constant, and the
+    /// paired negative shows the published refusal is obeyed.
+    ///
+    /// MUTATION (applied, observed red, reverted): `forced_draw_legal: false` at
+    /// the `WinstonTurn` construction empties the stopping-point iterator,
+    /// `continuation_value` returns `NEG_INFINITY`, and the thin-pile leg's
+    /// `Decline` becomes `Take`.
+    #[test]
+    fn winston_decision_prices_the_forced_draw_when_it_is_published_legal() {
+        let db = fixture_card_db();
+
+        let thin = view_with(final_pile_view(
+            vec![fixture_card(FILLER, "thin")],
+            both_legal(),
+            [1, 1],
+        ));
+        // FIXTURE VALIDITY: the cursor really is the last pile, so there is no
+        // later pile for the continuation to price instead.
+        let stack = thin.shared_stack.as_ref().unwrap();
+        assert!(stack
+            .piles
+            .iter()
+            .all(|pile| pile.index <= stack.active_pile));
+
+        assert_eq!(
+            winston_decision(&thin, AiDifficulty::Medium, Some(&db)),
+            Some((2, SharedStackPileDecision::Decline)),
+            "one sub-replacement common is worth less than a card off the main stack"
+        );
+
+        // PAIRED POSITIVE: the comparison is live -- a pile worth more than the
+        // forced draw is taken even though the forced draw is equally legal.
+        let fat = view_with(final_pile_view(
+            vec![fixture_card(REMOVAL, "fat")],
+            both_legal(),
+            [1, 1],
+        ));
+        assert_eq!(
+            winston_decision(&fat, AiDifficulty::Medium, Some(&db)),
+            Some((2, SharedStackPileDecision::Take)),
+        );
+
+        // PAIRED NEGATIVE: the same thin pile with the forced draw published as
+        // REFUSED. There is no continuation to price and no legal decline to
+        // return.
+        let refused = view_with(final_pile_view(
+            vec![fixture_card(FILLER, "thin")],
+            legality(None, Some(SharedStackRefusal::NoGuaranteedCard)),
+            [1, 1],
+        ));
+        assert_eq!(
+            winston_decision(&refused, AiDifficulty::Medium, Some(&db)),
+            Some((2, SharedStackPileDecision::Take)),
+        );
+    }
 }

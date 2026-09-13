@@ -12,6 +12,7 @@ vi.mock("../../services/draftPersistence", () => ({
 
 import { P2PDraftHost } from "../p2p-draft-host";
 import type { DraftPlayerView, MultiplayerSeatDescriptor } from "../draft-adapter";
+import type { PersistedDraftHostSession } from "../../services/draftPersistence";
 import { draftProcedureFixture } from "./draftProcedureFixture";
 
 /**
@@ -225,16 +226,18 @@ describe("P2PDraftHost Winston bot seats", () => {
       (botsHaveRun ? winstonView(0, finalStatus, seatABot) : winstonView(1, "Drafting", seatABot)));
     const submitSharedStackDecisionForSeat = vi.fn(
       async () => winstonView(1, "Drafting", seatABot));
-    (host as unknown as { adapter: unknown }).adapter = {
+    const adapter: Record<string, ReturnType<typeof vi.fn>> = {
       draftProcedure: vi.fn(async () => WINSTON_PROCEDURE),
       createMultiplayerDraft: vi.fn(async () => {}),
       loadCardDatabase: vi.fn(async () => 0),
       exportSession: vi.fn(async () => "{}"),
       allPicksSubmitted: vi.fn(async () => false),
+      replaceSeatWithBot: vi.fn(async () => winstonView(0, "Drafting", true)),
       getViewForSeat,
       submitSharedStackDecisionForSeat,
       resolveSharedStackBotTurns,
     };
+    (host as unknown as { adapter: unknown }).adapter = adapter;
     await host.initialize();
     await host.startDraft(seatABot);
     // The start path resolves the first bot turns too; reset so the assertions
@@ -246,6 +249,7 @@ describe("P2PDraftHost Winston bot seats", () => {
       host,
       resolveSharedStackBotTurns,
       submitSharedStackDecisionForSeat,
+      privateAdapter: adapter,
       privateHost: host as unknown as {
         timerContext: string | null;
         timerInterval: ReturnType<typeof setInterval> | null;
@@ -321,5 +325,423 @@ describe("P2PDraftHost Winston bot seats", () => {
 
     expect(events).toContain("draftComplete");
     expect(privateHost.timerInterval).toBeNull();
+  });
+
+  // ── The failure boundary around the bot loop ─────────────────────────
+
+  /**
+   * A loud bot-loop failure must not be reported as a refused player decision,
+   * and must not take the pod's broadcast and clock down with it.
+   *
+   * By the time `resolveBotPicks` runs, the deciding seat's decision is already
+   * applied by the reducer, persisted, and acknowledged. Letting an `Err` out of
+   * the loop fall into `handleSharedStackDecision`'s outer `catch` sent that
+   * seat `draft_error` — "your decision was refused" — about a decision the
+   * engine accepted, and skipped both the broadcast and the clock re-arm, which
+   * left the pod with a stale view and no timer and therefore no recovery at
+   * all. `resolve_shared_stack_bot_turns` fails loudly BY DESIGN
+   * (`the_loop_fails_loudly_rather_than_spinning`), so this is a reachable
+   * state rather than a hypothetical.
+   *
+   * REVERT-FAILING: remove the inner `try`/`catch` around `resolveBotPicks` and
+   * every assertion below reds — the call rejects, `draft_error` is sent, and
+   * `timerInterval` stays null.
+   */
+  it("keeps the pod broadcasting and timing when the bot loop fails loudly", async () => {
+    const { host, resolveSharedStackBotTurns, privateHost } =
+      await startedPodWithABot("Drafting");
+    resolveSharedStackBotTurns.mockRejectedValue(
+      new Error("shared-stack bot loop exceeded its bound"),
+    );
+    const guestSend = vi.fn();
+    (host as unknown as { guestSessions: Map<number, unknown> })
+      .guestSessions.set(1, { send: guestSend });
+    const events: { type: string; message?: string }[] = [];
+    host.onEvent((event) => events.push(event as { type: string; message?: string }));
+
+    // The deciding seat's own call RESOLVES: its decision was accepted.
+    await expect(host.submitHostSharedStackDecision(0, "Take")).resolves.toBeDefined();
+
+    // Reach-guard: the loop really was entered and really did throw.
+    expect(resolveSharedStackBotTurns).toHaveBeenCalledOnce();
+
+    // Reported as a host error, once, naming the engine's own message.
+    const errors = events.filter((event) => event.type === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.message).toContain("shared-stack bot loop exceeded its bound");
+
+    // NOT reported to the deciding seat as a refusal of its own decision.
+    expect(guestSend.mock.calls.map(([msg]) => (msg as { type: string }).type))
+      .not.toContain("draft_error");
+    // The pod still got its broadcast and its clock.
+    expect(guestSend.mock.calls.map(([msg]) => (msg as { type: string }).type))
+      .toContain("draft_state_update");
+    expect(privateHost.timerContext).toBe("pick");
+    expect(privateHost.timerInterval).not.toBeNull();
+  });
+
+  /**
+   * The paired positive that keeps the boundary from swallowing a REAL refusal:
+   * an `Err` out of the reducer itself still reaches the deciding seat as
+   * `draft_error` and still rejects.
+   *
+   * REVERT-FAILING: widen the new inner `catch` to cover
+   * `submitSharedStackDecisionForSeat` and this reds.
+   */
+  it("still reports a refused decision to the seat that made it", async () => {
+    const { host, submitSharedStackDecisionForSeat, resolveSharedStackBotTurns } =
+      await startedPodWithABot("Drafting");
+    submitSharedStackDecisionForSeat.mockRejectedValue(new Error("PileNotActive"));
+    const guestSend = vi.fn();
+    (host as unknown as { guestSessions: Map<number, unknown> })
+      .guestSessions.set(1, { send: guestSend });
+
+    await expect(host.submitHostSharedStackDecision(0, "Take")).rejects.toThrow("PileNotActive");
+
+    expect(resolveSharedStackBotTurns).not.toHaveBeenCalled();
+    expect(guestSend).not.toHaveBeenCalled();
+  });
+
+  // ── A seat that becomes a bot mid-draft ──────────────────────────────
+
+  /**
+   * `ReplaceSeatWithBot` is the third way a bot comes to own a shared-stack
+   * turn, and it used to persist and broadcast without ever driving it.
+   *
+   * The reducer accepts this action under `SharedStackPiles` now (the
+   * distribution dispatch that refused it was removed with this feature), and
+   * the seat it converts may be the ACTIVE one. Nothing else would move it: the
+   * reducer refuses a decision from a non-active seat, so no human can move for
+   * it, and the pick clock exists only under `Competitive`. It is unreachable
+   * from the UI today only because `HostControls.tsx` gates the button on
+   * `matchInProgress || roundComplete` — a gate in a different file, in a
+   * different layer, which is not where this invariant should live.
+   *
+   * The database load is the same obligation: an all-human pod never took
+   * `startDraftInner`'s bot-seat branch, so this seat is the pod's FIRST bot and
+   * would otherwise decide with no card faces at all.
+   *
+   * REVERT-FAILING: delete the `resolveBotPicks` call (or the
+   * `loadCardDatabaseForSharedStackBots` call) from `replaceSeatWithBotInner`
+   * and the matching assertion goes to zero calls.
+   */
+  it("drives and equips a seat that becomes a bot mid-Winston-draft", async () => {
+    const { host, resolveSharedStackBotTurns, privateAdapter } =
+      await startedPodWithABot("Drafting", { seatABot: false });
+    // The reducer's own return: seat 1 is a bot now, and the draft is live.
+    privateAdapter.replaceSeatWithBot = vi.fn(async () => winstonView(1, "Drafting", true));
+    privateAdapter.getViewForSeat = vi.fn(async () => winstonView(1, "Drafting", true));
+    fetchMock.mockClear();
+
+    await host.replaceSeatWithBot(1);
+
+    expect(privateAdapter.replaceSeatWithBot).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(privateAdapter.loadCardDatabase).toHaveBeenCalledWith("CARD-DATA");
+    expect(resolveSharedStackBotTurns).toHaveBeenCalledOnce();
+  });
+
+  /**
+   * The paired negative, and the reachable case: the host control is gated on
+   * `matchInProgress || roundComplete`, so a replacement outside `Drafting`
+   * owes no turn to anybody and must not pay for a card-data fetch.
+   *
+   * REVERT-FAILING: drop the `stillDrafting` gate and both assertions red.
+   */
+  it("drives nothing when a seat becomes a bot outside the draft", async () => {
+    const { host, resolveSharedStackBotTurns, privateAdapter } =
+      await startedPodWithABot("Drafting", { seatABot: false });
+    privateAdapter.replaceSeatWithBot = vi.fn(async () => winstonView(0, "MatchInProgress", true));
+    privateAdapter.getViewForSeat = vi.fn(async () => winstonView(0, "MatchInProgress", true));
+    fetchMock.mockClear();
+
+    await host.replaceSeatWithBot(1);
+
+    expect(privateAdapter.replaceSeatWithBot).toHaveBeenCalledOnce();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(resolveSharedStackBotTurns).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * A HOST RELOAD of a Winston pod whose restored active seat is a bot.
+ *
+ * This is the state the decision path itself creates:
+ * `handleSharedStackDecision` persists the human's applied decision BEFORE it
+ * runs the bot turns, so the durable snapshot strictly between those two awaits
+ * describes a pod waiting on a bot. `restoreFromPersisted` used to branch only
+ * on `MatchInProgress` and `Pairing` and hand a restored `Drafting` view back
+ * untouched — and nothing else could recover it: the reducer refuses a decision
+ * from a non-active seat, `frozenTimer` is in-memory only and is never
+ * persisted, and `startPickTimer` returns immediately for any pod that is not
+ * `Competitive`. The pod sat there with no error, no clock and no legal move
+ * available to anyone.
+ */
+describe("P2PDraftHost Winston restore", () => {
+  const WINSTON_PROCEDURE = draftProcedureFixture({
+    pod_size: 2,
+    human_seats: 2,
+    min_pod_size: 2,
+    max_pod_size: 4,
+    allowed_pod_sizes: [2, 3, 4],
+    distribution: { SharedStackPiles: { pile_count: 3 } },
+  });
+  const PREMIER_PROCEDURE = draftProcedureFixture({
+    pod_size: 8,
+    human_seats: 8,
+    allowed_pod_sizes: [2, 3, 4, 5, 6, 7, 8],
+    distribution: "PickAndPass",
+  });
+
+  const originalFetch = globalThis.fetch;
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    fetchMock = vi.fn(async () => new Response("CARD-DATA", { status: 200 }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  /**
+   * `seatTokens: {}` is load-bearing, for the reason `p2pDraftHostResume`
+   * states: a non-empty map arms a per-seat grace timer and pauses the host.
+   */
+  function persistedWinstonSession(): PersistedDraftHostSession {
+    return {
+      persistenceId: "winston-restore",
+      roomCode: "ABCDE",
+      kind: "Winston",
+      podSize: 2,
+      hostDisplayName: "Host",
+      tournamentFormat: "Swiss",
+      podPolicy: "Casual",
+      seatTokens: {},
+      seatNames: { 0: "Host" },
+      kickedTokens: [],
+      draftStarted: true,
+      draftCode: "draft-12345678",
+      draftSessionJson: '{"status":"Drafting"}',
+      poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
+    } as unknown as PersistedDraftHostSession;
+  }
+
+  /**
+   * A host that has NOT been initialized, which is the real ordering:
+   * `draftPodHostAdapter` restores at step 5 and calls `initialize()` at step 6.
+   * That is why `this.procedure` is still null inside `restoreFromPersisted`,
+   * and why a dispatch written against it silently falls through.
+   */
+  function restoringHost(
+    restored: DraftPlayerView,
+    kind: "Winston" | "Premier" = "Winston",
+  ) {
+    const host = new P2PDraftHost(
+      { id: "host" } as never,
+      () => () => {},
+      { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } } as never,
+      kind,
+      2,
+      "Host",
+      "Swiss",
+      "Casual",
+      undefined,
+      "winston-restore",
+      "ABCDE",
+    );
+    let botsHaveRun = false;
+    const resolveSharedStackBotTurns = vi.fn(async () => {
+      botsHaveRun = true;
+      return [{ SharedStackDecisionApplied: { seat: 1 } }];
+    });
+    const draftProcedure = vi.fn(async () =>
+      (kind === "Winston" ? WINSTON_PROCEDURE : PREMIER_PROCEDURE));
+    const loadCardDatabase = vi.fn(async (_json: string) => 0);
+    const adapter = {
+      draftProcedure,
+      loadCardDatabase,
+      importSession: vi.fn(async () => restored),
+      exportSession: vi.fn(async () => "{}"),
+      setSeatConnected: vi.fn(async () => {}),
+      resolveSharedStackBotTurns,
+      // After the loop the turn is back on the human seat; before it, the
+      // restored snapshot is the bot-active state itself.
+      getViewForSeat: vi.fn(async () =>
+        (botsHaveRun ? winstonRestoreView(0, "Drafting", true) : restored)),
+    };
+    (host as unknown as { adapter: unknown }).adapter = adapter;
+    return { host, adapter, resolveSharedStackBotTurns, loadCardDatabase, draftProcedure };
+  }
+
+  /**
+   * The restored pod, and the seam it turns on. The bot-active leg is
+   * `activeSeat: 1` with `is_bot: true` on that seat; every paired negative
+   * below moves exactly one of those two published fields.
+   */
+  function winstonRestoreView(
+    activeSeat: number,
+    status: string,
+    seatABot: boolean,
+    { sharedStack = true }: { sharedStack?: boolean } = {},
+  ): DraftPlayerView {
+    return {
+      status,
+      kind: "Winston",
+      pool: [],
+      current_pack: null,
+      required_pick_count: 0,
+      draft_effects: [],
+      seats: [
+        { seat_index: 0, display_name: "Host", is_bot: false, connected: true,
+          has_submitted_deck: false, pick_status: "Pending", active_pack_count: 0,
+          face_up_draft_cards: [] },
+        { seat_index: 1, display_name: "Guest", is_bot: seatABot, connected: true,
+          has_submitted_deck: false, pick_status: "Pending", active_pack_count: 0,
+          face_up_draft_cards: [] },
+      ],
+      pick_number: 0,
+      shared_stack: sharedStack
+        ? {
+          main_stack_remaining: 11,
+          total_cards: 20,
+          active_seat: activeSeat,
+          active_pile: 0,
+          piles: [],
+          decisions: 5,
+          history: [],
+        }
+        : null,
+    } as unknown as DraftPlayerView;
+  }
+
+  /**
+   * THE defect. A restored pod waiting on a bot is driven, fenced, and handed
+   * back in the state the drive left it — not the bot-active state it was
+   * restored into.
+   *
+   * REVERT-FAILING: delete the `view.status === "Drafting"` branch (or the
+   * `resolveBotPicks` call inside `resumeDraftingAfterRestore`) and the loop is
+   * never called, the snapshot is never re-fenced, and the returned view still
+   * names the bot as the active seat.
+   */
+  it("drives a restored pod whose active seat is a bot", async () => {
+    const restored = winstonRestoreView(1, "Drafting", true);
+    const { host, resolveSharedStackBotTurns } = restoringHost(restored);
+
+    const view = await host.restoreFromPersisted(persistedWinstonSession());
+
+    // Reach-guard: the restored snapshot really was waiting on the bot seat.
+    expect(restored.shared_stack!.active_seat).toBe(1);
+    expect(restored.seats[1]!.is_bot).toBe(true);
+
+    expect(resolveSharedStackBotTurns).toHaveBeenCalledOnce();
+    // Fenced: the bot turns are durable before anybody is served.
+    expect(saveDraftHostSession).toHaveBeenCalled();
+    // And the caller is handed where the chain STOPPED, not where it started.
+    expect(view!.shared_stack!.active_seat).toBe(0);
+  });
+
+  /**
+   * The second half of the same reload, and a defect of its own: a restored
+   * Set-pool Winston pod never loaded a card database. The only load for that
+   * case lives in `startDraftInner`, which restore never calls, and
+   * `draftPodHostAdapter`'s own fetch is gated on `Cube || CommanderDraft`. The
+   * bot kept playing and never said so —
+   * `winston_decision_degrades_without_a_card_database` pins exactly that
+   * degraded behaviour, with principles 1 and 5 dead.
+   *
+   * REVERT-FAILING: delete the `loadCardDatabaseForSharedStackBots` call from
+   * `resumeDraftingAfterRestore` and both assertions go to zero calls.
+   */
+  it("loads the card database for a restored pod that seats a bot", async () => {
+    const { host, loadCardDatabase } = restoringHost(winstonRestoreView(1, "Drafting", true));
+
+    await host.restoreFromPersisted(persistedWinstonSession());
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(loadCardDatabase).toHaveBeenCalledWith("CARD-DATA");
+  });
+
+  /**
+   * The `is_bot` half of the gate: a restored human-vs-human Winston pod — the
+   * common shape — makes no engine round-trip at all and pays for no fetch.
+   *
+   * The PROCEDURE assertion is the discriminating one, and it was chosen by
+   * measurement rather than by taste. Dropping the `is_bot` conjunct leaves the
+   * bot-loop and fetch assertions GREEN — `resolveSharedStackBotTurns` has its
+   * own published `is_bot` pre-check, and
+   * `loadCardDatabaseForSharedStackBots` short-circuits on a zero bot count —
+   * so the only thing the conjunct actually buys is not paying for the
+   * procedure round-trip on the common shape. That is what this pins.
+   *
+   * REVERT-FAILING: drop the `view.seats.some(seat => seat.is_bot)` conjunct and
+   * the `draftProcedure` assertion reds.
+   */
+  it("drives nothing for a restored pod of humans", async () => {
+    const { host, resolveSharedStackBotTurns, loadCardDatabase, draftProcedure } =
+      restoringHost(winstonRestoreView(1, "Drafting", false));
+
+    const view = await host.restoreFromPersisted(persistedWinstonSession());
+
+    // Reach-guard: the restore really did run and really did return the pod.
+    expect(view!.status).toBe("Drafting");
+    expect(draftProcedure).not.toHaveBeenCalled();
+    expect(resolveSharedStackBotTurns).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(loadCardDatabase).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The distribution half. `shared_stack` is the engine's own published
+   * discriminator — `None` for every non-Winston frame and outside `Drafting` —
+   * so a pick-and-pass pod full of bots falls straight through, fetches nothing,
+   * and does not even resolve its procedure.
+   *
+   * REVERT-FAILING: drop the `!view.shared_stack` conjunct and this reds on the
+   * fetch: the pick-and-pass branch of `resolveBotPicks` would run instead.
+   */
+  it("drives nothing for a restored pick-and-pass pod", async () => {
+    const { host, resolveSharedStackBotTurns, loadCardDatabase, draftProcedure } =
+      restoringHost(winstonRestoreView(1, "Drafting", true, { sharedStack: false }), "Premier");
+
+    const view = await host.restoreFromPersisted(persistedWinstonSession());
+
+    expect(view!.status).toBe("Drafting");
+    expect(resolveSharedStackBotTurns).not.toHaveBeenCalled();
+    expect(loadCardDatabase).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(draftProcedure).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The ordering the fix depends on, pinned so it cannot regress into a silent
+   * no-op: `restoreFromPersisted` runs BEFORE `initialize()`, so `this.procedure`
+   * is null and `resolveBotPicks`'s dispatch — which reads it — would fall
+   * through to a `current_pack` loop that is null for every seat under this
+   * distribution.
+   *
+   * REVERT-FAILING: remove the `ensureProcedure()` call from
+   * `resumeDraftingAfterRestore` and `resolveSharedStackBotTurns` is never
+   * called, because the shared-stack arm is never taken.
+   */
+  it("resolves the procedure itself, because restore precedes initialize", async () => {
+    const { host, draftProcedure, resolveSharedStackBotTurns } =
+      restoringHost(winstonRestoreView(1, "Drafting", true));
+    // The host really has not been initialized: the field the dispatch reads is
+    // still null when the restore begins.
+    expect((host as unknown as { procedure: unknown }).procedure).toBeNull();
+
+    await host.restoreFromPersisted(persistedWinstonSession());
+
+    expect(draftProcedure).toHaveBeenCalledWith("Winston", "Swiss");
+    expect(resolveSharedStackBotTurns).toHaveBeenCalledOnce();
+
+    // And `initialize()` does not fetch it a second time: the answer is a pure
+    // function of the kind and format, both immutable for this host.
+    await host.initialize();
+    expect(draftProcedure).toHaveBeenCalledOnce();
   });
 });

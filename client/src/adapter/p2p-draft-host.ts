@@ -14,7 +14,7 @@ import type { DataConnection } from "peerjs";
 
 import { DraftAdapter, EMPTY_DRAFT_POOL_GROUPS, isSharedStackDistribution } from "./draft-adapter";
 import type { DraftCardInstance, DraftPlayerView, MultiplayerSeatDescriptor, PairingView, PoolInput, SeatPublicView, SharedStackPileDecision } from "./draft-adapter";
-import type { DraftKind, DraftProcedure, PodPolicy, TournamentFormat } from "./draft-adapter";
+import type { DraftKind, DraftProcedure, PackDistribution, PodPolicy, TournamentFormat } from "./draft-adapter";
 import {
   createDraftPeerSession,
   type DraftPeerSession,
@@ -614,13 +614,66 @@ export class P2PDraftHost {
     // The third caller, the public `getHostView()`, is NOT covered by this
     // ordering — it is covered by `buildLobbyView`'s throw-on-null, which is
     // why that rule is load-bearing rather than defensive.
-    this.procedure = await this.adapter.draftProcedure(this.kind, this.tournamentFormat);
+    await this.ensureProcedure();
 
     this.hostConnectionUnsub = this.onGuestConnected((conn) => {
       this.handleNewConnection(conn);
     });
     this.syncLobbyToGuests();
     this.persistSession();
+  }
+
+  /**
+   * The engine-owned per-kind axes, fetched at most once.
+   *
+   * `initialize()` is where this normally happens, but it is NOT the earliest
+   * point that needs the answer: `restoreFromPersisted` runs BEFORE
+   * `initialize()` (`draftPodHostAdapter` step 5 precedes step 6), and a
+   * restored shared-stack pod has to dispatch on the distribution before any
+   * connection is accepted. A `null` procedure is not a neutral default at
+   * those dispatch sites — `resolveBotPicks` and `autoPickAllPending` both fall
+   * THROUGH to a `current_pack` loop that is null for every seat under
+   * `SharedStackPiles`, so an unfetched procedure reads as "nothing to do"
+   * rather than as an error.
+   *
+   * Caching is correct rather than merely cheap: `draftProcedure` is a pure
+   * function of the kind and the tournament format, and both are immutable for
+   * this host's lifetime, so a second read could not differ.
+   */
+  private async ensureProcedure(): Promise<DraftProcedure> {
+    this.procedure ??= await this.adapter.draftProcedure(this.kind, this.tournamentFormat);
+    return this.procedure;
+  }
+
+  /**
+   * Load the WASM CARD_DB when — and only when — a shared-stack pod actually
+   * seats a bot that will read card faces.
+   *
+   * THE single authority for that question, because it is asked from three
+   * places that learn the answer at different times: `startDraftInner` (from
+   * the seat descriptors it just built), `restoreFromPersisted` (from the
+   * engine-published seat list of a session it did not create), and
+   * `replaceSeatWithBotInner` (from the seat list *after* a human became a
+   * bot). A pod that reaches any of the three without a database still plays —
+   * `winston_decision` degrades every card to its rarity prior — but principles
+   * 1 (mana fixing) and 5 (interaction) go silently dead, which is exactly the
+   * failure `winston_decision_degrades_without_a_card_database` pins.
+   *
+   * Dispatched on the DISTRIBUTION and on a COUNT of bot seats, never on `kind`
+   * and never on a `human_seats` scalar: a human-vs-human Winston pod, which is
+   * the common shape, must not pay for a multi-megabyte fetch it would never
+   * read.
+   */
+  private async loadCardDatabaseForSharedStackBots(
+    distribution: PackDistribution,
+    botSeats: number,
+  ): Promise<void> {
+    if (!isSharedStackDistribution(distribution) || botSeats === 0) return;
+    const resp = await fetch(__CARD_DATA_URL__);
+    if (!resp.ok) {
+      throw new Error(`Failed to load card data: ${resp.status}`);
+    }
+    await this.adapter.loadCardDatabase(await resp.text());
   }
 
   // ── Connection handling ────────────────────────────────────────────
@@ -1163,8 +1216,7 @@ export class P2PDraftHost {
     // permitted it. `p2pDraftHostBotFill.test.ts` is that lesson's revert-probe
     // and still carries those three rows. Read from the procedure, never from
     // `kind`.
-    const procedure = this.procedure
-      ?? await this.adapter.draftProcedure(this.kind, this.tournamentFormat);
+    const procedure = await this.ensureProcedure();
     const botFillAllowed = botFillEmptySeats;
     const seats: MultiplayerSeatDescriptor[] = [];
     for (let i = 0; i < this.podSize; i++) {
@@ -1179,11 +1231,7 @@ export class P2PDraftHost {
         seats.push({ type: "Bot", name: this.botNameForSeat(i, seed) });
       }
     }
-    // A shared-stack BOT reads card faces, so it needs the WASM CARD_DB: the
-    // Winston valuation prices mana fixing off `produced_color_count` and cheap
-    // interaction off the parsed effect profile, and with no database every
-    // card collapses to its rarity prior — two of the five drafting principles
-    // silently dead, with a bot that still plays and never says so.
+    // A shared-stack BOT reads card faces, so it needs the WASM CARD_DB.
     //
     // Loaded HERE rather than in `draftPodHostAdapter`'s gate, for two reasons
     // that are both about what is knowable where. The adapter has only
@@ -1195,16 +1243,14 @@ export class P2PDraftHost {
     // Widening the adapter's gate instead would also redden its landed
     // "skips the CARD_DB fetch for Set pods" row, which that gate's own comment
     // warns about.
-    if (
-      isSharedStackDistribution(procedure.distribution)
-      && seats.some((seat) => seat.type === "Bot")
-    ) {
-      const resp = await fetch(__CARD_DATA_URL__);
-      if (!resp.ok) {
-        throw new Error(`Failed to load card data: ${resp.status}`);
-      }
-      await this.adapter.loadCardDatabase(await resp.text());
-    }
+    //
+    // This is only ONE of the three ways a bot comes to occupy a shared-stack
+    // seat; `loadCardDatabaseForSharedStackBots` carries the rule and names the
+    // other two.
+    await this.loadCardDatabaseForSharedStackBots(
+      procedure.distribution,
+      seats.filter((seat) => seat.type === "Bot").length,
+    );
     await this.adapter.createMultiplayerDraft(
       this.poolInput,
       seats,
@@ -1475,7 +1521,22 @@ export class P2PDraftHost {
       // `persist: true` gives the bot turns their OWN fence, and it fires only
       // when the engine actually moved — the same rule as the fence above: no
       // client may observe a reducer result a host reload could not restore.
-      await this.resolveBotPicks({ emit: false, persist: true });
+      //
+      // ITS OWN FAILURE BOUNDARY, and the boundary is the point. The deciding
+      // seat's decision is already applied, persisted and acknowledged by the
+      // time this runs, so letting an `Err` out of the bot loop fall into the
+      // outer `catch` would tell that seat `draft_error` — "your decision was
+      // refused" — about a decision the engine accepted, and would skip both
+      // the broadcast and the clock re-arm below, leaving the pod with a stale
+      // view and no timer. `resolve_shared_stack_bot_turns` fails LOUDLY by
+      // design (`the_loop_fails_loudly_rather_than_spinning`); a loud failure
+      // must surface as a host `error` and still leave the pod recoverable.
+      try {
+        await this.resolveBotPicks({ emit: false, persist: true });
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        this.emit({ type: "error", message: `Bot turn failed: ${reason}` });
+      }
 
       await this.broadcastViews();
 
@@ -2885,7 +2946,8 @@ export class P2PDraftHost {
   private async replaceSeatWithBotInner(seat: number): Promise<void> {
     try {
       const seed = this.draftSeed ?? hashStringToSeed(this.draftCode || this.roomCode || "draft");
-      await this.adapter.replaceSeatWithBot(seat, this.botNameForSeat(seat, seed));
+      const replaced = await this.adapter.replaceSeatWithBot(seat, this.botNameForSeat(seat, seed));
+      const stillDrafting = replaced.status === "Drafting";
       const grace = this.disconnectedSeats.get(seat);
       if (grace) this.clearReconnectGrace(seat);
       this.reconnectDeadlines.delete(seat);
@@ -2893,6 +2955,36 @@ export class P2PDraftHost {
       this.seatTokens.delete(seat);
       this.seatNames.delete(seat);
       await this.persistSessionStrict();
+
+      // A seat that just BECAME a bot may be the one the shared stack is
+      // waiting on, and nothing else would ever drive it: the reducer refuses
+      // a decision from a non-active seat, so no human can move for it, and
+      // the pick clock only exists under `Competitive`. Driving it here is the
+      // same obligation `startDraftInner` and `handleSharedStackDecision`
+      // already carry — every path that can leave a bot as the active seat
+      // must also drive it — and this is the third.
+      //
+      // The database load is not optional here either: an all-human pod that
+      // started before this replacement never took `startDraftInner`'s
+      // bot-seat branch, so the seat this creates would be the FIRST bot in the
+      // pod and would decide with no card faces at all.
+      //
+      // Gated on the ENGINE'S published status, read off the reducer's own
+      // return rather than re-queried: the only reachable caller today is the
+      // host control, which `HostControls.tsx` gates on `matchInProgress ||
+      // roundComplete`, so a pod outside `Drafting` owes no turn to anybody and
+      // must not pay for a card-data fetch. Both steps sit before the
+      // broadcast, so every seat's next view already shows where the bot chain
+      // stopped. The error boundary is the enclosing `catch`, which reports
+      // this as the host action it is rather than as a refused player decision.
+      if (stillDrafting) {
+        await this.loadCardDatabaseForSharedStackBots(
+          (await this.ensureProcedure()).distribution,
+          replaced.seats.filter((s) => s.is_bot).length,
+        );
+        await this.resolveBotPicks({ emit: false, persist: true });
+      }
+
       await this.broadcastViews();
       this.reconcileEffectivePause();
     } catch (err) {
@@ -3599,12 +3691,60 @@ export class P2PDraftHost {
         // is no round past the last one for this branch to invent.
         await this.generatePairingsInner();
         return this.adapter.getViewForSeat(0);
+      } else if (view.status === "Drafting") {
+        return await this.resumeDraftingAfterRestore(view);
       }
 
       return view;
     }
 
     return null;
+  }
+
+  /**
+   * Hand a restored, still-DRAFTING pod back to whoever owes the next move.
+   *
+   * A restored snapshot can legitimately hold a state whose active seat is a
+   * BOT, and this diff is what made that reachable: `handleSharedStackDecision`
+   * persists the human's applied decision BEFORE it runs the bot turns, so the
+   * durable snapshot between those two awaits describes a pod waiting on a bot.
+   * Nothing else recovers it. The reducer refuses a decision from a non-active
+   * seat, so no human can move for the bot; `frozenTimer` is in-memory only and
+   * is not persisted, so no clock is re-armed; and `startPickTimer` returns
+   * immediately for any pod that is not `Competitive`. The pod would sit there
+   * with no error, no timer and no legal move available to anybody.
+   *
+   * Gated on the ENGINE'S OWN discriminators, not on `kind`: `shared_stack` is
+   * `None` for every non-Winston frame and outside `Drafting`, and `is_bot` is
+   * the published seat flag the bot loop itself reads. A human-vs-human pod and
+   * a pick-and-pass pod both fall straight through, and neither pays for the
+   * procedure fetch or the card-data fetch below.
+   *
+   * The card database is loaded before the bot moves for the same reason
+   * `startDraftInner` loads it: restore never calls that method, and
+   * `draftPodHostAdapter`'s own fetch is gated on `Cube || CommanderDraft`, so
+   * a restored Set-pool Winston pod would otherwise decide every remaining turn
+   * with no card faces at all.
+   *
+   * `emit: false` because there is no per-pick event a decision can carry, and
+   * no broadcast because `restoreFromPersisted` runs BEFORE `initialize()` —
+   * there are no guest sessions yet. The returned view is the re-read one, so
+   * the caller publishes where the bot chain actually stopped rather than the
+   * bot-active state it was handed.
+   */
+  private async resumeDraftingAfterRestore(view: DraftPlayerView): Promise<DraftPlayerView> {
+    if (!view.shared_stack || !view.seats.some((seat) => seat.is_bot)) return view;
+    // `resolveBotPicks` dispatches on the PROCEDURE, which `initialize()` has
+    // not fetched yet at this point — see `ensureProcedure`. Without this the
+    // dispatch falls through to the `current_pack` loop, which is null for
+    // every seat under this distribution, and the bot silently does not move.
+    const procedure = await this.ensureProcedure();
+    await this.loadCardDatabaseForSharedStackBots(
+      procedure.distribution,
+      view.seats.filter((seat) => seat.is_bot).length,
+    );
+    await this.resolveBotPicks({ emit: false, persist: true });
+    return this.adapter.getViewForSeat(0);
   }
 
   /**
