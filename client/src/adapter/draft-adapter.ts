@@ -418,6 +418,35 @@ export interface SharedStackDecisionView {
   refusal: SharedStackRefusal | null;
 }
 
+/**
+ * One seat's decision on one pile, and how tall that pile was when they made
+ * it.
+ *
+ * PUBLIC INFORMATION: at a physical table everyone watches a player pick a pile
+ * up, weigh it and put it back, and every pile's HEIGHT is visible across the
+ * table (the same reason `SharedStackPileView.total` is published to every
+ * viewer).
+ *
+ * WHAT IS NOT HERE, and must never be added: the pile's CONTENTS. This record
+ * is the one place a future author might reach for them, and they are the
+ * format's only secret. A consumer that wants to know WHICH cards a seat passed
+ * reconstructs them from ITS OWN published `revealed` prefix plus `pile_size` —
+ * exactly the information a player at the table has.
+ */
+// @sync-with: crates/draft-core/src/types.rs
+export interface SharedStackDecisionRecord {
+  /** The seat that decided. */
+  seat: number;
+  /** The pile it decided on, addressed by the engine's own pile index (the same
+   * index `SharedStackPileView.index` publishes), never by a position in a
+   * vector. */
+  pile: number;
+  decision: SharedStackPileDecision;
+  /** The pile's height at the moment of the decision, captured before the
+   * decision moved the pile. */
+  pile_size: number;
+}
+
 /** One shared-stack pile, projected for one viewer. */
 // @sync-with: crates/draft-core/src/view.rs
 export interface SharedStackPileView {
@@ -464,6 +493,15 @@ export interface SharedStackView {
    * acknowledged by pool growth.
    */
   decisions: number;
+  /**
+   * The applied decisions the session still retains, oldest first and bounded
+   * by the engine's `SHARED_STACK_HISTORY_CAPACITY`.
+   *
+   * Published to EVERY viewer — every seat and both spectator visibilities —
+   * for the same reason `decisions` is: it is a record of PUBLIC events. It
+   * carries NO CARD; see `SharedStackDecisionRecord`.
+   */
+  history: SharedStackDecisionRecord[];
 }
 
 // @sync-with: crates/draft-core/src/view.rs

@@ -39,6 +39,10 @@ const store = vi.hoisted(() => {
       { index: 2, total: 0, revealed: [], legality: [{ decision: "Take", refusal: "PileNotActive" }, { decision: "Decline", refusal: "PileNotActive" }] },
     ],
     decisions: 6,
+    // Empty: this fixture exercises a display/transport path, and no client
+    // consumer reads the history yet. Its fidelity to the reducer is pinned
+    // in `draft-core` (`history_records_sizes_and_decisions_and_never_cards`).
+    history: [],
   };
 
   const packCards = [

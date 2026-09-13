@@ -88,6 +88,22 @@ pub struct TournamentRequestId(pub u64);
 ///      unchanged: `DraftLobbyMetadata::draft_kind` is a length-bounded
 ///      `String` whose producer is `format!("{:?}", …)`, so `"Winston"` needs
 ///      no lobby version move — only its doc's label list.
+///
+///      AMENDED IN PLACE, NOT BUMPED. `SharedStackState::history` and
+///      `SharedStackView::history` — vectors of the new
+///      `SharedStackDecisionRecord` (seat, pile, decision, pile_size; no card,
+///      deliberately and permanently) — were added after this entry was
+///      written. 71 is unreleased upstream (upstream is 70), so no peer has
+///      ever spoken a 71 without them and there is no version for a bump to
+///      separate: a second number would announce a break between two shapes
+///      that never coexisted on the wire. Both carry `#[serde(default)]`, so a
+///      local snapshot persisted by an earlier 71 build loads with an empty
+///      history rather than failing `import_draft_session`; the TypeScript
+///      mirror is REQUIRED rather than optional (`SharedStackView.history` in
+///      `client/src/adapter/draft-adapter.ts`), because the view is built by
+///      the engine on every frame and never by a client. They ride the same
+///      Winston-pod condition as the rest of this entry: a non-Winston pod's
+///      frames stay byte-identical to v70.
 /// 70 — `OutsideGameChoiceSource::BoosterPack` replaced its `set_code: String`
 ///      with a required `origin: PackOrigin` (`Set(code)` or `Cube`), so a
 ///      `WaitingFor::OutsideGameChoice` for an opened pack no longer decodes

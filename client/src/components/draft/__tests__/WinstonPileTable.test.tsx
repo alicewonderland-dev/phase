@@ -85,6 +85,10 @@ function activeTurn(piles: SharedStackPileView[], activePile: number): SharedSta
     active_pile: activePile,
     piles,
     decisions: 4,
+    // Empty: this fixture exercises a display/transport path, and no client
+    // consumer reads the history yet. Its fidelity to the reducer is pinned
+    // in `draft-core` (`history_records_sizes_and_decisions_and_never_cards`).
+    history: [],
   };
 }
 
@@ -207,6 +211,10 @@ describe("WinstonPileTable", () => {
       active_pile: 1,
       piles: [pile(0, 3, [], null, null), pile(1, 1, [], null, null), pile(2, 4, [], null, null)],
       decisions: 4,
+      // Empty: this fixture exercises a display/transport path, and no client
+      // consumer reads the history yet. Its fidelity to the reducer is pinned
+      // in `draft-core` (`history_records_sizes_and_decisions_and_never_cards`).
+      history: [],
     };
     renderTable(spectatingSeat, { viewerSeat: 1 });
 
@@ -247,6 +255,10 @@ describe("WinstonPileTable", () => {
       active_pile: 1,
       piles: [pile(0, 3, [], null, null), pile(1, 1, [], null, null), pile(2, 4, [], null, null)],
       decisions: 4,
+      // Empty: this fixture exercises a display/transport path, and no client
+      // consumer reads the history yet. Its fidelity to the reducer is pinned
+      // in `draft-core` (`history_records_sizes_and_decisions_and_never_cards`).
+      history: [],
     };
     renderTable(sameProjection, { viewerSeat: 0 });
 

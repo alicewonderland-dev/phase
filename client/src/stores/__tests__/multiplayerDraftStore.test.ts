@@ -1262,6 +1262,9 @@ describe("multiplayerDraftStore", () => {
           ],
         })),
         decisions,
+        // Empty: this fixture exercises the `decisions` acknowledgement path,
+        // and no client consumer reads the history yet.
+        history: [],
       },
       play_first_chooser: 1,
     });

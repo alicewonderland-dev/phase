@@ -232,6 +232,41 @@ impl DraftSession {
                             .to_string(),
                     });
                 }
+                // The decision history's own rules. The capacity is what bounds
+                // every view broadcast and every snapshot, so an import is the
+                // one place an unbounded history could arrive from.
+                if state.history.len() > SHARED_STACK_HISTORY_CAPACITY {
+                    return Err(DraftError::InvalidSharedStackConfiguration {
+                        reason: format!(
+                            "a shared-stack history keeps at most \
+                             {SHARED_STACK_HISTORY_CAPACITY} decisions"
+                        ),
+                    });
+                }
+                // Both indices are addressed the way the record documents them:
+                // `pile` is an engine pile index and `seat` is a seat index, so
+                // an out-of-range one would make a consumer's lookup silently
+                // wrong rather than loudly absent.
+                if state
+                    .history
+                    .iter()
+                    .any(|record| usize::from(record.pile) >= piles)
+                {
+                    return Err(DraftError::InvalidSharedStackConfiguration {
+                        reason: "a history record names a pile the session does not have"
+                            .to_string(),
+                    });
+                }
+                if state
+                    .history
+                    .iter()
+                    .any(|record| usize::from(record.seat) >= self.seats.len())
+                {
+                    return Err(DraftError::InvalidSharedStackConfiguration {
+                        reason: "a history record names a seat the session does not have"
+                            .to_string(),
+                    });
+                }
                 return Ok(());
             }
         }
@@ -1111,6 +1146,7 @@ fn apply_start_draft(
                 cursor: 0,
                 inspected,
                 decisions: 0,
+                history: Vec::new(),
             });
             session.status = DraftStatus::Drafting;
             return Ok(vec![DraftDelta::DraftStarted]);
@@ -2748,6 +2784,7 @@ mod tests {
             cursor: 0,
             inspected: vec![0; 3],
             decisions: 0,
+            history: Vec::new(),
         });
         let winston_json = serde_json::to_value(&winston).unwrap();
         assert!(winston_json.get("shared_stack").is_some());

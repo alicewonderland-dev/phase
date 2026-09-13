@@ -56,8 +56,8 @@
 //! follow-up, not part of a draft kind.
 
 use crate::types::{
-    DraftDelta, DraftError, DraftSession, DraftStatus, SharedStackPileDecision, SharedStackRefusal,
-    SharedStackState,
+    DraftDelta, DraftError, DraftSession, DraftStatus, SharedStackDecisionRecord,
+    SharedStackPileDecision, SharedStackRefusal, SharedStackState, SHARED_STACK_HISTORY_CAPACITY,
 };
 
 /// How many piles a [`PackDistribution::SharedStackPiles`] row deals, or the
@@ -220,6 +220,13 @@ pub fn apply_shared_stack_decision(
         .expect("`refusal_for` above read the state through the accessor");
     let pool = &mut session.pools[usize::from(seat)];
 
+    // Captured BEFORE the `match`, which is the whole content of the field: a
+    // `Take` empties the pile and refills it with one card, and a `Decline`
+    // appends one, so after the `match` the real height at the moment of the
+    // decision is gone. For a decline this is also exactly the prefix the
+    // deciding seat had inspected.
+    let pile_size = state.piles[pile_index].len();
+
     let turn_ends = match decision {
         // WotC: "Each time a player takes a pile, it's replaced by the top card
         // of the main stack to form a new one-card pile."
@@ -274,6 +281,30 @@ pub fn apply_shared_stack_decision(
     // never reaches this line, so the counter stays a count of applied
     // decisions and a refusal still leaves the session byte-identical.
     state.decisions += 1;
+
+    // The SECOND field this one event moves, and it sits here for exactly the
+    // reason `decisions` does: a refused decision returned above and never
+    // reaches this line, so a refusal still leaves the session byte-identical
+    // and the history stays a record of APPLIED decisions.
+    //
+    // PUBLIC INFORMATION ONLY -- seat, pile, decision, height. See
+    // `SharedStackDecisionRecord`: the pile's contents are the format's only
+    // secret and must never be recorded here.
+    state.history.push(SharedStackDecisionRecord {
+        seat,
+        pile,
+        decision,
+        pile_size,
+    });
+    // Trim the FRONT so the retained window is the most recent decisions,
+    // oldest first. `drain` rather than `remove` so a history that somehow
+    // arrived over capacity (an imported snapshot is validated, but a
+    // hand-built session is not) converges in one step instead of one decision
+    // at a time.
+    if state.history.len() > SHARED_STACK_HISTORY_CAPACITY {
+        let excess = state.history.len() - SHARED_STACK_HISTORY_CAPACITY;
+        state.history.drain(..excess);
+    }
 
     if turn_ends {
         // Modulo `seats.len()`, NEVER `config.pod_size`, whose serde default is
@@ -1049,6 +1080,381 @@ mod tests {
         assert!(
             s.inspected[0] > 0,
             "and the new seat's own pile-0 entitlement was published"
+        );
+    }
+
+    /// V-B1: the published decision history records PUBLIC facts only, keeps
+    /// them faithful to the moment they happened, and stays bounded.
+    ///
+    /// Driven through the REAL reducer (`session::apply`, via
+    /// `drive_one_decision`) rather than by hand-building a `SharedStackState`:
+    /// the claim is about what the reducer writes, and a hand-built state would
+    /// assert only that a struct literal holds what the literal put in it.
+    ///
+    /// Four legs, and the third is the one the type exists for:
+    ///   (a) FIDELITY -- after every decision of two full walks, the retained
+    ///       window equals the decisions actually applied, with `pile_size`
+    ///       captured BEFORE the pile moved.
+    ///   (b) BOUNDEDNESS -- a walk longer than the capacity keeps exactly the
+    ///       capacity, and the OLDEST record is the one that is gone.
+    ///   (c) NO CARDS -- a record's serialized key set is exactly the four
+    ///       public fields, and no card's `instance_id` appears anywhere in the
+    ///       serialized history of a completed draft.
+    ///   (d) PUBLICATION -- the same history reaches every seat's projection,
+    ///       verbatim, which is the half `view::shared_stack_view` owns.
+    #[test]
+    fn history_records_sizes_and_decisions_and_never_cards() {
+        // (a) + (b): both walk policies, because `TakeFirst` never declines and
+        // a decline is the record whose `pile_size` is the interesting one.
+        for policy in WalkPolicy::ALL {
+            // 4 seats x 3 packs x 15 cards = 180 cards. Chosen over the 2-seat
+            // fixture deliberately: a 2-seat 90-card draft costs fewer
+            // decisions than `SHARED_STACK_HISTORY_CAPACITY`, so leg (b) would
+            // never reach the trim and would pass vacuously. The reach-guard
+            // below fails rather than skipping if that ever stops being true.
+            let mut session = started(4, 4242);
+            let total = 4 * 3 * usize::from(CARDS_PER_PACK);
+            let mut applied: Vec<SharedStackDecisionRecord> = Vec::new();
+            let mut card_ids: Vec<String> = {
+                let s = state(&session);
+                s.main_stack
+                    .iter()
+                    .chain(s.piles.iter().flatten())
+                    .map(|card| card.instance_id.clone())
+                    .collect()
+            };
+            card_ids.sort_unstable();
+            assert_eq!(card_ids.len(), total, "every card is live at turn one");
+
+            let cap = total * 4;
+            while session.status == DraftStatus::Drafting {
+                assert!(
+                    applied.len() < cap,
+                    "{policy:?}: the draft did not terminate"
+                );
+                // Read from the state BEFORE applying, so `pile_size` is
+                // compared against the height the reducer had to capture
+                // before its own `match` moved the pile.
+                let (seat, pile, pile_size) = {
+                    let s = state(&session);
+                    (
+                        s.active_seat,
+                        s.cursor,
+                        s.piles[usize::from(s.cursor)].len(),
+                    )
+                };
+                let decision = drive_one_decision(&mut session, policy);
+                applied.push(SharedStackDecisionRecord {
+                    seat,
+                    pile,
+                    decision,
+                    pile_size,
+                });
+
+                // (b) asserted after EVERY decision, not only at the end: the
+                // length is the capacity once the walk passes it, and never
+                // more.
+                let kept = applied.len().min(SHARED_STACK_HISTORY_CAPACITY);
+                let history = &state(&session).history;
+                assert_eq!(
+                    history.len(),
+                    kept,
+                    "{policy:?}: the history keeps at most {SHARED_STACK_HISTORY_CAPACITY}"
+                );
+                // (a): the retained window is the MOST RECENT `kept` decisions,
+                // oldest first -- which pins both the contents and the
+                // direction of the trim. A trim from the back would keep the
+                // oldest and red this.
+                //
+                // Compared entry by entry rather than slice against slice, for
+                // the diagnostic: a whole-window `assert_eq!` prints 128
+                // records on failure (measured at ~11 KB under the
+                // capture-after-the-match mutation), which buries the one
+                // record that moved.
+                let window = &applied[applied.len() - kept..];
+                if let Some((i, (got, want))) = history
+                    .iter()
+                    .zip(window.iter())
+                    .enumerate()
+                    .find(|(_, (got, want))| got != want)
+                {
+                    panic!(
+                        "{policy:?}: history[{i}] of {kept} is {got:?}, but decision \
+                         {} applied {want:?}",
+                        applied.len() - kept + i
+                    );
+                }
+            }
+
+            // Reach-guards for (b), so a shorter draft cannot make the trim
+            // untested: the walk really did exceed the capacity, and the oldest
+            // record really is absent.
+            assert!(
+                applied.len() > SHARED_STACK_HISTORY_CAPACITY,
+                "{policy:?}: {} decisions must exceed the {SHARED_STACK_HISTORY_CAPACITY}-record \
+                 capacity, or leg (b) never reaches the trim",
+                applied.len()
+            );
+            let history = state(&session).history.clone();
+            assert_eq!(history.len(), SHARED_STACK_HISTORY_CAPACITY);
+            assert_eq!(
+                history.first().copied(),
+                applied
+                    .get(applied.len() - SHARED_STACK_HISTORY_CAPACITY)
+                    .copied(),
+                "{policy:?}: the OLDEST retained record is the one at the window's head"
+            );
+            // "The oldest is GONE", stated the only way that is well posed:
+            // records are compared by VALUE, and an early `(seat 0, pile 0,
+            // Take, size 1)` recurs verbatim later in any draft -- so a
+            // `!history.contains(&applied[0])` check would be asserting a
+            // coincidence, not a trim. The monotone `decisions` counter is the
+            // identity-free witness: it counted every decision, the history
+            // retained strictly fewer, and the difference is exactly what the
+            // trim dropped.
+            assert_eq!(
+                usize::try_from(state(&session).decisions).unwrap(),
+                applied.len(),
+                "{policy:?}: `decisions` counted every applied decision"
+            );
+            assert_eq!(
+                applied.len() - history.len(),
+                applied.len() - SHARED_STACK_HISTORY_CAPACITY,
+                "{policy:?}: exactly the overflow was dropped"
+            );
+            assert!(
+                history.len() < applied.len(),
+                "{policy:?}: the history is strictly shorter than the decisions made"
+            );
+
+            // Reach-guard for (a): both decisions occur, so `pile_size` is
+            // pinned for a `Take` (which empties the pile) and for a `Decline`
+            // (which appends to it).
+            assert!(
+                applied
+                    .iter()
+                    .any(|r| r.decision == SharedStackPileDecision::Take),
+                "{policy:?}: the walk took at least one pile"
+            );
+            assert!(
+                applied
+                    .iter()
+                    .any(|r| r.decision == SharedStackPileDecision::Decline),
+                "{policy:?}: the walk declined at least one pile"
+            );
+            // And the sizes are not all the same number, which is what would
+            // make the `pile_size` assertions satisfiable by a constant.
+            let sizes: std::collections::BTreeSet<usize> =
+                applied.iter().map(|r| r.pile_size).collect();
+            assert!(
+                sizes.len() > 1,
+                "{policy:?}: piles reached more than one height: {sizes:?}"
+            );
+
+            // (c) the negative that matters: no card's identity is anywhere in
+            // the serialized history of a whole draft.
+            let serialized = serde_json::to_string(&history).expect("history serializes");
+            for id in &card_ids {
+                assert!(
+                    !serialized.contains(id.as_str()),
+                    "{policy:?}: the history named a card ({id})"
+                );
+            }
+            // Paired positive for that scan, so a scan that could never match
+            // cannot pass vacuously: the same instrument DOES find a card id in
+            // the session's own pools.
+            let pooled = serde_json::to_string(&session.pools).expect("pools serialize");
+            assert!(
+                card_ids.iter().any(|id| pooled.contains(id.as_str())),
+                "{policy:?}: the substring scan finds a card id when one is present"
+            );
+        }
+
+        // (c) the structural half: the record's serialized shape is exactly the
+        // four public fields. A future author adding a card-bearing field reds
+        // this, which is the whole point of the type's doc.
+        let record = SharedStackDecisionRecord {
+            seat: 1,
+            pile: 2,
+            decision: SharedStackPileDecision::Decline,
+            pile_size: 4,
+        };
+        let value = serde_json::to_value(record).expect("a record serializes");
+        // Compared as a SET: `serde_json::Map` is a `BTreeMap` here (the
+        // `preserve_order` feature is off), so its iteration order is
+        // alphabetical and asserting declaration order would pin the
+        // serializer's internals instead of the field list.
+        let keys: std::collections::BTreeSet<&str> = value
+            .as_object()
+            .expect("a record is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["decision", "pile", "pile_size", "seat"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<&str>>(),
+            "a record carries the four PUBLIC fields and nothing else"
+        );
+
+        // (d): the projection publishes the same history to every seat,
+        // verbatim, including seats that are not the active one.
+        let mut session = started(2, 4242);
+        for _ in 0..5 {
+            drive_one_decision(&mut session, WalkPolicy::DeclineFirst);
+        }
+        let expected = state(&session).history.clone();
+        assert!(
+            expected.len() >= 5,
+            "reach-guard: there is a history to publish"
+        );
+        for seat in 0..session.seats.len() as u8 {
+            let view = crate::view::filter_for_player(&session, seat);
+            let published = view
+                .shared_stack
+                .expect("a live pile turn publishes a shared-stack view");
+            assert_eq!(
+                published.history, expected,
+                "seat {seat} receives the history verbatim -- it is a record of public events"
+            );
+        }
+    }
+
+    /// The import boundary's half of the history's contract: a snapshot is the
+    /// one place an over-long or out-of-range history can arrive from, because
+    /// the reducer cannot build one.
+    ///
+    /// Paired positive first, so the three refusals cannot be satisfied by a
+    /// validator that refuses everything.
+    #[test]
+    fn a_persisted_history_must_be_bounded_and_in_range() {
+        let mut session = started(2, 4242);
+        for _ in 0..4 {
+            drive_one_decision(&mut session, WalkPolicy::DeclineFirst);
+        }
+        let record = *state(&session)
+            .history
+            .first()
+            .expect("the walk wrote records");
+
+        // Paired positive (a): what the reducer itself produces validates.
+        session
+            .validate_persisted_snapshot()
+            .expect("a reducer-built history validates");
+        // Paired positive (b): a history exactly AT capacity validates, so the
+        // bound below is `>` and not `>=`.
+        let at_capacity = {
+            let mut s = session.clone();
+            let state = s.shared_stack.as_mut().expect("shared stack present");
+            state.history = vec![record; SHARED_STACK_HISTORY_CAPACITY];
+            s
+        };
+        at_capacity
+            .validate_persisted_snapshot()
+            .expect("a history exactly at capacity validates");
+
+        let over_capacity = {
+            let mut s = session.clone();
+            let state = s.shared_stack.as_mut().expect("shared stack present");
+            state.history = vec![record; SHARED_STACK_HISTORY_CAPACITY + 1];
+            s
+        };
+        assert!(
+            matches!(
+                over_capacity.validate_persisted_snapshot(),
+                Err(DraftError::InvalidSharedStackConfiguration { .. })
+            ),
+            "one record over capacity is refused at import"
+        );
+
+        let bad_pile = {
+            let mut s = session.clone();
+            let state = s.shared_stack.as_mut().expect("shared stack present");
+            let piles = state.piles.len() as u8;
+            state.history = vec![SharedStackDecisionRecord {
+                pile: piles,
+                ..record
+            }];
+            s
+        };
+        assert!(
+            matches!(
+                bad_pile.validate_persisted_snapshot(),
+                Err(DraftError::InvalidSharedStackConfiguration { .. })
+            ),
+            "a record naming a pile the session does not have is refused"
+        );
+
+        let bad_seat = {
+            let mut s = session.clone();
+            let seats = s.seats.len() as u8;
+            let state = s.shared_stack.as_mut().expect("shared stack present");
+            state.history = vec![SharedStackDecisionRecord {
+                seat: seats,
+                ..record
+            }];
+            s
+        };
+        assert!(
+            matches!(
+                bad_seat.validate_persisted_snapshot(),
+                Err(DraftError::InvalidSharedStackConfiguration { .. })
+            ),
+            "a record naming a seat the session does not have is refused"
+        );
+    }
+
+    /// The wire cost of [`SHARED_STACK_HISTORY_CAPACITY`], measured rather than
+    /// argued: the history rides every `SharedStackView` broadcast, so the
+    /// capacity is only defensible with a number beside it.
+    ///
+    /// The ceilings are generous headroom over the measured figures, not a
+    /// second copy of them -- this test exists to catch a record that starts
+    /// carrying something big (a card), not to fail on a byte of drift.
+    #[test]
+    fn history_at_capacity_has_a_measured_wire_size() {
+        let mut session = started(4, 4242);
+        while session.status == DraftStatus::Drafting
+            && state(&session).history.len() < SHARED_STACK_HISTORY_CAPACITY
+        {
+            drive_one_decision(&mut session, WalkPolicy::DeclineFirst);
+        }
+        let full = state(&session).history.clone();
+        assert_eq!(
+            full.len(),
+            SHARED_STACK_HISTORY_CAPACITY,
+            "reach-guard: the history really is at capacity"
+        );
+
+        let history_bytes = serde_json::to_string(&full)
+            .expect("history serializes")
+            .len();
+        let view = crate::view::filter_for_player(&session, state(&session).active_seat)
+            .shared_stack
+            .expect("a live pile turn publishes a shared-stack view");
+        let full_view_bytes = serde_json::to_string(&view).expect("view serializes").len();
+        let mut empty_view = view.clone();
+        empty_view.history.clear();
+        let empty_view_bytes = serde_json::to_string(&empty_view)
+            .expect("view serializes")
+            .len();
+
+        println!(
+            "MEASURED wire size at capacity {SHARED_STACK_HISTORY_CAPACITY}: \
+             history {history_bytes} B; SharedStackView {full_view_bytes} B with it, \
+             {empty_view_bytes} B without ({} B attributable)",
+            full_view_bytes - empty_view_bytes
+        );
+
+        assert!(
+            history_bytes < 16_000,
+            "a full history is small enough to ride every broadcast: {history_bytes} B"
+        );
+        assert!(
+            full_view_bytes - empty_view_bytes < 16_000,
+            "the history's share of a view is bounded: {} B",
+            full_view_bytes - empty_view_bytes
         );
     }
 }

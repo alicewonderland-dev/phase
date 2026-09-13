@@ -370,6 +370,29 @@ pub const MAX_COMMANDER_DESIGNATIONS: usize = 2;
 /// "three stacks face down on the table", by way of the procedure table.
 pub const MAX_SHARED_STACK_PILES: usize = 3;
 
+/// How many [`SharedStackDecisionRecord`]s [`SharedStackState::history`] keeps.
+///
+/// 128 covers an entire 2-seat 90-card draft outright (MEASURED in this
+/// worktree, driving the reducer to completion over four seeds x both walk
+/// policies: 72 decisions declining first, 93 taking first -- the count is
+/// policy-dependent and seed-independent), and the large majority of a 4-seat
+/// 180-card one (MEASURED the same way: 138 and 183).
+///
+/// Deliberately NOT unbounded, and the bound is the point: a 4-seat cube
+/// Winston admits thousands of decisions (`CubeDraftSettings::cards_per_pack`
+/// is client-supplied with no product ceiling -- the same reason
+/// [`SharedStackState::inspected`] is a `usize`), and this history rides every
+/// `SharedStackView` broadcast and every persisted snapshot. This constant is
+/// the knob that bounds that payload.
+///
+/// MEASURED wire cost at this capacity, rather than argued: a full 128-record
+/// history serializes to 7142 JSON bytes, and a whole 3-pile `SharedStackView`
+/// carrying one is 26536 bytes against 19396 without it -- 7140 bytes
+/// attributable, about 27% of that broadcast.
+/// `shared_stack::tests::history_at_capacity_has_a_measured_wire_size` prints
+/// those three figures; re-run it before changing this number.
+pub const SHARED_STACK_HISTORY_CAPACITY: usize = 128;
+
 impl DraftKind {
     /// Every `DraftKind`, in declaration order.
     ///
@@ -1203,6 +1226,25 @@ pub struct SharedStackState {
     /// per-DECISION reading it needs -- which is why this is a `u32` and not a
     /// `u8`.
     pub decisions: u32,
+    /// The most recent [`SHARED_STACK_HISTORY_CAPACITY`] applied decisions,
+    /// OLDEST FIRST. Public table information, and nothing else: see
+    /// [`SharedStackDecisionRecord`] for what is in a record and, more
+    /// importantly, what must never be added to one.
+    ///
+    /// BOUNDED, because a 4-seat cube Winston admits thousands of decisions
+    /// (`cards_per_pack` is client-supplied with no product ceiling -- see
+    /// [`Self::inspected`]'s own note) and this rides every view and every
+    /// snapshot. Dropping the oldest is not lossy for its consumers: a
+    /// pile-size read is a read on what a seat is doing NOW, and the
+    /// pass-colour reconstruction discards any record older than the last
+    /// `Take` on that pile anyway.
+    ///
+    /// `#[serde(default)]` so a snapshot persisted before this field existed
+    /// loads with an empty history instead of failing `import_draft_session`.
+    /// Only local snapshots can predate it -- the wire versions carrying it are
+    /// unreleased upstream.
+    #[serde(default)]
+    pub history: Vec<SharedStackDecisionRecord>,
 }
 
 /// Take the pile, or put it back.
@@ -1225,6 +1267,39 @@ impl SharedStackPileDecision {
         SharedStackPileDecision::Take,
         SharedStackPileDecision::Decline,
     ];
+}
+
+/// One seat's decision on one pile, and how tall that pile was when they made
+/// it.
+///
+/// PUBLIC INFORMATION: at a physical table everyone watches a player pick a
+/// pile up, weigh it and put it back, and every pile's HEIGHT is visible across
+/// the table (the same reason `SharedStackPileView::total` is published to
+/// every viewer).
+///
+/// WHAT IS NOT HERE, and must never be added: the pile's CONTENTS. This record
+/// is the one place a future author might reach for them, and they are the
+/// format's only secret. A consumer that wants to know WHICH cards a seat
+/// passed reconstructs them from ITS OWN published `revealed` prefix plus
+/// `pile_size` -- exactly the information a player at the table has.
+///
+/// Every field is `Copy`, so the record is a plain value and a fold over
+/// [`SharedStackState::history`] never clones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedStackDecisionRecord {
+    /// The seat that decided.
+    pub seat: u8,
+    /// The pile it decided on, addressed by the engine's own pile index (the
+    /// same index `SharedStackPileView::index` publishes), never by a position
+    /// in some vector.
+    pub pile: u8,
+    /// Take it, or put it back.
+    pub decision: SharedStackPileDecision,
+    /// The pile's height at the moment of the decision, captured BEFORE the
+    /// decision mutated the pile. For a `Decline` that is exactly the prefix
+    /// the deciding seat had looked at, which is what makes the record useful
+    /// without it carrying a card.
+    pub pile_size: usize,
 }
 
 /// Every reason a shared-stack decision can be refused.

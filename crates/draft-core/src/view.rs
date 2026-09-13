@@ -414,6 +414,20 @@ pub struct SharedStackView {
     /// predicate can never acknowledge it. A count of decisions made is public
     /// at a physical table for the same reason `active_seat` is.
     pub decisions: u32,
+    /// The applied decisions this session still retains, oldest first, verbatim
+    /// from [`SharedStackState::history`].
+    ///
+    /// Published to EVERY viewer — every seat and both spectator visibilities —
+    /// for exactly the reason [`Self::decisions`] is: it is a record of PUBLIC
+    /// events. At a physical table everyone watches which pile a player picked
+    /// up, how tall it was, and whether they kept it.
+    ///
+    /// It carries NO CARD, and that is the invariant to defend when extending
+    /// it: see [`SharedStackDecisionRecord`], whose doc says why the contents
+    /// must never be added. This vector is unconditional here — it is NOT
+    /// behind the `is_active_viewer` gate — so anything card-bearing added to
+    /// the record would be published to every spectator at once.
+    pub history: Vec<SharedStackDecisionRecord>,
 }
 
 /// One pile, projected for one viewer.
@@ -949,6 +963,10 @@ fn shared_stack_view(state: &SharedStackState, viewer_seat: Option<u8>) -> Share
         active_pile: state.cursor,
         piles,
         decisions: state.decisions,
+        // Verbatim, and deliberately OUTSIDE the `is_active_viewer` gate: these
+        // are public events. The engine keeps the history bounded
+        // (`SHARED_STACK_HISTORY_CAPACITY`), so this clone is bounded too.
+        history: state.history.clone(),
     }
 }
 

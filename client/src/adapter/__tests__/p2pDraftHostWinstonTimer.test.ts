@@ -164,6 +164,10 @@ describe("P2PDraftHost shared-stack pick timer", () => {
         pile(2, null, null),
       ],
       decisions: 5,
+      // Empty: this fixture exercises a display/transport path, and no client
+      // consumer reads the history yet. Its fidelity to the reducer is pinned
+      // in `draft-core` (`history_records_sizes_and_decisions_and_never_cards`).
+      history: [],
     };
     const { privateHost, submitSharedStackDecisionForSeat } =
       await startedWinstonHost(sharedStack);
@@ -198,6 +202,10 @@ describe("P2PDraftHost shared-stack pick timer", () => {
         pile(2, "PileNotActive", "PileNotActive"),
       ],
       decisions: 5,
+      // Empty: this fixture exercises a display/transport path, and no client
+      // consumer reads the history yet. Its fidelity to the reducer is pinned
+      // in `draft-core` (`history_records_sizes_and_decisions_and_never_cards`).
+      history: [],
     };
     const { privateHost, submitSharedStackDecisionForSeat } =
       await startedWinstonHost(sharedStack);
@@ -230,6 +238,10 @@ describe("P2PDraftHost shared-stack pick timer", () => {
         pile(2, null, null),
       ],
       decisions: 5,
+      // Empty: this fixture exercises a display/transport path, and no client
+      // consumer reads the history yet. Its fidelity to the reducer is pinned
+      // in `draft-core` (`history_records_sizes_and_decisions_and_never_cards`).
+      history: [],
     };
     const { host, privateHost, submitSharedStackDecisionForSeat } =
       await startedWinstonHost(sharedStack);

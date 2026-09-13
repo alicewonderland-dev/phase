@@ -176,6 +176,18 @@ import type {
  *       gate. Other kinds are unaffected: `shared_stack` and
  *       `play_first_chooser` are absent from every non-Winston view, which is
  *       also why their TypeScript mirrors are optional.
+ *
+ *       AMENDED IN PLACE, NOT BUMPED. `shared_stack.history` — a bounded,
+ *       oldest-first vector of `SharedStackDecisionRecord` (seat, pile,
+ *       decision, pile_size; no card, deliberately and permanently) — was
+ *       added after this entry was written. 30 is unreleased upstream
+ *       (upstream is 29), so no peer has ever spoken a 30 without it and there
+ *       is no version for a bump to separate. The Rust field carries
+ *       `#[serde(default)]` for locally persisted snapshots; this TypeScript
+ *       mirror is REQUIRED rather than optional, because `shared_stack` is
+ *       engine-built on every frame and a client never constructs one. Other
+ *       kinds stay unaffected for the reason above: no non-Winston view
+ *       carries a `shared_stack` at all.
  */
 export const DRAFT_PROTOCOL_VERSION = 30 as const;
 
