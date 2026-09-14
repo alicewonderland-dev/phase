@@ -27,6 +27,10 @@ const validSharedStack = {
   total_cards: 20,
   active_seat: 1,
   active_pile: 0,
+  // THREE piles, because the fully-populated positive declares
+  // `pile_count: 3`: the boundary now requires the declared count and the
+  // published vector to agree, and a fixture that contradicted itself was the
+  // first thing that check caught.
   piles: [
     {
       index: 0,
@@ -37,6 +41,8 @@ const validSharedStack = {
         { decision: "Decline", refusal: "NoGuaranteedCard" },
       ],
     },
+    { index: 1, total: 1, revealed: [], legality: [{ decision: "Take", refusal: null }] },
+    { index: 2, total: 1, revealed: [], legality: [{ decision: "Take", refusal: null }] },
   ],
   decisions: 5,
   history: [{ seat: 0, pile: 1, decision: "Decline", pile_size: 2 }],
@@ -722,6 +728,42 @@ describe("draftProtocol", () => {
       // An OBJECT missing `instance_id`, not a string: a string was already
       // refused by the old "is it an object" check, so that row pinned nothing
       // the card validation added.
+      // The schema the reducer could never have produced. Each of these looks
+      // locally plausible and is refused on a rule the engine states elsewhere.
+      ["a zero pile count, which `piles_needed` refuses outright", {
+        distribution: { SharedStackPiles: { pile_count: 0 } },
+      }],
+      ["a declared pile count that disagrees with the published piles", {
+        distribution: { SharedStackPiles: { pile_count: 2 } },
+        shared_stack: validSharedStack,
+      }],
+      ["a seat address past a u8", {
+        shared_stack: { ...validSharedStack, active_seat: 256 },
+      }],
+      ["a pile address past a u8", {
+        shared_stack: { ...validSharedStack, active_pile: 256 },
+      }],
+      ["a decision counter past a u32", {
+        shared_stack: { ...validSharedStack, decisions: 4294967296 },
+      }],
+      ["a history record addressing a seat past a u8", {
+        shared_stack: {
+          ...validSharedStack,
+          history: [{ seat: 256, pile: 0, decision: "Decline", pile_size: 2 }],
+        },
+      }],
+      ["a pile index past a u8", {
+        shared_stack: {
+          ...validSharedStack,
+          piles: [{ index: 256, total: 1, revealed: [], legality: [] }],
+        },
+      }],
+      ["a missing history, which the engine always serializes", {
+        shared_stack: (({ history: _h, ...rest }) => rest)(validSharedStack),
+      }],
+      ["a missing forced draw, which the engine always serializes", {
+        shared_stack: (({ forced_draw: _f, ...rest }) => rest)(validSharedStack),
+      }],
       ["a forced draw with no instance id", {
         shared_stack: { ...validSharedStack, forced_draw: { name: "Ponder" } },
       }],

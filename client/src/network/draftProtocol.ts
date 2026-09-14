@@ -1278,7 +1278,13 @@ function requireObject(raw: unknown, context: string): Record<string, unknown> {
   return raw as Record<string, unknown>;
 }
 
-/** A non-negative integer. Counts and seat/pile indices are all this shape. */
+/**
+ * A non-negative integer. The engine's `usize` counts -- `total_cards`,
+ * `main_stack_remaining`, a pile's `total`, a record's `pile_size` -- are this
+ * shape, and deliberately have no ceiling: a cube pod's card count is the
+ * host's to choose, so any bound written here would be a second, wrong
+ * authority on pool size.
+ */
 function requireCount(record: Record<string, unknown>, field: string, context: string): number {
   const value = record[field];
   if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
@@ -1289,6 +1295,51 @@ function requireCount(record: Record<string, unknown>, field: string, context: s
   return value;
 }
 
+/**
+ * An integer inside `[min, max]`, for the fields the engine declares as sized.
+ *
+ * Seat and pile ADDRESSES are `u8` in `draft-core` (`SharedStackView.active_seat`
+ * and `.active_pile`, `SharedStackPileView.index`, `SharedStackDecisionRecord`'s
+ * `seat` and `pile`); `decisions` is a `u32`. A frame carrying a value outside
+ * those ranges is one the engine could not have produced, so it is refused here
+ * rather than trusted as frontend state.
+ */
+function requireBoundedInt(
+  record: Record<string, unknown>,
+  field: string,
+  context: string,
+  min: number,
+  max: number,
+): number {
+  const value = record[field];
+  if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) {
+    throw new Error(
+      `Invalid draft message: ${context}.${field} must be an integer in [${min}, ${max}]`,
+    );
+  }
+  return value;
+}
+
+const U8_MAX = 255;
+const U32_MAX = 4294967295;
+
+/**
+ * A field the engine ALWAYS serializes, refused when the frame omits it.
+ *
+ * `history` and `forced_draw` carry no `skip_serializing_if` in
+ * `draft-core::view`, so every real frame has both -- `forced_draw` as `null`
+ * when the viewer drew nothing. Defaulting them on absence turned a truncated
+ * or hostile frame into a plausible-looking one: a missing `history` read as
+ * "no decisions yet" rather than as a frame that should never have been
+ * accepted.
+ */
+function requirePresent(record: Record<string, unknown>, field: string, context: string): unknown {
+  if (!(field in record)) {
+    throw new Error(`Invalid draft message: ${context}.${field} is required`);
+  }
+  return record[field];
+}
+
 function normalizePackDistribution(raw: unknown): PackDistribution {
   if (raw === "PickAndPass" || raw === "AllAtOnce") return raw;
   const tagged = requireObject(raw, "distribution");
@@ -1297,10 +1348,16 @@ function normalizePackDistribution(raw: unknown): PackDistribution {
     throw new Error("Invalid draft message: distribution must be a known pack distribution");
   }
   const piles = requireObject(shared, "distribution.SharedStackPiles");
-  const pile_count = requireCount(piles, "pile_count", "distribution.SharedStackPiles");
-  if (pile_count > 255) {
-    throw new Error("Invalid draft message: distribution.SharedStackPiles.pile_count must be a u8");
-  }
+  // NONZERO. `shared_stack::piles_needed` refuses a zero pile count outright --
+  // "a shared-stack distribution must deal at least one pile" -- so a frame
+  // declaring zero describes a session the reducer would never have built.
+  const pile_count = requireBoundedInt(
+    piles,
+    "pile_count",
+    "distribution.SharedStackPiles",
+    1,
+    U8_MAX,
+  );
   return { SharedStackPiles: { pile_count } };
 }
 
@@ -1360,7 +1417,7 @@ function normalizeSharedStackPileView(raw: unknown, index: number): SharedStackP
     throw new Error(`Invalid draft message: ${context}.legality must be an array`);
   }
   return {
-    index: requireCount(pile, "index", context),
+    index: requireBoundedInt(pile, "index", context, 0, U8_MAX),
     total,
     revealed,
     legality: pile.legality.map((entry, i) =>
@@ -1375,30 +1432,56 @@ function normalizeSharedStackDecisionRecord(raw: unknown, index: number): Shared
     throw new Error(`Invalid draft message: ${context}.decision must be Take or Decline`);
   }
   return {
-    seat: requireCount(record, "seat", context),
-    pile: requireCount(record, "pile", context),
+    seat: requireBoundedInt(record, "seat", context, 0, U8_MAX),
+    pile: requireBoundedInt(record, "pile", context, 0, U8_MAX),
     decision: record.decision as SharedStackPileDecision,
     pile_size: requireCount(record, "pile_size", context),
   };
 }
 
-function normalizeSharedStackView(raw: unknown): SharedStackView | null {
+/**
+ * @param declaredPileCount the pile count the frame's own `distribution` names,
+ *   or `null` when the distribution is not a shared stack. The two are checked
+ *   against each other rather than each in isolation.
+ */
+function normalizeSharedStackView(
+  raw: unknown,
+  declaredPileCount: number | null,
+): SharedStackView | null {
   if (raw === null || raw === undefined) return null;
   const stack = requireObject(raw, "shared_stack");
   if (!Array.isArray(stack.piles)) {
     throw new Error("Invalid draft message: shared_stack.piles must be an array");
   }
-  const forced = stack.forced_draw === null || stack.forced_draw === undefined
+  // CROSS-FIELD. `piles_needed(pile_count)` returns `usize::from(pile_count)`,
+  // so the reducer's pile vector is exactly as long as the distribution says --
+  // a frame where the two disagree is describing a session that cannot exist,
+  // and each half looks fine on its own. Only checked against a shared-stack
+  // distribution: a `null` here means the frame declared some other one, which
+  // the caller refuses separately.
+  if (declaredPileCount !== null && stack.piles.length !== declaredPileCount) {
+    throw new Error(
+      "Invalid draft message: shared_stack.piles length must equal the declared pile_count",
+    );
+  }
+  // REQUIRED, not defaulted: both are unconditionally serialized by the engine,
+  // so a frame omitting either is malformed rather than sparse.
+  const rawHistory = requirePresent(stack, "history", "shared_stack");
+  const rawForced = requirePresent(stack, "forced_draw", "shared_stack");
+  if (!Array.isArray(rawHistory)) {
+    throw new Error("Invalid draft message: shared_stack.history must be an array");
+  }
+  const forced = rawForced === null
     ? null
-    : normalizeDraftCardInstance(stack.forced_draw, "shared_stack.forced_draw");
+    : normalizeDraftCardInstance(rawForced, "shared_stack.forced_draw");
   return {
     main_stack_remaining: requireCount(stack, "main_stack_remaining", "shared_stack"),
     total_cards: requireCount(stack, "total_cards", "shared_stack"),
-    active_seat: requireCount(stack, "active_seat", "shared_stack"),
-    active_pile: requireCount(stack, "active_pile", "shared_stack"),
+    active_seat: requireBoundedInt(stack, "active_seat", "shared_stack", 0, U8_MAX),
+    active_pile: requireBoundedInt(stack, "active_pile", "shared_stack", 0, U8_MAX),
     piles: stack.piles.map(normalizeSharedStackPileView),
-    decisions: requireCount(stack, "decisions", "shared_stack"),
-    history: normalizeArrayField<unknown>(stack, "history").map(normalizeSharedStackDecisionRecord),
+    decisions: requireBoundedInt(stack, "decisions", "shared_stack", 0, U32_MAX),
+    history: rawHistory.map(normalizeSharedStackDecisionRecord),
     forced_draw: forced as SharedStackView["forced_draw"],
   };
 }
@@ -1434,6 +1517,10 @@ function normalizeDraftPlayerView(raw: unknown): DraftPlayerView {
   ) {
     throw new Error("Invalid draft message: commanders_required must be a u8 count");
   }
+  const distribution = normalizePackDistribution(view.distribution);
+  const declaredPileCount = typeof distribution === "object"
+    ? distribution.SharedStackPiles.pile_count
+    : null;
   const pool_groups = normalizePoolGroups(view.pool_groups);
   const source = normalizeDraftSourceView(view.source);
   // A v28 peer may still send this former public-view field. Do not preserve
@@ -1453,13 +1540,17 @@ function normalizeDraftPlayerView(raw: unknown): DraftPlayerView {
     // `distribution` is required: it is non-optional on `DraftPlayerView`, and
     // the draft protocol is compared for EXACT equality at the handshake, so a
     // peer that omits it is malformed rather than old.
-    distribution: normalizePackDistribution(view.distribution),
+    distribution,
     // The two OPTIONAL fields keep their absence rather than being materialized
     // as `null`. Same conditional-spread idiom as `pool_groups` and `source`
     // above, and for a concrete reason: turning an absent field into a present
     // null changes the object's shape, which a wire round-trip can see.
+    //
+    // The stack is checked AGAINST the distribution, not merely beside it: the
+    // declared pile count and the published pile vector have to agree, and
+    // neither half looks wrong on its own.
     ...(view.shared_stack !== undefined
-      ? { shared_stack: normalizeSharedStackView(view.shared_stack) }
+      ? { shared_stack: normalizeSharedStackView(view.shared_stack, declaredPileCount) }
       : {}),
     ...(view.play_first_chooser !== undefined
       ? { play_first_chooser: normalizePlayFirstChooser(view.play_first_chooser) }

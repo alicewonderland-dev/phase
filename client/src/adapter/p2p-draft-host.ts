@@ -1357,12 +1357,26 @@ export class P2PDraftHost {
       // No client may observe the started draft until the recoverable snapshot
       // exists.  A refresh between a state update and this fence was the root
       // cause of the original missing-pod incident.
-      await this.persistSessionStrict();
+      //
+      // `retainFailedDraftSnapshot: false` because THIS start is compensating.
+      // The retain path exists for a snapshot that records a reducer result
+      // already applied and owed to the player -- a pick, a deck submission --
+      // which must be replayed rather than recomputed. A failed start is the
+      // opposite: the rollback below unwinds it, so the draft it describes is
+      // abandoned. Retained, it would sit in `pendingDraftSnapshot` and be
+      // flushed AHEAD of newer state by the next persist, writing the
+      // abandoned draft to IndexedDB where a reload would restore it.
+      await this.persistSessionStrict({ retainFailedDraftSnapshot: false });
     } catch (err) {
       this.draftStarted = false;
       this.draftCode = "";
       this.activePodSize = previousPodSize;
       this.picksThisRound.clear();
+      // Belt to the braces above: the option stops THIS failure from queueing a
+      // snapshot, and this clears one queued by anything earlier in the start.
+      // A rollback that leaves an engine-backed snapshot behind has not rolled
+      // back -- the next save resurrects it.
+      this.pendingDraftSnapshot = null;
       throw err;
     }
 

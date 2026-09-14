@@ -59,19 +59,22 @@ describe("P2PDraftHost start recovery", () => {
       "Competitive",
     );
     const createMultiplayerDraft = vi.fn(async () => {});
+    // A DISTINGUISHABLE session blob per attempt, so a snapshot can be traced
+    // back to the start that produced it.
+    const exportSession = vi.fn(async () => "SESSION-A");
     (host as unknown as { adapter: unknown }).adapter = {
       draftProcedure: vi.fn(async () => procedure),
       createMultiplayerDraft,
       // `Lobby`, so the bot loop is skipped and the persist below is the only
       // thing that can fail -- the failure this test is about.
       getViewForSeat: vi.fn(async () => ({ status: "Lobby" })),
-      exportSession: vi.fn(async () => ({})),
+      exportSession,
       loadCardDatabase: vi.fn(async () => 0),
     };
     // Persistence is a no-op without an id, which would make the fixture unable
     // to fail at all.
     (host as unknown as { persistenceId: string }).persistenceId = "start-recovery";
-    return { host, createMultiplayerDraft };
+    return { host, createMultiplayerDraft, exportSession };
   }
 
   it("retries a start whose durable snapshot failed", async () => {
@@ -95,6 +98,52 @@ describe("P2PDraftHost start recovery", () => {
     // and the pod is stranded with the host reporting nothing wrong.
     await expect(host.startDraft(true)).resolves.toBeUndefined();
     expect(createMultiplayerDraft).toHaveBeenCalledTimes(2);
+  });
+
+  /**
+   * A ROLLED-BACK START MUST NOT COME BACK LATER.
+   *
+   * `enqueuePersistSession` keeps a failed engine-backed snapshot in
+   * `pendingDraftSnapshot` and flushes it AHEAD of newer state on the next
+   * persist. That is right for a pick or a deck submission: those record a
+   * reducer result already applied and owed to the player, so they must be
+   * replayed rather than recomputed.
+   *
+   * A failed START is the opposite. The rollback unwinds it, so the draft the
+   * snapshot describes is abandoned — and retaining it meant the next save
+   * wrote the abandoned draft to IndexedDB, where a reload would restore a pod
+   * the host had already been told did not start.
+   *
+   * The existing retry row proves the second start REACHES the adapter. It
+   * cannot see this: the resurrection happens on the persist queue, after the
+   * call it asserts on.
+   *
+   * REVERT-FAILING: restore `persistSessionStrict()` without the option, or
+   * drop the `pendingDraftSnapshot = null` in the rollback, and the abandoned
+   * blob shows up in a later save.
+   */
+  it("does not resurrect the abandoned draft on a later save", async () => {
+    const { host, exportSession } = hostWithAdapter();
+    saveDraftHostSession.mockResolvedValue(undefined);
+    await host.initialize();
+    saveDraftHostSession
+      .mockRejectedValueOnce(new Error("IndexedDB unavailable"))
+      .mockResolvedValue(undefined);
+
+    await expect(host.startDraft(true)).rejects.toThrow("IndexedDB unavailable");
+    saveDraftHostSession.mockClear();
+
+    // The retry produces a DIFFERENT session, so anything carrying the first
+    // one is the abandoned draft rather than the live one.
+    exportSession.mockResolvedValue("SESSION-B");
+    await expect(host.startDraft(true)).resolves.toBeUndefined();
+
+    const written = saveDraftHostSession.mock.calls
+      .map(([, snapshot]) => (snapshot as { draftSessionJson?: unknown }).draftSessionJson);
+    // Reach guard: the retry really did persist, so "no SESSION-A" is not
+    // vacuously true over an empty list.
+    expect(written).toContain("SESSION-B");
+    expect(written).not.toContain("SESSION-A");
   });
 
   it("does not restart a draft that started cleanly", async () => {
