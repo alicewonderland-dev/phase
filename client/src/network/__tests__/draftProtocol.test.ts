@@ -56,7 +56,12 @@ const validSharedStack = {
  *  table below reaches the rule it names instead of being refused for pairing a
  *  stack with a distribution that deals no piles. `pile_count` matches
  *  `validSharedStack`'s three piles. */
-const winstonSeat = { active_pack_count: 0, drafted_card_count: 0, pick_status: "Pending" };
+const winstonSeat = (seat_index: number) => ({
+  seat_index,
+  active_pack_count: 0,
+  drafted_card_count: 0,
+  pick_status: "Pending",
+});
 const validWinstonView = {
   launch_capability: "None" as const,
   commanders_required: 0,
@@ -64,7 +69,7 @@ const validWinstonView = {
   // TWO SEATS, because the shared-stack references are validated against how
   // many this frame carries -- `active_seat`, every history `seat`, and
   // `play_first_chooser`. A frame with no seats would refuse them all.
-  seats: [winstonSeat, winstonSeat],
+  seats: [winstonSeat(0), winstonSeat(1)],
 };
 
 const validDraftView = {
@@ -785,6 +790,24 @@ describe("draftProtocol", () => {
         },
       }],
       ["a play-first chooser past the frame's seat count", { play_first_chooser: 2 }],
+      // `seat_index` is the address the CLIENT resolves seats through -- whose
+      // turn it is, the React key, the local-seat test, the kick target. Two
+      // seats sharing one makes them answer to the same address, which is the
+      // defect the pile-index rule refuses and this one closes for seats.
+      ["duplicate seat indices, which would make two seats share an address", {
+        seats: [winstonSeat(0), { ...winstonSeat(1), seat_index: 0 }],
+      }],
+      ["a seat index that is not its own position", {
+        seats: [winstonSeat(1), winstonSeat(0)],
+      }],
+      // The seat count is the authority for seat references, and it carries no
+      // ceiling of its own -- so the `u8` bound has to survive alongside it. A
+      // frame publishing 300 seats must still not name seat 280: the engine's
+      // `active_seat` is a `u8` and could never hold it.
+      ["a seat reference past a u8, however many seats the frame publishes", {
+        seats: Array.from({ length: 300 }, (_, i) => winstonSeat(i)),
+        shared_stack: { ...validSharedStack, active_seat: 280 },
+      }],
       ["a pile index that is not its own position", {
         distribution: { SharedStackPiles: { pile_count: 1 } },
         shared_stack: {
@@ -989,7 +1012,7 @@ describe("draftProtocol", () => {
         type: "draft_state_update",
         view: {
           ...validDraftView,
-          seats: [{ seat_index: 1, display_name: "Alex", pick_status: "Pending", active_pack_count: 1, drafted_card_count: 7 }],
+          seats: [{ seat_index: 0, display_name: "Alex", pick_status: "Pending", active_pack_count: 1, drafted_card_count: 7 }],
         },
       });
 
@@ -1064,7 +1087,7 @@ describe("draftProtocol", () => {
           type: "draft_state_update",
           view: {
             ...validDraftView,
-            seats: [{ pick_status: "Pending", active_pack_count: activePackCount, drafted_card_count: 0 }],
+            seats: [{ seat_index: 0, pick_status: "Pending", active_pack_count: activePackCount, drafted_card_count: 0 }],
           },
         })).toThrow("active_pack_count must be an integer 0 or 1");
       },
@@ -1073,18 +1096,20 @@ describe("draftProtocol", () => {
     it.each([0, 1])("accepts active-pack presence %i", (activePackCount) => {
       const msg = validateDraftMessage({
         type: "draft_lobby_update",
-        seats: [{ pick_status: "Pending", active_pack_count: activePackCount, drafted_card_count: 0 }],
+        seats: [{ seat_index: 0, pick_status: "Pending", active_pack_count: activePackCount, drafted_card_count: 0 }],
       });
 
       expect(msg).toMatchObject({
-        seats: [{ pick_status: "Pending", active_pack_count: activePackCount, drafted_card_count: 0 }],
+        seats: [{ seat_index: 0, pick_status: "Pending", active_pack_count: activePackCount, drafted_card_count: 0 }],
       });
     });
 
     it("requires active-pack presence in lobby seats", () => {
       expect(() => validateDraftMessage({
         type: "draft_lobby_update",
-        seats: [{}],
+        // A valid `seat_index`, so this row reaches the rule it names rather
+        // than the positional check that now runs first.
+        seats: [{ seat_index: 0 }],
       })).toThrow("active_pack_count must be an integer 0 or 1");
     });
 
@@ -1093,7 +1118,7 @@ describe("draftProtocol", () => {
       (draftedCardCount) => {
         expect(() => validateDraftMessage({
           type: "draft_lobby_update",
-          seats: [{ pick_status: "Pending", active_pack_count: 0, drafted_card_count: draftedCardCount }],
+          seats: [{ seat_index: 0, pick_status: "Pending", active_pack_count: 0, drafted_card_count: draftedCardCount }],
         })).toThrow("drafted_card_count must be a non-negative integer");
       },
     );
@@ -1105,7 +1130,7 @@ describe("draftProtocol", () => {
       // authority on how many cards a pool can hold.
       const msg = validateDraftMessage({
         type: "draft_lobby_update",
-        seats: [{ pick_status: "Pending", active_pack_count: 0, drafted_card_count: 4096 }],
+        seats: [{ seat_index: 0, pick_status: "Pending", active_pack_count: 0, drafted_card_count: 4096 }],
       });
 
       expect(msg).toMatchObject({ seats: [{ drafted_card_count: 4096 }] });
@@ -1131,7 +1156,7 @@ describe("draftProtocol", () => {
         view: {
           ...validDraftView,
           draft_effects: [],
-          seats: [{ pick_status: "Pending", active_pack_count: 0, drafted_card_count: 0, face_up_draft_cards: faceUpCards }],
+          seats: [{ seat_index: 0, pick_status: "Pending", active_pack_count: 0, drafted_card_count: 0, face_up_draft_cards: faceUpCards }],
         },
       })).toThrow("face_up_draft_cards must be an array");
     });

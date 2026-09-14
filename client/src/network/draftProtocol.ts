@@ -1039,11 +1039,26 @@ function normalizeArrayField<T>(record: Record<string, unknown>, field: string):
   return value as T[];
 }
 
-function normalizeSeatPublicView(raw: unknown): SeatPublicView {
+function normalizeSeatPublicView(raw: unknown, position: number): SeatPublicView {
   if (typeof raw !== "object" || raw === null) {
     throw new Error("Invalid draft message: malformed public seat");
   }
   const seat = raw as Record<string, unknown>;
+  // `seat_index` IS the position, exactly as a pile's `index` is: both engine
+  // builders write `seat_index: i as u8` off `.enumerate()`
+  // (`view.rs`), and `buildSeatPublicViews` counts `i` to `podSize`.
+  //
+  // This matters more than the pile rule, because `seat_index` is the address
+  // the CLIENT resolves seats through -- `seats.find(s => s.seat_index === n)`
+  // names whose turn it is, keys the React rows, tests for the local seat, and
+  // picks the kick target. Two seats sharing an index makes them answer to one
+  // address: the active player renders under a fallback name while another
+  // seat's name is drawn twice, and one lobby row's kick hits both.
+  if (seat.seat_index !== position) {
+    throw new Error(
+      `Invalid draft message: seats[${position}].seat_index must equal its position`,
+    );
+  }
   if (
     !Number.isInteger(seat.active_pack_count)
     || (seat.active_pack_count !== 0 && seat.active_pack_count !== 1)
@@ -1068,6 +1083,7 @@ function normalizeSeatPublicView(raw: unknown): SeatPublicView {
   }
   return {
     ...seat,
+    seat_index: position,
     active_pack_count: seat.active_pack_count,
     drafted_card_count: seat.drafted_card_count,
     face_up_draft_cards: normalizeArrayField(seat, "face_up_draft_cards"),
@@ -1559,6 +1575,12 @@ function normalizeDraftPlayerView(raw: unknown): DraftPlayerView {
   // was simply unavailable, which is why `active_seat` could only ever be
   // checked against `u8`.
   const seats = normalizeArrayField(view, "seats").map(normalizeSeatPublicView);
+  // The seat count is the new authority for those references, and unlike
+  // `pile_count` it carries no ceiling of its own -- `normalizeArrayField`
+  // caps nothing. Keeping the `u8` bound as well means a frame publishing 400
+  // seats still cannot name seat 300, a value the engine's own `u8` field could
+  // not hold and which the previous bound refused.
+  const seatBound = Math.min(seats.length, U8_MAX + 1);
   // A LIVE PILE TURN IMPLIES THE DISTRIBUTION THAT DEALS PILES.
   // `shared_stack_view_for` returns `Some` only for a session that HAS a shared
   // stack and is drafting, so the engine cannot pair one with any other
@@ -1601,10 +1623,10 @@ function normalizeDraftPlayerView(raw: unknown): DraftPlayerView {
     // declared pile count and the published pile vector have to agree, and
     // neither half looks wrong on its own.
     ...(view.shared_stack !== undefined
-      ? { shared_stack: normalizeSharedStackView(view.shared_stack, declaredPileCount, seats.length) }
+      ? { shared_stack: normalizeSharedStackView(view.shared_stack, declaredPileCount, seatBound) }
       : {}),
     ...(view.play_first_chooser !== undefined
-      ? { play_first_chooser: normalizePlayFirstChooser(view.play_first_chooser, seats.length) }
+      ? { play_first_chooser: normalizePlayFirstChooser(view.play_first_chooser, seatBound) }
       : {}),
   } as unknown as DraftPlayerView;
 }
