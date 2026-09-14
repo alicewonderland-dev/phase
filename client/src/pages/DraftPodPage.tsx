@@ -34,6 +34,7 @@ import { PackDisplay, type PackDisplayController } from "../components/draft/Pac
 import { PickTimer } from "../components/draft/PickTimer";
 import { draftKindForEntry, type DraftKind } from "../components/draft/draftKind";
 import { distinctJoined, isSharedStackDistribution, type SharedStackPileDecision } from "../adapter/draft-adapter";
+import type { DraftPauseReason } from "../network/draftProtocol";
 import { PodIcon } from "../components/draft/PodIcon";
 import { PoolPanel } from "../components/draft/PoolPanel";
 import { ScoreBadge } from "../components/draft/ScoreBadge";
@@ -151,10 +152,14 @@ function PodSetup() {
     if (effectiveOffline) return;
     void refreshProcedure();
   }, [effectiveOffline, refreshProcedure, config.kind, config.tournamentFormat]);
-  // Total over `DraftKind`: a future kind is a TS2741 at this literal rather than a
-  // blank line under the radios. Values are already-resolved strings because
-  // `react-i18next.d.ts` types `t`'s key against the `en` catalog, so a `t(variable)`
-  // lookup would not typecheck.
+  // Total over `DraftKind`: a future kind is a TS2741 at this literal rather than
+  // a blank line under the radios. Values are already-resolved strings, which is
+  // the right shape regardless -- but NOT for the reason this comment used to
+  // give. It claimed `react-i18next.d.ts` types `t`'s key so a `t(variable)`
+  // lookup would not typecheck. Measured: it does not. `t()` keys are unchecked
+  // in this client, which is why the interpolated lookups elsewhere on this page
+  // and in the draft components were replaced with total `Record`s rather than
+  // trusted.
   const kindDescription: Record<Exclude<DraftKind, "Quick">, string> = {
     Premier: t("podSetup.kindPremierDesc"),
     Traditional: t("podSetup.kindTraditionalDesc"),
@@ -471,7 +476,7 @@ function PodSetup() {
               <div className="flex flex-col gap-1">
                 <span className="text-sm font-medium text-white/60">{t("podSetup.setDraftMode")}</span>
                 <div className="flex gap-4">
-                  <label className="flex items-center gap-2 text-sm text-white/70">
+                  <label className="flex min-h-11 items-center gap-2 py-2 text-sm text-white/70">
                     <input
                       type="radio"
                       name="setDraftMode"
@@ -481,7 +486,7 @@ function PodSetup() {
                     />
                     {t("podSetup.uniformPacks")}
                   </label>
-                  <label className="flex items-center gap-2 text-sm text-white/70">
+                  <label className="flex min-h-11 items-center gap-2 py-2 text-sm text-white/70">
                     <input
                       type="radio"
                       name="setDraftMode"
@@ -1102,9 +1107,18 @@ function DraftingPhaseContent({
     );
   }
 
-  // Wire `pauseReason` is `DraftPauseReason` (PascalCase) — same shape as the
-  // i18n key path, so no boundary conversion. Falls back to a generic key if
-  // the engine ever emits an unknown reason (defensive only).
+  // A total `Record` over `DraftPauseReason`, not an interpolated key. Same
+  // device as `PICK_STATUS_KEY` and `REFUSAL_KEY`, for the reason measured
+  // there: an interpolated `t()` does NOT typecheck its key, so a reason the
+  // engine grows later would reach the banner as its own key text. This way it
+  // is a TS2741 at this literal. The `??` is the "not paused for a named
+  // reason" fallback, not a defence against an unknown variant -- the wire
+  // refuses those.
+  const PAUSE_REASON_KEY = {
+    PlayerDisconnected: "podPhaseView.pauseReason.PlayerDisconnected",
+    PausedByHost: "podPhaseView.pauseReason.PausedByHost",
+    DisconnectGraceExpired: "podPhaseView.pauseReason.DisconnectGraceExpired",
+  } as const satisfies Record<DraftPauseReason, string>;
   const pauseKey = pauseReason ?? "PausedByHost";
 
   return (
@@ -1114,7 +1128,7 @@ function DraftingPhaseContent({
           role="status"
           className="mb-3 rounded-lg border border-amber-400/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-100"
         >
-          ⚠ {t(`podPhaseView.pauseReason.${pauseKey}`)}
+          ⚠ {t(PAUSE_REASON_KEY[pauseKey])}
         </div>
       )}
       <div

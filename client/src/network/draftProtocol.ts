@@ -1057,6 +1057,15 @@ function normalizeSeatPublicView(raw: unknown): SeatPublicView {
   if (!Number.isInteger(seat.drafted_card_count) || (seat.drafted_card_count as number) < 0) {
     throw new Error("Invalid draft message: drafted_card_count must be a non-negative integer");
   }
+  // A CLOSED SET, like `refusal` in `normalizeSharedStackDecisionView`. The
+  // dashboard now indexes a total `Record` with this value, so an out-of-union
+  // variant renders an EMPTY status rather than the raw key text it used to --
+  // failing silently instead of visibly. Unreachable while both transports
+  // refuse a protocol mismatch, which is exactly why it should be refused here
+  // rather than left to a renderer to absorb.
+  if (!PICK_STATUSES.includes(seat.pick_status as SeatPublicView["pick_status"])) {
+    throw new Error("Invalid draft message: pick_status must be a known status");
+  }
   return {
     ...seat,
     active_pack_count: seat.active_pack_count,
@@ -1246,6 +1255,14 @@ function normalizeDraftSourceView(raw: unknown): DraftSourceView | undefined {
 // the engine's verdict and are checked for being well-formed, not for being
 // right. Nothing here recomputes a rule.
 // ---------------------------------------------------------------------------
+
+const PICK_STATUSES: readonly SeatPublicView["pick_status"][] = [
+  "Pending",
+  "Picked",
+  "Waiting",
+  "TimedOut",
+  "NotDrafting",
+];
 
 const SHARED_STACK_DECISIONS: readonly SharedStackPileDecision[] = ["Take", "Decline"];
 const SHARED_STACK_REFUSALS: readonly SharedStackRefusal[] = [

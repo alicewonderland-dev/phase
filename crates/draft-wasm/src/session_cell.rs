@@ -29,6 +29,29 @@
 //! `PACK_GEN`, `DIFFICULTY`, `RNG` and `CARD_DB` deliberately stay at the crate
 //! root: none of them carries hidden information, and `CARD_DB` is the PUBLIC
 //! card database a bot reads through its own argument list.
+//!
+//! # What none of this closes: the HUMAN HOST
+//!
+//! Every device above is about code inside this crate. None of them — and no
+//! change to this module — can stop the person running a P2P host from reading
+//! their own browser's WASM heap, where this session lives in full. A P2P host
+//! can recover `main_stack`'s order, and with it every pile the rest of the
+//! draft will deal, without touching the engine at all.
+//!
+//! THIS IS THE P2P TRUST MODEL, NOT A WINSTON DEFECT, and it predates Winston:
+//! the same session holds `packs_by_seat` (every seat's unopened boosters) and
+//! `pools` (every seat's drafted cards) for pick-and-pass and sealed pods, so a
+//! P2P host has always held every other seat's secrets. What Winston changes is
+//! the DEGREE. A booster a host reads early is an advantage; a main-stack order
+//! is the whole remainder of a two-player draft, deterministically, because the
+//! piles are dealt off it in order.
+//!
+//! The answer is deployment, not code: a pod hosted by `phase-server` keeps the
+//! session on the server and hands every seat — the host included — only
+//! `filter_for_player`'s projection. Redaction of the backup payload
+//! (`p2p_backup_guard`, `redactDraftSessionObject`) protects the row, which is a
+//! different channel; it does nothing about live host memory and was never
+//! claimed to. Do not read the redaction work as covering this.
 
 use std::cell::Cell;
 

@@ -871,7 +871,7 @@ describe("draftProtocol", () => {
         type: "draft_state_update",
         view: {
           ...validDraftView,
-          seats: [{ seat_index: 1, display_name: "Alex", active_pack_count: 1, drafted_card_count: 7 }],
+          seats: [{ seat_index: 1, display_name: "Alex", pick_status: "Pending", active_pack_count: 1, drafted_card_count: 7 }],
         },
       });
 
@@ -946,7 +946,7 @@ describe("draftProtocol", () => {
           type: "draft_state_update",
           view: {
             ...validDraftView,
-            seats: [{ active_pack_count: activePackCount, drafted_card_count: 0 }],
+            seats: [{ pick_status: "Pending", active_pack_count: activePackCount, drafted_card_count: 0 }],
           },
         })).toThrow("active_pack_count must be an integer 0 or 1");
       },
@@ -955,11 +955,11 @@ describe("draftProtocol", () => {
     it.each([0, 1])("accepts active-pack presence %i", (activePackCount) => {
       const msg = validateDraftMessage({
         type: "draft_lobby_update",
-        seats: [{ active_pack_count: activePackCount, drafted_card_count: 0 }],
+        seats: [{ pick_status: "Pending", active_pack_count: activePackCount, drafted_card_count: 0 }],
       });
 
       expect(msg).toMatchObject({
-        seats: [{ active_pack_count: activePackCount, drafted_card_count: 0 }],
+        seats: [{ pick_status: "Pending", active_pack_count: activePackCount, drafted_card_count: 0 }],
       });
     });
 
@@ -975,7 +975,7 @@ describe("draftProtocol", () => {
       (draftedCardCount) => {
         expect(() => validateDraftMessage({
           type: "draft_lobby_update",
-          seats: [{ active_pack_count: 0, drafted_card_count: draftedCardCount }],
+          seats: [{ pick_status: "Pending", active_pack_count: 0, drafted_card_count: draftedCardCount }],
         })).toThrow("drafted_card_count must be a non-negative integer");
       },
     );
@@ -987,7 +987,7 @@ describe("draftProtocol", () => {
       // authority on how many cards a pool can hold.
       const msg = validateDraftMessage({
         type: "draft_lobby_update",
-        seats: [{ active_pack_count: 0, drafted_card_count: 4096 }],
+        seats: [{ pick_status: "Pending", active_pack_count: 0, drafted_card_count: 4096 }],
       });
 
       expect(msg).toMatchObject({ seats: [{ drafted_card_count: 4096 }] });
@@ -1013,7 +1013,7 @@ describe("draftProtocol", () => {
         view: {
           ...validDraftView,
           draft_effects: [],
-          seats: [{ active_pack_count: 0, drafted_card_count: 0, face_up_draft_cards: faceUpCards }],
+          seats: [{ pick_status: "Pending", active_pack_count: 0, drafted_card_count: 0, face_up_draft_cards: faceUpCards }],
         },
       })).toThrow("face_up_draft_cards must be an array");
     });
