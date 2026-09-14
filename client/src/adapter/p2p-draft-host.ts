@@ -160,6 +160,11 @@ function redactDraftSessionObject(session: Record<string, unknown>): void {
   // caller reads back; neither is allowed to rely on the other having run.
   delete session.pools;
   delete session.current_pack;
+  // THE BOOSTERS A SEAT HAS NOT OPENED YET. Not a shared-stack field — a
+  // pick-and-pass pod's undealt packs are just as private, and knowing them is
+  // knowing every card still to come. Listed last but redacted on the same
+  // terms: the mirror above is only true if it is complete.
+  delete session.packs_by_seat;
   if (isJsonRecord(session.config)) redactChaosAssignmentsFromSource(session.config.source);
 }
 

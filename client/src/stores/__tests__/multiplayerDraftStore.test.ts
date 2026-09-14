@@ -577,6 +577,49 @@ describe("multiplayerDraftStore", () => {
       expect(state.seats).toHaveLength(1);
     });
 
+    /**
+     * A BROADCAST MUST NOT BLANK THE CLOCK.
+     *
+     * `draft-core` publishes `timer_remaining_ms: None` on every view it builds
+     * — on the P2P path the countdown is a host-side JS timer delivered by
+     * `timerTick`. `startPickTimer` re-arms on each applied decision and is
+     * immediately followed by `broadcastViews()`, so coalescing the absent field
+     * to `null` here unmounted and remounted `PickTimer` once per turn, shifting
+     * the pile rows under the deciding player for exactly the window `timerTick`
+     * exists to cover.
+     *
+     * REVERT-FAILING: restore `timerRemainingMs: view.timer_remaining_ms ?? null`
+     * in `installEventView` and leg (i) reds.
+     */
+    it("leaves the pick clock alone when a broadcast view carries no timer", async () => {
+      await useMultiplayerDraftStore.getState().hostDraft({
+        poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
+        kind: "Premier",
+        podSize: 8,
+        hostDisplayName: "Host",
+        tournamentFormat: "Swiss",
+        podPolicy: "Competitive",
+      });
+
+      // The host-side tick is the only thing that sets this on the P2P path.
+      capturedHostEventHandler!({ type: "timerTick", remainingMs: 55_000 });
+      expect(useMultiplayerDraftStore.getState().timerRemainingMs).toBe(55_000);
+
+      // (i) A view with NO timer field must leave the running clock standing.
+      const view = mockView("Drafting");
+      expect(view.timer_remaining_ms ?? null).toBeNull();
+      capturedHostEventHandler!({ type: "viewUpdated", view });
+      expect(useMultiplayerDraftStore.getState().timerRemainingMs).toBe(55_000);
+
+      // (ii) Paired positive: a view that DOES carry a number still wins, so
+      // leg (i) is about the absent field and not about ignoring views.
+      capturedHostEventHandler!({
+        type: "viewUpdated",
+        view: { ...mockView("Drafting"), timer_remaining_ms: 12_000 },
+      });
+      expect(useMultiplayerDraftStore.getState().timerRemainingMs).toBe(12_000);
+    });
+
     it("projects restored MatchInProgress views into match phase", async () => {
       await useMultiplayerDraftStore.getState().hostDraft({
         poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
