@@ -319,6 +319,10 @@ const DRAFT_KIND_WIRE_NUMBER: Record<Exclude<DraftKind, "Quick">, number> = {
  * `crates/draft-wasm/src/lib.rs`. Read these; never re-derive them.
  */
 // @sync-with: crates/draft-wasm/src/lib.rs
+/** The discriminant of a set layout, without its payload. Mirrors the Rust
+ *  `SetLayoutKind`. */
+export type SetLayoutKind = "UniformByRound" | "Chaos";
+
 export interface DraftProcedure {
   pod_size: number;
   human_seats: number;
@@ -331,6 +335,16 @@ export interface DraftProcedure {
   /** Engine-owned interaction policy for selecting cards in one pick step. */
   pick_selection_mode: "Direct" | "Ordered";
   distribution: PackDistribution;
+  /**
+   * Which set-layout shapes this kind admits, published by the engine.
+   *
+   * Render exactly this list. Do NOT re-derive layout legality from
+   * `distribution` -- that was a second authority over a rule the engine owns
+   * (`DraftProcedure::allowed_set_layouts`, which `validate_source` and the
+   * server's admission guard both read), correct only by coincidence and free
+   * to drift the moment a distribution is added.
+   */
+  allowed_set_layouts: SetLayoutKind[];
   min_deck_size: number;
   /** Engine-owned minimum accepted for cube settings under this procedure. */
   cube_min_deck_size: number;

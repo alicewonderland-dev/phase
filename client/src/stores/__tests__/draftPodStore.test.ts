@@ -206,6 +206,10 @@ describe("draftPodStore", () => {
         max_pod_size: 4,
         allowed_pod_sizes: [2, 3, 4],
         distribution: { SharedStackPiles: { pile_count: 3 } },
+        // The CAPABILITY is what the store reads, not the distribution. Spread
+        // over the fixture, so it has to be narrowed here exactly as
+        // `DraftProcedure::allowed_set_layouts` narrows it for a shared stack.
+        allowed_set_layouts: ["UniformByRound"],
       });
 
       await useDraftPodStore.getState().enterKind("Winston");
@@ -397,7 +401,11 @@ describe("draftPodStore", () => {
       // Paired positive FIRST, on the same action and the same store: a
       // pick-and-pass distribution keeps the host's chaos intent, so the
       // refusal below is the distribution's doing and not the action's.
-      useDraftPodStore.setState({ packDistribution: "PickAndPass", setDraftMode: "uniform" });
+      useDraftPodStore.setState({
+        packDistribution: "PickAndPass",
+        allowedSetLayouts: ["UniformByRound", "Chaos"],
+        setDraftMode: "uniform",
+      });
       useDraftPodStore.getState().setSetDraftMode("chaos");
       expect(useDraftPodStore.getState().setDraftMode).toBe("chaos");
 
@@ -406,8 +414,12 @@ describe("draftPodStore", () => {
       // players can observe — and `DraftProcedure::validate_source` refuses
       // the pair outright. The engine's pile count is carried through rather
       // than invented: this is the tagged member, not a kind name.
+      // The store reads the engine's published capability now, not the
+      // distribution -- the distribution is carried alongside it only because
+      // other selectors still read it.
       useDraftPodStore.setState({
         packDistribution: { SharedStackPiles: { pile_count: 3 } },
+        allowedSetLayouts: ["UniformByRound"],
         setDraftMode: "uniform",
       });
 

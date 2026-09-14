@@ -1287,6 +1287,9 @@ struct DraftProcedureDto {
     cards_per_pick: u8,
     pick_selection_mode: draft_core::types::PickSelectionMode,
     distribution: draft_core::types::PackDistribution,
+    /// Which set-layout shapes this kind admits. The setup page renders exactly
+    /// this list; it does not derive layout legality from `distribution`.
+    allowed_set_layouts: Vec<draft_core::types::SetLayoutKind>,
     min_deck_size: usize,
     cube_min_deck_size: usize,
     commanders_required: u8,
@@ -1330,6 +1333,7 @@ fn draft_procedure_dto(
         cards_per_pick: procedure.cards_per_pick,
         pick_selection_mode: procedure.pick_selection_mode,
         distribution: procedure.distribution,
+        allowed_set_layouts: procedure.allowed_set_layouts().to_vec(),
         min_deck_size: procedure.min_deck_size,
         cube_min_deck_size: procedure.cube_min_deck_size,
         commanders_required: procedure.commanders_required,

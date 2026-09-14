@@ -132,6 +132,7 @@ function PodSetup() {
       : null,
   );
   const packDistribution = useDraftPodStore((s) => s.packDistribution);
+  const allowedSetLayouts = useDraftPodStore((s) => s.allowedSetLayouts);
   const packsPerPlayer = useDraftPodStore((s) => s.packsPerPlayer);
   const cubeMinDeckSize = useDraftPodStore((s) =>
     s.procedureCacheKey?.kind === s.config.kind
@@ -454,11 +455,19 @@ function PodSetup() {
                 together before the first decision, so no seat holds the packs
                 generated for it and the assignment only hides which sets the
                 pool is made of — `DraftProcedure::validate_source` refuses the
-                pair outright. The choice is therefore not offered, on the SAME
-                engine-published discriminant the Cube tab already dispatches on
-                for `AllAtOnce`; the store pins `setDraftMode` to "uniform" for
-                these kinds, so the copy below needs no second test. */}
-            {!isSharedStackDistribution(packDistribution) && (
+                pair outright.
+
+                RENDER THE PUBLISHED CAPABILITY. `allowed_set_layouts` is the
+                engine's own list, read by `validate_source` and by the server's
+                admission guard, so what is offered here and what is accepted
+                cannot disagree. This used to ask
+                `isSharedStackDistribution(packDistribution)` and conclude "then
+                no Chaos" — a second authority over a rule the engine owns,
+                correct only while the rule happens to track the distribution.
+                `null` means not published yet, and offers the choice: the engine
+                still refuses at `StartDraft`, and guessing here is the thing
+                being removed. */}
+            {(allowedSetLayouts?.includes("Chaos") ?? true) && (
               <div className="flex flex-col gap-1">
                 <span className="text-sm font-medium text-white/60">{t("podSetup.setDraftMode")}</span>
                 <div className="flex gap-4">

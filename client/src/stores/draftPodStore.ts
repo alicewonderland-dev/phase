@@ -16,7 +16,7 @@
 
 import { create } from "zustand";
 
-import { DraftAdapter, distinctJoined, isSharedStackDistribution, setPackSequence, type CubeDraftSettings, type DraftProcedure, type PackDistribution, type PoolInput, type SetPackSequence, type TournamentFormat, type PodPolicy } from "../adapter/draft-adapter";
+import { DraftAdapter, distinctJoined, setPackSequence, type CubeDraftSettings, type DraftProcedure, type PackDistribution, type PoolInput, type SetLayoutKind, type SetPackSequence, type TournamentFormat, type PodPolicy } from "../adapter/draft-adapter";
 import type { DraftPackChoice } from "./draftStore";
 import type { DraftPodHostConfig } from "../adapter/draftPodHostAdapter";
 import type { DraftPodGuestConfig } from "../adapter/draftPodGuestAdapter";
@@ -121,6 +121,12 @@ interface DraftPodState {
    */
   packDistribution: PackDistribution | null;
   /**
+   * Which set-layout shapes the selected kind admits, as published by the
+   * engine. `null` until a procedure has been published for the current
+   * selection -- the same "not yet known" shape `allowedPodSizes` uses.
+   */
+  allowedSetLayouts: SetLayoutKind[] | null;
+  /**
    * The kind's engine-published booster count (`DraftProcedure.packs_per_player`),
    * cached alongside `allowedPodSizes` and on the same terms: a copy of an engine
    * value, never a client derivation. It fixes how many sets the host arranges,
@@ -207,6 +213,7 @@ const initialState: DraftPodState = {
   procedureCacheKey: null,
   pendingProcedureDefault: null,
   packDistribution: null,
+  allowedSetLayouts: null,
   packsPerPlayer: null,
   cubeMinDeckSize: null,
 };
@@ -283,12 +290,18 @@ function procedureCache(
   procedureCacheKey: ProcedureCacheKey,
 ): Pick<
   DraftPodState,
-  "allowedPodSizes" | "procedureCacheKey" | "packDistribution" | "packsPerPlayer" | "cubeMinDeckSize"
+  | "allowedPodSizes"
+  | "procedureCacheKey"
+  | "packDistribution"
+  | "allowedSetLayouts"
+  | "packsPerPlayer"
+  | "cubeMinDeckSize"
 > {
   return {
     allowedPodSizes: procedure.allowed_pod_sizes,
     procedureCacheKey,
     packDistribution: procedure.distribution,
+    allowedSetLayouts: procedure.allowed_set_layouts,
     packsPerPlayer: procedure.packs_per_player,
     cubeMinDeckSize: procedure.cube_min_deck_size,
   };
@@ -306,11 +319,21 @@ function procedureCache(
  * a choice that refusal would reject, and is the same dispatch on the same
  * engine-published discriminant the Cube tab already uses for `AllAtOnce`.
  */
+/** Which published layout shape each setup-page mode asks the engine for. */
+const SET_LAYOUT_KIND_BY_MODE: Record<SetDraftMode, SetLayoutKind> = {
+  uniform: "UniformByRound",
+  chaos: "Chaos",
+};
+
 function setDraftModeFor(
-  distribution: PackDistribution | null,
+  allowedSetLayouts: SetLayoutKind[] | null,
   requested: SetDraftMode,
 ): SetDraftMode {
-  return isSharedStackDistribution(distribution) ? "uniform" : requested;
+  // Not published yet: keep the request. The engine refuses at `StartDraft`
+  // either way, and guessing here would be the second authority this function
+  // exists to remove.
+  if (allowedSetLayouts === null) return requested;
+  return allowedSetLayouts.includes(SET_LAYOUT_KIND_BY_MODE[requested]) ? requested : "uniform";
 }
 
 function procedurePublication(
@@ -332,7 +355,7 @@ function procedurePublication(
       : { ...prev.config, podSize },
     pendingProcedureDefault: adoptsProcedureDefault ? null : prev.pendingProcedureDefault,
     poolMode: procedure.distribution === "AllAtOnce" ? "set" : prev.poolMode,
-    setDraftMode: setDraftModeFor(procedure.distribution, prev.setDraftMode),
+    setDraftMode: setDraftModeFor(procedure.allowed_set_layouts, prev.setDraftMode),
     loadingPool: false,
     configError: null,
   };
@@ -364,6 +387,7 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
           procedureCacheKey: procedureChanged ? null : prev.procedureCacheKey,
           pendingProcedureDefault: procedureChanged ? null : prev.pendingProcedureDefault,
           packDistribution,
+          allowedSetLayouts: procedureChanged ? null : prev.allowedSetLayouts,
           packsPerPlayer: procedureChanged ? null : prev.packsPerPlayer,
           cubeMinDeckSize: procedureChanged ? null : prev.cubeMinDeckSize,
           loadingPool: false,
@@ -492,7 +516,7 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
 
     setSetDraftMode: (setDraftMode) => {
       set((prev) => ({
-        setDraftMode: setDraftModeFor(prev.packDistribution, setDraftMode),
+        setDraftMode: setDraftModeFor(prev.allowedSetLayouts, setDraftMode),
         configError: null,
       }));
     },
@@ -808,6 +832,7 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
             procedureCacheKey: null,
             pendingProcedureDefault: null,
             packDistribution: null,
+            allowedSetLayouts: null,
             packsPerPlayer: null,
             cubeMinDeckSize: null,
           });
@@ -838,6 +863,7 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
             procedureCacheKey: null,
             pendingProcedureDefault: null,
             packDistribution: null,
+            allowedSetLayouts: null,
             packsPerPlayer: null,
             cubeMinDeckSize: null,
           });

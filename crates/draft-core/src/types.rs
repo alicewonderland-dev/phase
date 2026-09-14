@@ -359,9 +359,32 @@ impl DraftProcedure {
     /// Exhaustive deliberately: a future distribution must decide this question
     /// rather than inherit a permissive fallback.
     pub fn allows_chaos_layout(self) -> bool {
+        self.allowed_set_layouts().contains(&SetLayoutKind::Chaos)
+    }
+
+    /// Every [`SetLayoutKind`] this procedure admits, most permissive first.
+    ///
+    /// THE SINGLE AUTHORITY for source-layout legality, and the published one:
+    /// `DraftProcedure`'s DTO carries this list to the client, which renders it
+    /// rather than deriving anything. [`Self::allows_chaos_layout`] and
+    /// [`Self::validate_source`] both read it, so the refusal a host sees at
+    /// admission, the refusal the reducer raises at `StartDraft`, and the
+    /// options the setup page offers cannot disagree.
+    ///
+    /// Exhaustive over [`PackDistribution`] so a new distribution must state its
+    /// answer rather than inherit one.
+    pub fn allowed_set_layouts(self) -> &'static [SetLayoutKind] {
         match self.distribution {
-            PackDistribution::PickAndPass | PackDistribution::AllAtOnce => true,
-            PackDistribution::SharedStackPiles { .. } => false,
+            // A pack per seat per round is exactly what a Chaos assignment
+            // addresses, so both shapes are expressible.
+            PackDistribution::PickAndPass | PackDistribution::AllAtOnce => {
+                &[SetLayoutKind::UniformByRound, SetLayoutKind::Chaos]
+            }
+            // A shared stack opens every booster into ONE pile before the first
+            // decision, so there is no per-seat, per-round slot for a Chaos
+            // assignment to fill and nothing a player could observe if there
+            // were.
+            PackDistribution::SharedStackPiles { .. } => &[SetLayoutKind::UniformByRound],
         }
     }
 
@@ -766,6 +789,25 @@ pub enum SetLayout {
         candidate_codes: Vec<String>,
         assignments: Vec<Vec<String>>,
     },
+}
+
+/// Which SHAPES of [`SetLayout`] a procedure admits, as a published capability.
+///
+/// The discriminant of `SetLayout` without its payload, so a client can be told
+/// what it may offer without being told how to build it. `DraftProcedure`
+/// publishes the list (`allowed_set_layouts`), the setup page renders exactly
+/// that list, and nothing outside the engine decides which layouts a kind takes.
+///
+/// This replaced the client asking `isSharedStackDistribution(distribution)` and
+/// concluding "then no Chaos". That was a second authority over source legality
+/// -- correct, but derived from the wrong input and free to drift the moment a
+/// distribution is added or the rule stops tracking the distribution at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SetLayoutKind {
+    /// One set per round for the entire pod.
+    UniformByRound,
+    /// A private per-`(seat, round)` assignment drawn from a candidate pool.
+    Chaos,
 }
 
 /// Strict wire forms used solely while deserializing [`SetLayout`]. An
@@ -1845,6 +1887,84 @@ pub struct DraftSession {
 
 #[cfg(test)]
 mod tests {
+    /// THE PUBLISHED CAPABILITY AND THE REFUSAL ARE ONE ANSWER.
+    ///
+    /// `allowed_set_layouts` is what the setup page renders; `validate_source`
+    /// is what the reducer enforces at `StartDraft`; `allows_chaos_layout` is
+    /// what the server's admission guard asks before it draws entropy. Three
+    /// readers, and a client that offers a layout either of the other two would
+    /// refuse produces a lobby players can join and never start -- which is the
+    /// exact failure the pre-entropy guard exists to prevent.
+    ///
+    /// Walked over every kind, so a kind added later cannot skip the agreement.
+    /// The counters are measured, not assumed: some kind must admit Chaos and
+    /// some kind must refuse it, or this test is passing vacuously over a table
+    /// that says the same thing everywhere.
+    #[test]
+    fn every_kind_publishes_the_layout_capability_its_reducer_enforces() {
+        let mut admitting = 0usize;
+        let mut refusing = 0usize;
+
+        for kind in super::DraftKind::ALL {
+            let procedure = kind.procedure();
+            let published = procedure.allowed_set_layouts();
+
+            // Uniform is the floor: a procedure that admits NO layout could
+            // never start at all, and the setup page would render an empty
+            // choice.
+            assert!(
+                published.contains(&super::SetLayoutKind::UniformByRound),
+                "{kind:?} publishes no uniform layout, so no source could start it"
+            );
+
+            let admits_chaos = published.contains(&super::SetLayoutKind::Chaos);
+            assert_eq!(
+                admits_chaos,
+                procedure.allows_chaos_layout(),
+                "{kind:?}: the published list and `allows_chaos_layout` disagree"
+            );
+
+            // And the reducer itself, through a real source rather than a flag.
+            let chaos = super::DraftSource::Set {
+                layout: super::SetLayout::Chaos {
+                    candidate_codes: vec!["TST".to_string()],
+                    assignments: vec![vec!["TST".to_string(); 3]; usize::from(procedure.pod_size)],
+                },
+            };
+            assert_eq!(
+                procedure.validate_source(&chaos).is_ok(),
+                admits_chaos,
+                "{kind:?}: the reducer and the published list disagree"
+            );
+
+            // The uniform paired positive, so "refuses everything" cannot pass.
+            let uniform = super::DraftSource::Set {
+                layout: super::SetLayout::UniformByRound {
+                    codes: vec!["TST".to_string()],
+                },
+            };
+            assert!(
+                procedure.validate_source(&uniform).is_ok(),
+                "{kind:?} refuses a uniform source"
+            );
+
+            if admits_chaos {
+                admitting += 1;
+            } else {
+                refusing += 1;
+            }
+        }
+
+        assert!(
+            admitting > 0,
+            "no kind admits Chaos, so the agreement is vacuous"
+        );
+        assert!(
+            refusing > 0,
+            "no kind refuses Chaos, so the agreement is vacuous"
+        );
+    }
+
     use super::*;
 
     #[test]
