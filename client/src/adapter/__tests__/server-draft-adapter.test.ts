@@ -775,6 +775,72 @@ describe("ServerDraftAdapter", () => {
     expect(result.pick_number).toBe(2);
   });
 
+  /**
+   * ONE SLOT, ONE ACTION. `draftResolve`/`draftReject` is a single pair, and
+   * every submit path used to assign straight into it. A second action
+   * overwrote the first's callbacks; the next `DraftStateUpdate` then resolved
+   * only the survivor and nulled both, so the first caller's promise never
+   * settled at all -- a permanently pending `await`, not a lost result.
+   *
+   * REVERT-FAILING: drop the `claimDraftAction` guard back to bare assignment
+   * and the first leg reds (the second action is accepted) and the last leg
+   * hangs until the test times out (the pick never settles).
+   */
+  it("refuses a second draft action while one is still in flight", async () => {
+    const pickPromise = adapter.submitPick("card-inflight");
+
+    // The intruder is refused IMMEDIATELY and by name, rather than silently
+    // taking the slot.
+    await expect(adapter.submitDeck(["deck-card"], [])).rejects.toThrow(
+      /Another draft action is still in flight; SubmitDeck was not sent/,
+    );
+
+    // Reach guard: exactly one action reached the wire. Without this the
+    // rejection above could be satisfied by an adapter that sends nothing.
+    const draftActions = ws.send.mock.calls.filter(([raw]) =>
+      typeof raw === "string" && raw.includes("\"DraftAction\""));
+    expect(draftActions).toHaveLength(1);
+
+    // THE POINT. The first action is untouched by the refusal and still settles.
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({
+        type: "DraftStateUpdate",
+        data: { view: createMockDraftView({ pick_number: 7 }) },
+      }),
+    );
+    await expect(pickPromise).resolves.toMatchObject({ pick_number: 7 });
+  });
+
+  /**
+   * The paired positive: the guard is a single-flight gate, not a one-shot
+   * latch. Every settle site nulls both callbacks together, which is what
+   * releases it — so the action after a completed one must be accepted. Without
+   * this, "refuse everything after the first action" would pass the test above
+   * and break the draft entirely.
+   */
+  it("accepts the next draft action once the previous one has settled", async () => {
+    const first = adapter.submitPick("card-first");
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({
+        type: "DraftStateUpdate",
+        data: { view: createMockDraftView({ pick_number: 1 }) },
+      }),
+    );
+    await first;
+
+    const second = adapter.submitPick("card-second");
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({
+        type: "DraftStateUpdate",
+        data: { view: createMockDraftView({ pick_number: 2 }) },
+      }),
+    );
+    await expect(second).resolves.toMatchObject({ pick_number: 2 });
+  });
+
   it("DraftStateUpdate resolves pending pick promise", async () => {
     const pickPromise = adapter.submitPick("card-002");
 

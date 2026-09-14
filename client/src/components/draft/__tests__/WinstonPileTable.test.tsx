@@ -364,12 +364,24 @@ describe("WinstonPileTable", () => {
     expect(stack!.querySelectorAll("[data-winston-revealed-card]")).toHaveLength(0);
   });
 
-  it("hides a pile the seat has already passed, prefix and all", () => {
+  it("keeps a declined pile's prefix, and never the card the decline buried", () => {
     // MID-TURN, and the shape the engine really publishes: the seat looked at
-    // pile 1, declined it, and is now on pile 2 — so the engine still sends
-    // pile 1's prefix, because that seat did look at it. At a physical table
-    // that pile went back face down, and remembering it is the player's job,
-    // so the screen stops showing it the instant the cursor moves on.
+    // pile 1, declined it, and is now on pile 2 -- so the engine still sends
+    // pile 1's prefix, because that seat did look at it.
+    //
+    // THE RULE, AND WHY THE PREFIX STAYS. You may not re-examine a declined pile
+    // at a physical table because doing so would show you the card the decline
+    // just added. The engine removes that reason structurally: a decline APPENDS
+    // its drawn card and the view slices `pile[..inspected[i]]`, so the buried
+    // card sits beyond the prefix and cannot be published. What is left is
+    // exactly what the seat legitimately saw, and it stays theirs for the rest
+    // of the turn (`inspected` is zeroed at the next turn's start).
+    //
+    // This surface used to blank the prefix on top of that. It was a second
+    // visibility authority in the display layer, and a one-sided one:
+    // `bot_ai::opponent_read` joins these prefixes against the public decline
+    // history to read open colours, so blanking them took that read away from
+    // the human and left it with the bot.
     renderTable(
       activeTurn(
         [
@@ -380,19 +392,26 @@ describe("WinstonPileTable", () => {
       ),
     );
 
-    // The passed pile: nothing face up, and its WHOLE height face down —
-    // including the card the decline just added, which was never shown anyway.
-    expect(screen.queryByText("Ponder")).toBeNull();
-    expect(screen.queryByText("Opt")).toBeNull();
-    expect(document.querySelector("[data-winston-pile='0'] [data-winston-revealed-card]")).toBeNull();
+    // The declined pile keeps what the seat saw.
+    expect(screen.getByText("Ponder")).toBeInTheDocument();
+    expect(screen.getByText("Opt")).toBeInTheDocument();
+    expect(document.querySelectorAll("[data-winston-pile='0'] [data-winston-revealed-card]"))
+      .toHaveLength(2);
+    // THE LOAD-BEARING NUMBER. The pile stands 3 tall and 2 are published, so
+    // exactly ONE card is face down: the one the decline buried. If this ever
+    // reads 0, the seat is being shown a card it put there blind.
     expect(document.querySelector("[data-winston-pile='0'] [data-winston-pile-facedown]"))
-      .toHaveAttribute("data-winston-pile-facedown-count", "3");
+      .toHaveAttribute("data-winston-pile-facedown-count", "1");
+    // Spent, not live: readable, visibly not the decision in front of you.
+    expect(document.querySelector("[data-winston-pile='0'] [data-winston-pile-spent]"))
+      .not.toBeNull();
 
-    // The paired positive on the SAME render: the pile under decision is still
-    // face up, so the hiding is keyed on the cursor and not on the turn.
+    // The paired positive on the SAME render: the pile under decision is face up
+    // and is NOT marked spent, so the treatment is keyed on the cursor.
     expect(screen.getByText("Brainstorm")).toBeInTheDocument();
     expect(document.querySelectorAll("[data-winston-pile='1'] [data-winston-revealed-card]"))
       .toHaveLength(1);
+    expect(document.querySelector("[data-winston-pile='1'] [data-winston-pile-spent]")).toBeNull();
   });
 
   it("draws nothing face down for a pile the seat is looking all the way through", () => {

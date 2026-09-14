@@ -1335,19 +1335,36 @@ export class P2PDraftHost {
       this.botDifficulty,
     );
 
+    // The started flags go up FIRST, because the bot loop and the persist below
+    // run against a host that has to look started to them -- and they come back
+    // DOWN if either throws. The guard at the top of this function is
+    // `if (this.draftStarted) return`, so a flag left standing over a failure
+    // turns the retry into a silent no-op: the engine holds a draft, no snapshot
+    // exists, no guest was ever told, and pressing Start again does nothing at
+    // all. Rolling back is what makes the retry reach `createMultiplayerDraft`
+    // a second time.
+    const previousPodSize = this.activePodSize;
     this.draftStarted = true;
     this.draftCode = draftCode;
     this.activePodSize = seats.length;
     this.picksThisRound.clear();
-    const startView = await this.adapter.getViewForSeat(0);
-    if (startView.status === "Drafting") {
-      await this.resolveBotPicks({ emit: false, persist: false });
-    }
+    try {
+      const startView = await this.adapter.getViewForSeat(0);
+      if (startView.status === "Drafting") {
+        await this.resolveBotPicks({ emit: false, persist: false });
+      }
 
-    // No client may observe the started draft until the recoverable snapshot
-    // exists.  A refresh between a state update and this fence was the root
-    // cause of the original missing-pod incident.
-    await this.persistSessionStrict();
+      // No client may observe the started draft until the recoverable snapshot
+      // exists.  A refresh between a state update and this fence was the root
+      // cause of the original missing-pod incident.
+      await this.persistSessionStrict();
+    } catch (err) {
+      this.draftStarted = false;
+      this.draftCode = "";
+      this.activePodSize = previousPodSize;
+      this.picksThisRound.clear();
+      throw err;
+    }
 
     // Send each guest their filtered view
     for (const [seat, session] of this.guestSessions) {

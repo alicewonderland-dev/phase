@@ -88,10 +88,6 @@ import { useDraftCardFace } from "./DraftCardFace.tsx";
 /** Card aspect, shared by every face-up card, card back and empty slot here. */
 const CARD_ASPECT = "488 / 680";
 
-/** Stable empty list for a pile drawn face down, so a pile showing nothing does
- *  not hand `map` a fresh array identity on every render. */
-const EMPTY_REVEALED: readonly DraftCardInstance[] = [];
-
 /**
  * How many card backs a face-down stack draws before it stops adding them.
  *
@@ -332,28 +328,26 @@ function Pile({
     }];
   });
 
-  // ONLY THE PILE UNDER DECISION IS DRAWN FACE UP. The engine still publishes
-  // the prefix of every pile this seat looked at earlier in the turn — it did
-  // look at them — but a declined pile goes back face down at a physical table,
-  // and this surface follows the table rather than acting as a memory aid. Keyed
-  // on `active_pile` by way of `isCursor`, so the engine's own cursor decides
-  // when a pile goes dark: the moment a decline advances it, the pile this seat
-  // just passed is a stack of backs again.
+  // RENDER THE PROJECTION. `revealed` is not "what is face up on the table" --
+  // it is what the ENGINE has decided this seat is entitled to know, and the
+  // engine computes it to the Winston rule exactly. A decline APPENDS the card
+  // it draws (`shared_stack::apply_shared_stack_decision`) and the view slices
+  // `pile[..inspected[i]]` and never by `pile.len()`, so the card a seat just
+  // buried sits beyond the prefix STRUCTURALLY. The entitlement also lapses on
+  // its own: `inspected` is zeroed for every pile at the start of each turn.
   //
-  // A non-active viewer is unaffected — the engine hands them an empty
-  // `revealed` for every pile, the cursor included — so this narrows nothing
-  // for them.
+  // So the paper rule is already enforced, and enforced better than paper. The
+  // reason you may not re-examine a declined pile at a table is that you would
+  // see the new card too; here you cannot see it, and the cards you did see are
+  // yours to keep for the rest of your turn.
   //
-  // DELIBERATE, and deliberately NOT pushed into the engine. The engine still
-  // publishes `revealed` for the piles this seat declined, and `opponent_read`
-  // in `bot_ai.rs` still folds those prefixes into its colour read — so an
-  // active bot "sees" what an active human no longer has on screen. That is
-  // parity, not an edge: the human saw those cards seconds ago and is expected
-  // to remember them, exactly as at a physical table, and the bot's
-  // `passed_colors` IS its memory. Narrowing the engine instead would take the
-  // read away from the bot and leave it worse informed than a human who simply
-  // remembers. Narrowing here can never leak; widening would be the bug.
-  const shownRevealed = isCursor ? pile.revealed : EMPTY_REVEALED;
+  // This surface USED TO re-hide declined piles on top of that, which was a
+  // second visibility authority in the display layer and, worse, a one-sided
+  // one: `bot_ai::opponent_read` joins these same prefixes against the public
+  // decline history to read which colours are open, so hiding them took that
+  // inference away from the human and left it with the bot. Deleted. A declined
+  // pile is de-emphasised below, not blanked.
+  const shownRevealed = pile.revealed;
   // The face-down remainder of THIS pile: a presentation split of one published
   // number into the part drawn face up and the part that is not. It answers no
   // legality question — those come from `pile.legality` — which is the property
@@ -392,7 +386,15 @@ function Pile({
         )}
       </div>
 
-      <div className="flex min-w-0 items-start gap-2 overflow-x-auto pb-1 [scrollbar-width:thin]">
+      {/* A pile this seat already declined stays READABLE but is visibly spent:
+          the decision has moved on, and the cards are here as the memory the
+          engine says this seat is entitled to, not as a live choice. */}
+      <div
+        data-winston-pile-spent={!isCursor && shownRevealed.length > 0 ? "true" : undefined}
+        className={`flex min-w-0 items-start gap-2 overflow-x-auto pb-1 [scrollbar-width:thin] ${
+          isCursor ? "" : "opacity-60 saturate-75"
+        }`}
+      >
         <FaceDownStack count={faceDownCount} total={pile.total} width={cardWidth} />
         {shownRevealed.map((card) => (
           <RevealedCard
