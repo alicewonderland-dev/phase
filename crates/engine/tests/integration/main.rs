@@ -1400,6 +1400,7 @@ mod fertile_thicket_reveal_to_top_2349;
 mod filtered_cost_reduction_only_first_cast;
 mod flame_spill_excess_damage;
 mod for_the_ancestors_chosen_creature_type_4834;
+mod fractalize;
 mod frantic_inventory_graveyard_count;
 mod furious_spinesplitter_any_damage;
 mod ghyrson_starn;
