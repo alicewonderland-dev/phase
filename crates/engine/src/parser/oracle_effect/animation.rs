@@ -1181,16 +1181,31 @@ mod test_den_bugbear {
 
     #[test]
     fn animation_dynamic_pt_rejects_incomplete_or_unsupported_numeric_expressions() {
+        let prefix = "a green Fractal with base power and toughness each equal to ";
+        let accepted = format!("{prefix}X plus 1");
+        let (_, (descriptor, quantity)) = parse_dynamic_pt_clause(&accepted)
+            .expect("the complete X plus 1 control must reach the dynamic P/T parser");
+        assert_eq!(descriptor, "a green Fractal");
+        assert_eq!(
+            quantity,
+            QuantityExpr::Offset {
+                inner: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::Variable {
+                        name: "X".to_owned(),
+                    },
+                }),
+                offset: 1,
+            },
+            "X plus 1 must retain its dynamic quantity rather than only accepting the prefix"
+        );
+
         for expression in [
             "X plus X",
             "X plus the number of creatures you control",
             "X plus 1 and gains flying",
         ] {
             assert!(
-                parse_dynamic_pt_clause(&format!(
-                    "a green Fractal with base power and toughness each equal to {expression}"
-                ))
-                .is_err(),
+                parse_dynamic_pt_clause(&format!("{prefix}{expression}")).is_err(),
                 "unsupported or trailing expression must not parse cleanly: {expression}"
             );
         }

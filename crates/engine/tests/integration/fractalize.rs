@@ -4,11 +4,14 @@ use engine::game::casting::can_cast_object_now;
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::game::zones::{add_to_zone, remove_from_zone};
 use engine::parser::oracle::parse_oracle_text;
+use engine::types::ability::{ContinuousModification, Effect, QuantityExpr, QuantityRef};
+use engine::types::ability_visit::visit_ability_def;
 use engine::types::card_type::CoreType;
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
+use std::ops::ControlFlow;
 
 const FRACTALIZE: &str = "Until end of turn, target creature becomes a green and blue Fractal with base power and toughness each equal to X plus 1. (It loses all other colors and creature types.)";
 
@@ -281,6 +284,59 @@ fn fractalize_rejects_no_target_and_skips_an_illegal_target_at_resolution() {
 fn fractalize_full_document_is_clean_while_unsupported_expression_stays_honest() {
     let types = vec!["Instant".to_owned()];
     let parsed = parse_oracle_text(FRACTALIZE, "Fractalize", &[], &types, &[]);
+    assert_eq!(
+        parsed.abilities.len(),
+        1,
+        "Fractalize must produce its one complete spell ability: {parsed:#?}"
+    );
+    assert!(
+        parsed.triggers.is_empty() && parsed.statics.is_empty() && parsed.replacements.is_empty(),
+        "Fractalize's complete document must not hide unsupported effects in another output tree: {parsed:#?}"
+    );
+
+    let ability = &parsed.abilities[0];
+    let mut has_unimplemented = false;
+    let mut visit = |effect: &Effect| {
+        has_unimplemented |= matches!(effect, Effect::Unimplemented { .. });
+        ControlFlow::Continue(())
+    };
+    let _ = visit_ability_def(ability, &mut visit);
+    assert!(
+        !has_unimplemented,
+        "Fractalize must contain zero unsupported effect nodes before its warning-free diagnostic is trusted: {ability:#?}"
+    );
+
+    let expected = QuantityExpr::Offset {
+        inner: Box::new(QuantityExpr::Ref {
+            qty: QuantityRef::Variable {
+                name: "X".to_owned(),
+            },
+        }),
+        offset: 1,
+    };
+    let Effect::GenericEffect {
+        static_abilities, ..
+    } = &*ability.effect
+    else {
+        panic!(
+            "Fractalize must produce a complete dynamic P/T GenericEffect, got {:#?}",
+            ability.effect
+        );
+    };
+    assert!(
+        static_abilities.iter().any(|static_def| {
+            static_def
+                .modifications
+                .contains(&ContinuousModification::SetPowerDynamic {
+                    value: expected.clone(),
+                })
+                && static_def.modifications.contains(
+                    &ContinuousModification::SetToughnessDynamic {
+                        value: expected.clone(),
+                    })
+        }),
+        "Fractalize must produce complete dynamic X plus 1 power and toughness effects: {static_abilities:#?}"
+    );
     assert!(
         parsed.parse_warnings.is_empty(),
         "complete Fractalize text must not retain a parser warning: {:#?}",
