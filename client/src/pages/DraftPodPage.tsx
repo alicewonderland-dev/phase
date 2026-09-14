@@ -469,10 +469,11 @@ function PodSetup() {
                 `isSharedStackDistribution(packDistribution)` and conclude "then
                 no Chaos" — a second authority over a rule the engine owns,
                 correct only while the rule happens to track the distribution.
-                `null` means not published yet, and offers the choice: the engine
-                still refuses at `StartDraft`, and guessing here is the thing
-                being removed. */}
-            {(allowedSetLayouts?.includes("Chaos") ?? true) && (
+                `null` means NOT PUBLISHED YET, and renders nothing: an absent
+                contract is not permission, and offering a control the engine
+                may refuse is the guessing this list exists to remove. The radio
+                returns when the engine says Chaos is admitted. */}
+            {(allowedSetLayouts?.includes("Chaos") ?? false) && (
               <div className="flex flex-col gap-1">
                 <span className="text-sm font-medium text-white/60">{t("podSetup.setDraftMode")}</span>
                 <div className="flex gap-4">

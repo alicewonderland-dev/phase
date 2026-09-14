@@ -198,6 +198,9 @@ describe("draftPodStore", () => {
       // The host arranged a Chaos pod under a pick-and-pass kind, then changed
       // the kind. Nothing in the UI can reach `setSetDraftMode` again on the
       // way through, so publication is where the stale intent has to go.
+      // A contract that ADMITS Chaos has to be in place first: an absent one
+      // normalizes the selection away, which is the point of the rows below.
+      useDraftPodStore.setState({ allowedSetLayouts: ["UniformByRound", "Chaos"] });
       useDraftPodStore.getState().setSetDraftMode("chaos");
       expect(useDraftPodStore.getState().setDraftMode).toBe("chaos");
       mocks.draftProcedure.mockResolvedValue({
@@ -232,7 +235,33 @@ describe("draftPodStore", () => {
      * actually reads. Both legs red if the store goes back to asking the
      * distribution.
      */
+    /**
+     * AN ABSENT CONTRACT IS NOT PERMISSION.
+     *
+     * `allowedSetLayouts` is `null` until a procedure has been published for the
+     * current selection. This used to keep the host's request through that
+     * window, on the reasoning that the engine refuses at `StartDraft` anyway --
+     * but "it will be refused later" is not a reason to hold a selection the
+     * engine may never honour, and it is how a stale Chaos intent survived a
+     * kind change to reach a control that could not be satisfied.
+     */
+    it("normalizes a chaos selection while no layout contract has been published", () => {
+      useDraftPodStore.setState({ allowedSetLayouts: ["UniformByRound", "Chaos"] });
+      useDraftPodStore.getState().setSetDraftMode("chaos");
+      // Reach guard: with a permitting contract the selection really does stick,
+      // so the normalization below is the ABSENCE doing it and not the action.
+      expect(useDraftPodStore.getState().setDraftMode).toBe("chaos");
+
+      useDraftPodStore.setState({ allowedSetLayouts: null });
+      useDraftPodStore.getState().setSetDraftMode("chaos");
+
+      expect(useDraftPodStore.getState().setDraftMode).toBe("uniform");
+    });
+
     it("keeps chaos when the published list allows it, whatever the distribution says", async () => {
+      // A contract that ADMITS Chaos has to be in place first: an absent one
+      // normalizes the selection away, which is the point of the rows below.
+      useDraftPodStore.setState({ allowedSetLayouts: ["UniformByRound", "Chaos"] });
       useDraftPodStore.getState().setSetDraftMode("chaos");
       mocks.draftProcedure.mockResolvedValue({
         ...procedure(2),
@@ -247,6 +276,9 @@ describe("draftPodStore", () => {
     });
 
     it("drops chaos when the published list omits it, whatever the distribution says", async () => {
+      // A contract that ADMITS Chaos has to be in place first: an absent one
+      // normalizes the selection away, which is the point of the rows below.
+      useDraftPodStore.setState({ allowedSetLayouts: ["UniformByRound", "Chaos"] });
       useDraftPodStore.getState().setSetDraftMode("chaos");
       mocks.draftProcedure.mockResolvedValue({
         ...procedure(2),
@@ -263,6 +295,9 @@ describe("draftPodStore", () => {
     it("keeps a chaos selection for a kind that passes packs", async () => {
       // The paired positive for the row above, through the SAME entry point:
       // publication normalizes on the distribution, not on every entry.
+      // A contract that ADMITS Chaos has to be in place first: an absent one
+      // normalizes the selection away, which is the point of the rows below.
+      useDraftPodStore.setState({ allowedSetLayouts: ["UniformByRound", "Chaos"] });
       useDraftPodStore.getState().setSetDraftMode("chaos");
       mocks.draftProcedure.mockResolvedValue(procedure(8));
 

@@ -239,6 +239,30 @@ describe("DraftPodPage host set selection", () => {
     expect(poolInput.data).not.toHaveProperty("assignments");
   });
 
+  /**
+   * AN ABSENT CONTRACT IS NOT PERMISSION EITHER.
+   *
+   * `allowed_set_layouts` is `null` on the page until a procedure has been
+   * published for the current selection. The radio used to render through that
+   * window (`?? true`), which offers a control the engine may refuse -- the
+   * guessing the published list exists to remove. The paired positive is the
+   * suite's own "creates a Chaos pod" row, which clicks this exact radio under
+   * a procedure that DOES publish Chaos, so its absence here is the missing
+   * contract and not a renamed label or a form that failed to render.
+   */
+  it("offers no chaos mode until the engine has published a layout contract", async () => {
+    // A procedure payload with NO `allowed_set_layouts` at all -- an engine that
+    // predates the capability, or any degraded response. The field arrives as
+    // `undefined`, which is why the store's guard is nullish rather than
+    // `=== null`: `undefined.includes` would be a TypeError, not a refusal.
+    const { allowed_set_layouts: _omitted, ...withoutContract } = draftProcedureFixture();
+    mocks.draftProcedure.mockResolvedValue(withoutContract as never);
+    const user = userEvent.setup();
+    await openHostSetup(user);
+
+    expect(screen.queryByRole("radio", { name: "Chaos Draft" })).toBeNull();
+  });
+
   it("offers no chaos mode for a kind whose boosters share one stack", async () => {
     // A shared stack opens every booster unlooked-at and shuffles them
     // together before the first decision, so no seat holds the packs generated

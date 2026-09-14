@@ -329,10 +329,15 @@ function setDraftModeFor(
   allowedSetLayouts: SetLayoutKind[] | null,
   requested: SetDraftMode,
 ): SetDraftMode {
-  // Not published yet: keep the request. The engine refuses at `StartDraft`
-  // either way, and guessing here would be the second authority this function
-  // exists to remove.
-  if (allowedSetLayouts === null) return requested;
+  // NOT PUBLISHED YET IS NOT PERMISSION. This used to keep the request until the
+  // contract arrived, on the reasoning that the engine refuses at `StartDraft`
+  // anyway -- but "the engine will refuse later" is not a reason to offer a
+  // choice now, and a stale Chaos selection surviving a kind change is exactly
+  // how a host reaches a control the engine cannot honour. Absent contract means
+  // the only layout every distribution admits.
+  // NULLISH, not `=== null`: a payload that omits the field entirely arrives as
+  // `undefined`, and `undefined.includes` is a TypeError rather than a refusal.
+  if (allowedSetLayouts == null) return "uniform";
   return allowedSetLayouts.includes(SET_LAYOUT_KIND_BY_MODE[requested]) ? requested : "uniform";
 }
 
