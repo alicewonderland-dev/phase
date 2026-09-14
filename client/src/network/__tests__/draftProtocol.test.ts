@@ -40,7 +40,10 @@ const validSharedStack = {
   ],
   decisions: 5,
   history: [{ seat: 0, pile: 1, decision: "Decline", pile_size: 2 }],
-  forced_draw: null,
+  // POPULATED, so the paired positive carries a real card down the forced-draw
+  // path. With `null` here no positive frame ever exercised it, and a check that
+  // wrongly rejected every drawing seat's frame would have passed.
+  forced_draw: { instance_id: "drawn-1", name: "Brainstorm" },
 };
 
 const validDraftView = {
@@ -716,8 +719,17 @@ describe("draftProtocol", () => {
           piles: [{ index: 0, total: 1, revealed: [{ name: "Ponder" }], legality: [] }],
         },
       }],
-      ["a forced draw that is not a card", {
-        shared_stack: { ...validSharedStack, forced_draw: "Ponder" },
+      // An OBJECT missing `instance_id`, not a string: a string was already
+      // refused by the old "is it an object" check, so that row pinned nothing
+      // the card validation added.
+      ["a forced draw with no instance id", {
+        shared_stack: { ...validSharedStack, forced_draw: { name: "Ponder" } },
+      }],
+      ["a forced draw whose name is not a string", {
+        shared_stack: {
+          ...validSharedStack,
+          forced_draw: { instance_id: "drawn-1", name: 7 },
+        },
       }],
       ["an unknown decision in the public history", {
         shared_stack: {
