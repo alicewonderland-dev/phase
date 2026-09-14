@@ -1456,9 +1456,13 @@ function normalizeSharedStackView(
   // CROSS-FIELD. `piles_needed(pile_count)` returns `usize::from(pile_count)`,
   // so the reducer's pile vector is exactly as long as the distribution says --
   // a frame where the two disagree is describing a session that cannot exist,
-  // and each half looks fine on its own. Only checked against a shared-stack
-  // distribution: a `null` here means the frame declared some other one, which
-  // the caller refuses separately.
+  // and each half looks fine on its own.
+  //
+  // `null` cannot reach here: the caller refuses a `shared_stack` paired with
+  // any other distribution before calling. That refusal is what makes this
+  // check un-evadable -- without it, declaring `PickAndPass` alongside a
+  // shared stack skipped straight past this and still rendered the pile table,
+  // so a one-word edit defeated the whole guard.
   if (declaredPileCount !== null && stack.piles.length !== declaredPileCount) {
     throw new Error(
       "Invalid draft message: shared_stack.piles length must equal the declared pile_count",
@@ -1521,6 +1525,19 @@ function normalizeDraftPlayerView(raw: unknown): DraftPlayerView {
   const declaredPileCount = typeof distribution === "object"
     ? distribution.SharedStackPiles.pile_count
     : null;
+  // A LIVE PILE TURN IMPLIES THE DISTRIBUTION THAT DEALS PILES.
+  // `shared_stack_view_for` returns `Some` only for a session that HAS a shared
+  // stack and is drafting, so the engine cannot pair one with any other
+  // distribution. Refusing the pairing here is also what stops the pile-count
+  // cross-check below being sidestepped: the client renders the pile table on
+  // `view.shared_stack` alone, so a frame declaring `PickAndPass` beside an
+  // arbitrary pile vector used to render while skipping every shared-stack
+  // rule.
+  if (view.shared_stack !== undefined && view.shared_stack !== null && declaredPileCount === null) {
+    throw new Error(
+      "Invalid draft message: shared_stack requires a SharedStackPiles distribution",
+    );
+  }
   const pool_groups = normalizePoolGroups(view.pool_groups);
   const source = normalizeDraftSourceView(view.source);
   // A v28 peer may still send this former public-view field. Do not preserve

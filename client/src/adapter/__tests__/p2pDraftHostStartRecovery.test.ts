@@ -118,9 +118,10 @@ describe("P2PDraftHost start recovery", () => {
    * cannot see this: the resurrection happens on the persist queue, after the
    * call it asserts on.
    *
-   * REVERT-FAILING: restore `persistSessionStrict()` without the option, or
-   * drop the `pendingDraftSnapshot = null` in the rollback, and the abandoned
-   * blob shows up in a later save.
+   * REVERT-FAILING ON THE PAIR: the option and the rollback clear each suppress
+   * the resurrection on their own, so removing BOTH is what reddens this row.
+   * The row after it pins the clear by itself, with a snapshot queued before
+   * the start's own persist -- which the option cannot reach.
    */
   it("does not resurrect the abandoned draft on a later save", async () => {
     const { host, exportSession } = hostWithAdapter();
@@ -144,6 +145,46 @@ describe("P2PDraftHost start recovery", () => {
     // vacuously true over an empty list.
     expect(written).toContain("SESSION-B");
     expect(written).not.toContain("SESSION-A");
+  });
+
+  /**
+   * THE ROLLBACK CLEAR, PINNED ON ITS OWN.
+   *
+   * `retainFailedDraftSnapshot: false` only governs whether THIS start's own
+   * failure queues a snapshot. A snapshot queued earlier — by any prior failed
+   * engine-backed save — is already sitting in `pendingDraftSnapshot`, and
+   * `enqueuePersistSession` flushes it AHEAD of newer state. The rollback has to
+   * drop it, or the abandoned draft still reaches IndexedDB by that route.
+   *
+   * REVERT-FAILING: delete `pendingDraftSnapshot = null` from the rollback and
+   * this reds while the row above stays green, which is the whole point of
+   * having both.
+   */
+  it("drops a snapshot queued before the failed start", async () => {
+    const { host, exportSession } = hostWithAdapter();
+    saveDraftHostSession.mockResolvedValue(undefined);
+    await host.initialize();
+
+    // Queued by something earlier than this start, so the option above cannot
+    // be what suppresses it.
+    (host as unknown as { pendingDraftSnapshot: unknown }).pendingDraftSnapshot = {
+      persistenceId: "start-recovery",
+      draftSessionJson: "SESSION-STALE",
+    };
+    saveDraftHostSession
+      .mockRejectedValueOnce(new Error("IndexedDB unavailable"))
+      .mockResolvedValue(undefined);
+
+    await expect(host.startDraft(true)).rejects.toThrow("IndexedDB unavailable");
+    saveDraftHostSession.mockClear();
+
+    exportSession.mockResolvedValue("SESSION-B");
+    await expect(host.startDraft(true)).resolves.toBeUndefined();
+
+    const written = saveDraftHostSession.mock.calls
+      .map(([, snapshot]) => (snapshot as { draftSessionJson?: unknown }).draftSessionJson);
+    expect(written).toContain("SESSION-B");
+    expect(written).not.toContain("SESSION-STALE");
   });
 
   it("does not restart a draft that started cleanly", async () => {

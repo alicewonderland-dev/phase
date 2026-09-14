@@ -52,6 +52,16 @@ const validSharedStack = {
   forced_draw: { instance_id: "drawn-1", name: "Brainstorm" },
 };
 
+/** A frame that DECLARES a shared stack, so a `shared_stack` override in the
+ *  table below reaches the rule it names instead of being refused for pairing a
+ *  stack with a distribution that deals no piles. `pile_count` matches
+ *  `validSharedStack`'s three piles. */
+const validWinstonView = {
+  launch_capability: "None" as const,
+  commanders_required: 0,
+  distribution: { SharedStackPiles: { pile_count: 3 } },
+};
+
 const validDraftView = {
   launch_capability: "None" as const,
   commanders_required: 0,
@@ -687,12 +697,14 @@ describe("draftProtocol", () => {
         shared_stack: { ...validSharedStack, active_seat: -1 },
       }],
       ["an unknown decision in a pile's legality", {
+        distribution: { SharedStackPiles: { pile_count: 1 } },
         shared_stack: {
           ...validSharedStack,
           piles: [{ index: 0, total: 1, revealed: [], legality: [{ decision: "Burn", refusal: null }] }],
         },
       }],
       ["an unknown refusal in a pile's legality", {
+        distribution: { SharedStackPiles: { pile_count: 1 } },
         shared_stack: {
           ...validSharedStack,
           piles: [{
@@ -704,6 +716,7 @@ describe("draftProtocol", () => {
         },
       }],
       ["a revealed prefix longer than the pile it belongs to", {
+        distribution: { SharedStackPiles: { pile_count: 1 } },
         shared_stack: {
           ...validSharedStack,
           piles: [{
@@ -720,6 +733,7 @@ describe("draftProtocol", () => {
         },
       }],
       ["a revealed card with no instance id", {
+        distribution: { SharedStackPiles: { pile_count: 1 } },
         shared_stack: {
           ...validSharedStack,
           piles: [{ index: 0, total: 1, revealed: [{ name: "Ponder" }], legality: [] }],
@@ -753,16 +767,11 @@ describe("draftProtocol", () => {
         },
       }],
       ["a pile index past a u8", {
+        distribution: { SharedStackPiles: { pile_count: 1 } },
         shared_stack: {
           ...validSharedStack,
           piles: [{ index: 256, total: 1, revealed: [], legality: [] }],
         },
-      }],
-      ["a missing history, which the engine always serializes", {
-        shared_stack: (({ history: _h, ...rest }) => rest)(validSharedStack),
-      }],
-      ["a missing forced draw, which the engine always serializes", {
-        shared_stack: (({ forced_draw: _f, ...rest }) => rest)(validSharedStack),
       }],
       ["a forced draw with no instance id", {
         shared_stack: { ...validSharedStack, forced_draw: { name: "Ponder" } },
@@ -781,11 +790,45 @@ describe("draftProtocol", () => {
       }],
       ["a play-first chooser that is not a seat index", { play_first_chooser: "seat-1" }],
       ["a fractional play-first chooser", { play_first_chooser: 1.5 }],
+      // A live pile turn beside a distribution that deals no piles. This is the
+      // frame that used to SKIP every shared-stack rule while still rendering
+      // the pile table, because the client keys that surface on
+      // `view.shared_stack` alone.
+      ["a shared stack beside a distribution that deals no piles", {
+        distribution: "PickAndPass",
+        shared_stack: validSharedStack,
+      }],
     ])("rejects %s at protocol v30", (_label, overrides) => {
       expect(() => validateDraftMessage({
         type: "draft_state_update",
-        view: { ...validDraftView, ...overrides },
+        view: { ...validWinstonView, ...overrides },
       })).toThrow(/Invalid draft message/);
+    });
+
+    /**
+     * REQUIRED, and pinned ON THE REQUIREMENT.
+     *
+     * `history` and `forced_draw` carry no `skip_serializing_if` in
+     * `draft-core::view`, so every real frame has both — `forced_draw` as
+     * `null` when the viewer drew nothing. Defaulting them on absence turned a
+     * truncated frame into a plausible one: a missing history read as "no
+     * decisions yet".
+     *
+     * These assert the SPECIFIC message rather than "some refusal", because
+     * both absences are also caught a line or two later by adjacent narrowings
+     * — the array check for `history`, and `undefined` reaching the card
+     * validator for `forced_draw`. A row matching only `/Invalid draft message/`
+     * therefore stayed green with the requirement deleted, which is exactly how
+     * this was measured to be pinning nothing.
+     */
+    it.each([
+      ["history", (({ history: _h, ...rest }) => rest)(validSharedStack)],
+      ["forced_draw", (({ forced_draw: _f, ...rest }) => rest)(validSharedStack)],
+    ])("rejects a shared stack with no %s, naming it as required", (field, shared_stack) => {
+      expect(() => validateDraftMessage({
+        type: "draft_state_update",
+        view: { ...validWinstonView, shared_stack },
+      })).toThrow(`shared_stack.${field} is required`);
     });
 
     /**
