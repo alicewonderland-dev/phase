@@ -659,6 +659,70 @@ mod tests {
     /// ACTIVE seat, so it does not prove `forced_decision` non-`None` for a
     /// non-active seat -- `disconnect_expiry_refuses_a_non_active_winston_seat`
     /// in `server-core` covers that case and asserts the opposite.
+    /// THE FORCED MOVE IS `SharedStackPileDecision::ALL`'s FIRST LEGAL ENTRY,
+    /// IN DECLARATION ORDER.
+    ///
+    /// This is the whole contract a timed-out or disconnected seat's move rests
+    /// on, and it is now the ONLY authority for it: the P2P host used to scan
+    /// the published `legality` vector for its first unrefused entry, which is
+    /// the same algorithm over a different ordering source -- the engine folds
+    /// `ALL`, the client folded whatever order the view serialized. They agreed
+    /// by coincidence. The host asks `shared_stack_forced_decision` now, so
+    /// reordering `ALL` changes which move every timed-out seat makes, and that
+    /// should redden a test rather than ship.
+    ///
+    /// Both arms are MEASURED over the walk, not assumed: the counters assert
+    /// the fixture actually reached a state where both moves were legal (so
+    /// "first in order" is a real choice and not a forced one) AND a state where
+    /// only the second was (so the fold genuinely advances past a refusal).
+    #[test]
+    fn a_forced_decision_is_the_first_legal_entry_of_all_in_declaration_order() {
+        let mut session = started(2, 7);
+        let mut both_legal = 0usize;
+        let mut only_the_second = 0usize;
+
+        while session.status == DraftStatus::Drafting {
+            let (seat, pile, forced) = {
+                let s = state(&session);
+                let legal: Vec<SharedStackPileDecision> = SharedStackPileDecision::ALL
+                    .into_iter()
+                    .filter(|d| refusal_for(s, s.active_seat, s.cursor, *d).is_none())
+                    .collect();
+                let forced =
+                    forced_decision(s, s.active_seat).expect("the active seat always has a move");
+                assert_eq!(
+                    forced, legal[0],
+                    "forced_decision must return ALL's first legal entry, not any legal entry"
+                );
+                if legal.len() == SharedStackPileDecision::ALL.len() {
+                    both_legal += 1;
+                    // THE LITERAL, deliberately -- not `ALL[0]`. Writing `ALL[0]`
+                    // here makes the assertion tautological: reorder `ALL` and
+                    // both sides move together, so the one change this test most
+                    // needs to catch sails through. (Measured: it did.) With
+                    // nothing to separate the two moves, a timed-out seat TAKES.
+                    assert_eq!(forced, SharedStackPileDecision::Take);
+                } else {
+                    only_the_second += 1;
+                }
+                (s.active_seat, s.cursor, forced)
+            };
+            // The answer is always one the reducer itself accepts -- a forced
+            // move the reducer would refuse is the failure this guards.
+            apply_shared_stack_decision(&mut session, seat, pile, forced)
+                .expect("a forced decision must be applicable");
+        }
+
+        assert!(
+            both_legal > 0,
+            "the walk never reached a state with two legal moves, so ordering was never exercised"
+        );
+        assert!(
+            only_the_second > 0,
+            "the walk never reached a state where ALL[0] was refused, so the fold never advanced"
+        );
+    }
+
     #[test]
     fn some_decision_is_always_legal_for_the_active_seat_while_drafting() {
         for policy in WalkPolicy::ALL {

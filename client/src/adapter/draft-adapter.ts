@@ -1034,6 +1034,21 @@ export class DraftEngineOperationLease {
     return this.wasm.resolve_shared_stack_bot_turns() as unknown[];
   }
 
+  /**
+   * The decision the ENGINE would apply for a seat whose turn must be resolved
+   * without that seat choosing. `null` when there is no shared stack or the
+   * seat has no legal move.
+   *
+   * The host asks this instead of scanning the published `legality` vector for
+   * the first entry with no refusal. Same algorithm, but the engine folds
+   * `SharedStackPileDecision::ALL` in declaration order while the client folded
+   * whatever order the view happened to serialize -- agreement by coincidence
+   * rather than by construction. Choosing a rules outcome is the reducer's job.
+   */
+  sharedStackForcedDecision(seat: number): SharedStackPileDecision | null {
+    return this.wasm.shared_stack_forced_decision(seat) as SharedStackPileDecision | null;
+  }
+
   submitDeckForSeat(
     seat: number,
     mainDeck: string[],
@@ -1279,6 +1294,10 @@ export class DraftAdapter {
    */
   async resolveSharedStackBotTurns(): Promise<unknown[]> {
     return withDraftEngineOperation((lease) => lease.resolveSharedStackBotTurns());
+  }
+
+  async sharedStackForcedDecision(seat: number): Promise<SharedStackPileDecision | null> {
+    return withDraftEngineOperation((lease) => lease.sharedStackForcedDecision(seat));
   }
 
   /** The engine-owned per-kind procedure axes; never re-derived by the UI. */

@@ -102,7 +102,12 @@ describe("P2PDraftHost shared-stack pick timer", () => {
     } as unknown as DraftPlayerView;
   }
 
-  async function startedWinstonHost(sharedStack: SharedStackView) {
+  async function startedWinstonHost(sharedStack: SharedStackView,
+    // WHAT THE ENGINE ANSWERS. The host no longer scans `legality` for the
+    // first unrefused entry -- `shared_stack::forced_decision` chooses and the
+    // host only dispatches -- so the fixture supplies the engine's answer and
+    // the assertions pin that the host relays exactly it.
+    forcedDecision: "Take" | "Decline" | null = "Take") {
     vi.useFakeTimers();
     const host = new P2PDraftHost(
       { id: "host" } as never,
@@ -124,17 +129,19 @@ describe("P2PDraftHost shared-stack pick timer", () => {
       timerContext: string | null;
       mutationQueue: Promise<void>;
     };
+    const sharedStackForcedDecision = vi.fn(async (_seat: number) => forcedDecision);
     (host as unknown as { adapter: unknown }).adapter = {
       draftProcedure: vi.fn(async () => WINSTON_PROCEDURE),
       createMultiplayerDraft: vi.fn(async () => {}),
       getViewForSeat: vi.fn(async () => winstonView(sharedStack)),
       allPicksSubmitted: vi.fn(async () => false),
       submitSharedStackDecisionForSeat,
+      sharedStackForcedDecision,
     };
 
     await host.initialize();
     await host.startDraft(false);
-    return { host, privateHost, submitSharedStackDecisionForSeat };
+    return { host, privateHost, submitSharedStackDecisionForSeat, sharedStackForcedDecision };
   }
 
   /** Runs the clock to zero and lets the detached expiry mutation settle. */
@@ -251,11 +258,15 @@ describe("P2PDraftHost shared-stack pick timer", () => {
       history: [],
       forced_draw: null,
     };
-    const { privateHost, submitSharedStackDecisionForSeat } =
-      await startedWinstonHost(sharedStack);
+    const { privateHost, submitSharedStackDecisionForSeat, sharedStackForcedDecision } =
+      await startedWinstonHost(sharedStack, "Decline");
 
     await expireTheClock(privateHost);
 
+    // Asked the ENGINE, about the active seat.
+    expect(sharedStackForcedDecision).toHaveBeenCalledWith(1);
+    // And relayed its answer verbatim. A host that hardcoded "Take", or that
+    // went back to scanning `legality` in its own order, reds here.
     expect(submitSharedStackDecisionForSeat).toHaveBeenCalledWith(1, 0, "Decline");
   });
 

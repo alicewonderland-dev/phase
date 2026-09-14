@@ -33,7 +33,7 @@ export function auto_pick(): any;
  * draft. This deliberately bypasses `DraftPlayerView`: players and spectators
  * must never receive undealt cube entries or their duplicate counts.
  */
-export function booster_pack_pool_for_game(): string[] | null;
+export function booster_pack_pool_for_game(): any;
 
 /**
  * Create a multiplayer draft session. Used by the P2P host to initialize a
@@ -185,6 +185,31 @@ export function resolve_shared_stack_bot_turns(): any;
 export function set_seat_connected(seat: number, connected: boolean): any;
 
 /**
+ * The decision the ENGINE would apply for a seat whose turn must be resolved
+ * without that seat choosing — a pick-timer expiry, or a disconnect.
+ *
+ * `None` when there is no shared stack, or when the seat has no legal move
+ * (which for the ACTIVE seat while drafting is unreachable, and proved so by
+ * `some_decision_is_always_legal_for_the_active_seat_while_drafting`).
+ *
+ * WHY THIS EXISTS AS AN EXPORT. The host used to scan the published
+ * `legality` vector itself — `legality.find(entry => entry.refusal === null)`
+ * — and take the first entry with no refusal. That is the same algorithm
+ * `shared_stack::forced_decision` runs, but over a DIFFERENT ordering source:
+ * the engine folds `SharedStackPileDecision::ALL` in declaration order, while
+ * the client folded whatever order the view happened to serialize. The two
+ * agreed by coincidence rather than by construction, and a reordering of
+ * either would have silently changed which move a timed-out seat makes.
+ *
+ * Choosing a rules outcome is the reducer's job. The host may ASK for the
+ * forced resolution — that is a timeout, which is a host concern — but the
+ * answer comes from here, and the host only dispatches it through the ordinary
+ * decision path so the timed-out turn is persisted, acknowledged, broadcast and
+ * re-armed by exactly the code a player-driven one is.
+ */
+export function shared_stack_forced_decision(seat_index: number): any;
+
+/**
  * Start a Quick Cube Draft session from a counted cube list.
  */
 export function start_quick_cube_draft(cube_list_text: string, cube_name: string, settings_json: string, difficulty: number, seed: number): any;
@@ -318,6 +343,7 @@ export interface InitOutput {
     readonly pool_filter_options: (a: number, b: number) => [number, number, number];
     readonly resolve_shared_stack_bot_turns: () => [number, number, number];
     readonly set_seat_connected: (a: number, b: number) => [number, number, number];
+    readonly shared_stack_forced_decision: (a: number) => [number, number, number];
     readonly start_quick_cube_draft: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number];
     readonly start_quick_draft: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly start_sealed_draft: (a: number, b: number, c: number, d: number) => [number, number, number];

@@ -2347,12 +2347,17 @@ export class P2PDraftHost {
       if (hostView.status !== "Drafting") return;
       const stack = hostView.shared_stack;
       if (!stack) return;
-      // Addressed BY `index`, not by position in `piles`, for the same reason
-      // `verdictFor` looks a decision up by name: the cursor is an address.
-      const cursorPile = stack.piles.find((pile) => pile.index === stack.active_pile);
-      if (cursorPile === undefined) return;
-      const forced = cursorPile.legality.find((entry) => entry.refusal === null)?.decision;
-      if (forced === undefined) return;
+      // THE ENGINE CHOOSES; THIS ASKS. A timeout is a host concern, so the host
+      // may request a forced resolution -- but which move that is, is a rules
+      // outcome. This used to be `legality.find(entry => entry.refusal === null)`
+      // here, the same algorithm `shared_stack::forced_decision` runs but folded
+      // over a different ordering source: the engine folds
+      // `SharedStackPileDecision::ALL` in declaration order, this folded
+      // whatever order the view happened to serialize. They agreed by
+      // coincidence, and a reordering of either would have silently changed
+      // which move a timed-out seat makes.
+      const forced = await this.adapter.sharedStackForcedDecision(stack.active_seat);
+      if (forced === null) return;
       // Goes through the ordinary decision path, so the timeout-driven turn is
       // persisted, acknowledged, broadcast and RE-ARMED by exactly the code a
       // player-driven one is. A second, quieter path here is how the two would
