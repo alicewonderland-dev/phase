@@ -343,6 +343,16 @@ function Pile({
   // A non-active viewer is unaffected — the engine hands them an empty
   // `revealed` for every pile, the cursor included — so this narrows nothing
   // for them.
+  //
+  // DELIBERATE, and deliberately NOT pushed into the engine. The engine still
+  // publishes `revealed` for the piles this seat declined, and `opponent_read`
+  // in `bot_ai.rs` still folds those prefixes into its colour read — so an
+  // active bot "sees" what an active human no longer has on screen. That is
+  // parity, not an edge: the human saw those cards seconds ago and is expected
+  // to remember them, exactly as at a physical table, and the bot's
+  // `passed_colors` IS its memory. Narrowing the engine instead would take the
+  // read away from the bot and leave it worse informed than a human who simply
+  // remembers. Narrowing here can never leak; widening would be the bug.
   const shownRevealed = isCursor ? pile.revealed : EMPTY_REVEALED;
   // The face-down remainder of THIS pile: a presentation split of one published
   // number into the part drawn face up and the part that is not. It answers no

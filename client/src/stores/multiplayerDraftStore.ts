@@ -3147,7 +3147,18 @@ function installEventView(view: DraftPlayerView): void {
     publish,
     patch: {
       phase: phaseForDraftViewStatus(view.status),
-      timerRemainingMs: view.timer_remaining_ms ?? null,
+      // Only overwrite the clock when the view actually carries one. A view
+      // NEVER does on the P2P path -- `draft-core` publishes
+      // `timer_remaining_ms: None` on every view it builds, and the countdown
+      // is a host-side JS timer delivered by `timerTick`. Coalescing to `null`
+      // here therefore wiped the clock on every broadcast, and `startPickTimer`
+      // re-arms on each applied decision and is immediately followed by
+      // `broadcastViews()` -- so the timer unmounted and remounted once per
+      // turn, shifting the rows under the deciding player for ~1s of exactly
+      // the window `timerTick` exists to cover.
+      ...(typeof view.timer_remaining_ms === "number"
+        ? { timerRemainingMs: view.timer_remaining_ms }
+        : {}),
       standings: view.standings ?? [],
       currentRound: view.current_round ?? 0,
       pairings: view.pairings ?? [],

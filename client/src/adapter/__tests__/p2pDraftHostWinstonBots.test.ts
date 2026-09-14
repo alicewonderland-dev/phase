@@ -382,6 +382,42 @@ describe("P2PDraftHost Winston bot seats", () => {
   });
 
   /**
+   * THE FAILURE PATH OWES THE SAME FENCE AS THE SUCCESS PATH.
+   * `drive_shared_stack_bot_turns` mutates the session in place and returns
+   * `Err` from wherever it reached, so a failure on a later bot turn leaves the
+   * earlier ones APPLIED in the reducer. The caller then emits and broadcasts --
+   * publishing a reducer result no snapshot holds. A host reload would rewind
+   * every client past decisions they had already seen.
+   *
+   * REVERT-FAILING: delete the `await this.persistSessionStrict()` from the
+   * `catch` in `driveSharedStackBots` and this drops to one persist and reds.
+   * The count is the discrimination: the first persist is the human's own
+   * applied decision, which happens before the loop is ever entered, so
+   * "persisted at all" would pass with the fence gone.
+   */
+  it("persists before rethrowing when the bot loop fails mid-way", async () => {
+    const { host, resolveSharedStackBotTurns } = await startedPodWithABot("Drafting");
+    // Non-empty deltas would be the success path; the point here is that the
+    // loop got far enough to apply decisions and THEN threw.
+    resolveSharedStackBotTurns.mockRejectedValue(
+      new Error("shared-stack bot loop exceeded its bound"),
+    );
+    const events: { type: string }[] = [];
+    host.onEvent((event) => events.push(event as { type: string }));
+
+    await expect(host.submitHostSharedStackDecision(0, "Take")).resolves.toBeDefined();
+
+    // Reach guard: the loop really was entered and really did throw.
+    expect(resolveSharedStackBotTurns).toHaveBeenCalledOnce();
+    expect(events.filter((event) => event.type === "error")).toHaveLength(1);
+
+    // Two persists: the human's applied decision, then the fence on the way out.
+    // The success path asserts this same count, so the failure path is held to
+    // the same durability bar rather than a weaker one.
+    expect(saveDraftHostSession).toHaveBeenCalledTimes(2);
+  });
+
+  /**
    * The paired positive that keeps the boundary from swallowing a REAL refusal:
    * an `Err` out of the reducer itself still reaches the deciding seat as
    * `draft_error` and still rejects.

@@ -56,8 +56,8 @@ use server_core::draft_session::{
     draft_seats_needing_auto_pick, DraftMatchPlayer, DraftMatchSpawn, DraftSessionManager,
 };
 use server_core::draft_wire_guard::{
-    guard_create_draft_with_settings, guard_draft_action, guard_join_draft_with_password,
-    guard_reconnect_draft,
+    guard_chaos_layout_for_kind, guard_create_draft_with_settings, guard_draft_action,
+    guard_join_draft_with_password, guard_reconnect_draft,
 };
 use server_core::emote_guard::guard_emote;
 use server_core::game_action_payload_guard::guard_game_action_payload;
@@ -10443,13 +10443,11 @@ async fn handle_client_message(
                     // `StartDraft` would otherwise arrive on a full lobby that
                     // can never start. The engine owns both the verdict and its
                     // wording; this boundary only asks earlier.
-                    let seed = if procedure.allows_chaos_layout() {
+                    let seed = guard_chaos_layout_for_kind(kind).and_then(|()| {
                         rand::rngs::OsRng.try_next_u64().map_err(|error| {
                             format!("Unable to seed Chaos draft assignments: {error}")
                         })
-                    } else {
-                        Err(draft_core::types::CHAOS_LAYOUT_REFUSAL.to_string())
-                    };
+                    });
                     seed.and_then(|seed| {
                         draft_pools
                             .resolve_chaos_layout(

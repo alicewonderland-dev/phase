@@ -288,9 +288,11 @@ impl DraftSession {
                 // it to publish a pool, so a snapshot with a short `pools` is
                 // an index-out-of-bounds -- and `panic = "abort"` in the release
                 // wasm profile makes that a dead client rather than an error.
-                // The pick-and-pass arm below reaches the same check by falling
-                // through to the shared per-seat block; this arm returns early,
-                // so it has to ask for itself.
+                // The `AllAtOnce` arm reaches this check by falling through to
+                // the shared per-seat block; this arm returns early, so it has
+                // to ask for itself. `PickAndPass` returns `Ok(())` above and
+                // gets no per-seat vector check at all -- pre-existing, and out
+                // of scope here, but do not read this comment as covering it.
                 if self.pools.len() != self.seats.len()
                     || self.config.pod_size as usize != self.seats.len()
                 {

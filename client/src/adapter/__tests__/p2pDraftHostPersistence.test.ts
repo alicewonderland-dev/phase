@@ -302,11 +302,26 @@ describe("P2PDraftHost persistence disposal", () => {
     decisions: 0,
   };
 
+  // EVERY SEAT'S DRAFTED CARDS and the booster a seat is mid-pick on. Private in
+  // every draft kind, and under a shared stack the format's central secret.
+  const winstonPools = [["Seat 0 secret card"], ["Seat 1 secret card"]];
+  const winstonCurrentPack = ["Mid-pick secret card"];
+
   it.each([
-    ["serialized", JSON.stringify({ booster_pack_pool: ["Nested cube"], shared_stack: winstonSharedStack })],
-    ["object", { booster_pack_pool: ["Nested cube"], shared_stack: winstonSharedStack }],
+    ["serialized", JSON.stringify({
+      booster_pack_pool: ["Nested cube"],
+      shared_stack: winstonSharedStack,
+      pools: winstonPools,
+      current_pack: winstonCurrentPack,
+    })],
+    ["object", {
+      booster_pack_pool: ["Nested cube"],
+      shared_stack: winstonSharedStack,
+      pools: winstonPools,
+      current_pack: winstonCurrentPack,
+    }],
     ["null", null],
-  ])("strips every cube source alias and the shared stack from a %s public backup without changing IndexedDB", async (_shape, draftSessionJson) => {
+  ])("strips every cube source alias, the shared stack, and every seat's pool from a %s public backup without changing IndexedDB", async (_shape, draftSessionJson) => {
     const originalFetch = globalThis.fetch;
     const fetchMock = vi.fn<typeof fetch>(async () => new Response("", { status: 200 }));
     globalThis.fetch = fetchMock;
@@ -359,17 +374,27 @@ describe("P2PDraftHost persistence disposal", () => {
       if (typeof snapshot.draftSessionJson === "string") {
         expect(JSON.parse(publicSnapshot.draftSessionJson).booster_pack_pool).toBeUndefined();
         expect(JSON.parse(publicSnapshot.draftSessionJson).shared_stack).toBeUndefined();
+        expect(JSON.parse(publicSnapshot.draftSessionJson).pools).toBeUndefined();
+        expect(JSON.parse(publicSnapshot.draftSessionJson).current_pack).toBeUndefined();
         expect(JSON.parse(snapshot.draftSessionJson).booster_pack_pool).toEqual(["Nested cube"]);
         expect(JSON.parse(snapshot.draftSessionJson).shared_stack).toEqual(winstonSharedStack);
+        expect(JSON.parse(snapshot.draftSessionJson).pools).toEqual(winstonPools);
+        expect(JSON.parse(snapshot.draftSessionJson).current_pack).toEqual(winstonCurrentPack);
       } else if (snapshot.draftSessionJson && typeof snapshot.draftSessionJson === "object") {
         expect(publicSnapshot.draftSessionJson.booster_pack_pool).toBeUndefined();
         expect(publicSnapshot.draftSessionJson.shared_stack).toBeUndefined();
+        expect(publicSnapshot.draftSessionJson.pools).toBeUndefined();
+        expect(publicSnapshot.draftSessionJson.current_pack).toBeUndefined();
         const retained = snapshot.draftSessionJson as {
           booster_pack_pool: string[];
           shared_stack: typeof winstonSharedStack;
+          pools: string[][];
+          current_pack: string[];
         };
         expect(retained.booster_pack_pool).toEqual(["Nested cube"]);
         expect(retained.shared_stack).toEqual(winstonSharedStack);
+        expect(retained.pools).toEqual(winstonPools);
+        expect(retained.current_pack).toEqual(winstonCurrentPack);
       } else {
         expect(publicSnapshot.draftSessionJson).toBeNull();
       }
