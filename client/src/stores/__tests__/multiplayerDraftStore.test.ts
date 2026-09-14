@@ -1431,6 +1431,49 @@ describe("multiplayerDraftStore", () => {
       expect(placements.costly.column).toBeGreaterThan(placements.cheap.column);
     });
 
+    /**
+     * A PREFERENCE CHANGE IS HONOURED BY THE VERY NEXT ARRIVAL.
+     *
+     * The page publishes board columns from `handlePreferencesChange` rather
+     * than from an effect keyed on the preference state. An effect runs after
+     * React commits, and a `viewUpdated` landing in that window placed the
+     * arrivals against the PREVIOUS columns -- cards sorted into the board the
+     * player had a moment ago.
+     *
+     * WHAT THIS PINS, HONESTLY: the publish-then-arrive sequence, with no
+     * re-render in between. It does NOT pin the React timing itself. Through
+     * Testing Library the two are indistinguishable -- `act()` flushes effects
+     * synchronously after the event, so "published during the handler" and
+     * "published by the effect" produce identical observable output, and a test
+     * claiming to catch the race would be claiming more than it can see. The
+     * timing is pinned by the page's structure instead: `DraftPodPage` has no
+     * effect keyed on `workspacePreferences.deck` any more, and its mount effect
+     * reads storage directly.
+     */
+    it("places an arrival against the columns published just before it", async () => {
+      await hostWinstonPod();
+      // Two cards that share a mana value and differ only in colour: under the
+      // default (sort by mana value) they land in the SAME column, so a stale
+      // preference is visible as a collision rather than as a reordering.
+      const taken = [
+        { ...card("white-one"), cmc: 2, colors: ["W"] },
+        { ...card("black-one"), cmc: 2, colors: ["B"] },
+      ];
+
+      setArrivingCardBoardPreferences({
+        sort: "color",
+        columnCount: 7,
+        rows: "one",
+        showHeaders: true,
+      });
+      // No re-render between the publish and the arrival, which is the whole
+      // point: the arrival must not be waiting on one.
+      capturedHostEventHandler!({ type: "viewUpdated", view: winstonView(5, taken) });
+
+      const placements = useMultiplayerDraftStore.getState().workspaceState!.placements;
+      expect(placements["white-one"].column).not.toBe(placements["black-one"].column);
+    });
+
     it("refuses to acknowledge a view whose decision counter did not advance", async () => {
       await hostWinstonPod();
       mockHostAdapter.submitSharedStackDecision.mockResolvedValueOnce(winstonView(4));

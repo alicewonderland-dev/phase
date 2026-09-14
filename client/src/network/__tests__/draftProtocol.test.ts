@@ -19,7 +19,35 @@ const validWorkspace = {
   virtualBasics: [{ instanceId: "basic-1", name: "Island" }],
 };
 
-const validDraftView = { launch_capability: "None" as const, commanders_required: 0 };
+// v30 requires `distribution`: the draft protocol is compared for EXACT
+// equality at the handshake, so a peer that omits it is malformed, not old.
+/** A well-formed shared-stack projection: every nested v30 shape, populated. */
+const validSharedStack = {
+  main_stack_remaining: 11,
+  total_cards: 20,
+  active_seat: 1,
+  active_pile: 0,
+  piles: [
+    {
+      index: 0,
+      total: 2,
+      revealed: [{ instance_id: "card-1", name: "Ponder" }],
+      legality: [
+        { decision: "Take", refusal: null },
+        { decision: "Decline", refusal: "NoGuaranteedCard" },
+      ],
+    },
+  ],
+  decisions: 5,
+  history: [{ seat: 0, pile: 1, decision: "Decline", pile_size: 2 }],
+  forced_draw: null,
+};
+
+const validDraftView = {
+  launch_capability: "None" as const,
+  commanders_required: 0,
+  distribution: "PickAndPass" as const,
+};
 
 /** A well-formed `DraftCommanderLaunch`, rebuilt per case so mutations cannot leak. */
 const commanderLaunch = () => ({
@@ -607,6 +635,110 @@ describe("draftProtocol", () => {
       },
     );
 
+    /**
+     * THE v30 FIELDS USED TO CROSS THE BOUNDARY ON A CAST.
+     *
+     * `normalizeDraftPlayerView` validated a handful of named fields and then
+     * spread the rest of the frame through `as unknown as DraftPlayerView`. A
+     * cast is not a check: `distribution`, `shared_stack` and
+     * `play_first_chooser` arrived with their declared TypeScript shape and none
+     * of their content, straight into the store and the renderer.
+     *
+     * The rows below are the malformed and unknown NESTED values specifically --
+     * a bad tag, an unknown enum member several levels down, a frame that
+     * contradicts itself -- because the outer field being an object was the part
+     * the old code effectively did check by accident.
+     */
+    it.each([
+      ["an unknown distribution name", { distribution: "RochesterDraft" }],
+      ["a distribution that is not a string or object", { distribution: 3 }],
+      ["a tagged distribution with an unknown variant", { distribution: { GridDraft: {} } }],
+      ["a tagged distribution carrying a second key", {
+        distribution: { SharedStackPiles: { pile_count: 3 }, AllAtOnce: {} },
+      }],
+      ["a pile count past a u8", {
+        distribution: { SharedStackPiles: { pile_count: 256 } },
+      }],
+      ["a negative pile count", {
+        distribution: { SharedStackPiles: { pile_count: -1 } },
+      }],
+    ])("rejects %s at protocol v30", (_label, overrides) => {
+      expect(() => validateDraftMessage({
+        type: "draft_state_update",
+        view: { ...validDraftView, ...overrides },
+      })).toThrow(/Invalid draft message/);
+    });
+
+    it.each([
+      ["a shared stack that is not an object", { shared_stack: 7 }],
+      ["shared-stack piles that are not an array", {
+        shared_stack: { ...validSharedStack, piles: {} },
+      }],
+      ["a negative seat index", {
+        shared_stack: { ...validSharedStack, active_seat: -1 },
+      }],
+      ["an unknown decision in a pile's legality", {
+        shared_stack: {
+          ...validSharedStack,
+          piles: [{ index: 0, total: 1, revealed: [], legality: [{ decision: "Burn", refusal: null }] }],
+        },
+      }],
+      ["an unknown refusal in a pile's legality", {
+        shared_stack: {
+          ...validSharedStack,
+          piles: [{
+            index: 0,
+            total: 1,
+            revealed: [],
+            legality: [{ decision: "Take", refusal: "NotYourTurn" }],
+          }],
+        },
+      }],
+      ["a revealed prefix longer than the pile it belongs to", {
+        shared_stack: {
+          ...validSharedStack,
+          piles: [{
+            index: 0,
+            total: 1,
+            revealed: [{ instance_id: "a" }, { instance_id: "b" }],
+            legality: [],
+          }],
+        },
+      }],
+      ["an unknown decision in the public history", {
+        shared_stack: {
+          ...validSharedStack,
+          history: [{ seat: 0, pile: 0, decision: "Shuffle", pile_size: 2 }],
+        },
+      }],
+      ["a play-first chooser that is not a seat index", { play_first_chooser: "seat-1" }],
+      ["a fractional play-first chooser", { play_first_chooser: 1.5 }],
+    ])("rejects %s at protocol v30", (_label, overrides) => {
+      expect(() => validateDraftMessage({
+        type: "draft_state_update",
+        view: { ...validDraftView, ...overrides },
+      })).toThrow(/Invalid draft message/);
+    });
+
+    /**
+     * The paired positive, and the reason the rows above discriminate: a
+     * well-formed shared-stack frame with every nested shape populated must
+     * still pass. Without this, a normalizer that rejected EVERYTHING would
+     * satisfy all of them.
+     */
+    it("accepts a fully populated shared-stack frame at protocol v30", () => {
+      const msg = validateDraftMessage({
+        type: "draft_state_update",
+        view: {
+          ...validDraftView,
+          distribution: { SharedStackPiles: { pile_count: 3 } },
+          shared_stack: validSharedStack,
+          play_first_chooser: null,
+        },
+      });
+      expect(msg.type).toBe("draft_state_update");
+    });
+
     it.each([undefined, null, -1, 0.5, 256, "1"])(
       "rejects a missing or invalid commander count at protocol v26",
       (commanders_required) => {
@@ -1109,6 +1241,7 @@ describe("draftProtocol", () => {
       const longView = {
         launch_capability: "None" as const,
         commanders_required: 0,
+        distribution: "PickAndPass" as const,
         status: "Deckbuilding",
         kind: "Sealed",
         current_pack_number: 1,

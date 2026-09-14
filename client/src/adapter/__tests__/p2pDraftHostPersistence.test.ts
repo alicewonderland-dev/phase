@@ -661,6 +661,9 @@ describe("P2PDraftHost persistence disposal", () => {
     };
     const view = {
       status: "Deckbuilding",
+      // Required from v30 on: the protocol is compared for EXACT equality at the
+      // handshake, so a frame without it is malformed rather than old.
+      distribution: "PickAndPass",
       seats: [{ has_submitted_deck: false, is_bot: false }],
     };
     privateHost.draftStarted = true;
@@ -696,6 +699,9 @@ describe("P2PDraftHost persistence disposal", () => {
     };
     const view = {
       status: "Deckbuilding",
+      // Required from v30 on: the protocol is compared for EXACT equality at the
+      // handshake, so a frame without it is malformed rather than old.
+      distribution: "PickAndPass",
       seats: [{ has_submitted_deck: false, is_bot: false }],
     };
     privateHost.draftStarted = true;
@@ -972,6 +978,9 @@ describe("P2PDraftHost persistence disposal", () => {
       privateHost.adapter.draftProcedure = vi.fn(async () => ({
         packs_per_player: 3, min_deck_size: 40, launch_capability: "None", commanders_required: 0,
         pick_selection_mode: "Direct", match_config: { match_type: "Bo1" },
+        // `buildLobbyView` copies this straight from the procedure, and every
+        // participant frame carries it from v30 on.
+        distribution: "PickAndPass",
       }));
       privateHost.adapter.createMultiplayerDraft = vi.fn(async () => {});
       privateHost.adapter.setSeatConnected = vi.fn(async () => {});

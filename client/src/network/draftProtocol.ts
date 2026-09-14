@@ -19,8 +19,14 @@ import type {
   DraftPlayerView,
   DraftRarityGroupKind,
   DraftSourceView,
+  PackDistribution,
   SeatPublicView,
+  SharedStackDecisionRecord,
+  SharedStackDecisionView,
   SharedStackPileDecision,
+  SharedStackPileView,
+  SharedStackRefusal,
+  SharedStackView,
 } from "../adapter/draft-adapter";
 import type { DeckCardCount, MatchConfig, MatchScore } from "../adapter/types";
 import {
@@ -1223,6 +1229,150 @@ function normalizeDraftSourceView(raw: unknown): DraftSourceView | undefined {
   };
 }
 
+// ---------------------------------------------------------------------------
+// v30 shared-stack wire validation.
+//
+// Everything below exists because `normalizeDraftPlayerView` used to validate a
+// handful of named fields and then spread the rest of the frame through
+// `as unknown as DraftPlayerView`. A cast is not a check: `distribution`,
+// `shared_stack` and `play_first_chooser` crossed the transport boundary
+// entirely unvalidated, so a malformed or hostile peer frame reached the store
+// and the renderer with its declared TypeScript shape and none of its content.
+// The draft protocol is compared for EXACT equality at the handshake
+// (`p2p-draft-guest.ts`), so a v30 peer that omits a v30 field is malformed
+// rather than old, and these validators are strict accordingly.
+//
+// They validate SHAPE and closed sets, never legality: `legality` entries carry
+// the engine's verdict and are checked for being well-formed, not for being
+// right. Nothing here recomputes a rule.
+// ---------------------------------------------------------------------------
+
+const SHARED_STACK_DECISIONS: readonly SharedStackPileDecision[] = ["Take", "Decline"];
+const SHARED_STACK_REFUSALS: readonly SharedStackRefusal[] = [
+  "PileNotActive",
+  "PileEmpty",
+  "NoGuaranteedCard",
+];
+
+function requireObject(raw: unknown, context: string): Record<string, unknown> {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`Invalid draft message: malformed ${context}`);
+  }
+  return raw as Record<string, unknown>;
+}
+
+/** A non-negative integer. Counts and seat/pile indices are all this shape. */
+function requireCount(record: Record<string, unknown>, field: string, context: string): number {
+  const value = record[field];
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new Error(
+      `Invalid draft message: ${context}.${field} must be a non-negative integer`,
+    );
+  }
+  return value;
+}
+
+function normalizePackDistribution(raw: unknown): PackDistribution {
+  if (raw === "PickAndPass" || raw === "AllAtOnce") return raw;
+  const tagged = requireObject(raw, "distribution");
+  const shared = tagged.SharedStackPiles;
+  if (shared === undefined || Object.keys(tagged).length !== 1) {
+    throw new Error("Invalid draft message: distribution must be a known pack distribution");
+  }
+  const piles = requireObject(shared, "distribution.SharedStackPiles");
+  const pile_count = requireCount(piles, "pile_count", "distribution.SharedStackPiles");
+  if (pile_count > 255) {
+    throw new Error("Invalid draft message: distribution.SharedStackPiles.pile_count must be a u8");
+  }
+  return { SharedStackPiles: { pile_count } };
+}
+
+function normalizeSharedStackDecisionView(raw: unknown, context: string): SharedStackDecisionView {
+  const entry = requireObject(raw, context);
+  if (!SHARED_STACK_DECISIONS.includes(entry.decision as SharedStackPileDecision)) {
+    throw new Error(`Invalid draft message: ${context}.decision must be Take or Decline`);
+  }
+  if (
+    entry.refusal !== null
+    && !SHARED_STACK_REFUSALS.includes(entry.refusal as SharedStackRefusal)
+  ) {
+    throw new Error(`Invalid draft message: ${context}.refusal must be null or a known refusal`);
+  }
+  return {
+    decision: entry.decision as SharedStackPileDecision,
+    refusal: entry.refusal as SharedStackRefusal | null,
+  };
+}
+
+function normalizeSharedStackPileView(raw: unknown, index: number): SharedStackPileView {
+  const context = `shared_stack.piles[${index}]`;
+  const pile = requireObject(raw, context);
+  const total = requireCount(pile, "total", context);
+  const revealed = normalizeArrayField<SharedStackPileView["revealed"][number]>(pile, "revealed");
+  // The engine publishes a PREFIX of the pile, so more revealed cards than the
+  // pile is tall is a frame that contradicts itself. Not a legality check --
+  // this compares the frame against itself, and nothing here re-derives which
+  // cards a viewer may see.
+  if (revealed.length > total) {
+    throw new Error(`Invalid draft message: ${context}.revealed is longer than the pile`);
+  }
+  if (!Array.isArray(pile.legality)) {
+    throw new Error(`Invalid draft message: ${context}.legality must be an array`);
+  }
+  return {
+    index: requireCount(pile, "index", context),
+    total,
+    revealed,
+    legality: pile.legality.map((entry, i) =>
+      normalizeSharedStackDecisionView(entry, `${context}.legality[${i}]`)),
+  };
+}
+
+function normalizeSharedStackDecisionRecord(raw: unknown, index: number): SharedStackDecisionRecord {
+  const context = `shared_stack.history[${index}]`;
+  const record = requireObject(raw, context);
+  if (!SHARED_STACK_DECISIONS.includes(record.decision as SharedStackPileDecision)) {
+    throw new Error(`Invalid draft message: ${context}.decision must be Take or Decline`);
+  }
+  return {
+    seat: requireCount(record, "seat", context),
+    pile: requireCount(record, "pile", context),
+    decision: record.decision as SharedStackPileDecision,
+    pile_size: requireCount(record, "pile_size", context),
+  };
+}
+
+function normalizeSharedStackView(raw: unknown): SharedStackView | null {
+  if (raw === null || raw === undefined) return null;
+  const stack = requireObject(raw, "shared_stack");
+  if (!Array.isArray(stack.piles)) {
+    throw new Error("Invalid draft message: shared_stack.piles must be an array");
+  }
+  const forced = stack.forced_draw;
+  if (forced !== null && forced !== undefined) {
+    requireObject(forced, "shared_stack.forced_draw");
+  }
+  return {
+    main_stack_remaining: requireCount(stack, "main_stack_remaining", "shared_stack"),
+    total_cards: requireCount(stack, "total_cards", "shared_stack"),
+    active_seat: requireCount(stack, "active_seat", "shared_stack"),
+    active_pile: requireCount(stack, "active_pile", "shared_stack"),
+    piles: stack.piles.map(normalizeSharedStackPileView),
+    decisions: requireCount(stack, "decisions", "shared_stack"),
+    history: normalizeArrayField<unknown>(stack, "history").map(normalizeSharedStackDecisionRecord),
+    forced_draw: (forced ?? null) as SharedStackView["forced_draw"],
+  };
+}
+
+/** The seat that chooses play/draw, or `null` when nobody has been designated. */
+function normalizePlayFirstChooser(raw: unknown): number | null {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 0) {
+    throw new Error("Invalid draft message: play_first_chooser must be null or a seat index");
+  }
+  return raw;
+}
+
 function normalizeDraftPlayerView(raw: unknown): DraftPlayerView {
   if (raw === undefined) {
     throw new Error("Invalid draft message: launch_capability must be a known capability");
@@ -1257,6 +1407,24 @@ function normalizeDraftPlayerView(raw: unknown): DraftPlayerView {
     ...(source !== undefined ? { source } : {}),
     draft_effects: normalizeArrayField(view, "draft_effects"),
     seats: normalizeArrayField(view, "seats").map(normalizeSeatPublicView),
+    // The v30 fields, validated rather than spread. Listed AFTER the spread so
+    // the checked value is the one that survives -- a raw `view.distribution`
+    // riding the spread would otherwise win.
+    //
+    // `distribution` is required: it is non-optional on `DraftPlayerView`, and
+    // the draft protocol is compared for EXACT equality at the handshake, so a
+    // peer that omits it is malformed rather than old.
+    distribution: normalizePackDistribution(view.distribution),
+    // The two OPTIONAL fields keep their absence rather than being materialized
+    // as `null`. Same conditional-spread idiom as `pool_groups` and `source`
+    // above, and for a concrete reason: turning an absent field into a present
+    // null changes the object's shape, which a wire round-trip can see.
+    ...(view.shared_stack !== undefined
+      ? { shared_stack: normalizeSharedStackView(view.shared_stack) }
+      : {}),
+    ...(view.play_first_chooser !== undefined
+      ? { play_first_chooser: normalizePlayFirstChooser(view.play_first_chooser) }
+      : {}),
   } as unknown as DraftPlayerView;
 }
 
