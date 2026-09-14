@@ -56,10 +56,15 @@ const validSharedStack = {
  *  table below reaches the rule it names instead of being refused for pairing a
  *  stack with a distribution that deals no piles. `pile_count` matches
  *  `validSharedStack`'s three piles. */
+const winstonSeat = { active_pack_count: 0, drafted_card_count: 0, pick_status: "Pending" };
 const validWinstonView = {
   launch_capability: "None" as const,
   commanders_required: 0,
   distribution: { SharedStackPiles: { pile_count: 3 } },
+  // TWO SEATS, because the shared-stack references are validated against how
+  // many this frame carries -- `active_seat`, every history `seat`, and
+  // `play_first_chooser`. A frame with no seats would refuse them all.
+  seats: [winstonSeat, winstonSeat],
 };
 
 const validDraftView = {
@@ -700,6 +705,7 @@ describe("draftProtocol", () => {
         distribution: { SharedStackPiles: { pile_count: 1 } },
         shared_stack: {
           ...validSharedStack,
+          history: [],
           piles: [{ index: 0, total: 1, revealed: [], legality: [{ decision: "Burn", refusal: null }] }],
         },
       }],
@@ -707,6 +713,7 @@ describe("draftProtocol", () => {
         distribution: { SharedStackPiles: { pile_count: 1 } },
         shared_stack: {
           ...validSharedStack,
+          history: [],
           piles: [{
             index: 0,
             total: 1,
@@ -719,6 +726,7 @@ describe("draftProtocol", () => {
         distribution: { SharedStackPiles: { pile_count: 1 } },
         shared_stack: {
           ...validSharedStack,
+          history: [],
           piles: [{
             index: 0,
             total: 1,
@@ -736,6 +744,7 @@ describe("draftProtocol", () => {
         distribution: { SharedStackPiles: { pile_count: 1 } },
         shared_stack: {
           ...validSharedStack,
+          history: [],
           piles: [{ index: 0, total: 1, revealed: [{ name: "Ponder" }], legality: [] }],
         },
       }],
@@ -751,26 +760,48 @@ describe("draftProtocol", () => {
         distribution: { SharedStackPiles: { pile_count: 2 } },
         shared_stack: validSharedStack,
       }],
-      ["a seat address past a u8", {
-        shared_stack: { ...validSharedStack, active_seat: 256 },
+      // THE COUNTEREXAMPLES THE INTEGER BOUND ADMITTED. Every value below fits
+      // a u8 comfortably; what makes each impossible is this frame's own
+      // cardinality -- two seats and three piles.
+      ["an active seat past the frame's seat count", {
+        shared_stack: { ...validSharedStack, active_seat: 2 },
       }],
-      ["a pile address past a u8", {
-        shared_stack: { ...validSharedStack, active_pile: 256 },
+      ["an active pile past the declared pile count", {
+        shared_stack: { ...validSharedStack, active_pile: 3 },
       }],
       ["a decision counter past a u32", {
         shared_stack: { ...validSharedStack, decisions: 4294967296 },
       }],
-      ["a history record addressing a seat past a u8", {
+      ["a history record addressing a seat the frame does not have", {
         shared_stack: {
           ...validSharedStack,
-          history: [{ seat: 256, pile: 0, decision: "Decline", pile_size: 2 }],
+          history: [{ seat: 2, pile: 0, decision: "Decline", pile_size: 2 }],
         },
       }],
-      ["a pile index past a u8", {
+      ["a history record addressing a pile the frame does not have", {
+        shared_stack: {
+          ...validSharedStack,
+          history: [{ seat: 0, pile: 3, decision: "Decline", pile_size: 2 }],
+        },
+      }],
+      ["a play-first chooser past the frame's seat count", { play_first_chooser: 2 }],
+      ["a pile index that is not its own position", {
         distribution: { SharedStackPiles: { pile_count: 1 } },
         shared_stack: {
           ...validSharedStack,
-          piles: [{ index: 256, total: 1, revealed: [], legality: [] }],
+          history: [],
+          piles: [{ index: 1, total: 1, revealed: [], legality: [] }],
+        },
+      }],
+      ["duplicate pile indices, which would make two piles share an address", {
+        distribution: { SharedStackPiles: { pile_count: 2 } },
+        shared_stack: {
+          ...validSharedStack,
+          history: [],
+          piles: [
+            { index: 0, total: 1, revealed: [], legality: [] },
+            { index: 0, total: 1, revealed: [], legality: [] },
+          ],
         },
       }],
       ["a forced draw with no instance id", {
@@ -841,10 +872,12 @@ describe("draftProtocol", () => {
       const msg = validateDraftMessage({
         type: "draft_state_update",
         view: {
-          ...validDraftView,
-          distribution: { SharedStackPiles: { pile_count: 3 } },
+          // The shared-stack base, so the frame carries the seats its own
+          // references are checked against -- and a POPULATED chooser, since a
+          // `null` one never exercises the seat-count bound at all.
+          ...validWinstonView,
           shared_stack: validSharedStack,
-          play_first_chooser: null,
+          play_first_chooser: 1,
         },
       });
       expect(msg.type).toBe("draft_state_update");

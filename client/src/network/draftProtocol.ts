@@ -1399,9 +1399,17 @@ function normalizeDraftCardInstance(raw: unknown, context: string): unknown {
   return card;
 }
 
-function normalizeSharedStackPileView(raw: unknown, index: number): SharedStackPileView {
-  const context = `shared_stack.piles[${index}]`;
+function normalizeSharedStackPileView(raw: unknown, position: number): SharedStackPileView {
+  const context = `shared_stack.piles[${position}]`;
   const pile = requireObject(raw, context);
+  // `shared_stack_view` builds this vector with `.enumerate()` and
+  // `let index = i as u8`, so a pile's index IS its position -- always, on every
+  // path. A frame carrying a duplicate or shuffled index is describing a vector
+  // the engine never produced, and the client addresses piles BY index, so a
+  // duplicate would make two piles answer to the same address.
+  if (pile.index !== position) {
+    throw new Error(`Invalid draft message: ${context}.index must equal its position`);
+  }
   const total = requireCount(pile, "total", context);
   const revealed = normalizeArrayField<unknown>(pile, "revealed")
     .map((card, i) => normalizeDraftCardInstance(card, `${context}.revealed[${i}]`)) as
@@ -1417,7 +1425,7 @@ function normalizeSharedStackPileView(raw: unknown, index: number): SharedStackP
     throw new Error(`Invalid draft message: ${context}.legality must be an array`);
   }
   return {
-    index: requireBoundedInt(pile, "index", context, 0, U8_MAX),
+    index: position,
     total,
     revealed,
     legality: pile.legality.map((entry, i) =>
@@ -1425,15 +1433,20 @@ function normalizeSharedStackPileView(raw: unknown, index: number): SharedStackP
   };
 }
 
-function normalizeSharedStackDecisionRecord(raw: unknown, index: number): SharedStackDecisionRecord {
+function normalizeSharedStackDecisionRecord(
+  raw: unknown,
+  index: number,
+  seatCount: number,
+  pileCount: number,
+): SharedStackDecisionRecord {
   const context = `shared_stack.history[${index}]`;
   const record = requireObject(raw, context);
   if (!SHARED_STACK_DECISIONS.includes(record.decision as SharedStackPileDecision)) {
     throw new Error(`Invalid draft message: ${context}.decision must be Take or Decline`);
   }
   return {
-    seat: requireBoundedInt(record, "seat", context, 0, U8_MAX),
-    pile: requireBoundedInt(record, "pile", context, 0, U8_MAX),
+    seat: requireBoundedInt(record, "seat", context, 0, seatCount - 1),
+    pile: requireBoundedInt(record, "pile", context, 0, pileCount - 1),
     decision: record.decision as SharedStackPileDecision,
     pile_size: requireCount(record, "pile_size", context),
   };
@@ -1447,6 +1460,7 @@ function normalizeSharedStackDecisionRecord(raw: unknown, index: number): Shared
 function normalizeSharedStackView(
   raw: unknown,
   declaredPileCount: number | null,
+  seatCount: number,
 ): SharedStackView | null {
   if (raw === null || raw === undefined) return null;
   const stack = requireObject(raw, "shared_stack");
@@ -1468,6 +1482,9 @@ function normalizeSharedStackView(
       "Invalid draft message: shared_stack.piles length must equal the declared pile_count",
     );
   }
+  // The published length, which the cross-check above has already tied to the
+  // declared count -- so bounding a reference by either is bounding it by both.
+  const pileCount = stack.piles.length;
   // REQUIRED, not defaulted: both are unconditionally serialized by the engine,
   // so a frame omitting either is malformed rather than sparse.
   const rawHistory = requirePresent(stack, "history", "shared_stack");
@@ -1481,19 +1498,31 @@ function normalizeSharedStackView(
   return {
     main_stack_remaining: requireCount(stack, "main_stack_remaining", "shared_stack"),
     total_cards: requireCount(stack, "total_cards", "shared_stack"),
-    active_seat: requireBoundedInt(stack, "active_seat", "shared_stack", 0, U8_MAX),
-    active_pile: requireBoundedInt(stack, "active_pile", "shared_stack", 0, U8_MAX),
+    // AGAINST THIS FRAME'S CARDINALITIES, not merely against `u8`. The engine
+    // copies the live seat and cursor out of a session that HAS those seats and
+    // those piles (`shared_stack_view`), so a two-seat, one-pile frame naming
+    // seat 2 or pile 1 is one it could not have emitted -- and every such value
+    // fits a `u8` perfectly well, which is why the integer bound alone admitted
+    // them.
+    active_seat: requireBoundedInt(stack, "active_seat", "shared_stack", 0, seatCount - 1),
+    active_pile: requireBoundedInt(stack, "active_pile", "shared_stack", 0, pileCount - 1),
     piles: stack.piles.map(normalizeSharedStackPileView),
     decisions: requireBoundedInt(stack, "decisions", "shared_stack", 0, U32_MAX),
-    history: rawHistory.map(normalizeSharedStackDecisionRecord),
+    history: rawHistory.map((record, i) =>
+      normalizeSharedStackDecisionRecord(record, i, seatCount, pileCount)),
     forced_draw: forced as SharedStackView["forced_draw"],
   };
 }
 
 /** The seat that chooses play/draw, or `null` when nobody has been designated. */
-function normalizePlayFirstChooser(raw: unknown): number | null {
+function normalizePlayFirstChooser(raw: unknown, seatCount: number): number | null {
   if (raw === null || raw === undefined) return null;
-  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 0) {
+  // A SEAT INDEX, so it is bounded by the seats this frame actually carries.
+  // `play_first_chooser` is produced only for a shared-stack session of exactly
+  // two seats, as `(starting_seat + 1) % 2` -- so the engine's own range is
+  // {0, 1}. Bounding by the frame's seat count is the general form of that and
+  // does not hard-code the two-seat rule here.
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 0 || raw >= seatCount) {
     throw new Error("Invalid draft message: play_first_chooser must be null or a seat index");
   }
   return raw;
@@ -1525,6 +1554,11 @@ function normalizeDraftPlayerView(raw: unknown): DraftPlayerView {
   const declaredPileCount = typeof distribution === "object"
     ? distribution.SharedStackPiles.pile_count
     : null;
+  // SEATS FIRST, because the shared-stack references are validated against how
+  // many there are. Normalizing the stack before the seats meant the seat count
+  // was simply unavailable, which is why `active_seat` could only ever be
+  // checked against `u8`.
+  const seats = normalizeArrayField(view, "seats").map(normalizeSeatPublicView);
   // A LIVE PILE TURN IMPLIES THE DISTRIBUTION THAT DEALS PILES.
   // `shared_stack_view_for` returns `Some` only for a session that HAS a shared
   // stack and is drafting, so the engine cannot pair one with any other
@@ -1549,7 +1583,7 @@ function normalizeDraftPlayerView(raw: unknown): DraftPlayerView {
     ...(pool_groups !== undefined ? { pool_groups } : {}),
     ...(source !== undefined ? { source } : {}),
     draft_effects: normalizeArrayField(view, "draft_effects"),
-    seats: normalizeArrayField(view, "seats").map(normalizeSeatPublicView),
+    seats,
     // The v30 fields, validated rather than spread. Listed AFTER the spread so
     // the checked value is the one that survives -- a raw `view.distribution`
     // riding the spread would otherwise win.
@@ -1567,10 +1601,10 @@ function normalizeDraftPlayerView(raw: unknown): DraftPlayerView {
     // declared pile count and the published pile vector have to agree, and
     // neither half looks wrong on its own.
     ...(view.shared_stack !== undefined
-      ? { shared_stack: normalizeSharedStackView(view.shared_stack, declaredPileCount) }
+      ? { shared_stack: normalizeSharedStackView(view.shared_stack, declaredPileCount, seats.length) }
       : {}),
     ...(view.play_first_chooser !== undefined
-      ? { play_first_chooser: normalizePlayFirstChooser(view.play_first_chooser) }
+      ? { play_first_chooser: normalizePlayFirstChooser(view.play_first_chooser, seats.length) }
       : {}),
   } as unknown as DraftPlayerView;
 }
