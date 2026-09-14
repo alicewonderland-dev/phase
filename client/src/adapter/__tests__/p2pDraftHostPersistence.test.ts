@@ -309,6 +309,9 @@ describe("P2PDraftHost persistence disposal", () => {
   // The boosters a seat has not opened yet — private in EVERY draft kind, which
   // is why this row is not Winston-specific.
   const winstonPacksBySeat = [["Unopened secret booster"]];
+  // The seed IS the draw order — stripping the stack while shipping this hands
+  // back everything stripping the stack protected.
+  const winstonRngSeed = 987654321;
 
   it.each([
     ["serialized", JSON.stringify({
@@ -317,6 +320,7 @@ describe("P2PDraftHost persistence disposal", () => {
       pools: winstonPools,
       current_pack: winstonCurrentPack,
       packs_by_seat: winstonPacksBySeat,
+      config: { rng_seed: winstonRngSeed },
     })],
     ["object", {
       booster_pack_pool: ["Nested cube"],
@@ -324,6 +328,7 @@ describe("P2PDraftHost persistence disposal", () => {
       pools: winstonPools,
       current_pack: winstonCurrentPack,
       packs_by_seat: winstonPacksBySeat,
+      config: { rng_seed: winstonRngSeed },
     }],
     ["null", null],
   ])("strips every cube source alias, the shared stack, and every seat's pool from a %s public backup without changing IndexedDB", async (_shape, draftSessionJson) => {
@@ -382,29 +387,34 @@ describe("P2PDraftHost persistence disposal", () => {
         expect(JSON.parse(publicSnapshot.draftSessionJson).pools).toBeUndefined();
         expect(JSON.parse(publicSnapshot.draftSessionJson).current_pack).toBeUndefined();
         expect(JSON.parse(publicSnapshot.draftSessionJson).packs_by_seat).toBeUndefined();
+        expect(JSON.parse(publicSnapshot.draftSessionJson).config.rng_seed).toBe(0);
         expect(JSON.parse(snapshot.draftSessionJson).booster_pack_pool).toEqual(["Nested cube"]);
         expect(JSON.parse(snapshot.draftSessionJson).shared_stack).toEqual(winstonSharedStack);
         expect(JSON.parse(snapshot.draftSessionJson).pools).toEqual(winstonPools);
         expect(JSON.parse(snapshot.draftSessionJson).current_pack).toEqual(winstonCurrentPack);
         expect(JSON.parse(snapshot.draftSessionJson).packs_by_seat).toEqual(winstonPacksBySeat);
+        expect(JSON.parse(snapshot.draftSessionJson).config.rng_seed).toBe(winstonRngSeed);
       } else if (snapshot.draftSessionJson && typeof snapshot.draftSessionJson === "object") {
         expect(publicSnapshot.draftSessionJson.booster_pack_pool).toBeUndefined();
         expect(publicSnapshot.draftSessionJson.shared_stack).toBeUndefined();
         expect(publicSnapshot.draftSessionJson.pools).toBeUndefined();
         expect(publicSnapshot.draftSessionJson.current_pack).toBeUndefined();
         expect(publicSnapshot.draftSessionJson.packs_by_seat).toBeUndefined();
+        expect(publicSnapshot.draftSessionJson.config.rng_seed).toBe(0);
         const retained = snapshot.draftSessionJson as {
           booster_pack_pool: string[];
           shared_stack: typeof winstonSharedStack;
           pools: string[][];
           current_pack: string[];
           packs_by_seat: string[][];
+          config: { rng_seed: number };
         };
         expect(retained.booster_pack_pool).toEqual(["Nested cube"]);
         expect(retained.shared_stack).toEqual(winstonSharedStack);
         expect(retained.pools).toEqual(winstonPools);
         expect(retained.current_pack).toEqual(winstonCurrentPack);
         expect(retained.packs_by_seat).toEqual(winstonPacksBySeat);
+        expect(retained.config.rng_seed).toBe(winstonRngSeed);
       } else {
         expect(publicSnapshot.draftSessionJson).toBeNull();
       }

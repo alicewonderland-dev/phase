@@ -98,12 +98,22 @@ const DRAFT_SESSION_JSON_KEY: &str = "draftSessionJson";
 ///     guest in the pod can, so echoing it hands an opponent the answer.
 ///   * `current_pack` — the booster a seat is looking at right now, which in a
 ///     pick-and-pass draft is the pick they are about to make.
+///   * `booster_pack_pool` — the cube/source card list the pods were built from.
+///     Folded in from a bespoke `session.remove` that sat beside this loop: it
+///     made the constant read as four keys to anyone comparing it against the
+///     client's mirror in `p2p-draft-host.ts`, which is exactly how
+///     `packs_by_seat` came to be missing there.
 ///
 /// This list is what makes the public copy NON-RESUMABLE, deliberately. The
 /// authoritative, resumable snapshot is the host's own IndexedDB copy; see the
 /// note on `validate_persisted_snapshot` in `draft-core`.
-const NESTED_DRAFT_SECRET_KEYS: &[&str] =
-    &["packs_by_seat", "shared_stack", "pools", "current_pack"];
+const NESTED_DRAFT_SECRET_KEYS: &[&str] = &[
+    "packs_by_seat",
+    "shared_stack",
+    "pools",
+    "current_pack",
+    "booster_pack_pool",
+];
 
 /// Remove session credentials from a host backup snapshot JSON blob.
 ///
@@ -173,7 +183,6 @@ fn redact_draft_session_object(session: &mut Map<String, Value>) {
     for key in NESTED_DRAFT_SECRET_KEYS {
         session.remove(*key);
     }
-    session.remove("booster_pack_pool");
     if let Some(Value::Object(config)) = session.get_mut("config") {
         config.insert("rng_seed".to_string(), Value::Number(0.into()));
         redact_chaos_assignments(config);

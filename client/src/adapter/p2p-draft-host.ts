@@ -165,7 +165,16 @@ function redactDraftSessionObject(session: Record<string, unknown>): void {
   // knowing every card still to come. Listed last but redacted on the same
   // terms: the mirror above is only true if it is complete.
   delete session.packs_by_seat;
-  if (isJsonRecord(session.config)) redactChaosAssignmentsFromSource(session.config.source);
+  if (isJsonRecord(session.config)) {
+    // THE SEED IS THE DRAW ORDER. `main_stack`'s order "is the `rng_seed`'s
+    // secret" (`draft_core::types`), so shipping the seed while stripping the
+    // stack hands back exactly what stripping the stack protected: every pile,
+    // predictable. Zeroed rather than deleted, to match the Rust guard's
+    // `config.insert("rng_seed", 0)` — the public copy stays shaped like a
+    // config and stays deliberately non-resumable.
+    session.config.rng_seed = 0;
+    redactChaosAssignmentsFromSource(session.config.source);
+  }
 }
 
 function redactChaosAssignmentsFromSource(source: unknown): boolean {
