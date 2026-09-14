@@ -2583,25 +2583,7 @@ pub(crate) fn resume_interrupted_cost_payment(
     finish_pending_cost_or_cast(state, player, pending, events)
 }
 
-fn replace_first_one_of_cost(cost: &mut AbilityCost, chosen: AbilityCost) -> bool {
-    match cost {
-        AbilityCost::OneOf { .. } => {
-            *cost = chosen;
-            true
-        }
-        AbilityCost::Composite { costs } => {
-            for cost in costs {
-                if replace_first_one_of_cost(cost, chosen.clone()) {
-                    return true;
-                }
-            }
-            false
-        }
-        _ => false,
-    }
-}
-
-/// CR 118.12a + CR 602.2b: Complete disjunctive activation-cost branch selection.
+/// CR 601.2h + CR 602.2b: Complete disjunctive activation-cost branch selection.
 pub(crate) fn handle_activation_cost_one_of_choice(
     state: &mut GameState,
     player: PlayerId,
@@ -2618,27 +2600,22 @@ pub(crate) fn handle_activation_cost_one_of_choice(
     }
 
     let chosen_cost = &costs[index];
-    if !super::casting::can_pay_ability_cost_now(
-        state,
-        player,
-        pending.object_id,
-        chosen_cost,
-        pending.activation_ability_index,
-    ) {
+    if !super::casting::activation_one_of_branch_payable(state, player, &pending, chosen_cost) {
         return Err(EngineError::ActionNotAllowed(
             "Chosen cost branch is not payable".to_string(),
         ));
     }
 
-    let replaced = pending
+    let Some(resolved) = pending
         .activation_cost
-        .as_mut()
-        .is_some_and(|cost| replace_first_one_of_cost(cost, chosen_cost.clone()));
-    if !replaced {
+        .as_ref()
+        .and_then(|cost| cost.resolve_first_one_of(chosen_cost))
+    else {
         return Err(EngineError::InvalidAction(
             "Pending activation cost no longer has a OneOf branch".to_string(),
         ));
-    }
+    };
+    pending.activation_cost = Some(resolved);
 
     if let Some(waiting_for) =
         surface_next_unpaid_interactive_activation_cost(state, player, &mut pending, events)?
@@ -5372,6 +5349,7 @@ pub(crate) fn surface_next_unpaid_interactive_activation_cost(
             state,
             player,
             source_id,
+            cost,
             costs,
             pending
                 .activation_ability_index
@@ -22990,6 +22968,14 @@ its replicate cost was paid.)\nDraw a card.";
         builder.from_oracle_text_with_keywords(&["replicate:{1}"], REPLICATE_DRAW_ORACLE);
         let spell_id = builder.id();
         let card_id = scenario.state.objects[&spell_id].card_id;
+        // CR 104.3c: stock the library so the copies' draws cannot deck the
+        // caster out mid-drain. A game that ends partway through resolution
+        // truncates `drain_counting_spell_copies`, which would hide an
+        // over-copying regression behind a correct-looking tally.
+        scenario.with_library_top(
+            PlayerId(0),
+            &["Filler A", "Filler B", "Filler C", "Filler D"],
+        );
         let runner = scenario.build();
         (runner, spell_id, card_id)
     }
@@ -23025,6 +23011,12 @@ its replicate cost was paid.)\nDraw a card.";
         builder.from_oracle_text("Draw a card.");
         let spell_id = builder.id();
         let card_id = scenario.state.objects[&spell_id].card_id;
+        // CR 104.3c: see `replicate_draw_scenario` — the library keeps the game
+        // alive through the whole drain so the copy tally cannot be truncated.
+        scenario.with_library_top(
+            PlayerId(0),
+            &["Filler A", "Filler B", "Filler C", "Filler D"],
+        );
         let runner = scenario.build();
         (runner, spell_id, card_id)
     }
@@ -23032,27 +23024,29 @@ its replicate cost was paid.)\nDraw a card.";
     /// Count `SpellCopied` events emitted while resolving the stack to empty.
     /// Each `Effect::CopySpell` iteration emits exactly one (CR 707.10), so the
     /// total equals the number of replicate copies created.
+    ///
+    /// Strict by design. Swallowing an `Err` (or leaving the stack unresolved)
+    /// stops the tally early, and an early stop reads as a LOWER copy count —
+    /// which is exactly the direction an over-copying regression needs in order
+    /// to look correct. Both replicate scenarios stock a library so the copied
+    /// draws cannot end the game mid-drain and reach these guards.
     fn drain_counting_spell_copies(runner: &mut crate::game::scenario::GameRunner) -> usize {
         use crate::types::actions::GameAction;
         let mut copies = 0usize;
         for _ in 0..40 {
             if runner.state().stack.is_empty() {
-                break;
+                return copies;
             }
-            match runner.act(GameAction::PassPriority) {
-                Ok(result) => {
-                    copies += result
-                        .events
-                        .iter()
-                        .filter(|e| {
-                            matches!(e, crate::types::events::GameEvent::SpellCopied { .. })
-                        })
-                        .count();
-                }
-                Err(_) => break,
-            }
+            let result = runner
+                .act(GameAction::PassPriority)
+                .expect("resolving the replicate stack must not error mid-drain");
+            copies += result
+                .events
+                .iter()
+                .filter(|e| matches!(e, crate::types::events::GameEvent::SpellCopied { .. }))
+                .count();
         }
-        copies
+        panic!("replicate stack never resolved to empty; the copy tally is not trustworthy");
     }
 
     /// CR 702.56a: Replicate paid twice copies the spell twice — two extra

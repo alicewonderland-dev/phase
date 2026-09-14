@@ -6160,6 +6160,31 @@ fn replacement_valid_card_matches(
     {
         return matches_target_filter_on_battlefield_entry(state, event, filter, ctx);
     }
+    // CR 109.2 + CR 110.1: a counter replacement whose `valid_card` describes
+    // the object by a card type or subtype without naming a zone — "a creature
+    // you control" (Hardened Scales, CR 109.2) — or as "a permanent" (Doubling
+    // Season, CR 110.1) means a permanent on the battlefield. Counters an effect puts
+    // on a card in another zone — the time counters of a suspended card
+    // (Delay, Jhoira of the Ghitu), Darigaaz Reincarnated's egg counters — are
+    // not counters on a permanent, so the replacement does not apply. The type
+    // reading alone cannot tell (`TypeFilter::Permanent` reads the card's types
+    // so that "a permanent spell" matches on the stack); the zone is read here,
+    // on the event's object. MEASURED before this gate: Delay under an opposing
+    // Doubling Season exiled the countered card with six time counters (issue
+    // #8795). A `valid_card` that names a zone (`population_zones`, the union
+    // of both zone readers, so a stack reference counts as one), or names no
+    // type (`SelfRef`, a "card" filter), is not touched; a placement on a
+    // player has no object and fails the filter as before.
+    if repl_def.event == ReplacementEvent::AddCounter
+        && filter.population_zones().is_empty()
+        && super::filter::filter_implies_battlefield_permanent(filter)
+        && !event
+            .affected_object_id()
+            .and_then(|oid| state.objects.get(&oid))
+            .is_some_and(|obj| obj.zone == Zone::Battlefield)
+    {
+        return false;
+    }
     event
         .affected_object_id()
         .map(|oid| matches_target_filter(state, oid, filter, ctx))
@@ -7348,6 +7373,26 @@ fn object_replacement_candidate_applies(
         return false;
     }
     if let ProposedEvent::AddCounter { placement, .. } = event {
+        // CR 109.2 + CR 110.1 (issue #8795): a counter replacement that carries
+        // no `valid_card` describes its object as a permanent — "on a permanent
+        // or player" (Vorinclex, Halving Season, Innkeeper's Talent), "a
+        // permanent you control" (Doc Samson), "a permanent your team controls"
+        // (Pir), "on ~" (Mowu); MEASURED over `card-data.json`, every corpus
+        // `AddCounter` replacement without a `valid_card` that names an object
+        // reads so (Solemnity's "Players can't get counters" names none). Like the
+        // typed-`valid_card` gate in `replacement_valid_card_matches`, it does
+        // not reach a card outside the battlefield: Delay's three time counters
+        // under the countered spell's controller's Vorinclex stay three, not
+        // six (or one under the counter's controller's). A placement on a
+        // player has no object and is untouched.
+        if repl_def.valid_card.is_none()
+            && placement
+                .object_id()
+                .and_then(|id| state.objects.get(&id))
+                .is_some_and(|affected| affected.zone != Zone::Battlefield)
+        {
+            return false;
+        }
         // CR 614.1a: `valid_player` is a *relative* scope; the subject axis selects
         // whom it is relative to. Actor-scoped replacements (Vorinclex/Halving
         // Season — "If you/an opponent would put …") compare against

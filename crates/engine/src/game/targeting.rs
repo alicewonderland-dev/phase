@@ -1015,6 +1015,77 @@ pub fn resolved_targets(
     ability.targets.clone()
 }
 
+/// CR 608.2c + CR 601.2c + CR 115.6: the referent(s) the parent's resolution chain SELECTED,
+/// for an ability that can no longer rely on `resolve_ability_chain`'s parent-target
+/// propagation (`ability_utils::build_resolved_from_def_with_targets` gives only the ROOT its
+/// targets; sub-abilities start empty on purpose).
+///
+/// Tiers, in order:
+///   1. `context.forwarded_result_context` — a forward-result producer is the most recent
+///      antecedent. `Some([])` there is a real zero-result and must not fall through.
+///   2. `parent_chain_targets_from_root` — the flattened resolving-root chain, so a
+///      `ParentTargetSlot { index }` anaphor can index an earlier declared slot. NOTE the
+///      breadth this implies: the flatten is CHAIN-WIDE, concatenating every node's `targets`,
+///      because slot indexing needs the whole declared sequence. A caller that binds the result
+///      wholesale therefore hands a bare `ParentTarget` rider every sink in the chain, not just
+///      the prevention's own. Measured zero carriers today — all five in-class prevention riders
+///      sit in chains with exactly one target sink — but a future prevention printed as one
+///      clause of a multi-sink chain would inherit the sibling clause's referent. That breadth
+///      is inherited from the delayed-trigger authority this was extracted from; narrowing it
+///      would change that seam too, so it is recorded here rather than special-cased.
+///   3. the node's OWN propagated `targets` (phase#4767: a runtime-injected referent that was
+///      never a declared slot — Animate Dead / Dance of the Dead).
+///   4. `chain_declares_chooseable_target_slots` — a slot WAS declared and zero targets were
+///      chosen (CR 115.6 / CR 603.3d, issue #5901): the referent is the empty set.
+///
+/// Returns `None` when the chain names NO referent at all. That is a distinct fact from
+/// tier 4's `Some(vec![])`, and the two callers answer it differently:
+///   * `effects::delayed_trigger::parent_target_snapshot` falls back to the creation event's
+///     `TriggeringSource` (CR 603.7c — "exile it at end of turn" on a slotless dies trigger).
+///   * `effects::bind_detached_continuation_to_parent` does NOT: a `ParentTarget` anaphor in a
+///     prevention rider names the parent's CHOSEN target, and if nothing was chosen the anaphor
+///     has no referent (CR 608.2b — "if part of the effect requires information about an
+///     illegal target, it fails to determine any such information"). Binding the creation
+///     event's source there would apply a different rule to a clause that does not invoke it.
+pub(crate) fn parent_chain_referents(
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> Option<Vec<TargetRef>> {
+    if let Some(context) = &ability.context.forwarded_result_context {
+        return Some(context.targets.clone());
+    }
+    let root_chain = parent_chain_targets_from_root(state, ability);
+    if !root_chain.is_empty() {
+        return Some(root_chain);
+    }
+    if !ability.targets.is_empty() {
+        return Some(ability.targets.clone());
+    }
+    if chain_declares_chooseable_target_slots(resolving_root_ability(state, ability)) {
+        return Some(Vec::new());
+    }
+    None
+}
+
+/// True when any link of the chain declares a target slot whose selection may
+/// legally be empty: a `multi_target` bound ("any number of target ...") or
+/// `optional_targeting` ("up to one target ..."). CR 115.6 permits zero
+/// targets; CR 603.3d governs the target choice for triggered abilities. Used
+/// by [`parent_chain_referents`] to distinguish "slots were declared but zero
+/// were chosen" (referent = empty set) from "no slots exist at all".
+fn chain_declares_chooseable_target_slots(ability: &ResolvedAbility) -> bool {
+    ability.multi_target.is_some()
+        || ability.optional_targeting
+        || ability
+            .sub_ability
+            .as_deref()
+            .is_some_and(chain_declares_chooseable_target_slots)
+        || ability
+            .else_ability
+            .as_deref()
+            .is_some_and(chain_declares_chooseable_target_slots)
+}
+
 /// CR 608.2c: The full flattened target chain from the resolving root stack
 /// entry, so a `ParentTargetSlot { index }` anaphor can index a specific earlier
 /// declared slot even after the current node's local `targets` were replaced by

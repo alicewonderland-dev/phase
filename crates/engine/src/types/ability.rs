@@ -12627,6 +12627,29 @@ impl AbilityCost {
         }
     }
 
+    /// CR 601.2h + CR 602.2b: a disjunctive cost leg is resolved to the chosen
+    /// instruction and the total cost is then paid as a whole.
+    ///
+    /// Returns this cost with its first unresolved `OneOf` (depth-first through
+    /// `Composite`) replaced by `branch`, or `None` when no `OneOf` exists. A
+    /// top-level `OneOf` resolves to exactly `branch`. Pure AST rewrite: the
+    /// payability of the result is the caller's business.
+    pub fn resolve_first_one_of(&self, branch: &AbilityCost) -> Option<AbilityCost> {
+        match self {
+            AbilityCost::OneOf { .. } => Some(branch.clone()),
+            AbilityCost::Composite { costs } => {
+                costs.iter().enumerate().find_map(|(index, child)| {
+                    child.resolve_first_one_of(branch).map(|resolved| {
+                        let mut costs = costs.clone();
+                        costs[index] = resolved;
+                        AbilityCost::Composite { costs }
+                    })
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// CR 605.1a (2026 amendment): does paying this cost move a card to or from
     /// a **library**?
     ///
@@ -36289,6 +36312,75 @@ mod tests {
                 "second same-id zone change must reject post-SBA SelfRef return"
             );
         }
+    }
+
+    fn generic_mana_cost(amount: u32) -> AbilityCost {
+        AbilityCost::Mana {
+            cost: crate::types::mana::ManaCost::generic(amount),
+        }
+    }
+
+    fn pay_life_cost(amount: i32) -> AbilityCost {
+        AbilityCost::PayLife {
+            amount: QuantityExpr::Fixed { value: amount },
+        }
+    }
+
+    /// CR 601.2h + CR 602.2b: a cost with no disjunctive leg has nothing to
+    /// resolve.
+    #[test]
+    fn resolve_first_one_of_returns_none_without_one_of() {
+        let branch = pay_life_cost(2);
+        assert_eq!(generic_mana_cost(2).resolve_first_one_of(&branch), None);
+        let composite = AbilityCost::Composite {
+            costs: vec![generic_mana_cost(2), AbilityCost::Tap],
+        };
+        assert_eq!(composite.resolve_first_one_of(&branch), None);
+    }
+
+    /// CR 601.2h + CR 602.2b: a top-level disjunction resolves to exactly the
+    /// chosen branch.
+    #[test]
+    fn resolve_first_one_of_top_level_yields_the_branch() {
+        let branch = pay_life_cost(2);
+        let one_of = AbilityCost::OneOf {
+            costs: vec![generic_mana_cost(1), branch.clone()],
+        };
+        assert_eq!(one_of.resolve_first_one_of(&branch), Some(branch));
+    }
+
+    /// CR 601.2h + CR 602.2b: only the first disjunction inside a composite is
+    /// substituted; sibling legs and a later disjunction stay intact.
+    #[test]
+    fn resolve_first_one_of_substitutes_only_first_nested_one_of() {
+        let first_one_of = AbilityCost::OneOf {
+            costs: vec![generic_mana_cost(1), pay_life_cost(2)],
+        };
+        let second_one_of = AbilityCost::OneOf {
+            costs: vec![generic_mana_cost(3), pay_life_cost(4)],
+        };
+        let composite = AbilityCost::Composite {
+            costs: vec![
+                generic_mana_cost(2),
+                AbilityCost::Composite {
+                    costs: vec![AbilityCost::Tap, first_one_of],
+                },
+                second_one_of.clone(),
+            ],
+        };
+        let branch = pay_life_cost(2);
+        assert_eq!(
+            composite.resolve_first_one_of(&branch),
+            Some(AbilityCost::Composite {
+                costs: vec![
+                    generic_mana_cost(2),
+                    AbilityCost::Composite {
+                        costs: vec![AbilityCost::Tap, branch.clone()],
+                    },
+                    second_one_of,
+                ],
+            })
+        );
     }
 }
 

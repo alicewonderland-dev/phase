@@ -168,7 +168,7 @@ pub(crate) fn is_data_carrying_static(mode: &StaticMode) -> bool {
             // CR 509.1b: BlockRestriction carries the allowed-attacker filter.
             | StaticMode::BlockRestriction { .. }
             // CR 301.5 + CR 303.4 + CR 701.3a: AttachmentRestriction carries the
-            // `TargetFilter` of legal hosts (Strata Scythe, Konda's Banner).
+            // `TargetFilter` of legal hosts (O-Naginata, Konda's Banner).
             // Enforced via active static definitions in effects/attach.rs::attachment_illegality.
             | StaticMode::AttachmentRestriction { .. }
             // CR 602.5 + CR 603.2a: CantBeActivated carries `who` + `source_filter`.

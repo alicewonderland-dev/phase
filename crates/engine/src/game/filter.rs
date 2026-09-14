@@ -1064,6 +1064,35 @@ pub fn normalize_contextual_filter(
     filter: &TargetFilter,
     parent_targets: &[TargetRef],
 ) -> TargetFilter {
+    normalize_contextual_filter_with_liveness(filter, parent_targets, &|_| true)
+}
+
+/// CR 400.7 + CR 603.7c: [`normalize_contextual_filter`] with a liveness test for
+/// the referents it concretizes.
+///
+/// A delayed trigger snapshots its referent and pins the incarnation. The
+/// exclusion it builds ("destroy each creature OTHER than that one") names that
+/// object, so the exclusion's LIFETIME is the referent's: once that permanent
+/// leaves and returns it is a new object, the old exclusion no longer names it,
+/// and it must be affected like any other. Without this the exclusion is
+/// concretized to `SpecificObject`, which compares object id alone and keeps
+/// sparing the returned permanent.
+///
+/// `referent_is_live` is applied AFTER the positional lookup, never before.
+/// `ParentTargetSlot { index }` indexes `parent_targets` by DECLARED position, so
+/// pre-filtering the slice would renumber the slots and silently select a
+/// different referent (see `ResolvedAbility::live_object_targets`, whose doc
+/// carries the same warning for the same reason).
+///
+/// When every named referent is stale the exclusion list is empty and the
+/// existing `[] => Any` arm makes the filter match everything again — which is
+/// exactly "nothing is excluded any more". It must NOT suppress the whole
+/// effect: the other objects are still affected.
+pub fn normalize_contextual_filter_with_liveness(
+    filter: &TargetFilter,
+    parent_targets: &[TargetRef],
+    referent_is_live: &dyn Fn(ObjectId) -> bool,
+) -> TargetFilter {
     match filter {
         TargetFilter::Not { filter: inner }
             if matches!(
@@ -1091,6 +1120,12 @@ pub fn normalize_contextual_filter(
                     })
                     .collect(),
             };
+            // CR 400.7: drop referents that became new objects — AFTER the
+            // positional lookup above, so slot indexes are never renumbered.
+            let object_ids: Vec<ObjectId> = object_ids
+                .into_iter()
+                .filter(|id| referent_is_live(*id))
+                .collect();
             match object_ids.as_slice() {
                 [] => TargetFilter::Any,
                 [id] => TargetFilter::Not {
@@ -1107,18 +1142,34 @@ pub fn normalize_contextual_filter(
             }
         }
         TargetFilter::Not { filter: inner } => TargetFilter::Not {
-            filter: Box::new(normalize_contextual_filter(inner, parent_targets)),
+            filter: Box::new(normalize_contextual_filter_with_liveness(
+                inner,
+                parent_targets,
+                referent_is_live,
+            )),
         },
         TargetFilter::Or { filters } => TargetFilter::Or {
             filters: filters
                 .iter()
-                .map(|inner| normalize_contextual_filter(inner, parent_targets))
+                .map(|inner| {
+                    normalize_contextual_filter_with_liveness(
+                        inner,
+                        parent_targets,
+                        referent_is_live,
+                    )
+                })
                 .collect(),
         },
         TargetFilter::And { filters } => TargetFilter::And {
             filters: filters
                 .iter()
-                .map(|inner| normalize_contextual_filter(inner, parent_targets))
+                .map(|inner| {
+                    normalize_contextual_filter_with_liveness(
+                        inner,
+                        parent_targets,
+                        referent_is_live,
+                    )
+                })
                 .collect(),
         },
         _ => filter.clone(),
@@ -1862,6 +1913,73 @@ pub(crate) fn filter_contains_last_zone_changed(filter: &TargetFilter) -> bool {
 /// resolution-local anaphors stay discoverable as one pair.
 pub(crate) fn filter_contains_last_created(filter: &TargetFilter) -> bool {
     filter_contains(filter, &|inner| matches!(inner, TargetFilter::LastCreated))
+}
+
+/// CR 109.2 + CR 110.1: does `filter` describe its object by a card type or
+/// subtype the way "a creature you control" or "a permanent" does — a
+/// description that, absent a named zone or the word "card"/"spell", "means a
+/// permanent of that card type or subtype on the battlefield"? True for a
+/// `Typed` predicate naming a permanent card type (Creature, Artifact,
+/// Enchantment, Planeswalker, Land, Battle, Kindred, Permanent) or a subtype;
+/// false for plain "card" (`TypeFilter::Card`), "spell", `Any`, a negated
+/// type ("nonland" describes any other card), and every non-`Typed`
+/// reference. A disjunction (`TypeFilter::AnyOf`, `TargetFilter::Or`) is
+/// battlefield-only when every branch is — "creature or instant" is not; the
+/// terms of one `Typed` filter and the legs of an `And` are conjunctive, so
+/// one battlefield-only term settles those. Zone is NOT read here — the caller pairs this with
+/// its own zone reading (`population_zones`, or an explicit `zone` field),
+/// because the two callers substitute different defaults when no zone is
+/// written.
+///
+/// Neighbour, not the same question: `typed_reference_names_zone` /
+/// `reference_leg_admits` below apply CR 109.2 to a SharesQuality reference
+/// leg and count every type word; this predicate names the permanent types
+/// only, because its first caller substitutes "hand" for a "card" filter.
+///
+/// Callers: `cost_payability::exile_cost_effective_zone` (Food Chain's "Exile
+/// a creature you control: …" — `zone: None` means the battlefield, a "card"
+/// filter keeps the hand default) and `replacement::replacement_valid_card_matches`
+/// (a counter replacement's "a permanent you control" does not reach a card in
+/// exile). `Kindred` and subtype descriptions were added for the second
+/// caller; MEASURED over `card-data.json`, the first caller's answers are
+/// unchanged: no zone-less exile cost names `Kindred`, and the one naming a
+/// subtype (Mechtitan Core, `Or[Typed[Artifact, Creature], Typed[Vehicle]]`)
+/// answers battlefield through both branches — the artifact-creature leg as
+/// before, the Vehicle leg through the subtype reading, which the universal
+/// `Or` aggregation now requires.
+pub(crate) fn filter_implies_battlefield_permanent(filter: &TargetFilter) -> bool {
+    fn type_implies_battlefield(t: &TypeFilter) -> bool {
+        match t {
+            TypeFilter::Creature
+            | TypeFilter::Artifact
+            | TypeFilter::Enchantment
+            | TypeFilter::Planeswalker
+            | TypeFilter::Land
+            | TypeFilter::Battle
+            | TypeFilter::Kindred
+            | TypeFilter::Permanent
+            | TypeFilter::Subtype(_) => true,
+            // "nonland", "noncreature": a negated type describes nothing that
+            // must be on the battlefield — a nonland card is any other card.
+            TypeFilter::Non(_) => false,
+            // A union is battlefield-only when EVERY branch is: "artifact or
+            // creature" is, "creature or instant" is not.
+            TypeFilter::AnyOf(inners) => {
+                !inners.is_empty() && inners.iter().all(type_implies_battlefield)
+            }
+            TypeFilter::Instant | TypeFilter::Sorcery | TypeFilter::Card | TypeFilter::Any => false,
+        }
+    }
+    match filter {
+        // The terms of one `Typed` filter are conjunctive ("artifact creature"),
+        // so one battlefield-only term settles it.
+        TargetFilter::Typed(tf) => tf.type_filters.iter().any(type_implies_battlefield),
+        TargetFilter::And { filters } => filters.iter().any(filter_implies_battlefield_permanent),
+        TargetFilter::Or { filters } => {
+            !filters.is_empty() && filters.iter().all(filter_implies_battlefield_permanent)
+        }
+        _ => false,
+    }
 }
 
 /// Check if an object matches a typed TargetFilter against the given context.
