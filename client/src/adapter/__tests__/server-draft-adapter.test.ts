@@ -841,6 +841,39 @@ describe("ServerDraftAdapter", () => {
     await expect(second).resolves.toMatchObject({ pick_number: 2 });
   });
 
+  /**
+   * THE RELEASE PATH, ON THE ROUTE THAT REJECTS.
+   *
+   * This is the leg whose failure is WORSE than the bug the guard fixes. The
+   * gate reads "in flight" off the callback pair itself, so a settle site that
+   * rejects without nulling BOTH callbacks leaves the slot claimed forever and
+   * every later action for the rest of the session is refused with "Another
+   * draft action is still in flight" -- a permanent wedge, where the unguarded
+   * behaviour merely stranded one promise.
+   *
+   * `DraftActionRejected` is the live rejection route (a refused pick, a refused
+   * shared-stack decision), so it is the one that has to release.
+   */
+  it("releases the action slot when the server rejects the action", async () => {
+    const rejected = adapter.submitPick("card-refused");
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({ type: "DraftActionRejected", data: { reason: "PileNotActive" } }),
+    );
+    await expect(rejected).rejects.toThrow("PileNotActive");
+
+    // THE CLAIM: the next action is accepted, not refused as "still in flight".
+    const next = adapter.submitPick("card-after-refusal");
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({
+        type: "DraftStateUpdate",
+        data: { view: createMockDraftView({ pick_number: 9 }) },
+      }),
+    );
+    await expect(next).resolves.toMatchObject({ pick_number: 9 });
+  });
+
   it("DraftStateUpdate resolves pending pick promise", async () => {
     const pickPromise = adapter.submitPick("card-002");
 

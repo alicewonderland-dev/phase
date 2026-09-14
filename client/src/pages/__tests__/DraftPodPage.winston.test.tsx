@@ -16,6 +16,13 @@ vi.mock("../../hooks/useCardImage", () => ({
   useCardBackImage: () => ({ src: null, advanceFailedSource: undefined }),
 }));
 
+/** Captures what the workspace is handed, so the page's own handler can be
+ *  invoked directly -- outside `act`, which is what makes the timing visible. */
+const workspaceProps = vi.hoisted(() => ({
+  onPreferencesChange: null as null | ((next: unknown) => void),
+}));
+const arrivingPreferences = vi.hoisted(() => vi.fn());
+
 const store = vi.hoisted(() => {
   const sharedStack: SharedStackView = {
     main_stack_remaining: 11,
@@ -141,6 +148,7 @@ vi.mock("../../stores/multiplayerDraftStore", async (importOriginal) => {
   return {
     ...actual,
     useMultiplayerDraftStore: hook,
+    setArrivingCardBoardPreferences: arrivingPreferences,
     draftPodScreen: (state: typeof store.state) => state.phase,
     intergamePromptKey: () => null,
   };
@@ -175,7 +183,10 @@ vi.mock("../../components/draft/PackDisplay", () => ({
   PackDisplay: () => <div data-testid="pack-display" />,
 }));
 vi.mock("../../components/draft/workspace/DraftWorkspace", () => ({
-  DraftWorkspace: () => <div data-testid="workspace" />,
+  DraftWorkspace: (props: { onPreferencesChange: (next: unknown) => void }) => {
+    workspaceProps.onPreferencesChange = props.onPreferencesChange;
+    return <div data-testid="workspace" />;
+  },
 }));
 vi.mock("../../components/card/HoverCardPreview", () => ({ HoverCardPreview: () => null }));
 
@@ -278,5 +289,41 @@ describe("DraftPodPage drafting-phase surface dispatch", () => {
     expect(decline).toBeDisabled();
     fireEvent.click(decline!);
     expect(store.state.submitSharedStackDecision).not.toHaveBeenCalled();
+  });
+
+  /**
+   * THE BOARD COLUMNS ARE PUBLISHED BY THE HANDLER, NOT BY AN EFFECT.
+   *
+   * Cards reach the pool on paths that resolve no placement of their own -- a
+   * shared-stack take collects a whole pile, a timed-out seat's decision is
+   * applied by the host and broadcast -- so the store has to know which columns
+   * this board currently means. An effect runs after React commits, and a
+   * `viewUpdated` landing in that window placed the arrivals against the
+   * PREVIOUS columns.
+   *
+   * The timing is observable precisely because the handler is invoked OUTSIDE
+   * `act`: a state update schedules an effect but does not flush one, so a
+   * publish that lives in an effect has provably not happened yet at the
+   * assertion below, while a publish that lives in the handler has. Restore
+   * `useEffect(..., [workspacePreferences.deck])` and this reds with zero calls.
+   */
+  it("publishes board columns during the preference change, not after a commit", () => {
+    renderDrafting();
+    expect(workspaceProps.onPreferencesChange).not.toBeNull();
+    // The mount publish already happened; this test is about the CHANGE.
+    arrivingPreferences.mockClear();
+
+    const next = {
+      deck: { sort: "color", columnCount: 7, rows: "one", showHeaders: true },
+      pool: { sort: "color", columnCount: 7, rows: "one", showHeaders: true },
+      packScale: 1,
+      pileScale: 1.35,
+    };
+    // Deliberately NOT wrapped in `act`: no effect flush between this call and
+    // the assertion.
+    workspaceProps.onPreferencesChange!(next);
+
+    expect(arrivingPreferences).toHaveBeenCalledTimes(1);
+    expect(arrivingPreferences).toHaveBeenCalledWith(next.deck);
   });
 });

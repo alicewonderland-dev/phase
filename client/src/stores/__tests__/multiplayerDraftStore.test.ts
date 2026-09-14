@@ -1440,15 +1440,12 @@ describe("multiplayerDraftStore", () => {
      * arrivals against the PREVIOUS columns -- cards sorted into the board the
      * player had a moment ago.
      *
-     * WHAT THIS PINS, HONESTLY: the publish-then-arrive sequence, with no
-     * re-render in between. It does NOT pin the React timing itself. Through
-     * Testing Library the two are indistinguishable -- `act()` flushes effects
-     * synchronously after the event, so "published during the handler" and
-     * "published by the effect" produce identical observable output, and a test
-     * claiming to catch the race would be claiming more than it can see. The
-     * timing is pinned by the page's structure instead: `DraftPodPage` has no
-     * effect keyed on `workspacePreferences.deck` any more, and its mount effect
-     * reads storage directly.
+     * WHAT THIS PINS: the publish-then-arrive sequence, with no re-render in
+     * between -- the store half. The PAGE half, that the publish happens inside
+     * the handler rather than from an effect, is pinned separately by
+     * `DraftPodPage.winston.test.tsx`, which invokes the captured
+     * `onPreferencesChange` outside `act` so an effect provably has not flushed
+     * at its assertion. The two together cover the race; neither does alone.
      */
     it("places an arrival against the columns published just before it", async () => {
       await hostWinstonPod();

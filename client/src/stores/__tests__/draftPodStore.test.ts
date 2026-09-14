@@ -218,6 +218,48 @@ describe("draftPodStore", () => {
       expect(useDraftPodStore.getState().setDraftMode).toBe("uniform");
     });
 
+    /**
+     * THE PUBLISHED LIST DECIDES, NOT THE DISTRIBUTION.
+     *
+     * Every other row here supplies a procedure whose `distribution` and
+     * `allowed_set_layouts` AGREE, because the fixture derives one from the
+     * other. That makes them all blind to the change this pair exists for:
+     * restore `setDraftModeFor(prev.packDistribution, ...)` and they stay green,
+     * because the two inputs give the same answer on every consistent fixture.
+     *
+     * So these two SKEW them on purpose. Neither procedure is one the engine
+     * would publish -- that is the point: they isolate which input the store
+     * actually reads. Both legs red if the store goes back to asking the
+     * distribution.
+     */
+    it("keeps chaos when the published list allows it, whatever the distribution says", async () => {
+      useDraftPodStore.getState().setSetDraftMode("chaos");
+      mocks.draftProcedure.mockResolvedValue({
+        ...procedure(2),
+        allowed_pod_sizes: [2, 3, 4],
+        distribution: { SharedStackPiles: { pile_count: 3 } },
+        allowed_set_layouts: ["UniformByRound", "Chaos"],
+      });
+
+      await useDraftPodStore.getState().enterKind("Winston");
+
+      expect(useDraftPodStore.getState().setDraftMode).toBe("chaos");
+    });
+
+    it("drops chaos when the published list omits it, whatever the distribution says", async () => {
+      useDraftPodStore.getState().setSetDraftMode("chaos");
+      mocks.draftProcedure.mockResolvedValue({
+        ...procedure(2),
+        allowed_pod_sizes: [2, 3, 4],
+        distribution: "PickAndPass",
+        allowed_set_layouts: ["UniformByRound"],
+      });
+
+      await useDraftPodStore.getState().enterKind("Premier");
+
+      expect(useDraftPodStore.getState().setDraftMode).toBe("uniform");
+    });
+
     it("keeps a chaos selection for a kind that passes packs", async () => {
       // The paired positive for the row above, through the SAME entry point:
       // publication normalizes on the distribution, not on every entry.

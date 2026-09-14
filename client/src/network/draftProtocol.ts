@@ -1304,11 +1304,34 @@ function normalizeSharedStackDecisionView(raw: unknown, context: string): Shared
   };
 }
 
+/**
+ * A drafted card, checked for the two fields every consumer dereferences.
+ *
+ * Deliberately NOT a full field-by-field check of `DraftCardInstance`: `pool`
+ * and `current_pack` have never been validated here either, so a complete one
+ * belongs in a change that covers all four rather than half of them. What this
+ * does buy is that the two v30 card-bearing payloads cannot deliver entries the
+ * pile table and the forced-draw notice will read `undefined` off -- `key` and
+ * the rendered name both come from these.
+ */
+function normalizeDraftCardInstance(raw: unknown, context: string): unknown {
+  const card = requireObject(raw, context);
+  if (typeof card.instance_id !== "string" || card.instance_id.length === 0) {
+    throw new Error(`Invalid draft message: ${context}.instance_id must be a non-empty string`);
+  }
+  if (typeof card.name !== "string") {
+    throw new Error(`Invalid draft message: ${context}.name must be a string`);
+  }
+  return card;
+}
+
 function normalizeSharedStackPileView(raw: unknown, index: number): SharedStackPileView {
   const context = `shared_stack.piles[${index}]`;
   const pile = requireObject(raw, context);
   const total = requireCount(pile, "total", context);
-  const revealed = normalizeArrayField<SharedStackPileView["revealed"][number]>(pile, "revealed");
+  const revealed = normalizeArrayField<unknown>(pile, "revealed")
+    .map((card, i) => normalizeDraftCardInstance(card, `${context}.revealed[${i}]`)) as
+    SharedStackPileView["revealed"];
   // The engine publishes a PREFIX of the pile, so more revealed cards than the
   // pile is tall is a frame that contradicts itself. Not a legality check --
   // this compares the frame against itself, and nothing here re-derives which
@@ -1348,10 +1371,9 @@ function normalizeSharedStackView(raw: unknown): SharedStackView | null {
   if (!Array.isArray(stack.piles)) {
     throw new Error("Invalid draft message: shared_stack.piles must be an array");
   }
-  const forced = stack.forced_draw;
-  if (forced !== null && forced !== undefined) {
-    requireObject(forced, "shared_stack.forced_draw");
-  }
+  const forced = stack.forced_draw === null || stack.forced_draw === undefined
+    ? null
+    : normalizeDraftCardInstance(stack.forced_draw, "shared_stack.forced_draw");
   return {
     main_stack_remaining: requireCount(stack, "main_stack_remaining", "shared_stack"),
     total_cards: requireCount(stack, "total_cards", "shared_stack"),
@@ -1360,7 +1382,7 @@ function normalizeSharedStackView(raw: unknown): SharedStackView | null {
     piles: stack.piles.map(normalizeSharedStackPileView),
     decisions: requireCount(stack, "decisions", "shared_stack"),
     history: normalizeArrayField<unknown>(stack, "history").map(normalizeSharedStackDecisionRecord),
-    forced_draw: (forced ?? null) as SharedStackView["forced_draw"],
+    forced_draw: forced as SharedStackView["forced_draw"],
   };
 }
 

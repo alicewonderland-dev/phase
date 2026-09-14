@@ -700,10 +700,24 @@ describe("draftProtocol", () => {
           piles: [{
             index: 0,
             total: 1,
-            revealed: [{ instance_id: "a" }, { instance_id: "b" }],
+            // Well-formed CARDS, so the length check is what fires here rather
+            // than the card-shape check catching it first for another reason.
+            revealed: [
+              { instance_id: "a", name: "Ponder" },
+              { instance_id: "b", name: "Opt" },
+            ],
             legality: [],
           }],
         },
+      }],
+      ["a revealed card with no instance id", {
+        shared_stack: {
+          ...validSharedStack,
+          piles: [{ index: 0, total: 1, revealed: [{ name: "Ponder" }], legality: [] }],
+        },
+      }],
+      ["a forced draw that is not a card", {
+        shared_stack: { ...validSharedStack, forced_draw: "Ponder" },
       }],
       ["an unknown decision in the public history", {
         shared_stack: {

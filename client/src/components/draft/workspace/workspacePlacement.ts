@@ -1165,12 +1165,14 @@ function twoRowPlacementRow(
   card: DraftCardInstance,
   pool: readonly DraftCardInstance[],
   poolGroups: DraftPoolGroups,
+  preferences: DraftBoardPreferences,
 ): number {
   const engineKnowsCard = pool.some((entry) => entry.instance_id === card.instance_id);
   if (engineKnowsCard) {
-    return poolGroups.workspace_row_classification.creature_instance_ids.includes(card.instance_id)
-      ? 0
-      : 1;
+    // Through `resolveWorkspaceRow`, not a second copy of its body: it is the
+    // reader every other placement path already goes through, so a third row or
+    // a change to the classification reaches this path too.
+    return resolveWorkspaceRow(card.instance_id, { ...preferences, rows: "two" }, poolGroups);
   }
   return /\bcreature\b/i.test(card.type_line) ? 0 : 1;
 }
@@ -1183,7 +1185,9 @@ export function resolveWorkspacePickPlacement(
   workspace: DraftWorkspaceState,
   preferences: DraftBoardPreferences,
 ): { column: number; row?: number } {
-  const row = preferences.rows === "two" ? twoRowPlacementRow(card, pool, poolGroups) : undefined;
+  const row = preferences.rows === "two"
+    ? twoRowPlacementRow(card, pool, poolGroups, preferences)
+    : undefined;
   const column = resolveWorkspaceSortColumn(
     card,
     zone,
