@@ -294,6 +294,19 @@ function Pile({
   // the only number this component derives at all.
   const label = pile.index + 1;
 
+  // Same device as `PICK_STATUS_KEY` in the spectator dashboard, for the same
+  // reason: interpolating a refusal into a translation key builds that key out
+  // of a serialized engine value, and a refusal the engine grows later reaches
+  // the screen as its own key text instead of failing the build. MEASURED on the
+  // sibling case -- adding a variant to the pick-status union broke exhaustive
+  // `Record`s elsewhere and did NOT break the interpolated call. A total
+  // `Record` keyed on `SharedStackRefusal` makes it a compile error here.
+  const REFUSAL_KEY = {
+    PileNotActive: "winston.refusal.PileNotActive",
+    PileEmpty: "winston.refusal.PileEmpty",
+    NoGuaranteedCard: "winston.refusal.NoGuaranteedCard",
+  } as const satisfies Record<SharedStackRefusal, string>;
+
   const decisionButton = (decision: SharedStackPileDecision, tone: "emerald" | "neutral") => {
     const refusal = verdictFor(pile, decision);
     // Disabled unless the engine published "legal". An unpublished verdict is NOT
@@ -301,7 +314,7 @@ function Pile({
     const refused = refusal !== null;
     const reason = refusal === undefined
       ? t("winston.refusalUnpublished")
-      : refusal === null ? undefined : t(`winston.refusal.${refusal}`);
+      : refusal === null ? undefined : t(REFUSAL_KEY[refusal]);
     const disabled = refused || interactionLocked;
     return (
       <button
@@ -324,7 +337,7 @@ function Pile({
     if (refusal === null) return [];
     return [{
       decision,
-      text: refusal === undefined ? t("winston.refusalUnpublished") : t(`winston.refusal.${refusal}`),
+      text: refusal === undefined ? t("winston.refusalUnpublished") : t(REFUSAL_KEY[refusal]),
     }];
   });
 

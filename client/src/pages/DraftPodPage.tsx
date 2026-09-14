@@ -298,7 +298,7 @@ function PodSetup() {
               />
               {t("podSetup.kindPremier")}
             </label>
-            <label className="flex items-center gap-2 text-sm text-white/70">
+            <label className="flex min-h-11 items-center gap-2 py-2 text-sm text-white/70">
               <input
                 type="radio"
                 name="draftKind"
@@ -308,7 +308,7 @@ function PodSetup() {
               />
               {t("podSetup.kindTraditional")}
             </label>
-            <label className="flex items-center gap-2 text-sm text-white/70">
+            <label className="flex min-h-11 items-center gap-2 py-2 text-sm text-white/70">
               <input
                 type="radio"
                 name="draftKind"
@@ -318,7 +318,7 @@ function PodSetup() {
               />
               {t("podSetup.kindSealed")}
             </label>
-            <label className="flex items-center gap-2 text-sm text-white/70">
+            <label className="flex min-h-11 items-center gap-2 py-2 text-sm text-white/70">
               <input
                 type="radio"
                 name="draftKind"
@@ -328,7 +328,7 @@ function PodSetup() {
               />
               {t("podSetup.kindCommanderDraft")}
             </label>
-            <label className="flex items-center gap-2 text-sm text-white/70">
+            <label className="flex min-h-11 items-center gap-2 py-2 text-sm text-white/70">
               <input
                 type="radio"
                 name="draftKind"
