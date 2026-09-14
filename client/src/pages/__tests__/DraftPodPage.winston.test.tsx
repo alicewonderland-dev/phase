@@ -11,6 +11,9 @@ import { DraftPodPage } from "../DraftPodPage";
 
 vi.mock("../../hooks/useCardImage", () => ({
   useCardImage: () => ({ src: null, isLoading: false }),
+  // The pile table's face-down stacks resolve the shared public card back
+  // through the same hook.
+  useCardBackImage: () => ({ src: null, advanceFailedSource: undefined }),
 }));
 
 const store = vi.hoisted(() => {
@@ -43,6 +46,7 @@ const store = vi.hoisted(() => {
     // consumer reads the history yet. Its fidelity to the reducer is pinned
     // in `draft-core` (`history_records_sizes_and_decisions_and_never_cards`).
     history: [],
+    forced_draw: null,
   };
 
   const packCards = [
@@ -52,6 +56,7 @@ const store = vi.hoisted(() => {
     status: "Drafting",
     kind: "Winston",
     launch_capability: "None",
+    distribution: { SharedStackPiles: { pile_count: 3 } },
     commanders_required: 0,
     pool: [],
     // Null for EVERY seat under a shared stack: the engine hands out no packs,
@@ -66,8 +71,8 @@ const store = vi.hoisted(() => {
       workspace_row_classification: { creature_instance_ids: [], noncreature_instance_ids: [] },
     },
     seats: [
-      { seat_index: 0, display_name: "Alice", is_bot: false, connected: true, has_submitted_deck: false, pick_status: "Pending", active_pack_count: 0, face_up_draft_cards: [] },
-      { seat_index: 1, display_name: "Bob", is_bot: false, connected: true, has_submitted_deck: false, pick_status: "Waiting", active_pack_count: 0, face_up_draft_cards: [] },
+      { seat_index: 0, display_name: "Alice", is_bot: false, connected: true, has_submitted_deck: false, pick_status: "Pending", active_pack_count: 0, drafted_card_count: 0, face_up_draft_cards: [] },
+      { seat_index: 1, display_name: "Bob", is_bot: false, connected: true, has_submitted_deck: false, pick_status: "Waiting", active_pack_count: 0, drafted_card_count: 0, face_up_draft_cards: [] },
     ],
     current_pack_number: 0, pick_number: 0, pass_direction: "Left",
     cards_per_pack: 15, pack_count: 3, min_deck_size: 40, addable_cards: [],
@@ -217,9 +222,9 @@ describe("DraftPodPage drafting-phase surface dispatch", () => {
     expect(screen.getByText("Bob chooses who plays first in the games after the draft.")).toBeInTheDocument();
     // The pool workspace is NOT swapped out: a taken pile still fills a pool.
     expect(screen.getByTestId("workspace")).toBeInTheDocument();
-    // Pick-and-pass chrome is gated on the same discriminator.
+    // The pack bar is gated on the same discriminator; the pick CLOCK is not —
+    // see the dedicated row below for why.
     expect(screen.queryByTestId("draft-progress")).toBeNull();
-    expect(screen.queryByTestId("pick-timer")).toBeNull();
   });
 
   it("renders the pack display when the engine published no shared stack", () => {
@@ -235,6 +240,20 @@ describe("DraftPodPage drafting-phase surface dispatch", () => {
     expect(document.querySelector("[data-winston-pile-table]")).toBeNull();
     expect(screen.getByTestId("draft-progress")).toBeInTheDocument();
     expect(screen.getByTestId("pick-timer")).toBeInTheDocument();
+  });
+
+  it("shows the pick clock, because the host still auto-decides when it expires", () => {
+    // THE HOST RE-ARMS this clock on every applied shared-stack decision, and
+    // expiry runs `autoDecideSharedStackTurn` — it takes the pile for the
+    // active seat. A player who cannot see the clock loses a turn with no
+    // warning. `PickTimer` self-gates on Competitive + a live remaining time,
+    // so rendering it unconditionally shows it exactly when the sweep can fire.
+    renderDrafting();
+
+    expect(screen.getByTestId("pick-timer")).toBeInTheDocument();
+    // The pack bar stays gated: there is no pack number or pick step here, so
+    // it would render frozen. The two are NOT the same question.
+    expect(screen.queryByTestId("draft-progress")).toBeNull();
   });
 
   it("submits the engine's pile index through the store's decision action", () => {

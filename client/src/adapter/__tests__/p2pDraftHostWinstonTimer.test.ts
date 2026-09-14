@@ -80,8 +80,8 @@ describe("P2PDraftHost shared-stack pick timer", () => {
         },
       },
       seats: [
-        { seat_index: 0, display_name: "Host", is_bot: false, connected: true, has_submitted_deck: false, pick_status: "Waiting", active_pack_count: 0, face_up_draft_cards: [] },
-        { seat_index: 1, display_name: "Guest", is_bot: false, connected: true, has_submitted_deck: false, pick_status: "Pending", active_pack_count: 0, face_up_draft_cards: [] },
+        { seat_index: 0, display_name: "Host", is_bot: false, connected: true, has_submitted_deck: false, pick_status: "Waiting", active_pack_count: 0, drafted_card_count: 0, face_up_draft_cards: [] },
+        { seat_index: 1, display_name: "Guest", is_bot: false, connected: true, has_submitted_deck: false, pick_status: "Pending", active_pack_count: 0, drafted_card_count: 0, face_up_draft_cards: [] },
       ],
       current_pack_number: 0,
       pick_number: 0,
@@ -149,6 +149,48 @@ describe("P2PDraftHost shared-stack pick timer", () => {
    * `autoPickAllPending` and this reds with zero calls — the old sweep falls
    * through to the `current_pack` loop, which is null for every seat here.
    */
+  /**
+   * THE HOST'S OWN CLOCK.
+   *
+   * `draft-core` publishes `timer_remaining_ms: None` on every view, and the
+   * countdown reaches guests only over the `draft_timer_sync` broadcast — which
+   * the host, holding no guest session of its own, never receives. So without
+   * this event the one player who owns the clock is the one who cannot see it.
+   * Under a shared stack expiry TAKES THE PILE, and the host is half of a
+   * two-seat pod and all of one played against bots.
+   *
+   * REVERT-FAILING: delete the `timerTick` emit from `onPickTimerTick` and no
+   * tick is ever observed.
+   */
+  it("emits its own clock reading, which no broadcast could reach it", async () => {
+    const sharedStack: SharedStackView = {
+      main_stack_remaining: 11,
+      total_cards: 20,
+      active_seat: 0,
+      active_pile: 0,
+      piles: [
+        pile(0, null, null),
+        pile(1, "PileNotActive", "PileNotActive"),
+        pile(2, "PileNotActive", "PileNotActive"),
+      ],
+      decisions: 1,
+      history: [],
+      forced_draw: null,
+    };
+    const { host } = await startedWinstonHost(sharedStack);
+    const ticks: number[] = [];
+    host.onEvent((event) => {
+      if (event.type === "timerTick") ticks.push(event.remainingMs);
+    });
+
+    await vi.advanceTimersByTimeAsync(3_000);
+
+    // A live countdown, not a single reading: the host sees it move.
+    expect(ticks.length).toBeGreaterThanOrEqual(2);
+    expect(ticks[0]).toBeGreaterThan(0);
+    expect(ticks[ticks.length - 1]).toBeLessThan(ticks[0]);
+  });
+
   it("drives the active seat's forced decision when the clock expires", async () => {
     const sharedStack: SharedStackView = {
       main_stack_remaining: 11,
@@ -168,6 +210,7 @@ describe("P2PDraftHost shared-stack pick timer", () => {
       // consumer reads the history yet. Its fidelity to the reducer is pinned
       // in `draft-core` (`history_records_sizes_and_decisions_and_never_cards`).
       history: [],
+      forced_draw: null,
     };
     const { privateHost, submitSharedStackDecisionForSeat } =
       await startedWinstonHost(sharedStack);
@@ -206,6 +249,7 @@ describe("P2PDraftHost shared-stack pick timer", () => {
       // consumer reads the history yet. Its fidelity to the reducer is pinned
       // in `draft-core` (`history_records_sizes_and_decisions_and_never_cards`).
       history: [],
+      forced_draw: null,
     };
     const { privateHost, submitSharedStackDecisionForSeat } =
       await startedWinstonHost(sharedStack);
@@ -242,6 +286,7 @@ describe("P2PDraftHost shared-stack pick timer", () => {
       // consumer reads the history yet. Its fidelity to the reducer is pinned
       // in `draft-core` (`history_records_sizes_and_decisions_and_never_cards`).
       history: [],
+      forced_draw: null,
     };
     const { host, privateHost, submitSharedStackDecisionForSeat } =
       await startedWinstonHost(sharedStack);

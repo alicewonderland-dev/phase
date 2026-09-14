@@ -154,6 +154,16 @@ export interface SeatPublicView {
    * Required by P2P draft v24 and the full WebSocket protocol v49.
    */
   active_pack_count: number;
+  /**
+   * How many cards this seat has drafted so far — a count, never an identity.
+   * Public in every draft kind: a pick-and-pass seat's total is already implied
+   * by the pick number, and at a shared stack the players watch each other's
+   * drafted pile grow across the table.
+   *
+   * Distinct from `active_pack_count`, which answers "is this seat holding a
+   * pack right now" and is 0 under `SharedStackPiles` by construction.
+   */
+  drafted_card_count: number;
   face_up_draft_cards: DraftCardInstance[];
 }
 
@@ -266,11 +276,19 @@ export type PackDistribution =
  * A narrowing predicate rather than a `boolean`, so a caller that needs
  * `pile_count` gets it from the same test instead of re-destructuring the
  * union and re-deciding what counts as a shared stack.
+ *
+ * `null` — the setup surfaces' "the engine has not published a procedure yet"
+ * state — answers `false`, so a caller need not re-spell the question with its
+ * own null test. The explicit `!== null` is load-bearing rather than defensive:
+ * `typeof null === "object"` in JavaScript, so without it the `in` below throws
+ * on exactly that input.
  */
 export function isSharedStackDistribution(
-  distribution: PackDistribution,
+  distribution: PackDistribution | null,
 ): distribution is { SharedStackPiles: { pile_count: number } } {
-  return typeof distribution === "object" && "SharedStackPiles" in distribution;
+  return distribution !== null
+    && typeof distribution === "object"
+    && "SharedStackPiles" in distribution;
 }
 
 /** Engine-authorized game launch for a completed draft procedure. */
@@ -512,6 +530,17 @@ export interface SharedStackView {
    * carries NO CARD; see `SharedStackDecisionRecord`.
    */
   history: SharedStackDecisionRecord[];
+  /**
+   * The card THIS VIEWER's most recent forced draw gave them, held until they
+   * decide again; `null` for every other viewer and for a spectator.
+   *
+   * The only private field on this type. A final-pile decline takes the top of
+   * the main stack sight unseen and drops it into the declining seat's pool, so
+   * this is the engine telling that seat what it just got — the one card in the
+   * format a player receives without having looked at it. Do not render it for
+   * anyone but its owner; the engine already refuses to send it to anyone else.
+   */
+  forced_draw: DraftCardInstance | null;
 }
 
 // @sync-with: crates/draft-core/src/view.rs
@@ -583,6 +612,17 @@ export interface DraftPlayerView {
   source?: DraftSourceView;
   /** Engine-owned completed-pod launch capability; never infer this from kind. */
   launch_capability: DraftLaunchCapability;
+  /**
+   * How this procedure delivers boosters to seats. Published for the same
+   * reason `launch_capability` is: a procedure fact a display layer needs and
+   * must never infer from the kind label.
+   *
+   * NOT status-gated, unlike `shared_stack` — which is why a surface that
+   * outlives the drafting phase (a pod-status dialog, the standings) asks THIS
+   * rather than `shared_stack !== null`. Pair it with
+   * `isSharedStackDistribution`.
+   */
+  distribution: PackDistribution;
   /**
    * CR 903.3 / CR 903.13f: exact number of commanders this procedure requires.
    * This remains a count because valid Commander construction can designate

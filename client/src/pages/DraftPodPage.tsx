@@ -33,7 +33,7 @@ import { LimitedDeckBuilder } from "../components/draft/LimitedDeckBuilder";
 import { PackDisplay, type PackDisplayController } from "../components/draft/PackDisplay";
 import { PickTimer } from "../components/draft/PickTimer";
 import { draftKindForEntry, type DraftKind } from "../components/draft/draftKind";
-import { distinctJoined, type SharedStackPileDecision } from "../adapter/draft-adapter";
+import { distinctJoined, isSharedStackDistribution, type SharedStackPileDecision } from "../adapter/draft-adapter";
 import { PodIcon } from "../components/draft/PodIcon";
 import { PoolPanel } from "../components/draft/PoolPanel";
 import { ScoreBadge } from "../components/draft/ScoreBadge";
@@ -46,6 +46,7 @@ import {
   getResponsiveDraftLayout,
   loadDraftWorkspacePreferences,
   repairDraftWorkspacePackScale,
+  repairDraftWorkspacePileScale,
   saveDraftWorkspacePreferences,
   type DraftWorkspacePreferences,
   type ResponsiveDraftLayout,
@@ -70,6 +71,7 @@ import {
   DRAFT_OFFLINE_ERROR,
   intergamePromptKey,
   isMultiplayerDraftPodLive,
+  setArrivingCardBoardPreferences,
   useMultiplayerDraftStore,
   type DraftPodScreen,
   type GuestDraftResumeOutcome,
@@ -447,36 +449,47 @@ function PodSetup() {
 
         {poolMode === "set" || packDistribution === "AllAtOnce" ? (
           <>
-            <div className="flex flex-col gap-1">
-              <span className="text-sm font-medium text-white/60">{t("podSetup.setDraftMode")}</span>
-              <div className="flex gap-4">
-                <label className="flex items-center gap-2 text-sm text-white/70">
-                  <input
-                    type="radio"
-                    name="setDraftMode"
-                    checked={setDraftMode === "uniform"}
-                    onChange={() => setSetDraftMode("uniform")}
-                    className="accent-emerald-400"
-                  />
-                  {t("podSetup.uniformPacks")}
-                </label>
-                <label className="flex items-center gap-2 text-sm text-white/70">
-                  <input
-                    type="radio"
-                    name="setDraftMode"
-                    checked={setDraftMode === "chaos"}
-                    onChange={() => setSetDraftMode("chaos")}
-                    className="accent-emerald-400"
-                  />
-                  {t("podSetup.chaosPacks")}
-                </label>
+            {/* A Chaos pod draws each (seat, round) booster from its own
+                privately-assigned set. A shared stack shuffles every booster
+                together before the first decision, so no seat holds the packs
+                generated for it and the assignment only hides which sets the
+                pool is made of — `DraftProcedure::validate_source` refuses the
+                pair outright. The choice is therefore not offered, on the SAME
+                engine-published discriminant the Cube tab already dispatches on
+                for `AllAtOnce`; the store pins `setDraftMode` to "uniform" for
+                these kinds, so the copy below needs no second test. */}
+            {!isSharedStackDistribution(packDistribution) && (
+              <div className="flex flex-col gap-1">
+                <span className="text-sm font-medium text-white/60">{t("podSetup.setDraftMode")}</span>
+                <div className="flex gap-4">
+                  <label className="flex items-center gap-2 text-sm text-white/70">
+                    <input
+                      type="radio"
+                      name="setDraftMode"
+                      checked={setDraftMode === "uniform"}
+                      onChange={() => setSetDraftMode("uniform")}
+                      className="accent-emerald-400"
+                    />
+                    {t("podSetup.uniformPacks")}
+                  </label>
+                  <label className="flex items-center gap-2 text-sm text-white/70">
+                    <input
+                      type="radio"
+                      name="setDraftMode"
+                      checked={setDraftMode === "chaos"}
+                      onChange={() => setSetDraftMode("chaos")}
+                      className="accent-emerald-400"
+                    />
+                    {t("podSetup.chaosPacks")}
+                  </label>
+                </div>
+                <p className="text-xs text-white/40">
+                  {setDraftMode === "chaos"
+                    ? t("podSetup.chaosSelectorHint")
+                    : t("podSetup.setSelectorHint")}
+                </p>
               </div>
-              <p className="text-xs text-white/40">
-                {setDraftMode === "chaos"
-                  ? t("podSetup.chaosSelectorHint")
-                  : t("podSetup.setSelectorHint")}
-              </p>
-            </div>
+            )}
             <div className="rounded-[16px] border border-white/8 bg-white/3 px-4 py-3 text-sm text-white/45">
               {setDraftMode === "chaos"
                 ? t("podSetup.chaosSelectorDetail")
@@ -913,9 +926,26 @@ function DraftingPhaseContent({
     setWorkspacePreferences(next);
     saveDraftWorkspacePreferences(next);
   }, []);
+  // Cards reach the pool on paths that resolve no placement of their own — a
+  // shared-stack take collects a whole pile, and a timed-out seat's decision is
+  // applied by the host and broadcast — so the store needs to know which columns
+  // this board currently means. Published on mount and on every change, because
+  // the player can re-sort mid-draft and the next arrival must follow.
+  useEffect(() => {
+    setArrivingCardBoardPreferences(workspacePreferences.deck);
+  }, [workspacePreferences.deck]);
   const setPackScale = useCallback((next: number) => {
     setWorkspacePreferences((current) => {
       const updated = { ...current, packScale: repairDraftWorkspacePackScale(next) };
+      saveDraftWorkspacePreferences(updated);
+      return updated;
+    });
+  }, []);
+  // The pile surface's own scale, stored beside the pack surface's and never
+  // shared with it: see `DRAFT_WORKSPACE_PILE_SCALE_DEFAULT`.
+  const setPileScale = useCallback((next: number) => {
+    setWorkspacePreferences((current) => {
+      const updated = { ...current, pileScale: repairDraftWorkspacePileScale(next) };
       saveDraftWorkspacePreferences(updated);
       return updated;
     });
@@ -1030,13 +1060,28 @@ function DraftingPhaseContent({
     // worse than a frame with no intro, and the following `viewUpdated` supplies it.
     if (!view) return null;
 
+    // The DISTRIBUTION is asked first, ahead of the launch capability. A
+    // shared-stack pod's capability is `None`, exactly like an ordinary pod's,
+    // so a capability-first test falls through to the pod copy and explains a
+    // Winston draft as opening packs and passing them — a procedure it does not
+    // have. Both reads are engine-published procedure facts; only their order
+    // makes one of them wrong.
+    const sharedStack = isSharedStackDistribution(view.distribution)
+      ? view.distribution.SharedStackPiles
+      : null;
+
     return (
       <DraftIntro
-        mode={view.launch_capability === "CommanderMultiplayer" ? "commander" : "pod"}
+        mode={sharedStack !== null
+          ? "winston"
+          : view.launch_capability === "CommanderMultiplayer"
+            ? "commander"
+            : "pod"}
         podSize={view.seats.length}
         packCount={view.pack_count}
         cardsPerPack={view.cards_per_pack}
         packSizes={view.pack_sizes}
+        pileCount={sharedStack?.pile_count}
         minDeckSize={view.min_deck_size}
         onContinue={() => setIntroDismissed(true)}
       />
@@ -1074,16 +1119,26 @@ function DraftingPhaseContent({
           ? "w-full min-w-0"
           : "h-full min-h-0 w-full min-w-0 overflow-hidden"}>
           {responsiveLayout === "desktop" && <SeatStatusRing />}
-          {/* `DraftProgress` and `PickTimer` describe a PICK-AND-PASS step — a pack
-              number, a pick step out of that pack's total, and the escalating
-              per-pick clock the host starts at each pick boundary. None of the
-              three exists under a shared stack: the turn is a whole-pile decision,
-              the engine publishes no pick step for it, and the host restarts no
-              clock per decision. So they are gated on the SAME engine-published
-              discriminator that selects the surface below, rather than rendering a
-              frozen pack bar and a clock that already ran out beside the piles. */}
+          {/* `DraftProgress` describes a PICK-AND-PASS step — a pack number and a
+              pick step out of that pack's total — and neither exists under a
+              shared stack: the turn is a whole-pile decision and the engine
+              publishes no pick step for it. So it is gated on the same
+              engine-published discriminator that selects the surface below,
+              rather than rendering a frozen pack bar beside the piles.
+
+              `PickTimer` IS NOT GATED, and the asymmetry is the point. The host
+              re-arms the pick clock on every applied shared-stack decision
+              (`P2PDraftHost.handleSharedStackDecision`) and expiry runs
+              `autoDecideSharedStackTurn`, which applies the first legal decision
+              for the active seat — it takes the pile for them. A player who
+              cannot see that clock loses a turn with no warning, which is worse
+              than the frozen-bar problem the gate above avoids. `PickTimer`
+              self-gates on `pod_policy === "Competitive"` and a non-null
+              remaining time, which is exactly the condition under which the
+              sweep can fire, so rendering it unconditionally shows it precisely
+              when it is real. */}
           {responsiveLayout === "desktop" && sharedStack === null && <DraftProgress view={view} />}
-          {sharedStack === null && <PickTimer />}
+          <PickTimer />
           {sharedStack !== null && view !== null ? (
             /* The ENGINE's discriminator, not a kind check: `shared_stack` is
                status-gated to `Drafting` and present only under
@@ -1097,7 +1152,9 @@ function DraftingPhaseContent({
               playFirstChooser={view.play_first_chooser}
               interactionLocked={interactionLocked}
               onDecide={handleSharedStackDecision}
-              onCardHover={setHoveredCard}
+              pileScale={workspacePreferences.pileScale}
+              setPileScale={setPileScale}
+              responsiveLayout={responsiveLayout}
             />
           ) : (
             <PackDisplay

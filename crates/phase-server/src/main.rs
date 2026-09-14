@@ -10438,9 +10438,18 @@ async fn handle_client_message(
                 // core layout holds the result, so reconnect/start never reroll
                 // a pod and a client never transmits assignments.
                 server_core::protocol::DraftSourceIntent::Chaos { candidate_codes } => {
-                    let seed = rand::rngs::OsRng.try_next_u64().map_err(|error| {
-                        format!("Unable to seed Chaos draft assignments: {error}")
-                    });
+                    // Asked BEFORE the entropy draw and before this pod is
+                    // registered and broadcast, because the reducer's answer at
+                    // `StartDraft` would otherwise arrive on a full lobby that
+                    // can never start. The engine owns both the verdict and its
+                    // wording; this boundary only asks earlier.
+                    let seed = if procedure.allows_chaos_layout() {
+                        rand::rngs::OsRng.try_next_u64().map_err(|error| {
+                            format!("Unable to seed Chaos draft assignments: {error}")
+                        })
+                    } else {
+                        Err(draft_core::types::CHAOS_LAYOUT_REFUSAL.to_string())
+                    };
                     seed.and_then(|seed| {
                         draft_pools
                             .resolve_chaos_layout(

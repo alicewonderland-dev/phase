@@ -9,14 +9,22 @@
 //! rather than a reviewer.
 //!
 //! What this module does NOT enforce: the `pub(crate)` accessors below ARE
-//! nameable from `bot_ai`. Rust has no visibility that says "the crate root but
-//! not a sibling" -- `pub(in crate::..)` grants visibility to a module *and its
-//! descendants*, and the crate root is an ancestor of `session_cell`, not a
-//! descendant. So that channel is closed by a test that varies the installed
-//! session while holding the bot's argument fixed (T-CHEAT-1b, landing with the
-//! bot itself), and not by this module. Do not add an accessor that hands out
-//! something narrower and call the problem solved -- the test is the authority
-//! on that channel.
+//! nameable from `bot_ai`. No VISIBILITY MODIFIER closes that -- there is none
+//! meaning "the crate root but not a sibling": `pub(in crate::..)` grants
+//! visibility to a module *and its descendants*, and the crate root is an
+//! ancestor of `session_cell`, not a descendant. So that channel is closed by a
+//! test that varies the installed session while holding the bot's argument
+//! fixed (T-CHEAT-1b, landing with the bot itself), and not by this module. Do
+//! not add an accessor that hands out something narrower and call the problem
+//! solved -- the test is the authority on that channel.
+//!
+//! IT IS CLOSABLE, and this is a deferral rather than a dead end, so do not
+//! read the paragraph above as "nothing can be done". `bot_ai`'s production
+//! half names nothing from this crate -- its whole dependency set is
+//! `draft_core`, `engine`, `phase_ai` and `rand` -- so lifting it into a crate
+//! of its own would make these `pub(crate)` items unnameable BY THE COMPILER,
+//! the same device that already closes the other channel. That is a module
+//! moving across a crate boundary, which is why it has not been done here.
 //!
 //! `PACK_GEN`, `DIFFICULTY`, `RNG` and `CARD_DB` deliberately stay at the crate
 //! root: none of them carries hidden information, and `CARD_DB` is the PUBLIC

@@ -2,6 +2,7 @@
   "intro": {
     "quickTitle": "Quick Draft",
     "podTitle": "Pod Draft",
+    "winstonTitle": "Winston Draft",
     "commanderTitle": "Commander Draft",
     "subtitle": "Ecco come funziona",
     "startDrafting": "Inizia il draft",
@@ -21,7 +22,11 @@
       "minimumDeckCards_one": "{{count, number}} carta",
       "minimumDeckCards_few": "{{count, number}} carte",
       "minimumDeckCards_many": "{{count, number}} carte",
-      "minimumDeckCards_other": "{{count, number}} carte"
+      "minimumDeckCards_other": "{{count, number}} carte",
+      "pilesDealt_one": "{{count, number}} mucchio da una carta",
+      "pilesDealt_few": "{{count, number}} mucchi da una carta",
+      "pilesDealt_many": "{{count, number}} mucchi da una carta",
+      "pilesDealt_other": "{{count, number}} mucchi da una carta"
     },
     "packPassing_one": "Questo draft ha un solo round di buste, quindi la direzione di passaggio non cambia",
     "packPassing_few": "La direzione di passaggio cambia a ogni round",
@@ -38,6 +43,13 @@
       "step2": "Apri {{packs}}; ogni busta contiene {{cardsPerPack}} — scegli una carta e passa il resto",
       "step2Mixed": "Apri {{packs}} di dimensioni diverse, in quest'ordine: {{packSizes, list}} — scegli una carta e passa il resto",
       "step4": "Dopo il draft, costruisci un mazzo di almeno {{minimumDeckCards}} e gioca le partite del torneo"
+    },
+    "winston": {
+      "step2": "Le {{packs}} di ogni giocatore vengono aperte senza che nessuno le guardi e tutte le carte sono mescolate in un'unica pila coperta",
+      "step2Mixed": "Le {{packs}} di dimensioni diverse di ogni giocatore, in quest'ordine: {{packSizes, list}}, vengono aperte senza che nessuno le guardi e mescolate in un'unica pila coperta",
+      "step3": "{{piles}} vengono distribuiti dalla cima. Nel tuo turno, guarda il primo mucchio: prendilo, oppure rifiutalo e passa al successivo",
+      "step4": "Rifiutare mette la carta in cima alla pila sul mucchio che hai rifiutato. Rifiutali tutti e prendi invece la carta in cima alla pila, senza vederla",
+      "step5": "I turni si alternano finché non restano carte; poi costruisci un mazzo di almeno {{minimumDeckCards}} e gioca le partite del torneo"
     },
     "commander": {
       "step2": "Apri {{packs}}; ogni busta contiene {{cardsPerPack}} — scegli due carte e passa il resto",
@@ -99,7 +111,11 @@
     "activePackCount_one": "{{count}} busta presso {{player}}",
     "activePackCount_few": "{{count}} buste presso {{player}}",
     "activePackCount_many": "{{count}} buste presso {{player}}",
-    "activePackCount_other": "{{count}} buste presso {{player}}"
+    "activePackCount_other": "{{count}} buste presso {{player}}",
+    "draftedCardCount_one": "{{count}} carta draftata da {{player}}",
+    "draftedCardCount_few": "{{count}} carte draftate da {{player}}",
+    "draftedCardCount_many": "{{count}} carte draftate da {{player}}",
+    "draftedCardCount_other": "{{count}} carte draftate da {{player}}"
   },
   "setSelector": {
     "botDifficulty": "Difficoltà bot",
@@ -644,7 +660,17 @@
       "NoGuaranteedCard": "Rifiutare non può più garantirti una carta in questo turno, quindi prendere questo mucchio è la tua unica mossa legale."
     },
     "refusalUnpublished": "Il draft non ha pubblicato alcun verdetto per questa decisione.",
-    "playFirstChooser": "{{name}} sceglie chi gioca per primo nelle partite dopo il draft."
+    "playFirstChooser": "{{name}} sceglie chi gioca per primo nelle partite dopo il draft.",
+    "scale": "Scala dei mucchi",
+    "scaleDecrease": "Riduci la scala dei mucchi",
+    "scaleReset": "Reimposta la scala dei mucchi",
+    "scaleIncrease": "Aumenta la scala dei mucchi",
+    "faceDownStack_one": "{{count, number}} carta coperta",
+    "faceDownStack_few": "{{count, number}} carte coperte",
+    "faceDownStack_many": "{{count, number}} carte coperte",
+    "faceDownStack_other": "{{count, number}} carte coperte",
+    "forcedDraw": "Hai rifiutato ogni mucchio, quindi hai pescato {{name}} dalla cima della pila principale.",
+    "forcedDrawLabel": "Pescata dalla pila principale"
   },
   "lobby": {
     "title": "Lobby del pod di draft",

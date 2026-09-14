@@ -2,6 +2,7 @@
   "intro": {
     "quickTitle": "Quick Draft",
     "podTitle": "Pod Draft",
+    "winstonTitle": "Winston Draft",
     "commanderTitle": "Commander Draft",
     "subtitle": "Here's how it works",
     "startDrafting": "Start Drafting",
@@ -21,7 +22,11 @@
       "minimumDeckCards_one": "{{count, number}} card",
       "minimumDeckCards_few": "{{count, number}} cards",
       "minimumDeckCards_many": "{{count, number}} cards",
-      "minimumDeckCards_other": "{{count, number}} cards"
+      "minimumDeckCards_other": "{{count, number}} cards",
+      "pilesDealt_one": "{{count, number}} one-card pile",
+      "pilesDealt_few": "{{count, number}} one-card piles",
+      "pilesDealt_many": "{{count, number}} one-card piles",
+      "pilesDealt_other": "{{count, number}} one-card piles"
     },
     "packPassing_one": "This draft has one pack round, so the passing direction does not alternate",
     "packPassing_few": "The passing direction alternates each round",
@@ -38,6 +43,13 @@
       "step2": "Open {{packs}}; each pack contains {{cardsPerPack}} — pick one, pass the rest",
       "step2Mixed": "Open {{packs}} of mixed sizes, in this order: {{packSizes, list}} — pick one, pass the rest",
       "step4": "After drafting, build a deck of at least {{minimumDeckCards}} and play tournament matches"
+    },
+    "winston": {
+      "step2": "Every player's {{packs}} are opened without anyone looking, and every card is shuffled together into one face-down stack",
+      "step2Mixed": "Every player's {{packs}} of mixed sizes, in this order: {{packSizes, list}}, are opened without anyone looking and shuffled together into one face-down stack",
+      "step3": "{{piles}} are dealt off the top. On your turn, look at the first pile: take it, or decline it and move to the next",
+      "step4": "Declining puts the top card of the stack onto the pile you refused. Decline every pile and you take the top card of the stack instead, sight unseen",
+      "step5": "Turns alternate until no cards are left; then build a deck of at least {{minimumDeckCards}} and play tournament matches"
     },
     "commander": {
       "step2": "Open {{packs}}; each pack contains {{cardsPerPack}} — pick two cards, pass the rest",
@@ -99,7 +111,11 @@
     "activePackCount_one": "{{count}} pack at {{player}}",
     "activePackCount_few": "{{count}} packs at {{player}}",
     "activePackCount_many": "{{count}} packs at {{player}}",
-    "activePackCount_other": "{{count}} packs at {{player}}"
+    "activePackCount_other": "{{count}} packs at {{player}}",
+    "draftedCardCount_one": "{{count}} card drafted by {{player}}",
+    "draftedCardCount_few": "{{count}} cards drafted by {{player}}",
+    "draftedCardCount_many": "{{count}} cards drafted by {{player}}",
+    "draftedCardCount_other": "{{count}} cards drafted by {{player}}"
   },
   "setSelector": {
     "botDifficulty": "Bot Difficulty",
@@ -669,7 +685,17 @@
       "NoGuaranteedCard": "Declining can no longer leave you a card this turn, so taking this pile is your only legal move."
     },
     "refusalUnpublished": "The draft published no verdict for this decision.",
-    "playFirstChooser": "{{name}} chooses who plays first in the games after the draft."
+    "playFirstChooser": "{{name}} chooses who plays first in the games after the draft.",
+    "scale": "Pile scale",
+    "scaleDecrease": "Decrease pile scale",
+    "scaleReset": "Reset pile scale",
+    "scaleIncrease": "Increase pile scale",
+    "faceDownStack_one": "{{count, number}} card face down",
+    "faceDownStack_few": "{{count, number}} cards face down",
+    "faceDownStack_many": "{{count, number}} cards face down",
+    "faceDownStack_other": "{{count, number}} cards face down",
+    "forcedDraw": "You declined every pile, so you drew {{name}} off the top of the main stack.",
+    "forcedDrawLabel": "Drawn from the main stack"
   },
   "lobby": {
     "title": "Draft Pod Lobby",

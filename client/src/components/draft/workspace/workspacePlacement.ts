@@ -1084,6 +1084,62 @@ export function resolveWorkspaceSortColumn(
   return 0;
 }
 
+/**
+ * Place cards that ARRIVED in the pool into the columns the board's sort means.
+ *
+ * The pick path resolves a placement before it dispatches, because it knows
+ * which card it is picking. Two paths do not: a shared-stack `Take` collects a
+ * whole pile the engine chose the contents of, and any view that arrives on its
+ * own — the host deciding for a timed-out seat, a reconnect, a guest's
+ * broadcast — carries cards the client never requested. `reconcileWorkspaceState`
+ * gives those the default placement, which is column 0, so a sorted board
+ * quietly stacks every new card in its first column no matter what the sort says.
+ *
+ * Threaded one card at a time rather than resolved in a batch: the column a card
+ * belongs in depends on what the board already holds (`resolveWorkspaceSortColumn`
+ * prefers a column already holding the group over an empty one reserved for it),
+ * so each placement has to be visible to the next. The same reason
+ * `autoPickCard` reduces its own hints one at a time.
+ *
+ * Cards with no placement at all are skipped rather than created:
+ * `reconcileWorkspaceState` owns which instances exist, and this owns only
+ * where the ones it just made go.
+ */
+export function placeArrivingPoolCards(
+  workspace: DraftWorkspaceState,
+  arrivingInstanceIds: readonly string[],
+  pool: readonly DraftCardInstance[],
+  poolGroups: DraftPoolGroups,
+  preferences: DraftBoardPreferences,
+): DraftWorkspaceState {
+  let next = workspace;
+  for (const instanceId of arrivingInstanceIds) {
+    const card = pool.find((entry) => entry.instance_id === instanceId);
+    if (card === undefined) continue;
+    const placement = next.placements[instanceId];
+    // Deck zone only. The caller passes ids the workspace had NO placement for
+    // before this reconcile, so a card the player has already moved is not in
+    // the list at all and this can never overrule a person; the zone test is
+    // the belt to that braces, and the one thing it catches on its own is a
+    // caller that widened the list to cards already in the sideboard.
+    if (placement === undefined || placement.zone !== "deck") continue;
+    const hint = resolveWorkspacePickPlacement(
+      card,
+      "deck",
+      pool,
+      poolGroups,
+      next,
+      preferences,
+    );
+    next = appendWorkspaceInstanceToResolvedDestination(next, pool, instanceId, {
+      zone: "deck",
+      column: hint.column,
+      row: hint.row ?? placement.row,
+    });
+  }
+  return next;
+}
+
 export function resolveWorkspacePickPlacement(
   card: DraftCardInstance,
   zone: DraftZone,

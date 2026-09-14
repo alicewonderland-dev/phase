@@ -1071,6 +1071,9 @@ mod tests {
             ],
             decisions: 0,
             history,
+            // The bot never reads it: a forced draw is a fact about a card
+            // already in a pool, and the bot decides from the table.
+            forced_draw: None,
         }
     }
 
@@ -1812,6 +1815,7 @@ mod tests {
             ],
             decisions: 0,
             history: Vec::new(),
+            forced_draw: None,
         }
     }
 

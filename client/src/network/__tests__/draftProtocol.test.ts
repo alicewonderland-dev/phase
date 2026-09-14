@@ -713,7 +713,7 @@ describe("draftProtocol", () => {
         type: "draft_state_update",
         view: {
           ...validDraftView,
-          seats: [{ seat_index: 1, display_name: "Alex", active_pack_count: 1 }],
+          seats: [{ seat_index: 1, display_name: "Alex", active_pack_count: 1, drafted_card_count: 7 }],
         },
       });
 
@@ -788,7 +788,7 @@ describe("draftProtocol", () => {
           type: "draft_state_update",
           view: {
             ...validDraftView,
-            seats: [{ active_pack_count: activePackCount }],
+            seats: [{ active_pack_count: activePackCount, drafted_card_count: 0 }],
           },
         })).toThrow("active_pack_count must be an integer 0 or 1");
       },
@@ -797,11 +797,11 @@ describe("draftProtocol", () => {
     it.each([0, 1])("accepts active-pack presence %i", (activePackCount) => {
       const msg = validateDraftMessage({
         type: "draft_lobby_update",
-        seats: [{ active_pack_count: activePackCount }],
+        seats: [{ active_pack_count: activePackCount, drafted_card_count: 0 }],
       });
 
       expect(msg).toMatchObject({
-        seats: [{ active_pack_count: activePackCount }],
+        seats: [{ active_pack_count: activePackCount, drafted_card_count: 0 }],
       });
     });
 
@@ -810,6 +810,29 @@ describe("draftProtocol", () => {
         type: "draft_lobby_update",
         seats: [{}],
       })).toThrow("active_pack_count must be an integer 0 or 1");
+    });
+
+    it.each([undefined, null, "3", 1.5, -1])(
+      "rejects a drafted-card count that is not a whole number of cards %j",
+      (draftedCardCount) => {
+        expect(() => validateDraftMessage({
+          type: "draft_lobby_update",
+          seats: [{ active_pack_count: 0, drafted_card_count: draftedCardCount }],
+        })).toThrow("drafted_card_count must be a non-negative integer");
+      },
+    );
+
+    it("accepts a drafted-card count with no upper bound", () => {
+      // Deliberately larger than any booster product this client ships with: a
+      // shared-stack cube pod's per-seat total follows the host's own
+      // `cards_per_pack`, so a ceiling written here would be a second and wrong
+      // authority on how many cards a pool can hold.
+      const msg = validateDraftMessage({
+        type: "draft_lobby_update",
+        seats: [{ active_pack_count: 0, drafted_card_count: 4096 }],
+      });
+
+      expect(msg).toMatchObject({ seats: [{ drafted_card_count: 4096 }] });
     });
 
     it.each([null, {}])("rejects present non-array draft_effects values", (draftEffects) => {
@@ -832,7 +855,7 @@ describe("draftProtocol", () => {
         view: {
           ...validDraftView,
           draft_effects: [],
-          seats: [{ active_pack_count: 0, face_up_draft_cards: faceUpCards }],
+          seats: [{ active_pack_count: 0, drafted_card_count: 0, face_up_draft_cards: faceUpCards }],
         },
       })).toThrow("face_up_draft_cards must be an array");
     });

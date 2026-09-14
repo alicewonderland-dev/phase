@@ -2,6 +2,7 @@
   "intro": {
     "quickTitle": "Quick Draft",
     "podTitle": "Pod Draft",
+    "winstonTitle": "Winston Draft",
     "commanderTitle": "Commander Draft",
     "subtitle": "So funktioniert es",
     "startDrafting": "Mit dem Draften beginnen",
@@ -21,7 +22,11 @@
       "minimumDeckCards_one": "{{count, number}} Karte",
       "minimumDeckCards_few": "{{count, number}} Karten",
       "minimumDeckCards_many": "{{count, number}} Karten",
-      "minimumDeckCards_other": "{{count, number}} Karten"
+      "minimumDeckCards_other": "{{count, number}} Karten",
+      "pilesDealt_one": "{{count, number}} Häufchen mit einer Karte",
+      "pilesDealt_few": "{{count, number}} Häufchen mit je einer Karte",
+      "pilesDealt_many": "{{count, number}} Häufchen mit je einer Karte",
+      "pilesDealt_other": "{{count, number}} Häufchen mit je einer Karte"
     },
     "packPassing_one": "Dieser Draft hat nur eine Boosterrunde, daher wechselt die Weitergaberichtung nicht",
     "packPassing_few": "Die Weitergaberichtung wechselt in jeder Runde",
@@ -38,6 +43,13 @@
       "step2": "Öffne {{packs}}; jeder Booster enthält {{cardsPerPack}} — wähle eine Karte, gib den Rest weiter",
       "step2Mixed": "Öffne {{packs}} unterschiedlicher Größe, in dieser Reihenfolge: {{packSizes, list}} — wähle eine Karte, gib den Rest weiter",
       "step4": "Baue nach dem Draften ein Deck mit mindestens {{minimumDeckCards}} und spiele Turnierpartien"
+    },
+    "winston": {
+      "step2": "Die {{packs}} jedes Spielers werden ungesehen geöffnet und alle Karten zu einem einzigen verdeckten Stapel gemischt",
+      "step2Mixed": "Die {{packs}} unterschiedlicher Größe jedes Spielers, in dieser Reihenfolge: {{packSizes, list}}, werden ungesehen geöffnet und zu einem einzigen verdeckten Stapel gemischt",
+      "step3": "{{piles}} werden von oben ausgeteilt. Sieh dir in deinem Zug das erste Häufchen an: nimm es, oder lehne es ab und geh zum nächsten",
+      "step4": "Ablehnen legt die oberste Karte des Stapels auf das abgelehnte Häufchen. Lehnst du alle ab, nimmst du stattdessen die oberste Karte des Stapels, ungesehen",
+      "step5": "Die Züge wechseln, bis keine Karten mehr übrig sind; baue danach ein Deck mit mindestens {{minimumDeckCards}} und spiele Turnierpartien"
     },
     "commander": {
       "step2": "Öffne {{packs}}; jeder Booster enthält {{cardsPerPack}} — wähle zwei Karten, gib den Rest weiter",
@@ -99,7 +111,11 @@
     "activePackCount_one": "{{count}} Booster bei {{player}}",
     "activePackCount_few": "{{count}} Booster bei {{player}}",
     "activePackCount_many": "{{count}} Booster bei {{player}}",
-    "activePackCount_other": "{{count}} Booster bei {{player}}"
+    "activePackCount_other": "{{count}} Booster bei {{player}}",
+    "draftedCardCount_one": "{{count}} Karte von {{player}} gedraftet",
+    "draftedCardCount_few": "{{count}} Karten von {{player}} gedraftet",
+    "draftedCardCount_many": "{{count}} Karten von {{player}} gedraftet",
+    "draftedCardCount_other": "{{count}} Karten von {{player}} gedraftet"
   },
   "setSelector": {
     "botDifficulty": "Bot-Schwierigkeit",
@@ -644,7 +660,17 @@
       "NoGuaranteedCard": "Ablehnen kann dir in diesem Zug keine Karte mehr sichern, deshalb ist das Nehmen dieses Häufchens dein einziger legaler Zug."
     },
     "refusalUnpublished": "Der Draft hat für diese Entscheidung kein Urteil veröffentlicht.",
-    "playFirstChooser": "{{name}} entscheidet, wer in den Partien nach dem Draft beginnt."
+    "playFirstChooser": "{{name}} entscheidet, wer in den Partien nach dem Draft beginnt.",
+    "scale": "Häufchengröße",
+    "scaleDecrease": "Häufchengröße verkleinern",
+    "scaleReset": "Häufchengröße zurücksetzen",
+    "scaleIncrease": "Häufchengröße vergrößern",
+    "faceDownStack_one": "{{count, number}} verdeckte Karte",
+    "faceDownStack_few": "{{count, number}} verdeckte Karten",
+    "faceDownStack_many": "{{count, number}} verdeckte Karten",
+    "faceDownStack_other": "{{count, number}} verdeckte Karten",
+    "forcedDraw": "Du hast jedes Häufchen abgelehnt und daher {{name}} von der Spitze des Hauptstapels gezogen.",
+    "forcedDrawLabel": "Vom Hauptstapel gezogen"
   },
   "lobby": {
     "title": "Draft-Pod-Lobby",

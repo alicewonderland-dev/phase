@@ -89,32 +89,57 @@ pub struct TournamentRequestId(pub u64);
 ///      `String` whose producer is `format!("{:?}", …)`, so `"Winston"` needs
 ///      no lobby version move — only its doc's label list.
 ///
-///      AMENDED IN PLACE, NOT BUMPED (1/2). The `DraftError` list above lost
-///      `SharedStackRequiresHumanSeats`, which was the engine's refusal of a
-///      bot seat in a shared-stack pod: such a pod now admits bot seats, so the
-///      variant has no producer and is deleted rather than deprecated. Removing
-///      a variant is ordinarily a bump, and this one is not, for the reason the
-///      next paragraph gives at length: 71 is unreleased upstream (upstream is
-///      70), so no peer ever spoke a 71 that carried it, and a second number
-///      would announce a break between two shapes that never coexisted on the
-///      wire. No TypeScript mirror names it -- MEASURED,
-///      `grep -rn SharedStackRequiresHumanSeats client/` is empty.
+///   AMENDED IN PLACE, NOT BUMPED (1/3). The `DraftError` list above lost
+///   `SharedStackRequiresHumanSeats`, which was the engine's refusal of a
+///   bot seat in a shared-stack pod: such a pod now admits bot seats, so the
+///   variant has no producer and is deleted rather than deprecated. Removing
+///   a variant is ordinarily a bump, and this one is not, for the reason the
+///   next paragraph gives at length: 71 is unreleased upstream (upstream is
+///   70), so no peer ever spoke a 71 that carried it, and a second number
+///   would announce a break between two shapes that never coexisted on the
+///   wire. No TypeScript mirror names it -- MEASURED,
+///   `grep -rn SharedStackRequiresHumanSeats client/` is empty.
 ///
-///      AMENDED IN PLACE, NOT BUMPED (2/2). `SharedStackState::history` and
-///      `SharedStackView::history` — vectors of the new
-///      `SharedStackDecisionRecord` (seat, pile, decision, pile_size; no card,
-///      deliberately and permanently) — were added after this entry was
-///      written. 71 is unreleased upstream (upstream is 70), so no peer has
-///      ever spoken a 71 without them and there is no version for a bump to
-///      separate: a second number would announce a break between two shapes
-///      that never coexisted on the wire. Both carry `#[serde(default)]`, so a
-///      local snapshot persisted by an earlier 71 build loads with an empty
-///      history rather than failing `import_draft_session`; the TypeScript
-///      mirror is REQUIRED rather than optional (`SharedStackView.history` in
-///      `client/src/adapter/draft-adapter.ts`), because the view is built by
-///      the engine on every frame and never by a client. They ride the same
-///      Winston-pod condition as the rest of this entry: a non-Winston pod's
-///      frames stay byte-identical to v70.
+///   AMENDED IN PLACE, NOT BUMPED (2/3). `SharedStackState::history` and
+///   `SharedStackView::history` — vectors of the new
+///   `SharedStackDecisionRecord` (seat, pile, decision, pile_size; no card,
+///   deliberately and permanently) — were added after this entry was
+///   written. 71 is unreleased upstream (upstream is 70), so no peer has
+///   ever spoken a 71 without them and there is no version for a bump to
+///   separate: a second number would announce a break between two shapes
+///   that never coexisted on the wire. Both carry `#[serde(default)]`, so a
+///   local snapshot persisted by an earlier 71 build loads with an empty
+///   history rather than failing `import_draft_session`; the TypeScript
+///   mirror is REQUIRED rather than optional (`SharedStackView.history` in
+///   `client/src/adapter/draft-adapter.ts`), because the view is built by
+///   the engine on every frame and never by a client. They ride the same
+///   Winston-pod condition as the rest of this entry: a non-Winston pod's
+///   frames stay byte-identical to v70.
+///
+///   AMENDED IN PLACE, NOT BUMPED (3/3), on the same evidence — 71 is
+///   unreleased upstream, so no peer has ever spoken a 71 without these:
+///     * `SharedStackState::forced_draws` and `SharedStackView::forced_draw`
+///       — the card a seat's final-pile decline drew off the top of the main
+///       stack, sight unseen. The state field is per seat with
+///       `#[serde(default)]`; the view field is the ONLY card-bearing
+///       private field on that view and is projected to the drawing seat
+///       alone, never to an opponent and never to either spectator
+///       visibility. Rides the Winston-pod condition like the rest.
+///     * `SeatPublicView::drafted_card_count` and
+///       `DraftPlayerView::distribution` — and THESE TWO BREAK THE
+///       CONDITION. They ride every kind's frames, so the sentence above
+///       ("every other kind's draft frames are byte-identical to v70") is
+///       true of everything named before this paragraph and false of these.
+///       Both are required (non-`Option`) engine-built fields, so a v70
+///       server's view fails to satisfy a v71 client's shape for EVERY kind,
+///       not just Winston — which is what the version gate is for, and it
+///       already refuses the mismatch. `drafted_card_count` is a count and
+///       never an identity, and it is public in every kind: a pick-and-pass
+///       seat's total follows from the pick number, and a shared stack's is
+///       visible across the table. `distribution` is a procedure fact
+///       published for the same reason `launch_capability` is, and
+///       deliberately NOT status-gated, so a surface that outlives the
+///       drafting phase can still tell a pile pod from a passing one.
 /// 70 — `OutsideGameChoiceSource::BoosterPack` replaced its `set_code: String`
 ///      with a required `origin: PackOrigin` (`Set(code)` or `Cube`), so a
 ///      `WaitingFor::OutsideGameChoice` for an opened pack no longer decodes

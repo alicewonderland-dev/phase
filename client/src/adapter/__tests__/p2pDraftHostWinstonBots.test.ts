@@ -175,10 +175,10 @@ describe("P2PDraftHost Winston bot seats", () => {
       draft_effects: [],
       seats: [
         { seat_index: 0, display_name: "Host", is_bot: false, connected: true,
-          has_submitted_deck: false, pick_status: "Pending", active_pack_count: 0,
+          has_submitted_deck: false, pick_status: "Pending", active_pack_count: 0, drafted_card_count: 0,
           face_up_draft_cards: [] },
         { seat_index: 1, display_name: "Guest", is_bot: seatABot, connected: true,
-          has_submitted_deck: false, pick_status: "Pending", active_pack_count: 0,
+          has_submitted_deck: false, pick_status: "Pending", active_pack_count: 0, drafted_card_count: 0,
           face_up_draft_cards: [] },
       ],
       pick_number: 0,
@@ -190,6 +190,7 @@ describe("P2PDraftHost Winston bot seats", () => {
         piles: [],
         decisions: 5,
         history: [],
+        forced_draw: null,
       },
     } as unknown as DraftPlayerView;
   }
@@ -596,10 +597,10 @@ describe("P2PDraftHost Winston restore", () => {
       draft_effects: [],
       seats: [
         { seat_index: 0, display_name: "Host", is_bot: false, connected: true,
-          has_submitted_deck: false, pick_status: "Pending", active_pack_count: 0,
+          has_submitted_deck: false, pick_status: "Pending", active_pack_count: 0, drafted_card_count: 0,
           face_up_draft_cards: [] },
         { seat_index: 1, display_name: "Guest", is_bot: seatABot, connected: true,
-          has_submitted_deck: false, pick_status: "Pending", active_pack_count: 0,
+          has_submitted_deck: false, pick_status: "Pending", active_pack_count: 0, drafted_card_count: 0,
           face_up_draft_cards: [] },
       ],
       pick_number: 0,
@@ -612,6 +613,7 @@ describe("P2PDraftHost Winston restore", () => {
           piles: [],
           decisions: 5,
           history: [],
+          forced_draw: null,
         }
         : null,
     } as unknown as DraftPlayerView;
@@ -663,6 +665,68 @@ describe("P2PDraftHost Winston restore", () => {
 
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(loadCardDatabase).toHaveBeenCalledWith("CARD-DATA");
+  });
+
+  /**
+   * A CASUAL POD HAS A RECOVERY TOO.
+   *
+   * When a bot turn fails loudly the shared-stack cursor is left on a seat only
+   * the host can move: `refusal_for` refuses a decision from any other seat, and
+   * `ReplaceSeatWithBot` on a seat that is already a bot changes nothing. The
+   * pick clock is the documented recovery — but `startPickTimer` returns
+   * immediately unless the pod is Competitive, and `restoringHost` builds a
+   * CASUAL pod, so without this the pod is simply stranded.
+   *
+   * REVERT-FAILING: delete the bot re-drive from `requestResume` and the second
+   * `resolveSharedStackBotTurns` call never happens.
+   */
+  it("re-drives a stuck bot when the host resumes, whatever the pod policy", async () => {
+    const { host, resolveSharedStackBotTurns } = restoringHost(
+      winstonRestoreView(1, "Drafting", true),
+    );
+    await host.restoreFromPersisted(persistedWinstonSession());
+    const drivenByRestore = resolveSharedStackBotTurns.mock.calls.length;
+
+    host.requestPause();
+    host.requestResume();
+    await vi.waitFor(() =>
+      expect(resolveSharedStackBotTurns.mock.calls.length).toBeGreaterThan(drivenByRestore));
+  });
+
+  /**
+   * A FAILING CARD-DATA FETCH MUST NOT COST THE POD.
+   *
+   * `loadCardDatabaseForSharedStackBots` pulls multiple megabytes over the
+   * network, so an offline reload or a CDN blip throws inside the restore. If
+   * that throw escaped, it would propagate through `hostDraft`'s catch, which
+   * disposes the pending host and rethrows — leaving the IndexedDB snapshot
+   * untouched and still describing a bot-active pod, so every later attempt to
+   * re-host would run the same failing path. One transient fetch failure would
+   * make an in-progress draft permanently unhostable.
+   *
+   * Failing open costs only the bot's head start. The engine scores without a
+   * card database (degraded but functional), and the pick clock or a host
+   * control recovers the turn, so there is nothing to fail closed for.
+   *
+   * REVERT-FAILING: remove the `try`/`catch` from `resumeDraftingAfterRestore`
+   * and `restoreFromPersisted` rejects instead of resolving.
+   */
+  it("survives a card-data fetch that fails during a restore", async () => {
+    const { host } = restoringHost(winstonRestoreView(1, "Drafting", true));
+    fetchMock.mockRejectedValueOnce(new Error("offline"));
+    const events = vi.fn();
+    host.onEvent(events);
+
+    const view = await host.restoreFromPersisted(persistedWinstonSession());
+
+    // The pod came back rather than throwing, which is the whole claim.
+    expect(view!.status).toBe("Drafting");
+    // And the failure is surfaced rather than swallowed, so the host is not
+    // left wondering why its bot has not moved.
+    expect(events).toHaveBeenCalledWith(expect.objectContaining({
+      type: "error",
+      message: expect.stringContaining("offline"),
+    }));
   });
 
   /**

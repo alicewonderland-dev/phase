@@ -10,9 +10,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   draftPodScreen,
   isMultiplayerDraftPodLive,
+  setArrivingCardBoardPreferences,
   useMultiplayerDraftStore,
   type DraftPodScreen,
 } from "../multiplayerDraftStore";
+import { createDefaultDraftWorkspacePreferences } from "../../components/draft/workspace/workspacePreferences";
 import { DraftPodHostAdapter } from "../../adapter/draftPodHostAdapter";
 import { DraftPodGuestAdapter } from "../../adapter/draftPodGuestAdapter";
 import type { DraftPlayerView } from "../../adapter/draft-adapter";
@@ -168,6 +170,7 @@ function mockView(status: string): DraftPlayerView {
     status: status as DraftPlayerView["status"],
     kind: "Premier",
     launch_capability: "None",
+    distribution: "PickAndPass",
     commanders_required: 0,
     current_pack_number: 1,
     pick_number: 1,
@@ -240,6 +243,7 @@ describe("multiplayerDraftStore", () => {
     guestRecovery.inspect.mockReturnValue({ type: "absent" });
     guestRecovery.loadSession.mockResolvedValue(null);
     useConnectivityStore.setState({ forcedOffline: false, browserOnline: true });
+    setArrivingCardBoardPreferences(createDefaultDraftWorkspacePreferences().deck);
     useMultiplayerDraftStore.getState().reset();
     useAppNotificationStore.setState({ notification: null, expiresAt: 0 });
     wasmMatchAdapterMock.reset();
@@ -1265,6 +1269,7 @@ describe("multiplayerDraftStore", () => {
         // Empty: this fixture exercises the `decisions` acknowledgement path,
         // and no client consumer reads the history yet.
         history: [],
+        forced_draw: null,
       },
       play_first_chooser: 1,
     });
@@ -1309,6 +1314,78 @@ describe("multiplayerDraftStore", () => {
       expect(useMultiplayerDraftStore.getState().view?.shared_stack?.decisions).toBe(5);
       expect(useMultiplayerDraftStore.getState().view?.pool).toEqual([]);
       expect(useMultiplayerDraftStore.getState().pickInteractionLocked).toBe(false);
+    });
+
+    // A take collects a WHOLE PILE the engine chose the contents of, so unlike a
+    // pick there is no card to resolve a placement for before dispatching. That
+    // is why these arrive at the workspace's default placement — column 0 —
+    // unless something places them, and why "every card I draft stacks in the
+    // first column" was the visible symptom.
+    it("sorts the cards a take collected into the board's own columns", async () => {
+      await hostWinstonPod();
+      const taken = [
+        { ...card("cheap"), cmc: 1 },
+        { ...card("costly"), cmc: 5 },
+      ];
+      mockHostAdapter.submitSharedStackDecision.mockResolvedValueOnce(winstonView(5, taken));
+
+      await expect(useMultiplayerDraftStore.getState().submitSharedStackDecision(0, "Take"))
+        .resolves.toEqual({ status: "acknowledged" });
+
+      const placements = useMultiplayerDraftStore.getState().workspaceState!.placements;
+      // Two different columns at all is the regression guard; the ORDER is what
+      // says they were sorted rather than merely spread — the board's default
+      // sort is by mana value, so the five-drop belongs to the right of the
+      // one-drop.
+      expect(placements.costly.column).toBeGreaterThan(placements.cheap.column);
+    });
+
+    // The board's sort is a PLAYER setting, so the placement has to follow the
+    // one they actually chose rather than the module's seeded default. The two
+    // cards share a mana value and differ only in colour, so the default
+    // (sort by mana value) would put them in the SAME column — this row passes
+    // only if the "color" preference really reached the placement.
+    it("sorts arriving cards by the board preference the page published", () => {
+      setArrivingCardBoardPreferences({
+        sort: "color",
+        columnCount: 7,
+        rows: "one",
+        showHeaders: true,
+      });
+      const taken = [
+        { ...card("white-one"), cmc: 2, colors: ["W"] },
+        { ...card("black-one"), cmc: 2, colors: ["B"] },
+      ];
+
+      return (async () => {
+        await hostWinstonPod();
+        mockHostAdapter.submitSharedStackDecision.mockResolvedValueOnce(winstonView(5, taken));
+
+        await expect(useMultiplayerDraftStore.getState().submitSharedStackDecision(0, "Take"))
+          .resolves.toEqual({ status: "acknowledged" });
+
+        const placements = useMultiplayerDraftStore.getState().workspaceState!.placements;
+        expect(placements["white-one"].column).not.toBe(placements["black-one"].column);
+      })();
+    });
+
+    // The same claim for cards that arrive with no decision of this client's
+    // own behind them: the host deciding for a timed-out seat, or any broadcast
+    // a guest receives. A fix that lived only in the decision path would leave
+    // every timed-out Winston turn stacking in column 0.
+    it("sorts cards that arrive on a broadcast view with no decision of ours", async () => {
+      await hostWinstonPod();
+
+      capturedHostEventHandler!({
+        type: "viewUpdated",
+        view: winstonView(5, [
+          { ...card("cheap"), cmc: 1 },
+          { ...card("costly"), cmc: 5 },
+        ]),
+      });
+
+      const placements = useMultiplayerDraftStore.getState().workspaceState!.placements;
+      expect(placements.costly.column).toBeGreaterThan(placements.cheap.column);
     });
 
     it("refuses to acknowledge a view whose decision counter did not advance", async () => {

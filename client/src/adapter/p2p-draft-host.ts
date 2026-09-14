@@ -148,6 +148,18 @@ function redactDraftSessionPoolAndChaos(snapshot: Record<string, unknown>): void
 function redactDraftSessionObject(session: Record<string, unknown>): void {
   delete session.booster_pack_pool;
   delete session.shared_stack;
+  // EVERY SEAT'S DRAFTED CARDS, and the booster a seat is mid-pick on. A pool is
+  // private in every draft kind, and under a shared stack it is the format's
+  // central secret — guessing the opponent's pool is most of what a Winston
+  // player is doing. The backup row is reachable by anyone who can derive the
+  // host peer id, which a guest in the pod can, so this must not travel.
+  //
+  // Mirrors `NESTED_DRAFT_SECRET_KEYS` in `server-core::p2p_backup_guard`, which
+  // strips the same fields again on store and on echo. Two redactors rather than
+  // one because this side is what a host uploads and that side is what any
+  // caller reads back; neither is allowed to rely on the other having run.
+  delete session.pools;
+  delete session.current_pack;
   if (isJsonRecord(session.config)) redactChaosAssignmentsFromSource(session.config.source);
 }
 
@@ -225,6 +237,19 @@ export type DraftHostEvent =
   | { type: "matchResultReceived"; matchId: string; winnerSeat: number | null }
   | { type: "roundAdvanced" }
   | { type: "timerExpired" }
+  /**
+   * The pick clock's current reading, for the HOST'S OWN store.
+   *
+   * The clock lives entirely on the host: `draft-core` publishes
+   * `timer_remaining_ms: None` on every view, and the countdown reaches guests
+   * only through the `draft_timer_sync` broadcast — which by construction does
+   * not reach the host. So without this the one player who owns the clock is
+   * the one player who cannot see it, in every draft kind. That is tolerable
+   * where a timeout picks a card out of a pack the player is already staring
+   * at; it is not tolerable under a shared stack, where expiry TAKES THE PILE,
+   * and the host is half the pod in a two-seat game and all of it against bots.
+   */
+  | { type: "timerTick"; remainingMs: number }
   | {
       type: "bo3SideboardPrompt";
       matchId: string;
@@ -1543,6 +1568,9 @@ export class P2PDraftHost {
       // view and no timer. `resolve_shared_stack_bot_turns` fails LOUDLY by
       // design (`the_loop_fails_loudly_rather_than_spinning`); a loud failure
       // must surface as a host `error` and still leave the pod recoverable.
+      // The recovery is the pick clock for a Competitive pod and Pause/Resume
+      // for any pod — see `requestResume`, which re-drives a stuck shared-stack
+      // bot precisely because the clock does not run under `Casual`.
       try {
         await this.resolveBotPicks({ emit: false, persist: true });
       } catch (err) {
@@ -2133,6 +2161,9 @@ export class P2PDraftHost {
   private onPickTimerTick(): void {
     this.timerRemainingMs = Math.max(0, this.timerEndAt - Date.now());
     this.broadcastToGuests({ type: "draft_timer_sync", remainingMs: this.timerRemainingMs });
+    // The same reading to the host's own store. `broadcastToGuests` cannot
+    // deliver it: the host holds no guest session of its own.
+    this.emit({ type: "timerTick", remainingMs: this.timerRemainingMs });
     if (this.timerRemainingMs <= 0) {
       this.clearActiveTimer();
       this.emit({ type: "timerExpired" });
@@ -2347,10 +2378,29 @@ export class P2PDraftHost {
     options: PickOptions,
   ): Promise<void> {
     if (!hostView.seats.some((seat) => seat.is_bot)) return;
-    const deltas = await this.adapter.resolveSharedStackBotTurns();
-    if (deltas.length === 0) return;
-    if (options.persist) {
-      await this.persistSessionStrict();
+    try {
+      const deltas = await this.adapter.resolveSharedStackBotTurns();
+      if (deltas.length === 0) return;
+      if (options.persist) {
+        await this.persistSessionStrict();
+      }
+    } catch (err) {
+      // THE LOOP CAN FAIL AFTER APPLYING DECISIONS. `drive_shared_stack_bot_turns`
+      // mutates the session in place and returns `Err` from wherever it got to,
+      // so a failure on the third bot turn leaves the first two applied in the
+      // reducer. The caller catches, emits, and broadcasts — which would publish
+      // a reducer result no snapshot holds, and a host reload would then rewind
+      // every client past decisions they had already seen. That is exactly the
+      // invariant the fence on the success path exists for, so the failure path
+      // owes the same fence.
+      //
+      // A persist failure here replaces the original error deliberately: losing
+      // durability is the more serious of the two, and it is the one that makes
+      // the broadcast unsafe.
+      if (options.persist) {
+        await this.persistSessionStrict();
+      }
+      throw err;
     }
   }
 
@@ -3449,6 +3499,26 @@ export class P2PDraftHost {
       if (!this.manualPause) return;
       this.manualPause = false;
       await this.persistSessionStrict();
+      // RESUME RE-DRIVES A STUCK BOT, and this is the pod-policy-independent
+      // half of the recovery. If a bot turn failed loudly, the shared-stack
+      // cursor is left on a seat only the host can move: no human may decide
+      // for it (`refusal_for` refuses a decision from any other seat), and
+      // `ReplaceSeatWithBot` on a seat that is already a bot changes nothing.
+      // The pick clock recovers it — but `startPickTimer` returns immediately
+      // unless the pod is Competitive, so a CASUAL pod had no recovery at all
+      // and was simply stranded. Pause/Resume is a control the host always has.
+      //
+      // Contained, because a resume must not fail on the retry it is offering.
+      const view = await this.adapter.getViewForSeat(0);
+      if (view.shared_stack && view.seats.some((seat) => seat.is_bot)) {
+        try {
+          await this.resolveBotPicks({ emit: false, persist: true });
+          await this.broadcastViews();
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.emit({ type: "error", message: `Driving the bot seat failed again: ${message}` });
+        }
+      }
       this.reconcileEffectivePause();
     }).catch((error: unknown) => console.error("[P2PDraftHost] resume persistence failed:", error));
   }
@@ -3763,12 +3833,36 @@ export class P2PDraftHost {
     // not fetched yet at this point — see `ensureProcedure`. Without this the
     // dispatch falls through to the `current_pack` loop, which is null for
     // every seat under this distribution, and the bot silently does not move.
-    const procedure = await this.ensureProcedure();
-    await this.loadCardDatabaseForSharedStackBots(
-      procedure.distribution,
-      view.seats.filter((seat) => seat.is_bot).length,
-    );
-    await this.resolveBotPicks({ emit: false, persist: true });
+    // CONTAINED, exactly as `replaceSeatWithBotInner` contains the same two
+    // calls and for a sharper version of the same reason. `loadCardDatabaseForSharedStackBots`
+    // fetches multiple megabytes over the network, so an offline reload or a
+    // CDN blip throws here — and this throw would propagate out of
+    // `restoreFromPersisted`, through `hostDraft`'s catch, which disposes the
+    // pending host and rethrows. The snapshot is left untouched, still
+    // describing a bot-active pod, so EVERY later attempt to re-host runs the
+    // same failing path: one transient fetch failure would make an in-progress
+    // draft permanently unhostable.
+    //
+    // Failing open costs only the bot's head start: the pod comes up with the
+    // bot still to move, and the pick clock (Competitive) or a host control
+    // recovers it. The engine also scores without a card database, degraded but
+    // functional -- see `winston_decision_degrades_without_a_card_database` --
+    // so there is nothing to fail closed FOR.
+    try {
+      const procedure = await this.ensureProcedure();
+      await this.loadCardDatabaseForSharedStackBots(
+        procedure.distribution,
+        view.seats.filter((seat) => seat.is_bot).length,
+      );
+      await this.resolveBotPicks({ emit: false, persist: true });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.emit({
+        type: "error",
+        message: `The pod was restored, but driving its bot seat failed: ${message}`,
+      });
+      return view;
+    }
     return this.adapter.getViewForSeat(0);
   }
 
@@ -3937,6 +4031,11 @@ export class P2PDraftHost {
         has_submitted_deck: false,
         pick_status: "NotDrafting",
         active_pack_count: 0,
+        // A LOBBY seat, before `StartDraft` exists to deal anything: nobody has
+        // drafted a card yet, so this is 0 for the same reason the two fields
+        // above it are their own "nothing is happening" values. Every drafting
+        // view is engine-built and carries the real count.
+        drafted_card_count: 0,
         face_up_draft_cards: [],
       });
     }
@@ -3956,6 +4055,10 @@ export class P2PDraftHost {
       status: "Lobby",
       kind: this.kind,
       launch_capability: this.procedure.launch_capability,
+      // From the SAME engine-published procedure as the capability above, so a
+      // lobby view answers "is this a shared-stack pod" exactly as every
+      // drafting view does.
+      distribution: this.procedure.distribution,
       commanders_required: this.procedure.commanders_required,
       current_pack_number: 0,
       pick_number: 0,

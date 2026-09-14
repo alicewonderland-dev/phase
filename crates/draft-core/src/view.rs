@@ -55,6 +55,21 @@ pub struct SeatPublicView {
     /// and this seat has a nonempty current pack that it has not picked from in
     /// the current round; otherwise it is `0`.
     pub active_pack_count: u8,
+    /// How many cards this seat has drafted so far. A COUNT, never an identity:
+    /// which cards are in a pool stays private to its owner.
+    ///
+    /// Public in every draft this engine runs, which is why it is not gated.
+    /// In a pick-and-pass draft every seat has picked the same number of cards,
+    /// so the figure is already common knowledge from the pick number alone; at
+    /// a shared stack the players watch each other take piles, and the size of
+    /// an opponent's drafted pile is simply visible across the table — it is
+    /// the number a Winston player actually tracks, since the whole format is a
+    /// race for the same 90 cards.
+    ///
+    /// Distinct from [`Self::active_pack_count`] rather than replacing it: that
+    /// one answers "is this seat holding a pack right now", which is a
+    /// pick-and-pass question and is 0 under a shared stack by construction.
+    pub drafted_card_count: usize,
     /// CR 905.2c: Draft cards that remain face up are visible to every player.
     pub face_up_draft_cards: Vec<DraftCardInstance>,
 }
@@ -428,6 +443,25 @@ pub struct SharedStackView {
     /// behind the `is_active_viewer` gate — so anything card-bearing added to
     /// the record would be published to every spectator at once.
     pub history: Vec<SharedStackDecisionRecord>,
+    /// The card THIS VIEWER's most recent forced draw gave them, retained until
+    /// they decide again. `None` for every other viewer, always.
+    ///
+    /// THE ONLY PRIVATE FIELD ON THIS TYPE, and the one place a
+    /// `SharedStackView` names a card that is not on the table. A final-pile
+    /// decline takes the top of the main stack "no matter what it is", sight
+    /// unseen, and drops it straight into the declining seat's pool — so this
+    /// is that seat telling itself what it just got. It is emphatically NOT
+    /// public: a pool is not public, and an opponent or a spectator learning
+    /// which card came off the stack would know a card the format kept secret
+    /// from them.
+    ///
+    /// Gated on the VIEWER'S OWN SEAT, not on `is_active_viewer`: the notice
+    /// outlives the turn that produced it — that is the point, the player must
+    /// still be able to read it once their turn has ended — and by then the
+    /// active seat is somebody else. Reading the active-seat gate here would
+    /// show the notice to the opponent and hide it from its owner, in that
+    /// order.
+    pub forced_draw: Option<DraftCardInstance>,
 }
 
 /// One pile, projected for one viewer.
@@ -492,6 +526,19 @@ pub struct DraftPlayerView {
     /// capability, not a client inference from the draft-kind label: a
     /// completed pod only offers a game when the procedure says it can.
     pub launch_capability: DraftLaunchCapability,
+    /// How this procedure delivers boosters to seats, published for the same
+    /// reason [`Self::launch_capability`] is: it is a PROCEDURE fact a display
+    /// layer needs and must not infer from the kind label.
+    ///
+    /// NOT status-gated, and that is the point. `shared_stack` is published only
+    /// while the session is `Drafting`, so a surface that asked "is this a
+    /// shared stack" by testing it would answer YES during the draft and NO
+    /// everywhere after — in deckbuilding, in a pod-status dialog, at the
+    /// standings — and would quietly go back to describing a Winston pod as a
+    /// pack-passing one the moment the last card was taken. Same reasoning as
+    /// [`Self::play_first_chooser`], which is deliberately not status-gated
+    /// because the fact it carries outlives the draft too.
+    pub distribution: PackDistribution,
     /// CR 903.3 / CR 903.13f: number of commanders the deck must designate
     /// under this draft procedure. This is a count, not a boolean, because
     /// Commander deck construction can require multiple designated cards.
@@ -967,6 +1014,13 @@ fn shared_stack_view(state: &SharedStackState, viewer_seat: Option<u8>) -> Share
         // are public events. The engine keeps the history bounded
         // (`SHARED_STACK_HISTORY_CAPACITY`), so this clone is bounded too.
         history: state.history.clone(),
+        // The VIEWER'S OWN seat, never `active_seat`. A spectator (`None`)
+        // indexes nothing and is told nothing, which is the fail-closed
+        // direction: `and_then` on the viewer's seat means every path that does
+        // not name a seat yields `None` without a special case.
+        forced_draw: viewer_seat
+            .and_then(|seat| state.forced_draws.get(usize::from(seat)).cloned())
+            .flatten(),
     }
 }
 
@@ -1089,6 +1143,7 @@ pub fn filter_for_spectator(
                             .is_some_and(|pack| !pack.0.is_empty())
                         && !session.seats_picked_this_round.get(i as u8),
                 ),
+                drafted_card_count: session.pools[i].len(),
                 face_up_draft_cards: face_up_draft_cards(&session.pools[i]),
             }
         })
@@ -1276,6 +1331,7 @@ pub fn filter_for_player(session: &DraftSession, seat_index: u8) -> DraftPlayerV
                             .is_some_and(|pack| !pack.0.is_empty())
                         && !session.seats_picked_this_round.get(i as u8),
                 ),
+                drafted_card_count: session.pools[i].len(),
                 face_up_draft_cards: face_up_draft_cards(&session.pools[i]),
             }
         })
@@ -1292,6 +1348,7 @@ pub fn filter_for_player(session: &DraftSession, seat_index: u8) -> DraftPlayerV
         kind: session.kind,
         source: source_view_for_player(session, seat_index),
         launch_capability: session.kind.procedure().launch_capability(),
+        distribution: session.kind.procedure().distribution,
         commanders_required: session.kind.procedure().commanders_required,
         current_pack_number: session.current_pack_number,
         pick_number: session.pick_number,
@@ -4107,6 +4164,112 @@ mod tests {
         assert!(filter_for_spectator(&session, SpectatorVisibility::Public)
             .pools
             .is_none());
+    }
+
+    /// The forced-draw notice reaches its owner and NOBODY else — not the
+    /// opponent, not either spectator visibility.
+    ///
+    /// This is the only card-bearing field on `SharedStackView`, so its gate is
+    /// the one that has to hold: the card came off a face-down stack straight
+    /// into a pool, and a pool is not public. Both spectator legs are asserted
+    /// rather than only the opponent's, because `Omniscient` is the visibility
+    /// that deliberately DOES publish other seats' pools — and a spectator who
+    /// can see the pool still must not be handed "this card arrived unseen,
+    /// just now", which is information the players themselves do not share.
+    #[test]
+    fn a_forced_draw_notice_reaches_only_the_seat_that_drew_it() {
+        let mut session = started_winston(2, 4);
+        let drawing_seat = stack_of(&session).active_seat;
+        let piles = stack_of(&session).piles.len();
+        for _ in 0..piles {
+            let (seat, pile) = {
+                let state = stack_of(&session);
+                (state.active_seat, state.cursor)
+            };
+            session::apply(
+                &mut session,
+                DraftAction::SharedStackDecision {
+                    seat,
+                    pile,
+                    decision: SharedStackPileDecision::Decline,
+                },
+                None,
+            )
+            .expect("declining every pile takes the forced draw");
+        }
+
+        let owner = filter_for_player(&session, drawing_seat)
+            .shared_stack
+            .expect("a live pile turn publishes its stack");
+        let drawn = owner
+            .forced_draw
+            .expect("the seat that drew is told what it drew");
+        // Reach guard: the notice names a real card this seat now holds, so the
+        // legs below are hiding something that genuinely exists.
+        assert!(session.pools[usize::from(drawing_seat)]
+            .iter()
+            .any(|card| card.instance_id == drawn.instance_id));
+
+        let opponent = filter_for_player(&session, (drawing_seat + 1) % 2)
+            .shared_stack
+            .expect("the opponent sees the same live turn");
+        assert!(opponent.forced_draw.is_none());
+
+        for visibility in [SpectatorVisibility::Public, SpectatorVisibility::Omniscient] {
+            let spectator = filter_for_spectator(&session, visibility)
+                .shared_stack
+                .expect("a spectator sees the live turn");
+            assert!(
+                spectator.forced_draw.is_none(),
+                "{visibility:?} spectators are not told what came off the stack"
+            );
+        }
+    }
+
+    /// Every seat's drafted count is published to every viewer, and it is the
+    /// pool's real size rather than a constant.
+    ///
+    /// The asymmetry is the assertion: after ONE take the two seats hold
+    /// different numbers of cards, so a field wired to a shared counter (a pick
+    /// number, a decision count) would report them equal and pass a test that
+    /// only looked at one seat.
+    #[test]
+    fn every_viewer_is_told_how_many_cards_each_seat_has_drafted() {
+        let mut session = started_winston(2, 4);
+        let taking_seat = stack_of(&session).active_seat;
+        let (seat, pile) = {
+            let state = stack_of(&session);
+            (state.active_seat, state.cursor)
+        };
+        session::apply(
+            &mut session,
+            DraftAction::SharedStackDecision {
+                seat,
+                pile,
+                decision: SharedStackPileDecision::Take,
+            },
+            None,
+        )
+        .expect("taking the first pile");
+
+        let expected: Vec<usize> = session.pools.iter().map(Vec::len).collect();
+        assert_ne!(
+            expected[usize::from(taking_seat)],
+            expected[usize::from((taking_seat + 1) % 2)],
+            "the fixture must leave the seats holding different amounts"
+        );
+
+        for viewer in 0..2u8 {
+            let seats = filter_for_player(&session, viewer).seats;
+            assert_eq!(
+                seats
+                    .iter()
+                    .map(|seat| seat.drafted_card_count)
+                    .collect::<Vec<_>>(),
+                expected,
+                "viewer {viewer} is told every seat's real drafted count"
+            );
+        }
     }
 
     /// VM row V11 — the published legality IS the enforced legality, per pile

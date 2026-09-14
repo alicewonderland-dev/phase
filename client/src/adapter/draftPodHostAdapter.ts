@@ -67,6 +67,10 @@ export type DraftPodHostEvent =
   | { type: "matchResultReceived"; matchId: string; winnerSeat: number | null }
   | { type: "roundAdvanced" }
   | { type: "timerExpired" }
+  /** The pick clock's current reading, forwarded so the HOST'S OWN store can
+   *  show it. Guests receive the same number over `draft_timer_sync`; the host
+   *  holds no guest session, so this is the only path to it. */
+  | { type: "timerTick"; remainingMs: number }
   | {
       type: "bo3SideboardPrompt";
       matchId: string;
@@ -464,6 +468,9 @@ export class DraftPodHostAdapter {
       case "roundAdvanced":
         this.setStatus("pairing");
         this.emit({ type: "roundAdvanced" });
+        break;
+      case "timerTick":
+        this.emit({ type: "timerTick", remainingMs: event.remainingMs });
         break;
       case "timerExpired":
         this.emit({ type: "timerExpired" });

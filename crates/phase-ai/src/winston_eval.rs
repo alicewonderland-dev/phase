@@ -383,10 +383,13 @@ pub struct WinstonWeights {
 }
 
 impl WinstonWeights {
-    /// All five principles live, conservatively tuned. This is what a pod
-    /// actually gets: `create_multiplayer_draft` does not set a difficulty, so a
-    /// pod bot runs at the `AiDifficulty::Medium` default — putting any principle
-    /// above `Medium` would leave it dead in production.
+    /// All five principles live, conservatively tuned. This is what a pod gets
+    /// BY DEFAULT: a pod that names no difficulty runs its bots at
+    /// `AiDifficulty::Medium`, so a principle placed above `Medium` would be
+    /// dead for every such pod. The higher rungs are genuinely reachable — a
+    /// pod CAN name a difficulty and `create_multiplayer_draft` writes it on
+    /// every pool arm — they are simply not what the common pod gets, which is
+    /// why the full set lives here rather than at `sharp()`.
     pub fn baseline() -> Self {
         Self {
             // A vanilla 2/2-for-2 scores 3.5 under `DraftWeights::default`, so
@@ -1453,8 +1456,9 @@ mod tests {
         assert!(one_bomb.total().is_finite());
         assert!(three_bombs.total() > one_bomb.total());
 
-        // Medium — what a pod actually gets, since `create_multiplayer_draft`
-        // sets no difficulty — has every principle live.
+        // Medium — what a pod gets when it names no difficulty — has every
+        // principle live. A pod that DOES name one reaches the harder rungs;
+        // this is the floor, not the ceiling.
         let medium = WinstonWeights::baseline();
         assert!(medium.fixing_premium > 0.0);
         assert!(medium.color_commitment_max > 0.0);

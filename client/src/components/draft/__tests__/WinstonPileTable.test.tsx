@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import type {
@@ -8,12 +8,38 @@ import type {
   SharedStackRefusal,
   SharedStackView,
 } from "../../../adapter/draft-adapter";
+import { usePreferencesStore } from "../../../stores/preferencesStore";
+import {
+  DRAFT_WORKSPACE_PILE_SCALE_DEFAULT,
+  type ResponsiveDraftLayout,
+} from "../workspace/workspacePreferences";
 import { WinstonPileTable } from "../WinstonPileTable";
 
 // The image ladder is not what this surface is about, and resolving it would
 // reach the Scryfall service. Same stub the pack-display tests use.
 vi.mock("../../../hooks/useCardImage", () => ({
   useCardImage: () => ({ src: null, isLoading: false }),
+  // The face-down stacks resolve the shared public card back through the same
+  // hook. Stubbed to "no art yet" so the backs render their vector fallback
+  // rather than reaching the image service.
+  useCardBackImage: () => ({ src: null, advanceFailedSource: undefined }),
+}));
+
+// Records what this surface asks the preview for. Renders nothing: the claim
+// under test is which preview behaviour a pile turn requires, not how the
+// preview draws it — that is pinned in the preview's own suite.
+interface RecordedPreview {
+  card?: { name: string } | null;
+  mode?: string;
+  mobileLayout?: string;
+  onDismiss?: () => void;
+}
+const previewProps: RecordedPreview[] = vi.hoisted(() => []);
+vi.mock("../../card/HoverCardPreview", () => ({
+  HoverCardPreview: (props: RecordedPreview) => {
+    previewProps.push(props);
+    return null;
+  },
 }));
 
 function card(id: string, name: string): DraftCardInstance {
@@ -38,6 +64,7 @@ const seats: SeatPublicView[] = [
     has_submitted_deck: false,
     pick_status: "Pending",
     active_pack_count: 0,
+    drafted_card_count: 0,
     face_up_draft_cards: [],
   },
   {
@@ -48,6 +75,7 @@ const seats: SeatPublicView[] = [
     has_submitted_deck: false,
     pick_status: "Waiting",
     active_pack_count: 0,
+    drafted_card_count: 0,
     face_up_draft_cards: [],
   },
 ];
@@ -89,6 +117,7 @@ function activeTurn(piles: SharedStackPileView[], activePile: number): SharedSta
     // consumer reads the history yet. Its fidelity to the reducer is pinned
     // in `draft-core` (`history_records_sizes_and_decisions_and_never_cards`).
     history: [],
+    forced_draw: null,
   };
 }
 
@@ -100,9 +129,17 @@ function renderTable(
     playFirstChooser?: number | null;
     /** Defaults to seat 0, which `activeTurn` makes the ACTIVE seat. */
     viewerSeat?: number | null;
+    /** A round 1 by default, so a rendered card width is the base width and a
+     *  scale assertion reads as a multiple of it. */
+    pileScale?: number;
+    setPileScale?: (next: number) => void;
+    /** Desktop by default, where the page scrolls and this surface does not
+     *  own its own height. */
+    responsiveLayout?: ResponsiveDraftLayout;
   } = {},
 ) {
   const onDecide = overrides.onDecide ?? vi.fn();
+  const setPileScale = overrides.setPileScale ?? vi.fn();
   const rendered = render(
     <WinstonPileTable
       sharedStack={sharedStack}
@@ -111,9 +148,12 @@ function renderTable(
       playFirstChooser={overrides.playFirstChooser ?? null}
       interactionLocked={overrides.interactionLocked ?? false}
       onDecide={onDecide}
+      pileScale={overrides.pileScale ?? 1}
+      setPileScale={setPileScale}
+      responsiveLayout={overrides.responsiveLayout ?? "desktop"}
     />,
   );
-  return { ...rendered, onDecide };
+  return { ...rendered, onDecide, setPileScale };
 }
 
 function decisionButton(pileIndex: number, decision: "Take" | "Decline"): HTMLButtonElement {
@@ -126,6 +166,11 @@ function decisionButton(pileIndex: number, decision: "Take" | "Decline"): HTMLBu
 
 describe("WinstonPileTable", () => {
   afterEach(cleanup);
+
+  beforeEach(() => {
+    previewProps.length = 0;
+    usePreferencesStore.setState({ draftCardPreviewMode: "none" });
+  });
 
   it("enables Take exactly when the engine publishes no refusal for it", () => {
     // Paired positive: the same fixture shape, differing ONLY in the published
@@ -215,6 +260,7 @@ describe("WinstonPileTable", () => {
       // consumer reads the history yet. Its fidelity to the reducer is pinned
       // in `draft-core` (`history_records_sizes_and_decisions_and_never_cards`).
       history: [],
+      forced_draw: null,
     };
     renderTable(spectatingSeat, { viewerSeat: 1 });
 
@@ -259,6 +305,7 @@ describe("WinstonPileTable", () => {
       // consumer reads the history yet. Its fidelity to the reducer is pinned
       // in `draft-core` (`history_records_sizes_and_decisions_and_never_cards`).
       history: [],
+      forced_draw: null,
     };
     renderTable(sameProjection, { viewerSeat: 0 });
 
@@ -293,6 +340,181 @@ describe("WinstonPileTable", () => {
     expect(screen.getByText("Your turn — pile 1")).toBeInTheDocument();
   });
 
+  it("draws the unlooked-at remainder as card backs, not the pile's whole height", () => {
+    // 4 cards, 2 of them already looked at. The stack stands for the OTHER two.
+    // A stack drawn from `total` would say 4 and claim the seat has not seen
+    // cards it is looking at right now; one drawn from a constant would say the
+    // same thing for every pile on the table.
+    renderTable(
+      activeTurn([pile(0, 4, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
+    );
+
+    const stack = document.querySelector("[data-winston-pile-facedown]");
+    expect(stack).not.toBeNull();
+    expect(stack).toHaveAttribute("data-winston-pile-facedown-count", "2");
+    // Contents stay unpublished: the backs carry no card identity at all.
+    expect(stack!.textContent).toBe("");
+    expect(stack!.querySelectorAll("[data-winston-revealed-card]")).toHaveLength(0);
+  });
+
+  it("hides a pile the seat has already passed, prefix and all", () => {
+    // MID-TURN, and the shape the engine really publishes: the seat looked at
+    // pile 1, declined it, and is now on pile 2 — so the engine still sends
+    // pile 1's prefix, because that seat did look at it. At a physical table
+    // that pile went back face down, and remembering it is the player's job,
+    // so the screen stops showing it the instant the cursor moves on.
+    renderTable(
+      activeTurn(
+        [
+          pile(0, 3, [card("passed-1", "Ponder"), card("passed-2", "Opt")], null, null),
+          pile(1, 2, [card("cursor-1", "Brainstorm")], null, null),
+        ],
+        1,
+      ),
+    );
+
+    // The passed pile: nothing face up, and its WHOLE height face down —
+    // including the card the decline just added, which was never shown anyway.
+    expect(screen.queryByText("Ponder")).toBeNull();
+    expect(screen.queryByText("Opt")).toBeNull();
+    expect(document.querySelector("[data-winston-pile='0'] [data-winston-revealed-card]")).toBeNull();
+    expect(document.querySelector("[data-winston-pile='0'] [data-winston-pile-facedown]"))
+      .toHaveAttribute("data-winston-pile-facedown-count", "3");
+
+    // The paired positive on the SAME render: the pile under decision is still
+    // face up, so the hiding is keyed on the cursor and not on the turn.
+    expect(screen.getByText("Brainstorm")).toBeInTheDocument();
+    expect(document.querySelectorAll("[data-winston-pile='1'] [data-winston-revealed-card]"))
+      .toHaveLength(1);
+  });
+
+  it("draws nothing face down for a pile the seat is looking all the way through", () => {
+    // The paired negative, and the active seat's state at the cursor on EVERY
+    // turn: the engine sets `inspected` to the pile's full height there, so
+    // `revealed.length === total`. A slot here would claim a card nobody has
+    // seen, on the one pile the screen is about.
+    renderTable(activeTurn([pile(0, 1, [card("c1", "Ponder")], null, null)], 0));
+
+    expect(document.querySelector("[data-winston-pile-facedown]")).toBeNull();
+  });
+
+  it("still draws a slot for a pile with no cards at all", () => {
+    // The other `count === 0`, and the reason the branch is not simply deleted:
+    // an empty pile is a real pile and its row should read as one.
+    renderTable(activeTurn([pile(0, 0, [], null, "PileEmpty")], 0));
+
+    expect(document.querySelector("[data-winston-pile-facedown]"))
+      .toHaveAttribute("data-winston-pile-facedown-count", "0");
+  });
+
+  it("keeps the decision controls reachable while a forced draw is on screen", () => {
+    // The notice holds a full-size card with a fixed width and aspect ratio, so
+    // it cannot shrink. Outside the scroller it was an unshrinkable block
+    // competing with the only flex-1 item in a fixed-height box, and on a short
+    // viewport it took the whole box — collapsing the pile list to nothing and
+    // putting Take and Decline out of reach. It is on screen for the whole of
+    // the seat's NEXT turn, which is exactly when those buttons are needed.
+    const stack = activeTurn([pile(0, 1, [card("c1", "Ponder")], null, null)], 0);
+    renderTable(
+      { ...stack, forced_draw: card("drawn-1", "Dreaded Bat-Cloud") },
+      { responsiveLayout: "phone-landscape" },
+    );
+
+    const list = document.querySelector("[data-winston-pile-list]");
+    const notice = document.querySelector("[data-winston-forced-draw]");
+    expect(notice).not.toBeNull();
+    // Inside the scroller, so the whole column scrolls as one and nothing below
+    // it can be pushed out of the box.
+    expect(list!.contains(notice!)).toBe(true);
+    // And the controls are still rendered on the same surface.
+    expect(list!.contains(decisionButton(0, "Take"))).toBe(true);
+  });
+
+  it("scrolls its own rows wherever the page will not scroll for it", () => {
+    // Every viewport under 1200px wide is a non-desktop band, and the page puts
+    // the surface in a fixed-height `overflow-hidden` box there. Three
+    // full-card rows do not fit, and a row that overflows takes the cursor
+    // pile's Take/Decline buttons off-screen with no way to reach them.
+    renderTable(activeTurn([pile(0, 1, [card("c1", "Ponder")], null, null)], 0), {
+      responsiveLayout: "tablet-landscape",
+    });
+
+    expect(document.querySelector("[data-winston-pile-table]"))
+      .toHaveAttribute("data-winston-scrolls-piles", "true");
+    expect(document.querySelector("[data-winston-pile-list]")).toHaveClass("overflow-y-auto");
+
+    cleanup();
+
+    // Desktop is the paired negative: the page scrolls, so a second scroller
+    // here would trap the rows in a short box for no reason.
+    renderTable(activeTurn([pile(0, 1, [card("c1", "Ponder")], null, null)], 0), {
+      responsiveLayout: "desktop",
+    });
+
+    expect(document.querySelector("[data-winston-pile-table]"))
+      .toHaveAttribute("data-winston-scrolls-piles", "false");
+    expect(document.querySelector("[data-winston-pile-list]")).not.toHaveClass("overflow-y-auto");
+  });
+
+  it("scales the cards by the stored pile scale rather than a fixed width", () => {
+    const { unmount } = renderTable(
+      activeTurn([pile(0, 1, [card("c1", "Ponder")], null, null)], 0),
+      { pileScale: 1 },
+    );
+    const atOne = document.querySelector<HTMLElement>("[data-winston-revealed-card]")!.style.width;
+    unmount();
+
+    renderTable(activeTurn([pile(0, 1, [card("c1", "Ponder")], null, null)], 0), { pileScale: 2 });
+    const atTwo = document.querySelector<HTMLElement>("[data-winston-revealed-card]")!.style.width;
+
+    // Read as a RATIO, so the assertion survives a change to the base width the
+    // pack surface shares — it is the scaling that is under test, not 146px.
+    expect(Number.parseFloat(atTwo)).toBeCloseTo(Number.parseFloat(atOne) * 2);
+  });
+
+  it("offers the same scale affordances the pack surface does", () => {
+    const { setPileScale } = renderTable(
+      activeTurn([pile(0, 1, [card("c1", "Ponder")], null, null)], 0),
+      { pileScale: 1 },
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Increase pile scale" }));
+    expect(setPileScale).toHaveBeenLastCalledWith(1.1);
+    fireEvent.click(screen.getByRole("button", { name: "Decrease pile scale" }));
+    expect(setPileScale).toHaveBeenLastCalledWith(0.9);
+    fireEvent.click(screen.getByRole("button", { name: "Reset pile scale" }));
+    // The engine-free default, read from the preferences module rather than
+    // retyped, so a retuned default moves this row with it.
+    expect(setPileScale).toHaveBeenLastCalledWith(DRAFT_WORKSPACE_PILE_SCALE_DEFAULT);
+
+    fireEvent.change(screen.getByRole("slider", { name: "Pile scale" }), { target: { value: "1.8" } });
+    expect(setPileScale).toHaveBeenLastCalledWith(1.8);
+  });
+
+  it("names the card a forced draw took off the stack", () => {
+    // The one card in the format a player receives without seeing it. The
+    // engine publishes it to that seat alone; this asserts the surface actually
+    // says so rather than leaving the player to hunt their pool.
+    const stack = activeTurn([pile(0, 1, [], null, null)], 0);
+    renderTable({ ...stack, forced_draw: card("drawn-1", "Dreaded Bat-Cloud") });
+
+    expect(document.querySelector("[data-winston-forced-draw='drawn-1']")).not.toBeNull();
+    expect(
+      screen.getByText(
+        "You declined every pile, so you drew Dreaded Bat-Cloud off the top of the main stack.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("says nothing about a forced draw the engine did not publish", () => {
+    // The paired negative, and the privacy leg: `forced_draw` is null for every
+    // viewer but the seat that drew, so a surface that rendered a notice from
+    // anything else — the pool, the history, a local flag — would show one here.
+    renderTable(activeTurn([pile(0, 1, [card("c1", "Ponder")], null, null)], 0));
+
+    expect(document.querySelector("[data-winston-forced-draw]")).toBeNull();
+  });
+
   it("locks both controls while a decision is in flight, claiming no refusal", () => {
     renderTable(activeTurn([pile(0, 3, [card("c1", "Ponder")], null, null)], 0), {
       interactionLocked: true,
@@ -317,5 +539,69 @@ describe("WinstonPileTable", () => {
     renderTable(activeTurn([pile(0, 3, [], null, null)], 0), { playFirstChooser: null });
 
     expect(document.querySelector("[data-winston-play-first]")).toBeNull();
+  });
+
+  it("asks for a readable preview even when draft previews are switched off", () => {
+    // `draftCardPreviewMode` ships as "none", which is a fair default for a
+    // pack: those cards render large enough to read where they sit. A pile's
+    // are 88px thumbnails and the turn is a decision about what they ARE, so
+    // "none" here is not a preference — it is an unreadable screen.
+    renderTable(activeTurn([pile(0, 3, [card("c1", "Ponder")], null, null)], 0));
+
+    expect(previewProps[previewProps.length - 1]?.mode).toBe("side");
+  });
+
+  it("passes a mode the player actually chose through untouched", () => {
+    // The paired positive, and the reason the row above is not "this surface
+    // ignores the preference": only the off state is substituted for.
+    usePreferencesStore.setState({ draftCardPreviewMode: "follow" });
+
+    renderTable(activeTurn([pile(0, 3, [card("c1", "Ponder")], null, null)], 0));
+
+    expect(previewProps[previewProps.length - 1]?.mode).toBe("follow");
+  });
+
+  it("owns the state its overlay dismisses, and never blocks the turn behind it", () => {
+    // Without both of these a narrow viewport (under the preview's 1024px
+    // breakpoint) gets the blocking full-screen modal whose default dismiss
+    // clears the in-game inspector — unrelated state — leaving an overlay over
+    // a live turn that no tap can close.
+    renderTable(activeTurn([pile(0, 3, [card("c1", "Ponder")], null, null)], 0));
+
+    const props = previewProps[previewProps.length - 1];
+    expect(props?.mobileLayout).toBe("compact");
+    expect(typeof props?.onDismiss).toBe("function");
+  });
+
+  it("reaches the card a keyboard player is deciding on", () => {
+    // The decision controls are real buttons, so a keyboard player can Take a
+    // pile. Focusing its cards is how they can first read one.
+    renderTable(activeTurn([pile(0, 3, [card("c1", "Ponder")], null, null)], 0));
+
+    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card]");
+    expect(revealed).not.toBeNull();
+    expect(revealed!.tabIndex).toBe(0);
+
+    fireEvent.focus(revealed!);
+    expect(previewProps[previewProps.length - 1]?.card).toMatchObject({ name: "Ponder" });
+
+    fireEvent.blur(revealed!);
+    expect(previewProps[previewProps.length - 1]?.card).toBeNull();
+  });
+
+  it("marks its cards for the preview's own stale-hover sweep", () => {
+    // The marker is not decoration: `HoverCardPreview`'s cleanup effect clears
+    // a preview on the next pointer move unless a `[data-deck-card-hover]`
+    // element is still hovered. Without it, passing `onDismiss` above would
+    // close the preview the moment the pointer twitched over the card. The
+    // attribute comes from `mouseHoverPreview`, which also carries the
+    // pointerleave rule that stops a narrow-viewport overlay closing the
+    // gesture that opened it — both written for exactly this surface, whose
+    // cards are replaced under a stationary pointer every turn.
+    renderTable(activeTurn([pile(0, 3, [card("c1", "Ponder")], null, null)], 0));
+
+    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card]");
+    expect(revealed).not.toBeNull();
+    expect(revealed!.hasAttribute("data-deck-card-hover")).toBe(true);
   });
 });

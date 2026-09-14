@@ -2,6 +2,7 @@
   "intro": {
     "quickTitle": "Draft Rápido",
     "podTitle": "Pod Draft",
+    "winstonTitle": "Winston Draft",
     "commanderTitle": "Commander Draft",
     "subtitle": "Así funciona",
     "startDrafting": "Empezar a draftear",
@@ -21,7 +22,11 @@
       "minimumDeckCards_one": "{{count, number}} carta",
       "minimumDeckCards_few": "{{count, number}} cartas",
       "minimumDeckCards_many": "{{count, number}} cartas",
-      "minimumDeckCards_other": "{{count, number}} cartas"
+      "minimumDeckCards_other": "{{count, number}} cartas",
+      "pilesDealt_one": "{{count, number}} montón de una carta",
+      "pilesDealt_few": "{{count, number}} montones de una carta",
+      "pilesDealt_many": "{{count, number}} montones de una carta",
+      "pilesDealt_other": "{{count, number}} montones de una carta"
     },
     "packPassing_one": "Este draft tiene una sola ronda de sobres, por lo que la dirección de pase no cambia",
     "packPassing_few": "La dirección de pase cambia en cada ronda",
@@ -38,6 +43,13 @@
       "step2": "Abre {{packs}}; cada sobre contiene {{cardsPerPack}} — elige una carta y pasa el resto",
       "step2Mixed": "Abre {{packs}} de tamaños distintos, en este orden: {{packSizes, list}} — elige una carta y pasa el resto",
       "step4": "Tras el draft, construye un mazo de al menos {{minimumDeckCards}} y juega partidas de torneo"
+    },
+    "winston": {
+      "step2": "Los {{packs}} de cada jugador se abren sin que nadie los mire y todas las cartas se barajan en un único mazo boca abajo",
+      "step2Mixed": "Los {{packs}} de tamaños distintos de cada jugador, en este orden: {{packSizes, list}}, se abren sin que nadie los mire y se barajan en un único mazo boca abajo",
+      "step3": "Se reparten {{piles}} de la cima. En tu turno, mira el primer montón: tómalo o recházalo y pasa al siguiente",
+      "step4": "Rechazar pone la carta superior del mazo sobre el montón que rechazaste. Recházalos todos y te llevas la carta superior del mazo sin verla",
+      "step5": "Los turnos se alternan hasta que no quedan cartas; después construye un mazo de al menos {{minimumDeckCards}} y juega partidas de torneo"
     },
     "commander": {
       "step2": "Abre {{packs}}; cada sobre contiene {{cardsPerPack}} — elige dos cartas y pasa el resto",
@@ -99,7 +111,11 @@
     "activePackCount_one": "{{count}} sobre en {{player}}",
     "activePackCount_few": "{{count}} sobres en {{player}}",
     "activePackCount_many": "{{count}} sobres en {{player}}",
-    "activePackCount_other": "{{count}} sobres en {{player}}"
+    "activePackCount_other": "{{count}} sobres en {{player}}",
+    "draftedCardCount_one": "{{count}} carta drafteada por {{player}}",
+    "draftedCardCount_few": "{{count}} cartas drafteadas por {{player}}",
+    "draftedCardCount_many": "{{count}} cartas drafteadas por {{player}}",
+    "draftedCardCount_other": "{{count}} cartas drafteadas por {{player}}"
   },
   "setSelector": {
     "botDifficulty": "Dificultad de los bots",
@@ -644,7 +660,17 @@
       "NoGuaranteedCard": "Rechazar ya no puede darte una carta este turno, así que tomar este montón es tu única jugada legal."
     },
     "refusalUnpublished": "El draft no publicó ningún veredicto para esta decisión.",
-    "playFirstChooser": "{{name}} elige quién juega primero en las partidas posteriores al draft."
+    "playFirstChooser": "{{name}} elige quién juega primero en las partidas posteriores al draft.",
+    "scale": "Escala de montones",
+    "scaleDecrease": "Reducir la escala de montones",
+    "scaleReset": "Restablecer la escala de montones",
+    "scaleIncrease": "Aumentar la escala de montones",
+    "faceDownStack_one": "{{count, number}} carta boca abajo",
+    "faceDownStack_few": "{{count, number}} cartas boca abajo",
+    "faceDownStack_many": "{{count, number}} cartas boca abajo",
+    "faceDownStack_other": "{{count, number}} cartas boca abajo",
+    "forcedDraw": "Rechazaste todos los montones, así que robaste {{name}} de la cima del mazo principal.",
+    "forcedDrawLabel": "Robada del mazo principal"
   },
   "lobby": {
     "title": "Sala de espera del pod de draft",

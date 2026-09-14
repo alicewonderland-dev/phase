@@ -2578,6 +2578,202 @@ mod create_multiplayer_draft_tests {
     /// A started, drafting 2-seat Winston session, built through the REAL
     /// reducer so its `shared_stack` is the shape the reducer produces rather
     /// than one this test invented.
+    /// A booster shaped like a real one: five colours, a mana curve, and type
+    /// lines. `FixturePackSource` makes colourless, typeless, mana-value-zero
+    /// cards, which is right for the reducer's conservation and legality tests
+    /// and useless here — a deck suggested from that pool has no colours to
+    /// choose between and no curve to build, so a playability claim over it
+    /// would assert nothing.
+    struct WinstonDeckFixtureSource;
+
+    impl draft_core::pack_source::PackSource for WinstonDeckFixtureSource {
+        fn generate_pack(
+            &self,
+            _rng: &mut dyn rand::RngCore,
+            seat: u8,
+            pack_number: u8,
+        ) -> draft_core::types::DraftPack {
+            // Five colours plus COLOURLESS, because every real booster has
+            // artifacts and a pool with none of them is a worst case no set
+            // produces: with nothing colourless to play, a two-colour build can
+            // never reach the suggester's 23-playable target and its documented
+            // top-up splashes the whole pool. Roughly one in five here, which is
+            // the low end of a real booster's artifact count.
+            const COLORS: [Option<&str>; 6] =
+                [Some("W"), Some("U"), Some("B"), Some("R"), Some("G"), None];
+            let cards = (0..15u8)
+                .map(|i| {
+                    let color = COLORS[usize::from(i) % COLORS.len()];
+                    // A curve, not a flat cost: 1..=5, so the land count the
+                    // suggester derives is a real answer rather than a constant.
+                    let cmc: u8 = 1 + (i % 5);
+                    let creature = i % 3 != 0;
+                    DraftCardInstance {
+                        instance_id: format!("FIX-{seat}-{pack_number}-{i}"),
+                        // The colour is IN THE NAME on purpose: `SuggestedDeck`
+                        // carries names only, so this is how the assertions read
+                        // a finished deck's colours back.
+                        name: format!(
+                            "Fixture {} {cmc} {seat}-{pack_number}-{i}",
+                            color.unwrap_or("C")
+                        ),
+                        set_code: "FIX".to_string(),
+                        collector_number: format!("{}", i + 1),
+                        rarity: if i == 0 { "rare" } else { "common" }.to_string(),
+                        colors: color.map(|c| vec![c.to_string()]).unwrap_or_default(),
+                        cmc,
+                        type_line: match (color, creature) {
+                            (None, _) => "Artifact".to_string(),
+                            (Some(_), true) => "Creature — Fixture".to_string(),
+                            (Some(_), false) => "Instant".to_string(),
+                        },
+                        draft_effect: None,
+                    }
+                })
+                .collect();
+            draft_core::types::DraftPack(cards)
+        }
+    }
+
+    /// A complete two-BOT Winston draft, driven by the same loop production
+    /// uses, returning the finished session.
+    fn winston_drafted_by_bots(card_db: Option<&CardDatabase>) -> DraftSession {
+        let source = DraftSource::single_set("FIX".to_string());
+        let config = DraftConfig {
+            set_code: source.set_code(),
+            source,
+            kind: DraftKind::Winston,
+            pod_size: 2,
+            cards_per_pack: 15,
+            pack_count: 3,
+            min_deck_size: 40,
+            addable_cards: DeckAddableCards::standard_basics(),
+            rng_seed: 20_260_913,
+            tournament_format: TournamentFormat::Swiss,
+            pod_policy: PodPolicy::Competitive,
+            spectator_visibility: SpectatorVisibility::default(),
+        };
+        // BOTH seats are bots, so the driver runs the whole draft rather than
+        // stopping at the first human turn.
+        let seats = (0..2)
+            .map(|seat| DraftSeat::Bot {
+                name: format!("Bot {seat}"),
+            })
+            .collect();
+        let mut session = DraftSession::new(config, seats, "winston-bots".to_string());
+        draft_core::session::apply(
+            &mut session,
+            draft_core::types::DraftAction::StartDraft,
+            Some(&WinstonDeckFixtureSource),
+        )
+        .expect("a Winston pod starts");
+        drive_shared_stack_bot_turns(&mut session, AiDifficulty::Medium, card_db, 10_000)
+            .expect("the bot loop drives a whole draft");
+        assert_eq!(
+            session.status,
+            DraftStatus::Deckbuilding,
+            "the draft must actually finish before a deck can be judged"
+        );
+        session
+    }
+
+    /// The colour a fixture card's name encodes.
+    fn fixture_color(name: &str) -> Option<&'static str> {
+        ["W", "U", "B", "R", "G"]
+            .into_iter()
+            .find(|color| name.starts_with(&format!("Fixture {color} ")))
+    }
+
+    /// THE BAR: A BOT MUST END UP WITH A DECK IT COULD ACTUALLY PLAY.
+    ///
+    /// Not "a bot that drafts like a human" — it is not expected to. This is the
+    /// weaker, and the only load-bearing, claim: a bot seat drafts a pool, and
+    /// the suggester turns that pool into a legal, castable, sensibly shaped
+    /// deck. Everything the draft heuristics do above that is quality of play.
+    ///
+    /// Run WITHOUT a card database, which is the worst case and now a reachable
+    /// one: `resumeDraftingAfterRestore` fails open on a card-data fetch, so a
+    /// pod whose fetch failed drafts in exactly this degraded mode. If the deck
+    /// is playable here it is playable with the database too.
+    ///
+    /// DELIBERATELY NOT ASSERTED HERE: that the deck is focused on two colours,
+    /// and that the same pool builds the same deck twice. Both hold only once
+    /// `find_best_colors` sorts on a total order -- it sorts on score alone, and
+    /// `rarity_prior` scores a common at 0.0, so without a card database every
+    /// colour holding no rare or uncommon ties at exactly 0.0 and the second
+    /// colour falls out of `HashMap` iteration order. That is a defect in the
+    /// deckbuilding suggester, which is shared by every draft kind and is not
+    /// Winston's to fix; it is carried in its own change. The three claims
+    /// below are the ones that hold either way, measured green over 13 runs.
+    #[test]
+    fn a_bot_that_drafted_a_whole_winston_pod_can_build_a_playable_deck() {
+        let session = winston_drafted_by_bots(None);
+
+        for seat in 0..2usize {
+            let pool = &session.pools[seat];
+            // Reach guard: the draft really dealt this seat a pool to build from.
+            assert!(
+                pool.len() >= 40,
+                "seat {seat} drafted {} cards, which is not a limited pool",
+                pool.len()
+            );
+
+            let deck = suggest::suggest_deck(
+                pool,
+                AiDifficulty::Medium,
+                None,
+                session.config.min_deck_size,
+                0,
+                &session.config.addable_cards,
+            );
+
+            let basics: u32 = deck.lands.values().map(|count| u32::from(*count)).sum();
+            let spells = deck.main_deck.len() as u32;
+
+            // (1) LEGAL. CR 100.2b: a limited deck is at least 40 cards, and the
+            // engine's own `validate_limited_deck` counts spells plus basics.
+            assert!(
+                spells + basics >= session.config.min_deck_size as u32,
+                "seat {seat}: {spells} spells + {basics} basics is short of 40"
+            );
+
+            // (2) CASTABLE. Every colour the chosen spells need is produced by a
+            // basic the suggester actually added. A deck with red spells and no
+            // Mountains is legal and unplayable, which is the distinction this
+            // whole test exists to draw.
+            let needed: std::collections::HashSet<&str> = deck
+                .main_deck
+                .iter()
+                .filter_map(|name| fixture_color(name))
+                .collect();
+            let produced: std::collections::HashSet<&str> = deck
+                .lands
+                .iter()
+                .filter(|(_, count)| **count > 0)
+                .filter_map(|(name, _)| match name.as_str() {
+                    "Plains" => Some("W"),
+                    "Island" => Some("U"),
+                    "Swamp" => Some("B"),
+                    "Mountain" => Some("R"),
+                    "Forest" => Some("G"),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                needed.is_subset(&produced),
+                "seat {seat}: spells need {needed:?} but the manabase produces {produced:?}"
+            );
+
+            // (3) A DECK, not a pile of lands. A 40-card limited deck is about
+            // seventeen lands and twenty-three spells; this floor is deliberately
+            // well below that, because the claim is playability and not quality.
+            assert!(
+                spells >= 15,
+                "seat {seat}: {spells} spells is a land pile, not a deck"
+            );
+        }
+    }
+
     fn started_winston_session() -> DraftSession {
         let source = DraftSource::single_set("TST".to_string());
         let config = DraftConfig {

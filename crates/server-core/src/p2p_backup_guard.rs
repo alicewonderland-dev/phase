@@ -86,7 +86,24 @@ const DRAFT_SESSION_JSON_KEY: &str = "draftSessionJson";
 /// THE ONE PLACE THE ANSWER LIVES. Extend this constant rather than adding a
 /// bespoke `session.remove(...)` beside it — a bespoke removal leaves the next
 /// field to the next incident.
-const NESTED_DRAFT_SECRET_KEYS: &[&str] = &["packs_by_seat", "shared_stack"];
+///
+/// What each one is, since "secret" is doing a lot of work:
+///   * `packs_by_seat` — the boosters a seat still has to open.
+///   * `shared_stack` — the whole Winston state, whose `main_stack` IS the
+///     face-down draw order every pile is dealt from.
+///   * `pools` — EVERY SEAT'S DRAFTED CARDS. A pool is private in every draft
+///     kind, and under a shared stack it is the format's central secret: the
+///     opponent's pool is what a Winston player is guessing at all draft. The
+///     row is reachable by anyone who can derive the host peer id, which a
+///     guest in the pod can, so echoing it hands an opponent the answer.
+///   * `current_pack` — the booster a seat is looking at right now, which in a
+///     pick-and-pass draft is the pick they are about to make.
+///
+/// This list is what makes the public copy NON-RESUMABLE, deliberately. The
+/// authoritative, resumable snapshot is the host's own IndexedDB copy; see the
+/// note on `validate_persisted_snapshot` in `draft-core`.
+const NESTED_DRAFT_SECRET_KEYS: &[&str] =
+    &["packs_by_seat", "shared_stack", "pools", "current_pack"];
 
 /// Remove session credentials from a host backup snapshot JSON blob.
 ///
@@ -377,6 +394,8 @@ mod tests {
             "kind": "Winston",
             "config": { "rng_seed": 42, "pod_size": 2 },
             "packs_by_seat": [[{"card_id": "secret-pack"}]],
+            "pools": [[{"instance_id": "secret-own-pool"}], [{"instance_id": "secret-rival-pool"}]],
+            "current_pack": [[{"instance_id": "secret-open-pack"}], null],
             "shared_stack": {
                 "main_stack": [{"instance_id": "secret-draw-order"}],
                 "piles": [[], [], []],
@@ -408,6 +427,23 @@ mod tests {
             assert_eq!(nested_out["config"]["rng_seed"], 0);
             // The new leg.
             assert!(nested_out.get("shared_stack").is_none());
+            // A POOL IS PRIVATE IN EVERY KIND, and under a shared stack the
+            // opponent's pool is what the whole format is a guess at. This row
+            // is reachable by anyone who can derive the host peer id, which a
+            // guest in the pod can.
+            assert!(nested_out.get("pools").is_none());
+            assert!(nested_out.get("current_pack").is_none());
+            // Whole-payload sentinel: no secret card id survives anywhere in
+            // the projection, whatever shape it took.
+            for secret in [
+                "secret-draw-order",
+                "secret-own-pool",
+                "secret-rival-pool",
+                "secret-open-pack",
+                "secret-pack",
+            ] {
+                assert!(!redacted.contains(secret), "{secret} survived redaction");
+            }
             // Untouched fields survive, so this is not a blanket wipe.
             assert_eq!(nested_out["status"], "Drafting");
             assert_eq!(nested_out["kind"], "Winston");

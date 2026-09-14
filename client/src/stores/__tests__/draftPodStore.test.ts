@@ -194,6 +194,37 @@ describe("draftPodStore", () => {
       expect(state.configError).toBe("wasm unavailable");
     });
 
+    it("drops a chaos selection when the entered kind shares one stack", async () => {
+      // The host arranged a Chaos pod under a pick-and-pass kind, then changed
+      // the kind. Nothing in the UI can reach `setSetDraftMode` again on the
+      // way through, so publication is where the stale intent has to go.
+      useDraftPodStore.getState().setSetDraftMode("chaos");
+      expect(useDraftPodStore.getState().setDraftMode).toBe("chaos");
+      mocks.draftProcedure.mockResolvedValue({
+        ...procedure(2),
+        min_pod_size: 2,
+        max_pod_size: 4,
+        allowed_pod_sizes: [2, 3, 4],
+        distribution: { SharedStackPiles: { pile_count: 3 } },
+      });
+
+      await useDraftPodStore.getState().enterKind("Winston");
+
+      expect(useDraftPodStore.getState().config.kind).toBe("Winston");
+      expect(useDraftPodStore.getState().setDraftMode).toBe("uniform");
+    });
+
+    it("keeps a chaos selection for a kind that passes packs", async () => {
+      // The paired positive for the row above, through the SAME entry point:
+      // publication normalizes on the distribution, not on every entry.
+      useDraftPodStore.getState().setSetDraftMode("chaos");
+      mocks.draftProcedure.mockResolvedValue(procedure(8));
+
+      await useDraftPodStore.getState().enterKind("Premier");
+
+      expect(useDraftPodStore.getState().setDraftMode).toBe("chaos");
+    });
+
     it("uses the procedure distribution to select a set pool", async () => {
       // The kind is deliberately not the old all-at-once kind. This proves the
       // client follows the engine-published distribution rather than inferring
@@ -360,6 +391,29 @@ describe("draftPodStore", () => {
       useDraftPodStore.getState().setPoolMode("cube");
 
       expect(useDraftPodStore.getState().poolMode).toBe("set");
+    });
+
+    it("does not allow a chaos selection when the procedure shares one stack", () => {
+      // Paired positive FIRST, on the same action and the same store: a
+      // pick-and-pass distribution keeps the host's chaos intent, so the
+      // refusal below is the distribution's doing and not the action's.
+      useDraftPodStore.setState({ packDistribution: "PickAndPass", setDraftMode: "uniform" });
+      useDraftPodStore.getState().setSetDraftMode("chaos");
+      expect(useDraftPodStore.getState().setDraftMode).toBe("chaos");
+
+      // A shared stack shuffles every booster together before the first
+      // decision, so a per-(seat, round) set assignment describes nothing the
+      // players can observe — and `DraftProcedure::validate_source` refuses
+      // the pair outright. The engine's pile count is carried through rather
+      // than invented: this is the tagged member, not a kind name.
+      useDraftPodStore.setState({
+        packDistribution: { SharedStackPiles: { pile_count: 3 } },
+        setDraftMode: "uniform",
+      });
+
+      useDraftPodStore.getState().setSetDraftMode("chaos");
+
+      expect(useDraftPodStore.getState().setDraftMode).toBe("uniform");
     });
   });
 

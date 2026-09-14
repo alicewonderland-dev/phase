@@ -2,6 +2,7 @@
   "intro": {
     "quickTitle": "Quick Draft",
     "podTitle": "Pod Draft",
+    "winstonTitle": "Winston Draft",
     "commanderTitle": "Commander Draft",
     "subtitle": "Voici comment ça fonctionne",
     "startDrafting": "Commencer le draft",
@@ -21,7 +22,11 @@
       "minimumDeckCards_one": "{{count, number}} carte",
       "minimumDeckCards_few": "{{count, number}} cartes",
       "minimumDeckCards_many": "{{count, number}} cartes",
-      "minimumDeckCards_other": "{{count, number}} cartes"
+      "minimumDeckCards_other": "{{count, number}} cartes",
+      "pilesDealt_one": "{{count, number}} tas d'une carte",
+      "pilesDealt_few": "{{count, number}} tas d'une carte",
+      "pilesDealt_many": "{{count, number}} tas d'une carte",
+      "pilesDealt_other": "{{count, number}} tas d'une carte"
     },
     "packPassing_one": "Ce draft ne comporte qu'une seule manche de boosters, donc le sens de passage n'alterne pas",
     "packPassing_few": "Le sens de passage change à chaque manche",
@@ -38,6 +43,13 @@
       "step2": "Ouvrez {{packs}} ; chaque booster contient {{cardsPerPack}} — choisissez une carte, puis passez le reste",
       "step2Mixed": "Ouvrez {{packs}} de tailles différentes, dans cet ordre : {{packSizes, list}} — choisissez une carte, puis passez le reste",
       "step4": "Après le draft, construisez un deck d'au moins {{minimumDeckCards}} et jouez des matchs de tournoi"
+    },
+    "winston": {
+      "step2": "Les {{packs}} de chaque joueur sont ouverts sans que personne ne les regarde, et toutes les cartes sont mélangées en une seule pile face cachée",
+      "step2Mixed": "Les {{packs}} de tailles différentes de chaque joueur, dans cet ordre : {{packSizes, list}}, sont ouverts sans que personne ne les regarde et mélangés en une seule pile face cachée",
+      "step3": "{{piles}} sont distribués du dessus. À votre tour, regardez le premier tas : prenez-le, ou refusez-le et passez au suivant",
+      "step4": "Refuser place la carte du dessus de la pile sur le tas refusé. Refusez-les tous et vous prenez la carte du dessus de la pile sans la voir",
+      "step5": "Les tours alternent jusqu'à épuisement des cartes ; construisez ensuite un deck d'au moins {{minimumDeckCards}} et jouez des matchs de tournoi"
     },
     "commander": {
       "step2": "Ouvrez {{packs}} ; chaque booster contient {{cardsPerPack}} — choisissez deux cartes, puis passez le reste",
@@ -99,7 +111,11 @@
     "activePackCount_one": "{{count}} booster chez {{player}}",
     "activePackCount_few": "{{count}} boosters chez {{player}}",
     "activePackCount_many": "{{count}} boosters chez {{player}}",
-    "activePackCount_other": "{{count}} boosters chez {{player}}"
+    "activePackCount_other": "{{count}} boosters chez {{player}}",
+    "draftedCardCount_one": "{{count}} carte draftée par {{player}}",
+    "draftedCardCount_few": "{{count}} cartes draftées par {{player}}",
+    "draftedCardCount_many": "{{count}} cartes draftées par {{player}}",
+    "draftedCardCount_other": "{{count}} cartes draftées par {{player}}"
   },
   "setSelector": {
     "botDifficulty": "Difficulté des bots",
@@ -644,7 +660,17 @@
       "NoGuaranteedCard": "Refuser ne peut plus vous garantir une carte ce tour-ci : prendre ce tas est votre seul coup légal."
     },
     "refusalUnpublished": "Le draft n'a publié aucun verdict pour cette décision.",
-    "playFirstChooser": "{{name}} choisit qui joue en premier dans les parties qui suivent le draft."
+    "playFirstChooser": "{{name}} choisit qui joue en premier dans les parties qui suivent le draft.",
+    "scale": "Échelle des tas",
+    "scaleDecrease": "Réduire l'échelle des tas",
+    "scaleReset": "Réinitialiser l'échelle des tas",
+    "scaleIncrease": "Augmenter l'échelle des tas",
+    "faceDownStack_one": "{{count, number}} carte face cachée",
+    "faceDownStack_few": "{{count, number}} cartes face cachée",
+    "faceDownStack_many": "{{count, number}} cartes face cachée",
+    "faceDownStack_other": "{{count, number}} cartes face cachée",
+    "forcedDraw": "Vous avez refusé tous les tas, vous avez donc pioché {{name}} sur le dessus de la pile principale.",
+    "forcedDrawLabel": "Piochée sur la pile principale"
   },
   "lobby": {
     "title": "Salon du Draft Pod",

@@ -112,7 +112,10 @@ pub enum DraftKind {
 /// This is the axis the `kind == DraftKind::Sealed` equality tests were really
 /// testing. Consumers match on it exhaustively, so a new kind must *declare*
 /// which shape it uses instead of silently falling into an `else` branch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+// `Deserialize` as well as `Serialize` because the player view carries this
+// now, and every view type on this boundary round-trips: a persisted snapshot
+// and a peer's frame both parse back into the same struct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PackDistribution {
     /// Packs are opened one at a time and passed around the pod.
     /// CR 905.1a describes this shape (one card per step, pass the remainder).
@@ -332,7 +335,65 @@ impl DraftProcedure {
     pub fn pick_steps_per_pack(self, cards_per_pack: u8) -> u8 {
         cards_per_pack.div_ceil(self.cards_per_pick)
     }
+
+    /// Can this distribution express a per-`(seat, round)` set assignment?
+    ///
+    /// [`SetLayout::Chaos`] says two things at once: each booster is drawn from
+    /// its own set, and WHICH set reached WHICH `(seat, round)` stays private to
+    /// the host. Under [`PackDistribution::SharedStackPiles`] every booster is
+    /// opened unlooked-at and shuffled into one shared stack before the first
+    /// decision, so no seat ever holds the packs generated for it — the first
+    /// half of that statement names a distinction the shuffle has already
+    /// erased, and the second leaves the players unable to learn what pool they
+    /// are drafting. The same mixed pool remains available through
+    /// [`SetLayout::UniformByRound`], which states its sets openly and is what
+    /// a shared-stack pod takes.
+    ///
+    /// No CR: Winston Draft is a WotC casual format with no Comprehensive Rules
+    /// section. See [`PackDistribution::SharedStackPiles`].
+    ///
+    /// This is the SHAPE-ONLY half of [`Self::validate_source`], for an
+    /// admission boundary that holds a host's intent and has not resolved a
+    /// [`DraftSource`] yet — a server that asks here refuses before it draws
+    /// entropy and before it registers a lobby nothing could later start.
+    /// Exhaustive deliberately: a future distribution must decide this question
+    /// rather than inherit a permissive fallback.
+    pub fn allows_chaos_layout(self) -> bool {
+        match self.distribution {
+            PackDistribution::PickAndPass | PackDistribution::AllAtOnce => true,
+            PackDistribution::SharedStackPiles { .. } => false,
+        }
+    }
+
+    /// Refuse a resolved pack source this distribution cannot express.
+    ///
+    /// The whole-source half of [`Self::allows_chaos_layout`], which carries the
+    /// reasoning. A cube source generates packs exactly as a set source does and
+    /// names no seats, so every distribution takes one.
+    pub fn validate_source(self, source: &DraftSource) -> Result<(), DraftError> {
+        let layout = match source {
+            DraftSource::Set { layout } => layout,
+            DraftSource::Cube { .. } => return Ok(()),
+        };
+        match layout {
+            SetLayout::Chaos { .. } if !self.allows_chaos_layout() => {
+                Err(DraftError::InvalidSharedStackConfiguration {
+                    reason: CHAOS_LAYOUT_REFUSAL.to_string(),
+                })
+            }
+            SetLayout::Chaos { .. } | SetLayout::UniformByRound { .. } => Ok(()),
+        }
+    }
 }
+
+/// The one sentence every boundary that refuses a Chaos layout says.
+///
+/// Shared so the reducer's refusal and an admission boundary's pre-resolution
+/// refusal cannot drift into two different explanations of one rule. See
+/// [`DraftProcedure::allows_chaos_layout`].
+pub const CHAOS_LAYOUT_REFUSAL: &str =
+    "a shared-stack draft shuffles every booster into one stack, so it takes a named pack \
+     sequence rather than a Chaos assignment";
 
 /// The largest `DraftProcedure::cards_per_pick` over every `DraftKind`.
 ///
@@ -1258,6 +1319,35 @@ pub struct SharedStackState {
     /// unreleased upstream.
     #[serde(default)]
     pub history: Vec<SharedStackDecisionRecord>,
+    /// Per seat, the card that seat's most recent FORCED DRAW gave it, retained
+    /// until that seat decides again. `None` for a seat that has not taken one
+    /// since its last decision. Indexed by seat; length is the pod size.
+    ///
+    /// THE ONE CARD A PLAYER RECEIVES WITHOUT SEEING IT. Every other card a
+    /// seat drafts was face up in the pile it took, so the seat watched it
+    /// arrive; the card a final-pile decline draws off the top of the main
+    /// stack is, by the format's own rule, taken "no matter what it is" --
+    /// sight unseen. Without a record of it the player is never told what they
+    /// got, and could only find it by hunting their pool for a card they do not
+    /// remember.
+    ///
+    /// STORED rather than derived, and the near-miss is instructive: a client
+    /// CAN diff its pool across the acknowledgement and find the added card,
+    /// but that makes the display layer compute a fact about the game, and it
+    /// answers nothing for a view that arrives any other way -- a reconnect, a
+    /// restored snapshot, or the host deciding for a timed-out seat. The engine
+    /// knows which card it drew; nobody else should have to work it out.
+    ///
+    /// NOT PUBLIC, unlike every other field on this type. This is the only
+    /// shared-stack state that is private to ONE seat: the drawn card goes
+    /// straight into that seat's pool, and a pool is not public. The projection
+    /// (`view::shared_stack_view`) publishes a seat's entry to that seat alone.
+    ///
+    /// `#[serde(default)]` so a snapshot persisted before this field existed
+    /// loads with no pending notices rather than failing `import_draft_session`;
+    /// `validate_persisted_snapshot` then holds it to the pod's seat count.
+    #[serde(default)]
+    pub forced_draws: Vec<Option<DraftCardInstance>>,
 }
 
 /// Take the pile, or put it back.

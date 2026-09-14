@@ -31,9 +31,14 @@ import {
   appendWorkspaceInstanceToResolvedDestination,
   createDraftWorkspaceState,
   makeInteractiveVirtualBasicInstanceId,
+  placeArrivingPoolCards,
   reconcileWorkspaceState,
   updateWorkspacePlacement,
 } from "../components/draft/workspace/workspacePlacement";
+import {
+  loadDraftWorkspacePreferences,
+  type DraftBoardPreferences,
+} from "../components/draft/workspace/workspacePreferences";
 import {
   addVirtualBasic,
   countProjectedNames,
@@ -665,6 +670,70 @@ function publishWorkspace(workspace: DraftWorkspaceState): Promise<void> {
   );
 }
 
+/**
+ * The deck board's sort and geometry, as the player has them set right now.
+ *
+ * Module state rather than store state, and deliberately so: it is a
+ * PRESENTATION preference that lives in `localStorage` and belongs to the page,
+ * not a piece of draft state any view publishes. What it is needed for here is
+ * narrow — cards arrive in the pool on paths that resolve no placement of their
+ * own (a shared-stack take collects a whole pile; a timed-out seat's decision is
+ * applied by the host and broadcast), and those cards have to land in the column
+ * the board's sort means rather than all in column 0.
+ *
+ * Seeded from the player's STORED preferences, not from the module defaults,
+ * and the difference is not cosmetic. On a resume or a rejoin the first
+ * `viewUpdated` is what flips `phase` to `"drafting"`, which is what mounts the
+ * page component that publishes this value — and React effects run after that
+ * render, so the first `placeArrivingPoolCards` call happens BEFORE the page
+ * can say anything. On that first call `unplacedPoolIds` returns the WHOLE
+ * restored pool, and the layout it produces is the one that gets published and
+ * persisted. Seeded from the defaults, a player who drafts by colour across
+ * five columns would find their entire resumed pool laid out by mana value
+ * across seven, with only later arrivals placed correctly.
+ *
+ * The page's effect then carries in-session changes, which is what it is for.
+ */
+/**
+ * Pool cards the workspace had no placement for BEFORE this reconcile.
+ *
+ * The question "which cards are new" asked structurally rather than by diffing
+ * two pools. A pool diff answers it for a card that arrived between two views,
+ * but not for the first view of a lifecycle — a reconnect, a resume, a restored
+ * session — where there is no earlier pool and every card is new. Both cases
+ * are the same question: `reconcileWorkspaceState` is about to invent a
+ * default placement for exactly these ids, and this is the list it will invent
+ * them for.
+ *
+ * A workspace restored with the player's own saved placements therefore yields
+ * an empty list and nothing is re-sorted, which is the right answer: their
+ * layout wins.
+ */
+function unplacedPoolIds(
+  workspace: DraftWorkspaceState | null,
+  pool: DraftPlayerView["pool"],
+): string[] {
+  if (workspace === null) return pool.map((card) => card.instance_id);
+  return pool
+    .filter((card) => workspace.placements[card.instance_id] === undefined)
+    .map((card) => card.instance_id);
+}
+
+let arrivingCardBoardPreferences: DraftBoardPreferences =
+  loadDraftWorkspacePreferences().deck;
+
+/**
+ * Tell this module which columns the deck board currently means.
+ *
+ * A module function rather than a store action, because the value is not draft
+ * state: no view publishes it, nothing is persisted with it, and a mocked store
+ * in a test has no business carrying it. The page calls this whenever the
+ * player's board preferences load or change.
+ */
+export function setArrivingCardBoardPreferences(preferences: DraftBoardPreferences): void {
+  arrivingCardBoardPreferences = preferences;
+}
+
 function installWorkspace(input: {
   view: DraftPlayerView;
   base: DraftWorkspaceState;
@@ -950,9 +1019,19 @@ async function performSharedStackDecision(
     }
     exclusivePickToken = null;
     pendingGuestPick = null;
+    // A take collects a WHOLE PILE the engine chose the contents of, so unlike a
+    // pick there was no card to resolve a placement for before dispatching.
+    // Placed here, or every card this format delivers would stack in the
+    // board's first column.
     installWorkspace({
       view: acknowledgedView,
-      base: reconcileWorkspaceState(state.workspaceState, acknowledgedView.pool),
+      base: placeArrivingPoolCards(
+        reconcileWorkspaceState(state.workspaceState, acknowledgedView.pool),
+        unplacedPoolIds(state.workspaceState, acknowledgedView.pool),
+        acknowledgedView.pool,
+        acknowledgedView.pool_groups,
+        arrivingCardBoardPreferences,
+      ),
       publish: true,
       patch: {
         phase: phaseForDraftViewStatus(acknowledgedView.status),
@@ -3047,7 +3126,18 @@ function installEventView(view: DraftPlayerView): void {
   const restored = restoredWorkspace?.generation === lifecycleGeneration ? restoredWorkspace : null;
   restoredWorkspace = null;
   const base = restored?.state ?? state.workspaceState ?? createDraftWorkspaceState();
-  const workspace = reconcileWorkspaceState(base, view.pool);
+  // Cards can arrive on this path with no placement resolved for them: the host
+  // decides for a timed-out seat and broadcasts the result, a guest receives
+  // every one of its own shared-stack takes this way, and a reconnect or a
+  // resume arrives holding a whole pool at once. Same treatment as the decision
+  // path, for the same reason — otherwise they land in column 0.
+  const workspace = placeArrivingPoolCards(
+    reconcileWorkspaceState(base, view.pool),
+    unplacedPoolIds(base, view.pool),
+    view.pool,
+    view.pool_groups,
+    arrivingCardBoardPreferences,
+  );
   const publish = restored !== null
     ? (restored.state === null ? view.pool.length > 0 : workspace !== base)
     : workspace !== state.workspaceState;
@@ -3172,6 +3262,14 @@ function handleHostEvent(event: DraftPodHostEvent, set: SetFn): void {
       // Informational — standings update comes via viewUpdated
       break;
     case "timerExpired":
+      set({ timerRemainingMs: null });
+      break;
+    case "timerTick":
+      // The host's own clock. A guest receives this reading over
+      // `draft_timer_sync`; the host has no session to receive it on, so the
+      // adapter hands it straight to this store. Without it the host cannot see
+      // a countdown that, under a shared stack, takes the pile when it expires.
+      set({ timerRemainingMs: event.remainingMs > 0 ? event.remainingMs : null });
       break;
     case "error":
       set({ error: event.message });

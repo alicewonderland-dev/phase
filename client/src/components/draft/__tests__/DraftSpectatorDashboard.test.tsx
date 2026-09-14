@@ -13,6 +13,7 @@ function seat(seat_index: number, display_name: string, pick_status: SeatPublicV
     has_submitted_deck: false,
     pick_status,
     active_pack_count: 0,
+    drafted_card_count: 0,
     face_up_draft_cards: [],
   };
 }

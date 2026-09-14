@@ -16,7 +16,7 @@
 
 import { create } from "zustand";
 
-import { DraftAdapter, distinctJoined, setPackSequence, type CubeDraftSettings, type DraftProcedure, type PackDistribution, type PoolInput, type SetPackSequence, type TournamentFormat, type PodPolicy } from "../adapter/draft-adapter";
+import { DraftAdapter, distinctJoined, isSharedStackDistribution, setPackSequence, type CubeDraftSettings, type DraftProcedure, type PackDistribution, type PoolInput, type SetPackSequence, type TournamentFormat, type PodPolicy } from "../adapter/draft-adapter";
 import type { DraftPackChoice } from "./draftStore";
 import type { DraftPodHostConfig } from "../adapter/draftPodHostAdapter";
 import type { DraftPodGuestConfig } from "../adapter/draftPodGuestAdapter";
@@ -294,6 +294,25 @@ function procedureCache(
   };
 }
 
+/**
+ * The set-to-booster mapping a distribution can actually express.
+ *
+ * A `Chaos` pod draws each `(seat, round)` booster from its own set and keeps
+ * the draw private. `SharedStackPiles` shuffles every booster into one stack
+ * before the first decision, so no seat holds the packs generated for it and
+ * nothing distinguishes the result from a mixed pool — except that the players
+ * cannot see which sets they are drafting. The engine refuses the pair
+ * (`DraftProcedure::validate_source`); this keeps the setup page from offering
+ * a choice that refusal would reject, and is the same dispatch on the same
+ * engine-published discriminant the Cube tab already uses for `AllAtOnce`.
+ */
+function setDraftModeFor(
+  distribution: PackDistribution | null,
+  requested: SetDraftMode,
+): SetDraftMode {
+  return isSharedStackDistribution(distribution) ? "uniform" : requested;
+}
+
 function procedurePublication(
   prev: DraftPodState,
   procedure: DraftProcedure,
@@ -313,6 +332,7 @@ function procedurePublication(
       : { ...prev.config, podSize },
     pendingProcedureDefault: adoptsProcedureDefault ? null : prev.pendingProcedureDefault,
     poolMode: procedure.distribution === "AllAtOnce" ? "set" : prev.poolMode,
+    setDraftMode: setDraftModeFor(procedure.distribution, prev.setDraftMode),
     loadingPool: false,
     configError: null,
   };
@@ -471,7 +491,10 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
     },
 
     setSetDraftMode: (setDraftMode) => {
-      set({ setDraftMode, configError: null });
+      set((prev) => ({
+        setDraftMode: setDraftModeFor(prev.packDistribution, setDraftMode),
+        configError: null,
+      }));
     },
 
     setCubeForm: (form) => {

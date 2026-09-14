@@ -116,8 +116,16 @@ pub fn piles_needed(pile_count: u8) -> Result<usize, DraftError> {
 /// instant it is taken, so while the main stack is non-empty every pile is
 /// non-empty, and a pile can only be empty if the stack was already empty when
 /// that pile was last taken (the stack never grows). With `stack > 0` a take is
-/// always available; with `stack == 0` the decline predicate only lets the
-/// cursor advance onto a pile it has already proved non-empty.
+/// always available; with `stack == 0` the decline predicate maintains
+/// "SOME pile at or after the cursor is non-empty" across every advance, and at
+/// the final pile that existential collapses to the final pile itself -- so a
+/// take is available there.
+///
+/// State the invariant as the EXISTENTIAL, not as "the next pile is non-empty":
+/// the predicate lets the cursor advance from pile 0 to pile 1 when only pile 2
+/// holds cards, so `piles[1]` can legally be empty at the cursor. Weakening the
+/// predicate to a next-pile test would look like it preserved this proof and
+/// would not.
 pub fn refusal_for(
     state: &SharedStackState,
     seat: u8,
@@ -227,6 +235,23 @@ pub fn apply_shared_stack_decision(
     // deciding seat had inspected.
     let pile_size = state.piles[pile_index].len();
 
+    // GROW BEFORE WRITING, so a snapshot that predates the field becomes a
+    // session that records notices rather than one that silently never will.
+    // `forced_draws` carries `#[serde(default)]`, and
+    // `validate_persisted_snapshot` therefore ACCEPTS an empty vector as "no
+    // seat has a pending notice" — but nothing else would ever resize it, and a
+    // `get_mut` on an empty vector no-ops forever. This is the one write path
+    // every decision takes, so it is where the migration belongs. A vector
+    // already the right length is untouched.
+    state.forced_draws.resize(usize::from(seat_count), None);
+    // This seat is acting again, so whatever its last forced draw was, it has
+    // now been seen -- or was never going to be. Cleared BEFORE the `match`, so
+    // the forced-draw arm below can write this turn's card into a slot it knows
+    // is empty rather than racing its own clear.
+    if let Some(pending) = state.forced_draws.get_mut(usize::from(seat)) {
+        *pending = None;
+    }
+
     let turn_ends = match decision {
         // WotC: "Each time a player takes a pile, it's replaced by the top card
         // of the main stack to form a new one-card pile."
@@ -262,6 +287,14 @@ pub fn apply_shared_stack_decision(
                 // before the pop above, so one card remains here; the `if let`
                 // keeps the reducer panic-free rather than asserting it.
                 if let Some(card) = state.main_stack.pop() {
+                    // Recorded before the move into the pool, because this is
+                    // the ONE card this seat receives without having seen it:
+                    // the format takes it "no matter what it is". Every other
+                    // card a seat drafts was face up in the pile it took. See
+                    // `SharedStackState::forced_draws`.
+                    if let Some(pending) = state.forced_draws.get_mut(usize::from(seat)) {
+                        *pending = Some(card.clone());
+                    }
                     pool.push(card);
                 }
                 true
@@ -315,8 +348,10 @@ pub fn apply_shared_stack_decision(
         // and belong to nobody, so the engine never re-publishes a previous
         // turn's prefix. First write site of the `inspected` contract.
         state.inspected.iter_mut().for_each(|seen| *seen = 0);
-        // Index 0 exists because `piles_needed` refused a zero-pile row at
-        // `StartDraft`, which is the only way a session gets a stack.
+        // Index 0 exists on both paths a session can arrive by: `StartDraft`
+        // refuses a zero-pile row through `piles_needed`, and an imported
+        // snapshot is held to `piles.len() == piles_needed(pile_count)` by
+        // `validate_persisted_snapshot`.
         state.inspected[0] = state.piles[0].len();
     }
 
@@ -415,6 +450,18 @@ mod tests {
             },
             None,
         )
+    }
+
+    /// Decline every pile, which is the only way a seat drafts a card it has
+    /// not seen. Returns the seat that took the forced draw.
+    fn decline_through_the_forced_draw(session: &mut DraftSession) -> u8 {
+        let seat = state(session).active_seat;
+        let piles = state(session).piles.len();
+        for _ in 0..piles {
+            decide(session, SharedStackPileDecision::Decline)
+                .expect("declining a pile with a later pile or a stocked stack behind it");
+        }
+        seat
     }
 
     /// Total cards across the stack, every pile and every pool. Models
@@ -1460,5 +1507,89 @@ mod tests {
             "the history's share of a view is bounded: {} B",
             full_view_bytes - empty_view_bytes
         );
+    }
+
+    /// The card a final-pile decline draws is the ONE card a seat receives
+    /// without seeing it, so the engine records which card that was.
+    ///
+    /// The paired negative is the whole point: a `Take` leaves no notice,
+    /// because the cards a take collects were face up in the pile the seat was
+    /// looking at. A test that only asserted the positive would pass against a
+    /// reducer that recorded every card a seat ever drafted.
+    #[test]
+    fn a_forced_draw_records_the_card_the_seat_never_saw() {
+        let mut session = started(2, 20_260_913);
+
+        // Paired negative FIRST: a take is not a forced draw.
+        decide(&mut session, SharedStackPileDecision::Take).expect("taking pile 0");
+        assert!(
+            state(&session).forced_draws.iter().all(Option::is_none),
+            "a take collects cards the seat was already looking at"
+        );
+
+        // The pool BEFORE the declining turn. Deliberately not "the top of the
+        // stack before the turn": the three declines each pop a card onto the
+        // pile they refuse, so the card the fourth pop draws is four deep at
+        // this point. Reading the pool instead asks the question that actually
+        // matters — did the notice name the card this seat received — without
+        // re-implementing the reducer's draw order in the assertion.
+        let seat = state(&session).active_seat;
+        let pool_before: Vec<String> = session.pools[usize::from(seat)]
+            .iter()
+            .map(|card| card.instance_id.clone())
+            .collect();
+        let stack_before: Vec<String> = state(&session)
+            .main_stack
+            .iter()
+            .map(|card| card.instance_id.clone())
+            .collect();
+        assert_eq!(seat, decline_through_the_forced_draw(&mut session));
+
+        let gained: Vec<&DraftCardInstance> = session.pools[usize::from(seat)]
+            .iter()
+            .filter(|card| !pool_before.contains(&card.instance_id))
+            .collect();
+        assert_eq!(gained.len(), 1, "a declining turn drafts exactly one card");
+        let recorded = state(&session).forced_draws[usize::from(seat)]
+            .as_ref()
+            .expect("a final-pile decline draws, so it records");
+        assert_eq!(recorded.instance_id, gained[0].instance_id);
+        // And it came off the stack, rather than out of a pile: the whole point
+        // is that nobody had looked at it.
+        assert!(stack_before.contains(&recorded.instance_id));
+        assert!(!state(&session)
+            .main_stack
+            .iter()
+            .any(|card| card.instance_id == recorded.instance_id));
+        // Only the seat that drew has a notice.
+        assert!(state(&session)
+            .forced_draws
+            .iter()
+            .enumerate()
+            .all(|(index, pending)| (index == usize::from(seat)) == pending.is_some()));
+    }
+
+    /// A notice survives the turn that produced it — the player has to be able
+    /// to read it after their turn ends — and is cleared by that seat's NEXT
+    /// decision, not by the opponent's.
+    #[test]
+    fn a_forced_draw_notice_outlives_the_turn_and_ends_at_the_seats_next_decision() {
+        let mut session = started(2, 20_260_913);
+        let seat = decline_through_the_forced_draw(&mut session);
+        assert!(state(&session).forced_draws[usize::from(seat)].is_some());
+
+        // The opponent's whole turn passes. The notice is still there, which is
+        // what makes it readable at all: by now the active seat is not its owner.
+        assert_ne!(state(&session).active_seat, seat);
+        decide(&mut session, SharedStackPileDecision::Take).expect("the opponent takes a pile");
+        assert_eq!(state(&session).active_seat, seat);
+        assert!(
+            state(&session).forced_draws[usize::from(seat)].is_some(),
+            "the notice must outlive the turn that produced it"
+        );
+
+        // The owner acts again, so the notice has served its purpose.
+        decide(&mut session, SharedStackPileDecision::Take).expect("the owner takes a pile");
+        assert!(state(&session).forced_draws[usize::from(seat)].is_none());
     }
 }

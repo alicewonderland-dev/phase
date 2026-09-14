@@ -188,6 +188,36 @@ import type {
  *       engine-built on every frame and a client never constructs one. Other
  *       kinds stay unaffected for the reason above: no non-Winston view
  *       carries a `shared_stack` at all.
+ *
+ *       AMENDED IN PLACE AGAIN, for the same reason and on the same evidence
+ *       (30 is unreleased upstream; upstream is 29, so no peer has ever spoken
+ *       a 30 without these):
+ *         • `shared_stack.forced_draw` — the card the VIEWER's own final-pile
+ *           decline drew, or null. The one private field on a `SharedStackView`
+ *           and the only one that names a card off the face-down stack; the
+ *           engine sends it to that seat alone, never to the opponent and never
+ *           to either spectator visibility.
+ *         • `seats[*].drafted_card_count` — how many cards each seat has
+ *           drafted. Unlike everything else in 30 this is NOT Winston-scoped:
+ *           it rides every kind's public seat list. It is a count and never an
+ *           identity, and it is already public in every kind (a pick-and-pass
+ *           seat's total follows from the pick number; a shared stack's is
+ *           visible across the table).
+ *         • `DraftPlayerView.distribution` — how the procedure delivers
+ *           boosters to seats. Like `drafted_card_count` this is NOT
+ *           Winston-scoped: it is a required field on every kind's player
+ *           view, which crosses this wire in `draft_welcome`,
+ *           `draft_reconnect_ack`, `draft_state_update` and `draft_pick_ack`.
+ *           Published for the same reason `launch_capability` is, and
+ *           deliberately not status-gated, so a surface that outlives the
+ *           drafting phase can still tell a pile pod from a passing one.
+ *       Of these, only `SharedStackState::forced_draws` carries
+ *       `#[serde(default)]` — it is the one that rides a persisted snapshot.
+ *       `drafted_card_count` and `distribution` carry no serde attribute and
+ *       need none: they live on view types the engine builds fresh for every
+ *       frame and never deserializes from an older snapshot. All three
+ *       TypeScript mirrors are REQUIRED rather than optional, for that same
+ *       reason — a client never constructs one of these views.
  */
 export const DRAFT_PROTOCOL_VERSION = 30 as const;
 
@@ -1014,9 +1044,17 @@ function normalizeSeatPublicView(raw: unknown): SeatPublicView {
   ) {
     throw new Error("Invalid draft message: active_pack_count must be an integer 0 or 1");
   }
+  // Bounded only as a non-negative integer, unlike `active_pack_count`'s exact
+  // 0-or-1: this is a real count with no product ceiling. A cube shared-stack
+  // pod's per-seat total rises with the host's own `cards_per_pack`, so any
+  // fixed bound written here would be a second, wrong authority on pool size.
+  if (!Number.isInteger(seat.drafted_card_count) || (seat.drafted_card_count as number) < 0) {
+    throw new Error("Invalid draft message: drafted_card_count must be a non-negative integer");
+  }
   return {
     ...seat,
     active_pack_count: seat.active_pack_count,
+    drafted_card_count: seat.drafted_card_count,
     face_up_draft_cards: normalizeArrayField(seat, "face_up_draft_cards"),
   } as SeatPublicView;
 }

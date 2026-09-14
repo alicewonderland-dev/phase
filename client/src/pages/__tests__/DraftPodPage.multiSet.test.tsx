@@ -238,4 +238,47 @@ describe("DraftPodPage host set selection", () => {
     ]);
     expect(poolInput.data).not.toHaveProperty("assignments");
   });
+
+  it("offers no chaos mode for a kind whose boosters share one stack", async () => {
+    // A shared stack opens every booster unlooked-at and shuffles them
+    // together before the first decision, so no seat holds the packs generated
+    // for it: the per-(seat, round) assignment a Chaos pod exists to express
+    // describes nothing the players can observe, and only hides which sets the
+    // pool is made of. `DraftProcedure::validate_source` refuses the pair, so
+    // the setup form must not offer it.
+    //
+    // The row directly above CLICKS this radio under the pick-and-pass
+    // procedure this suite's `beforeEach` publishes. That is the paired
+    // positive: the control exists, is reachable, and is labelled exactly this
+    // — so its absence here is the distribution's doing, not a renamed label
+    // or a form that failed to render.
+    mocks.draftProcedure.mockResolvedValue(draftProcedureFixture({
+      pod_size: 2,
+      human_seats: 2,
+      min_pod_size: 2,
+      max_pod_size: 4,
+      allowed_pod_sizes: [2, 3, 4],
+      packs_per_player: 3,
+      cards_per_pick: 1,
+      distribution: { SharedStackPiles: { pile_count: 3 } },
+      min_deck_size: 40,
+      match_config: { match_type: "Bo1" },
+    }));
+    const user = userEvent.setup();
+    await openHostSetup(user);
+
+    expect(screen.queryByRole("radio", { name: "Chaos Draft" })).toBeNull();
+    expect(screen.queryByRole("radio", { name: "Specific lineup" })).toBeNull();
+
+    // And the pod the host can still create is the named sequence, which is
+    // how a Winston pool says what it is made of.
+    await user.click(screen.getByRole("button", { name: /Add a pack of Innistrad/ }));
+    await user.click(screen.getByRole("button", { name: /Add a pack of Dark Ascension/ }));
+    await user.click(screen.getByRole("button", { name: "Create Pod" }));
+
+    await waitFor(() => expect(mocks.multiplayerState.hostDraft).toHaveBeenCalledOnce());
+    const poolInput = hostedPoolInput();
+    expect(poolInput.type).toBe("Set");
+    expect(poolInput.data.sequence).toEqual(["ISD", "DKA"]);
+  });
 });
