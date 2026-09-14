@@ -543,7 +543,7 @@
     "kindCommanderDraft": "Commander",
     "kindCommanderDraftDesc": "Cada jogador drafta duas cartas de cada vez e monta um deck Commander de 60 cartas; depois o pod joga uma partida multijogador.",
     "kindWinston": "Winston",
-    "kindWinstonDesc": "Dois jogadores draftam uma pilha compartilhada virada para baixo através de três montes: no seu turno, olhe um monte e pegue-o ou recuse e adicione uma carta a ele.",
+    "kindWinstonDesc": "De dois a quatro jogadores draftam uma pilha compartilhada virada para baixo através de três montes: no seu turno, olhe um monte e pegue-o ou recuse e adicione uma carta a ele.",
     "tournamentFormat": "Formato do Torneio",
     "tournamentSwiss": "Suíço",
     "tournamentSwissDesc": "Todos continuam jogando por três rodadas, mesmo após uma derrota.",

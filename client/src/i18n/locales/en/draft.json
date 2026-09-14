@@ -551,7 +551,7 @@
     "kindCommanderDraft": "Commander",
     "kindCommanderDraftDesc": "Each player drafts two cards at a time and builds a 60-card Commander deck, then the pod plays one multiplayer game.",
     "kindWinston": "Winston",
-    "kindWinstonDesc": "Two players draft one shared face-down stack through three piles: on your turn, look at a pile and take it or decline and add a card to it.",
+    "kindWinstonDesc": "Two to four players draft one shared face-down stack through three piles: on your turn, look at a pile and take it or decline and add a card to it.",
     "tournamentFormat": "Tournament Format",
     "tournamentSwiss": "Swiss",
     "tournamentSwissDesc": "Everyone keeps playing through three rounds, even after a loss.",

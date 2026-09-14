@@ -543,7 +543,7 @@
     "kindCommanderDraft": "Commander",
     "kindCommanderDraftDesc": "Każdy gracz draftuje po dwie karty naraz i buduje talię Commander z 60 kart, a potem grupa rozgrywa jedną grę wieloosobową.",
     "kindWinston": "Winston",
-    "kindWinstonDesc": "Dwóch graczy draftuje wspólny zakryty stos przez trzy kupki: w swojej turze obejrzyj kupkę i weź ją albo odmów i dołóż do niej kartę.",
+    "kindWinstonDesc": "Od dwóch do czterech graczy draftuje wspólny zakryty stos przez trzy kupki: w swojej turze obejrzyj kupkę i weź ją albo odmów i dołóż do niej kartę.",
     "tournamentFormat": "Format turnieju",
     "tournamentSwiss": "Szwajcarski",
     "tournamentSwissDesc": "Wszyscy grają przez trzy rundy, nawet po porażce.",

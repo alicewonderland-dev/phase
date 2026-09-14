@@ -1140,6 +1140,41 @@ export function placeArrivingPoolCards(
   return next;
 }
 
+/**
+ * Which of the two rows a card belongs in, preferring the ENGINE's answer.
+ *
+ * `workspace_row_classification` is published for exactly this question, and
+ * `resolveWorkspaceRow` is the reader every other placement path already goes
+ * through (drag resolution, reconcile, the sort pass). A regex over the printed
+ * type line is a second opinion that disagrees wherever the two differ -- an
+ * artifact creature, a Vehicle the engine is treating as a creature, a
+ * changeling -- and it used to decide the row here for every card, including
+ * every card arriving on a path that resolved no placement of its own: every
+ * shared-stack pile take, every timeout broadcast.
+ *
+ * THE ONE CASE THE ENGINE CANNOT ANSWER. `handleConfirmPick` resolves a
+ * placement for a card taken from `current_pack`, which by definition is not in
+ * `pool` yet and therefore not in `pool_groups` either -- the classification is
+ * published for the POOL. For that card the absence of an id from
+ * `creature_instance_ids` means "not yet classified", not "not a creature", and
+ * reading it as the latter sends every picked creature to the spell row. So
+ * membership in `pool` is the test for whether the engine has an opinion at all,
+ * and only a card it has never seen falls back to the printed type line.
+ */
+function twoRowPlacementRow(
+  card: DraftCardInstance,
+  pool: readonly DraftCardInstance[],
+  poolGroups: DraftPoolGroups,
+): number {
+  const engineKnowsCard = pool.some((entry) => entry.instance_id === card.instance_id);
+  if (engineKnowsCard) {
+    return poolGroups.workspace_row_classification.creature_instance_ids.includes(card.instance_id)
+      ? 0
+      : 1;
+  }
+  return /\bcreature\b/i.test(card.type_line) ? 0 : 1;
+}
+
 export function resolveWorkspacePickPlacement(
   card: DraftCardInstance,
   zone: DraftZone,
@@ -1148,9 +1183,7 @@ export function resolveWorkspacePickPlacement(
   workspace: DraftWorkspaceState,
   preferences: DraftBoardPreferences,
 ): { column: number; row?: number } {
-  const row = preferences.rows === "two"
-    ? (/\bcreature\b/i.test(card.type_line) ? 0 : 1)
-    : undefined;
+  const row = preferences.rows === "two" ? twoRowPlacementRow(card, pool, poolGroups) : undefined;
   const column = resolveWorkspaceSortColumn(
     card,
     zone,

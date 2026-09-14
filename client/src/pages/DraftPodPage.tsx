@@ -925,15 +925,20 @@ function DraftingPhaseContent({
     if (useMultiplayerDraftStore.getState().pickInteractionLocked) return;
     setWorkspacePreferences(next);
     saveDraftWorkspacePreferences(next);
+    // SYNCHRONOUSLY, not from an effect. Cards reach the pool on paths that
+    // resolve no placement of their own -- a shared-stack take collects a whole
+    // pile, a timed-out seat's decision is applied by the host and broadcast --
+    // so the store has to know which columns this board currently means. An
+    // effect runs after commit, and a `viewUpdated` landing in that window made
+    // `installEventView` place and publish the arrivals against the PREVIOUS
+    // columns. This is the only path that changes `deck`: the scale setters
+    // below spread `current` and touch one numeric field.
+    setArrivingCardBoardPreferences(next.deck);
   }, []);
-  // Cards reach the pool on paths that resolve no placement of their own — a
-  // shared-stack take collects a whole pile, and a timed-out seat's decision is
-  // applied by the host and broadcast — so the store needs to know which columns
-  // this board currently means. Published on mount and on every change, because
-  // the player can re-sort mid-draft and the next arrival must follow.
+  // Mount only. The change path publishes for itself, above.
   useEffect(() => {
-    setArrivingCardBoardPreferences(workspacePreferences.deck);
-  }, [workspacePreferences.deck]);
+    setArrivingCardBoardPreferences(loadDraftWorkspacePreferences().deck);
+  }, []);
   const setPackScale = useCallback((next: number) => {
     setWorkspacePreferences((current) => {
       const updated = { ...current, packScale: repairDraftWorkspacePackScale(next) };

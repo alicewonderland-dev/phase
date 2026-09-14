@@ -543,7 +543,7 @@
     "kindCommanderDraft": "Commander",
     "kindCommanderDraftDesc": "Chaque joueur drafte deux cartes à la fois et construit un deck Commander de 60 cartes, puis le pod joue une partie multijoueur.",
     "kindWinston": "Winston",
-    "kindWinstonDesc": "Deux joueurs draftent une pile commune face cachée répartie en trois tas : à votre tour, regardez un tas et prenez-le, ou refusez-le et ajoutez-y une carte.",
+    "kindWinstonDesc": "De deux à quatre joueurs draftent une pile commune face cachée répartie en trois tas : à votre tour, regardez un tas et prenez-le, ou refusez-le et ajoutez-y une carte.",
     "tournamentFormat": "Format du tournoi",
     "tournamentSwiss": "Suisse",
     "tournamentSwissDesc": "Tout le monde continue de jouer sur trois manches, même après une défaite.",

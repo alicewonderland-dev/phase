@@ -210,7 +210,7 @@ describe("DraftPodPage ?kind= mode entry", () => {
     await waitFor(() => expect(screen.getByRole("radio", { name: "Winston" })).toBeChecked());
     expect(
       screen.getByText(
-        "Two players draft one shared face-down stack through three piles: on your turn, look at a pile and take it or decline and add a card to it.",
+        "Two to four players draft one shared face-down stack through three piles: on your turn, look at a pile and take it or decline and add a card to it.",
       ),
     ).toBeInTheDocument();
   });

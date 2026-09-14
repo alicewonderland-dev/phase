@@ -543,7 +543,7 @@
     "kindCommanderDraft": "Commander",
     "kindCommanderDraftDesc": "Jeder Spieler draftet zwei Karten gleichzeitig und baut ein Commander-Deck mit 60 Karten; danach spielt der Pod eine Mehrspielerpartie.",
     "kindWinston": "Winston",
-    "kindWinstonDesc": "Zwei Spieler draften einen gemeinsamen verdeckten Stapel über drei Häufchen: Sieh dir in deinem Zug ein Häufchen an und nimm es oder lehne ab und lege eine Karte darauf.",
+    "kindWinstonDesc": "Zwei bis vier Spieler draften einen gemeinsamen verdeckten Stapel über drei Häufchen: Sieh dir in deinem Zug ein Häufchen an und nimm es oder lehne ab und lege eine Karte darauf.",
     "tournamentFormat": "Turnierformat",
     "tournamentSwiss": "Schweizer System",
     "tournamentSwissDesc": "Alle spielen drei Runden lang weiter, auch nach einer Niederlage.",

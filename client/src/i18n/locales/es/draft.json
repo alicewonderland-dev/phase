@@ -543,7 +543,7 @@
     "kindCommanderDraft": "Commander",
     "kindCommanderDraftDesc": "Cada jugador draftea dos cartas a la vez y construye un mazo Commander de 60 cartas; después el pod juega una partida multijugador.",
     "kindWinston": "Winston",
-    "kindWinstonDesc": "Dos jugadores draftean una pila compartida boca abajo mediante tres montones: en tu turno, mira un montón y tómalo o recházalo y añádele una carta.",
+    "kindWinstonDesc": "De dos a cuatro jugadores draftean una pila compartida boca abajo mediante tres montones: en tu turno, mira un montón y tómalo o recházalo y añádele una carta.",
     "tournamentFormat": "Formato de torneo",
     "tournamentSwiss": "Suizo",
     "tournamentSwissDesc": "Todos siguen jugando durante tres rondas, incluso tras una derrota.",

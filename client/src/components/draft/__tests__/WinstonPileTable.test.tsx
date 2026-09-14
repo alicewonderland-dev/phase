@@ -17,7 +17,14 @@ import { WinstonPileTable } from "../WinstonPileTable";
 
 // The image ladder is not what this surface is about, and resolving it would
 // reach the Scryfall service. Same stub the pack-display tests use.
-vi.mock("../../../hooks/useCardImage", () => ({
+// Partial: `importOriginal` keeps the module's other runtime exports
+// (`BoundedCache`, `useLocaleArt`) rather than replacing the module with two
+// functions. Nothing on this surface's current path reaches them, so this is
+// not a bug fix -- it is the mock contract the rest of the suite follows, and
+// the reason it is followed is that a bare factory turns "someone imported
+// another export" into an undefined-is-not-a-function at a distance.
+vi.mock("../../../hooks/useCardImage", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../hooks/useCardImage")>()),
   useCardImage: () => ({ src: null, isLoading: false }),
   // The face-down stacks resolve the shared public card back through the same
   // hook. Stubbed to "no art yet" so the backs render their vector fallback

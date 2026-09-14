@@ -317,6 +317,28 @@ function hostDraftSeed(): number {
 }
 
 /**
+ * A public draft code, drawn from its OWN randomness.
+ *
+ * DELIBERATELY NOT DERIVED FROM `hostDraftSeed()`. The code is public in the
+ * strongest sense available here: it keys the backup row in the URL
+ * (`/p2p-draft-backup/<code>`) and travels inside the backup body. The host
+ * seed is the opposite -- it orders the shared stack, and `main_stack`'s order
+ * "is the `rng_seed`'s secret" (`draft_core::types`), which is why
+ * `redactDraftSessionObject` zeroes `config.rng_seed` out of that very payload.
+ *
+ * A code built as `seed.toString(16)` handed that secret straight back in the
+ * row's own key: `parseInt(code.slice(6), 16)` recovers the seed, and the seed
+ * regenerates every pile. Zeroing the field while publishing a reversible
+ * encoding of it protected nothing. Two independent draws, so the public
+ * identifier carries no information about the private one.
+ */
+function hostDraftCode(): string {
+  const values = new Uint32Array(1);
+  crypto.getRandomValues(values);
+  return `draft-${values[0]!.toString(16).padStart(8, "0")}`;
+}
+
+/**
  * `count` distinct random cards from `pack`, or the whole pack if it is shorter.
  * Distinctness is required: `apply_pick_inner` refuses a repeated id with
  * `DuplicatePickCardId`.
@@ -1252,7 +1274,7 @@ export class P2PDraftHost {
 
     const seed = hostDraftSeed();
     this.draftSeed = seed;
-    const draftCode = `draft-${seed.toString(16).padStart(8, "0")}`;
+    const draftCode = hostDraftCode();
     // Bot fill is the HOST'S choice and nothing else. Every distribution the
     // engine ships now admits a bot seat — a shared-stack pod included, where
     // `resolve_shared_stack_bot_turns` drives the seat the reducer used to
