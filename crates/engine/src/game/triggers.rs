@@ -13766,11 +13766,11 @@ fn zone_changed_condition_provenance_is_coherent(event: &GameEvent) -> bool {
 /// The live-entrant branch is also scoped to `record.to_zone == Zone::Battlefield`
 /// — not because CR 608.2h + CR 113.7a's "public zone it was expected in" is
 /// battlefield-only (it is not), but because the PRECONDITION above cuts both
-/// ways: the projection is snapshotted (`snapshot_for_zone_change`,
-/// `game/zones.rs:1248`) before the move it describes, so once the subject
+/// ways: the projection is snapshotted (`GameObject::snapshot_for_zone_change`)
+/// before the move it describes, so once the subject
 /// has moved, whatever that move writes to the live object afterward —
 /// inline, or downstream through a callee that receives the already-built
-/// record by value, as `resolve_and_apply_zone_change` (`game/zones.rs:817`)
+/// record by value, as `zones::resolve_and_apply_zone_change`
 /// does — necessarily lands after the snapshot. So for every destination the
 /// record's projection is an equal-or-better authority than the live object,
 /// regardless of which step does the writing or where a future one is added.

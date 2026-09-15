@@ -1457,7 +1457,7 @@ enum ControllerLookup {
 /// object leaves those zones, it ceases to have a controller (CR 109.4: "Objects
 /// that are neither on the stack nor on the battlefield aren't controlled by
 /// any player"), and the at-departure controller is preserved in
-/// `state.lki_cache` by `change_zone` (`game/zones.rs:65-92`). Filters such as
+/// `state.lki_cache` by `zones::apply_zone_exit_cleanup`. Filters such as
 /// "creatures they controlled that were exiled this way" (Oversimplify) must
 /// read the at-exile controller, not the post-reset owner; the LKI cache holds
 /// exactly that value.

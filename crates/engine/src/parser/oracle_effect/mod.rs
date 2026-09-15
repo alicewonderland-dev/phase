@@ -2263,8 +2263,9 @@ fn try_parse_when_next_event(tp: TextPair) -> Option<ParsedEffectClause> {
     // trigger has no parent target to inherit. `parse_target` returns the
     // subject-position anaphor as `ParentTarget` because trigger context is not
     // threaded through the effect parser; lift it to `TriggeringSource` so the
-    // runtime binds the grant via `resolve_event_context_target` (effect.rs:259)
-    // instead of the empty chain-tracked set (effect.rs:474). Mirrors the
+    // runtime binds the grant via `targeting::resolve_event_context_target`
+    // instead of the empty chain-tracked set in the `TargetFilter::ParentTarget`
+    // arm of `effects::effect::register_transient_effect`. Mirrors the
     // `lift_parent_target_to_triggering_source` family in oracle_trigger.rs.
     lift_generic_effect_parent_target_to_triggering_source_in_ability(&mut inner);
 
@@ -2322,9 +2323,9 @@ fn try_parse_when_next_event(tp: TextPair) -> Option<ParsedEffectClause> {
 /// runtime registers the transient grant against `chain_tracked_set_id`, which
 /// is empty for a delayed trigger, so the grant silently never lands (#5337,
 /// Solar Array / Lux Artillery's when-next form). Rebinding to
-/// `TriggeringSource` routes it through `resolve_event_context_target`
-/// (effect.rs:259) — the same path Lux Artillery's non-delayed "it gains
-/// sunburst" already uses. Only `GenericEffect`-borne grants are affected;
+/// `TriggeringSource` routes it through `targeting::resolve_event_context_target`
+/// — the same path Lux Artillery's non-delayed "it gains sunburst" already
+/// uses. Only `GenericEffect`-borne grants are affected;
 /// other effect variants (e.g. a delayed `ChangeZone` on the cast spell) are
 /// out of scope for this class and left untouched.
 fn lift_generic_effect_parent_target_to_triggering_source_in_ability(
@@ -25776,8 +25777,8 @@ fn parse_cast_head_noun(input: &str) -> OracleResult<'_, ()> {
 /// type (for example, an artifact creature). Such objects satisfy the criteria
 /// for any effect that applies to any of their card types." So adjacent words
 /// describe ONE object bearing all of them and lower to a conjunctive
-/// `TypedFilter::type_filters` vector (`game/filter.rs:3722` / `:4024` evaluate
-/// that vector with `.all()`).
+/// `TypedFilter::type_filters` vector (`filter::spell_record_matches_filter` /
+/// `filter::spell_object_matches_filter_inner` evaluate that vector with `.all()`).
 ///
 /// The word alphabet is `oracle_nom::target::parse_type_filter_word` — the
 /// shared, word-boundary-guarded table of core types (singular AND plural) plus
