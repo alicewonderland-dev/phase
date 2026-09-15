@@ -2794,26 +2794,12 @@ pub(super) fn strip_property_conditional(
     (None, text.to_string())
 }
 
-/// Parser-internal selector for which player-property a superlative-comparison
-/// condition reads. Selects which `QuantityRef` to build — not stored in the
-/// AST. Single arm today; future player-properties add `alt` arms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlayerProperty {
-    /// CR 702.179f: a player's speed.
-    Speed,
-}
-
-/// CR 702.179f: parse "speed" → `PlayerProperty::Speed`.
-fn parse_player_property_keyword(input: &str) -> OracleResult<'_, PlayerProperty> {
-    value(PlayerProperty::Speed, tag("speed")).parse(input)
-}
-
-/// Build the `QuantityRef` for a player-property of the given player scope.
-fn player_property_quantity(property: PlayerProperty, player: PlayerScope) -> QuantityRef {
-    match property {
-        PlayerProperty::Speed => QuantityRef::Speed { player },
-    }
-}
+/// `PlayerProperty` / `parse_player_property_keyword` / `player_property_quantity`
+/// moved to `oracle_nom/quantity.rs` (the shared dynamic-quantity vocabulary
+/// module, per oracle-parser SKILL §7) once a second and third consumer
+/// (the player-property leader condition and subject/target predicate)
+/// joined this one. Imported, not re-declared.
+use super::super::oracle_nom::quantity::{parse_player_property_keyword, player_property_quantity};
 
 /// CR 608.2c: Strip a player-property superlative-comparison conditional that
 /// gates a chained sub-ability — e.g. Spikeshell Harrier's
