@@ -1342,9 +1342,23 @@ pub fn parse_target_with_syntax<'a>(
             // among every player. The `alt` above binds exactly these two head
             // nouns (`TargetFilter::Player` bare, or `Typed` with an `Opponent`
             // controller), so the mapping is exhaustive over what can reach here.
+            // Both reachable head nouns are matched explicitly rather than one
+            // of them falling out of a wildcard, so a third one added to that
+            // `alt` cannot silently inherit the opponent population. The arm
+            // stays total (the relation is consumed only by the superlative
+            // arm; declining here would also disable the pre-existing
+            // "who controls more X than Y" anchor arm), and the debug assert
+            // makes the unreachable case loud under test.
             let head_relation = match &player_filter {
                 TargetFilter::Player => PlayerRelation::All,
-                _ => PlayerRelation::Opponent,
+                TargetFilter::Typed(_) => PlayerRelation::Opponent,
+                other => {
+                    debug_assert!(
+                        false,
+                        "unexpected player head noun for the superlative arm: {other:?}"
+                    );
+                    PlayerRelation::Opponent
+                }
             };
             let mut tentative_ctx = ctx.clone();
             if let Ok((clause_rest, predicates)) =

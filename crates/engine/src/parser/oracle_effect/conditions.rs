@@ -2799,8 +2799,9 @@ pub(super) fn strip_property_conditional(
 // module, per oracle-parser SKILL §7) once a second and third consumer
 // (the player-property leader condition and subject/target predicate)
 // joined this one. Called through `nom_quantity::` (imported at the file
-// header, line 21), not re-declared here — the same convention
-// `oracle_nom/condition.rs:3129` and `oracle_effect/mod.rs:8660` use.
+// header), not re-declared here — the same convention
+// `oracle_nom::condition::parse_unique_property_lead_tail` and
+// `oracle_effect::parse_most_property_tail` use.
 
 /// CR 608.2c: Strip a player-property superlative-comparison conditional that
 /// gates a chained sub-ability — e.g. Spikeshell Harrier's

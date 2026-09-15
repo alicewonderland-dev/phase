@@ -11453,19 +11453,21 @@ mod tests {
         );
     }
 
-    /// G5 — REPRODUCTION: `resolve_per_team_life`'s `AllPlayers`/`Opponent`
-    /// arms do not filter `!p.is_eliminated`, unlike their
-    /// `resolve_per_player_scalar` siblings (see the `HandSize`/`is_eliminated`
-    /// fix pinned by `f7_hostile_eliminated_player_hand_axis_leader_still_wins`,
+    /// G5 — REGRESSION: pins the `!p.is_eliminated` filter on
+    /// `resolve_per_team_life`'s `AllPlayers`/`Opponent` arms, mirroring the
+    /// guard on their `resolve_per_player_scalar` siblings (pinned by
+    /// `f7_hostile_eliminated_player_hand_axis_leader_still_wins`,
     /// `crates/engine/tests/integration/superlative_player_subject_control.rs`).
+    /// WITHOUT that filter this read returns 0 rather than the lowest live
+    /// life total, and this test fails.
     /// Because `topology::shared_resource_members` returns EMPTY for a departed
     /// (non-2HG) player, `team_life_total` for an eliminated player reads 0 —
     /// which becomes the new Min whenever it undercuts every live player's
     /// actual life. `Max` is unaffected (0 never wins a Max fold unless every
-    /// life total is non-positive), which is why the sibling fixture
-    /// `hostile_eliminated_player_life_axis_excluded_from_population`
-    /// (`unique_player_property_leader_condition.rs`, a `Max`-shaped query) is
-    /// green despite this bug.
+    /// life total is non-positive), which is why the `Max`-shaped sibling
+    /// fixture `hostile_eliminated_player_life_axis_excluded_from_population`
+    /// (`unique_player_property_leader_condition.rs`) was green even before
+    /// this filter existed — only the `Min` reads were wrong.
     ///
     /// 3 players, lives 20/15/12 (P0 controller); P2 (the true minimum, 12) is
     /// ELIMINATED. Expected (CR 104.3 + CR 104.5 + CR 800.4: an eliminated

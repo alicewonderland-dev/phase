@@ -2202,7 +2202,7 @@ fn trigger_ghazban_ogre_maps_to_unique_leader_condition_and_give_control() {
             comparator: Comparator::EQ,
             rhs: QuantityExpr::Fixed { value: 1 },
         }),
-        "condition must be None if U1 did not bind — this is the whole B1-v2 hazard"
+        "condition must be the unique-leader comparison; a None here means U1 did not bind — this is the whole B1-v2 hazard"
     );
     let Some(execute) = &def.execute else {
         panic!("expected a GiveControl execute ability, got None");

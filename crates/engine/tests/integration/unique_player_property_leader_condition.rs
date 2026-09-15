@@ -307,15 +307,18 @@ fn hostile_multi_authority_non_controller_tie_blocks_trigger() {
 
 /// Hostile fixture — ELIMINATED PLAYER, LIFE AXIS: a player eliminated while
 /// holding the highest RECORDED life must not count toward the population;
-/// the live leader still wins. [measured to pass, P3/P5] Pins
-/// `shared_resource_members`'s eliminated-player exclusion so a future
-/// refactor cannot silently change it.
+/// the live leader still wins. Pins the `!p.is_eliminated` filter on
+/// `resolve_per_team_life`'s `AllPlayers`/`Opponent` arms, plus
+/// `resolve_player_count`'s candidate-side filter. It does NOT pin
+/// `topology::shared_resource_members`'s `is_alive` branch: deleting that
+/// branch leaves this fixture green, because `resolve_per_team_life` drops the
+/// departed player before `team_life_total` is ever called (measured).
 ///
-/// The mirror HAND-axis fixture lives alongside the F7 fixture,
+/// The mirror HAND-axis fixture,
 /// `f7_hostile_eliminated_player_hand_axis_leader_still_wins`
-/// (`superlative_player_subject_control.rs`), which pins the same
-/// `resolve_per_player_scalar` `!p.is_eliminated` guard on the `HandSize`
-/// axis and is green.
+/// (`superlative_player_subject_control.rs`), pins a DIFFERENT guard —
+/// `resolve_per_player_scalar`'s — because `QuantityRef::LifeTotal` and
+/// `QuantityRef::HandSize` take separate resolution paths.
 #[test]
 fn hostile_eliminated_player_life_axis_excluded_from_population() {
     let trigger = leader_condition_trigger(LIFE_AXIS_LINE, "Ghazbán Ogre", gain_life_3());

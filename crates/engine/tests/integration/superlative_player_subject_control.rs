@@ -546,22 +546,26 @@ fn u2_r5b_sokenzan_renegade_leader_not_controller_control_moves_to_leader() {
 /// player's larger hand would inflate the population `Max` above every LIVE
 /// candidate's hand size, so `player_property_leader_filter`'s
 /// `PlayerAttribute` predicate (`candidate's hand size >= population Max`)
-/// would match NO live player, and `unique_recipient_from_filter`
-/// (`game/effects/gain_control.rs`) would error "GiveControl recipient" —
-/// the trigger's control move would silently never happen, even though the
-/// intervening-if condition (U1, via `resolve_player_count`, which DOES
-/// filter `!p.is_eliminated`) correctly judges the live leader unique and
-/// lets the trigger stay on the stack.
+/// would match NO live player. The failure surfaces at the CONDITION, not at
+/// the recipient: U1's intervening-if reads that same inflated
+/// `HandSize{AllPlayers{Max}}` as its threshold, so its `PlayerCount` folds to
+/// 0, the condition is FALSE, and the trigger is removed on resolution —
+/// `unique_recipient_from_filter` (`game/effects/gain_control.rs`) is never
+/// reached. Measured: with the guard reverted, a `GainLife`-observable probe
+/// on this board shows a life delta of 0.
 ///
 /// Board: P0 (controller) has 1 card; P1 is ELIMINATED holding 5 cards (would
 /// "lead" if counted); P2 (live) has 3 cards — the unique LIVE leader.
-/// Expected: control moves to P2. The LIFE-axis sibling,
+/// Expected: control moves to P2. The two axes are guarded SEPARATELY, not by
+/// one shared filter: `QuantityRef::HandSize` resolves through
+/// `resolve_per_player_scalar`, whose guard this fixture pins, while
+/// `QuantityRef::LifeTotal` never reaches that function — it dispatches to
+/// `resolve_per_team_life` / `team_life_total` (CR 810.9a team folding). The
+/// LIFE-axis sibling
 /// `hostile_eliminated_player_life_axis_excluded_from_population`
-/// (`unique_player_property_leader_condition.rs`), is green through the SAME
-/// `resolve_per_player_scalar` `!p.is_eliminated` filter — both axes share
-/// one guard, not two independent ones (`resolve_per_team_life` /
-/// `shared_resource_members` is a different function, used for team-life
-/// contexts, not this "player with the most `<property>`" superlative).
+/// (`unique_player_property_leader_condition.rs`) therefore pins
+/// `resolve_per_team_life`'s own filter. Reverting either guard fails only its
+/// own axis — measured in both directions.
 #[test]
 fn f7_hostile_eliminated_player_hand_axis_leader_still_wins() {
     let mut scenario = upkeep_scenario(3, 111);
