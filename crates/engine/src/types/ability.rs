@@ -11264,6 +11264,23 @@ impl StaticCondition {
         self.any_leaf(|leaf| matches!(leaf, StaticCondition::Unrecognized { .. }))
     }
 
+    /// CR 506.2 + CR 508.5: true when this condition tree contains a leaf whose
+    /// answer depends on WHICH player is the defending player. That is only
+    /// answerable relative to a specific attacking creature — from the target it is
+    /// declared to be attacking, or from the target recorded for it once it is an
+    /// attacking creature (CR 508.1k). A CREATURE-LEVEL query ("can this creature
+    /// attack at all?") carries neither, so it must defer to the per-pairing
+    /// authority rather than evaluate the gate unanchored — exactly as
+    /// `StaticDefinition::attack_defended` scoping already defers (CR 508.1c,
+    /// + CR 508.1d for the cost form).
+    ///
+    /// Delegates to [`Self::any_leaf`], the same compiler-forced leaf walker
+    /// `contains_unrecognized` and `has_unbindable_designation_anchor` use, so a
+    /// future nested-condition variant is a compile error here too.
+    pub(crate) fn needs_defending_player_anchor(&self) -> bool {
+        self.any_leaf(|leaf| matches!(leaf, StaticCondition::DefendingPlayerControls { .. }))
+    }
+
     /// Returns the text of every [`StaticCondition::Unrecognized`] leaf found
     /// anywhere in this condition tree, for use in coverage gap labels.
     /// Derived from [`Self::walk_leaves`] — the same single traversal

@@ -9878,7 +9878,16 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         StaticCondition::And { .. } => ("And", Handled),
         StaticCondition::Or { .. } => ("Or", Handled),
         StaticCondition::Not { .. } => ("Not", Handled),
-        StaticCondition::DefendingPlayerControls { .. } => ("DefendingPlayerControls", Unhandled),
+        // CR 506.2 + CR 508.1c + CR 508.5: resolved at runtime by
+        // `layers::evaluate_condition_with_context`'s `DefendingPlayerControls` arm from
+        // `ConditionContext` — the attack target under validation during
+        // declare-attackers (before CR 508.1k records the attacker), else the recorded
+        // `AttackerInfo` for the RECIPIENT attacking creature (so a remote carrier such
+        // as Tanglewalker resolves per affected attacker rather than per carrier).
+        // Creature-level queries that cannot bind the anchor defer to
+        // `combat::attacker_can_attack_target` rather than guess. The board census is
+        // `filter::player_controls_matching` (CR 109.2 + CR 108.4).
+        StaticCondition::DefendingPlayerControls { .. } => ("DefendingPlayerControls", Handled),
         StaticCondition::SourceAttackingAlone => ("SourceAttackingAlone", Unhandled),
         // CR 508.1k / 509.1g / 509.1h: runtime-evaluated against the live combat
         // attacker/blocker sets (conditions.rs:81 / layers.rs:1118 / layers.rs:1123).

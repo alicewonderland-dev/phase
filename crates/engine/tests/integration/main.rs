@@ -220,6 +220,7 @@ mod darkness_crystal_exiled_with_activation_8164;
 mod dawnbreak_reclaimer;
 mod death_priest_myrkul_oxford_anthem;
 mod declare_attackers_end_combat_pairing;
+mod defending_player_controls_combat_anchor;
 mod deferred_card_type_reflexive_guard;
 mod delayed_event_subject_anaphor_snapshot;
 mod delayed_parent_target_incarnation;
