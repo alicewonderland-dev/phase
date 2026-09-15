@@ -2794,12 +2794,13 @@ pub(super) fn strip_property_conditional(
     (None, text.to_string())
 }
 
-/// `PlayerProperty` / `parse_player_property_keyword` / `player_property_quantity`
-/// moved to `oracle_nom/quantity.rs` (the shared dynamic-quantity vocabulary
-/// module, per oracle-parser SKILL §7) once a second and third consumer
-/// (the player-property leader condition and subject/target predicate)
-/// joined this one. Imported, not re-declared.
-use super::super::oracle_nom::quantity::{parse_player_property_keyword, player_property_quantity};
+// `PlayerProperty` / `parse_player_property_keyword` / `player_property_quantity`
+// moved to `oracle_nom/quantity.rs` (the shared dynamic-quantity vocabulary
+// module, per oracle-parser SKILL §7) once a second and third consumer
+// (the player-property leader condition and subject/target predicate)
+// joined this one. Called through `nom_quantity::` (imported at the file
+// header, line 21), not re-declared here — the same convention
+// `oracle_nom/condition.rs:3129` and `oracle_effect/mod.rs:8660` use.
 
 /// CR 608.2c: Strip a player-property superlative-comparison conditional that
 /// gates a chained sub-ability — e.g. Spikeshell Harrier's
@@ -2827,7 +2828,7 @@ pub(super) fn strip_player_property_superlative_conditional(
     };
 
     // LHS: "<property> is <comparator phrase>each other player's <property>, "
-    let Ok((rest, lhs_property)) = parse_player_property_keyword(rest) else {
+    let Ok((rest, lhs_property)) = nom_quantity::parse_player_property_keyword(rest) else {
         return (None, text.to_string());
     };
     let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(" is ").parse(rest) else {
@@ -2848,7 +2849,7 @@ pub(super) fn strip_player_property_superlative_conditional(
     let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("player's ").parse(rest) else {
         return (None, text.to_string());
     };
-    let Ok((rest, rhs_property)) = parse_player_property_keyword(rest) else {
+    let Ok((rest, rhs_property)) = nom_quantity::parse_player_property_keyword(rest) else {
         return (None, text.to_string());
     };
     // RHS-property guard: the compared properties must match (mirrors the
@@ -2866,10 +2867,13 @@ pub(super) fn strip_player_property_superlative_conditional(
     // CR 109.4 + CR 608.2c: LHS = the bounced object's controller's property;
     // RHS = the same property aggregated over every OTHER player.
     let lhs = QuantityExpr::Ref {
-        qty: player_property_quantity(lhs_property, PlayerScope::ParentObjectTargetController),
+        qty: nom_quantity::player_property_quantity(
+            lhs_property,
+            PlayerScope::ParentObjectTargetController,
+        ),
     };
     let rhs = QuantityExpr::Ref {
-        qty: player_property_quantity(
+        qty: nom_quantity::player_property_quantity(
             lhs_property,
             PlayerScope::AllPlayers {
                 aggregate,

@@ -11,9 +11,10 @@ use nom::Parser;
 use crate::types::ability::{
     AggregateFunction, AttachmentKind, CardTypeSetSource, ChoiceType, CombatRelation,
     CombatRelationSubject, Comparator, ControllerRef, CountScope, DamageKindFilter, FilterProp,
-    ObjectProperty, ObjectScope, ParitySource, PlayerFilter, PropertyAggregate, PtStat,
-    PtValueScope, QuantityExpr, QuantityRef, SeatDirection, SharedQuality, SharedQualityRelation,
-    TargetFilter, TargetSelectionMode, ThisWayCause, TypeFilter, TypedFilter,
+    ObjectProperty, ObjectScope, ParitySource, PlayerFilter, PlayerRelation, PropertyAggregate,
+    PtStat, PtValueScope, QuantityExpr, QuantityRef, SeatDirection, SharedQuality,
+    SharedQualityRelation, TargetFilter, TargetSelectionMode, ThisWayCause, TypeFilter,
+    TypedFilter,
 };
 use crate::types::card_type::{noncreature_subtype_set, SubtypeSet, Supertype};
 use crate::types::counter::{CounterMatch, CounterType};
@@ -1334,11 +1335,23 @@ pub fn parse_target_with_syntax<'a>(
             let after_noun = tag::<_, _, OracleError<'_>>(" ")
                 .parse(after_noun_orig)
                 .map_or(after_noun_orig, |(after, _)| after);
+            // CR 102.1 + CR 102.3: the superlative arm of the relative clause
+            // ("with/who has the most <property>") must measure "most" against
+            // the population the HEAD NOUN itself named — "target opponent …"
+            // measures among the caster's opponents, "target player …" measures
+            // among every player. The `alt` above binds exactly these two head
+            // nouns (`TargetFilter::Player` bare, or `Typed` with an `Opponent`
+            // controller), so the mapping is exhaustive over what can reach here.
+            let head_relation = match &player_filter {
+                TargetFilter::Player => PlayerRelation::All,
+                _ => PlayerRelation::Opponent,
+            };
             let mut tentative_ctx = ctx.clone();
             if let Ok((clause_rest, predicates)) =
                 super::oracle_effect::parse_target_player_relative_clause(
                     after_noun,
                     &mut tentative_ctx,
+                    head_relation,
                 )
             {
                 let clause_rest_lower = clause_rest.to_lowercase();

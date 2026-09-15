@@ -311,9 +311,11 @@ fn hostile_multi_authority_non_controller_tie_blocks_trigger() {
 /// `shared_resource_members`'s eliminated-player exclusion so a future
 /// refactor cannot silently change it.
 ///
-/// The mirror HAND-axis fixture is KNOWN RED (P5: `resolve_per_player_scalar`'s
-/// `AllPlayers` arm has no `is_eliminated` filter) and is deliberately NOT
-/// written here as a passing assertion (U4 follow-up, §8).
+/// The mirror HAND-axis fixture lives alongside the F7 fixture,
+/// `f7_hostile_eliminated_player_hand_axis_leader_still_wins`
+/// (`superlative_player_subject_control.rs`), which pins the same
+/// `resolve_per_player_scalar` `!p.is_eliminated` guard on the `HandSize`
+/// axis and is green.
 #[test]
 fn hostile_eliminated_player_life_axis_excluded_from_population() {
     let trigger = leader_condition_trigger(LIFE_AXIS_LINE, "Ghazbán Ogre", gain_life_3());

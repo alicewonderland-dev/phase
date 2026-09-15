@@ -76,6 +76,13 @@ const SUBFAMILY_B_DECLINE_LINE: &str = "At the beginning of your upkeep, the pla
 /// regression this diff closes as a side effect of U2.2.
 const TARGET_LEADER_DRAW: &str = "Target player with the most life draws a card.";
 
+/// "target opponent with the most life draws a card" — the G2 fix's own
+/// regression coverage: the "opponent" head noun must scope the superlative
+/// population to the caster's opponents (`PlayerRelation::Opponent`), not to
+/// every player (`PlayerRelation::All`). Synthetic, matching the convention
+/// `TARGET_LEADER_DRAW` above already establishes for this test file.
+const TARGET_OPPONENT_LEADER_DRAW: &str = "Target opponent with the most life draws a card.";
+
 fn upkeep_scenario(player_count: u8, seed: u64) -> GameScenario {
     let mut scenario = GameScenario::new_n_player(player_count, seed);
     scenario.at_phase(Phase::Untap);
@@ -269,6 +276,80 @@ fn u2_r4b_target_position_leader_draws_card() {
     outcome.assert_hand_drawn(P0, 1);
 }
 
+/// G2 — "target opponent with the most life" must scope the superlative
+/// population to P0's OPPONENTS, not to every player. P0 (the caster) has the
+/// highest life in the game (30); P0's two opponents P1 and P2 are TIED at
+/// 20, both below P0. CR 102.1 + CR 102.3: `Opponent` is a topology relation,
+/// not raw life comparison, so the "most life" superlative must be measured
+/// only against the population the head noun names — here, P0's opponents,
+/// among whom P1 and P2 are tied leaders.
+///
+/// REVERT-FAIL: before the G2 fix, the superlative arm hardcoded
+/// `PlayerRelation::All`, so the population was `PlayerScope::AllPlayers`
+/// (life >= 30, the caster's own life) rather than `PlayerScope::Opponent`
+/// (life >= 20, the max among P0's opponents). Composed with the head noun's
+/// own `Typed{controller: Opponent}` leg, that required a legal target to be
+/// both an opponent AND at least as high on life as the caster — on this
+/// arrangement NO opponent satisfies it, so the target slot would have ZERO
+/// legal targets and the cast could not even be declared. The tie between P1
+/// and P2 also forces a real `TargetSelection` prompt here (mirroring
+/// `u2_r4a`'s tie-breaking technique) rather than letting
+/// `auto_select_targets` silently resolve a single-candidate slot.
+#[test]
+fn g2_target_opponent_leader_scopes_to_opponents_not_all_players() {
+    let mut scenario = GameScenario::new_n_player(3, 107);
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario
+        .with_life(P0, 30)
+        .with_life(P1, 20)
+        .with_life(PlayerId(2), 20);
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(
+            P0,
+            "Test Opponent Draw Instant",
+            true,
+            TARGET_OPPONENT_LEADER_DRAW,
+        )
+        .id();
+    let mut runner = scenario.build();
+    let card_id = runner.state().objects[&spell].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: spell,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect(
+            "casting the spell must be accepted with a non-empty legal target set — \
+             REVERT-FAIL: under the pre-fix `PlayerRelation::All` population, no opponent \
+             has life >= the caster's 30, so this cast would be rejected for lack of a \
+             legal target",
+        );
+    let WaitingFor::TargetSelection { target_slots, .. } = &runner.state().waiting_for else {
+        panic!(
+            "expected WaitingFor::TargetSelection (the P1/P2 tie among opponents must force \
+             a real prompt), got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(target_slots.len(), 1, "exactly one target slot expected");
+    let legal = &target_slots[0].legal_targets;
+    assert!(
+        legal.contains(&TargetRef::Player(P1)),
+        "P1 (tied life leader AMONG P0's opponents) must be a legal target, got {legal:?}"
+    );
+    assert!(
+        legal.contains(&TargetRef::Player(PlayerId(2))),
+        "P2 (tied life leader AMONG P0's opponents) must be a legal target, got {legal:?}"
+    );
+    assert!(
+        !legal.contains(&TargetRef::Player(P0)),
+        "P0 is the caster, never a legal target for an opponent-headed target filter, \
+         got {legal:?}"
+    );
+}
+
 /// U2-R5 — the `HandSize` axis end-to-end (Sokenzan Renegade), inline
 /// Bushido keyword. Same leader-is-controller shape as R1: the
 /// `unimplemented_oracle_ids` check does NOT discriminate a revert of U2
@@ -458,26 +539,29 @@ fn u2_r5b_sokenzan_renegade_leader_not_controller_control_moves_to_leader() {
     );
 }
 
-/// F7 (HOSTILE) — ELIMINATED PLAYER, HAND-SIZE AXIS: `resolve_per_player_scalar`'s
-/// `AllPlayers` arm (`game/quantity.rs`) filters candidates only on
-/// `excluded_id`, not `is_eliminated`. An eliminated player's larger hand
-/// therefore inflates the population `Max` above every LIVE candidate's hand
-/// size, so `player_property_leader_filter`'s `PlayerAttribute` predicate
-/// (`candidate's hand size >= population Max`) matches NO live player, and
-/// `unique_recipient_from_filter` (`game/effects/gain_control.rs`) errors
-/// "GiveControl recipient" — the trigger's control move silently never
-/// happens, even though the intervening-if condition (U1, via
-/// `resolve_player_count`, which DOES filter `!p.is_eliminated`) correctly
-/// judged the live leader unique and let the trigger stay on the stack.
+/// F7 (HOSTILE) — ELIMINATED PLAYER, HAND-SIZE AXIS: pins that
+/// `resolve_per_player_scalar`'s `AllPlayers` arm (`game/quantity.rs`)
+/// excludes eliminated players from the population via `!p.is_eliminated`,
+/// not just the `exclude` anchor. Without that filter, an eliminated
+/// player's larger hand would inflate the population `Max` above every LIVE
+/// candidate's hand size, so `player_property_leader_filter`'s
+/// `PlayerAttribute` predicate (`candidate's hand size >= population Max`)
+/// would match NO live player, and `unique_recipient_from_filter`
+/// (`game/effects/gain_control.rs`) would error "GiveControl recipient" —
+/// the trigger's control move would silently never happen, even though the
+/// intervening-if condition (U1, via `resolve_player_count`, which DOES
+/// filter `!p.is_eliminated`) correctly judges the live leader unique and
+/// lets the trigger stay on the stack.
 ///
 /// Board: P0 (controller) has 1 card; P1 is ELIMINATED holding 5 cards (would
 /// "lead" if counted); P2 (live) has 3 cards — the unique LIVE leader.
-/// Expected: control moves to P2. Contrast with
+/// Expected: control moves to P2. The LIFE-axis sibling,
 /// `hostile_eliminated_player_life_axis_excluded_from_population`
-/// (`unique_player_property_leader_condition.rs`), which is GREEN on the LIFE
-/// axis because `resolve_per_team_life` → `shared_resource_members`
-/// (`game/topology.rs`) already excludes non-alive players (CR 800.4a);
-/// `HandSize` has no equivalent guard on this arm.
+/// (`unique_player_property_leader_condition.rs`), is green through the SAME
+/// `resolve_per_player_scalar` `!p.is_eliminated` filter — both axes share
+/// one guard, not two independent ones (`resolve_per_team_life` /
+/// `shared_resource_members` is a different function, used for team-life
+/// contexts, not this "player with the most `<property>`" superlative).
 #[test]
 fn f7_hostile_eliminated_player_hand_axis_leader_still_wins() {
     let mut scenario = upkeep_scenario(3, 111);

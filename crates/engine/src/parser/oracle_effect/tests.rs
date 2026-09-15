@@ -65063,8 +65063,9 @@ fn parse_opponent_most_life_restriction_acceptance_set_unchanged() {
 #[test]
 fn parse_target_player_relative_clause_superlative_arm_binds_leader_filter() {
     let mut ctx = ParseContext::default();
-    let (rest, filters) = parse_target_player_relative_clause("with the most life", &mut ctx)
-        .expect("the superlative arm must bind");
+    let (rest, filters) =
+        parse_target_player_relative_clause("with the most life", &mut ctx, PlayerRelation::All)
+            .expect("the superlative arm must bind");
     assert_eq!(rest, "");
     assert_eq!(filters.len(), 1);
     assert_eq!(
@@ -65087,6 +65088,47 @@ fn parse_target_player_relative_clause_superlative_arm_binds_leader_filter() {
     );
 }
 
+/// G2 fix: "target OPPONENT with the most `<property>`" must thread the head
+/// noun's `PlayerRelation::Opponent` through to the superlative predicate —
+/// both the candidate-relation gate AND the population the "most" is measured
+/// against must be scoped to the caster's opponents, not every player. Before
+/// this fix, `head_relation` was hardcoded to `PlayerRelation::All` here,
+/// which (composed with the caller's `Typed{controller: Opponent}` head-noun
+/// leg at `oracle_target.rs`) required the target to also have at least as
+/// much life as the CASTER — impossible in multiplayer whenever the caster
+/// itself leads on life.
+#[test]
+fn parse_target_player_relative_clause_superlative_arm_opponent_head_scopes_to_opponents() {
+    let mut ctx = ParseContext::default();
+    let (rest, filters) = parse_target_player_relative_clause(
+        "with the most life",
+        &mut ctx,
+        PlayerRelation::Opponent,
+    )
+    .expect("the superlative arm must bind under an opponent head noun");
+    assert_eq!(rest, "");
+    assert_eq!(filters.len(), 1);
+    assert_eq!(
+        filters[0],
+        PlayerFilter::PlayerAttribute {
+            relation: PlayerRelation::Opponent,
+            attr: Box::new(QuantityRef::LifeTotal {
+                player: PlayerScope::ScopedPlayer,
+            }),
+            comparator: Comparator::GE,
+            value: Box::new(QuantityExpr::Ref {
+                qty: QuantityRef::LifeTotal {
+                    player: PlayerScope::Opponent {
+                        aggregate: AggregateFunction::Max,
+                    },
+                },
+            }),
+        },
+        "the population must be scoped to the caster's opponents (`PlayerScope::Opponent`), \
+         not every player (`PlayerScope::AllPlayers`)"
+    );
+}
+
 /// The OTHER copula, at the target position: "who has the most `<property>`"
 /// binds the same shape. Unlike the subject position (U2.3), the target
 /// position is reached via `oracle_target.rs`'s `after_target` branch, not
@@ -65095,9 +65137,12 @@ fn parse_target_player_relative_clause_superlative_arm_binds_leader_filter() {
 #[test]
 fn parse_target_player_relative_clause_superlative_arm_who_has_copula_binds() {
     let mut ctx = ParseContext::default();
-    let (rest, filters) =
-        parse_target_player_relative_clause("who has the most cards in hand", &mut ctx)
-            .expect("the \"who has the most\" copula must bind at the target position");
+    let (rest, filters) = parse_target_player_relative_clause(
+        "who has the most cards in hand",
+        &mut ctx,
+        PlayerRelation::All,
+    )
+    .expect("the \"who has the most\" copula must bind at the target position");
     assert_eq!(rest, "");
     assert_eq!(filters.len(), 1);
     assert_eq!(
@@ -65127,9 +65172,12 @@ fn parse_target_player_relative_clause_superlative_arm_who_has_copula_binds() {
 #[test]
 fn parse_target_player_relative_clause_anchor_arm_unchanged_by_u2_2() {
     let mut ctx = ParseContext::default();
-    let (rest, filters) =
-        parse_target_player_relative_clause("who controls more creatures than you", &mut ctx)
-            .expect("the pre-existing anchor arm must still bind");
+    let (rest, filters) = parse_target_player_relative_clause(
+        "who controls more creatures than you",
+        &mut ctx,
+        PlayerRelation::All,
+    )
+    .expect("the pre-existing anchor arm must still bind");
     assert_eq!(rest, "");
     assert_eq!(filters.len(), 1);
     let PlayerFilter::ControlsCount { relation, .. } = &filters[0] else {
@@ -65176,9 +65224,22 @@ fn parse_subject_application_superlative_player_subject_binds() {
 }
 
 /// "the opponent with the most `<property>`" binds with `relation: Opponent`
-/// — the head-noun `alt`'s second arm, which also closes P11's first row
-/// ("the opponent with the most life draws a card" used to swallow the
-/// qualifier and bind `Draw{Controller}`).
+/// via this direct `parse_subject_application` seam — the head-noun `alt`'s
+/// second arm.
+///
+/// NOT YET production-reachable. This arm is exercised only through the
+/// helper call below, not through the production clause dispatcher: at
+/// HEAD, `parse_effect_clause("the opponent with the most life draws a
+/// card", ..)` still yields `Draw{target: Controller}` (the subject falls
+/// through to the generic subject-stripped imperative instead of this
+/// superlative arm), and `parse_effect_clause("the opponent with the most
+/// life gains control of ~", ..)` yields
+/// `Effect::Unimplemented{"unrecognized_clause_head"}`. The clause-head
+/// dispatcher does not yet route an "the opponent"-headed subject into
+/// `try_parse_subject_predicate_ast`. The sibling "the player " arm IS
+/// reachable in production — see
+/// `parse_subject_application_superlative_player_subject_binds`, which
+/// binds correctly both here and through the full clause dispatcher.
 #[test]
 fn parse_subject_application_superlative_opponent_subject_binds_opponent_relation() {
     let mut ctx = ParseContext::default();

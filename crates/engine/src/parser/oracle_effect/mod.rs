@@ -8649,12 +8649,17 @@ pub(crate) fn parse_opponent_most_life_restriction(input: &str) -> OracleResult<
 }
 
 /// CR 102.1 + CR 102.2 + CR 102.3 + CR 119.3 / CR 402.3: the superlative
-/// predicate tail shared by both grammatical positions (condition-subject
-/// via [`super::oracle_nom::condition::parse_unique_property_lead_tail`] and
-/// the effect subject/target arms below) — "with the most `<property>`" /
-/// "who has the most `<property>`". Space-less and domain-tail-free: the
-/// caller peels its own leading space and any domain-restricting suffix, so
-/// this core cannot widen any existing caller's accepted-input set (S3).
+/// predicate tail used by both grammatical positions (the effect
+/// subject/target arms below) — "with the most `<property>`" / "who has the
+/// most `<property>`". Space-less and domain-tail-free: the caller peels its
+/// own leading space and any domain-restricting suffix, so this core cannot
+/// widen any existing caller's accepted-input set (S3).
+///
+/// Sibling of `oracle_nom::condition::parse_unique_property_lead_tail`
+/// (condition-subject position, "more `<property>` than each other player"):
+/// that function parses its own comparative from its own tags rather than
+/// calling this one, but both feed the same downstream
+/// `nom_quantity::player_property_leader_filter`.
 fn parse_most_property_tail(input: &str) -> OracleResult<'_, nom_quantity::PlayerProperty> {
     preceded(
         alt((tag("with the most "), tag("who has the most "))),
@@ -9007,9 +9012,27 @@ fn parse_controls_more_than_anchor<'a>(
 /// card", "target opponent with the most life draws a card") as a side
 /// effect: before this arm existed, the qualifier was swallowed and the
 /// bare `TargetFilter::Player` left any player as a legal target.
-fn parse_most_property_player_predicate(input: &str) -> OracleResult<'_, PlayerFilter> {
+///
+/// `relation` is the HEAD NOUN's population, threaded in by the caller —
+/// `PlayerRelation::All` for "target player with the most `<property>`",
+/// `PlayerRelation::Opponent` for "target opponent with the most
+/// `<property>`". This must NOT be hardcoded to `All`: `relation` both
+/// gates the runtime candidate set (`matches_relation`,
+/// `game/effects/mod.rs`) AND selects the population the "most" superlative
+/// is measured against (`player_property_leader_filter`,
+/// `oracle_nom/quantity.rs` — `Opponent` maps to `PlayerScope::Opponent{Max}`,
+/// the max among the caster's opponents; `All` maps to
+/// `PlayerScope::AllPlayers{Max}`, the max among every player including the
+/// caster). Hardcoding `All` here for an "opponent"-headed target would
+/// require the candidate to also out-live the caster, and would leave no
+/// legal target in multiplayer whenever the caster itself leads on the
+/// property.
+fn parse_most_property_player_predicate(
+    input: &str,
+    relation: PlayerRelation,
+) -> OracleResult<'_, PlayerFilter> {
     let (rest, property) = parse_most_property_tail(input)?;
-    let filter = nom_quantity::player_property_leader_filter(property, PlayerRelation::All)
+    let filter = nom_quantity::player_property_leader_filter(property, relation)
         .ok_or_else(|| oracle_err(input))?;
     Ok((rest, filter))
 }
@@ -9033,9 +9056,20 @@ fn parse_most_property_player_predicate(input: &str) -> OracleResult<'_, PlayerF
 /// (`nom_primitives::peek_clause_terminator`) on the returned remainder: binding
 /// a PREFIX of a printed restriction is an under-restricted target, which is the
 /// exact silent-drop failure this grammar exists to eliminate.
+///
+/// `head_relation` is the population named by the TARGET'S OWN head noun
+/// (`PlayerRelation::All` for "target player …", `PlayerRelation::Opponent`
+/// for "target opponent …") and is threaded through ONLY to the superlative
+/// leader predicate (see [`parse_most_property_player_predicate`]). It does
+/// NOT apply to the anchor comparative arm ("who controls more X than Y"):
+/// that arm's `relation` is fixed to `PlayerRelation::All` by design — see
+/// [`parse_controls_more_than_anchor`]'s doc comment — because its printed
+/// relation restriction, when present, is a separate conjunct anchored on
+/// the clause subject, not the head noun.
 pub(crate) fn parse_target_player_relative_clause<'a>(
     input: &'a str,
     ctx: &mut ParseContext,
+    head_relation: PlayerRelation,
 ) -> OracleResult<'a, Vec<PlayerFilter>> {
     // The clause's FIRST conjunct is now one of two predicate productions —
     // the pre-existing anchor comparative ("who controls more X than Y",
@@ -9057,7 +9091,7 @@ pub(crate) fn parse_target_player_relative_clause<'a>(
             *ctx = anchor_ctx;
             ok
         }
-        Err(_) => parse_most_property_player_predicate(input)?,
+        Err(_) => parse_most_property_player_predicate(input, head_relation)?,
     };
     let mut filters = vec![predicate];
     let rest_lower = rest.to_lowercase();
