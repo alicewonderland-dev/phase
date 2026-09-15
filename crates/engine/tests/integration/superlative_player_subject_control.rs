@@ -15,16 +15,20 @@
 //! "ambiguous GiveControl recipient" path is never hit here. That coupling
 //! is pinned by `u2_r3_multi_authority_tie_blocks_trigger` below.
 //!
-//! Several rows below assert `state.unimplemented_oracle_ids` is EMPTY as
-//! their revert discriminator, alongside the controller check. This is
-//! necessary on rows where the pre-fix and post-fix final CONTROLLER happens
-//! to coincide (the leader already controls the permanent) — with U2
-//! reverted the clause lowers to `Effect::Unimplemented{name:
-//! "unbound_subject"}`, which on execution records the source's oracle id in
-//! `state.unimplemented_oracle_ids` (`game/effects/mod.rs`); with U2 present
-//! nothing unimplemented ever executes, so the set stays empty. This is a
-//! genuine revert-failing assertion, not a restatement of the (identical)
-//! final-controller observable.
+//! Several rows below also assert `state.unimplemented_oracle_ids` is EMPTY,
+//! alongside the controller check. **Corrected by the F1 fix (see
+//! `f1_unimplemented_oracle_ids_not_recorded_for_bare_top_level_unimplemented`
+//! below): this does NOT discriminate a revert of U2.** With U2 reverted the
+//! clause lowers to `Effect::Unimplemented{name: "unbound_subject"}` as a
+//! BARE top-level ability effect (no `sub_ability` chain), and
+//! `game/stack.rs::execute_effect` skips such an ability before
+//! `effects::resolve_effect`'s recording arm (`game/effects/mod.rs:6152`) is
+//! ever reached — so `unimplemented_oracle_ids` stays empty whether U2 is
+//! present or reverted. The rows on which the final-controller observable
+//! ALSO coincides (`u2_r1`, `u2_r5`, `u2_r6` — leader already controls the
+//! permanent) have no revert-discriminating assertion of their own; the
+//! genuine hand-size-axis coverage for that is `u2_r5b`
+//! (`u2_r2` already covers the life axis).
 
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::parser::parse_oracle_text;
@@ -103,9 +107,14 @@ fn u2_r0_positive_reach_guard_neighbor_control_moves() {
 /// The final-controller observable (`P0`) is IDENTICAL whether U2 is present
 /// or reverted (P0 already controls it), so that alone does not discriminate
 /// — passes either way, like U1-R1/R3. The `unimplemented_oracle_ids` check
-/// is what actually discriminates: reverted, the clause lowers to
-/// `Effect::Unimplemented{"unbound_subject"}`, which records the source's id
-/// on execution; fixed, nothing unimplemented ever executes.
+/// does NOT discriminate either (see the F1 fix,
+/// `f1_unimplemented_oracle_ids_not_recorded_for_bare_top_level_unimplemented`):
+/// a reverted clause lowers to a bare top-level
+/// `Effect::Unimplemented{"unbound_subject"}`, which `game/stack.rs`'s
+/// `execute_effect` skips before the recording arm is ever reached, so the
+/// set stays empty either way. Kept here as a same-shape sanity check
+/// (nothing unimplemented executes in the shipped, non-reverted path); the
+/// genuine revert-discriminating coverage for this axis is `u2_r2`.
 #[test]
 fn u2_r1_leader_is_controller_resolves_cleanly() {
     let mut scenario = upkeep_scenario(3, 101);
@@ -123,9 +132,8 @@ fn u2_r1_leader_is_controller_resolves_cleanly() {
     assert_eq!(runner.state().objects[&card].controller, P0);
     assert!(
         runner.state().unimplemented_oracle_ids.is_empty(),
-        "REVERT-FAIL: with U2 reverted the subject lowers to \
-         Effect::Unimplemented{{\"unbound_subject\"}}, which records the source \
-         id here on execution; got {:?}",
+        "in the shipped path nothing unimplemented executes here, so the set \
+         should stay empty (NOT revert-discriminating — see the F1 fix); got {:?}",
         runner.state().unimplemented_oracle_ids
     );
 }
@@ -189,7 +197,7 @@ fn u2_r3_multi_authority_tie_blocks_trigger() {
 /// U2-R4a — P11 TARGET-POSITION REGRESSION, legality half. Board is 20/20/10
 /// (P0 and P1 TIED for the max, P2 strictly lower) rather than a unique
 /// leader: with a single legal candidate the cast pipeline's
-/// `auto_select_targets` (CR 602.2b-style single-legal-option resolution,
+/// `auto_select_targets` (CR 601.2c-style single-legal-option resolution,
 /// `game/ability_utils.rs`) would silently pick it and skip straight to
 /// `Priority`, never surfacing `WaitingFor::TargetSelection` for this test to
 /// inspect. Two tied candidates force a real prompt. REVERT-FAIL: today the
@@ -263,7 +271,12 @@ fn u2_r4b_target_position_leader_draws_card() {
 
 /// U2-R5 — the `HandSize` axis end-to-end (Sokenzan Renegade), inline
 /// Bushido keyword. Same leader-is-controller shape as R1: the
-/// `unimplemented_oracle_ids` check is the revert discriminator.
+/// `unimplemented_oracle_ids` check does NOT discriminate a revert of U2
+/// (see the F1 fix,
+/// `f1_unimplemented_oracle_ids_not_recorded_for_bare_top_level_unimplemented`
+/// — a bare top-level `Effect::Unimplemented` never populates the set, so
+/// it stays empty either way). Kept as a same-shape sanity check; `u2_r5b`
+/// below is the genuine revert-discriminating coverage for this axis.
 #[test]
 fn u2_r5_sokenzan_renegade_hand_axis_resolves_cleanly() {
     let mut scenario = upkeep_scenario(3, 106);
@@ -281,8 +294,9 @@ fn u2_r5_sokenzan_renegade_hand_axis_resolves_cleanly() {
     assert_eq!(runner.state().objects[&card].controller, P0);
     assert!(
         runner.state().unimplemented_oracle_ids.is_empty(),
-        "REVERT-FAIL: Sokenzan Renegade's subject must not lower to \
-         Effect::Unimplemented; got {:?}",
+        "in the shipped path Sokenzan Renegade's subject does not lower to \
+         Effect::Unimplemented, so the set should stay empty (NOT \
+         revert-discriminating — see the F1 fix); got {:?}",
         runner.state().unimplemented_oracle_ids
     );
 }
@@ -290,7 +304,11 @@ fn u2_r5_sokenzan_renegade_hand_axis_resolves_cleanly() {
 /// U2-R6 — the LIFE axis end-to-end via Wild Dogs, inline Cycling keyword.
 /// Pins that the inline Cycling line does not derail the upkeep line's
 /// parse. Same leader-is-controller shape as R1: the
-/// `unimplemented_oracle_ids` check is the revert discriminator.
+/// `unimplemented_oracle_ids` check does NOT discriminate a revert of U2
+/// (see the F1 fix,
+/// `f1_unimplemented_oracle_ids_not_recorded_for_bare_top_level_unimplemented`).
+/// Kept as a same-shape sanity check; `u2_r2` is the genuine
+/// revert-discriminating coverage for the life axis.
 #[test]
 fn u2_r6_wild_dogs_life_axis_resolves_cleanly() {
     let mut scenario = upkeep_scenario(3, 107);
@@ -308,9 +326,10 @@ fn u2_r6_wild_dogs_life_axis_resolves_cleanly() {
     assert_eq!(runner.state().objects[&card].controller, P0);
     assert!(
         runner.state().unimplemented_oracle_ids.is_empty(),
-        "REVERT-FAIL: Wild Dogs' subject must not lower to Effect::Unimplemented \
-         (and the inline Cycling line must not derail the upkeep line's parse); \
-         got {:?}",
+        "in the shipped path Wild Dogs' subject does not lower to \
+         Effect::Unimplemented (and the inline Cycling line must not derail the \
+         upkeep line's parse), so the set should stay empty (NOT \
+         revert-discriminating — see the F1 fix); got {:?}",
         runner.state().unimplemented_oracle_ids
     );
 }
@@ -346,5 +365,139 @@ fn subfamily_b_object_count_noun_declines_honestly() {
         "the object-count noun 'creatures' must decline honestly as unbound_subject, \
          got {:?}",
         execute.effect
+    );
+}
+
+/// F1 — RUNTIME CONTROL for the `unimplemented_oracle_ids` discriminator
+/// used (as a secondary check) by `u2_r1`/`u2_r5`/`u2_r6` above. Those rows
+/// assert `unimplemented_oracle_ids.is_empty()`, which would ALSO pass
+/// vacuously if the upkeep trigger never fired, never resolved, or an
+/// inline keyword derailed the parse so no trigger existed at all.
+/// `subfamily_b_object_count_noun_declines_honestly` above proves
+/// `SUBFAMILY_B_DECLINE_LINE` parses to
+/// `Effect::Unimplemented{"unbound_subject"}`, but only asserts parse SHAPE
+/// — it never executes the trigger. This row drives the same shape through
+/// the SAME runtime harness the `is_empty()` rows use (`upkeep_scenario` +
+/// `advance_until_stack_empty`) to check what the instrument actually does.
+///
+/// MEASURED RESULT (not the outcome originally expected): `state.stack`
+/// carries the triggered ability with `execute.effect ==
+/// Effect::Unimplemented{"unbound_subject"}` immediately after
+/// `advance_to_upkeep` (confirmed via direct inspection), and the stack
+/// drains to empty via `advance_until_stack_empty` — but
+/// `unimplemented_oracle_ids` stays EMPTY. The reason is
+/// `game/stack.rs::execute_effect`: for a stack entry whose OWN
+/// `ability.effect` is `Effect::Unimplemented` (no `sub_ability` chain), it
+/// returns immediately ("Skip unimplemented effects (logged elsewhere as
+/// warnings)") without ever calling `resolve_ability_chain` /
+/// `effects::resolve_effect` — so the recording arm at
+/// `game/effects/mod.rs:6152` is never reached. That skip is PRE-EXISTING
+/// baseline behavior (absent from `git diff 9f628b2..fc540c7`), not
+/// introduced by U1/U2, and out of scope to change here — it is a broad,
+/// unmeasured-blast-radius engine change, not a parser/test fix.
+///
+/// CONSEQUENCE: `unimplemented_oracle_ids.is_empty()` does **not**
+/// discriminate a revert of U2 on `u2_r1`/`u2_r5`/`u2_r6` — a reverted U2
+/// would lower those clauses to exactly this bare top-level
+/// `Effect::Unimplemented` shape, which (per this measurement) never
+/// populates the set either. Those three rows' `unimplemented_oracle_ids`
+/// checks are corrected below to say so; their REAL revert-discriminating
+/// coverage is the final-controller assertions in the sibling
+/// leader-not-controller rows (`u2_r2` for the life axis;
+/// `u2_r5b`, added below, for the hand-size axis, which had no such row
+/// before this fix).
+#[test]
+fn f1_unimplemented_oracle_ids_not_recorded_for_bare_top_level_unimplemented() {
+    let mut scenario = upkeep_scenario(3, 109);
+    scenario
+        .add_creature(P0, "Subfamily-B Decline Test Card", 2, 2)
+        .from_oracle_text(SUBFAMILY_B_DECLINE_LINE);
+    let mut runner = scenario.build();
+    runner.advance_to_upkeep();
+    runner.advance_until_stack_empty();
+    assert!(
+        runner.state().unimplemented_oracle_ids.is_empty(),
+        "MEASURED (not originally expected): a bare top-level \
+         Effect::Unimplemented ability is skipped by \
+         game/stack.rs::execute_effect before effects::resolve_effect's \
+         recording arm is ever reached, so unimplemented_oracle_ids stays \
+         empty even though the trigger genuinely fired and resolved; got {:?}",
+        runner.state().unimplemented_oracle_ids
+    );
+}
+
+/// U2-R5b — HAND-SIZE AXIS, LEADER NOT CONTROLLER (Sokenzan Renegade). The
+/// mirror of `u2_r2` (life axis) for the hand-size axis, added by the F1 fix:
+/// `u2_r5` alone (leader IS controller, P0) cannot discriminate a revert of
+/// U2, because both the final-controller observable (P0 either way) AND the
+/// `unimplemented_oracle_ids` check (proven non-discriminating above) hold
+/// regardless of whether U2 is present. This row's final-controller
+/// observable is genuinely revert-discriminating: reverted, U2's clause
+/// lowers to `Effect::Unimplemented`, no control move happens, and control
+/// stays with the controller P0; fixed, control moves to the unique
+/// hand-size leader P1.
+#[test]
+fn u2_r5b_sokenzan_renegade_leader_not_controller_control_moves_to_leader() {
+    let mut scenario = upkeep_scenario(3, 110);
+    let card = scenario
+        .add_creature(P0, "Sokenzan Renegade", 3, 2)
+        .from_oracle_text_with_keywords(&["Bushido"], SOKENZAN_RENEGADE)
+        .id();
+    scenario
+        .with_cards_in_hand(P0, &["Card A1"])
+        .with_cards_in_hand(P1, &["Card B1", "Card B2", "Card B3"])
+        .with_cards_in_hand(PlayerId(2), &["Card C1"]);
+    let mut runner = scenario.build();
+    runner.advance_to_upkeep();
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        runner.state().objects[&card].controller,
+        P1,
+        "control must move to the unique hand-size leader P1, not stay with the \
+         controller P0"
+    );
+}
+
+/// F7 (HOSTILE) — ELIMINATED PLAYER, HAND-SIZE AXIS: `resolve_per_player_scalar`'s
+/// `AllPlayers` arm (`game/quantity.rs`) filters candidates only on
+/// `excluded_id`, not `is_eliminated`. An eliminated player's larger hand
+/// therefore inflates the population `Max` above every LIVE candidate's hand
+/// size, so `player_property_leader_filter`'s `PlayerAttribute` predicate
+/// (`candidate's hand size >= population Max`) matches NO live player, and
+/// `unique_recipient_from_filter` (`game/effects/gain_control.rs`) errors
+/// "GiveControl recipient" — the trigger's control move silently never
+/// happens, even though the intervening-if condition (U1, via
+/// `resolve_player_count`, which DOES filter `!p.is_eliminated`) correctly
+/// judged the live leader unique and let the trigger stay on the stack.
+///
+/// Board: P0 (controller) has 1 card; P1 is ELIMINATED holding 5 cards (would
+/// "lead" if counted); P2 (live) has 3 cards — the unique LIVE leader.
+/// Expected: control moves to P2. Contrast with
+/// `hostile_eliminated_player_life_axis_excluded_from_population`
+/// (`unique_player_property_leader_condition.rs`), which is GREEN on the LIFE
+/// axis because `resolve_per_team_life` → `shared_resource_members`
+/// (`game/topology.rs`) already excludes non-alive players (CR 800.4a);
+/// `HandSize` has no equivalent guard on this arm.
+#[test]
+fn f7_hostile_eliminated_player_hand_axis_leader_still_wins() {
+    let mut scenario = upkeep_scenario(3, 111);
+    let card = scenario
+        .add_creature(P0, "Sokenzan Renegade", 3, 2)
+        .from_oracle_text_with_keywords(&["Bushido"], SOKENZAN_RENEGADE)
+        .id();
+    scenario
+        .with_cards_in_hand(P0, &["Card A1"])
+        .with_cards_in_hand(P1, &["Card B1", "Card B2", "Card B3", "Card B4", "Card B5"])
+        .with_cards_in_hand(PlayerId(2), &["Card C1", "Card C2", "Card C3"]);
+    let mut runner = scenario.build();
+    runner.state_mut().players[1].is_eliminated = true;
+    runner.advance_to_upkeep();
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        runner.state().objects[&card].controller,
+        PlayerId(2),
+        "REVERT-FAIL (F7): with P1 eliminated, control must still move to the live \
+         hand-size leader P2 (3 cards); eliminated P1 (5 cards) must not count \
+         toward the population max"
     );
 }

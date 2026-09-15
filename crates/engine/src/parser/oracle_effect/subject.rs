@@ -2908,14 +2908,14 @@ pub(super) fn parse_subject_application(
     // to a concrete `TargetFilter` and handed to `subject_filter_application`,
     // from which the GainControl -> GiveControl rewrite takes `recipient`.
     //
-    // CR 608.2d would let the controller break a tie among equally-qualifying
-    // players at resolution. On the three corpus cards a tie CANNOT occur when
-    // the ability resolves, because U1's CR 603.4 intervening-if rechecks
-    // uniqueness on resolution and removes the ability from the stack
-    // otherwise. This coupling is why U1 and U2 must ship together, and it is
-    // also why the engine's fail-closed `unique_recipient_from_filter`
-    // (game/effects/gain_control.rs, "ambiguous GiveControl recipient") is
-    // never reached on these cards.
+    // On the three corpus cards a tie among equally-qualifying players CANNOT
+    // occur when the ability resolves, because U1's CR 603.4 intervening-if
+    // rechecks uniqueness on resolution and removes the ability from the
+    // stack otherwise — a tie means multiple players satisfy the superlative,
+    // not a choice the effect offers the controller. This coupling is why U1
+    // and U2 must ship together, and it is also why the engine's fail-closed
+    // `unique_recipient_from_filter` (game/effects/gain_control.rs,
+    // "ambiguous GiveControl recipient") is never reached on these cards.
     //
     // Placement here (before the bare "the player"/"that player" anaphor
     // `alt` below) mirrors the seating-neighbor convention for locality, but
@@ -7313,9 +7313,12 @@ fn token_starts_predicate(token: &str) -> bool {
 /// bogus predicate. This is why Sokenzan Renegade's HandSize-axis subject
 /// ("who has the most cards in hand") failed to bind while Ghazbán Ogre's
 /// Life-axis "with the most life" (no embedded verb in the copula) did not —
-/// measured via the U2 integration suite. "who has the most " can never be a
-/// sentence's own predicate (a relative pronoun cannot open a main clause),
-/// so this is a structural disambiguation, not a per-card special case.
+/// measured via the U2 integration suite. The guard is deliberately narrowed
+/// to exactly `has`/`have` followed by `"the most "`, not to every `who
+/// <verb>` predicate: the broader corpus's other `who <verb>` forms bind
+/// through the filter-subject path and must not be disturbed, so this covers
+/// only the superlative shape U2.3 introduces, not relative clauses in
+/// general.
 fn is_embedded_who_has_the_most(prev_token: Option<&str>, token: &str, rest_after: &str) -> bool {
     matches!(token, "has" | "have")
         && prev_token == Some("who")

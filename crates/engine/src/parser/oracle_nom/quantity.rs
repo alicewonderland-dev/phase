@@ -101,7 +101,7 @@ fn parse_pt_stat(input: &str) -> OracleResult<'_, PtStat> {
 /// property (graveyard size CR 404.1, poison CR 122.1f, cards drawn CR
 /// 121.1) is one `alt` arm plus two `match` arms, not a new grammar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PlayerProperty {
+pub(in crate::parser) enum PlayerProperty {
     /// CR 702.179f: a player's speed.
     Speed,
     /// CR 119.3: a player's life total.
@@ -111,7 +111,9 @@ pub(crate) enum PlayerProperty {
 }
 
 /// CR 702.179f / CR 119.3 / CR 402.3: parse a player-property keyword.
-pub(crate) fn parse_player_property_keyword(input: &str) -> OracleResult<'_, PlayerProperty> {
+pub(in crate::parser) fn parse_player_property_keyword(
+    input: &str,
+) -> OracleResult<'_, PlayerProperty> {
     alt((
         value(PlayerProperty::Speed, tag("speed")),
         value(PlayerProperty::Life, tag("life")),
@@ -123,7 +125,7 @@ pub(crate) fn parse_player_property_keyword(input: &str) -> OracleResult<'_, Pla
 /// Build the `QuantityRef` for a player-property of the given player scope.
 /// Infallible — `game/quantity.rs::resolve_per_player_scalar` resolves all
 /// three (`Speed` is Spikeshell Harrier's live path).
-pub(crate) fn player_property_quantity(
+pub(in crate::parser) fn player_property_quantity(
     property: PlayerProperty,
     player: PlayerScope,
 ) -> QuantityRef {
@@ -147,7 +149,7 @@ pub(crate) fn player_property_quantity(
 /// never-matching filter is worse than a declined parse, so this fails at
 /// the constructor. Adding a `Speed` arm to `candidate_player_scalar` is the
 /// one edit that flips this on.
-pub(crate) fn player_property_leader_filter(
+pub(in crate::parser) fn player_property_leader_filter(
     property: PlayerProperty,
     relation: PlayerRelation,
 ) -> Option<PlayerFilter> {

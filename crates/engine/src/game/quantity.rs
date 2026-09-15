@@ -8250,19 +8250,32 @@ where
         PlayerScope::SourceChosenPlayer => source_chosen_player_for_context(state, &ctx)
             .and_then(|pid| state.players.iter().find(|p| p.id == pid))
             .map_or(0, &mut extract),
+        // CR 104.3a + CR 800.4a: a player who has left the game is excluded
+        // from the aggregate population, same as `resolve_player_count`'s
+        // candidate loop — an eliminated player's scalar must not inflate a
+        // `Max`/`Min`/`Sum` read over the remaining, still-in-the-game
+        // players (Sokenzan Renegade: an eliminated player's larger hand
+        // must not out-rank the live leader).
         PlayerScope::Opponent { aggregate } => aggregate_over_players(
-            state.players.iter().filter(|p| p.id != controller),
+            state
+                .players
+                .iter()
+                .filter(|p| p.id != controller && !p.is_eliminated),
             *aggregate,
             &mut extract,
         ),
-        // CR 102.1: aggregate over all players, optionally excluding the
-        // `exclude` anchor ("each OTHER player").
+        // CR 102.1 + CR 104.3a + CR 800.4a: aggregate over all players still
+        // in the game, optionally excluding the `exclude` anchor ("each
+        // OTHER player").
         PlayerScope::AllPlayers { aggregate, exclude } => {
             let excluded_id = exclude.as_deref().and_then(|ex| {
                 resolve_single_player_scope(state, ex, controller, ctx, targets, ability)
             });
             aggregate_over_players(
-                state.players.iter().filter(|p| Some(p.id) != excluded_id),
+                state
+                    .players
+                    .iter()
+                    .filter(|p| Some(p.id) != excluded_id && !p.is_eliminated),
                 *aggregate,
                 &mut extract,
             )
@@ -8303,10 +8316,14 @@ where
     F: FnMut(&crate::types::player::Player) -> Option<i32>,
 {
     match scope {
-        // CR 102.2 / CR 102.1: the aggregate populations, narrowed to the
-        // players that actually have the scalar.
+        // CR 102.2 / CR 102.1 / CR 104.3a / CR 800.4a: the aggregate
+        // populations, narrowed to players still in the game that actually
+        // have the scalar.
         PlayerScope::Opponent { aggregate } => aggregate_over_present_players(
-            state.players.iter().filter(|p| p.id != controller),
+            state
+                .players
+                .iter()
+                .filter(|p| p.id != controller && !p.is_eliminated),
             *aggregate,
             &mut extract,
         ),
@@ -8315,7 +8332,10 @@ where
                 resolve_single_player_scope(state, ex, controller, ctx, targets, ability)
             });
             aggregate_over_present_players(
-                state.players.iter().filter(|p| Some(p.id) != excluded_id),
+                state
+                    .players
+                    .iter()
+                    .filter(|p| Some(p.id) != excluded_id && !p.is_eliminated),
                 *aggregate,
                 &mut extract,
             )
