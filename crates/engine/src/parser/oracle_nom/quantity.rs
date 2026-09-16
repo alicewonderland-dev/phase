@@ -123,8 +123,13 @@ pub(in crate::parser) fn parse_player_property_keyword(
 }
 
 /// Build the `QuantityRef` for a player-property of the given player scope.
-/// Infallible — `game/quantity.rs::resolve_per_player_scalar` resolves all
-/// three (`Speed` is Spikeshell Harrier's live path).
+/// Infallible — every arm has a runtime resolver, but NOT a single shared one:
+/// `Speed` and `HandSize` resolve through
+/// `game/quantity.rs::resolve_per_player_scalar` (`Speed` is Spikeshell
+/// Harrier's live path), while `LifeTotal`'s arm never reaches that function —
+/// it resolves single-player scopes through `players::team_life_total` and
+/// aggregate scopes through `resolve_per_team_life` (CR 810.9a team folding).
+/// A guard added to one path is not on the other.
 pub(in crate::parser) fn player_property_quantity(
     property: PlayerProperty,
     player: PlayerScope,

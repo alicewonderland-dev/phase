@@ -8179,10 +8179,12 @@ fn resolve_single_player_scope(
 
 /// CR 102 + CR 119 + CR 402: Resolve a per-player scalar through a `PlayerScope`.
 ///
-/// Single authority for all `LifeTotal { player }` / `HandSize { player }`-style
-/// player-scoped quantity references. `extract` returns the scalar for a single
-/// player (e.g., `p.life`, `p.hand.len()`); the scope decides which players
-/// contribute and how to combine them.
+/// Single authority for the `HandSize { player }`-style player-scoped quantity
+/// references — NOT for `LifeTotal { player }`, whose arm never reaches here:
+/// it routes through `players::team_life_total` / `resolve_per_team_life` for
+/// CR 810.9a team folding. `extract` returns the scalar for a single player
+/// (e.g., `p.hand.len()`); the scope decides which players contribute and how
+/// to combine them.
 ///
 /// - `Controller`: returns the controller's value, or 0 if not found.
 /// - `Target`: returns the first player target's value (CR 115.1), or 0.
@@ -11507,6 +11509,63 @@ mod tests {
         assert_eq!(
             resolve_quantity(&state, &opponent_min, PlayerId(0), ObjectId(0)),
             15,
+            "the same exclusion must hold for the Opponent-scoped population"
+        );
+    }
+
+    /// G5 SIBLING — REGRESSION: pins the `!p.is_eliminated` filters on
+    /// `resolve_per_player_scalar_opt`'s `Opponent` / `AllPlayers` arms, the
+    /// partially-defined-scalar twin of the guards on `resolve_per_player_scalar`.
+    /// Those two arms had NO test of their own; this row is that test.
+    ///
+    /// `PlayerChosenNumber` is the shape that discriminates them. Unlike
+    /// `LifeTotal`, an eliminated player's `chosen_number()` still reads back the
+    /// number they actually chose, so a departed player enters the fold with a
+    /// REAL value rather than a 0 — which is exactly what `Min` picks up when
+    /// their number undercuts every live player's.
+    ///
+    /// 3 players, chosen numbers 5 / 7 / 2 (P0 controller); P2 (the true
+    /// minimum, 2) is ELIMINATED. Expected (CR 104.3 + CR 104.5 + CR 800.4: a
+    /// player who has left the game is not in the population): `AllPlayers{Min}`
+    /// over the live {P0:5, P1:7} = 5, and `Opponent{Min}` over the live
+    /// opponents {P1:7} = 7. Each arm was discriminated on its own, measured:
+    /// reverting the `AllPlayers` filter fails the first assertion (reads 2,
+    /// expected 5); reverting the `Opponent` filter alone fails the second
+    /// (reads 2, expected 7).
+    #[test]
+    fn player_chosen_number_min_excludes_eliminated_player_from_population() {
+        use crate::types::ability::ChosenAttribute;
+
+        let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 3, 0);
+        state.players[0].chosen_attributes = vec![ChosenAttribute::Number(5)];
+        state.players[1].chosen_attributes = vec![ChosenAttribute::Number(7)];
+        state.players[2].chosen_attributes = vec![ChosenAttribute::Number(2)];
+        state.players[2].is_eliminated = true;
+
+        let all_players_min = QuantityExpr::Ref {
+            qty: QuantityRef::PlayerChosenNumber {
+                player: PlayerScope::AllPlayers {
+                    aggregate: AggregateFunction::Min,
+                    exclude: None,
+                },
+            },
+        };
+        assert_eq!(
+            resolve_quantity(&state, &all_players_min, PlayerId(0), ObjectId(0)),
+            5,
+            "an eliminated player's chosen number (2) must not win the live-population Min"
+        );
+
+        let opponent_min = QuantityExpr::Ref {
+            qty: QuantityRef::PlayerChosenNumber {
+                player: PlayerScope::Opponent {
+                    aggregate: AggregateFunction::Min,
+                },
+            },
+        };
+        assert_eq!(
+            resolve_quantity(&state, &opponent_min, PlayerId(0), ObjectId(0)),
+            7,
             "the same exclusion must hold for the Opponent-scoped population"
         );
     }

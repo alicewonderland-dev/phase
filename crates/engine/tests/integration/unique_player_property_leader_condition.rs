@@ -307,18 +307,40 @@ fn hostile_multi_authority_non_controller_tie_blocks_trigger() {
 
 /// Hostile fixture — ELIMINATED PLAYER, LIFE AXIS: a player eliminated while
 /// holding the highest RECORDED life must not count toward the population;
-/// the live leader still wins. Pins the `!p.is_eliminated` filter on
-/// `resolve_per_team_life`'s `AllPlayers`/`Opponent` arms, plus
-/// `resolve_player_count`'s candidate-side filter. It does NOT pin
-/// `topology::shared_resource_members`'s `is_alive` branch: deleting that
-/// branch leaves this fixture green, because `resolve_per_team_life` drops the
-/// departed player before `team_life_total` is ever called (measured).
+/// the live leader still wins.
+///
+/// WHAT THIS ROW ACTUALLY PINS — a DISJUNCTION, not this diff's life-axis
+/// filter on its own. Four revert experiments against this fixture, measured:
+///
+/// 1. Revert only `resolve_per_team_life`'s two `!p.is_eliminated` filters →
+///    GREEN. Measured further, via
+///    `cargo test -p phase-engine --no-fail-fast` under that revert: every
+///    target is green (integration 7076 passed, 0 failed) except ONE lib unit
+///    test —
+///    `game::quantity::tests::life_total_min_excludes_eliminated_player_from_population`.
+///    That is the whole of this filter's regression coverage.
+/// 2. Neutralize `resolve_player_count`'s candidate-side `!p.is_eliminated` →
+///    GREEN.
+/// 3. Delete `topology::shared_resource_members`'s `is_alive` branch → GREEN.
+/// 4. Remove the team-life filters AND the `is_alive` branch together → RED
+///    (P0's life reads 20, expected 23).
+///
+/// `shared_resource_members`'s `is_alive` branch is PRE-EXISTING at
+/// upstream/main and untouched by this diff, so this fixture stays green with
+/// this diff's entire life-axis production change reverted: it does NOT
+/// discriminate that change on its own. It is an end-to-end guard that the
+/// combined path keeps a departed player out of the population, not a
+/// regression pin for the new filter. That pin is the `quantity.rs` unit test
+/// named above; its doc block explains which read shapes the filter actually
+/// changes.
 ///
 /// The mirror HAND-axis fixture,
 /// `f7_hostile_eliminated_player_hand_axis_leader_still_wins`
-/// (`superlative_player_subject_control.rs`), pins a DIFFERENT guard —
-/// `resolve_per_player_scalar`'s — because `QuantityRef::LifeTotal` and
-/// `QuantityRef::HandSize` take separate resolution paths.
+/// (`superlative_player_subject_control.rs`), DOES discriminate its own guard:
+/// reverting `resolve_per_player_scalar`'s `AllPlayers` `!p.is_eliminated`
+/// turns that row RED (measured). The two axes take separate resolution
+/// paths — `QuantityRef::HandSize` through `resolve_per_player_scalar`,
+/// `QuantityRef::LifeTotal` through `resolve_per_team_life`.
 #[test]
 fn hostile_eliminated_player_life_axis_excluded_from_population() {
     let trigger = leader_condition_trigger(LIFE_AXIS_LINE, "Ghazbán Ogre", gain_life_3());

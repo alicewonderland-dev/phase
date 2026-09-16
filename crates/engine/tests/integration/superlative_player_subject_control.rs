@@ -22,8 +22,9 @@
 //! clause lowers to `Effect::Unimplemented{name: "unbound_subject"}` as a
 //! BARE top-level ability effect (no `sub_ability` chain), and
 //! `game/stack.rs::execute_effect` skips such an ability before
-//! `effects::resolve_effect`'s recording arm (`game/effects/mod.rs:6152`) is
-//! ever reached — so `unimplemented_oracle_ids` stays empty whether U2 is
+//! `effects::resolve_effect`'s `Effect::Unimplemented` recording arm
+//! (`game/effects/mod.rs`) is ever reached — so
+//! `unimplemented_oracle_ids` stays empty whether U2 is
 //! present or reverted. The rows on which the final-controller observable
 //! ALSO coincides (`u2_r1`, `u2_r5`, `u2_r6` — leader already controls the
 //! permanent) have no revert-discriminating assertion of their own; the
@@ -471,9 +472,9 @@ fn subfamily_b_object_count_noun_declines_honestly() {
 /// `ability.effect` is `Effect::Unimplemented` (no `sub_ability` chain), it
 /// returns immediately ("Skip unimplemented effects (logged elsewhere as
 /// warnings)") without ever calling `resolve_ability_chain` /
-/// `effects::resolve_effect` — so the recording arm at
-/// `game/effects/mod.rs:6152` is never reached. That skip is PRE-EXISTING
-/// baseline behavior (absent from `git diff 9f628b2..fc540c7`), not
+/// `effects::resolve_effect` — so the latter's `Effect::Unimplemented`
+/// recording arm (`game/effects/mod.rs`) is never reached. That skip is
+/// PRE-EXISTING baseline behavior (untouched by this branch), not
 /// introduced by U1/U2, and out of scope to change here — it is a broad,
 /// unmeasured-blast-radius engine change, not a parser/test fix.
 ///
@@ -549,10 +550,18 @@ fn u2_r5b_sokenzan_renegade_leader_not_controller_control_moves_to_leader() {
 /// would match NO live player. The failure surfaces at the CONDITION, not at
 /// the recipient: U1's intervening-if reads that same inflated
 /// `HandSize{AllPlayers{Max}}` as its threshold, so its `PlayerCount` folds to
-/// 0, the condition is FALSE, and the trigger is removed on resolution —
+/// 0 and the condition is FALSE at the CR 603.4 FIRE-TIME check, so the
+/// ability never triggers and never reaches the stack;
 /// `unique_recipient_from_filter` (`game/effects/gain_control.rs`) is never
-/// reached. Measured: with the guard reverted, a `GainLife`-observable probe
-/// on this board shows a life delta of 0.
+/// reached. Measured with the guard reverted, by `eprintln` probes on
+/// `triggers::check_trigger_condition_with_source` (printing its result plus a
+/// captured backtrace) and on `unique_recipient_from_filter`: the condition is
+/// evaluated exactly ONCE, returning `false`, from
+/// `collect_matching_triggers_inner` ← `collect_matching_triggers` ←
+/// `collect_pending_triggers_with_overlay`, and the
+/// `unique_recipient_from_filter` probe prints nothing. With the guard
+/// restored, the same probes print `true` three times and reach
+/// `unique_recipient_from_filter` exactly once.
 ///
 /// Board: P0 (controller) has 1 card; P1 is ELIMINATED holding 5 cards (would
 /// "lead" if counted); P2 (live) has 3 cards — the unique LIVE leader.
@@ -563,9 +572,17 @@ fn u2_r5b_sokenzan_renegade_leader_not_controller_control_moves_to_leader() {
 /// `resolve_per_team_life` / `team_life_total` (CR 810.9a team folding). The
 /// LIFE-axis sibling
 /// `hostile_eliminated_player_life_axis_excluded_from_population`
-/// (`unique_player_property_leader_condition.rs`) therefore pins
-/// `resolve_per_team_life`'s own filter. Reverting either guard fails only its
-/// own axis — measured in both directions.
+/// (`unique_player_property_leader_condition.rs`) covers the
+/// `resolve_per_team_life` path.
+///
+/// The two guards are NOT symmetric in what they pin, and this row's sibling
+/// is not the life guard's regression pin. Measured with
+/// `cargo test -p phase-engine --no-fail-fast` under a revert of
+/// `resolve_per_team_life`'s filters: NO integration fixture fails (7076
+/// passed, 0 failed) and every other target is green — that guard's only
+/// failing test anywhere is the lib unit test
+/// `game::quantity::tests::life_total_min_excludes_eliminated_player_from_population`.
+/// See the life-axis fixture's own doc block for the four reverts behind that.
 #[test]
 fn f7_hostile_eliminated_player_hand_axis_leader_still_wins() {
     let mut scenario = upkeep_scenario(3, 111);
