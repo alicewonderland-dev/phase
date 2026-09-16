@@ -28014,14 +28014,14 @@ pub struct StaticDefinition {
     /// uses the same axis). `None` means the creature cannot attack at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attack_defended: Option<crate::types::triggers::AttackTargetFilter>,
-    /// CR 611.2c + CR 109.5: Installing-player anchor for controller-relative
-    /// semantics granted onto another object. This snapshots the resolving
-    /// effect's controller for blocker filters (`MustBeBlockedByAll` /
-    /// `MustBeBlocked`) and defended attack scopes (`CantAttack` /
-    /// `CantAttackOrBlock`) that say "you" or "planeswalkers you control".
-    /// Without the snapshot, a later control change of the recipient would
-    /// redirect the restriction to its new controller. `None` retains the
-    /// intrinsic-static fallback to the carrier object's current controller.
+    /// Optional installing-player anchor for the grafted combat modes that
+    /// explicitly materialize one. `GrantStaticAbility` sets it only for an
+    /// unconditional, bare-`SelfRef` `CantAttack` / `CantAttackOrBlock` with an
+    /// eligible controller-relative defended scope. `AddStaticMode` separately
+    /// sets it for controller-relative `MustBeBlocked*` filters and
+    /// `MustAttackAwayFromSource`. Other granted statics, including quoted
+    /// statics with a nontrivial scope or condition, retain the carrier
+    /// controller fallback when this is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_controller: Option<crate::types::player::PlayerId>,
     /// CR 508.1d + CR 611.2c: The object that grafted this static onto its
@@ -28312,10 +28312,10 @@ impl StaticDefinition {
         self
     }
 
-    /// CR 611.2c + CR 109.5: Snapshot the installing player as the anchor for
-    /// controller-relative granted combat semantics (see the
-    /// `source_controller` field doc). Set at graft time by the relevant
-    /// continuous-effect materialization path.
+    /// Set an installing-player anchor when the applicable materialization gate
+    /// has established that the grafted combat mode needs one. The narrow
+    /// `GrantStaticAbility` and `AddStaticMode` gates are documented on
+    /// `source_controller`; this builder does not make that decision itself.
     pub fn source_controller(mut self, controller: crate::types::player::PlayerId) -> Self {
         self.source_controller = Some(controller);
         self
