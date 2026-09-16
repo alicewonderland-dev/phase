@@ -122,6 +122,25 @@ pub fn resolve(
                     // continuous effect for the rest of the turn (CR 611.2c).
                     ContinuousModification::GrantStaticAbility { definition } => {
                         snapshot_granted_cost_modifier(state, ability, definition);
+                        // CR 109.5 + CR 508.1c + CR 611.2c: A resolving
+                        // one-shot effect that grants a scoped attack
+                        // prohibition fixes the installing player as the
+                        // meaning of controller-relative defended scopes.
+                        // Owner-relative and dynamic monarch scopes have no
+                        // controller anchor and must remain unstamped.
+                        if definition.source_controller.is_none()
+                            && definition
+                                .attack_defended
+                                .as_ref()
+                                .is_some_and(defended_scope_uses_source_controller_anchor)
+                            && matches!(
+                                definition.mode,
+                                crate::types::statics::StaticMode::CantAttack
+                                    | crate::types::statics::StaticMode::CantAttackOrBlock
+                            )
+                        {
+                            definition.source_controller = Some(ability.controller);
+                        }
                     }
                     _ => {}
                 }
@@ -1309,6 +1328,23 @@ fn snapshot_granted_cost_modifier(
     *amount = amount.scaled(multiplier);
 }
 
+fn defended_scope_uses_source_controller_anchor(
+    filter: &crate::types::triggers::AttackTargetFilter,
+) -> bool {
+    use crate::types::triggers::AttackTargetFilter;
+
+    match filter {
+        AttackTargetFilter::Player
+        | AttackTargetFilter::Planeswalker
+        | AttackTargetFilter::PlayerOrPlaneswalker
+        | AttackTargetFilter::Battle
+        | AttackTargetFilter::PlayerOrPermanents => true,
+        AttackTargetFilter::Owner
+        | AttackTargetFilter::OwnerOrPlaneswalker
+        | AttackTargetFilter::Monarch => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1369,6 +1405,164 @@ mod tests {
                 keyword: Keyword::Flying,
             }]
         );
+    }
+
+    /// CR 109.5 + CR 611.2c: a one-shot effect that grants a defended attack
+    /// restriction keeps the installing player as the meaning of "you" even if
+    /// the affected creature later changes controllers.
+    #[test]
+    fn generic_effect_snapshots_installer_for_granted_defended_restriction() {
+        use crate::game::combat::AttackTarget;
+        use crate::game::layers::evaluate_layers;
+        use crate::game::static_abilities::{check_static_ability, StaticCheckContext};
+        use crate::types::ability::TargetRef;
+        use crate::types::format::FormatConfig;
+        use crate::types::statics::StaticMode;
+        use crate::types::triggers::AttackTargetFilter;
+
+        let mut state = GameState::new(FormatConfig::standard(), 3, 42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Restriction Source".to_string(),
+            Zone::Command,
+        );
+        let recipient = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Restricted Creature".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&recipient)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+
+        let installer_walker = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Installer Walker".to_string(),
+            Zone::Battlefield,
+        );
+        let new_controller_walker = create_object(
+            &mut state,
+            CardId(4),
+            PlayerId(2),
+            "New Controller Walker".to_string(),
+            Zone::Battlefield,
+        );
+        for walker in [installer_walker, new_controller_walker] {
+            state
+                .objects
+                .get_mut(&walker)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Planeswalker);
+        }
+
+        let outer = StaticDefinition::continuous()
+            .affected(TargetFilter::ParentTarget)
+            .modifications(
+                [
+                    (
+                        StaticMode::CantAttack,
+                        AttackTargetFilter::PlayerOrPlaneswalker,
+                    ),
+                    (
+                        StaticMode::CantAttackOrBlock,
+                        AttackTargetFilter::PlayerOrPlaneswalker,
+                    ),
+                    (StaticMode::CantAttack, AttackTargetFilter::Owner),
+                    (StaticMode::CantAttack, AttackTargetFilter::Monarch),
+                ]
+                .into_iter()
+                .map(
+                    |(mode, defended)| ContinuousModification::GrantStaticAbility {
+                        definition: Box::new(
+                            StaticDefinition::new(mode)
+                                .affected(TargetFilter::SelfRef)
+                                .attack_defended(Some(defended)),
+                        ),
+                    },
+                )
+                .collect(),
+            );
+        let ability = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![outer],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: Some(TargetFilter::ParentTarget),
+                end_cost: None,
+            },
+            vec![TargetRef::Object(recipient)],
+            source,
+            PlayerId(0),
+        )
+        .duration(Duration::UntilEndOfTurn);
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let installed_anchors: Vec<_> = state.transient_continuous_effects[0]
+            .modifications
+            .iter()
+            .map(|modification| match modification {
+                ContinuousModification::GrantStaticAbility { definition } => (
+                    definition.attack_defended.clone(),
+                    definition.source_controller,
+                ),
+                other => panic!("expected granted static definitions, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            installed_anchors,
+            vec![
+                (
+                    Some(AttackTargetFilter::PlayerOrPlaneswalker),
+                    Some(PlayerId(0))
+                ),
+                (
+                    Some(AttackTargetFilter::PlayerOrPlaneswalker),
+                    Some(PlayerId(0))
+                ),
+                (Some(AttackTargetFilter::Owner), None),
+                (Some(AttackTargetFilter::Monarch), None),
+            ]
+        );
+
+        state.objects.get_mut(&recipient).unwrap().controller = PlayerId(2);
+        evaluate_layers(&mut state);
+
+        let applies_to = |mode, attack_target| {
+            check_static_ability(
+                &state,
+                mode,
+                &StaticCheckContext {
+                    target_id: Some(recipient),
+                    attack_target: Some(attack_target),
+                    ..Default::default()
+                },
+            )
+        };
+        for mode in [StaticMode::CantAttack, StaticMode::CantAttackOrBlock] {
+            assert!(applies_to(mode.clone(), AttackTarget::Player(PlayerId(0))));
+            assert!(applies_to(
+                mode.clone(),
+                AttackTarget::Planeswalker(installer_walker)
+            ));
+            assert!(!applies_to(mode.clone(), AttackTarget::Player(PlayerId(2))));
+            assert!(!applies_to(
+                mode,
+                AttackTarget::Planeswalker(new_controller_walker)
+            ));
+        }
     }
 
     /// CR 701.47c: a hypothetical "amass N, then the amassed Army gains/gets

@@ -28008,25 +28008,20 @@ pub struct StaticDefinition {
     pub characteristic_defining: bool,
     #[serde(default)]
     pub description: Option<String>,
-    /// CR 506.3 + CR 508.1d: When set on `CantAttack` / `CantAttackOrBlock`, the
+    /// CR 506.3 + CR 508.1c: When set on `CantAttack` / `CantAttackOrBlock`, the
     /// prohibition applies only to attacks whose `AttackTarget` matches this filter,
     /// scoped to the static's source controller (Propaganda's `UnlessPay::defended`
     /// uses the same axis). `None` means the creature cannot attack at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attack_defended: Option<crate::types::triggers::AttackTargetFilter>,
-    /// CR 611.2c + CR 109.5: Installing-player anchor for a controller-relative
-    /// blocker filter granted onto another object. When a one-shot effect grafts
-    /// a `MustBeBlockedByAll` / `MustBeBlocked` static whose blocker filter is
-    /// controller-relative (`ControllerRef::You`/`Opponent`) onto a TARGET
-    /// permanent (You Look Upon the Tarrasque), CR 109.5's "the current
-    /// controller of the object it's on" would evaluate "your opponents"
-    /// relative to the target's controller, not the spell controller. Per
-    /// CR 611.2c the resolving continuous effect's anchor is locked at
-    /// materialization, so this field snapshots the installing player's id so
-    /// combat re-derives the filter context via
-    /// `FilterContext::from_source_with_controller`. `None` = resolve the
-    /// controller from the carrier object (every permanent-static lure; Talruum
-    /// Piper, Marble Priest; unchanged).
+    /// CR 611.2c + CR 109.5: Installing-player anchor for controller-relative
+    /// semantics granted onto another object. This snapshots the resolving
+    /// effect's controller for blocker filters (`MustBeBlockedByAll` /
+    /// `MustBeBlocked`) and defended attack scopes (`CantAttack` /
+    /// `CantAttackOrBlock`) that say "you" or "planeswalkers you control".
+    /// Without the snapshot, a later control change of the recipient would
+    /// redirect the restriction to its new controller. `None` retains the
+    /// intrinsic-static fallback to the carrier object's current controller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_controller: Option<crate::types::player::PlayerId>,
     /// CR 508.1d + CR 611.2c: The object that grafted this static onto its
@@ -28317,9 +28312,10 @@ impl StaticDefinition {
         self
     }
 
-    /// CR 611.2c + CR 109.5: Snapshot the installing player as the anchor for a
-    /// controller-relative granted blocker filter (see the `source_controller`
-    /// field doc). Set at graft time by the `AddStaticMode` layer arm.
+    /// CR 611.2c + CR 109.5: Snapshot the installing player as the anchor for
+    /// controller-relative granted combat semantics (see the
+    /// `source_controller` field doc). Set at graft time by the relevant
+    /// continuous-effect materialization path.
     pub fn source_controller(mut self, controller: crate::types::player::PlayerId) -> Self {
         self.source_controller = Some(controller);
         self
