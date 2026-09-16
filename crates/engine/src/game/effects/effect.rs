@@ -123,12 +123,18 @@ pub fn resolve(
                     ContinuousModification::GrantStaticAbility { definition } => {
                         snapshot_granted_cost_modifier(state, ability, definition);
                         // CR 109.5 + CR 508.1c + CR 611.2c: A resolving
-                        // one-shot effect that grants a scoped attack
-                        // prohibition fixes the installing player as the
-                        // meaning of controller-relative defended scopes.
-                        // Owner-relative and dynamic monarch scopes have no
-                        // controller anchor and must remain unstamped.
+                        // one-shot effect that grants a bare recipient-local
+                        // attack prohibition fixes the installing player as
+                        // the meaning of controller-relative defended scopes.
+                        // A quoted static ability can also arrive as
+                        // GrantStaticAbility, but its own nontrivial scope or
+                        // condition keeps "you" relative to the recipient's
+                        // controller (CR 109.5). Owner-relative and dynamic
+                        // monarch scopes also remain unstamped.
                         if definition.source_controller.is_none()
+                            && definition.affected == Some(TargetFilter::SelfRef)
+                            && definition.condition.is_none()
+                            && definition.modifications.is_empty()
                             && definition
                                 .attack_defended
                                 .as_ref()
@@ -1585,6 +1591,108 @@ mod tests {
             attack_is_legal(AttackTarget::Player(PlayerId(3)))
         );
         assert!(attack_is_legal(AttackTarget::Planeswalker(other_walker)).is_ok());
+    }
+
+    /// CR 109.5: a quoted static granted as ability text uses the recipient's
+    /// controller for "you", not the player who installed the quotation.
+    #[test]
+    fn quoted_defended_static_does_not_snapshot_installer() {
+        use crate::game::combat::{declare_attackers, AttackTarget};
+        use crate::game::effects::resolve_ability_chain;
+        use crate::game::layers::evaluate_layers;
+        use crate::parser::oracle_static::classify_quoted_inner;
+        use crate::types::ability::TargetRef;
+        use crate::types::format::FormatConfig;
+        use crate::types::triggers::AttackTargetFilter;
+
+        let mut state = GameState::new(FormatConfig::standard(), 4, 43);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Quotation Source".to_string(),
+            Zone::Command,
+        );
+        let host = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Quotation Recipient".to_string(),
+            Zone::Battlefield,
+        );
+        let attacker = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(3),
+            "Flying Attacker".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let creature = state.objects.get_mut(&attacker).unwrap();
+            creature.card_types.core_types.push(CoreType::Creature);
+            creature.base_card_types = creature.card_types.clone();
+            creature.power = Some(2);
+            creature.toughness = Some(2);
+            creature.base_power = Some(2);
+            creature.base_toughness = Some(2);
+            creature.base_keywords.push(Keyword::Flying);
+            creature.keywords.push(Keyword::Flying);
+            creature.summoning_sick = false;
+        }
+
+        let quoted = classify_quoted_inner("Creatures with flying can't attack you.");
+        assert!(matches!(
+            quoted.as_slice(),
+            [ContinuousModification::GrantStaticAbility { definition }]
+                if definition.affected != Some(TargetFilter::SelfRef)
+                    && definition.attack_defended == Some(AttackTargetFilter::Player)
+        ));
+        let outer = StaticDefinition::continuous()
+            .affected(TargetFilter::ParentTarget)
+            .modifications(quoted);
+        let ability = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![outer],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: Some(TargetFilter::ParentTarget),
+                end_cost: None,
+            },
+            vec![TargetRef::Object(host)],
+            source,
+            PlayerId(0),
+        )
+        .duration(Duration::UntilEndOfTurn);
+        resolve_ability_chain(&mut state, &ability, &mut Vec::new(), 0).unwrap();
+        let [ContinuousModification::GrantStaticAbility { definition }] = state
+            .transient_continuous_effects[0]
+            .modifications
+            .as_slice()
+        else {
+            panic!("quoted static must remain a full granted definition")
+        };
+        assert_eq!(definition.source_controller, None);
+
+        {
+            let recipient = state.objects.get_mut(&host).unwrap();
+            recipient.controller = PlayerId(2);
+            recipient.base_controller = Some(PlayerId(2));
+        }
+        evaluate_layers(&mut state);
+        let attack_is_legal = |defender| {
+            let mut candidate = state.clone();
+            candidate.active_player = PlayerId(3);
+            declare_attackers(
+                &mut candidate,
+                &[(attacker, AttackTarget::Player(defender))],
+                &mut Vec::new(),
+            )
+            .is_ok()
+        };
+        assert!(attack_is_legal(PlayerId(0)), "installer is not protected");
+        assert!(
+            !attack_is_legal(PlayerId(2)),
+            "recipient's controller is protected"
+        );
     }
 
     /// CR 701.47c: a hypothetical "amass N, then the amassed Army gains/gets
