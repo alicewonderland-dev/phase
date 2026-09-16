@@ -1412,7 +1412,8 @@ mod tests {
     /// the affected creature later changes controllers.
     #[test]
     fn generic_effect_snapshots_installer_for_granted_defended_restriction() {
-        use crate::game::combat::AttackTarget;
+        use crate::game::combat::{declare_attackers, AttackTarget};
+        use crate::game::effects::resolve_ability_chain;
         use crate::game::layers::evaluate_layers;
         use crate::game::static_abilities::{check_static_ability, StaticCheckContext};
         use crate::types::ability::TargetRef;
@@ -1420,7 +1421,7 @@ mod tests {
         use crate::types::statics::StaticMode;
         use crate::types::triggers::AttackTargetFilter;
 
-        let mut state = GameState::new(FormatConfig::standard(), 3, 42);
+        let mut state = GameState::new(FormatConfig::standard(), 4, 42);
         let source = create_object(
             &mut state,
             CardId(1),
@@ -1435,13 +1436,16 @@ mod tests {
             "Restricted Creature".to_string(),
             Zone::Battlefield,
         );
-        state
-            .objects
-            .get_mut(&recipient)
-            .unwrap()
-            .card_types
-            .core_types
-            .push(CoreType::Creature);
+        {
+            let creature = state.objects.get_mut(&recipient).unwrap();
+            creature.card_types.core_types.push(CoreType::Creature);
+            creature.base_card_types = creature.card_types.clone();
+            creature.power = Some(2);
+            creature.toughness = Some(2);
+            creature.base_power = Some(2);
+            creature.base_toughness = Some(2);
+            creature.summoning_sick = false;
+        }
 
         let installer_walker = create_object(
             &mut state,
@@ -1450,14 +1454,14 @@ mod tests {
             "Installer Walker".to_string(),
             Zone::Battlefield,
         );
-        let new_controller_walker = create_object(
+        let other_walker = create_object(
             &mut state,
             CardId(4),
-            PlayerId(2),
-            "New Controller Walker".to_string(),
+            PlayerId(3),
+            "Other Walker".to_string(),
             Zone::Battlefield,
         );
-        for walker in [installer_walker, new_controller_walker] {
+        for walker in [installer_walker, other_walker] {
             state
                 .objects
                 .get_mut(&walker)
@@ -1508,7 +1512,7 @@ mod tests {
         .duration(Duration::UntilEndOfTurn);
 
         let mut events = Vec::new();
-        resolve(&mut state, &ability, &mut events).unwrap();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
 
         let installed_anchors: Vec<_> = state.transient_continuous_effects[0]
             .modifications
@@ -1537,7 +1541,11 @@ mod tests {
             ]
         );
 
-        state.objects.get_mut(&recipient).unwrap().controller = PlayerId(2);
+        {
+            let creature = state.objects.get_mut(&recipient).unwrap();
+            creature.controller = PlayerId(2);
+            creature.base_controller = Some(PlayerId(2));
+        }
         evaluate_layers(&mut state);
 
         let applies_to = |mode, attack_target| {
@@ -1557,12 +1565,26 @@ mod tests {
                 mode.clone(),
                 AttackTarget::Planeswalker(installer_walker)
             ));
-            assert!(!applies_to(mode.clone(), AttackTarget::Player(PlayerId(2))));
-            assert!(!applies_to(
-                mode,
-                AttackTarget::Planeswalker(new_controller_walker)
-            ));
+            assert!(!applies_to(mode.clone(), AttackTarget::Player(PlayerId(3))));
+            assert!(!applies_to(mode, AttackTarget::Planeswalker(other_walker)));
         }
+
+        // Declare from P2 after the control change. P3 is a legal opposing
+        // defender, unlike P2 itself; the four-player fixture separates the
+        // installer, owner, current controller, and alternate defender.
+        let attack_is_legal = |target| {
+            let mut candidate = state.clone();
+            candidate.active_player = PlayerId(2);
+            declare_attackers(&mut candidate, &[(recipient, target)], &mut Vec::new())
+        };
+        assert!(attack_is_legal(AttackTarget::Player(PlayerId(0))).is_err());
+        assert!(attack_is_legal(AttackTarget::Planeswalker(installer_walker)).is_err());
+        assert!(
+            attack_is_legal(AttackTarget::Player(PlayerId(3))).is_ok(),
+            "alternate defender must be attackable: {:?}",
+            attack_is_legal(AttackTarget::Player(PlayerId(3)))
+        );
+        assert!(attack_is_legal(AttackTarget::Planeswalker(other_walker)).is_ok());
     }
 
     /// CR 701.47c: a hypothetical "amass N, then the amassed Army gains/gets
