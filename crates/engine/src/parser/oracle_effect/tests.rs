@@ -65227,19 +65227,12 @@ fn parse_subject_application_superlative_player_subject_binds() {
 /// via this direct `parse_subject_application` seam — the head-noun `alt`'s
 /// second arm.
 ///
-/// NOT YET production-reachable. This arm is exercised only through the
-/// helper call below, not through the production clause dispatcher: at
-/// HEAD, `parse_effect_clause("the opponent with the most life draws a
-/// card", ..)` still yields `Draw{target: Controller}` (the subject falls
-/// through to the generic subject-stripped imperative instead of this
-/// superlative arm), and `parse_effect_clause("the opponent with the most
-/// life gains control of ~", ..)` yields
-/// `Effect::Unimplemented{"unrecognized_clause_head"}`. The clause-head
-/// dispatcher does not yet route an "the opponent"-headed subject into
-/// `try_parse_subject_predicate_ast`. The sibling "the player " arm IS
-/// reachable in production — see
-/// `parse_subject_application_superlative_player_subject_binds`, which
-/// binds correctly both here and through the full clause dispatcher.
+/// Also production-reachable: `starts_with_subject_prefix` now includes
+/// `"the opponent "`, so `parse_effect_clause` routes this subject through
+/// `strip_subject_clause` into the same seam — see
+/// `parse_effect_clause_superlative_opponent_subject_binds_via_production_dispatch`,
+/// which measures the full-dispatch `Effect::Draw` output for both the life
+/// and cards-in-hand forms.
 #[test]
 fn parse_subject_application_superlative_opponent_subject_binds_opponent_relation() {
     let mut ctx = ParseContext::default();
@@ -65300,4 +65293,89 @@ fn parse_subject_application_subfamily_b_noun_declines() {
             .is_none(),
         "an object-count noun must NOT bind via the player-property subject arm"
     );
+}
+
+/// Production-dispatch coverage for the "the player with/who has the most
+/// `<property>`" superlative subject, through the full `parse_effect_clause`
+/// entry point (not the `parse_subject_application` helper directly). Both
+/// properties. Measured: `parse_effect_clause("the player with the most life
+/// draws a card", ..)` and the cards-in-hand form both yield
+/// `Effect::Draw { target: TargetFilter::PlayerMatching { player:
+/// PlayerFilter::PlayerAttribute { relation: PlayerRelation::All, attr, .. }
+/// } }` with `attr` matching the property (`QuantityRef::LifeTotal` /
+/// `QuantityRef::HandSize`).
+#[test]
+fn parse_effect_clause_superlative_player_subject_binds_via_production_dispatch() {
+    for (text, expected_attr) in [
+        (
+            "the player with the most life draws a card",
+            QuantityRef::LifeTotal {
+                player: PlayerScope::ScopedPlayer,
+            },
+        ),
+        (
+            "the player who has the most cards in hand draws a card",
+            QuantityRef::HandSize {
+                player: PlayerScope::ScopedPlayer,
+            },
+        ),
+    ] {
+        let clause = parse_effect_clause(text, &mut ParseContext::default());
+        let Effect::Draw { target, .. } = &clause.effect else {
+            panic!("{text:?}: expected Effect::Draw, got {:?}", clause.effect);
+        };
+        let TargetFilter::PlayerMatching { player } = target else {
+            panic!("{text:?}: expected TargetFilter::PlayerMatching, got {target:?}");
+        };
+        let PlayerFilter::PlayerAttribute { relation, attr, .. } = player.as_ref() else {
+            panic!("{text:?}: expected PlayerFilter::PlayerAttribute, got {player:?}");
+        };
+        assert_eq!(*relation, PlayerRelation::All, "{text:?}: wrong relation");
+        assert_eq!(**attr, expected_attr, "{text:?}: wrong attr");
+    }
+}
+
+/// Production-dispatch coverage for the "the opponent with/who has the most
+/// `<property>`" superlative subject — the fix for the PR #8918 CR review
+/// gap. Prior to adding `"the opponent "` to `starts_with_subject_prefix`,
+/// `parse_effect_clause` on both inputs below produced `Effect::Draw {
+/// target: TargetFilter::Controller, .. }` (the opponent-headed subject fell
+/// through subject-stripping entirely and the clause defaulted to the
+/// imperative `Draw` target). Measured after the fix: both inputs now yield
+/// `Effect::Draw { target: TargetFilter::PlayerMatching { player:
+/// PlayerFilter::PlayerAttribute { relation: PlayerRelation::Opponent, attr,
+/// .. } } }` with `attr` matching the property.
+#[test]
+fn parse_effect_clause_superlative_opponent_subject_binds_via_production_dispatch() {
+    for (text, expected_attr) in [
+        (
+            "the opponent with the most life draws a card",
+            QuantityRef::LifeTotal {
+                player: PlayerScope::ScopedPlayer,
+            },
+        ),
+        (
+            "the opponent who has the most cards in hand draws a card",
+            QuantityRef::HandSize {
+                player: PlayerScope::ScopedPlayer,
+            },
+        ),
+    ] {
+        let clause = parse_effect_clause(text, &mut ParseContext::default());
+        let Effect::Draw { target, .. } = &clause.effect else {
+            panic!("{text:?}: expected Effect::Draw, got {:?}", clause.effect);
+        };
+        let TargetFilter::PlayerMatching { player } = target else {
+            panic!("{text:?}: expected TargetFilter::PlayerMatching, got {target:?}");
+        };
+        let PlayerFilter::PlayerAttribute { relation, attr, .. } = player.as_ref() else {
+            panic!("{text:?}: expected PlayerFilter::PlayerAttribute, got {player:?}");
+        };
+        assert_eq!(
+            *relation,
+            PlayerRelation::Opponent,
+            "{text:?}: wrong relation"
+        );
+        assert_eq!(**attr, expected_attr, "{text:?}: wrong attr");
+    }
 }

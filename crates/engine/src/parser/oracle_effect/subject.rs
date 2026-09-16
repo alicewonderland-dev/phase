@@ -7130,6 +7130,16 @@ pub(crate) fn starts_with_subject_prefix(lower: &str) -> bool {
             // before the bare "the player " arm.
             value((), tag("the attacking player ")),
             value((), tag("the player ")),
+            // CR 102.2 + CR 608.2c: "the opponent with/who has the most
+            // <property>" as an effect subject — the sibling of the "the
+            // player " superlative arm above, routed through the same
+            // `strip_subject_clause` -> `parse_subject_application` seam so
+            // `superlative_player_subject`'s `PlayerRelation::Opponent` arm
+            // (this file, `parse_subject_application`) becomes reachable
+            // from `parse_effect_clause`. Lexically disjoint from "the
+            // player " (distinct second word), so ordering relative to it
+            // is not load-bearing.
+            value((), tag("the opponent ")),
             // CR 609.7 + CR 615.5: "the source's controller" / "the source's
             // owner" as a subject in a damage-prevention follow-up (Swans of
             // Bryn Argoll, Eye for an Eye class). The "that source's …" form
