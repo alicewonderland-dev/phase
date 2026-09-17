@@ -4,6 +4,7 @@ import { motion } from "framer-motion";
 import { useNavigate, useSearchParams } from "react-router";
 
 import {
+  setArrivingCardBoardPreferences,
   useDraftStore,
   type DraftPackChoice,
   type DraftPickDestination,
@@ -491,6 +492,17 @@ export function DraftPage() {
     if (useDraftStore.getState().pickInteractionLocked) return;
     setWorkspacePreferences(next);
     saveDraftWorkspacePreferences(next);
+    // SYNCHRONOUSLY, not from an effect, for the reason
+    // `DraftPodPage.handlePreferencesChange` states: an effect runs after
+    // commit, and a pick acknowledged in that window would have
+    // `installWorkspace` place the arriving card against the PREVIOUS columns.
+    // This is the only path that changes `deck`; `setPackScale` below spreads
+    // `workspacePreferences` and touches one numeric field.
+    setArrivingCardBoardPreferences(next.deck);
+  }, []);
+  // Mount only. The change path publishes for itself, above.
+  useEffect(() => {
+    setArrivingCardBoardPreferences(loadDraftWorkspacePreferences().deck);
   }, []);
 
   const handleDrop = useCallback((request: DraftDropRequest) => {

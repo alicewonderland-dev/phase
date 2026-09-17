@@ -4,6 +4,7 @@ import {
   appendWorkspaceInstanceToResolvedDestination,
   createDraftWorkspaceState,
   moveWorkspaceInstance,
+  placeArrivingPoolCards,
   reconcileWorkspaceState,
   updateWorkspacePlacement,
 } from "../workspace/workspacePlacement";
@@ -41,6 +42,51 @@ function boardPreferences(): Record<DraftZone, DraftBoardPreferences> {
 }
 
 describe("workspace placement", () => {
+  // `draftStore.installWorkspace` and `multiplayerDraftStore.performPick` both
+  // call `placeArrivingPoolCards` ahead of their own `applyDestination`, and
+  // both rely on the deck-zone guard the second case below pins to keep a
+  // sideboard pick out of the deck-sorted columns.
+  it("places_arriving_cards_into_the_columns_the_sort_means", () => {
+    const pool = [{ ...card("cheap"), cmc: 1 }, { ...card("costly"), cmc: 5 }];
+    const base = reconcileWorkspaceState(createDraftWorkspaceState(), pool);
+
+    const placed = placeArrivingPoolCards(
+      base, ["cheap", "costly"], pool, groups(), boardPreferences().deck,
+    );
+
+    // Six columns under a `cmc` sort, so `manaValueColumn` truncates and clamps
+    // to 5 — a card reconcile had just defaulted to column 0.
+    expect(base.placements.cheap.column).toBe(0);
+    expect(placed.placements.cheap.column).toBe(1);
+    expect(placed.placements.costly.column).toBe(5);
+  });
+
+  it("leaves_an_arriving_card_alone_when_its_placement_is_in_the_sideboard", () => {
+    const pool = [{ ...card("costly"), cmc: 5 }];
+    const sideboarded = { zone: "sideboard", row: 0, column: 0, order: 0 } as const;
+    const base: DraftWorkspaceState = {
+      ...createDraftWorkspaceState(),
+      placements: { costly: sideboarded },
+    };
+
+    const placed = placeArrivingPoolCards(
+      base, ["costly"], pool, groups(), boardPreferences().deck,
+    );
+
+    expect(placed.placements.costly).toEqual(sideboarded);
+  });
+
+  it("creates_no_placement_for_an_id_the_pool_does_not_hold", () => {
+    const pool = [card("present")];
+    const base = reconcileWorkspaceState(createDraftWorkspaceState(), pool);
+
+    const placed = placeArrivingPoolCards(
+      base, ["absent"], pool, groups(), boardPreferences().deck,
+    );
+
+    expect(placed.placements).not.toHaveProperty("absent");
+  });
+
   it("reconciles_authoritative_instances_without_losing_manual_placement", () => {
     const manual = { zone: "sideboard", row: 1, column: 4, order: 7 } as const;
     const state: DraftWorkspaceState = {

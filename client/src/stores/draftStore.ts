@@ -21,9 +21,14 @@ import {
   appendWorkspaceInstanceToResolvedDestination,
   createDraftWorkspaceState,
   makeInteractiveVirtualBasicInstanceId,
+  placeArrivingPoolCards,
   reconcileWorkspaceState,
   updateWorkspacePlacement,
 } from "../components/draft/workspace/workspacePlacement";
+import {
+  loadDraftWorkspacePreferences,
+  type DraftBoardPreferences,
+} from "../components/draft/workspace/workspacePreferences";
 import {
   addVirtualBasic,
   projectDeckNames,
@@ -391,10 +396,103 @@ type WorkspaceInstallOperation =
       readonly persistence: "schedule";
     };
 
+/**
+ * Pool cards the workspace had no placement for BEFORE this reconcile.
+ *
+ * Structural rather than a pool diff, for the reason `multiplayerDraftStore`'s
+ * twin of this function gives: a diff answers "which cards are new" only when
+ * there is an earlier pool to diff against, and the first view of a lifecycle —
+ * a resumed Quick draft, a restored Sealed pool — has none. Both cases are the
+ * same question, because `reconcileWorkspaceState` is about to invent a default
+ * placement for exactly these ids and this is the list it will invent them for.
+ *
+ * A workspace restored with the player's own saved placements yields an empty
+ * list, so nothing they arranged is re-sorted.
+ */
+function unplacedPoolIds(
+  workspace: DraftWorkspaceState | null,
+  pool: DraftPlayerView["pool"],
+): string[] {
+  if (workspace === null) return pool.map((card) => card.instance_id);
+  return pool
+    .filter((card) => workspace.placements[card.instance_id] === undefined)
+    .map((card) => card.instance_id);
+}
+
+let arrivingCardBoardPreferences: DraftBoardPreferences =
+  loadDraftWorkspacePreferences().deck;
+
+/**
+ * Tell this module which columns the deck board currently means.
+ *
+ * Module state rather than store state, matching
+ * `multiplayerDraftStore.setArrivingCardBoardPreferences`: the value is a
+ * PRESENTATION preference that lives in `localStorage`, and it is absent from
+ * both `DraftStoreState` and the persisted `QuickDraftSnapshotInput`.
+ *
+ * Seeded from the player's STORED preferences rather than the module defaults,
+ * so that an install this setter has not yet been called for still places
+ * against the columns the player chose. `startLocalDraft` and `resumeDraft`
+ * both install through `kind: "state"`, and on a fresh Sealed pool — whose
+ * base is `createDraftWorkspaceState()` — every card in the pool is unplaced
+ * at once, so the preferences in force at that moment lay out the whole board.
+ */
+export function setArrivingCardBoardPreferences(preferences: DraftBoardPreferences): void {
+  arrivingCardBoardPreferences = preferences;
+}
+
+/**
+ * Ids this operation resolves a placement for ITSELF, and so which the arriving
+ * pass below must not speak for.
+ *
+ * Two cases, and only two. A `placementHint` names a column outright — the page
+ * resolved one in `DraftPage.handleConfirmPick`, or the player dropped the card
+ * on a specific column through `handleDrop` — and re-deriving it would discard
+ * a choice someone actually made. A `sideboard` destination is the other: the
+ * arriving pass is deck-only by construction (`placeArrivingPoolCards` skips
+ * any placement whose `zone` is not `"deck"`), so letting it run first would
+ * leave a deck-sorted column index on a card that `applyDestination` then
+ * carries into the sideboard, where `normalizeWorkspaceForBoardGeometry` clamps
+ * it to that zone's last column instead of its first.
+ *
+ * A hint-less DECK pick is deliberately absent from both: it has no placement
+ * decision of its own, which is precisely what the arriving pass is for.
+ */
+function operationResolvesOwnPlacement(operation: WorkspaceInstallOperation): readonly string[] {
+  switch (operation.kind) {
+    case "state":
+      return [];
+    case "acknowledged-pick":
+      return operation.placementHint !== undefined || operation.destination !== "deck"
+        ? operation.placeInstanceIds
+        : [];
+    case "acknowledged-auto-pick":
+      return operation.placementHint !== undefined ? [operation.addedInstanceId] : [];
+  }
+}
+
 function installWorkspace(operation: WorkspaceInstallOperation): void {
-  let workspace = reconcileWorkspaceState(
-    operation.baseWorkspace,
+  const ownPlacement = operationResolvesOwnPlacement(operation);
+  // Against `operation.baseWorkspace`, the PRE-reconcile workspace, so a card
+  // that entered the pool on this install still counts as arriving. Asked after
+  // the reconcile below it would already hold the column-0 default and be
+  // filtered out, which is why the id list is computed here and not inside the
+  // placement call.
+  const arriving = unplacedPoolIds(operation.baseWorkspace, operation.authoritativeView.pool)
+    .filter((instanceId) => !ownPlacement.includes(instanceId));
+  // Sorted placement for cards that reach the pool with no hint resolved for
+  // them: the `kind: "state"` installs `startLocalDraft` and `resumeDraft` make,
+  // plus the hint-less deck picks `PackDisplay.request` dispatches through
+  // `pickCard`, `pickCardStep` and `pickCardWithDraftEffect`. Without this they
+  // stack in the board's first column whatever the sort says.
+  // Before the switch, so the `placement.column` fallback in `applyDestination`
+  // reads the sorted column rather than reconcile's default.
+  let workspace = placeArrivingPoolCards(
+    reconcileWorkspaceState(operation.baseWorkspace, operation.authoritativeView.pool),
+    arriving,
     operation.authoritativeView.pool,
+    operation.authoritativeView.pool_groups,
+    arrivingCardBoardPreferences,
   );
   switch (operation.kind) {
     case "state":

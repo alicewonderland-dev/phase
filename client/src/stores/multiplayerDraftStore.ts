@@ -884,7 +884,36 @@ async function performPick(request: MultiplayerPickRequest): Promise<DraftPickOu
       cleanup();
       return { status: "rejected", reason: "unacknowledged" };
     }
-    let workspace = reconcileWorkspaceState(state.workspaceState, acknowledgedView.pool);
+    // Sorted placement for a pick that resolved no hint of its own. The pod page
+    // resolves one in `handleConfirmPick` and `handleAutoPick`, but
+    // `PackDisplay`'s `request` dispatches `pickCardStep` and
+    // `pickCardWithDraftEffect` with no hint at all, and `applyDestination` then
+    // falls back to `placement.column` — reconcile's column-0 default.
+    //
+    // Skipped for the ids this request places itself, on the same two grounds
+    // `draftStore.operationResolvesOwnPlacement` names: a `placementHint` is a
+    // column someone chose, and a `sideboard` destination is a zone this
+    // deck-only pass does not speak for — `placeArrivingPoolCards` would leave a
+    // deck column index that `applyDestination` carries into the sideboard, to
+    // be clamped by `normalizeWorkspaceForBoardGeometry` to that zone's LAST
+    // column rather than its first.
+    //
+    // The id list is taken against `state.workspaceState`, BEFORE the reconcile,
+    // so the cards this pick just added still count as arriving; asked
+    // afterwards they would already hold that default and be filtered out.
+    const ownPlacement = request.kind === "auto-pick"
+      ? request.instanceIds.filter((instanceId) => request.placementHints?.[instanceId] !== undefined)
+      : request.placementHint !== undefined || request.destination !== "deck"
+        ? request.instanceIds
+        : [];
+    let workspace = placeArrivingPoolCards(
+      reconcileWorkspaceState(state.workspaceState, acknowledgedView.pool),
+      unplacedPoolIds(state.workspaceState, acknowledgedView.pool)
+        .filter((instanceId) => !ownPlacement.includes(instanceId)),
+      acknowledgedView.pool,
+      acknowledgedView.pool_groups,
+      arrivingCardBoardPreferences,
+    );
     workspace = request.kind === "auto-pick"
       ? request.instanceIds.reduce(
         (next, instanceId) => applyDestination(

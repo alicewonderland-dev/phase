@@ -97,6 +97,15 @@ function card(instanceId: string, name = instanceId): DraftCardInstance {
   };
 }
 
+/** A card whose mana value decides its column under the default `cmc` board sort.
+ *  `manaValueColumn` truncates and clamps to `columnCount - 1`, and the deck board
+ *  defaults to 7 columns against the sideboard's 6 — so cmc 6 is the value that
+ *  distinguishes "sorted into the deck's last column" from "clamped into the
+ *  sideboard's last column", which is the confusion these tests exist to pin. */
+function cardWithCmc(instanceId: string, cmc: number): DraftCardInstance {
+  return { ...card(instanceId), cmc };
+}
+
 function view(pool: DraftCardInstance[] = []): DraftPlayerView {
   return {
     status: "Drafting",
@@ -189,6 +198,55 @@ describe("draft store workspace authority", () => {
       useDraftStore.getState().workspaceState!,
       useDraftStore.getState().view!.pool,
     )).toEqual([]);
+  });
+
+  it("sorts_a_pool_arriving_on_a_state_install_into_the_boards_columns", async () => {
+    // `startDraft` installs the whole pool through a `kind: "state"` operation,
+    // which resolves no placement hint for any card — the path a restored Sealed
+    // pool and a resumed Quick draft both take. Before `placeArrivingPoolCards`
+    // was wired into this store every one of these landed in column 0.
+    await start([cardWithCmc("cheap", 1), cardWithCmc("costly", 6)]);
+
+    const placements = useDraftStore.getState().workspaceState!.placements;
+    expect(placements.cheap.column).toBe(1);
+    expect(placements.costly.column).toBe(6);
+  });
+
+  it("sorts_a_hint_less_deck_pick_into_the_column_its_mana_value_means", async () => {
+    // `PackDisplay.request` dispatches `pickCard` with no placement hint, so
+    // `applyDestination` has only reconcile's column-0 default to fall back on.
+    await start();
+    wasm.submit_pick.mockReturnValue(view([cardWithCmc("picked", 6)]));
+
+    await useDraftStore.getState().pickCard("picked", "deck");
+
+    expect(useDraftStore.getState().workspaceState!.placements.picked.column).toBe(6);
+  });
+
+  it("keeps_the_hint_column_on_a_deck_pick_that_resolved_one", async () => {
+    // The arriving pass must not overrule a column someone chose — this is the
+    // drag-and-drop target as well as `DraftPage.handleConfirmPick`'s resolution.
+    await start();
+    wasm.submit_pick.mockReturnValue(view([cardWithCmc("picked", 6)]));
+
+    await useDraftStore.getState().pickCard("picked", "deck", { column: 2 });
+
+    expect(useDraftStore.getState().workspaceState!.placements.picked.column).toBe(2);
+  });
+
+  it("leaves_a_hint_less_sideboard_pick_in_the_first_column", async () => {
+    // The arriving pass is deck-only. Were it allowed to run for a sideboard
+    // pick it would stamp deck column 6 on this card, and
+    // `normalizeWorkspaceForBoardGeometry` would clamp that to 5 — the
+    // sideboard's LAST column — rather than leaving it in the first.
+    await start();
+    wasm.submit_pick.mockReturnValue(view([cardWithCmc("picked", 6)]));
+
+    await useDraftStore.getState().pickCard("picked", "sideboard");
+
+    const placement = useDraftStore.getState().workspaceState!.placements.picked;
+    expect(placement.zone).toBe("sideboard");
+    expect(placement.column).toBe(0);
   });
 
   it("has_exactly_one_reconciliation_call_inside_install_workspace", () => {

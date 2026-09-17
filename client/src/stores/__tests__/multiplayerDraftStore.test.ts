@@ -1762,6 +1762,61 @@ describe("multiplayerDraftStore", () => {
       expect(useMultiplayerDraftStore.getState().selectedCard).toBeNull();
     });
 
+    // A PREMIER pod, deliberately — not Winston. `submitPick` is what
+    // `PackDisplay.request` reaches with no placement hint at all, so before
+    // `performPick` ran the arriving pass this card had only reconcile's
+    // column-0 default to fall back on, in every pick-and-pass format.
+    it("sorts a hint-less pick into the column the board's sort means", async () => {
+      await useMultiplayerDraftStore.getState().hostDraft({
+        poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
+        kind: "Premier",
+        podSize: 8,
+        hostDisplayName: "Host",
+        tournamentFormat: "Swiss",
+        podPolicy: "Competitive",
+      });
+      capturedHostEventHandler!({ type: "viewUpdated", view: mockView("Drafting") });
+      const picked = { ...card("costly"), cmc: 5 };
+      mockHostAdapter.submitPick.mockResolvedValueOnce({
+        ...mockView("Drafting"),
+        pool: [picked],
+      });
+
+      await expect(useMultiplayerDraftStore.getState().submitPick("costly", "deck"))
+        .resolves.toEqual({ status: "acknowledged" });
+
+      // The seeded default sort is by mana value, so a five-drop belongs in
+      // column 5 rather than the first column it would otherwise land in.
+      expect(useMultiplayerDraftStore.getState().workspaceState!.placements.costly.column)
+        .toBe(5);
+    });
+
+    // The companion claim: a hint is a column someone chose — the drop target
+    // from a drag, or `DraftPodPage.handleConfirmPick`'s resolution — and the
+    // arriving pass must not re-derive over it.
+    it("keeps the hint column on a pick that carries one", async () => {
+      await useMultiplayerDraftStore.getState().hostDraft({
+        poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
+        kind: "Premier",
+        podSize: 8,
+        hostDisplayName: "Host",
+        tournamentFormat: "Swiss",
+        podPolicy: "Competitive",
+      });
+      capturedHostEventHandler!({ type: "viewUpdated", view: mockView("Drafting") });
+      const picked = { ...card("costly"), cmc: 5 };
+      mockHostAdapter.submitPick.mockResolvedValueOnce({
+        ...mockView("Drafting"),
+        pool: [picked],
+      });
+
+      await expect(useMultiplayerDraftStore.getState().submitPick("costly", "deck", { column: 2 }))
+        .resolves.toEqual({ status: "acknowledged" });
+
+      expect(useMultiplayerDraftStore.getState().workspaceState!.placements.costly.column)
+        .toBe(2);
+    });
+
     it("ignores selection replacement while pick interaction is locked", () => {
       useMultiplayerDraftStore.setState({ selectedCard: "prior", pickInteractionLocked: true });
 
