@@ -1101,6 +1101,8 @@ pub fn apply_resolved_counter_edit(
         }
     };
 
+    // CR 611.2a + CR 611.2b: A resolved "for as long as" effect lasts only
+    // for its stated duration.
     // Capture only a duration that is presently true for the exact object
     // incarnation named by this accepted edit. The independent application
     // condition does not determine whether the duration has ended.
@@ -1195,6 +1197,8 @@ pub fn apply_resolved_counter_edit(
         }
     };
 
+    // CR 611.2a + CR 611.2b: Retire effects whose duration ends on this
+    // edit; later counters cannot resume an ended effect.
     let mut retired = false;
     if !started_counter_durations.is_empty() {
         state.transient_continuous_effects.retain(|effect| {
