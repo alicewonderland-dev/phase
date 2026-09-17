@@ -35,7 +35,7 @@ use engine::game::scenario::{GameScenario, P0, P1};
 use engine::parser::parse_oracle_text;
 use engine::types::ability::{Effect, TargetRef};
 use engine::types::actions::GameAction;
-use engine::types::game_state::{CastPaymentMode, WaitingFor};
+use engine::types::game_state::{CastPaymentMode, StackEntryKind, WaitingFor};
 use engine::types::phase::Phase;
 use engine::types::PlayerId;
 
@@ -511,11 +511,46 @@ fn subfamily_b_object_count_noun_declines_honestly() {
 #[test]
 fn f1_unimplemented_oracle_ids_not_recorded_for_bare_top_level_unimplemented() {
     let mut scenario = upkeep_scenario(3, 109);
-    scenario
+    let card = scenario
         .add_creature(P0, "Subfamily-B Decline Test Card", 2, 2)
-        .from_oracle_text(SUBFAMILY_B_DECLINE_LINE);
+        .from_oracle_text(SUBFAMILY_B_DECLINE_LINE)
+        .id();
     let mut runner = scenario.build();
     runner.advance_to_upkeep();
+
+    // The post-drain assertion below is an ABSENCE check, and absence is also
+    // what you get when the trigger never fires at all. Pin the antecedent
+    // first: the ability really does reach the stack carrying the bare
+    // top-level `Effect::Unimplemented`, so the empty set measured afterwards
+    // is the skip in `game/stack.rs::execute_effect` and not a no-show.
+    //
+    // Measured non-vacuous: drop the `advance_to_upkeep()` above so the
+    // trigger never reaches the stack, and this pair fails with `got []`
+    // (left 0, right 1) while the post-drain absence check still passes.
+    // That difference is exactly the gap these two assertions close.
+    let staged: Vec<Effect> = runner
+        .state()
+        .stack
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            StackEntryKind::TriggeredAbility {
+                source_id, ability, ..
+            } if *source_id == card => Some(ability.effect.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        staged.len(),
+        1,
+        "expected exactly one triggered ability from this source on the stack before draining; got {staged:?}"
+    );
+    assert!(
+        matches!(&staged[0], Effect::Unimplemented { name, .. } if name == "unbound_subject"),
+        "the staged ability must carry the bare top-level Effect::Unimplemented with name \
+         \"unbound_subject\" that this test is about; got {:?}",
+        staged[0]
+    );
+
     runner.advance_until_stack_empty();
     assert!(
         runner.state().unimplemented_oracle_ids.is_empty(),
