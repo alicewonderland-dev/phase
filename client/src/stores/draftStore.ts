@@ -395,37 +395,49 @@ type WorkspaceInstallOperation =
     };
 
 /**
- * Ids bound for the SIDEBOARD, which the deck-only arriving pass must not place.
+ * Ids this operation resolves a placement for ITSELF, which the arriving pass
+ * must leave alone.
  *
- * `placeArrivingPoolCards` skips any placement whose `zone` is not `"deck"`, but
- * a card this operation is about to move still carries reconcile's `"deck"`
- * default when the pass runs. Left in, the pass would stamp a deck-geometry
- * column on it that `applyDestination` then carries into the sideboard — where
- * `normalizeWorkspaceForBoardGeometry` clamps it to that zone's last column
- * once it overflows the narrower sideboard, instead of leaving it in the first.
+ * A `sideboard` destination, because the pass is deck-only: the card still
+ * carries reconcile's `"deck"` default when the pass runs, so the pass would
+ * stamp a deck-geometry column that `applyDestination` then carries into the
+ * sideboard, to be clamped by `normalizeWorkspaceForBoardGeometry` to that
+ * zone's last column once it overflows the narrower sideboard.
  *
- * A `placementHint` needs no exclusion: `applyDestination` runs after the pass
- * and reads `placementHint?.column ?? placement.column`, so a hint already wins
- * over anything the pass resolved.
+ * A `placementHint`, because `applyDestination` falls back per FIELD:
+ * `placementHint?.row ?? placement.row`. `DraftPickPlacementHint.row` is
+ * optional, and `useDraftWorkspaceDrag` omits it whenever the drop hit a column
+ * but no row band. On a two-row board the pass would then decide that card's
+ * row through the engine classification, where the hint path has always fallen
+ * back to reconcile's default — a drag-behaviour change this change has no
+ * business making. The COLUMN is unaffected either way: a hint always wins
+ * there, which is why excluding these ids changes nothing for a one-row board.
  *
- * `acknowledged-auto-pick` installs to `"deck"` unconditionally below, so it
- * never contributes ids here.
+ * `acknowledged-auto-pick` installs to `"deck"` unconditionally below, so only
+ * its hint can exclude it.
  */
-function sideboardBoundInstanceIds(operation: WorkspaceInstallOperation): readonly string[] {
-  return operation.kind === "acknowledged-pick" && operation.destination !== "deck"
-    ? operation.placeInstanceIds
-    : [];
+function operationResolvesOwnPlacement(operation: WorkspaceInstallOperation): readonly string[] {
+  switch (operation.kind) {
+    case "state":
+      return [];
+    case "acknowledged-pick":
+      return operation.placementHint !== undefined || operation.destination !== "deck"
+        ? operation.placeInstanceIds
+        : [];
+    case "acknowledged-auto-pick":
+      return operation.placementHint !== undefined ? [operation.addedInstanceId] : [];
+  }
 }
 
 function installWorkspace(operation: WorkspaceInstallOperation): void {
-  const sideboardBound = sideboardBoundInstanceIds(operation);
+  const ownPlacement = operationResolvesOwnPlacement(operation);
   // Against `operation.baseWorkspace`, the PRE-reconcile workspace, so a card
   // that entered the pool on this install still counts as arriving. Asked after
   // the reconcile below it would already hold the column-0 default and be
   // filtered out, which is why the id list is computed here and not inside the
   // placement call.
   const arriving = unplacedPoolIds(operation.baseWorkspace, operation.authoritativeView.pool)
-    .filter((instanceId) => !sideboardBound.includes(instanceId));
+    .filter((instanceId) => !ownPlacement.includes(instanceId));
   // Sorted placement for cards that reach the pool with no hint resolved for
   // them: the `kind: "state"` installs `startLocalDraft` and `resumeDraft` make,
   // plus the hint-less deck picks `PackDisplay.request` dispatches through

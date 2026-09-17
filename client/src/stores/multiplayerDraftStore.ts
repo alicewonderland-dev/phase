@@ -669,30 +669,6 @@ function publishWorkspace(workspace: DraftWorkspaceState): Promise<void> {
 }
 
 /**
- * The deck board's sort and geometry, as the player has them set right now.
- *
- * Module state rather than store state, and deliberately so: it is a
- * PRESENTATION preference that lives in `localStorage` and belongs to the page,
- * not a piece of draft state any view publishes. What it is needed for here is
- * narrow — cards arrive in the pool on paths that resolve no placement of their
- * own (a shared-stack take collects a whole pile; a timed-out seat's decision is
- * applied by the host and broadcast), and those cards have to land in the column
- * the board's sort means rather than all in column 0.
- *
- * Seeded from the player's STORED preferences, not from the module defaults,
- * and the difference is not cosmetic. On a resume or a rejoin the first
- * `viewUpdated` is what flips `phase` to `"drafting"`, which is what mounts the
- * page component that publishes this value — and React effects run after that
- * render, so the first `placeArrivingPoolCards` call happens BEFORE the page
- * can say anything. On that first call `unplacedPoolIds` returns the WHOLE
- * restored pool, and the layout it produces is the one that gets published and
- * persisted. Seeded from the defaults, a player who drafts by colour across
- * five columns would find their entire resumed pool laid out by mana value
- * across seven, with only later arrivals placed correctly.
- *
- * The page's effect then carries in-session changes, which is what it is for.
- */
-/**
  * The workspace to ask `unplacedPoolIds` about before this store has one.
  *
  * A null `workspaceState` means no card has a placement yet, which an empty
@@ -859,37 +835,36 @@ async function performPick(request: MultiplayerPickRequest): Promise<DraftPickOu
     // `pickCardWithDraftEffect` with no hint at all, and `applyDestination` then
     // falls back to `placement.column` — reconcile's column-0 default.
     //
-    // Skipped for the ids this request places itself, on the same two grounds
-    // `draftStore.operationResolvesOwnPlacement` names: a `placementHint` is a
-    // column someone chose, and a `sideboard` destination is a zone this
-    // deck-only pass does not speak for — `placeArrivingPoolCards` would leave a
-    // deck column index that `applyDestination` carries into the sideboard, to
-    // be clamped by `normalizeWorkspaceForBoardGeometry` to that zone's LAST
-    // column rather than its first.
+    // Ids this request places itself, which the arriving pass must leave alone.
     //
-    // The id list is taken against `state.workspaceState`, BEFORE the reconcile,
-    // so the cards this pick just added still count as arriving; asked
-    // afterwards they would already hold that default and be filtered out.
-    // Ids bound for the SIDEBOARD, which the deck-only arriving pass must not
-    // place. Same reason `draftStore.sideboardBoundInstanceIds` gives: the card
-    // still carries reconcile's `"deck"` default when the pass runs, so the pass
-    // would stamp a deck-geometry column that `applyDestination` carries into
-    // the sideboard, to be clamped by `normalizeWorkspaceForBoardGeometry` to
-    // that zone's last column once it overflows the narrower sideboard.
+    // A `sideboard` destination, because the pass is deck-only: the card still
+    // carries reconcile's `"deck"` default when the pass runs, so the pass would
+    // stamp a deck-geometry column that `applyDestination` carries into the
+    // sideboard, to be clamped by `normalizeWorkspaceForBoardGeometry` to that
+    // zone's last column once it overflows the narrower sideboard.
     //
-    // A `placementHint` needs no exclusion: `applyDestination` runs after this
-    // and reads `placementHint?.column ?? placement.column`, so a hint already
-    // wins. `auto-pick` types its `destination` as the literal `"deck"`.
-    const sideboardBound = request.kind !== "auto-pick" && request.destination !== "deck"
-      ? request.instanceIds
-      : [];
+    // A `placementHint`, because `applyDestination` falls back per FIELD:
+    // `placementHint?.row ?? placement.row`. A drag that hits a column but no
+    // row band omits `row` (`useDraftWorkspaceDrag` sends none when
+    // `target.row === null`), so on a two-row board the pass would decide that
+    // card's row through the engine classification instead of leaving the
+    // reconcile default the hint path has always fallen back to. The column is
+    // unaffected either way — the hint always wins there.
+    //
+    // `auto-pick` types its `destination` as the literal `"deck"`, and carries
+    // per-id hints rather than one.
+    const ownPlacement = request.kind === "auto-pick"
+      ? request.instanceIds.filter((instanceId) => request.placementHints?.[instanceId] !== undefined)
+      : request.placementHint !== undefined || request.destination !== "deck"
+        ? request.instanceIds
+        : [];
     let workspace = placeArrivingPoolCards(
       reconcileWorkspaceState(state.workspaceState, acknowledgedView.pool),
       // Against the PRE-reconcile workspace, so the cards this pick just added
       // still count as arriving; asked afterwards they would already hold
       // reconcile's column-0 default and be filtered out.
       unplacedPoolIds(placementsSoFar(state.workspaceState), acknowledgedView.pool)
-        .filter((instanceId) => !sideboardBound.includes(instanceId)),
+        .filter((instanceId) => !ownPlacement.includes(instanceId)),
       acknowledgedView.pool,
       acknowledgedView.pool_groups,
       getArrivingCardBoardPreferences(),

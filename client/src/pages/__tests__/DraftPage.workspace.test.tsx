@@ -145,6 +145,12 @@ vi.mock("../../components/draft/workspace/workspacePreferences", async (importOr
   const actual = await importOriginal<
     typeof import("../../components/draft/workspace/workspacePreferences")
   >();
+  // FORWARDS to the real setter rather than swallowing the call. The stores read
+  // the published value back through `getArrivingCardBoardPreferences` in this
+  // same module, so a bare `vi.fn()` would sever the page-to-store seam and any
+  // later placement assertion here would silently measure the module's seeded
+  // default instead of what the page published.
+  arrivingPreferences.mockImplementation(actual.setArrivingCardBoardPreferences);
   return { ...actual, setArrivingCardBoardPreferences: arrivingPreferences };
 });
 

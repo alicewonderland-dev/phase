@@ -22,6 +22,10 @@ import {
   makeInteractiveVirtualBasicInstanceId,
 } from "../../components/draft/workspace/workspacePlacement";
 import {
+  createDefaultDraftWorkspacePreferences,
+  setArrivingCardBoardPreferences,
+} from "../../components/draft/workspace/workspacePreferences";
+import {
   projectWorkspaceLandCounts,
   projectWorkspaceMainDeck,
 } from "../../components/draft/workspace/workspaceProjection";
@@ -170,6 +174,9 @@ describe("draft store workspace authority", () => {
     vi.useFakeTimers();
     vi.clearAllMocks();
     persistence.inspectActiveQuickDraftLifecycle.mockResolvedValue(null);
+    // Module state, so it survives `reset()` and would otherwise leak the
+    // geometry one test publishes into the next.
+    setArrivingCardBoardPreferences(createDefaultDraftWorkspacePreferences().deck);
     useDraftStore.getState().reset();
   });
 
@@ -251,6 +258,26 @@ describe("draft store workspace authority", () => {
     const placement = useDraftStore.getState().workspaceState!.placements.picked;
     expect(placement.zone).toBe("sideboard");
     expect(placement.column).toBe(0);
+  });
+
+  it("leaves_a_row_less_hint_on_a_two_row_board_in_the_reconcile_default_row", async () => {
+    // `applyDestination` falls back per FIELD, so a hint naming only a column
+    // leaves `row` to whatever placement is in the workspace. A drag that hits a
+    // column but no row band sends exactly that shape. The arriving pass must
+    // therefore skip hinted ids: were it to run, it would resolve this card's
+    // row through the engine classification and change where a drag lands on a
+    // two-row board, which is not this change's business.
+    setArrivingCardBoardPreferences({
+      sort: "cmc", columnCount: 7, rows: "two", showHeaders: true,
+    });
+    await start();
+    wasm.submit_pick.mockReturnValue(view([cardWithCmc("picked", 6)]));
+
+    await useDraftStore.getState().pickCard("picked", "deck", { column: 2 });
+
+    const placement = useDraftStore.getState().workspaceState!.placements.picked;
+    expect(placement.column).toBe(2);
+    expect(placement.row).toBe(0);
   });
 
   it("has_exactly_one_reconciliation_call_inside_install_workspace", () => {
