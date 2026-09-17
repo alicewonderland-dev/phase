@@ -65079,6 +65079,386 @@ fn counter_gate_guard_is_claimed_upstream_of_the_guard_ownership_seam() {
     );
 }
 
+// ── U2 building-block tests: acceptance-set preservation + target/subject
+// predicate shapes. Test the block across its input range, not one card
+// (CLAUDE.md).
+
+/// S3 — `parse_opponent_most_life_restriction`'s ACCEPTED-INPUT SET must not
+/// widen. An `assert_eq!` on the constructed filter pins the *output* for
+/// one input, never the *accepted-input set*, so this test asserts
+/// acceptance/rejection directly instead.
+#[test]
+fn parse_opponent_most_life_restriction_acceptance_set_unchanged() {
+    // Accepts: the mandatory leading space, with and without the fixed tail.
+    // Asserted on the REMAINDER, not `is_ok()`: this helper's contract is that
+    // it CONSUMES the optional " among your opponents" tail, and two of its
+    // three consumers reject a non-empty remainder. `is_ok()` alone would stay
+    // green if the tail were left unconsumed.
+    let (rest, _) = parse_opponent_most_life_restriction(" with the most life")
+        .expect("the bare form must parse");
+    assert_eq!(rest, "", "the bare form must consume its whole input");
+    let (rest, _) =
+        parse_opponent_most_life_restriction(" with the most life among your opponents")
+            .expect("the form carrying the fixed tail must parse");
+    assert_eq!(
+        rest, "",
+        "the ' among your opponents' tail must be CONSUMED, not left as remainder"
+    );
+    // Rejects: no leading space (U2.1 must not make it optional).
+    assert!(
+        parse_opponent_most_life_restriction("with the most life").is_err(),
+        "the leading space must stay MANDATORY — making it optional would widen this \
+         entry point's accepted-input set (S3)"
+    );
+    // An unknown/generalized domain tail is left UNCONSUMED, not swallowed:
+    // this function is not `all_consuming` (never was — the pre-existing
+    // implementation had the identical `opt(tag(" among your opponents"))`
+    // no-op-on-mismatch shape), so the caller's own consume-on-success check
+    // is what actually declines an unrecognized domain. What must NOT
+    // happen is the domain tail being generalized into a phrase that
+    // SWALLOWS " among all players" — pin that the residue is untouched.
+    let (rest, _) = parse_opponent_most_life_restriction(" with the most life among all players")
+        .expect("the fixed-prefix match must still succeed; the unknown suffix is left as residue");
+    assert_eq!(
+        rest, " among all players",
+        "the domain tail must stay the FIXED literal \" among your opponents\" — \
+         generalizing it to a phrase would swallow (rather than leave as residue) an \
+         unrecognized domain, widening this entry point's accepted-input set (S3)"
+    );
+    // Rejects: the other copula and the other two properties — this entry
+    // point is deliberately narrower than the shared `parse_most_property_tail`
+    // core it delegates to.
+    assert!(
+        parse_opponent_most_life_restriction(" who has the most life").is_err(),
+        "the OTHER copula must still decline at this entry point"
+    );
+    assert!(parse_opponent_most_life_restriction(" with the most speed").is_err());
+    assert!(parse_opponent_most_life_restriction(" with the most cards in hand").is_err());
+}
+
+/// U2.2's target-position arm, via the public `parse_target_player_relative_clause`
+/// seam: "who has the most `<property>`" / "with the most `<property>`" binds
+/// a `PlayerAttribute` leader filter, matching what U1's condition-position
+/// existential and U2.3's subject arm both build.
+#[test]
+fn parse_target_player_relative_clause_superlative_arm_binds_leader_filter() {
+    let mut ctx = ParseContext::default();
+    let (rest, filters) =
+        parse_target_player_relative_clause("with the most life", &mut ctx, PlayerRelation::All)
+            .expect("the superlative arm must bind");
+    assert_eq!(rest, "");
+    assert_eq!(filters.len(), 1);
+    assert_eq!(
+        filters[0],
+        PlayerFilter::PlayerAttribute {
+            relation: PlayerRelation::All,
+            attr: Box::new(QuantityRef::LifeTotal {
+                player: PlayerScope::ScopedPlayer,
+            }),
+            comparator: Comparator::GE,
+            value: Box::new(QuantityExpr::Ref {
+                qty: QuantityRef::LifeTotal {
+                    player: PlayerScope::AllPlayers {
+                        aggregate: AggregateFunction::Max,
+                        exclude: None,
+                    },
+                },
+            }),
+        }
+    );
+}
+
+/// G2 fix: "target OPPONENT with the most `<property>`" must thread the head
+/// noun's `PlayerRelation::Opponent` through to the superlative predicate —
+/// both the candidate-relation gate AND the population the "most" is measured
+/// against must be scoped to the caster's opponents, not every player. Before
+/// this fix, `head_relation` was hardcoded to `PlayerRelation::All` here,
+/// which (composed with the caller's `Typed{controller: Opponent}` head-noun
+/// leg at `oracle_target.rs`) required the target to also have at least as
+/// much life as the CASTER — impossible in multiplayer whenever the caster
+/// itself leads on life.
+#[test]
+fn parse_target_player_relative_clause_superlative_arm_opponent_head_scopes_to_opponents() {
+    let mut ctx = ParseContext::default();
+    let (rest, filters) = parse_target_player_relative_clause(
+        "with the most life",
+        &mut ctx,
+        PlayerRelation::Opponent,
+    )
+    .expect("the superlative arm must bind under an opponent head noun");
+    assert_eq!(rest, "");
+    assert_eq!(filters.len(), 1);
+    assert_eq!(
+        filters[0],
+        PlayerFilter::PlayerAttribute {
+            relation: PlayerRelation::Opponent,
+            attr: Box::new(QuantityRef::LifeTotal {
+                player: PlayerScope::ScopedPlayer,
+            }),
+            comparator: Comparator::GE,
+            value: Box::new(QuantityExpr::Ref {
+                qty: QuantityRef::LifeTotal {
+                    player: PlayerScope::Opponent {
+                        aggregate: AggregateFunction::Max,
+                    },
+                },
+            }),
+        },
+        "the population must be scoped to the caster's opponents (`PlayerScope::Opponent`), \
+         not every player (`PlayerScope::AllPlayers`)"
+    );
+}
+
+/// The OTHER copula, at the target position: "who has the most `<property>`"
+/// binds the same shape. Unlike the subject position (U2.3), the target
+/// position is reached via `oracle_target.rs`'s `after_target` branch, not
+/// `find_predicate_start` — so this axis was never exposed to the
+/// "who has"-deconjugates-to-a-`PREDICATE_VERB` collision U2.3 hit.
+#[test]
+fn parse_target_player_relative_clause_superlative_arm_who_has_copula_binds() {
+    let mut ctx = ParseContext::default();
+    let (rest, filters) = parse_target_player_relative_clause(
+        "who has the most cards in hand",
+        &mut ctx,
+        PlayerRelation::All,
+    )
+    .expect("the \"who has the most\" copula must bind at the target position");
+    assert_eq!(rest, "");
+    assert_eq!(filters.len(), 1);
+    assert_eq!(
+        filters[0],
+        PlayerFilter::PlayerAttribute {
+            relation: PlayerRelation::All,
+            attr: Box::new(QuantityRef::HandSize {
+                player: PlayerScope::ScopedPlayer,
+            }),
+            comparator: Comparator::GE,
+            value: Box::new(QuantityExpr::Ref {
+                qty: QuantityRef::HandSize {
+                    player: PlayerScope::AllPlayers {
+                        aggregate: AggregateFunction::Max,
+                        exclude: None,
+                    },
+                },
+            }),
+        }
+    );
+}
+
+/// The pre-existing `who controls more <type> than <anchor>` arm must keep
+/// binding byte-identically after U2.2's restructure into a two-arm
+/// dispatch (probe G1a re-run, per the plan's first U2.2 implementation
+/// action).
+#[test]
+fn parse_target_player_relative_clause_anchor_arm_unchanged_by_u2_2() {
+    let mut ctx = ParseContext::default();
+    let (rest, filters) = parse_target_player_relative_clause(
+        "who controls more creatures than you",
+        &mut ctx,
+        PlayerRelation::All,
+    )
+    .expect("the pre-existing anchor arm must still bind");
+    assert_eq!(rest, "");
+    assert_eq!(filters.len(), 1);
+    let PlayerFilter::ControlsCount { relation, .. } = &filters[0] else {
+        panic!("expected ControlsCount, got {:?}", filters[0]);
+    };
+    assert_eq!(*relation, PlayerRelation::All);
+}
+
+/// U2.3's subject arm, via the public `parse_subject_application` seam: "the
+/// player with the most `<property>`" / "the player who has the most
+/// `<property>`" bind a `PlayerMatching` `TargetFilter`. Both properties and
+/// both copulas.
+#[test]
+fn parse_subject_application_superlative_player_subject_binds() {
+    let mut ctx = ParseContext::default();
+    for (subject, expected_attr) in [
+        (
+            "the player with the most life",
+            QuantityRef::LifeTotal {
+                player: PlayerScope::ScopedPlayer,
+            },
+        ),
+        (
+            "the player who has the most cards in hand",
+            QuantityRef::HandSize {
+                player: PlayerScope::ScopedPlayer,
+            },
+        ),
+    ] {
+        let application = subject::parse_subject_application(subject, &mut ctx)
+            .unwrap_or_else(|| panic!("{subject:?} must bind a subject application"));
+        let TargetFilter::PlayerMatching { player } = &application.affected else {
+            panic!(
+                "expected TargetFilter::PlayerMatching, got {:?}",
+                application.affected
+            );
+        };
+        let PlayerFilter::PlayerAttribute { relation, attr, .. } = player.as_ref() else {
+            panic!("expected PlayerFilter::PlayerAttribute, got {player:?}");
+        };
+        assert_eq!(*relation, PlayerRelation::All);
+        assert_eq!(**attr, expected_attr);
+    }
+}
+
+/// "the opponent with the most `<property>`" binds with `relation: Opponent`
+/// via this direct `parse_subject_application` seam — the head-noun `alt`'s
+/// second arm.
+///
+/// Also production-reachable: `starts_with_subject_prefix` now includes
+/// `"the opponent "`, so `parse_effect_clause` routes this subject through
+/// `strip_subject_clause` into the same seam — see
+/// `parse_effect_clause_superlative_opponent_subject_binds_via_production_dispatch`,
+/// which measures the full-dispatch `Effect::Draw` output for both the life
+/// and cards-in-hand forms.
+#[test]
+fn parse_subject_application_superlative_opponent_subject_binds_opponent_relation() {
+    let mut ctx = ParseContext::default();
+    let application =
+        subject::parse_subject_application("the opponent with the most life", &mut ctx)
+            .expect("the opponent-headed superlative subject must bind");
+    let TargetFilter::PlayerMatching { player } = &application.affected else {
+        panic!(
+            "expected TargetFilter::PlayerMatching, got {:?}",
+            application.affected
+        );
+    };
+    let PlayerFilter::PlayerAttribute { relation, .. } = player.as_ref() else {
+        panic!("expected PlayerFilter::PlayerAttribute, got {player:?}");
+    };
+    assert_eq!(*relation, PlayerRelation::Opponent);
+}
+
+/// Preservation: the bare "the player" anaphor must keep its current
+/// binding (a `TargetFilter::TriggeringPlayer`-family resolution, NOT
+/// `PlayerMatching`) — the new superlative arm's `all_consuming` guard must
+/// decline on any tail it does not own rather than shadow this arm.
+#[test]
+fn parse_subject_application_bare_the_player_anaphor_unshadowed() {
+    let mut ctx = ParseContext::default();
+    let application = subject::parse_subject_application("the player", &mut ctx)
+        .expect("the bare anaphor must still bind");
+    assert!(
+        !matches!(application.affected, TargetFilter::PlayerMatching { .. }),
+        "the bare \"the player\" anaphor must NOT be captured by the superlative arm, \
+         got {:?}",
+        application.affected
+    );
+}
+
+/// Preservation: "the player to your right" must still yield `Neighbor` —
+/// the seating-neighbor arm precedes the superlative arm and the two are
+/// lexically disjoint, so this must be unaffected.
+#[test]
+fn parse_subject_application_seating_neighbor_unaffected_by_u2_3() {
+    let mut ctx = ParseContext::default();
+    let application = subject::parse_subject_application("the player to your right", &mut ctx)
+        .expect("the seating-neighbor subject must still bind");
+    assert!(
+        matches!(application.affected, TargetFilter::Neighbor { .. }),
+        "expected TargetFilter::Neighbor, got {:?}",
+        application.affected
+    );
+}
+
+/// Decline path: "the player with the most creatures" (subfamily-B object
+/// count, no `creatures` arm in the property `alt`) must remain unbound.
+#[test]
+fn parse_subject_application_subfamily_b_noun_declines() {
+    let mut ctx = ParseContext::default();
+    assert!(
+        subject::parse_subject_application("the player with the most creatures", &mut ctx)
+            .is_none(),
+        "an object-count noun must NOT bind via the player-property subject arm"
+    );
+}
+
+/// Production-dispatch coverage for the "the player with/who has the most
+/// `<property>`" superlative subject, through the full `parse_effect_clause`
+/// entry point (not the `parse_subject_application` helper directly). Both
+/// properties. Measured: `parse_effect_clause("the player with the most life
+/// draws a card", ..)` and the cards-in-hand form both yield
+/// `Effect::Draw { target: TargetFilter::PlayerMatching { player:
+/// PlayerFilter::PlayerAttribute { relation: PlayerRelation::All, attr, .. }
+/// } }` with `attr` matching the property (`QuantityRef::LifeTotal` /
+/// `QuantityRef::HandSize`).
+#[test]
+fn parse_effect_clause_superlative_player_subject_binds_via_production_dispatch() {
+    for (text, expected_attr) in [
+        (
+            "the player with the most life draws a card",
+            QuantityRef::LifeTotal {
+                player: PlayerScope::ScopedPlayer,
+            },
+        ),
+        (
+            "the player who has the most cards in hand draws a card",
+            QuantityRef::HandSize {
+                player: PlayerScope::ScopedPlayer,
+            },
+        ),
+    ] {
+        let clause = parse_effect_clause(text, &mut ParseContext::default());
+        let Effect::Draw { target, .. } = &clause.effect else {
+            panic!("{text:?}: expected Effect::Draw, got {:?}", clause.effect);
+        };
+        let TargetFilter::PlayerMatching { player } = target else {
+            panic!("{text:?}: expected TargetFilter::PlayerMatching, got {target:?}");
+        };
+        let PlayerFilter::PlayerAttribute { relation, attr, .. } = player.as_ref() else {
+            panic!("{text:?}: expected PlayerFilter::PlayerAttribute, got {player:?}");
+        };
+        assert_eq!(*relation, PlayerRelation::All, "{text:?}: wrong relation");
+        assert_eq!(**attr, expected_attr, "{text:?}: wrong attr");
+    }
+}
+
+/// Production-dispatch coverage for the "the opponent with/who has the most
+/// `<property>`" superlative subject — the fix for the PR #8918 CR review
+/// gap. Prior to adding `"the opponent "` to `starts_with_subject_prefix`,
+/// `parse_effect_clause` on both inputs below produced `Effect::Draw {
+/// target: TargetFilter::Controller, .. }` (the opponent-headed subject fell
+/// through subject-stripping entirely and the clause defaulted to the
+/// imperative `Draw` target). Measured after the fix: both inputs now yield
+/// `Effect::Draw { target: TargetFilter::PlayerMatching { player:
+/// PlayerFilter::PlayerAttribute { relation: PlayerRelation::Opponent, attr,
+/// .. } } }` with `attr` matching the property.
+#[test]
+fn parse_effect_clause_superlative_opponent_subject_binds_via_production_dispatch() {
+    for (text, expected_attr) in [
+        (
+            "the opponent with the most life draws a card",
+            QuantityRef::LifeTotal {
+                player: PlayerScope::ScopedPlayer,
+            },
+        ),
+        (
+            "the opponent who has the most cards in hand draws a card",
+            QuantityRef::HandSize {
+                player: PlayerScope::ScopedPlayer,
+            },
+        ),
+    ] {
+        let clause = parse_effect_clause(text, &mut ParseContext::default());
+        let Effect::Draw { target, .. } = &clause.effect else {
+            panic!("{text:?}: expected Effect::Draw, got {:?}", clause.effect);
+        };
+        let TargetFilter::PlayerMatching { player } = target else {
+            panic!("{text:?}: expected TargetFilter::PlayerMatching, got {target:?}");
+        };
+        let PlayerFilter::PlayerAttribute { relation, attr, .. } = player.as_ref() else {
+            panic!("{text:?}: expected PlayerFilter::PlayerAttribute, got {player:?}");
+        };
+        assert_eq!(
+            *relation,
+            PlayerRelation::Opponent,
+            "{text:?}: wrong relation"
+        );
+        assert_eq!(**attr, expected_attr, "{text:?}: wrong attr");
+    }
+}
 // ---------------------------------------------------------------------------
 // Announced target-set cardinality for positional library placement.
 // CR 115.1 + CR 601.2c: "put any number of target …" / "put up to N target …"
@@ -65298,23 +65678,15 @@ fn bow_of_nylea_mode_four_gains_up_to_four_target_set_shape() {
     );
 }
 
-/// A-10 — KNOWN-BAD LOCK. Lodestone Bauble's "from a player's graveyard" zone
-/// and owner qualifiers are NOT extracted by the parser at all: the filter is
-/// bare `Land + HasSupertype(Basic)`, with no `InZone` and no `Owned`. This
-/// phase widens the clause's cardinality from one object to four, which
-/// AMPLIFIES that pre-existing misparse rather than causing it.
-///
-/// This test exists to make the amplification visible in the tree instead of
-/// latent. The follow-up that extracts "from a player's X" must cite this test
-/// by name and DELETE it as part of the real fix.
-///
-/// The `multi_target` half is the reach guard for the "no `InZone` / no `Owned`"
-/// half, which is vacuous over a filter the locator failed to reach. Paired
-/// positive: `misinformation` is the same "up to N target … from an opponent's
-/// graveyard" family WITH the owner binding present, proving the extractor can
-/// produce one.
+/// A-10. Lodestone Bauble: "Put up to four target basic land cards from a player's
+/// graveyard on top of their library in any order." The announced target set is
+/// up to four (CR 115.1c, CR 601.2c), and every target is a basic land card in a
+/// graveyard (CR 404.1). "A player's" binds no owner, so the filter carries
+/// `InZone` and no `Owned` property. Before the zone qualifier was extracted, the
+/// filter admitted basic lands in any zone, and the four-target set widened that
+/// misparse.
 #[test]
-fn lodestone_bauble_known_bad_missing_zone_qualifier_lock() {
+fn lodestone_bauble_targets_up_to_four_basic_lands_in_a_graveyard() {
     let parsed = parse_oracle_text(
         "{1}, {T}, Sacrifice this artifact: Put up to four target basic land cards from a \
          player's graveyard on top of their library in any order. That player draws a card at \
@@ -65329,12 +65701,10 @@ fn lodestone_bauble_known_bad_missing_zone_qualifier_lock() {
         .first()
         .expect("Lodestone Bauble parses its activated ability");
 
-    // REACH GUARD: the phase fired on this card at all.
     assert_eq!(
         ability.multi_target,
         Some(MultiTargetSpec::up_to(QuantityExpr::Fixed { value: 4 })),
-        "reach guard: the announced target set must be present, or the filter \
-         assertions below prove nothing"
+        "the announced target set must be up to four"
     );
 
     let Effect::PutAtLibraryPosition { target, .. } = ability.effect.as_ref() else {
@@ -65346,24 +65716,28 @@ fn lodestone_bauble_known_bad_missing_zone_qualifier_lock() {
     assert_eq!(filter.type_filters, vec![TypeFilter::Land]);
     assert_eq!(
         filter.controller, None,
-        "KNOWN BAD: no controller/owner is bound"
+        "\"a player's\" binds no controller"
     );
     assert!(
         filter.properties.contains(&FilterProp::HasSupertype {
             value: Supertype::Basic
         }),
-        "the basic-land supertype IS extracted, got {:?}",
+        "the basic-land supertype is extracted, got {:?}",
         filter.properties
     );
     assert!(
-        !filter.properties.iter().any(|property| matches!(
-            property,
-            FilterProp::InZone { .. } | FilterProp::Owned { .. }
-        )),
-        "KNOWN BAD: \"from a player's graveyard\" contributes neither an InZone nor an \
-         Owned property, so this clause targets basic lands anywhere — a pre-existing \
-         misparse this phase amplifies from one object to four. Delete this test when \
-         that extraction is fixed. Got {:?}",
+        filter.properties.contains(&FilterProp::InZone {
+            zone: Zone::Graveyard
+        }),
+        "\"from a player's graveyard\" must bind the graveyard zone, got {:?}",
+        filter.properties
+    );
+    assert!(
+        !filter
+            .properties
+            .iter()
+            .any(|property| matches!(property, FilterProp::Owned { .. })),
+        "\"a player's\" binds no owner, got {:?}",
         filter.properties
     );
 }

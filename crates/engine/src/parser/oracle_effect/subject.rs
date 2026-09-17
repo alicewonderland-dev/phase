@@ -4,7 +4,7 @@ use nom::bytes::complete::{tag, take_till, take_until};
 use nom::character::complete::multispace0;
 use nom::combinator::{all_consuming, map, opt, peek, rest, value, verify};
 use nom::multi::separated_list1;
-use nom::sequence::{delimited, preceded, terminated};
+use nom::sequence::{delimited, pair, preceded, terminated};
 use nom::Parser;
 
 use super::animation::{
@@ -18,8 +18,8 @@ use crate::parser::oracle_ir::ast::*;
 use crate::types::ability::{
     AbilityDefinition, AbilityKind, ChosenSubtypeKind, ColorChangeMode, ContinuousModification,
     ControllerRef, CopyRecipient, Duration, EachDamageRecipient, Effect, EffectScope, FilterProp,
-    MultiTargetSpec, ObjectScope, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef,
-    StaticCondition, StaticDefinition, TargetFilter, TypedFilter,
+    MultiTargetSpec, ObjectScope, PlayerFilter, PlayerRelation, PlayerScope, PtValue, QuantityExpr,
+    QuantityRef, StaticCondition, StaticDefinition, TargetFilter, TypedFilter,
 };
 use crate::types::game_state::DayNight;
 use crate::types::keywords::Keyword;
@@ -2941,6 +2941,61 @@ fn parse_subject_application_for(
         let (neighbor_filter, rest) = parse_target(subject);
         if rest.trim().is_empty() && matches!(neighbor_filter, TargetFilter::Neighbor { .. }) {
             return subject_filter_application(neighbor_filter, false);
+        }
+    }
+    // CR 102.1 + CR 608.2c: "the player with the most <property>" / "the
+    // player who has the most <property>" as an effect SUBJECT — a live
+    // per-candidate predicate, not an anaphor. Structural sibling of the
+    // seating-neighbor arm above: a definite-article player subject resolved
+    // to a concrete `TargetFilter` and handed to `subject_filter_application`,
+    // from which the GainControl -> GiveControl rewrite takes `recipient`.
+    //
+    // On the three corpus cards a tie among equally-qualifying players CANNOT
+    // occur when the ability resolves, because U1's CR 603.4 intervening-if
+    // rechecks uniqueness on resolution and removes the ability from the
+    // stack otherwise — a tie means multiple players satisfy the superlative,
+    // not a choice the effect offers the controller. This coupling is why U1
+    // and U2 must ship together, and it is also why the engine's fail-closed
+    // `unique_recipient_from_filter` (game/effects/gain_control.rs,
+    // "ambiguous GiveControl recipient") is never reached on these cards.
+    //
+    // Placement here (before the bare "the player"/"that player" anaphor
+    // `alt` below) mirrors the seating-neighbor convention for locality, but
+    // is not load-bearing: both this arm and the bare anaphor below are
+    // `all_consuming` over lexically disjoint inputs ("the player" exactly,
+    // versus "the player with/who has the most <property>"), so neither can
+    // shadow the other at any position. The `all_consuming` wrapper IS
+    // load-bearing — it makes an unrecognized tail fall through to the
+    // existing failure rather than binding a prefix.
+    //
+    // The head-noun tags MUST carry their own trailing space:
+    // `parse_most_property_tail` opens with `tag("with the most ")` /
+    // `tag("who has the most ")`, so a bare `tag("the player")` would leave
+    // " with the most life" behind and the tail could never match. The
+    // `oracle_target.rs` target-position seam and U2.1's
+    // `parse_opponent_most_life_restriction` caller each peel that space
+    // themselves before calling; this site has no one to peel it for it, so
+    // the tag owns it. `value()` also carries the relation off the same arm.
+    {
+        let mut superlative_player_subject = all_consuming(pair(
+            alt((
+                value(
+                    PlayerRelation::All,
+                    tag::<_, _, OracleError<'_>>("the player "),
+                ),
+                value(PlayerRelation::Opponent, tag("the opponent ")),
+            )),
+            super::parse_most_property_tail,
+        ));
+        if let Ok((_, (relation, property))) = superlative_player_subject.parse(lower.as_str()) {
+            if let Some(player) = nom_quantity::player_property_leader_filter(property, relation) {
+                return subject_filter_application(
+                    TargetFilter::PlayerMatching {
+                        player: Box::new(player),
+                    },
+                    false,
+                );
+            }
         }
     }
     // CR 608.2c + CR 117.3a: "that player" / "the player" as subject,
@@ -7184,6 +7239,16 @@ pub(crate) fn starts_with_subject_prefix(lower: &str) -> bool {
             // before the bare "the player " arm.
             value((), tag("the attacking player ")),
             value((), tag("the player ")),
+            // CR 102.2 + CR 608.2c: "the opponent with/who has the most
+            // <property>" as an effect subject — the sibling of the "the
+            // player " superlative arm above, routed through the same
+            // `strip_subject_clause` -> `parse_subject_application` seam so
+            // `superlative_player_subject`'s `PlayerRelation::Opponent` arm
+            // (this file, `parse_subject_application`) becomes reachable
+            // from `parse_effect_clause`. Lexically disjoint from "the
+            // player " (distinct second word), so ordering relative to it
+            // is not load-bearing.
+            value((), tag("the opponent ")),
             // CR 609.7 + CR 615.5: "the source's controller" / "the source's
             // owner" as a subject in a damage-prevention follow-up (Swans of
             // Bryn Argoll, Eye for an Eye class). The "that source's …" form
@@ -7356,17 +7421,46 @@ fn token_starts_predicate(token: &str) -> bool {
         || PREDICATE_VERBS.contains(&super::normalize_verb_token(token).as_str())
 }
 
+/// CR 102.1 + CR 608.2c: "who has the most `<property>`" (U2.3's superlative
+/// player-subject copula, e.g. "the player who has the most cards in hand
+/// gains control of ~") is a RELATIVE CLAUSE embedded inside the subject noun
+/// phrase, not the sentence's own predicate. Without this guard,
+/// `find_predicate_start`'s token scan mistakes the copula's own "has" —
+/// which deconjugates to the registered `PREDICATE_VERBS` entry "have" — for
+/// the sentence's real predicate verb, truncating the subject at "the player
+/// who " and leaving "has the most cards in hand gains control of ~" as a
+/// bogus predicate. This is why Sokenzan Renegade's HandSize-axis subject
+/// ("who has the most cards in hand") failed to bind while Ghazbán Ogre's
+/// Life-axis "with the most life" (no embedded verb in the copula) did not —
+/// measured via the U2 integration suite. The guard is deliberately narrowed
+/// to exactly `has`/`have` followed by `"the most "`, not to every `who
+/// <verb>` predicate: the broader corpus's other `who <verb>` forms bind
+/// through the filter-subject path and must not be disturbed, so this covers
+/// only the superlative shape U2.3 introduces, not relative clauses in
+/// general.
+fn is_embedded_who_has_the_most(prev_token: Option<&str>, token: &str, rest_after: &str) -> bool {
+    matches!(token, "has" | "have")
+        && prev_token == Some("who")
+        && preceded(multispace0, tag::<_, _, OracleError<'_>>("the most "))
+            .parse(rest_after)
+            .is_ok()
+}
+
 pub(super) fn find_predicate_start(text: &str) -> Option<usize> {
     let lower = text.to_lowercase();
     let mut word_start = None;
+    let mut prev_token: Option<&str> = None;
 
     for (idx, ch) in lower.char_indices() {
         if ch.is_whitespace() {
             if let Some(start) = word_start.take() {
                 let token = &lower[start..idx];
-                if token_starts_predicate(token) {
+                if !is_embedded_who_has_the_most(prev_token, token, &lower[idx..])
+                    && token_starts_predicate(token)
+                {
                     return Some(start);
                 }
+                prev_token = Some(token);
             }
             continue;
         }
@@ -7378,7 +7472,7 @@ pub(super) fn find_predicate_start(text: &str) -> Option<usize> {
 
     if let Some(start) = word_start {
         let token = &lower[start..];
-        if token_starts_predicate(token) {
+        if !is_embedded_who_has_the_most(prev_token, token, "") && token_starts_predicate(token) {
             return Some(start);
         }
     }
