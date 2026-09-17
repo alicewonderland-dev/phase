@@ -6492,8 +6492,23 @@ fn scoped_players<'a>(
         CountScope::SourceChosenPlayer => {
             source_chosen_player_for_context(state, &ctx).is_some_and(|player| p.id == player)
         }
-        CountScope::All => true,
-        CountScope::Opponents => p.id != controller,
+        // CR 104.5 + CR 800.4 + CR 800.4a: a player who has left the game is
+        // not part of the live population these two scopes range over, and
+        // CR 800.4a takes their owned objects out of the game with them. So
+        // neither their player counters (CR 122.1) nor their zone and
+        // spell-cast counts may contribute to an "each player" / "each
+        // opponent" total. Same population as the `PlayerScope` aggregate
+        // authority in `resolve_per_player_scalar`, which filters
+        // `!p.is_eliminated` on its `Opponent` and `AllPlayers` arms; these
+        // two scopes are the `CountScope` mirror of those and must agree.
+        //
+        // The single-player scopes above deliberately keep no such filter: they
+        // name ONE specific player rather than ranging over a population, and
+        // silently resolving `Controller` (the "you" axis) or a persisted
+        // `SourceChosenPlayer` to the empty set would read 0 instead of that
+        // player's actual value.
+        CountScope::All => !p.is_eliminated,
+        CountScope::Opponents => p.id != controller && !p.is_eliminated,
     })
 }
 
@@ -6513,9 +6528,33 @@ fn count_scope_owner_matches(
         CountScope::SourceChosenPlayer => {
             source_chosen_player_for_context(state, &ctx).is_some_and(|player| owner == player)
         }
-        CountScope::All => true,
-        CountScope::Opponents => owner != controller,
+        // CR 800.4a: "all objects owned by that player leave the game" — so a
+        // departed player's cards are not part of the exile population these
+        // two scopes range over, even though this engine models leaving the
+        // game by moving those cards INTO `state.exile` (see
+        // `elimination::eliminate_player`, whose own test asserts the departed
+        // player's graveyard and library cards land there). Keying on the
+        // OWNER is what makes this precise: a card owned by a surviving player
+        // but exiled by the departed one stays counted, because CR 800.4a only
+        // removes objects the departed player OWNED.
+        //
+        // Single-player scopes above keep no filter, for the same reason as in
+        // `scoped_players`: they name one player rather than a population.
+        CountScope::All => !player_has_left(state, owner),
+        CountScope::Opponents => owner != controller && !player_has_left(state, owner),
     }
+}
+
+/// CR 104.5 + CR 800.4: whether `player` has left the game.
+///
+/// An unknown id reads as "still in the game" so a lookup miss can never
+/// silently delete a live player from a population count.
+fn player_has_left(state: &GameState, player: PlayerId) -> bool {
+    state
+        .players
+        .iter()
+        .find(|p| p.id == player)
+        .is_some_and(|p| p.is_eliminated)
 }
 
 fn count_scope_actor_matches(
@@ -11568,6 +11607,140 @@ mod tests {
             7,
             "the same exclusion must hold for the Opponent-scoped population"
         );
+    }
+
+    /// CR 104.5 + CR 800.4 + CR 122.1: `CountScope::All` ranges over the LIVE
+    /// player population, so a departed player's poison counters must not
+    /// inflate an "each player" total.
+    ///
+    /// Drives the real departure path (`eliminate_player`), not a hand-set
+    /// flag. The mid-test assertion is the non-vacuity guard: elimination does
+    /// NOT clear `poison_counters`, so the departed 40 is still sitting on the
+    /// struct when the quantity resolves. Without that check the test would
+    /// pass for the wrong reason if elimination ever started zeroing counters.
+    ///
+    /// REVERT-FAIL: drop `!p.is_eliminated` from `scoped_players`'s `All` arm
+    /// and this reads 43 instead of 3.
+    #[test]
+    fn player_counter_all_scope_excludes_departed_player() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 3, 0);
+        state.players[0].poison_counters = 1;
+        state.players[1].poison_counters = 2;
+        state.players[2].poison_counters = 40;
+
+        let mut events = Vec::new();
+        crate::game::elimination::eliminate_player(&mut state, PlayerId(2), &mut events);
+        assert!(
+            state.players[2].is_eliminated,
+            "precondition: P2 must have actually left the game"
+        );
+        assert_eq!(
+            state.players[2].poison_counters, 40,
+            "non-vacuity: the departed player's counters must SURVIVE elimination, so that \
+             excluding them is the filter's doing and not a side effect of the sweep"
+        );
+
+        let all_poison = QuantityExpr::Ref {
+            qty: QuantityRef::PlayerCounter {
+                kind: crate::types::player::PlayerCounterKind::Poison,
+                scope: CountScope::All,
+            },
+        };
+        assert_eq!(
+            resolve_quantity(&state, &all_poison, PlayerId(0), ObjectId(0)),
+            3,
+            "an 'each player' poison total must sum the live survivors (1 + 2) and leave the \
+             departed player's 40 out"
+        );
+    }
+
+    /// CR 102.1 + CR 104.5 + CR 800.4: the same live-population rule for
+    /// `CountScope::Opponents`, which must drop BOTH the controller and the
+    /// departed opponent while keeping the surviving one.
+    ///
+    /// REVERT-FAIL: drop `!p.is_eliminated` from the `Opponents` arm and this
+    /// reads 42 instead of 2.
+    #[test]
+    fn player_counter_opponents_scope_excludes_departed_player() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 3, 0);
+        state.players[0].poison_counters = 1;
+        state.players[1].poison_counters = 2;
+        state.players[2].poison_counters = 40;
+
+        let mut events = Vec::new();
+        crate::game::elimination::eliminate_player(&mut state, PlayerId(2), &mut events);
+        assert_eq!(
+            state.players[2].poison_counters, 40,
+            "non-vacuity: see the All-scope sibling"
+        );
+
+        let opponent_poison = QuantityExpr::Ref {
+            qty: QuantityRef::PlayerCounter {
+                kind: crate::types::player::PlayerCounterKind::Poison,
+                scope: CountScope::Opponents,
+            },
+        };
+        assert_eq!(
+            resolve_quantity(&state, &opponent_poison, PlayerId(0), ObjectId(0)),
+            2,
+            "an 'each opponent' poison total must read only the SURVIVING opponent (2): the \
+             controller's 1 is not an opponent and the departed 40 is not in the game"
+        );
+    }
+
+    /// CR 800.4a: the owner-axis counterpart for the EXILE zone, which reaches
+    /// `count_scope_owner_matches` rather than `scoped_players` (exile is a
+    /// global zone, so membership is predicated per object on `obj.owner`).
+    ///
+    /// This engine models "leaves the game" by moving the departed player's
+    /// cards into `state.exile` — measured here by the mid-test assertions:
+    /// after a real `eliminate_player`, the card IS in exile and IS still
+    /// owned by P2. So without the owner-axis filter an "each opponent" exile
+    /// count reports a card that CR 800.4a says left the game.
+    ///
+    /// REVERT-FAIL: drop `!player_has_left(..)` from either arm of
+    /// `count_scope_owner_matches` and both counts read 1 instead of 0.
+    #[test]
+    fn exile_zone_count_excludes_cards_owned_by_a_departed_player() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 3, 0);
+        let card = create_object(
+            &mut state,
+            crate::types::identifiers::CardId(1),
+            PlayerId(2),
+            "Departed Bear".to_string(),
+            crate::types::zones::Zone::Graveyard,
+        );
+
+        let mut events = Vec::new();
+        crate::game::elimination::eliminate_player(&mut state, PlayerId(2), &mut events);
+        assert!(
+            state.exile.contains(&card),
+            "non-vacuity: this engine routes a departed player's cards INTO exile, so the \
+             card must be sitting there for the filter to have anything to exclude"
+        );
+        assert_eq!(
+            state.objects.get(&card).map(|o| o.owner),
+            Some(PlayerId(2)),
+            "non-vacuity: ownership must survive the sweep, so exclusion is the filter's \
+             doing and not a re-owning side effect"
+        );
+
+        for scope in [CountScope::Opponents, CountScope::All] {
+            let expr = QuantityExpr::Ref {
+                qty: QuantityRef::ZoneCardCount {
+                    zone: ZoneRef::Exile,
+                    card_types: Vec::new(),
+                    filter: None,
+                    scope: scope.clone(),
+                },
+            };
+            assert_eq!(
+                resolve_quantity(&state, &expr, PlayerId(0), ObjectId(0)),
+                0,
+                "{scope:?}: a card owned by a player who left the game must not be counted \
+                 as an exiled card (CR 800.4a)"
+            );
+        }
     }
 
     /// CR 810.9a + CR 810.4: `LifeAboveStarting` reads the controller's TEAM
