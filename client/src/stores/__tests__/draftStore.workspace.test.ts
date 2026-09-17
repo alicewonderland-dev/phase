@@ -236,9 +236,13 @@ describe("draft store workspace authority", () => {
 
   it("leaves_a_hint_less_sideboard_pick_in_the_first_column", async () => {
     // The arriving pass is deck-only. Were it allowed to run for a sideboard
-    // pick it would stamp deck column 6 on this card, and
-    // `normalizeWorkspaceForBoardGeometry` would clamp that to 5 — the
-    // sideboard's LAST column — rather than leaving it in the first.
+    // pick it would stamp this card with a column from the DECK's geometry —
+    // 6, asserted above as the stored value on the deck-pick case — which the
+    // sideboard's narrower six columns cannot hold, so
+    // `normalizeWorkspaceForBoardGeometry` would clamp it at render to 5, the
+    // sideboard's last column, rather than leaving it in the first. A cheaper
+    // card would land mid-board instead; the clamp is the overflow case, not
+    // the general one.
     await start();
     wasm.submit_pick.mockReturnValue(view([cardWithCmc("picked", 6)]));
 

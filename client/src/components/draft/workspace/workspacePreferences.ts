@@ -314,6 +314,40 @@ export function saveDraftWorkspacePreferences(
   }
 }
 
+/**
+ * The deck board geometry the mounted draft page is currently showing.
+ *
+ * Read by the stores' arriving-card placement, which has to know which columns
+ * the board means but has no access to page state. It lives here rather than in
+ * either store because it is a PRESENTATION preference — the same thing
+ * `loadDraftWorkspacePreferences` reads and `saveDraftWorkspacePreferences`
+ * writes — and because both `draftStore` and `multiplayerDraftStore` need it:
+ * a copy per store would be two same-named exports a caller could import from
+ * the wrong module.
+ *
+ * Module state rather than store state: no view publishes it, and it is absent
+ * from the persisted `QuickDraftSnapshotInput`.
+ *
+ * Seeded from the player's STORED preferences rather than the module defaults,
+ * so an install that lands before the page has published anything still places
+ * against the columns the player chose.
+ *
+ * One page is mounted at a time, so the solo and pod pages never contend: each
+ * publishes on mount and on every change to its own deck board.
+ */
+let arrivingCardBoardPreferences: DraftBoardPreferences =
+  loadDraftWorkspacePreferences().deck;
+
+/** Tell the placement paths which columns the deck board currently means. */
+export function setArrivingCardBoardPreferences(preferences: DraftBoardPreferences): void {
+  arrivingCardBoardPreferences = preferences;
+}
+
+/** The value last published by the mounted draft page. */
+export function getArrivingCardBoardPreferences(): DraftBoardPreferences {
+  return arrivingCardBoardPreferences;
+}
+
 export function resolveDraftWorkspaceView(
   explicitView: DraftWorkspaceView | null,
   viewportWidth: number,

@@ -148,10 +148,20 @@ vi.mock("../../stores/multiplayerDraftStore", async (importOriginal) => {
   return {
     ...actual,
     useMultiplayerDraftStore: hook,
-    setArrivingCardBoardPreferences: arrivingPreferences,
     draftPodScreen: (state: typeof store.state) => state.phase,
     intergamePromptKey: () => null,
   };
+});
+
+// `setArrivingCardBoardPreferences` lives in `workspacePreferences` rather than
+// in either store: both draft stores read the published value, so a copy per
+// store would be two same-named exports. Spying here, on the module the page
+// actually imports from, is what makes the call observable.
+vi.mock("../../components/draft/workspace/workspacePreferences", async (importOriginal) => {
+  const actual = await importOriginal<
+    typeof import("../../components/draft/workspace/workspacePreferences")
+  >();
+  return { ...actual, setArrivingCardBoardPreferences: arrivingPreferences };
 });
 
 vi.mock("../../stores/draftPodStore", () => ({

@@ -4,7 +4,6 @@ import { motion } from "framer-motion";
 import { useNavigate, useSearchParams } from "react-router";
 
 import {
-  setArrivingCardBoardPreferences,
   useDraftStore,
   type DraftPackChoice,
   type DraftPickDestination,
@@ -32,6 +31,7 @@ import {
   loadDraftWorkspacePreferences,
   repairDraftWorkspacePackScale,
   saveDraftWorkspacePreferences,
+  setArrivingCardBoardPreferences,
   type DraftWorkspacePreferences,
   type ResponsiveDraftLayout,
 } from "../components/draft/workspace/workspacePreferences";
@@ -492,10 +492,16 @@ export function DraftPage() {
     if (useDraftStore.getState().pickInteractionLocked) return;
     setWorkspacePreferences(next);
     saveDraftWorkspacePreferences(next);
-    // SYNCHRONOUSLY, not from an effect, for the reason
-    // `DraftPodPage.handlePreferencesChange` states: an effect runs after
-    // commit, and a pick acknowledged in that window would have
-    // `installWorkspace` place the arriving card against the PREVIOUS columns.
+    // SYNCHRONOUSLY, not from an effect. An effect runs after commit, and an
+    // install landing in that window would place its arriving cards against the
+    // PREVIOUS columns. A pick is not the case to worry about here — the guard
+    // above returns while `pickInteractionLocked` is set, which
+    // `draftStore.performPick` sets before its first await — but a `kind:
+    // "state"` install takes no such lock, so `resumeDraft` finishing in that
+    // window would lay out the whole restored pool against stale columns.
+    // `DraftPodPage.handlePreferencesChange` publishes synchronously for the
+    // same reason, against its own unguarded `viewUpdated` broadcasts.
+    //
     // This is the only path that changes `deck`; `setPackScale` below spreads
     // `workspacePreferences` and touches one numeric field.
     setArrivingCardBoardPreferences(next.deck);

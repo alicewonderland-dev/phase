@@ -1105,6 +1105,33 @@ export function resolveWorkspaceSortColumn(
  * `reconcileWorkspaceState` owns which instances exist, and this owns only
  * where the ones it just made go.
  */
+/**
+ * Pool cards `workspace` holds no placement for — the ids `placeArrivingPoolCards`
+ * is meant to be given, asked BEFORE the reconcile that invents their defaults.
+ *
+ * Structural rather than a pool diff. A diff answers "which cards are new" only
+ * where there is an earlier pool to diff against, and the first view of a
+ * lifecycle — a reconnect, a resume, a restored session — has none. Both cases
+ * are the same question, because `reconcileWorkspaceState` is about to invent a
+ * default placement for exactly these ids and this is the list it will invent
+ * them for.
+ *
+ * A workspace carrying the player's own saved placements yields an empty list,
+ * so nothing they arranged is re-sorted.
+ *
+ * Pool cards only: a virtual basic lives in `virtualBasics` rather than `pool`,
+ * and `placeArrivingPoolCards` could not resolve a column for one anyway — it
+ * needs the `DraftCardInstance` the engine publishes.
+ */
+export function unplacedPoolIds(
+  workspace: DraftWorkspaceState,
+  pool: readonly DraftCardInstance[],
+): string[] {
+  return pool
+    .filter((card) => workspace.placements[card.instance_id] === undefined)
+    .map((card) => card.instance_id);
+}
+
 export function placeArrivingPoolCards(
   workspace: DraftWorkspaceState,
   arrivingInstanceIds: readonly string[],

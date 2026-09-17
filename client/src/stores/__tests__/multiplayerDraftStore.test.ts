@@ -10,10 +10,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   draftPodScreen,
   isMultiplayerDraftPodLive,
-  setArrivingCardBoardPreferences,
   useMultiplayerDraftStore,
   type DraftPodScreen,
 } from "../multiplayerDraftStore";
+import { setArrivingCardBoardPreferences } from "../../components/draft/workspace/workspacePreferences";
 import { createDefaultDraftWorkspacePreferences } from "../../components/draft/workspace/workspacePreferences";
 import { DraftPodHostAdapter } from "../../adapter/draftPodHostAdapter";
 import { DraftPodGuestAdapter } from "../../adapter/draftPodGuestAdapter";
@@ -1815,6 +1815,34 @@ describe("multiplayerDraftStore", () => {
 
       expect(useMultiplayerDraftStore.getState().workspaceState!.placements.costly.column)
         .toBe(2);
+    });
+
+    // The sibling of the solo store's
+    // `leaves_a_hint_less_sideboard_pick_in_the_first_column`. The arriving pass
+    // is deck-only, so a sideboard-bound pick must be excluded from it: left in,
+    // it would carry a column from the DECK's seven-column geometry into the
+    // six-column sideboard, to be clamped at render to that zone's last column.
+    it("leaves a hint-less sideboard pick in the first column", async () => {
+      await useMultiplayerDraftStore.getState().hostDraft({
+        poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
+        kind: "Premier",
+        podSize: 8,
+        hostDisplayName: "Host",
+        tournamentFormat: "Swiss",
+        podPolicy: "Competitive",
+      });
+      capturedHostEventHandler!({ type: "viewUpdated", view: mockView("Drafting") });
+      mockHostAdapter.submitPick.mockResolvedValueOnce({
+        ...mockView("Drafting"),
+        pool: [{ ...card("costly"), cmc: 5 }],
+      });
+
+      await expect(useMultiplayerDraftStore.getState().submitPick("costly", "sideboard"))
+        .resolves.toEqual({ status: "acknowledged" });
+
+      const placement = useMultiplayerDraftStore.getState().workspaceState!.placements.costly;
+      expect(placement.zone).toBe("sideboard");
+      expect(placement.column).toBe(0);
     });
 
     it("ignores selection replacement while pick interaction is locked", () => {

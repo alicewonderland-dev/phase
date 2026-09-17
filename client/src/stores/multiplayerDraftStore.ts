@@ -33,12 +33,10 @@ import {
   makeInteractiveVirtualBasicInstanceId,
   placeArrivingPoolCards,
   reconcileWorkspaceState,
+  unplacedPoolIds,
   updateWorkspacePlacement,
 } from "../components/draft/workspace/workspacePlacement";
-import {
-  loadDraftWorkspacePreferences,
-  type DraftBoardPreferences,
-} from "../components/draft/workspace/workspacePreferences";
+import { getArrivingCardBoardPreferences } from "../components/draft/workspace/workspacePreferences";
 import {
   addVirtualBasic,
   countProjectedNames,
@@ -695,43 +693,14 @@ function publishWorkspace(workspace: DraftWorkspaceState): Promise<void> {
  * The page's effect then carries in-session changes, which is what it is for.
  */
 /**
- * Pool cards the workspace had no placement for BEFORE this reconcile.
+ * The workspace to ask `unplacedPoolIds` about before this store has one.
  *
- * The question "which cards are new" asked structurally rather than by diffing
- * two pools. A pool diff answers it for a card that arrived between two views,
- * but not for the first view of a lifecycle — a reconnect, a resume, a restored
- * session — where there is no earlier pool and every card is new. Both cases
- * are the same question: `reconcileWorkspaceState` is about to invent a
- * default placement for exactly these ids, and this is the list it will invent
- * them for.
- *
- * A workspace restored with the player's own saved placements therefore yields
- * an empty list and nothing is re-sorted, which is the right answer: their
- * layout wins.
+ * A null `workspaceState` means no card has a placement yet, which an empty
+ * workspace answers identically — every pool card comes back unplaced — so the
+ * shared helper needs no nullable overload of its own.
  */
-function unplacedPoolIds(
-  workspace: DraftWorkspaceState | null,
-  pool: DraftPlayerView["pool"],
-): string[] {
-  if (workspace === null) return pool.map((card) => card.instance_id);
-  return pool
-    .filter((card) => workspace.placements[card.instance_id] === undefined)
-    .map((card) => card.instance_id);
-}
-
-let arrivingCardBoardPreferences: DraftBoardPreferences =
-  loadDraftWorkspacePreferences().deck;
-
-/**
- * Tell this module which columns the deck board currently means.
- *
- * A module function rather than a store action, because the value is not draft
- * state: no view publishes it, nothing is persisted with it, and a mocked store
- * in a test has no business carrying it. The page calls this whenever the
- * player's board preferences load or change.
- */
-export function setArrivingCardBoardPreferences(preferences: DraftBoardPreferences): void {
-  arrivingCardBoardPreferences = preferences;
+function placementsSoFar(workspace: DraftWorkspaceState | null): DraftWorkspaceState {
+  return workspace ?? createDraftWorkspaceState();
 }
 
 function installWorkspace(input: {
@@ -901,18 +870,29 @@ async function performPick(request: MultiplayerPickRequest): Promise<DraftPickOu
     // The id list is taken against `state.workspaceState`, BEFORE the reconcile,
     // so the cards this pick just added still count as arriving; asked
     // afterwards they would already hold that default and be filtered out.
-    const ownPlacement = request.kind === "auto-pick"
-      ? request.instanceIds.filter((instanceId) => request.placementHints?.[instanceId] !== undefined)
-      : request.placementHint !== undefined || request.destination !== "deck"
-        ? request.instanceIds
-        : [];
+    // Ids bound for the SIDEBOARD, which the deck-only arriving pass must not
+    // place. Same reason `draftStore.sideboardBoundInstanceIds` gives: the card
+    // still carries reconcile's `"deck"` default when the pass runs, so the pass
+    // would stamp a deck-geometry column that `applyDestination` carries into
+    // the sideboard, to be clamped by `normalizeWorkspaceForBoardGeometry` to
+    // that zone's last column once it overflows the narrower sideboard.
+    //
+    // A `placementHint` needs no exclusion: `applyDestination` runs after this
+    // and reads `placementHint?.column ?? placement.column`, so a hint already
+    // wins. `auto-pick` types its `destination` as the literal `"deck"`.
+    const sideboardBound = request.kind !== "auto-pick" && request.destination !== "deck"
+      ? request.instanceIds
+      : [];
     let workspace = placeArrivingPoolCards(
       reconcileWorkspaceState(state.workspaceState, acknowledgedView.pool),
-      unplacedPoolIds(state.workspaceState, acknowledgedView.pool)
-        .filter((instanceId) => !ownPlacement.includes(instanceId)),
+      // Against the PRE-reconcile workspace, so the cards this pick just added
+      // still count as arriving; asked afterwards they would already hold
+      // reconcile's column-0 default and be filtered out.
+      unplacedPoolIds(placementsSoFar(state.workspaceState), acknowledgedView.pool)
+        .filter((instanceId) => !sideboardBound.includes(instanceId)),
       acknowledgedView.pool,
       acknowledgedView.pool_groups,
-      arrivingCardBoardPreferences,
+      getArrivingCardBoardPreferences(),
     );
     workspace = request.kind === "auto-pick"
       ? request.instanceIds.reduce(
@@ -1056,10 +1036,10 @@ async function performSharedStackDecision(
       view: acknowledgedView,
       base: placeArrivingPoolCards(
         reconcileWorkspaceState(state.workspaceState, acknowledgedView.pool),
-        unplacedPoolIds(state.workspaceState, acknowledgedView.pool),
+        unplacedPoolIds(placementsSoFar(state.workspaceState), acknowledgedView.pool),
         acknowledgedView.pool,
         acknowledgedView.pool_groups,
-        arrivingCardBoardPreferences,
+        getArrivingCardBoardPreferences(),
       ),
       publish: true,
       patch: {
@@ -3165,7 +3145,7 @@ function installEventView(view: DraftPlayerView): void {
     unplacedPoolIds(base, view.pool),
     view.pool,
     view.pool_groups,
-    arrivingCardBoardPreferences,
+    getArrivingCardBoardPreferences(),
   );
   const publish = restored !== null
     ? (restored.state === null ? view.pool.length > 0 : workspace !== base)
