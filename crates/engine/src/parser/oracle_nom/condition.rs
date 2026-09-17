@@ -11061,6 +11061,14 @@ mod tests {
             parse_inner_condition("a player controls more lands than each other player").is_err(),
             "the object-count noun 'lands' must decline — subfamily B stays honestly red"
         );
+        // The assertion above declines at the "a player has " prefix (its verb
+        // is "controls"), so on its own it never reaches the property
+        // selector. This one shares the prefix and therefore exercises the
+        // unsupported-PROPERTY rejection itself.
+        assert!(
+            parse_inner_condition("a player has more lands than each other player").is_err(),
+            "'lands' must decline at the property selector, not only at the verb"
+        );
     }
 
     /// Regression: "a player has one or fewer cards in hand" (Temple of the

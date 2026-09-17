@@ -193,6 +193,26 @@ fn u2_r3_multi_authority_tie_blocks_trigger() {
         .id();
     let mut runner = scenario.build();
     runner.advance_to_upkeep();
+    // The final-controller assertion below cannot tell a BLOCKED condition
+    // apart from a trigger that reached the stack and then failed closed in
+    // `unique_recipient_from_filter` on the P1/P2 ambiguity: both outcomes
+    // leave control with P0. Assert the trigger never reached the stack, so
+    // this fixture pins the condition rather than the fail-closed path.
+    //
+    // Measured non-vacuous: break the tie (P2 20 -> 15, making P1 the unique
+    // leader) and this assertion fires here with the message below. So the
+    // stack IS populated at this point when the trigger fires, and a green
+    // result means the trigger genuinely never reached it.
+    assert!(
+        runner
+            .state()
+            .stack
+            .iter()
+            .all(|entry| entry.source_id != card),
+        "U1's intervening-if must keep this trigger off the stack entirely; if it \
+         reaches the stack, the controller assertion below is satisfied by \
+         unique_recipient_from_filter failing closed instead"
+    );
     runner.advance_until_stack_empty();
     assert_eq!(
         runner.state().objects[&card].controller,

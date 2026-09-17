@@ -65020,9 +65020,19 @@ fn counter_gate_guard_is_claimed_upstream_of_the_guard_ownership_seam() {
 #[test]
 fn parse_opponent_most_life_restriction_acceptance_set_unchanged() {
     // Accepts: the mandatory leading space, with and without the fixed tail.
-    assert!(parse_opponent_most_life_restriction(" with the most life").is_ok());
-    assert!(
-        parse_opponent_most_life_restriction(" with the most life among your opponents").is_ok()
+    // Asserted on the REMAINDER, not `is_ok()`: this helper's contract is that
+    // it CONSUMES the optional " among your opponents" tail, and two of its
+    // three consumers reject a non-empty remainder. `is_ok()` alone would stay
+    // green if the tail were left unconsumed.
+    let (rest, _) = parse_opponent_most_life_restriction(" with the most life")
+        .expect("the bare form must parse");
+    assert_eq!(rest, "", "the bare form must consume its whole input");
+    let (rest, _) =
+        parse_opponent_most_life_restriction(" with the most life among your opponents")
+            .expect("the form carrying the fixed tail must parse");
+    assert_eq!(
+        rest, "",
+        "the ' among your opponents' tail must be CONSUMED, not left as remainder"
     );
     // Rejects: no leading space (U2.1 must not make it optional).
     assert!(
