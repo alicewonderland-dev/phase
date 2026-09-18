@@ -85,9 +85,29 @@
  * STACK_EXPOSED_WIDTH_RATIO` ≈ 31px, off a card drawn ≈197px WIDE (the first
  * two of those constants) and so ≈275px TALL (that width times
  * `CARD_FACE_HEIGHT / CARD_FACE_WIDTH`) — arithmetic over five in-tree
- * constants, and about a name bar's worth. Reading a covered card takes
- * a hover or a Tab, each of which raises it above its neighbour. What the rows
- * cost instead was HEIGHT: three of them, each at least a full card tall, on a
+ * constants, and about a name bar's worth. Reading a covered card takes a Tab,
+ * or a hover over the strip it still shows rather than anywhere on its box —
+ * "releases a lifted card when the pointer drops below its exposed strip, and
+ * lifts the one under it instead". Why the band and not the whole box is
+ * REASONING about browser hit-testing, written out at `RevealedCard`'s
+ * `updateLift`.
+ *
+ * What a lift shows is the card's OWN FACE at the pile scale, and nothing
+ * larger: this surface renders NO enlarged preview of its own ("renders no
+ * preview overlay of its own over the piles"), so how readable a lifted card is
+ * is settled by the pile scale control
+ * (`git grep -n DRAFT_WORKSPACE_PILE_SCALE_M -- client/src/components/draft/workspace/workspacePreferences.ts`
+ * prints the range the player picks from, 0.4 to 2.9). An overlay stood in for
+ * that until this commit and came out on a user report that it covered the
+ * piles they were choosing between — a report about a running browser, not
+ * something this repo measures. The price is REASONING for the same reason
+ * everything else about the drawn box here is — what fits inside a strip is a
+ * question about rendered glyphs, and the client lane runs under happy-dom,
+ * which resolves no layout — and the price is that a covered card's type line,
+ * P/T and rules text are behind the card covering it until it is lifted.
+ *
+ * What the rows cost instead was HEIGHT: three of them, each at least a full
+ * card tall, on a
  * page whose other half is the player's own pool. Which of those two costs
  * matters more is a judgement, and it was made deliberately in favour of the
  * height; no command decides it.
@@ -99,7 +119,7 @@
  * surface's own stored value.
  */
 
-import { useState } from "react";
+import { useState, type PointerEvent } from "react";
 import { useTranslation } from "react-i18next";
 
 import type { ResponsiveDraftLayout } from "./workspace/workspacePreferences";
@@ -112,11 +132,7 @@ import type {
   SharedStackView,
 } from "../../adapter/draft-adapter";
 import { CardBackFallback } from "../card/CardBackFallback";
-import type { CardHoverInfo } from "../card/CardPreview";
-import { HoverCardPreview } from "../card/HoverCardPreview";
-import { mouseHoverPreview, type CardHoverHandler } from "../deck-builder/hoverPreview";
 import { menuButtonClass } from "../menu/buttonStyles";
-import { usePreferencesStore } from "../../stores/preferencesStore";
 import {
   DRAFT_PACK_CARD_BASE_WIDTH_PX,
   DRAFT_WORKSPACE_PILE_SCALE_DEFAULT,
@@ -235,7 +251,6 @@ function RevealedCard({
   card,
   width,
   stackIndex = 0,
-  onCardHover,
 }: {
   card: DraftCardInstance;
   width: number;
@@ -243,13 +258,11 @@ function RevealedCard({
    *  pulled up over the one before it, leaving one strip of it showing.
    *  Omitted by `ForcedDrawNotice`, which draws one card and no stack. */
   stackIndex?: number;
-  onCardHover: CardHoverHandler;
 }) {
   const sourcePrinting = { setCode: card.set_code, collectorNumber: card.collector_number };
   const { src, isLoading, displayName } = useDraftCardFace(card.name, sourcePrinting);
-  const preview = { name: card.name, sourcePrinting };
-  // A covered card shows one strip of itself, so hovering or tabbing to one has
-  // to raise it out of the stack as well as preview it. A `z-index` lift and
+  // A covered card shows one strip of itself, so hovering over that strip or
+  // tabbing to the card has to raise it out of the stack. A `z-index` lift and
   // not a transform, because off desktop `[data-winston-pile-list]` takes
   // `overflow-y-auto` and a card that MOVED could be clipped by it — CSS
   // reasoning, and no test here measures it. The `ownsHeight` that switches
@@ -258,19 +271,46 @@ function RevealedCard({
   // section: "scrolls its own columns wherever the page will not scroll for
   // it" asserts the attribute and the class on different elements.
   const [lifted, setLifted] = useState(false);
-  // Bound once so the handlers below can DELEGATE to it. JSX spread precedence
-  // is last-wins, so an explicit `onPointerEnter` written before the spread
-  // would be discarded and one written after it without this call would discard
-  // the preview instead.
-  const hover = mouseHoverPreview(onCardHover, preview);
+  // The card pool's own band predicate, against this file's own
+  // `STACK_EXPOSED_WIDTH_RATIO` — see the LAYOUT note at the top for the grep
+  // that checks the two declarations still agree, and
+  // `WorkspaceCard.tsx::WorkspaceCard`'s `updateHoverReveal` for the pool's
+  // copy of these three lines.
+  //
+  // It is bound to `onPointerMove` as well as `onPointerEnter` below, and the
+  // move binding is the one this commit adds. REASONING for why it is needed,
+  // about browser hit-testing, which happy-dom does not perform: while a card
+  // holds `z-10` its box covers the cards below it, so no `pointerenter` can
+  // reach them and no `pointerleave` reaches this card until the cursor leaves
+  // its WHOLE box — a move over the lifted card is the only event left, and
+  // the band going false is what releases it. The halves this file CAN observe
+  // are pinned by "releases a lifted card when the pointer drops below its
+  // exposed strip, and lifts the one under it instead", which deleting the
+  // move binding reddens.
+  //
+  // `currentTarget` here IS the element that takes `z-10`, which is why that
+  // row stubs the rect and asserts the class on one node. The pool measures
+  // the same box one level down, on the button inside the wrapper that takes
+  // the class — `git grep -n "block w-full" --
+  // client/src/components/draft/workspace/WorkspaceCard.tsx`.
+  //
+  // Touch is excluded rather than mouse required, because a pen genuinely
+  // hovers. That is this repo's idiom for a hover affordance:
+  // `git grep -n 'pointerType === "touch") return' -- client/src/hooks
+  // client/src/components/draft/workspace` prints the identical guard in
+  // `WorkspaceCard.tsx::WorkspaceCard`, `useCardHover.ts::useCardHover` and
+  // `useInspectHoverProps.ts::useInspectHoverProps`, and
+  // `useCardHover.test.tsx` runs its hover rows over `["mouse", "pen"]` on the
+  // stated ground that only touch synthesizes its enter from a tap. Both
+  // halves are pinned here, by "gives a touch pointer no lift" and "lifts a
+  // covered card for a pen pointer too".
+  const updateLift = (event: PointerEvent<HTMLDivElement>) => {
+    if (event.pointerType === "touch") return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    setLifted(event.clientY - rect.top <= rect.width * STACK_EXPOSED_WIDTH_RATIO);
+  };
 
   return (
-    // `mouseHoverPreview` rather than bare mouse handlers: it carries the
-    // `data-deck-card-hover` marker the preview's own stale-hover sweep looks
-    // for, and the pointerleave rule that keeps a narrow-viewport overlay from
-    // closing the moment it opens over the card that opened it. A pile is
-    // exactly the surface both were written for — its cards are replaced under
-    // a stationary pointer every time the turn advances.
     <div
       data-winston-revealed-card={card.instance_id}
       // `relative` and `max-w-full` are load-bearing rather than decoration,
@@ -291,41 +331,22 @@ function RevealedCard({
       // publishes its name — it does not take Enter.
       tabIndex={0}
       aria-label={card.name}
-      {...hover}
-      // After the spread, and each one calls through to what it replaced.
-      //
-      // ENTER is symmetric: the lift is gated on the same `"mouse"` pointer
-      // type `mouseHoverPreview` gates the preview on, so a touch pointer gets
-      // neither ("gives a touch pointer neither the lift nor the preview").
-      //
-      // LEAVE is deliberately NOT, and it is the one place the two come apart:
-      // `mouseHoverPreview` ignores a leave whose `relatedTarget` is inside the
-      // preview overlay — see its own doc for the narrow-viewport bug that rule
-      // exists for — while the lift drops on every leave regardless.
-      //
-      // Dropping it is the safe direction: the overlay is dismissed from
-      // elsewhere on the page rather than by the pointer returning to this
-      // card, so a lift that survived the leave would get no second leave to
-      // clear it. DOM reasoning about the dismissal paths, and not measured
-      // here. The observable half — that the leave drops the lift while the
-      // preview stays up — is pinned by "drops the lift but keeps the preview
-      // when the pointer moves onto the overlay".
-      onPointerEnter={(event) => {
-        hover.onPointerEnter(event);
-        if (event.pointerType === "mouse") setLifted(true);
-      }}
-      onPointerLeave={(event) => {
-        hover.onPointerLeave(event);
-        setLifted(false);
-      }}
-      onFocus={() => {
-        setLifted(true);
-        onCardHover(preview);
-      }}
-      onBlur={() => {
-        setLifted(false);
-        onCardHover(null);
-      }}
+      onPointerEnter={updateLift}
+      onPointerMove={updateLift}
+      // The leave clears the lift unconditionally, focused or not — pinned by
+      // "lifts a covered card clear of its neighbour when the pointer is on
+      // its exposed strip".
+      onPointerLeave={() => setLifted(false)}
+      // A focus has no cursor, so there is no `clientY` to band-test and the
+      // lift is unconditional. ONE flag serves focus and hover both, so a
+      // pointer move below the strip drops a lift a focus put there — pinned
+      // by "drops a focus lift once the pointer moves below the card's exposed
+      // strip", and deliberate rather than incidental. REASONING about browser
+      // hit-testing again: a focus-lifted card's `z-10` box covers the card
+      // under it, so separate focus and hover flags would leave that card
+      // unreachable by pointer for as long as the focus held.
+      onFocus={() => setLifted(true)}
+      onBlur={() => setLifted(false)}
     >
       {isLoading || src === null ? (
         <span className="flex h-full items-center justify-center bg-white/5 px-1 text-center text-[10px] leading-tight text-white/60">
@@ -447,7 +468,6 @@ function Pile({
   interactionLocked,
   cardWidth,
   onDecide,
-  onCardHover,
 }: {
   pile: SharedStackPileView;
   /** This is the pile being decided on. PUBLIC: every viewer sees the
@@ -460,7 +480,6 @@ function Pile({
   interactionLocked: boolean;
   cardWidth: number;
   onDecide: (pile: number, decision: SharedStackPileDecision) => void;
-  onCardHover: CardHoverHandler;
 }) {
   const { t } = useTranslation("draft");
   // Piles are 0-indexed on the wire and 1-indexed in copy. A display offset, and
@@ -605,7 +624,8 @@ function Pile({
           padding thin", what it then does is not measured here.
 
           No `overflow-x-auto` here, and none should come back: a scroll
-          container would clip the card a hover or a Tab lifts. That argument
+          container would clip the card a Tab, or a hover on its exposed
+          strip, lifts. That argument
           also rules out bounding a tall cursor pile with `max-height` +
           `overflow-y-auto`, so the trade taken here is that a long pile is a
           long column. Both halves are CSS reasoning, not measurement. */}
@@ -624,7 +644,6 @@ function Pile({
             // The fan, when there is one, is the top of the column, so the
             // first revealed card stacks onto it rather than sitting flush.
             stackIndex={(drawsFaceDownStack(faceDownCount, pile.total) ? 1 : 0) + index}
-            onCardHover={onCardHover}
           />
         ))}
         {/* No "you have not looked at this pile yet" placeholder, and its
@@ -652,7 +671,7 @@ function Pile({
           the count is the same wherever they sit
           (`grep -rn data-winston-decision client/src`). MEASURED: rendering the
           actions block as a sibling of `[data-winston-pile]` instead of a child
-          reddens 8 of that file's 41 rows — exactly the 8 that call the helper
+          reddens 8 of that file's 40 rows — exactly the 8 that call the helper
           — and both of `DraftPodPage.winston.test.tsx`'s scoped rows. */}
       {canDecide && (
         <div data-winston-pile-actions className="flex flex-col gap-1">
@@ -693,14 +712,12 @@ function ForcedDrawNotice({
   card,
   width,
   gridColumn,
-  onCardHover,
 }: {
   card: DraftCardInstance;
   width: number;
   /** Track span inside the pile list's grid, supplied by the caller that owns
    *  the track count. The notice is not a pile and wants the whole row. */
   gridColumn: string;
-  onCardHover: CardHoverHandler;
 }) {
   const { t } = useTranslation("draft");
 
@@ -711,7 +728,7 @@ function ForcedDrawNotice({
       className="flex items-center gap-3 rounded-[16px] border border-sky-300/30 bg-sky-400/[0.07] p-3"
       style={{ gridColumn }}
     >
-      <RevealedCard card={card} width={width} onCardHover={onCardHover} />
+      <RevealedCard card={card} width={width} />
       <div className="flex min-w-0 flex-col gap-0.5">
         <span className="text-[0.6rem] font-semibold uppercase tracking-[0.18em] text-sky-200/80">
           {t("winston.forcedDrawLabel")}
@@ -803,24 +820,12 @@ export function WinstonPileTable({
   responsiveLayout,
 }: WinstonPileTableProps) {
   const { t } = useTranslation("draft");
-  // THIS SURFACE OWNS ITS PREVIEW, rather than reporting hovers to the page.
-  //
-  // A pack renders its cards at the player's own `packScale`, large enough to
-  // read where they sit, so `draftCardPreviewMode` — which ships as "none" —
-  // is a fair default there. A pile column stacks its cards, so every card but
-  // the last shows one strip of itself: here an enlarged preview is part of the
-  // surface and "none" would leave the decision harder than it needs to be —
-  // harder than it was under the row layout, which is the cost this surface
-  // pays for the height it gives back. Only "none" is overridden: a mode the
-  // player actually chose is theirs, "follow" and "shift" included. The side
-  // dock is the substitute because it is the one placement that cannot cover
-  // the piles the pointer is moving between.
-  //
-  // Owning it locally is what keeps that override scoped to these cards. The
-  // page's own preview still serves the pool workspace on this same screen,
-  // and still reads the preference straight.
-  const draftCardPreviewMode = usePreferencesStore((s) => s.draftCardPreviewMode);
-  const [hoveredCard, setHoveredCard] = useState<CardHoverInfo | null>(null);
+  // NO PREVIEW OVERLAY OF ITS OWN, and the absence is deliberate rather than an
+  // omission: the overlay this surface used to render was reported as covering
+  // the piles the player was choosing between. A lifted card at the player's
+  // own pile scale is what stands in — see the LAYOUT note at the top of this
+  // file for what that costs. Pinned by "renders no preview overlay of its own
+  // over the piles", which reddens if the element is put back.
   const { active_pile, active_seat, main_stack_remaining, total_cards, piles, forced_draw } = sharedStack;
 
   const seatName = (seat: number) =>
@@ -925,7 +930,6 @@ export function WinstonPileTable({
             card={forced_draw}
             width={cardWidth}
             gridColumn="1 / -1"
-            onCardHover={setHoveredCard}
           />
         )}
         {piles.map((pile) => (
@@ -937,7 +941,6 @@ export function WinstonPileTable({
             interactionLocked={interactionLocked}
             cardWidth={cardWidth}
             onDecide={onDecide}
-            onCardHover={setHoveredCard}
           />
         ))}
       </div>
@@ -947,19 +950,6 @@ export function WinstonPileTable({
           {t("winston.playFirstChooser", { name: seatName(playFirstChooser) })}
         </p>
       )}
-
-      {/* `onDismiss` clears THIS component's state, which is the only state the
-          overlay is showing — the default would clear the in-game inspector
-          instead and leave a narrow-viewport overlay undismissable. `compact`
-          for the same reason the pool review uses it: a blocking full-screen
-          modal over a live turn is not a preview. */}
-      <HoverCardPreview
-        card={hoveredCard}
-        mode={draftCardPreviewMode === "none" ? "side" : draftCardPreviewMode}
-        hoverDelayMs={0}
-        mobileLayout="compact"
-        onDismiss={() => setHoveredCard(null)}
-      />
     </section>
   );
 }

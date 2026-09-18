@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import type {
@@ -8,7 +8,6 @@ import type {
   SharedStackRefusal,
   SharedStackView,
 } from "../../../adapter/draft-adapter";
-import { usePreferencesStore } from "../../../stores/preferencesStore";
 import {
   DRAFT_WORKSPACE_PILE_SCALE_DEFAULT,
   type ResponsiveDraftLayout,
@@ -32,40 +31,11 @@ vi.mock("../../../hooks/useCardImage", async (importOriginal) => ({
   useCardBackImage: () => ({ src: null, advanceFailedSource: undefined }),
 }));
 
-// Records what this surface asks the preview for. How the preview DRAWS is
-// pinned in its own suite and is not the claim here — so this renders one bare
-// marked element and nothing else.
-//
-// The marker is not decoration. The real overlay carries `data-card-preview`
-// (`CardPreview.tsx`) and is a descendant of `HoverCardPreview`, which this
-// surface renders inside its own `<section>` — and that marker is what
-// `mouseHoverPreview`'s leave rule reads off `relatedTarget`. Being in the same
-// REACT tree is the load-bearing part: React synthesizes pointerenter/leave
-// from pointerout/over and resolves `relatedTarget` through the fiber tree, so
-// a related node rendered by this root arrives as an `Element` while a bare
-// `document.body` child arrives as the window object.
-//
-// REPRODUCE: in "drops the lift but keeps the preview when the pointer moves
-// onto the overlay", swap the overlay this mock renders for a
-// `document.createElement("div")` appended to `document.body`, then
-// `npx vitest run --coverage.enabled=false
-// src/components/draft/__tests__/WinstonPileTable.test.tsx
-// -t "drops the lift but keeps the preview"`. The row fails on the preview
-// half, `expected null to match object { name: 'Ponder' }` — the leave rule
-// never sees the overlay, so the leave clears the preview.
-interface RecordedPreview {
-  card?: { name: string } | null;
-  mode?: string;
-  mobileLayout?: string;
-  onDismiss?: () => void;
-}
-const previewProps: RecordedPreview[] = vi.hoisted(() => []);
-vi.mock("../../card/HoverCardPreview", () => ({
-  HoverCardPreview: (props: RecordedPreview) => {
-    previewProps.push(props);
-    return props.card == null ? null : <div data-card-preview="" />;
-  },
-}));
+// `HoverCardPreview` is NOT mocked here, and that is what lets "renders no
+// preview overlay of its own over the piles" fail at all: the real component
+// runs, and its overlay carries `data-card-preview`. MEASURED — rendering a
+// `<HoverCardPreview>` inside `RevealedCard` while `lifted` reddens that row
+// and no other in this file or `DraftPodPage.winston.test.tsx`.
 
 function card(id: string, name: string): DraftCardInstance {
   return {
@@ -191,11 +161,6 @@ function decisionButton(pileIndex: number, decision: "Take" | "Decline"): HTMLBu
 
 describe("WinstonPileTable", () => {
   afterEach(cleanup);
-
-  beforeEach(() => {
-    previewProps.length = 0;
-    usePreferencesStore.setState({ draftCardPreviewMode: "none" });
-  });
 
   it("enables Take exactly when the engine publishes no refusal for it", () => {
     // Paired positive: the same fixture shape, differing ONLY in the published
@@ -657,80 +622,142 @@ describe("WinstonPileTable", () => {
     expect(cards[1]!.style.marginTop).not.toBe("");
   });
 
-  it("lifts a covered card clear of its neighbour on hover, and previews it too", () => {
-    // Stacked, a covered card shows one strip of itself, so the preview alone
-    // is not enough — the card under the pointer has to come out from under the
-    // one covering it. Both halves are asserted on the same gesture because the
-    // handler composes over `mouseHoverPreview`: writing the lift so that it
-    // replaces the spread rather than delegating to it kills the preview, and
-    // writing it before the spread kills the lift.
+  /** The rect the pool's own band row stubs, verbatim: a 100x139 card whose top
+   *  edge is at `clientY` 100. The band is `100 * STACK_EXPOSED_WIDTH_RATIO`
+   *  = 16px, so 115 is inside it and 117 is not — the same two probes
+   *  `CardPoolBoard.test.tsx`'s
+   *  `reveals_sixteen_percent_of_the_card_width_between_stacked_cards` uses.
+   *  MEASURED under this file's own environment: happy-dom returns
+   *  `{top: 0, width: 0, height: 0}` from `getBoundingClientRect` for a
+   *  `render`ed element carrying an explicit `width`/`height` style. Without a
+   *  stub the band therefore collapses to `clientY <= 0`, and `fireEvent`
+   *  defaults an unset `clientY` to 0 — so every row below would pass or fail
+   *  for a reason nobody chose. */
+  function stubCardRect(el: HTMLElement, top: number): void {
+    el.getBoundingClientRect = () => ({
+      top, left: 0, right: 100, bottom: top + 139, width: 100, height: 139,
+      x: 0, y: top, toJSON: () => ({}),
+    });
+  }
+
+  it("lifts a covered card clear of its neighbour when the pointer is on its exposed strip", () => {
+    // Stacked, a covered card shows one strip of itself, so the card under the
+    // pointer has to come out from under the one covering it. MEASURED: this
+    // row covers the `onPointerEnter` binding (deleting it reddens the pen and
+    // band rows too) and is the ONLY row that deleting `onPointerLeave`
+    // reddens. The band row below is what pins WHERE in the card the pointer
+    // has to be.
     renderTable(
       activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
     );
 
-    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card]")!;
+    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card='c1']")!;
+    stubCardRect(revealed, 100);
     expect(revealed).not.toHaveClass("z-10");
 
-    fireEvent.pointerEnter(revealed, { pointerType: "mouse" });
+    fireEvent.pointerEnter(revealed, { clientY: 115, pointerType: "mouse" });
     expect(revealed).toHaveClass("z-10");
-    expect(previewProps[previewProps.length - 1]?.card).toMatchObject({ name: "Ponder" });
 
     fireEvent.pointerLeave(revealed, { pointerType: "mouse" });
     expect(revealed).not.toHaveClass("z-10");
-    expect(previewProps[previewProps.length - 1]?.card).toBeNull();
   });
 
-  it("gives a touch pointer neither the lift nor the preview", () => {
+  it("gives a touch pointer no lift", () => {
     // The paired negative for the row above, and the only thing in this file
-    // that enters the `pointerType === "mouse"` gate on the lift: the mouse row
-    // passes whether the gate is there or not, so without this one deleting it
-    // costs nothing. Touch drives the preview by tap/long-press instead
-    // (`hoverPreview.ts::mouseHoverPreview`), and a lift with no preview behind
-    // it would raise a card a touch player never asked to see. Same device as
-    // `useCardHover.test.tsx`'s touch row.
+    // that enters the touch gate: same fixture, same stubbed rect, same in-band
+    // `clientY` of 115 — the pointer type is the ONLY difference between the
+    // two rows, so the row above is this one's positive control. Without the
+    // stub happy-dom's 0x0 rect would reduce the band to `clientY <= 0` and a
+    // `fireEvent` default `clientY` of 0 would satisfy it, which is a pass
+    // nobody chose. Touch drives card inspection by tap and long-press
+    // instead (`useCardHover.ts::useCardHover` composes `useLongPress`), so a
+    // lift a touch player never asked for would raise a card over the one they
+    // were reading. Same device as `useCardHover.test.tsx`'s touch row.
     renderTable(
       activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
     );
 
-    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card]")!;
+    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card='c1']")!;
+    stubCardRect(revealed, 100);
 
-    fireEvent.pointerEnter(revealed, { pointerId: 1, pointerType: "touch" });
+    fireEvent.pointerEnter(revealed, { clientY: 115, pointerId: 1, pointerType: "touch" });
+    fireEvent.pointerMove(revealed, { clientY: 115, pointerId: 1, pointerType: "touch" });
 
     expect(revealed).not.toHaveClass("z-10");
-    expect(previewProps[previewProps.length - 1]?.card ?? null).toBeNull();
   });
 
-  it("drops the lift but keeps the preview when the pointer moves onto the overlay", () => {
-    // The one leave where the lift and the preview come apart, and it is
-    // deliberate on both sides — see the composed `onPointerLeave` in
-    // `WinstonPileTable.tsx::RevealedCard` for why the lift does not follow
-    // `mouseHoverPreview`'s overlay rule. This row is what makes the split
-    // observable rather than incidental: adding that rule to the lift reddens
-    // the `z-10` assertion, and deleting it from `mouseHoverPreview` reddens
-    // the preview assertion.
-    //
-    // `relatedTarget` reaches a React handler through `fireEvent` only when the
-    // related node is in the same React tree — same device as
-    // `PermanentCard.test.tsx`'s "restores host preview when moving from an
-    // attachment back to its host", where it is a rendered sibling. So the
-    // overlay here is the one the `HoverCardPreview` mock renders, not a
-    // hand-appended `document.body` child; see the note on that mock.
+  it("lifts a covered card for a pen pointer too", () => {
+    // The paired POSITIVE for the touch row, and what makes "exclude touch"
+    // rather than "require mouse" a measured choice instead of a preference:
+    // rewriting the gate as `if (event.pointerType !== "mouse") return;` reds
+    // this row and no other — MEASURED across this file and
+    // `DraftPodPage.winston.test.tsx`. A pen genuinely hovers — `useCardHover.test.tsx`
+    // runs its own hover rows over `["mouse", "pen"]` for the same reason.
     renderTable(
       activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
     );
 
-    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card]")!;
-    fireEvent.pointerEnter(revealed, { pointerType: "mouse" });
+    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card='c1']")!;
+    stubCardRect(revealed, 100);
+
+    fireEvent.pointerEnter(revealed, { clientY: 115, pointerType: "pen" });
+
     expect(revealed).toHaveClass("z-10");
-    expect(previewProps[previewProps.length - 1]?.card).toMatchObject({ name: "Ponder" });
+  });
 
-    const overlay = document.querySelector<HTMLElement>("[data-card-preview]");
-    expect(overlay).not.toBeNull();
+  it("releases a lifted card when the pointer drops below its exposed strip, and lifts the one under it instead", () => {
+    // The reported defect, and MEASURED to be the row that catches it:
+    // replacing the band predicate with a bare `setLifted(true)` — the
+    // behaviour before this commit, where a lift was held for as long as the
+    // pointer was anywhere inside the card — reddens this row.
+    //
+    // What a real browser then does — re-route the pointer to the card
+    // underneath the instant the one above stops being `z-10` — is hit-testing,
+    // and happy-dom does none, so the hand-off is FIRED here rather than
+    // observed. The two halves that belong to this file are what is asserted:
+    // the card above releases at the boundary, and the same `clientY` is inside
+    // the card below's own strip. The second card's `top` is one strip down
+    // from the first's, which is what the negative percentage top margin
+    // produces — REASONING, since happy-dom resolves no percentage margin (see
+    // the LAYOUT note in `WinstonPileTable.tsx`).
+    renderTable(
+      activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
+    );
 
-    fireEvent.pointerLeave(revealed, { pointerType: "mouse", relatedTarget: overlay });
+    const above = document.querySelector<HTMLElement>("[data-winston-revealed-card='c1']")!;
+    const below = document.querySelector<HTMLElement>("[data-winston-revealed-card='c2']")!;
+    stubCardRect(above, 100);
+    stubCardRect(below, 116);
 
+    fireEvent.pointerMove(above, { clientY: 115, pointerType: "mouse" });
+    expect(above).toHaveClass("z-10");
+
+    fireEvent.pointerMove(above, { clientY: 117, pointerType: "mouse" });
+    expect(above).not.toHaveClass("z-10");
+
+    fireEvent.pointerEnter(below, { clientY: 117, pointerType: "mouse" });
+    expect(below).toHaveClass("z-10");
+  });
+
+  it("drops a focus lift once the pointer moves below the card's exposed strip", () => {
+    // ONE `lifted` flag serves focus and hover both, so the mouse wins a
+    // disagreement with the keyboard. Deliberate: the alternative — separate
+    // flags OR-ed together — would leave the card under a focused one
+    // unreachable by pointer for as long as the focus held, because the
+    // focused card's `z-10` box covers it. That last clause is REASONING about
+    // browser hit-testing; what this row measures is the flag.
+    renderTable(
+      activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
+    );
+
+    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card='c1']")!;
+    stubCardRect(revealed, 100);
+
+    fireEvent.focus(revealed);
+    expect(revealed).toHaveClass("z-10");
+
+    fireEvent.pointerMove(revealed, { clientY: 130, pointerType: "mouse" });
     expect(revealed).not.toHaveClass("z-10");
-    expect(previewProps[previewProps.length - 1]?.card).toMatchObject({ name: "Ponder" });
   });
 
   it("centres each pile's stack in its column and keeps the column's padding thin", () => {
@@ -751,9 +778,10 @@ describe("WinstonPileTable", () => {
 
   it("lifts a covered card for a keyboard player too", () => {
     // `RevealedCard` is already focusable (`tabIndex={0}`, pinned by "reaches
-    // the card a keyboard player is deciding on"), and focusing it already
-    // published the preview. What it did not do was raise the card itself out
-    // from under its neighbour, which stacking is what made necessary.
+    // the card a keyboard player is deciding on"). What focus did not do was
+    // raise the card itself out from under its neighbour, which stacking is
+    // what made necessary. No rect is stubbed and none is wanted: a focus has
+    // no cursor, so the lift is not band-gated.
     renderTable(
       activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
     );
@@ -761,11 +789,9 @@ describe("WinstonPileTable", () => {
     const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card]")!;
     fireEvent.focus(revealed);
     expect(revealed).toHaveClass("z-10");
-    expect(previewProps[previewProps.length - 1]?.card).toMatchObject({ name: "Ponder" });
 
     fireEvent.blur(revealed);
     expect(revealed).not.toHaveClass("z-10");
-    expect(previewProps[previewProps.length - 1]?.card).toBeNull();
   });
 
   it("puts the decision controls under the pile they decide, not in its header", () => {
@@ -776,7 +802,7 @@ describe("WinstonPileTable", () => {
     // file; the other four `data-winston-decision` queries here count the
     // buttons document-wide, and that count is the same wherever they sit.
     // MEASURED: rendering the actions block as a sibling of
-    // `[data-winston-pile]` instead of a child reddens 8 of this file's 41
+    // `[data-winston-pile]` instead of a child reddens 8 of this file's 40
     // rows — exactly the 8 that call the helper, this one among them.
     renderTable(activeTurn([pile(0, 1, [card("c1", "Ponder")], null, null)], 0));
 
@@ -888,68 +914,36 @@ describe("WinstonPileTable", () => {
     expect(document.querySelector("[data-winston-play-first]")).toBeNull();
   });
 
-  it("asks for a readable preview even when draft previews are switched off", () => {
-    // `draftCardPreviewMode` ships as "none", which is a fair default for a
-    // pack: those cards render large enough to read where they sit. A pile
-    // column stacks its cards, so every one but the last shows a strip of
-    // itself, and the turn is a decision about what they ARE — "none" here is
-    // not a preference, it is an unreadable screen.
-    renderTable(activeTurn([pile(0, 3, [card("c1", "Ponder")], null, null)], 0));
+  it("renders no preview overlay of its own over the piles", () => {
+    // Defect 2, and the row is written so that it CAN fail:
+    // `HoverCardPreview` is deliberately not mocked in this file, so putting
+    // the element back renders the real component, whose overlay carries
+    // `data-card-preview` (`CardPreview.tsx`). A dock-side overlay covering
+    // the piles is the reported behaviour; what stands in for it is the lift,
+    // at whatever the player set the pile scale to.
+    renderTable(activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0));
 
-    expect(previewProps[previewProps.length - 1]?.mode).toBe("side");
-  });
+    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card='c1']")!;
+    stubCardRect(revealed, 100);
+    fireEvent.pointerEnter(revealed, { clientY: 115, pointerType: "mouse" });
+    fireEvent.focus(revealed);
 
-  it("passes a mode the player actually chose through untouched", () => {
-    // The paired positive, and the reason the row above is not "this surface
-    // ignores the preference": only the off state is substituted for.
-    usePreferencesStore.setState({ draftCardPreviewMode: "follow" });
-
-    renderTable(activeTurn([pile(0, 3, [card("c1", "Ponder")], null, null)], 0));
-
-    expect(previewProps[previewProps.length - 1]?.mode).toBe("follow");
-  });
-
-  it("owns the state its overlay dismisses, and never blocks the turn behind it", () => {
-    // Without both of these a narrow viewport (under the preview's 1024px
-    // breakpoint) gets the blocking full-screen modal whose default dismiss
-    // clears the in-game inspector — unrelated state — leaving an overlay over
-    // a live turn that no tap can close.
-    renderTable(activeTurn([pile(0, 3, [card("c1", "Ponder")], null, null)], 0));
-
-    const props = previewProps[previewProps.length - 1];
-    expect(props?.mobileLayout).toBe("compact");
-    expect(typeof props?.onDismiss).toBe("function");
+    expect(document.querySelector("[data-card-preview]")).toBeNull();
   });
 
   it("reaches the card a keyboard player is deciding on", () => {
     // The decision controls are real buttons, so a keyboard player can Take a
-    // pile. Focusing its cards is how they can first read one.
+    // pile. Focusing its cards is how they can first read one, and the name is
+    // declared on the card itself. The `aria-label` DECLARATION is what this
+    // pins and all it pins: the element is a `div` with no `role`, and whether
+    // the label then reaches assistive technology on a role-less element is
+    // not established anywhere in this repo. Nothing else in this file asserts
+    // it.
     renderTable(activeTurn([pile(0, 3, [card("c1", "Ponder")], null, null)], 0));
 
     const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card]");
     expect(revealed).not.toBeNull();
     expect(revealed!.tabIndex).toBe(0);
-
-    fireEvent.focus(revealed!);
-    expect(previewProps[previewProps.length - 1]?.card).toMatchObject({ name: "Ponder" });
-
-    fireEvent.blur(revealed!);
-    expect(previewProps[previewProps.length - 1]?.card).toBeNull();
-  });
-
-  it("marks its cards for the preview's own stale-hover sweep", () => {
-    // The marker is not decoration: `HoverCardPreview`'s cleanup effect clears
-    // a preview on the next pointer move unless a `[data-deck-card-hover]`
-    // element is still hovered. Without it, passing `onDismiss` above would
-    // close the preview the moment the pointer twitched over the card. The
-    // attribute comes from `mouseHoverPreview`, which also carries the
-    // pointerleave rule that stops a narrow-viewport overlay closing the
-    // gesture that opened it — both written for exactly this surface, whose
-    // cards are replaced under a stationary pointer every turn.
-    renderTable(activeTurn([pile(0, 3, [card("c1", "Ponder")], null, null)], 0));
-
-    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card]");
-    expect(revealed).not.toBeNull();
-    expect(revealed!.hasAttribute("data-deck-card-hover")).toBe(true);
+    expect(revealed!.getAttribute("aria-label")).toBe("Ponder");
   });
 });
