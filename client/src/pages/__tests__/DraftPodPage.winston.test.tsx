@@ -163,6 +163,12 @@ vi.mock("../../components/draft/workspace/workspacePreferences", async (importOr
   const actual = await importOriginal<
     typeof import("../../components/draft/workspace/workspacePreferences")
   >();
+  // Forwards, matching `DraftPage.workspace.test.tsx`. Inert while this file
+  // mocks `useMultiplayerDraftStore` wholesale, but a bare `vi.fn()` is the same
+  // latent trap: the stores read the published value back through
+  // `getArrivingCardBoardPreferences` in this module, so any later test here
+  // that stops mocking the store would silently measure the seeded default.
+  arrivingPreferences.mockImplementation(actual.setArrivingCardBoardPreferences);
   return { ...actual, setArrivingCardBoardPreferences: arrivingPreferences };
 });
 

@@ -43,9 +43,13 @@ function boardPreferences(): Record<DraftZone, DraftBoardPreferences> {
 
 describe("workspace placement", () => {
   // `draftStore.installWorkspace` and `multiplayerDraftStore.performPick` both
-  // call `placeArrivingPoolCards` ahead of their own `applyDestination`, and
-  // both rely on the deck-zone guard the second case below pins to keep a
-  // sideboard pick out of the deck-sorted columns.
+  // call `placeArrivingPoolCards` ahead of their own `applyDestination`. What
+  // keeps a sideboard-bound pick out of the deck-sorted columns on those paths
+  // is their own `ownPlacement` arm, not the deck-zone guard the second case
+  // below pins: the card still carries reconcile's `"deck"` default when the
+  // pass runs, so the zone test never fires for them. That guard is the
+  // independent belt for a DIRECT caller that hands over an id already in the
+  // sideboard, which is what the second case exercises.
   it("places_arriving_cards_into_the_columns_the_sort_means", () => {
     const pool = [{ ...card("cheap"), cmc: 1 }, { ...card("costly"), cmc: 5 }];
     const base = reconcileWorkspaceState(createDraftWorkspaceState(), pool);

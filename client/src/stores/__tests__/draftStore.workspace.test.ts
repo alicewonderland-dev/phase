@@ -512,6 +512,23 @@ describe("draft store workspace authority", () => {
     expect(useDraftStore.getState().workspaceState).toBe(original);
   });
 
+  it("sorts_an_auto_picked_card_that_carries_no_hint_of_its_own", async () => {
+    // The other direction of the `acknowledged-auto-pick` arm, and the solo twin
+    // of the pod store's `sorts an auto-picked card that carries no hint of its
+    // own`. `performPick` builds this card's hint as
+    // `request.placementHints?.[addedInstanceId]`, so an id the page's
+    // pack-keyed map does not cover — or any bare `autoPickCard("deck")` —
+    // arrives with no decision of its own and must be sorted, not parked in
+    // column 0.
+    await start();
+    wasm.auto_pick.mockReturnValue(view([cardWithCmc("added", 6)]));
+
+    await expect(useDraftStore.getState().autoPickCard("deck"))
+      .resolves.toEqual({ status: "acknowledged" });
+
+    expect(useDraftStore.getState().workspaceState!.placements.added.column).toBe(6);
+  });
+
   it("leaves_a_row_less_auto_pick_hint_on_a_two_row_board_in_the_reconcile_default_row", async () => {
     // The `acknowledged-auto-pick` arm of the same exclusion. `validPlacementHint`
     // admits a hint with no `row`, and `DraftPage.handleAutoPick` builds its hints
