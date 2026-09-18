@@ -47,14 +47,52 @@
  * control: the engine does not enforce the choice (it is advisory), so offering a
  * button would claim an authority no reducer backs.
  *
- * LAYOUT. The piles are ROWS, not columns, and the scale control is the pack
- * surface's control on its own stored value. A Winston turn is a decision about
- * one pile's cards, so that pile gets the full width of the surface to show them
- * side by side at a readable size; the two piles that are not being decided on
- * are heights, and a height reads better as a fanned stack of card backs than as
- * a number in a box. Three equal columns gave the cards being decided on a third
- * of the width and the two face-down piles the other two thirds, which is
- * backwards.
+ * LAYOUT. The piles are COLUMNS — one grid column per published pile — and each
+ * pile's cards STACK vertically inside its column, each card pulled up over the
+ * one before it so that all but the last shows only a strip of itself. That is
+ * the card pool's own primitive at the pool's own exposure ratio:
+ * `STACK_EXPOSED_WIDTH_RATIO` below carries the same name and the same value as
+ * the pool's, in `WorkspaceCard`. They are two separate declarations and nothing
+ * imports one from the other — `git grep -n STACK_EXPOSED_WIDTH_RATIO -- client`
+ * prints both, and is also the check that they still agree.
+ *
+ * The overlap is a NEGATIVE PERCENTAGE top margin, and the percentage rather
+ * than a pixel count is deliberate. REASONING, not measurement, for the whole
+ * of this paragraph: a percentage top margin resolves against the containing
+ * block's INLINE size rather than its height, which is a CSS box-model rule,
+ * and this repo has no lane that observes it — the client suite runs under
+ * happy-dom, which returns a 0x0 `getBoundingClientRect` for a sized element.
+ * Granting the rule, one constant stated in units of card WIDTH — a card height
+ * less one strip — expresses the same overlap at whatever width the card is
+ * finally drawn at, including a width a narrow column capped. `WorkspaceCard`
+ * states that same product as the literal `-123.3442622951%`; this file derives
+ * it from the ratio instead, so the two strings agree only to ten decimal
+ * places (`node -e 'console.log((680 / 488 - 0.16) * 100)'`).
+ *
+ * This surface used to be three full-width ROWS, on the argument that a Winston
+ * turn is a decision about one pile's cards so that pile should have the whole
+ * width to show them side by side. That argument was about the cards inside a
+ * pile running HORIZONTALLY, in the `overflow-x-auto` scroller this commit
+ * deletes (`git diff upstream/main -- <this file> | grep overflow-x-auto`), and
+ * it does not survive the cards being stacked.
+ *
+ * The cost of stacking them is real, and is why this was a judgement call and
+ * not a tidy-up: in the pile under decision every card but the last now shows
+ * only its top strip. At the shipped default that strip is
+ * `DRAFT_PACK_CARD_BASE_WIDTH_PX * DRAFT_WORKSPACE_PILE_SCALE_DEFAULT *
+ * STACK_EXPOSED_WIDTH_RATIO` ≈ 31px of a ≈275px card — arithmetic over three
+ * in-tree constants, and about a name bar's worth. Reading a covered card takes
+ * a hover or a Tab, each of which raises it above its neighbour. What the rows
+ * cost instead was HEIGHT: three of them, each at least a full card tall, on a
+ * page whose other half is the player's own pool. Which of those two costs
+ * matters more is a judgement, and it was made deliberately in favour of the
+ * height; no command decides it.
+ *
+ * The piles not being decided on are still heights, and a height still reads
+ * better as a fanned stack of card backs than as a number in a box. The fan now
+ * runs DOWN the column at the same `STACK_EXPOSED_WIDTH_RATIO` the revealed
+ * cards expose. The scale control is still the pack surface's control on this
+ * surface's own stored value.
  */
 
 import { useState } from "react";
@@ -85,21 +123,47 @@ import {
 } from "./workspace/workspacePreferences";
 import { useDraftCardFace } from "./DraftCardFace.tsx";
 
+/**
+ * The card face's own dimensions, in the one ratio every face-up card, card
+ * back and empty slot on this surface is drawn at. Both forms below are derived
+ * from this pair, so the string handed to `aspect-ratio` and the number the
+ * overlap arithmetic uses cannot state different shapes.
+ */
+const CARD_FACE_WIDTH = 488;
+const CARD_FACE_HEIGHT = 680;
 /** Card aspect, shared by every face-up card, card back and empty slot here. */
-const CARD_ASPECT = "488 / 680";
+const CARD_ASPECT = `${CARD_FACE_WIDTH} / ${CARD_FACE_HEIGHT}`;
+/** The same aspect as a bare number, for the overlap arithmetic below. */
+const CARD_HEIGHT_TO_WIDTH = CARD_FACE_HEIGHT / CARD_FACE_WIDTH;
 
 /**
  * How many card backs a face-down stack draws before it stops adding them.
  *
  * A display cap and nothing else: the pile's real height is published as
- * `total` and is always rendered as a number beside the stack. Fanning one back
- * per card would make a 20-card pile wider than the surface while saying
- * nothing a reader can count at a glance.
+ * `total` and is always rendered as a number in the pile's header. Fanning one
+ * back per card would run a 20-card pile nineteen strips down its column while
+ * saying nothing a reader can count at a glance.
  */
 const FACE_DOWN_STACK_MAX_BACKS = 5;
 
-/** Fraction of a card's width each further back in a fanned stack advances by. */
-const FACE_DOWN_STACK_STEP = 0.16;
+/**
+ * Fraction of a stacked card's WIDTH that stays visible above the card covering
+ * it. The pool's own exposure ratio — see the LAYOUT note at the top of this
+ * file for what does and does not keep the two in step.
+ */
+const STACK_EXPOSED_WIDTH_RATIO = 0.16;
+
+/**
+ * How far a stacked card is pulled up over the one before it, as a percentage
+ * of the stack's own width: one card height less one exposed strip, both in
+ * units of card width. See the LAYOUT note for why this is a percentage.
+ */
+const STACK_OVERLAP_PERCENT = (CARD_HEIGHT_TO_WIDTH - STACK_EXPOSED_WIDTH_RATIO) * 100;
+
+/** The stacking margin one card deep into a stack, or none at its top. */
+function stackMarginTop(stackIndex: number): string | undefined {
+  return stackIndex === 0 ? undefined : `-${STACK_OVERLAP_PERCENT}%`;
+}
 
 export interface WinstonPileTableProps {
   /** The engine's projection of the live turn FOR THIS VIEWER. */
@@ -124,16 +188,23 @@ export interface WinstonPileTableProps {
   setPileScale: (next: number) => void;
   /**
    * The page's own layout band, passed for ONE reason: whether this surface
-   * owns its height.
+   * owns its height. It selects nothing about the column layout, which is the
+   * same `repeat(pileCount, minmax(0, 1fr))` in every band.
    *
    * On desktop the drafting column is `flex-col` in a page that scrolls, so the
-   * rows can be as tall as the scale makes them. Every other band puts the
+   * columns can be as tall as the scale makes them. Every other band puts the
    * surface inside a fixed-height `overflow-hidden` box — and "every other" is
    * literally every viewport under 1200px wide, not just phones
-   * (`getResponsiveDraftLayout`). Three full-card rows do not fit in a 56%
-   * slice of `100dvh`, and a row that overflows an `overflow-hidden` parent
-   * takes its Take/Decline buttons off-screen with no scrollbar to reach them.
-   * So off desktop the pile list becomes this component's own scroller.
+   * (`getResponsiveDraftLayout` returns "desktop" at `viewportWidth >= 1200`
+   * and something else at every width below it). A pile column has no bounded
+   * height to fit into one: it is a full card plus one strip for every further
+   * card, and the pile itself gains a card every time a seat declines it
+   * (`shared_stack::apply_shared_stack_decision`'s `Decline` arm pushes the top
+   * of the main stack onto the declined pile). A column that overflows an
+   * `overflow-hidden` parent takes its Take/Decline buttons off-screen with no
+   * scrollbar to reach them — reasoning inherited from the row layout this
+   * replaced, and no test here measures it. So off desktop the pile list
+   * becomes this component's own scroller.
    */
   responsiveLayout: ResponsiveDraftLayout;
 }
@@ -159,15 +230,31 @@ function verdictFor(
 function RevealedCard({
   card,
   width,
+  stackIndex = 0,
   onCardHover,
 }: {
   card: DraftCardInstance;
   width: number;
+  /** Position in the pile's vertical stack. 0 sits flush; every later card is
+   *  pulled up over the one before it, leaving one strip of it showing.
+   *  Omitted by `ForcedDrawNotice`, which draws one card and no stack. */
+  stackIndex?: number;
   onCardHover: CardHoverHandler;
 }) {
   const sourcePrinting = { setCode: card.set_code, collectorNumber: card.collector_number };
   const { src, isLoading, displayName } = useDraftCardFace(card.name, sourcePrinting);
   const preview = { name: card.name, sourcePrinting };
+  // A covered card shows one strip of itself, so hovering or tabbing to one has
+  // to raise it out of the stack as well as preview it. A `z-index` lift and
+  // not a transform, because off desktop the pile list is a scroll container
+  // (`data-winston-scrolls-piles`) and a card that MOVED could be clipped by
+  // one — CSS reasoning, and no test here measures it.
+  const [lifted, setLifted] = useState(false);
+  // Bound once so the handlers below can DELEGATE to it. JSX spread precedence
+  // is last-wins, so an explicit `onPointerEnter` written before the spread
+  // would be discarded and one written after it without this call would discard
+  // the preview instead.
+  const hover = mouseHoverPreview(onCardHover, preview);
 
   return (
     // `mouseHoverPreview` rather than bare mouse handlers: it carries the
@@ -178,17 +265,44 @@ function RevealedCard({
     // a stationary pointer every time the turn advances.
     <div
       data-winston-revealed-card={card.instance_id}
-      className="shrink-0 overflow-hidden rounded-md ring-1 ring-white/15 focus-visible:outline focus-visible:outline-2 focus-visible:outline-amber-300/70"
-      style={{ width, aspectRatio: CARD_ASPECT }}
+      // `relative` and `max-w-full` are load-bearing rather than decoration,
+      // and both are asserted: `relative` puts this card in the same positioned
+      // group as the card backs above it, and `max-w-full` is the cap a narrow
+      // column applies. What each one then DOES — tree order deciding who
+      // paints on top, a used width following the column down — is CSS
+      // behaviour this repo cannot observe. `shrink-0` is for
+      // `ForcedDrawNotice`, whose parent is a flex row; in the block stack it
+      // is inert.
+      className={`relative shrink-0 max-w-full overflow-hidden rounded-md ring-1 ring-white/15 focus-visible:outline focus-visible:outline-2 focus-visible:outline-amber-300/70 ${
+        lifted ? "z-10" : ""
+      }`}
+      style={{ width, aspectRatio: CARD_ASPECT, marginTop: stackMarginTop(stackIndex) }}
       // Keyboard parity with the decision buttons below, which are real
       // `<button>`s: a player who tabs to Take must be able to reach what they
       // are taking. The card is not itself a control, so it takes focus and
       // publishes its name — it does not take Enter.
       tabIndex={0}
       aria-label={card.name}
-      onFocus={() => onCardHover(preview)}
-      onBlur={() => onCardHover(null)}
-      {...mouseHoverPreview(onCardHover, preview)}
+      {...hover}
+      // After the spread, and each one calls through to what it replaced. The
+      // lift is gated on the same `"mouse"` pointer type `mouseHoverPreview`
+      // gates the preview on, so no pointer gets one without the other.
+      onPointerEnter={(event) => {
+        hover.onPointerEnter(event);
+        if (event.pointerType === "mouse") setLifted(true);
+      }}
+      onPointerLeave={(event) => {
+        hover.onPointerLeave(event);
+        setLifted(false);
+      }}
+      onFocus={() => {
+        setLifted(true);
+        onCardHover(preview);
+      }}
+      onBlur={() => {
+        setLifted(false);
+        onCardHover(null);
+      }}
     >
       {isLoading || src === null ? (
         <span className="flex h-full items-center justify-center bg-white/5 px-1 text-center text-[10px] leading-tight text-white/60">
@@ -212,52 +326,73 @@ function RevealedCard({
  * stands for a particular card: `count` is the truth, the backs are how a
  * player reads it without counting digits.
  */
-function FaceDownStack({ count, total, width }: { count: number; total: number; width: number }) {
+/**
+ * Whether `FaceDownStack` draws anything for this pile.
+ *
+ * The single authority for that question, called by the component itself and by
+ * the caller, which needs to know whether the first revealed card is the top of
+ * the column or is stacking onto a fan.
+ *
+ * `false` is the one case where nothing is face down and cards are face up: the
+ * seat is looking at the WHOLE pile, which is the active seat's state at the
+ * cursor on every turn (both engine write sites of the `inspected` contract set
+ * `inspected[cursor] = piles[cursor].len()`). Drawing an empty slot there would
+ * claim a card nobody has seen, on the one pile the screen is about, and cost
+ * it a card of height.
+ */
+function drawsFaceDownStack(count: number, total: number): boolean {
+  return count > 0 || total === 0;
+}
+
+function FaceDownStack({ count, total }: { count: number; total: number }) {
   const { t } = useTranslation("draft");
   const backs = Math.min(count, FACE_DOWN_STACK_MAX_BACKS);
-  // Width of the fan: one full card plus a step for every back after the first.
-  const spread = width * (1 + Math.max(0, backs - 1) * FACE_DOWN_STACK_STEP);
+
+  if (!drawsFaceDownStack(count, total)) return null;
 
   if (count === 0) {
-    // Nothing face down while cards are face up: the seat is looking at the
-    // WHOLE pile, which is the active seat's state at the cursor on every turn
-    // (both engine write sites of the `inspected` contract set
-    // `inspected[cursor] = piles[cursor].len()`). Drawing an empty slot there
-    // would claim a card nobody has seen, on the one pile the screen is about,
-    // and cost it a card of width.
-    if (total > 0) return null;
     return (
       <div
         data-winston-pile-facedown
         data-winston-pile-facedown-count={count}
         role="img"
         aria-label={t("winston.pileTotal", { count })}
-        className="relative shrink-0 rounded-md border border-dashed border-white/12"
-        style={{ width, aspectRatio: CARD_ASPECT }}
+        className="relative w-full rounded-md border border-dashed border-white/12"
+        style={{ aspectRatio: CARD_ASPECT }}
       />
     );
   }
 
+  // No height of its own: the backs are in flow and their negative top margins
+  // are what set it. GEOMETRY, worked through on paper and not measured here —
+  // the fan runs a card tall plus one strip per further back, and the first
+  // revealed card pulls up by a card less a strip, which leaves one strip of
+  // the fan showing and makes the column one uniform stack from the deepest
+  // back to the newest card.
   return (
     <div
       data-winston-pile-facedown
       data-winston-pile-facedown-count={count}
       role="img"
       aria-label={t("winston.faceDownStack", { count })}
-      className="relative shrink-0"
-      style={{ width: spread, aspectRatio: `${spread} / ${width * 680 / 488}` }}
+      className="relative w-full"
     >
       {Array.from({ length: backs }, (_, index) => (
         <CardBackFallback
           key={index}
-          className="absolute top-0 rounded-md ring-1 ring-white/12"
+          // Positioned, in flow, and carrying no `z-index`. The first back is
+          // the bottom of the stack and later backs come after it in the
+          // document, and every card in the column — backs and revealed cards
+          // alike — is positioned and unlayered. That every element is
+          // positioned is the precondition, and the part that is asserted; what
+          // follows from it (tree order alone deciding who paints on top, and
+          // an explicit `z-index` here painting a back over the revealed card
+          // that overlaps it) is CSS behaviour no test here observes.
+          className="relative block rounded-md ring-1 ring-white/12"
           style={{
-            width,
+            width: "100%",
             aspectRatio: CARD_ASPECT,
-            left: width * index * FACE_DOWN_STACK_STEP,
-            // The leftmost back is the bottom of the fan, so later backs sit on
-            // top and the stack reads as one pile rather than a row of cards.
-            zIndex: index,
+            marginTop: stackMarginTop(index),
           }}
         />
       ))}
@@ -325,7 +460,12 @@ function Pile({
         aria-label={t(decision === "Take" ? "winston.takeAria" : "winston.declineAria", { index: label })}
         aria-describedby={reason === undefined ? undefined : `winston-refusal-${pile.index}-${decision}`}
         onClick={() => onDecide(pile.index, decision)}
-        className={menuButtonClass({ tone, size: "sm", disabled, className: "min-w-[6rem]" })}
+        // `w-full min-w-0` in place of the row layout's `min-w-[6rem]`: in a
+        // one-card-wide column a per-button floor is a floor the column cannot
+        // meet, so the buttons fill instead. `menuButtonClass`'s `sm` size is
+        // unchanged and still carries `min-h-11`, the touch target that had to
+        // survive (`buttonStyles.ts::menuButtonClass`).
+        className={menuButtonClass({ tone, size: "sm", disabled, className: "w-full min-w-0 px-2" })}
       >
         {t(decision === "Take" ? "winston.take" : "winston.decline")}
       </button>
@@ -373,7 +513,7 @@ function Pile({
     <div
       data-winston-pile={pile.index}
       data-winston-pile-active={isCursor ? "true" : "false"}
-      className={`flex min-w-0 flex-col gap-2 rounded-[16px] border p-3 ${
+      className={`flex min-w-0 flex-col gap-2 rounded-[16px] border p-2 ${
         isCursor
           ? "border-amber-300/40 bg-amber-400/[0.06] shadow-[inset_0_-1px_0_rgba(0,0,0,0.28)]"
           : "border-hairline bg-white/[0.035]"
@@ -391,29 +531,39 @@ function Pile({
             {t("winston.deciding")}
           </span>
         )}
-        {canDecide && (
-          <span className="ml-auto flex shrink-0 gap-2">
-            {decisionButton("Take", "emerald")}
-            {decisionButton("Decline", "neutral")}
-          </span>
-        )}
       </div>
 
       {/* A pile this seat already declined stays READABLE but is visibly spent:
           the decision has moved on, and the cards are here as the memory the
-          engine says this seat is entitled to, not as a live choice. */}
+          engine says this seat is entitled to, not as a live choice.
+
+          `width: cardWidth` is load-bearing and not a cosmetic size — it is the
+          containing block the stacked children's percentage top margins resolve
+          against, so the overlap comes out of a card's width and not the grid
+          column's. Its presence is asserted; that consequence is the CSS
+          box-model rule the LAYOUT note flags as unmeasurable here, and the
+          same goes for `maxWidth: 100%` capping the stack in a narrow column.
+
+          No `overflow-x-auto` here, and none should come back: a scroll
+          container would clip the card a hover or a Tab lifts. That argument
+          also rules out bounding a tall cursor pile with `max-height` +
+          `overflow-y-auto`, so the trade taken here is that a long pile is a
+          long column. Both halves are CSS reasoning, not measurement. */}
       <div
+        data-winston-pile-stack
         data-winston-pile-spent={!isCursor && shownRevealed.length > 0 ? "true" : undefined}
-        className={`flex min-w-0 items-start gap-2 overflow-x-auto pb-1 [scrollbar-width:thin] ${
-          isCursor ? "" : "opacity-60 saturate-75"
-        }`}
+        className={`relative mx-auto min-w-0 ${isCursor ? "" : "opacity-60 saturate-75"}`}
+        style={{ width: cardWidth, maxWidth: "100%" }}
       >
-        <FaceDownStack count={faceDownCount} total={pile.total} width={cardWidth} />
-        {shownRevealed.map((card) => (
+        <FaceDownStack count={faceDownCount} total={pile.total} />
+        {shownRevealed.map((card, index) => (
           <RevealedCard
             key={card.instance_id}
             card={card}
             width={cardWidth}
+            // The fan, when there is one, is the top of the column, so the
+            // first revealed card stacks onto it rather than sitting flush.
+            stackIndex={(drawsFaceDownStack(faceDownCount, pile.total) ? 1 : 0) + index}
             onCardHover={onCardHover}
           />
         ))}
@@ -427,8 +577,21 @@ function Pile({
             stated twice over, by the empty slot `FaceDownStack` draws for a
             pile whose own total is zero and by the engine's `PileEmpty` refusal
             note below. Away from the cursor it means "face down", which is
-            exactly what the stack of backs beside it says. */}
+            exactly what the stack of backs above it says. */}
       </div>
+
+      {/* Under the stack rather than on the header line, and stacked rather
+          than side by side, because a pile column is one card wide and the
+          header's pair carried a `min-w-[6rem]` floor each — a sizing judgement
+          about a layout nothing here measures. What IS pinned is that both
+          buttons stay inside this pile's own element, which is what every
+          `data-winston-decision` query in the suite scopes to. */}
+      {canDecide && (
+        <div data-winston-pile-actions className="flex flex-col gap-1">
+          {decisionButton("Take", "emerald")}
+          {decisionButton("Decline", "neutral")}
+        </div>
+      )}
 
       {canDecide && refusalNotes.length > 0 && (
         <div className="flex flex-col gap-1">
@@ -461,10 +624,14 @@ function Pile({
 function ForcedDrawNotice({
   card,
   width,
+  gridColumn,
   onCardHover,
 }: {
   card: DraftCardInstance;
   width: number;
+  /** Track span inside the pile list's grid, supplied by the caller that owns
+   *  the track count. The notice is not a pile and wants the whole row. */
+  gridColumn: string;
   onCardHover: CardHoverHandler;
 }) {
   const { t } = useTranslation("draft");
@@ -474,6 +641,7 @@ function ForcedDrawNotice({
       data-winston-forced-draw={card.instance_id}
       role="status"
       className="flex items-center gap-3 rounded-[16px] border border-sky-300/30 bg-sky-400/[0.07] p-3"
+      style={{ gridColumn }}
     >
       <RevealedCard card={card} width={width} onCardHover={onCardHover} />
       <div className="flex min-w-0 flex-col gap-0.5">
@@ -571,9 +739,11 @@ export function WinstonPileTable({
   //
   // A pack renders its cards at the player's own `packScale`, large enough to
   // read where they sit, so `draftCardPreviewMode` — which ships as "none" —
-  // is a fair default there. A pile row is read at a glance and decided on, so
-  // here an enlarged preview is part of the surface and "none" would leave the
-  // decision harder than it needs to be. Only "none" is overridden: a mode the
+  // is a fair default there. A pile column stacks its cards, so every card but
+  // the last shows one strip of itself: here an enlarged preview is part of the
+  // surface and "none" would leave the decision harder than it needs to be —
+  // harder than it was under the row layout, which is the cost this surface
+  // pays for the height it gives back. Only "none" is overridden: a mode the
   // player actually chose is theirs, "follow" and "shift" included. The side
   // dock is the substitute because it is the one placement that cannot cover
   // the piles the pointer is moving between.
@@ -602,8 +772,8 @@ export function WinstonPileTable({
   // one notch of pack scale mean the same thing on screen.
   const cardWidth = DRAFT_PACK_CARD_BASE_WIDTH_PX * pileScale;
   // See `responsiveLayout`: off desktop this surface is inside a fixed-height
-  // `overflow-hidden` box, so it has to scroll its own rows or the cursor pile's
-  // controls become unreachable at a scale the player chose.
+  // `overflow-hidden` box, so it has to scroll its own columns or the cursor
+  // pile's controls become unreachable at a scale the player chose.
   const ownsHeight = responsiveLayout !== "desktop";
 
   return (
@@ -649,11 +819,16 @@ export function WinstonPileTable({
         {yourTurn ? t("winston.turnHint") : t("winston.hiddenPiles")}
       </p>
 
+      {/* One grid column per PUBLISHED pile, never a hard-coded three:
+          `pile_count` is engine data (`SharedStackPiles { pile_count }`), and a
+          layout that assumed its current value would be a second authority for
+          a number the projection already carries. */}
       <div
         data-winston-pile-list
-        className={`flex min-w-0 flex-col gap-2 ${
+        className={`grid min-w-0 gap-2 ${
           ownsHeight ? "min-h-0 flex-1 overflow-y-auto pr-1" : ""
         }`}
+        style={{ gridTemplateColumns: `repeat(${piles.length}, minmax(0, 1fr))` }}
       >
         {/* INSIDE THE SCROLLER, not above it. The notice holds a full-size card
             with a fixed width and aspect ratio, so its min-content height is
@@ -671,9 +846,17 @@ export function WinstonPileTable({
             presence — though see the note on `viewerSeat` below for what that
             restatement does and does not buy. Deliberately NOT gated on
             `yourTurn`: the notice describes the turn that just ENDED, so by the
-            time it matters the active seat is the opponent. */}
+            time it matters the active seat is the opponent.
+
+            A grid item now, so it is given the whole row rather than a third of
+            it: the notice is a card beside a sentence, not a pile. */}
         {forced_draw !== null && viewerSeat !== null && (
-          <ForcedDrawNotice card={forced_draw} width={cardWidth} onCardHover={setHoveredCard} />
+          <ForcedDrawNotice
+            card={forced_draw}
+            width={cardWidth}
+            gridColumn="1 / -1"
+            onCardHover={setHoveredCard}
+          />
         )}
         {piles.map((pile) => (
           <Pile
