@@ -410,11 +410,8 @@ type WorkspaceInstallOperation =
  * but no row band. On a two-row board the pass would then decide that card's
  * row through the engine classification, where the hint path has always fallen
  * back to reconcile's default — a drag-behaviour change this change has no
- * business making. THAT CARD's own column is unaffected either way, since a
- * hint always wins there; the exclusion still matters beyond `row` because
- * `placeArrivingPoolCards` threads placements one at a time, so whether a
- * hinted card is in the board while the hint-less ones resolve can move THEM
- * under a grouping sort.
+ * business making. That card's own COLUMN is unaffected either way, since a
+ * hint always wins there — `row` is the whole of what this arm protects.
  *
  * `acknowledged-auto-pick` installs to `"deck"` unconditionally below, so only
  * its hint can exclude it.

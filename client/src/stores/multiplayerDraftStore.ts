@@ -831,8 +831,8 @@ async function performPick(request: MultiplayerPickRequest): Promise<DraftPickOu
     }
     // Sorted placement for a pick that resolved no hint of its own. The pod page
     // resolves one in `handleConfirmPick` and `handleAutoPick`, but
-    // `PackDisplay`'s `request` dispatches `pickCardStep` and
-    // `pickCardWithDraftEffect` with no hint at all, and `applyDestination` then
+    // `PackDisplay`'s `request` dispatches `pickCard`,
+    // `pickCardStep` and `pickCardWithDraftEffect` with no hint at all, and `applyDestination` then
     // falls back to `placement.column` — reconcile's column-0 default.
     //
     // Ids this request places itself, which the arriving pass must leave alone.
@@ -849,9 +849,8 @@ async function performPick(request: MultiplayerPickRequest): Promise<DraftPickOu
     // `target.row === null`), so on a two-row board the pass would decide that
     // card's row through the engine classification instead of leaving the
     // reconcile default the hint path has always fallen back to. That card's own
-    // column is unaffected — the hint always wins there — but the pass threads
-    // placements one at a time, so leaving hinted cards out also keeps them from
-    // moving the hint-less ones under a grouping sort.
+    // column is unaffected — the hint always wins there — so `row` is the whole
+    // of what this arm protects.
     //
     // `auto-pick` types its `destination` as the literal `"deck"`, and carries
     // per-id hints rather than one.

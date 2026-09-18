@@ -1832,9 +1832,13 @@ describe("multiplayerDraftStore", () => {
         podPolicy: "Competitive",
       });
       capturedHostEventHandler!({ type: "viewUpdated", view: mockView("Drafting") });
+      // cmc 6, matching the solo sibling: the deck board's seven columns can hold
+      // it and the sideboard's six cannot, so this is the fixture that actually
+      // reaches the clamp the comment above describes. A five-drop would land in
+      // sideboard column 5 unclamped and prove less.
       mockHostAdapter.submitPick.mockResolvedValueOnce({
         ...mockView("Drafting"),
-        pool: [{ ...card("costly"), cmc: 5 }],
+        pool: [{ ...card("costly"), cmc: 6 }],
       });
 
       await expect(useMultiplayerDraftStore.getState().submitPick("costly", "sideboard"))
@@ -1932,6 +1936,78 @@ describe("multiplayerDraftStore", () => {
       expect(mockHostAdapter.submitPick).toHaveBeenCalledWith(["card-123"]);
       expect(useMultiplayerDraftStore.getState().workspaceState?.placements["card-123"])
         .toMatchObject({ zone: "deck", column: 3, row: 1 });
+    });
+
+    // The pod twin of the solo store's
+    // `leaves_a_row_less_auto_pick_hint_on_a_two_row_board_in_the_reconcile_default_row`.
+    // Pins the `auto-pick` arm of `ownPlacement`, which filters per id on
+    // `placementHints?.[id] !== undefined`: a hint naming only a column must
+    // still keep the arriving pass off that card's row.
+    it("leaves a row-less auto-pick hint on a two-row board in the reconcile default row", async () => {
+      setArrivingCardBoardPreferences({
+        sort: "cmc", columnCount: 7, rows: "two", showHeaders: true,
+      });
+      await useMultiplayerDraftStore.getState().hostDraft({
+        poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
+        kind: "Premier",
+        podSize: 8,
+        hostDisplayName: "Host",
+        tournamentFormat: "Swiss",
+        podPolicy: "Competitive",
+      });
+      const picked = { ...card("costly"), cmc: 5, type_line: "Creature — Bear" };
+      capturedHostEventHandler!({
+        type: "viewUpdated",
+        // `required_pick_count` drives `chooseAutoPickCards`, which slices the
+        // scored pack to that length — left at `mockView`'s 0 the auto-pick
+        // selects nothing and never reaches the adapter.
+        view: {
+          ...mockView("Drafting"), pool: [], current_pack: [picked], required_pick_count: 1,
+        },
+      });
+      mockHostAdapter.submitPick.mockResolvedValueOnce({
+        ...mockView("Drafting"),
+        pool: [picked],
+      });
+
+      await useMultiplayerDraftStore.getState().autoPickCard({ costly: { column: 2 } });
+
+      const placement = useMultiplayerDraftStore.getState().workspaceState!.placements.costly;
+      expect(placement.column).toBe(2);
+      expect(placement.row).toBe(0);
+    });
+
+    // The other direction of the same arm: an auto-pick carrying NO hint for a
+    // card has no placement decision of its own, so the arriving pass must sort
+    // it rather than leave it at reconcile's column 0.
+    it("sorts an auto-picked card that carries no hint of its own", async () => {
+      await useMultiplayerDraftStore.getState().hostDraft({
+        poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
+        kind: "Premier",
+        podSize: 8,
+        hostDisplayName: "Host",
+        tournamentFormat: "Swiss",
+        podPolicy: "Competitive",
+      });
+      const picked = { ...card("costly"), cmc: 5 };
+      capturedHostEventHandler!({
+        type: "viewUpdated",
+        // `required_pick_count` drives `chooseAutoPickCards`, which slices the
+        // scored pack to that length — left at `mockView`'s 0 the auto-pick
+        // selects nothing and never reaches the adapter.
+        view: {
+          ...mockView("Drafting"), pool: [], current_pack: [picked], required_pick_count: 1,
+        },
+      });
+      mockHostAdapter.submitPick.mockResolvedValueOnce({
+        ...mockView("Drafting"),
+        pool: [picked],
+      });
+
+      await useMultiplayerDraftStore.getState().autoPickCard();
+
+      expect(useMultiplayerDraftStore.getState().workspaceState!.placements.costly.column)
+        .toBe(5);
     });
 
     it("applies_each_multi-card_auto-pick_placement_hint_to_its_own_card", async () => {
