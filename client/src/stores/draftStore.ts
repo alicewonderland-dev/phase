@@ -443,12 +443,18 @@ function installWorkspace(operation: WorkspaceInstallOperation): void {
   // plus the hint-less deck picks `PackDisplay.request` dispatches through
   // `pickCard`, `pickCardStep` and `pickCardWithDraftEffect`. Without this they
   // stack in the board's first column whatever the sort says.
-  // Placed before the switch rather than after it. The two orders are
-  // interchangeable for every case reached today — moving this below the switch
-  // leaves the whole file green — because the ids the switch places are either
-  // excluded from `arriving` or land back in the deck zone the pass accepts.
-  // Before, so a reader meets the default-filling pass next to the reconcile
-  // that creates the defaults.
+  // BEFORE the switch, and the order is load-bearing — do not move this below
+  // it. For a multi-id hint-less DECK pick (`pickCardWithDraftEffect` from
+  // `PackDisplay.request`) the two orders give different STACK order: before,
+  // `applyDestination` appends the ids in request order, which is the semantic
+  // `appends_acknowledged_draft_effect_cards_in_request_order` names; after, the
+  // pass has already appended them in pool order and `applyDestination` finds
+  // them placed. Probed at `{ first.order: 1, second.order: 0 }` against
+  // `{ 0, 1 }` for a request of `["second", "first"]`, and pinned by
+  // `appends_a_hint_less_deck_draft_effect_pick_in_request_order`.
+  //
+  // The placement tests alone do NOT catch a move: they cover single ids, where
+  // both orders agree.
   let workspace = placeArrivingPoolCards(
     reconcileWorkspaceState(operation.baseWorkspace, operation.authoritativeView.pool),
     arriving,

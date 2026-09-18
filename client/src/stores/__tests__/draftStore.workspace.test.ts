@@ -503,6 +503,29 @@ describe("draft store workspace authority", () => {
     expect(adapterIds).not.toBe(tuple);
   });
 
+  it("appends_a_hint_less_deck_draft_effect_pick_in_request_order", async () => {
+    // The sibling above uses `"sideboard"` with a hint, so both ids are excluded
+    // from the arriving pass and it cannot see this. THIS case — deck, no hint —
+    // is what `PackDisplay.request` dispatches, and it is the one that makes the
+    // arriving pass's position relative to the switch load-bearing: run the pass
+    // after `applyDestination` instead and these two land in POOL order
+    // (`first` then `second`) rather than the requested order.
+    await start([card("effect")]);
+    wasm.submit_pick_with_draft_effect.mockReturnValue(view([
+      { ...cardWithCmc("effect", 3) },
+      { ...cardWithCmc("first", 3) },
+      { ...cardWithCmc("second", 3) },
+    ]));
+
+    await expect(useDraftStore.getState().pickCardWithDraftEffect(
+      "effect", ["second", "first"], "deck",
+    )).resolves.toEqual({ status: "acknowledged" });
+
+    const placements = useDraftStore.getState().workspaceState!.placements;
+    expect(placements.second.order).toBe(0);
+    expect(placements.first.order).toBe(1);
+  });
+
   it("appends_acknowledged_draft_effect_cards_in_request_order", async () => {
     await start([card("effect")]);
     wasm.submit_pick_with_draft_effect.mockReturnValue(view([

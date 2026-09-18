@@ -668,17 +668,6 @@ function publishWorkspace(workspace: DraftWorkspaceState): Promise<void> {
   );
 }
 
-/**
- * The workspace to ask `unplacedPoolIds` about before this store has one.
- *
- * A null `workspaceState` means no card has a placement yet, which an empty
- * workspace answers identically — every pool card comes back unplaced — so the
- * shared helper needs no nullable overload of its own.
- */
-function placementsSoFar(workspace: DraftWorkspaceState | null): DraftWorkspaceState {
-  return workspace ?? createDraftWorkspaceState();
-}
-
 function installWorkspace(input: {
   view: DraftPlayerView;
   base: DraftWorkspaceState;
@@ -864,7 +853,7 @@ async function performPick(request: MultiplayerPickRequest): Promise<DraftPickOu
       // Against the PRE-reconcile workspace, so the cards this pick just added
       // still count as arriving; asked afterwards they would already hold
       // reconcile's column-0 default and be filtered out.
-      unplacedPoolIds(placementsSoFar(state.workspaceState), acknowledgedView.pool)
+      unplacedPoolIds(state.workspaceState, acknowledgedView.pool)
         .filter((instanceId) => !ownPlacement.includes(instanceId)),
       acknowledgedView.pool,
       acknowledgedView.pool_groups,
@@ -1012,7 +1001,7 @@ async function performSharedStackDecision(
       view: acknowledgedView,
       base: placeArrivingPoolCards(
         reconcileWorkspaceState(state.workspaceState, acknowledgedView.pool),
-        unplacedPoolIds(placementsSoFar(state.workspaceState), acknowledgedView.pool),
+        unplacedPoolIds(state.workspaceState, acknowledgedView.pool),
         acknowledgedView.pool,
         acknowledgedView.pool_groups,
         getArrivingCardBoardPreferences(),

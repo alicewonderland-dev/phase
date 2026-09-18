@@ -13,8 +13,10 @@ import {
   useMultiplayerDraftStore,
   type DraftPodScreen,
 } from "../multiplayerDraftStore";
-import { setArrivingCardBoardPreferences } from "../../components/draft/workspace/workspacePreferences";
-import { createDefaultDraftWorkspacePreferences } from "../../components/draft/workspace/workspacePreferences";
+import {
+  createDefaultDraftWorkspacePreferences,
+  setArrivingCardBoardPreferences,
+} from "../../components/draft/workspace/workspacePreferences";
 import { DraftPodHostAdapter } from "../../adapter/draftPodHostAdapter";
 import { DraftPodGuestAdapter } from "../../adapter/draftPodGuestAdapter";
 import type { DraftPlayerView } from "../../adapter/draft-adapter";
@@ -1817,11 +1819,6 @@ describe("multiplayerDraftStore", () => {
         .toBe(2);
     });
 
-    // The sibling of the solo store's
-    // `leaves_a_hint_less_sideboard_pick_in_the_first_column`. The arriving pass
-    // is deck-only, so a sideboard-bound pick must be excluded from it: left in,
-    // it would carry a column from the DECK's seven-column geometry into the
-    // six-column sideboard, to be clamped at render to that zone's last column.
     // The pod half of the same seam: `performPick` reads the geometry through
     // `getArrivingCardBoardPreferences`. A six-drop clamps to column 2 under
     // three columns and column 6 under the seven-column default, so the
@@ -1851,6 +1848,11 @@ describe("multiplayerDraftStore", () => {
         .toBe(2);
     });
 
+    // The sibling of the solo store's
+    // `leaves_a_hint_less_sideboard_pick_in_the_first_column`. The arriving pass
+    // is deck-only, so a sideboard-bound pick must be excluded from it: left in,
+    // it would carry a column from the DECK's seven-column geometry into the
+    // six-column sideboard, to be clamped at render to that zone's last column.
     it("leaves a hint-less sideboard pick in the first column", async () => {
       await useMultiplayerDraftStore.getState().hostDraft({
         poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
