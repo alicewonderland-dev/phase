@@ -857,9 +857,12 @@ async function performPick(request: MultiplayerPickRequest): Promise<DraftPickOu
     // appends them in REQUEST order and re-appends an id it finds already
     // placed (`if (!placement) continue` is its only skip). Whichever runs last
     // decides the stack order. Pinned by `appends a hint-less deck draft-effect
-    // pick in request order`, which was the single failure of a full
+    // pick in request order`, which was the single placement failure of a full
     // `npx vitest run` with this call moved below the `applyDestination`
-    // assignment.
+    // assignment — it failed there on `second.order`, expecting 0 and getting
+    // 1, the pool-order result. Count the placement failures, not the failures:
+    // `devServerPort.test.ts` times out beside it in some runs of that move,
+    // and timed out on this tree with nothing moved too.
     let workspace = placeArrivingPoolCards(
       reconcileWorkspaceState(state.workspaceState, acknowledgedView.pool),
       // Against the PRE-reconcile workspace, so the cards this pick just added
