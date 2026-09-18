@@ -1822,6 +1822,35 @@ describe("multiplayerDraftStore", () => {
     // is deck-only, so a sideboard-bound pick must be excluded from it: left in,
     // it would carry a column from the DECK's seven-column geometry into the
     // six-column sideboard, to be clamped at render to that zone's last column.
+    // The pod half of the same seam: `performPick` reads the geometry through
+    // `getArrivingCardBoardPreferences`. A six-drop clamps to column 2 under
+    // three columns and column 6 under the seven-column default, so the
+    // assertion cannot be satisfied by any default.
+    it("places a pick against the columns the page published, not the module default", async () => {
+      setArrivingCardBoardPreferences({
+        sort: "cmc", columnCount: 3, rows: "one", showHeaders: true,
+      });
+      await useMultiplayerDraftStore.getState().hostDraft({
+        poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
+        kind: "Premier",
+        podSize: 8,
+        hostDisplayName: "Host",
+        tournamentFormat: "Swiss",
+        podPolicy: "Competitive",
+      });
+      capturedHostEventHandler!({ type: "viewUpdated", view: mockView("Drafting") });
+      mockHostAdapter.submitPick.mockResolvedValueOnce({
+        ...mockView("Drafting"),
+        pool: [{ ...card("costly"), cmc: 6 }],
+      });
+
+      await expect(useMultiplayerDraftStore.getState().submitPick("costly", "deck"))
+        .resolves.toEqual({ status: "acknowledged" });
+
+      expect(useMultiplayerDraftStore.getState().workspaceState!.placements.costly.column)
+        .toBe(2);
+    });
+
     it("leaves a hint-less sideboard pick in the first column", async () => {
       await useMultiplayerDraftStore.getState().hostDraft({
         poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },

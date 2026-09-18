@@ -443,8 +443,12 @@ function installWorkspace(operation: WorkspaceInstallOperation): void {
   // plus the hint-less deck picks `PackDisplay.request` dispatches through
   // `pickCard`, `pickCardStep` and `pickCardWithDraftEffect`. Without this they
   // stack in the board's first column whatever the sort says.
-  // Before the switch, so the `placement.column` fallback in `applyDestination`
-  // reads the sorted column rather than reconcile's default.
+  // Placed before the switch rather than after it. The two orders are
+  // interchangeable for every case reached today — moving this below the switch
+  // leaves the whole file green — because the ids the switch places are either
+  // excluded from `arriving` or land back in the deck zone the pass accepts.
+  // Before, so a reader meets the default-filling pass next to the reconcile
+  // that creates the defaults.
   let workspace = placeArrivingPoolCards(
     reconcileWorkspaceState(operation.baseWorkspace, operation.authoritativeView.pool),
     arriving,

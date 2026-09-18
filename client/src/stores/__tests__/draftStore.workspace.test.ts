@@ -241,6 +241,24 @@ describe("draft store workspace authority", () => {
     expect(useDraftStore.getState().workspaceState!.placements.picked.column).toBe(2);
   });
 
+  it("places_a_pick_against_the_columns_the_page_published_not_the_module_default", async () => {
+    // The seam the whole feature rests on: `installWorkspace` reads the board
+    // geometry through `getArrivingCardBoardPreferences`, so a page that has
+    // published three columns must get three-column placement. Three is chosen
+    // because `manaValueColumn` clamps to `columnCount - 1`: a six-drop lands in
+    // column 2 here and column 6 under the seven-column default, so no default
+    // can produce this result.
+    setArrivingCardBoardPreferences({
+      sort: "cmc", columnCount: 3, rows: "one", showHeaders: true,
+    });
+    await start();
+    wasm.submit_pick.mockReturnValue(view([cardWithCmc("picked", 6)]));
+
+    await useDraftStore.getState().pickCard("picked", "deck");
+
+    expect(useDraftStore.getState().workspaceState!.placements.picked.column).toBe(2);
+  });
+
   it("leaves_a_hint_less_sideboard_pick_in_the_first_column", async () => {
     // The arriving pass is deck-only. Were it allowed to run for a sideboard
     // pick it would stamp this card with a column from the DECK's geometry —

@@ -81,14 +81,23 @@ describe("workspace placement", () => {
   });
 
   it("creates_no_placement_for_an_id_the_pool_does_not_hold", () => {
+    // The id must already HOLD a deck placement, or this reaches the
+    // `placement === undefined` guard instead and passes without ever
+    // exercising the pool lookup it is named for. `reconcileWorkspaceState`
+    // would strip a placement whose id is absent from the pool, so the base is
+    // built directly.
     const pool = [card("present")];
-    const base = reconcileWorkspaceState(createDraftWorkspaceState(), pool);
+    const ghost = { zone: "deck", row: 0, column: 0, order: 0 } as const;
+    const base: DraftWorkspaceState = {
+      ...createDraftWorkspaceState(),
+      placements: { ghost },
+    };
 
     const placed = placeArrivingPoolCards(
-      base, ["absent"], pool, groups(), boardPreferences().deck,
+      base, ["ghost"], pool, groups(), boardPreferences().deck,
     );
 
-    expect(placed.placements).not.toHaveProperty("absent");
+    expect(placed.placements.ghost).toEqual(ghost);
   });
 
   it("reconciles_authoritative_instances_without_losing_manual_placement", () => {
