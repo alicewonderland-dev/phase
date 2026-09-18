@@ -65,9 +65,11 @@
  * Granting the rule, one constant stated in units of card WIDTH — a card height
  * less one strip — expresses the same overlap at whatever width the card is
  * finally drawn at, including a width a narrow column capped. `WorkspaceCard`
- * states that same product as the literal `-123.3442622951%`; this file derives
- * it from the ratio instead, so the two strings agree only to ten decimal
- * places (`node -e 'console.log((680 / 488 - 0.16) * 100)'`).
+ * states that same product as the literal `-123.3442622951%` — that value
+ * ROUNDED to ten decimal places, so the two strings agree to nine and diverge
+ * at the tenth. This file derives it from the ratio instead
+ * (`node -e 'console.log((680 / 488 - 0.16) * 100)'` prints
+ * `123.34426229508198`).
  *
  * This surface used to be three full-width ROWS, on the argument that a Winston
  * turn is a decision about one pile's cards so that pile should have the whole
@@ -80,8 +82,10 @@
  * not a tidy-up: in the pile under decision every card but the last now shows
  * only its top strip. At the shipped default that strip is
  * `DRAFT_PACK_CARD_BASE_WIDTH_PX * DRAFT_WORKSPACE_PILE_SCALE_DEFAULT *
- * STACK_EXPOSED_WIDTH_RATIO` ≈ 31px of a ≈275px card — arithmetic over three
- * in-tree constants, and about a name bar's worth. Reading a covered card takes
+ * STACK_EXPOSED_WIDTH_RATIO` ≈ 31px, off a card drawn ≈197px WIDE (the first
+ * two of those constants) and so ≈275px TALL (that width times
+ * `CARD_FACE_HEIGHT / CARD_FACE_WIDTH`) — arithmetic over five in-tree
+ * constants, and about a name bar's worth. Reading a covered card takes
  * a hover or a Tab, each of which raises it above its neighbour. What the rows
  * cost instead was HEIGHT: three of them, each at least a full card tall, on a
  * page whose other half is the player's own pool. Which of those two costs
@@ -189,7 +193,7 @@ export interface WinstonPileTableProps {
   /**
    * The page's own layout band, passed for ONE reason: whether this surface
    * owns its height. It selects nothing about the column layout, which is the
-   * same `repeat(pileCount, minmax(0, 1fr))` in every band.
+   * same `repeat(${piles.length}, minmax(0, 1fr))` in every band.
    *
    * On desktop the drafting column is `flex-col` in a page that scrolls, so the
    * columns can be as tall as the scale makes them. Every other band puts the
@@ -284,9 +288,24 @@ function RevealedCard({
       tabIndex={0}
       aria-label={card.name}
       {...hover}
-      // After the spread, and each one calls through to what it replaced. The
-      // lift is gated on the same `"mouse"` pointer type `mouseHoverPreview`
-      // gates the preview on, so no pointer gets one without the other.
+      // After the spread, and each one calls through to what it replaced.
+      //
+      // ENTER is symmetric: the lift is gated on the same `"mouse"` pointer
+      // type `mouseHoverPreview` gates the preview on, so a touch pointer gets
+      // neither ("gives a touch pointer neither the lift nor the preview").
+      //
+      // LEAVE is deliberately NOT, and it is the one place the two come apart:
+      // `mouseHoverPreview` ignores a leave whose `relatedTarget` is inside the
+      // preview overlay — see its own doc for the narrow-viewport bug that rule
+      // exists for — while the lift drops on every leave regardless.
+      //
+      // Dropping it is the safe direction: the overlay is dismissed from
+      // elsewhere on the page rather than by the pointer returning to this
+      // card, so a lift that survived the leave would get no second leave to
+      // clear it. DOM reasoning about the dismissal paths, and not measured
+      // here. The observable half — that the leave drops the lift while the
+      // preview stays up — is pinned by "drops the lift but keeps the preview
+      // when the pointer moves onto the overlay".
       onPointerEnter={(event) => {
         hover.onPointerEnter(event);
         if (event.pointerType === "mouse") setLifted(true);
@@ -335,10 +354,20 @@ function RevealedCard({
  *
  * `false` is the one case where nothing is face down and cards are face up: the
  * seat is looking at the WHOLE pile, which is the active seat's state at the
- * cursor on every turn (both engine write sites of the `inspected` contract set
- * `inspected[cursor] = piles[cursor].len()`). Drawing an empty slot there would
- * claim a card nobody has seen, on the one pile the screen is about, and cost
- * it a card of height.
+ * cursor on every turn — all three engine write sites of the `inspected`
+ * contract set the cursor pile's entry to that pile's own length
+ * (`git grep -n 'inspected\[' -- crates/draft-core/src`: `shared_stack.rs`'s
+ * turn-end reset and its decline cursor-advance, and `session.rs`'s draft
+ * start; the fourth hit in `shared_stack.rs` is under `#[cfg(test)]`). Drawing
+ * an empty slot there would claim a card nobody has seen, on the one pile the
+ * screen is about, and cost it a card of height.
+ *
+ * The remaining quadrant, `(count > 0, total === 0)`, is unreachable rather
+ * than handled. Both call sites (`git grep -n drawsFaceDownStack -- client/src`
+ * — `FaceDownStack`'s own guard and `Pile`'s `stackIndex`) pass the same
+ * derived pair, and `count` in it is only ever
+ * `Math.max(0, pile.total - shownRevealed.length)`, which is 0 whenever `total`
+ * is. The `||` is written for the three quadrants that occur.
  */
 function drawsFaceDownStack(count: number, total: number): boolean {
   return count > 0 || total === 0;
@@ -366,8 +395,9 @@ function FaceDownStack({ count, total }: { count: number; total: number }) {
   // No height of its own: the backs are in flow and their negative top margins
   // are what set it. GEOMETRY, worked through on paper and not measured here —
   // the fan runs a card tall plus one strip per further back, and the first
-  // revealed card pulls up by a card less a strip, which leaves one strip of
-  // the fan showing and makes the column one uniform stack from the deepest
+  // revealed card pulls up by a card less a strip, which leaves the LAST back
+  // showing exactly one strip — the same strip every other covered card in the
+  // column shows — and so makes the column one uniform stack from the deepest
   // back to the newest card.
   return (
     <div
@@ -465,7 +495,15 @@ function Pile({
         // meet, so the buttons fill instead. `menuButtonClass`'s `sm` size is
         // unchanged and still carries `min-h-11`, the touch target that had to
         // survive (`buttonStyles.ts::menuButtonClass`).
-        className={menuButtonClass({ tone, size: "sm", disabled, className: "w-full min-w-0 px-2" })}
+        //
+        // And no padding override, which could not work here anyway: `className`
+        // is appended to the class ATTRIBUTE, and attribute order does not
+        // decide a Tailwind conflict — stylesheet source order does. The
+        // compiled sheet emits `.px-4` (which `sm` already carries) AFTER
+        // `.px-2`, in the same `@layer utilities` and at the same specificity,
+        // so a `px-2` passed here would be inert. Against a running dev server:
+        // `curl -s 'http://[::1]:5173/src/index.css?direct' | grep -n '\.px-2 {\|\.px-4 {'`.
+        className={menuButtonClass({ tone, size: "sm", disabled, className: "w-full min-w-0" })}
       >
         {t(decision === "Take" ? "winston.take" : "winston.decline")}
       </button>
@@ -513,6 +551,12 @@ function Pile({
     <div
       data-winston-pile={pile.index}
       data-winston-pile-active={isCursor ? "true" : "false"}
+      // `p-2` where the row layout had `p-3`: a pile is now a column about one
+      // card wide, so its padding is taken out of the card's own drawn width
+      // rather than out of a full row's slack. A sizing judgement about a
+      // layout nothing in this repo measures; the declaration itself is pinned
+      // by "centres each pile's stack in its column and keeps the column's
+      // padding thin".
       className={`flex min-w-0 flex-col gap-2 rounded-[16px] border p-2 ${
         isCursor
           ? "border-amber-300/40 bg-amber-400/[0.06] shadow-[inset_0_-1px_0_rgba(0,0,0,0.28)]"
@@ -544,6 +588,14 @@ function Pile({
           box-model rule the LAYOUT note flags as unmeasurable here, and the
           same goes for `maxWidth: 100%` capping the stack in a narrow column.
 
+          `mx-auto` is new with the columns and not carried over: a fixed
+          `cardWidth` inside a `minmax(0, 1fr)` track is narrower than its track
+          at most scales, and without the auto margins it would sit against the
+          track's leading edge instead of under the pile's own header. A sizing
+          judgement of the same kind as `p-2` above — the declaration is pinned
+          by "centres each pile's stack in its column and keeps the column's
+          padding thin", what it then does is not measured here.
+
           No `overflow-x-auto` here, and none should come back: a scroll
           container would clip the card a hover or a Tab lifts. That argument
           also rules out bounding a tall cursor pile with `max-height` +
@@ -568,15 +620,15 @@ function Pile({
           />
         ))}
         {/* No "you have not looked at this pile yet" placeholder, and its
-            absence is load-bearing rather than an omission. BOTH engine write
-            sites of the `inspected` contract set `inspected[cursor] =
-            piles[cursor].len()` (the turn-end reset and the decline's
-            cursor-advance), so at the cursor `revealed.length === total`
-            ALWAYS. An empty `shownRevealed` AT THE CURSOR therefore means the
-            pile is empty, never "unlooked-at" — and an empty pile is already
-            stated twice over, by the empty slot `FaceDownStack` draws for a
-            pile whose own total is zero and by the engine's `PileEmpty` refusal
-            note below. Away from the cursor it means "face down", which is
+            absence is load-bearing rather than an omission. ALL THREE engine
+            write sites of the `inspected` contract set the cursor pile's entry
+            to that pile's own length — see `drawsFaceDownStack` above for the
+            grep that enumerates them — so at the cursor
+            `revealed.length === total` ALWAYS. An empty `shownRevealed` AT THE
+            CURSOR therefore means the pile is empty, never "unlooked-at" — and
+            an empty pile is already stated twice over, by the empty slot
+            `FaceDownStack` draws for a pile whose own total is zero and by the
+            engine's `PileEmpty` refusal note below. Away from the cursor it means "face down", which is
             exactly what the stack of backs above it says. */}
       </div>
 
@@ -820,9 +872,11 @@ export function WinstonPileTable({
       </p>
 
       {/* One grid column per PUBLISHED pile, never a hard-coded three:
-          `pile_count` is engine data (`SharedStackPiles { pile_count }`), and a
-          layout that assumed its current value would be a second authority for
-          a number the projection already carries. */}
+          `pile_count` is draft-core data, not this layer's
+          (`PackDistribution::SharedStackPiles { pile_count }` in
+          `crates/draft-core/src/types.rs`), and a layout that assumed its
+          current value would be a second authority for a number the projection
+          already carries. */}
       <div
         data-winston-pile-list
         className={`grid min-w-0 gap-2 ${

@@ -32,9 +32,19 @@ vi.mock("../../../hooks/useCardImage", async (importOriginal) => ({
   useCardBackImage: () => ({ src: null, advanceFailedSource: undefined }),
 }));
 
-// Records what this surface asks the preview for. Renders nothing: the claim
-// under test is which preview behaviour a pile turn requires, not how the
-// preview draws it — that is pinned in the preview's own suite.
+// Records what this surface asks the preview for. How the preview DRAWS is
+// pinned in its own suite and is not the claim here — so this renders one bare
+// marked element and nothing else.
+//
+// The marker is not decoration. The real overlay carries `data-card-preview`
+// (`CardPreview.tsx`) and is a descendant of `HoverCardPreview`, which this
+// surface renders inside its own `<section>` — and that marker is what
+// `mouseHoverPreview`'s leave rule reads off `relatedTarget`. Being in the same
+// REACT tree is the load-bearing part: React synthesizes pointerenter/leave
+// from pointerout/over and resolves `relatedTarget` through the fiber tree, so
+// a related node rendered by this root arrives as an `Element` while a bare
+// `document.body` child arrives as the window object. MEASURED both ways before
+// this mock was written to render anything.
 interface RecordedPreview {
   card?: { name: string } | null;
   mode?: string;
@@ -45,7 +55,7 @@ const previewProps: RecordedPreview[] = vi.hoisted(() => []);
 vi.mock("../../card/HoverCardPreview", () => ({
   HoverCardPreview: (props: RecordedPreview) => {
     previewProps.push(props);
-    return null;
+    return props.card == null ? null : <div data-card-preview="" />;
   },
 }));
 
@@ -659,6 +669,75 @@ describe("WinstonPileTable", () => {
     expect(previewProps[previewProps.length - 1]?.card).toBeNull();
   });
 
+  it("gives a touch pointer neither the lift nor the preview", () => {
+    // The paired negative for the row above, and the only thing in this file
+    // that enters the `pointerType === "mouse"` gate on the lift: the mouse row
+    // passes whether the gate is there or not, so without this one deleting it
+    // costs nothing. Touch drives the preview by tap/long-press instead
+    // (`hoverPreview.ts::mouseHoverPreview`), and a lift with no preview behind
+    // it would raise a card a touch player never asked to see. Same device as
+    // `useCardHover.test.tsx`'s touch row.
+    renderTable(
+      activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
+    );
+
+    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card]")!;
+
+    fireEvent.pointerEnter(revealed, { pointerId: 1, pointerType: "touch" });
+
+    expect(revealed).not.toHaveClass("z-10");
+    expect(previewProps[previewProps.length - 1]?.card ?? null).toBeNull();
+  });
+
+  it("drops the lift but keeps the preview when the pointer moves onto the overlay", () => {
+    // The one leave where the lift and the preview come apart, and it is
+    // deliberate on both sides — see the composed `onPointerLeave` in
+    // `WinstonPileTable.tsx::RevealedCard` for why the lift does not follow
+    // `mouseHoverPreview`'s overlay rule. This row is what makes the split
+    // observable rather than incidental: adding that rule to the lift reddens
+    // the `z-10` assertion, and deleting it from `mouseHoverPreview` reddens
+    // the preview assertion.
+    //
+    // `relatedTarget` reaches a React handler through `fireEvent` only when the
+    // related node is in the same React tree — same device as
+    // `PermanentCard.test.tsx`'s "restores host preview when moving from an
+    // attachment back to its host", where it is a rendered sibling. So the
+    // overlay here is the one the `HoverCardPreview` mock renders, not a
+    // hand-appended `document.body` child; see the note on that mock.
+    renderTable(
+      activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
+    );
+
+    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card]")!;
+    fireEvent.pointerEnter(revealed, { pointerType: "mouse" });
+    expect(revealed).toHaveClass("z-10");
+    expect(previewProps[previewProps.length - 1]?.card).toMatchObject({ name: "Ponder" });
+
+    const overlay = document.querySelector<HTMLElement>("[data-card-preview]");
+    expect(overlay).not.toBeNull();
+
+    fireEvent.pointerLeave(revealed, { pointerType: "mouse", relatedTarget: overlay });
+
+    expect(revealed).not.toHaveClass("z-10");
+    expect(previewProps[previewProps.length - 1]?.card).toMatchObject({ name: "Ponder" });
+  });
+
+  it("centres each pile's stack in its column and keeps the column's padding thin", () => {
+    // Marker assertions, and named as ones: happy-dom resolves no Tailwind, so
+    // these pin the DECLARATIONS and not a measured box. Both are sizing
+    // judgements the column layout forced and neither was observed before — the
+    // stack is a fixed `cardWidth` inside a `minmax(0, 1fr)` track, so without
+    // `mx-auto` it sits against the track's leading edge; and the row layout's
+    // `p-3` came out of a full row's slack, where a one-card-wide column has
+    // none to give.
+    renderTable(activeTurn([pile(0, 1, [card("c1", "Ponder")], null, null)], 0));
+
+    const pileEl = document.querySelector("[data-winston-pile='0']")!;
+    expect(pileEl).toHaveClass("p-2");
+    expect(pileEl).not.toHaveClass("p-3");
+    expect(pileEl.querySelector("[data-winston-pile-stack]")).toHaveClass("mx-auto");
+  });
+
   it("lifts a covered card for a keyboard player too", () => {
     // `RevealedCard` is already focusable (`tabIndex={0}`, pinned by "reaches
     // the card a keyboard player is deciding on"), and focusing it already
@@ -702,6 +781,11 @@ describe("WinstonPileTable", () => {
     // column; what replaces it has to be a fill rather than a floor.
     expect(decisionButton(0, "Take")).toHaveClass("w-full");
     expect(decisionButton(0, "Take")).not.toHaveClass("min-w-[6rem]");
+    // And no padding override either. `menuButtonClass`'s `sm` already carries
+    // `px-4`, and a `px-2` appended after it in the class attribute loses to it
+    // on stylesheet source order — so one here would be dead weight that reads
+    // like a narrower button. See the note at the call site for the check.
+    expect(decisionButton(0, "Take")).not.toHaveClass("px-2");
   });
 
   it("scales the cards by the stored pile scale rather than a fixed width", () => {
