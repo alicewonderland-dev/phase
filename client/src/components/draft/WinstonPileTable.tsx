@@ -250,9 +250,13 @@ function RevealedCard({
   const preview = { name: card.name, sourcePrinting };
   // A covered card shows one strip of itself, so hovering or tabbing to one has
   // to raise it out of the stack as well as preview it. A `z-index` lift and
-  // not a transform, because off desktop the pile list is a scroll container
-  // (`data-winston-scrolls-piles`) and a card that MOVED could be clipped by
-  // one — CSS reasoning, and no test here measures it.
+  // not a transform, because off desktop `[data-winston-pile-list]` takes
+  // `overflow-y-auto` and a card that MOVED could be clipped by it — CSS
+  // reasoning, and no test here measures it. The `ownsHeight` that switches
+  // that class on is the same one that publishes `data-winston-scrolls-piles`,
+  // but the attribute sits a level up, on the `[data-winston-pile-table]`
+  // section: "scrolls its own columns wherever the page will not scroll for
+  // it" asserts the attribute and the class on different elements.
   const [lifted, setLifted] = useState(false);
   // Bound once so the handlers below can DELEGATE to it. JSX spread precedence
   // is last-wins, so an explicit `onPointerEnter` written before the spread
@@ -337,15 +341,6 @@ function RevealedCard({
 // ── Face-down stack ─────────────────────────────────────────────────────
 
 /**
- * A pile's face-down cards, drawn as overlapping card backs.
- *
- * A HEIGHT, never contents — the same contract the number it replaces had. The
- * stack's order is published to nobody and a pile's unlooked-at cards to
- * nobody, so every back here is the same public card back and none of them
- * stands for a particular card: `count` is the truth, the backs are how a
- * player reads it without counting digits.
- */
-/**
  * Whether `FaceDownStack` draws anything for this pile.
  *
  * The single authority for that question, called by the component itself and by
@@ -354,13 +349,17 @@ function RevealedCard({
  *
  * `false` is the one case where nothing is face down and cards are face up: the
  * seat is looking at the WHOLE pile, which is the active seat's state at the
- * cursor on every turn — all three engine write sites of the `inspected`
- * contract set the cursor pile's entry to that pile's own length
- * (`git grep -n 'inspected\[' -- crates/draft-core/src`: `shared_stack.rs`'s
- * turn-end reset and its decline cursor-advance, and `session.rs`'s draft
- * start; the fourth hit in `shared_stack.rs` is under `#[cfg(test)]`). Drawing
- * an empty slot there would claim a card nobody has seen, on the one pile the
- * screen is about, and cost it a card of height.
+ * cursor on every turn — every engine write site of the `inspected` contract
+ * sets the cursor pile's entry to that pile's own length. There are three:
+ * `session::apply_start_draft` at draft start, and, in
+ * `shared_stack::apply_shared_stack_decision`, the decline cursor-advance and
+ * the turn-end reset (which zeroes the whole vector first, then sets index 0).
+ * `git grep -n 'inspected\[' -- crates/draft-core/src` is the enumeration: it
+ * spans `session.rs`, `shared_stack.rs`, `types.rs` and `view.rs`, and those
+ * three are the only assignments among its hits that are neither a doc comment
+ * nor inside a `#[cfg(test)]` module. Drawing an empty slot there would claim a
+ * card nobody has seen, on the one pile the screen is about, and cost it a card
+ * of height.
  *
  * The remaining quadrant, `(count > 0, total === 0)`, is unreachable rather
  * than handled. Both call sites (`git grep -n drawsFaceDownStack -- client/src`
@@ -373,6 +372,15 @@ function drawsFaceDownStack(count: number, total: number): boolean {
   return count > 0 || total === 0;
 }
 
+/**
+ * A pile's face-down cards, drawn as overlapping card backs.
+ *
+ * A HEIGHT, never contents — the same contract the number it replaces had. The
+ * stack's order is published to nobody and a pile's unlooked-at cards to
+ * nobody, so every back here is the same public card back and none of them
+ * stands for a particular card: `count` is the truth, the backs are how a
+ * player reads it without counting digits.
+ */
 function FaceDownStack({ count, total }: { count: number; total: number }) {
   const { t } = useTranslation("draft");
   const backs = Math.min(count, FACE_DOWN_STACK_MAX_BACKS);
@@ -386,7 +394,7 @@ function FaceDownStack({ count, total }: { count: number; total: number }) {
         data-winston-pile-facedown-count={count}
         role="img"
         aria-label={t("winston.pileTotal", { count })}
-        className="relative w-full rounded-md border border-dashed border-white/12"
+        className="w-full rounded-md border border-dashed border-white/12"
         style={{ aspectRatio: CARD_ASPECT }}
       />
     );
@@ -405,7 +413,7 @@ function FaceDownStack({ count, total }: { count: number; total: number }) {
       data-winston-pile-facedown-count={count}
       role="img"
       aria-label={t("winston.faceDownStack", { count })}
-      className="relative w-full"
+      className="w-full"
     >
       {Array.from({ length: backs }, (_, index) => (
         <CardBackFallback
@@ -490,7 +498,7 @@ function Pile({
         aria-label={t(decision === "Take" ? "winston.takeAria" : "winston.declineAria", { index: label })}
         aria-describedby={reason === undefined ? undefined : `winston-refusal-${pile.index}-${decision}`}
         onClick={() => onDecide(pile.index, decision)}
-        // `w-full min-w-0` in place of the row layout's `min-w-[6rem]`: in a
+        // `w-full` in place of the row layout's `min-w-[6rem]`: in a
         // one-card-wide column a per-button floor is a floor the column cannot
         // meet, so the buttons fill instead. `menuButtonClass`'s `sm` size is
         // unchanged and still carries `min-h-11`, the touch target that had to
@@ -503,7 +511,7 @@ function Pile({
         // `.px-2`, in the same `@layer utilities` and at the same specificity,
         // so a `px-2` passed here would be inert. Against a running dev server:
         // `curl -s 'http://[::1]:5173/src/index.css?direct' | grep -n '\.px-2 {\|\.px-4 {'`.
-        className={menuButtonClass({ tone, size: "sm", disabled, className: "w-full min-w-0" })}
+        className={menuButtonClass({ tone, size: "sm", disabled, className: "w-full" })}
       >
         {t(decision === "Take" ? "winston.take" : "winston.decline")}
       </button>
@@ -604,7 +612,7 @@ function Pile({
       <div
         data-winston-pile-stack
         data-winston-pile-spent={!isCursor && shownRevealed.length > 0 ? "true" : undefined}
-        className={`relative mx-auto min-w-0 ${isCursor ? "" : "opacity-60 saturate-75"}`}
+        className={`mx-auto ${isCursor ? "" : "opacity-60 saturate-75"}`}
         style={{ width: cardWidth, maxWidth: "100%" }}
       >
         <FaceDownStack count={faceDownCount} total={pile.total} />
@@ -636,8 +644,16 @@ function Pile({
           than side by side, because a pile column is one card wide and the
           header's pair carried a `min-w-[6rem]` floor each — a sizing judgement
           about a layout nothing here measures. What IS pinned is that both
-          buttons stay inside this pile's own element, which is what every
-          `data-winston-decision` query in the suite scopes to. */}
+          buttons stay inside this pile's own element. The PILE-SCOPED queries
+          are `WinstonPileTable.test.tsx`'s `decisionButton` helper and the two
+          `[data-winston-pile='1'] [data-winston-decision=…]` selectors in
+          `DraftPodPage.winston.test.tsx`; the suite's other four
+          `data-winston-decision` queries count the buttons document-wide, where
+          the count is the same wherever they sit
+          (`grep -rn data-winston-decision client/src`). MEASURED: rendering the
+          actions block as a sibling of `[data-winston-pile]` instead of a child
+          reddens 8 of that file's 41 rows — exactly the 8 that call the helper
+          — and both of `DraftPodPage.winston.test.tsx`'s scoped rows. */}
       {canDecide && (
         <div data-winston-pile-actions className="flex flex-col gap-1">
           {decisionButton("Take", "emerald")}

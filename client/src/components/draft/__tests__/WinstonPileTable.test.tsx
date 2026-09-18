@@ -43,8 +43,16 @@ vi.mock("../../../hooks/useCardImage", async (importOriginal) => ({
 // REACT tree is the load-bearing part: React synthesizes pointerenter/leave
 // from pointerout/over and resolves `relatedTarget` through the fiber tree, so
 // a related node rendered by this root arrives as an `Element` while a bare
-// `document.body` child arrives as the window object. MEASURED both ways before
-// this mock was written to render anything.
+// `document.body` child arrives as the window object.
+//
+// REPRODUCE: in "drops the lift but keeps the preview when the pointer moves
+// onto the overlay", swap the overlay this mock renders for a
+// `document.createElement("div")` appended to `document.body`, then
+// `npx vitest run --coverage.enabled=false
+// src/components/draft/__tests__/WinstonPileTable.test.tsx
+// -t "drops the lift but keeps the preview"`. The row fails on the preview
+// half, `expected null to match object { name: 'Ponder' }` — the leave rule
+// never sees the overlay, so the leave clears the preview.
 interface RecordedPreview {
   card?: { name: string } | null;
   mode?: string;
@@ -539,9 +547,12 @@ describe("WinstonPileTable", () => {
   it("takes the column count from the projection rather than assuming three", () => {
     // The discriminating arm for the row above: a hard-coded `repeat(3, ...)`
     // passes every band there and fails here. Synthetic on purpose — the only
-    // live `SharedStackPiles` row is `pile_count: 3` (`shared_stack::
-    // piles_needed`) — but the track count is read from `piles`, so a format
-    // published with a different count must not meet a layout that assumed 3.
+    // live `SharedStackPiles` row is the `pile_count: 3` in
+    // `types::DraftKind::procedure`'s `DraftKind::Winston` arm, and
+    // `git grep -n 'pile_count: 3' -- crates/draft-core/src` returns that row,
+    // two prose mentions of it, and two hits under `#[cfg(test)]` — but the
+    // track count is read from `piles`, so a format published with a different
+    // count must not meet a layout that assumed 3.
     renderTable(activeTurn([pile(0, 3, [], null, null), pile(1, 2, [], null, null)], 0));
 
     expect(document.querySelector<HTMLElement>("[data-winston-pile-list]")!.style.gridTemplateColumns)
@@ -761,8 +772,12 @@ describe("WinstonPileTable", () => {
     // The pair moved off the header line, which is a sizing judgement about a
     // one-card-wide column that nothing here measures. What this pins is the
     // part that would break the suite: they stay inside this pile's own
-    // element, which is what every `data-winston-decision` query in this file
-    // scopes to (`decisionButton` above).
+    // element. `decisionButton` above is the only PILE-SCOPED query in this
+    // file; the other four `data-winston-decision` queries here count the
+    // buttons document-wide, and that count is the same wherever they sit.
+    // MEASURED: rendering the actions block as a sibling of
+    // `[data-winston-pile]` instead of a child reddens 8 of this file's 41
+    // rows — exactly the 8 that call the helper, this one among them.
     renderTable(activeTurn([pile(0, 1, [card("c1", "Ponder")], null, null)], 0));
 
     const pileEl = document.querySelector("[data-winston-pile='0']")!;
