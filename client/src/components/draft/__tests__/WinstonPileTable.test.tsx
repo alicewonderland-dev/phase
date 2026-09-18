@@ -571,10 +571,12 @@ describe("WinstonPileTable", () => {
   });
 
   it("runs the face-down fan down the column, not across it", () => {
-    // 4 cards, 2 looked at, so 2 backs. The fan is FIRST in the column and the
-    // revealed cards take their stack offset from it, so the declarations
-    // describe one continuous run rather than two stacks in different
-    // directions. Whether it looks like one is not in reach of this lane.
+    // 4 cards, 2 looked at, so 2 backs. The fan comes BEFORE the revealed cards
+    // in the column and they take their stack offset from it, so the
+    // declarations describe one continuous run rather than two stacks in
+    // different directions. Whether it looks like one is not in reach of this
+    // lane, but both halves of that premise are asserted below: the offsets,
+    // and the document order they are only meaningful in.
     renderTable(
       activeTurn([pile(0, 4, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
     );
@@ -605,8 +607,20 @@ describe("WinstonPileTable", () => {
     // And the fan itself is the top of the column, so it takes no margin.
     expect(fan!.style.marginTop).toBe("");
     // The load-bearing half: the first REVEALED card is offset. A stack index
-    // that ignored the fan would leave it flush and paint it over the backs.
+    // that ignored the fan would leave it flush.
     expect(cards[0]!.style.marginTop).not.toBe("");
+    // The other half. Without it the row passes with the fan rendered AFTER the
+    // revealed cards: the offsets come from `drawsFaceDownStack`, which that
+    // move does not touch, so every other assertion here reads the same value
+    // either way. What it costs on screen — a run of backs below the cards
+    // instead of heading them — is a layout consequence this lane cannot
+    // measure, which is why the order is pinned directly. MEASURED: moving
+    // `<FaceDownStack>` in `Pile` to after the `shownRevealed.map` reddens this
+    // row and only this row across both Winston files (1 failed | 47 passed);
+    // with this assertion removed the same mutation reddens nothing
+    // (48 passed).
+    expect(fan!.compareDocumentPosition(cards[0]!) & Node.DOCUMENT_POSITION_FOLLOWING)
+      .toBeTruthy();
   });
 
   it("puts the first revealed card at the top of the column when nothing is face down", () => {
@@ -622,10 +636,13 @@ describe("WinstonPileTable", () => {
     expect(cards[1]!.style.marginTop).not.toBe("");
   });
 
-  /** The rect the pool's own band row stubs, verbatim: a 100x139 card whose top
-   *  edge is at `clientY` 100. The band is `100 * STACK_EXPOSED_WIDTH_RATIO`
-   *  = 16px, so 115 is inside it and 117 is not — the same two probes
-   *  `CardPoolBoard.test.tsx`'s
+  /** The rect the pool's own band row stubs, at `top: 100`: a 100x139 card
+   *  whose top edge is at `clientY` 100. Called that way the fields match the
+   *  pool's literal one for one, `bottom: top + 139` landing on its 239; the
+   *  `top` is a parameter rather than a constant only so the release row below
+   *  can place a second card one strip down at 116. The band is
+   *  `100 * STACK_EXPOSED_WIDTH_RATIO` = 16px, so 115 is inside it and 117 is
+   *  not — the same two probes `CardPoolBoard.test.tsx`'s
    *  `reveals_sixteen_percent_of_the_card_width_between_stacked_cards` uses.
    *  MEASURED under this file's own environment: happy-dom returns
    *  `{top: 0, width: 0, height: 0}` from `getBoundingClientRect` for a
@@ -644,9 +661,10 @@ describe("WinstonPileTable", () => {
     // Stacked, a covered card shows one strip of itself, so the card under the
     // pointer has to come out from under the one covering it. MEASURED: this
     // row covers the `onPointerEnter` binding (deleting it reddens the pen and
-    // band rows too) and is the ONLY row that deleting `onPointerLeave`
-    // reddens. The band row below is what pins WHERE in the card the pointer
-    // has to be.
+    // band rows too), and deleting `onPointerLeave` reddens exactly this row
+    // and "drops a focus lift when the pointer leaves the card" — this one
+    // entering the leave off a hover lift and that one off a focus lift. The
+    // band row below is what pins WHERE in the card the pointer has to be.
     renderTable(
       activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
     );
@@ -664,15 +682,24 @@ describe("WinstonPileTable", () => {
 
   it("gives a touch pointer no lift", () => {
     // The paired negative for the row above, and the only thing in this file
-    // that enters the touch gate: same fixture, same stubbed rect, same in-band
-    // `clientY` of 115 — the pointer type is the ONLY difference between the
-    // two rows, so the row above is this one's positive control. Without the
-    // stub happy-dom's 0x0 rect would reduce the band to `clientY <= 0` and a
-    // `fireEvent` default `clientY` of 0 would satisfy it, which is a pass
-    // nobody chose. Touch drives card inspection by tap and long-press
-    // instead (`useCardHover.ts::useCardHover` composes `useLongPress`), so a
-    // lift a touch player never asked for would raise a card over the one they
-    // were reading. Same device as `useCardHover.test.tsx`'s touch row.
+    // that enters the touch gate — `grep -n '"touch"'` over this file prints
+    // the two `fireEvent` lines below and, apart from this comment, nothing
+    // else. Same fixture, same stubbed rect, same in-band `clientY` of 115, so
+    // `pointerType` is the only difference the GATE can see and the row above
+    // is this one's positive control. The two rows are not otherwise
+    // identical, and every difference cuts the safe way: this one fires an
+    // extra `pointerMove`, which only gives the negative a second chance to
+    // fail, and carries a `pointerId: 1` that nothing in `RevealedCard` reads
+    // and that matches this repo's touch idiom (`grep -n pointerId
+    // client/src/hooks/__tests__/useCardHover.test.tsx` prints five lines, all
+    // of them on touch events); the row above additionally asserts the
+    // pre-state and fires a `pointerLeave`, neither of which a negative needs.
+    // Without the stub happy-dom's 0x0 rect would reduce the band to
+    // `clientY <= 0` and a `fireEvent` default `clientY` of 0 would satisfy
+    // it, which is a pass nobody chose. Touch drives card inspection by tap
+    // and long-press instead (`useCardHover.ts::useCardHover` composes
+    // `useLongPress`), so a lift a touch player never asked for would raise a
+    // card over the one they were reading.
     renderTable(
       activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
     );
@@ -760,6 +787,30 @@ describe("WinstonPileTable", () => {
     expect(revealed).not.toHaveClass("z-10");
   });
 
+  it("drops a focus lift when the pointer leaves the card", () => {
+    // The other half of the ONE-flag design, and the half that was unmeasured:
+    // `onPointerLeave` clears the lift whether a pointer or a focus put it
+    // there. The sibling row above drives the same flag through a move that
+    // lands below the strip; this one drives it through the leave, which is a
+    // different binding and is band-gated by nothing. MEASURED: giving focus
+    // its own flag and guarding the leave with it
+    // (`onPointerLeave={() => { if (!focused) setLifted(false); }}`, plus an
+    // `onFocus`/`onBlur` pair that sets it) reddens this row and no other
+    // across this file and `DraftPodPage.winston.test.tsx`. No rect is stubbed
+    // and none is wanted: neither a focus nor a leave reads one.
+    renderTable(
+      activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
+    );
+
+    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card='c1']")!;
+
+    fireEvent.focus(revealed);
+    expect(revealed).toHaveClass("z-10");
+
+    fireEvent.pointerLeave(revealed, { pointerType: "mouse" });
+    expect(revealed).not.toHaveClass("z-10");
+  });
+
   it("centres each pile's stack in its column and keeps the column's padding thin", () => {
     // Marker assertions, and named as ones: happy-dom resolves no Tailwind, so
     // these pin the DECLARATIONS and not a measured box. Both are sizing
@@ -798,11 +849,14 @@ describe("WinstonPileTable", () => {
     // The pair moved off the header line, which is a sizing judgement about a
     // one-card-wide column that nothing here measures. What this pins is the
     // part that would break the suite: they stay inside this pile's own
-    // element. `decisionButton` above is the only PILE-SCOPED query in this
-    // file; the other four `data-winston-decision` queries here count the
-    // buttons document-wide, and that count is the same wherever they sit.
+    // element. `decisionButton` above is this file's only PILE-SCOPED
+    // `data-winston-decision` query — the qualifier is load-bearing, since the
+    // file scopes plenty of OTHER selectors to a pile. The four remaining
+    // `data-winston-decision` queries here count the buttons document-wide,
+    // and that count is the same wherever they sit
+    // (`grep -rn data-winston-decision client/src`).
     // MEASURED: rendering the actions block as a sibling of
-    // `[data-winston-pile]` instead of a child reddens 8 of this file's 40
+    // `[data-winston-pile]` instead of a child reddens 8 of this file's 41
     // rows — exactly the 8 that call the helper, this one among them.
     renderTable(activeTurn([pile(0, 1, [card("c1", "Ponder")], null, null)], 0));
 
@@ -818,8 +872,14 @@ describe("WinstonPileTable", () => {
 
     // A marker assertion, and named as one: happy-dom resolves no Tailwind, so
     // this pins the declaration and not a measured width. The row layout gave
-    // each button a 6rem floor, which is wider than the tightest band's whole
-    // column; what replaces it has to be a fill rather than a floor.
+    // each button a `min-w-[6rem]` floor, sized for a pair sitting SIDE BY SIDE
+    // across a full-width row — in
+    // `git show upstream/main:client/src/components/draft/WinstonPileTable.tsx`
+    // the pile list is a column flex, so each pile spans the container, and
+    // the pair sits in an `ml-auto flex shrink-0 gap-2` span on the header
+    // line. Stacked in a one-card-wide column the pair wants a fill instead.
+    // Whether the floor would actually overflow such a column is a
+    // resolved-layout question, and no lane in this repo can ask it.
     expect(decisionButton(0, "Take")).toHaveClass("w-full");
     expect(decisionButton(0, "Take")).not.toHaveClass("min-w-[6rem]");
     // And no padding override either. `menuButtonClass`'s `sm` already carries

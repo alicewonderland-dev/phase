@@ -107,10 +107,9 @@
  * P/T and rules text are behind the card covering it until it is lifted.
  *
  * What the rows cost instead was HEIGHT: three of them, each at least a full
- * card tall, on a
- * page whose other half is the player's own pool. Which of those two costs
- * matters more is a judgement, and it was made deliberately in favour of the
- * height; no command decides it.
+ * card tall, on a page whose other half is the player's own pool. Which of
+ * those two costs matters more is a judgement, and it was made deliberately in
+ * favour of the height; no command decides it.
  *
  * The piles not being decided on are still heights, and a height still reads
  * better as a fanned stack of card backs than as a number in a box. The fan now
@@ -333,9 +332,12 @@ function RevealedCard({
       aria-label={card.name}
       onPointerEnter={updateLift}
       onPointerMove={updateLift}
-      // The leave clears the lift unconditionally, focused or not — pinned by
-      // "lifts a covered card clear of its neighbour when the pointer is on
-      // its exposed strip".
+      // The leave clears the lift unconditionally, focused or not, and each
+      // half has its own row: "lifts a covered card clear of its neighbour
+      // when the pointer is on its exposed strip" enters here off a hover
+      // lift, and "drops a focus lift when the pointer leaves the card" off a
+      // focus lift. Deleting this binding reds both; guarding it with a second
+      // focus-only flag reds only the second.
       onPointerLeave={() => setLifted(false)}
       // A focus has no cursor, so there is no `clientY` to band-test and the
       // lift is unconditional. ONE flag serves focus and hover both, so a
@@ -624,11 +626,11 @@ function Pile({
           padding thin", what it then does is not measured here.
 
           No `overflow-x-auto` here, and none should come back: a scroll
-          container would clip the card a Tab, or a hover on its exposed
-          strip, lifts. That argument
-          also rules out bounding a tall cursor pile with `max-height` +
-          `overflow-y-auto`, so the trade taken here is that a long pile is a
-          long column. Both halves are CSS reasoning, not measurement. */}
+          container would clip the card a Tab, or a hover on its exposed strip,
+          lifts. That argument also rules out bounding a tall cursor pile with
+          `max-height` + `overflow-y-auto`, so the trade taken here is that a
+          long pile is a long column. Both halves are CSS reasoning, not
+          measurement. */}
       <div
         data-winston-pile-stack
         data-winston-pile-spent={!isCursor && shownRevealed.length > 0 ? "true" : undefined}
@@ -671,7 +673,7 @@ function Pile({
           the count is the same wherever they sit
           (`grep -rn data-winston-decision client/src`). MEASURED: rendering the
           actions block as a sibling of `[data-winston-pile]` instead of a child
-          reddens 8 of that file's 40 rows — exactly the 8 that call the helper
+          reddens 8 of that file's 41 rows — exactly the 8 that call the helper
           — and both of `DraftPodPage.winston.test.tsx`'s scoped rows. */}
       {canDecide && (
         <div data-winston-pile-actions className="flex flex-col gap-1">
