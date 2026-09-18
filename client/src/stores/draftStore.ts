@@ -445,16 +445,14 @@ function installWorkspace(operation: WorkspaceInstallOperation): void {
   // stack in the board's first column whatever the sort says.
   // BEFORE the switch, and the order is load-bearing — do not move this below
   // it. For a multi-id hint-less DECK pick (`pickCardWithDraftEffect` from
-  // `PackDisplay.request`) the two orders give different STACK order: before,
-  // `applyDestination` appends the ids in request order, which is the semantic
-  // `appends_acknowledged_draft_effect_cards_in_request_order` names; after, the
-  // pass has already appended them in pool order and `applyDestination` finds
-  // them placed. Probed at `{ first.order: 1, second.order: 0 }` against
-  // `{ 0, 1 }` for a request of `["second", "first"]`, and pinned by
-  // `appends_a_hint_less_deck_draft_effect_pick_in_request_order`.
-  //
-  // The placement tests alone do NOT catch a move: they cover single ids, where
-  // both orders agree.
+  // `PackDisplay.request`) both calls write the same two ids' placements: this
+  // pass appends them in POOL order, `applyDestination` appends them in REQUEST
+  // order and re-appends an id it finds already placed (`if (!placement)
+  // continue` is its only skip). Whichever runs last decides the stack order.
+  // Pinned by `appends_a_hint_less_deck_draft_effect_pick_in_request_order`,
+  // which was the single placement failure of a full `npx vitest run` with this
+  // call moved below the switch — it failed there on `second.order`, expecting
+  // 0 and getting 1, the pool-order result.
   let workspace = placeArrivingPoolCards(
     reconcileWorkspaceState(operation.baseWorkspace, operation.authoritativeView.pool),
     arriving,

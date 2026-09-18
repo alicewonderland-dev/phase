@@ -1668,6 +1668,49 @@ describe("multiplayerDraftStore", () => {
       expect(mockHostAdapter.updateWorkspace).toHaveBeenCalledTimes(1);
     });
 
+    // The pod twin of the solo store's
+    // `appends_a_hint_less_deck_draft_effect_pick_in_request_order`, and the
+    // sibling above cannot stand in for it: that one sends `"sideboard"`, which
+    // puts both ids in `ownPlacement` and out of the arriving pass. THIS case —
+    // deck, no hint — is what `PackDisplay.request` dispatches through
+    // `DraftPodPage`, and it is the one that makes the pass's position relative
+    // to `applyDestination` observable: both write these two ids' placements,
+    // the pass in POOL order and `applyDestination` in REQUEST order, and
+    // whichever runs last decides the stack. Run the pass after
+    // `applyDestination` instead and these land `first` then `second`.
+    it("appends a hint-less deck draft-effect pick in request order", async () => {
+      await useMultiplayerDraftStore.getState().hostDraft({
+        poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
+        kind: "Premier",
+        podSize: 8,
+        hostDisplayName: "Host",
+        tournamentFormat: "Swiss",
+        podPolicy: "Competitive",
+      });
+      // Two fixture choices, each measured by breaking it: drop the effect card
+      // from the pre-pick pool and `exactAddedIds` counts three additions
+      // against two requested ids, so the pick settles `rejected`
+      // `"unacknowledged"`; give it the pair's cmc 1 instead of 5 and it shares
+      // their column, so their `order` values start at 1 rather than 0.
+      const effect = { ...card("effect"), cmc: 5 };
+      capturedHostEventHandler!({
+        type: "viewUpdated",
+        view: { ...mockView("Drafting"), pool: [effect] },
+      });
+      mockHostAdapter.submitPickWithDraftEffect.mockResolvedValueOnce({
+        ...mockView("Drafting"),
+        pool: [effect, card("first"), card("second")],
+      });
+
+      await expect(useMultiplayerDraftStore.getState().submitPickWithDraftEffect(
+        "effect", ["second", "first"], "deck",
+      )).resolves.toEqual({ status: "acknowledged" });
+
+      const placements = useMultiplayerDraftStore.getState().workspaceState!.placements;
+      expect(placements.second.order).toBe(0);
+      expect(placements.first.order).toBe(1);
+    });
+
     it("appends_an_acknowledged_host_pick_to_its_resolved_target_stack", async () => {
       await useMultiplayerDraftStore.getState().hostDraft({
         poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },

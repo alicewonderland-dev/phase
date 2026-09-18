@@ -330,7 +330,11 @@ export function saveDraftWorkspacePreferences(
  *
  * Seeded from the player's STORED preferences rather than the module defaults,
  * so an install that lands before the page has published anything still places
- * against the columns the player chose.
+ * against the columns the player chose. Pinned by
+ * `draftStore.workspace.test.ts::places_an_install_before_any_publish_against_the_stored_preferences`,
+ * which seeds `localStorage`, re-imports the store into a fresh module registry
+ * and drives a `startDraft` install with no publish in front of it; making this
+ * initializer `{ ...DECK_DEFAULTS }` reds it with `expected 6 to be 2`.
  *
  * One page is mounted at a time — `/draft/quick` and `/draft-pod` are separate
  * routes — so the solo and pod pages never contend. The publishers are

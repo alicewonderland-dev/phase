@@ -25,6 +25,7 @@ import {
   createDefaultDraftWorkspacePreferences,
   setArrivingCardBoardPreferences,
 } from "../../components/draft/workspace/workspacePreferences";
+import { DRAFT_WORKSPACE_PREFERENCES_KEY } from "../../constants/storage";
 import {
   projectWorkspaceLandCounts,
   projectWorkspaceMainDeck,
@@ -257,6 +258,37 @@ describe("draft store workspace authority", () => {
     await useDraftStore.getState().pickCard("picked", "deck");
 
     expect(useDraftStore.getState().workspaceState!.placements.picked.column).toBe(2);
+  });
+
+  it("places_an_install_before_any_publish_against_the_stored_preferences", async () => {
+    // The OTHER end of that seam: `arrivingCardBoardPreferences` is seeded at
+    // module init from `loadDraftWorkspacePreferences()`, and this install
+    // reaches it with no `setArrivingCardBoardPreferences` call on the module
+    // instance it reads — the `beforeEach` one lands on this file's static
+    // instance, not the one imported below. Three stored columns against the
+    // seven-column module default: `manaValueColumn` clamps a six-drop to 2
+    // here and to 6 under the defaults, so only the stored value produces this,
+    // and replacing that initializer with `{ ...DECK_DEFAULTS }` reds this test
+    // with `expected 6 to be 2`.
+    localStorage.setItem(DRAFT_WORKSPACE_PREFERENCES_KEY, JSON.stringify({
+      ...createDefaultDraftWorkspacePreferences(),
+      deck: { sort: "cmc", columnCount: 3, rows: "one", showHeaders: true },
+    }));
+    // A fresh module registry: the initializer runs once per module instance,
+    // and the instance this file imported statically is not it — drop
+    // `vi.resetModules()` and this install places against the seven-column
+    // default instead, `expected 6 to be 2`. `vi.mock` registrations survive
+    // `resetModules`: the pool asserted on below is the one
+    // `wasm.start_quick_draft` returns, so the re-imported store is still
+    // running against the mocked engine.
+    vi.resetModules();
+    const { useDraftStore: freshStore } = await import("../draftStore");
+    wasm.start_quick_draft.mockReturnValue(view([cardWithCmc("costly", 6)]));
+
+    await freshStore.getState().startDraft("pool", "TST", "Test", 2);
+
+    expect(freshStore.getState().workspaceState!.placements.costly.column).toBe(2);
+    localStorage.removeItem(DRAFT_WORKSPACE_PREFERENCES_KEY);
   });
 
   it("leaves_a_hint_less_sideboard_pick_in_the_first_column", async () => {
@@ -504,12 +536,14 @@ describe("draft store workspace authority", () => {
   });
 
   it("appends_a_hint_less_deck_draft_effect_pick_in_request_order", async () => {
-    // The sibling above uses `"sideboard"` with a hint, so both ids are excluded
-    // from the arriving pass and it cannot see this. THIS case — deck, no hint —
-    // is what `PackDisplay.request` dispatches, and it is the one that makes the
-    // arriving pass's position relative to the switch load-bearing: run the pass
-    // after `applyDestination` instead and these two land in POOL order
-    // (`first` then `second`) rather than the requested order.
+    // `appends_acknowledged_draft_effect_cards_in_request_order`, below, sends
+    // `"sideboard"` with a `{ column: 4 }` hint, so `operationResolvesOwnPlacement`
+    // excludes both ids from the arriving pass and that test stays green whichever
+    // side of the switch the pass runs on. THIS case — deck, no hint — is what
+    // `PackDisplay.request` dispatches, and it is the one that makes the pass's
+    // position relative to the switch observable: run the pass after
+    // `applyDestination` instead and these two land in POOL order (`first` then
+    // `second`) rather than the requested order.
     await start([card("effect")]);
     wasm.submit_pick_with_draft_effect.mockReturnValue(view([
       { ...cardWithCmc("effect", 3) },

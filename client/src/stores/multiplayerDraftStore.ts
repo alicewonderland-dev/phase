@@ -848,6 +848,18 @@ async function performPick(request: MultiplayerPickRequest): Promise<DraftPickOu
       : request.placementHint !== undefined || request.destination !== "deck"
         ? request.instanceIds
         : [];
+    // BEFORE the `applyDestination` below, and the order is load-bearing — do
+    // not move this under it. For a multi-id hint-less DECK pick — what
+    // `PackDisplay`'s `request` sends as `pickCardWithDraftEffect(effect, ids,
+    // destination)` with no hint, which `DraftPodPage`'s controller forwards to
+    // `submitPickWithDraftEffect` — both calls write the same two ids'
+    // placements: this pass appends them in POOL order, `applyDestination`
+    // appends them in REQUEST order and re-appends an id it finds already
+    // placed (`if (!placement) continue` is its only skip). Whichever runs last
+    // decides the stack order. Pinned by `appends a hint-less deck draft-effect
+    // pick in request order`, which was the single failure of a full
+    // `npx vitest run` with this call moved below the `applyDestination`
+    // assignment.
     let workspace = placeArrivingPoolCards(
       reconcileWorkspaceState(state.workspaceState, acknowledgedView.pool),
       // Against the PRE-reconcile workspace, so the cards this pick just added
