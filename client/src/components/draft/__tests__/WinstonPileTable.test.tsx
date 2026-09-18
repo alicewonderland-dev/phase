@@ -426,7 +426,7 @@ describe("WinstonPileTable", () => {
 
   it("still draws a slot for a pile with no cards at all", () => {
     // The other `count === 0`, and the reason the branch is not simply deleted:
-    // an empty pile is a real pile and its row should read as one.
+    // an empty pile is a real pile and its column should read as one.
     renderTable(activeTurn([pile(0, 0, [], null, "PileEmpty")], 0));
 
     expect(document.querySelector("[data-winston-pile-facedown]"))
@@ -454,13 +454,18 @@ describe("WinstonPileTable", () => {
     expect(list!.contains(notice!)).toBe(true);
     // And the controls are still rendered on the same surface.
     expect(list!.contains(decisionButton(0, "Take"))).toBe(true);
+    // The list is a grid of one track per pile, so a notice with no span would
+    // be squeezed into the first pile's column. A marker assertion: happy-dom
+    // does no layout, so this pins the declaration and not the width.
+    expect((notice as HTMLElement).style.gridColumn).toBe("1 / -1");
   });
 
-  it("scrolls its own rows wherever the page will not scroll for it", () => {
+  it("scrolls its own columns wherever the page will not scroll for it", () => {
     // Every viewport under 1200px wide is a non-desktop band, and the page puts
-    // the surface in a fixed-height `overflow-hidden` box there. Three
-    // full-card rows do not fit, and a row that overflows takes the cursor
-    // pile's Take/Decline buttons off-screen with no way to reach them.
+    // the surface in a fixed-height `overflow-hidden` box there. A pile column
+    // has no bounded height — a full card plus a strip per further card, and a
+    // decline adds a card — and one that overflows takes the cursor pile's
+    // Take/Decline buttons off-screen with no way to reach them.
     renderTable(activeTurn([pile(0, 1, [card("c1", "Ponder")], null, null)], 0), {
       responsiveLayout: "tablet-landscape",
     });
@@ -472,7 +477,7 @@ describe("WinstonPileTable", () => {
     cleanup();
 
     // Desktop is the paired negative: the page scrolls, so a second scroller
-    // here would trap the rows in a short box for no reason.
+    // here would trap the columns in a short box for no reason.
     renderTable(activeTurn([pile(0, 1, [card("c1", "Ponder")], null, null)], 0), {
       responsiveLayout: "desktop",
     });
@@ -480,6 +485,223 @@ describe("WinstonPileTable", () => {
     expect(document.querySelector("[data-winston-pile-table]"))
       .toHaveAttribute("data-winston-scrolls-piles", "false");
     expect(document.querySelector("[data-winston-pile-list]")).not.toHaveClass("overflow-y-auto");
+  });
+
+  // ── Column layout ─────────────────────────────────────────────────────
+  //
+  // `vitest.config.ts` sets `environment: "happy-dom"`, and happy-dom performs
+  // no layout: `getBoundingClientRect()` on a sized element returns 0x0, which
+  // a `node -e` probe against the installed copy prints directly. So every
+  // assertion below pins a DECLARATION, a class or an inline style string, and
+  // none of them establishes that the columns appear side by side or that the
+  // overlap looks right on a screen. Only a human looking at the running app
+  // establishes that.
+
+  const BANDS: ResponsiveDraftLayout[] = [
+    "phone-portrait",
+    "phone-landscape",
+    "tablet-portrait",
+    "tablet-landscape",
+    "desktop",
+  ];
+
+  it.each(BANDS)("gives each published pile its own grid column in %s", (band) => {
+    renderTable(
+      activeTurn(
+        [
+          pile(0, 3, [], null, null),
+          pile(1, 1, [card("c1", "Ponder")], null, null),
+          pile(2, 4, [], null, null),
+        ],
+        1,
+      ),
+      { responsiveLayout: band },
+    );
+
+    const list = document.querySelector<HTMLElement>("[data-winston-pile-list]");
+    expect(list).not.toBeNull();
+    expect(list!).toHaveClass("grid");
+    // The band selects the scroller and nothing else: the track list is the
+    // same in all five.
+    expect(list!.style.gridTemplateColumns).toBe("repeat(3, minmax(0, 1fr))");
+  });
+
+  it("takes the column count from the projection rather than assuming three", () => {
+    // The discriminating arm for the row above: a hard-coded `repeat(3, ...)`
+    // passes every band there and fails here. Synthetic on purpose — the only
+    // live `SharedStackPiles` row is `pile_count: 3` (`shared_stack::
+    // piles_needed`) — but the track count is read from `piles`, so a format
+    // published with a different count must not meet a layout that assumed 3.
+    renderTable(activeTurn([pile(0, 3, [], null, null), pile(1, 2, [], null, null)], 0));
+
+    expect(document.querySelector<HTMLElement>("[data-winston-pile-list]")!.style.gridTemplateColumns)
+      .toBe("repeat(2, minmax(0, 1fr))");
+  });
+
+  it("stacks a pile's cards at the pool's exposure ratio, in percent of the stack width", () => {
+    // `revealed.length === total`, so nothing is face down and the first card is
+    // the top of the column.
+    renderTable(
+      activeTurn(
+        [pile(0, 3, [card("c1", "Ponder"), card("c2", "Opt"), card("c3", "Brainstorm")], null, null)],
+        0,
+      ),
+    );
+
+    const stack = document.querySelector<HTMLElement>("[data-winston-pile-stack]");
+    expect(stack).not.toBeNull();
+    const cards = Array.from(document.querySelectorAll<HTMLElement>("[data-winston-revealed-card]"));
+    expect(cards).toHaveLength(3);
+
+    // The stack is declared a card wide. `not.toBe("")` first, because two
+    // missing widths compare equal to each other and the pair would then pass
+    // on a component that declared neither.
+    expect(stack!.style.width).not.toBe("");
+    expect(stack!.style.width).toBe(cards[0]!.style.width);
+    // ...and that width is a maximum at both levels, so a narrow column caps it.
+    expect(stack!.style.maxWidth).toBe("100%");
+    expect(cards[0]!).toHaveClass("max-w-full");
+    // Positioned, and carrying no explicit layer. This is the precondition the
+    // component's comment about paint order rests on; the paint order itself is
+    // CSS behaviour and is not asserted anywhere, here or elsewhere.
+    expect(cards[0]!).toHaveClass("relative");
+    expect(cards[0]!.style.zIndex).toBe("");
+
+    // The top card sits flush; every later one is pulled up by the same amount.
+    expect(cards[0]!.style.marginTop).toBe("");
+    expect(cards[1]!.style.marginTop).toBe(cards[2]!.style.marginTop);
+    expect(cards[1]!.style.marginTop).toMatch(/^-[\d.]+%$/);
+
+    // THE RATIO THE LAYOUT WAS CHOSEN FOR. Granting the CSS rule that a
+    // percentage top margin resolves against the containing block's inline size
+    // — which nothing here measures — the overlap, the card height and the
+    // strip left showing are all in units of card WIDTH, so height minus
+    // overlap is the exposed strip. The 0.16 is restated here rather than
+    // imported from the component, because it is the ratio this surface was
+    // asked for and not a number the code may choose.
+    const cardHeightsInWidths = 680 / 488;
+    const overlapInWidths = -Number.parseFloat(cards[1]!.style.marginTop) / 100;
+    expect(cardHeightsInWidths - overlapInWidths).toBeCloseTo(0.16, 10);
+  });
+
+  it("runs the face-down fan down the column, not across it", () => {
+    // 4 cards, 2 looked at, so 2 backs. The fan is FIRST in the column and the
+    // revealed cards take their stack offset from it, so the declarations
+    // describe one continuous run rather than two stacks in different
+    // directions. Whether it looks like one is not in reach of this lane.
+    renderTable(
+      activeTurn([pile(0, 4, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
+    );
+
+    const fan = document.querySelector<HTMLElement>("[data-winston-pile-facedown]");
+    expect(fan).not.toBeNull();
+    const backs = Array.from(fan!.querySelectorAll<HTMLElement>(":scope > *"));
+    // The positive control for every negative assertion below: the backs exist
+    // and are the elements being read.
+    expect(backs).toHaveLength(2);
+
+    // Vertical: a top margin, and none of the horizontal fan's declarations.
+    expect(backs[0]!.style.marginTop).toBe("");
+    expect(backs[1]!.style.left).toBe("");
+    expect(backs[1]!.style.zIndex).toBe("");
+    // The two negatives above are satisfied by an absolutely placed back that
+    // simply dropped `left` and `zIndex`, so these two are what keeps them from
+    // passing vacuously — the fan has to be in flow and positioned, not merely
+    // missing the horizontal declarations.
+    expect(backs[1]!).toHaveClass("relative");
+    expect(backs[1]!).not.toHaveClass("absolute");
+
+    const cards = Array.from(document.querySelectorAll<HTMLElement>("[data-winston-revealed-card]"));
+    expect(cards).toHaveLength(2);
+    // One strip per back and one per card, at the same step throughout.
+    expect(backs[1]!.style.marginTop).toBe(cards[0]!.style.marginTop);
+    expect(cards[0]!.style.marginTop).toBe(cards[1]!.style.marginTop);
+    // And the fan itself is the top of the column, so it takes no margin.
+    expect(fan!.style.marginTop).toBe("");
+    // The load-bearing half: the first REVEALED card is offset. A stack index
+    // that ignored the fan would leave it flush and paint it over the backs.
+    expect(cards[0]!.style.marginTop).not.toBe("");
+  });
+
+  it("puts the first revealed card at the top of the column when nothing is face down", () => {
+    // The paired negative for the row above, on the same code path: no fan, so
+    // the first revealed card takes no margin. Together the two pin that the
+    // offset tracks `drawsFaceDownStack` rather than being constant either way.
+    renderTable(activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0));
+
+    expect(document.querySelector("[data-winston-pile-facedown]")).toBeNull();
+    const cards = Array.from(document.querySelectorAll<HTMLElement>("[data-winston-revealed-card]"));
+    expect(cards).toHaveLength(2);
+    expect(cards[0]!.style.marginTop).toBe("");
+    expect(cards[1]!.style.marginTop).not.toBe("");
+  });
+
+  it("lifts a covered card clear of its neighbour on hover, and previews it too", () => {
+    // Stacked, a covered card shows one strip of itself, so the preview alone
+    // is not enough — the card under the pointer has to come out from under the
+    // one covering it. Both halves are asserted on the same gesture because the
+    // handler composes over `mouseHoverPreview`: writing the lift so that it
+    // replaces the spread rather than delegating to it kills the preview, and
+    // writing it before the spread kills the lift.
+    renderTable(
+      activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
+    );
+
+    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card]")!;
+    expect(revealed).not.toHaveClass("z-10");
+
+    fireEvent.pointerEnter(revealed, { pointerType: "mouse" });
+    expect(revealed).toHaveClass("z-10");
+    expect(previewProps[previewProps.length - 1]?.card).toMatchObject({ name: "Ponder" });
+
+    fireEvent.pointerLeave(revealed, { pointerType: "mouse" });
+    expect(revealed).not.toHaveClass("z-10");
+    expect(previewProps[previewProps.length - 1]?.card).toBeNull();
+  });
+
+  it("lifts a covered card for a keyboard player too", () => {
+    // `RevealedCard` is already focusable (`tabIndex={0}`, pinned by "reaches
+    // the card a keyboard player is deciding on"), and focusing it already
+    // published the preview. What it did not do was raise the card itself out
+    // from under its neighbour, which stacking is what made necessary.
+    renderTable(
+      activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
+    );
+
+    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card]")!;
+    fireEvent.focus(revealed);
+    expect(revealed).toHaveClass("z-10");
+    expect(previewProps[previewProps.length - 1]?.card).toMatchObject({ name: "Ponder" });
+
+    fireEvent.blur(revealed);
+    expect(revealed).not.toHaveClass("z-10");
+    expect(previewProps[previewProps.length - 1]?.card).toBeNull();
+  });
+
+  it("puts the decision controls under the pile they decide, not in its header", () => {
+    // The pair moved off the header line, which is a sizing judgement about a
+    // one-card-wide column that nothing here measures. What this pins is the
+    // part that would break the suite: they stay inside this pile's own
+    // element, which is what every `data-winston-decision` query in this file
+    // scopes to (`decisionButton` above).
+    renderTable(activeTurn([pile(0, 1, [card("c1", "Ponder")], null, null)], 0));
+
+    const pileEl = document.querySelector("[data-winston-pile='0']")!;
+    const actions = pileEl.querySelector("[data-winston-pile-actions]");
+    expect(actions).not.toBeNull();
+    expect(actions!.contains(decisionButton(0, "Take"))).toBe(true);
+    expect(actions!.contains(decisionButton(0, "Decline"))).toBe(true);
+
+    const stack = pileEl.querySelector("[data-winston-pile-stack]")!;
+    expect(stack.compareDocumentPosition(actions!) & Node.DOCUMENT_POSITION_FOLLOWING)
+      .toBeTruthy();
+
+    // A marker assertion, and named as one: happy-dom resolves no Tailwind, so
+    // this pins the declaration and not a measured width. The row layout gave
+    // each button a 6rem floor, which is wider than the tightest band's whole
+    // column; what replaces it has to be a fill rather than a floor.
+    expect(decisionButton(0, "Take")).toHaveClass("w-full");
+    expect(decisionButton(0, "Take")).not.toHaveClass("min-w-[6rem]");
   });
 
   it("scales the cards by the stored pile scale rather than a fixed width", () => {
@@ -569,9 +791,10 @@ describe("WinstonPileTable", () => {
 
   it("asks for a readable preview even when draft previews are switched off", () => {
     // `draftCardPreviewMode` ships as "none", which is a fair default for a
-    // pack: those cards render large enough to read where they sit. A pile's
-    // are 88px thumbnails and the turn is a decision about what they ARE, so
-    // "none" here is not a preference — it is an unreadable screen.
+    // pack: those cards render large enough to read where they sit. A pile
+    // column stacks its cards, so every one but the last shows a strip of
+    // itself, and the turn is a decision about what they ARE — "none" here is
+    // not a preference, it is an unreadable screen.
     renderTable(activeTurn([pile(0, 3, [card("c1", "Ponder")], null, null)], 0));
 
     expect(previewProps[previewProps.length - 1]?.mode).toBe("side");
