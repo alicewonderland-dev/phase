@@ -332,8 +332,14 @@ export function saveDraftWorkspacePreferences(
  * so an install that lands before the page has published anything still places
  * against the columns the player chose.
  *
- * One page is mounted at a time, so the solo and pod pages never contend: each
- * publishes on mount and on every change to its own deck board.
+ * One page is mounted at a time — `/draft/quick` and `/draft-pod` are separate
+ * routes — so the solo and pod pages never contend. The publishers are
+ * `DraftPage`'s `handleWorkspacePreferencesChange` and the DRAFTING screen's
+ * `handlePreferencesChange` in `DraftPodPage`, each with a mount effect
+ * alongside it. `DraftPodPage` has two further same-named handlers, on the
+ * intergame screen and in `PodDeckBuilder`, which save without publishing:
+ * neither screen receives pool arrivals, and the drafting screen's mount effect
+ * re-reads `localStorage` on the way back in.
  */
 let arrivingCardBoardPreferences: DraftBoardPreferences =
   loadDraftWorkspacePreferences().deck;

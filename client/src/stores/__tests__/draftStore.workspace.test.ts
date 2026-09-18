@@ -512,6 +512,28 @@ describe("draft store workspace authority", () => {
     expect(useDraftStore.getState().workspaceState).toBe(original);
   });
 
+  it("leaves_a_row_less_auto_pick_hint_on_a_two_row_board_in_the_reconcile_default_row", async () => {
+    // The `acknowledged-auto-pick` arm of the same exclusion. `validPlacementHint`
+    // admits a hint with no `row`, and `DraftPage.handleAutoPick` builds its hints
+    // from `resolveWorkspacePickPlacement`, which omits `row` on a one-row board —
+    // a persisted or restored intent can therefore carry that shape into a
+    // two-row board. Without the arm the arriving pass decides the row instead.
+    setArrivingCardBoardPreferences({
+      sort: "cmc", columnCount: 7, rows: "two", showHeaders: true,
+    });
+    await start();
+    wasm.auto_pick.mockReturnValue(view([
+      { ...cardWithCmc("added", 6), type_line: "Creature — Bear" },
+    ]));
+
+    await expect(useDraftStore.getState().autoPickCard("deck", { added: { column: 2 } }))
+      .resolves.toEqual({ status: "acknowledged" });
+
+    const placement = useDraftStore.getState().workspaceState!.placements.added;
+    expect(placement.column).toBe(2);
+    expect(placement.row).toBe(0);
+  });
+
   it("appends_the_acknowledged_auto_pick_to_its_resolved_target_stack", async () => {
     await start([card("existing"), card("target")]);
     useDraftStore.getState().setWorkspacePlacement("existing", {

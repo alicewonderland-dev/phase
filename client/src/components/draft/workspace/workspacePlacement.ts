@@ -1114,12 +1114,14 @@ export function unplacedPoolIds(
 /**
  * Place cards that ARRIVED in the pool into the columns the board's sort means.
  *
- * The pick path resolves a placement before it dispatches, because it knows
- * which card it is picking. Two paths do not: a shared-stack `Take` collects a
- * whole pile the engine chose the contents of, and any view that arrives on its
- * own — the host deciding for a timed-out seat, a reconnect, a guest's
- * broadcast — carries cards the client never requested. `reconcileWorkspaceState`
- * gives those the default placement, which is column 0, so a sorted board
+ * A pick that resolves a placement before it dispatches does not need this,
+ * because it knows which card it is picking. Three paths do not resolve one:
+ * a shared-stack `Take` collects a whole pile the engine chose the contents of;
+ * any view that arrives on its own — the host deciding for a timed-out seat, a
+ * reconnect, a guest's broadcast — carries cards the client never requested;
+ * and `PackDisplay.request` dispatches `pickCard`, `pickCardStep` and
+ * `pickCardWithDraftEffect` with no hint at all. `reconcileWorkspaceState` gives
+ * all of those the default placement, which is column 0, so a sorted board
  * quietly stacks every new card in its first column no matter what the sort says.
  *
  * Threaded one card at a time rather than resolved in a batch: the column a card

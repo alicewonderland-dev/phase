@@ -848,8 +848,10 @@ async function performPick(request: MultiplayerPickRequest): Promise<DraftPickOu
     // row band omits `row` (`useDraftWorkspaceDrag` sends none when
     // `target.row === null`), so on a two-row board the pass would decide that
     // card's row through the engine classification instead of leaving the
-    // reconcile default the hint path has always fallen back to. The column is
-    // unaffected either way — the hint always wins there.
+    // reconcile default the hint path has always fallen back to. That card's own
+    // column is unaffected — the hint always wins there — but the pass threads
+    // placements one at a time, so leaving hinted cards out also keeps them from
+    // moving the hint-less ones under a grouping sort.
     //
     // `auto-pick` types its `destination` as the literal `"deck"`, and carries
     // per-id hints rather than one.

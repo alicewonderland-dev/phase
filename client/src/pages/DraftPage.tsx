@@ -499,8 +499,10 @@ export function DraftPage() {
     // `draftStore.performPick` sets before its first await — but a `kind:
     // "state"` install takes no such lock, so `resumeDraft` finishing in that
     // window would lay out the whole restored pool against stale columns.
-    // `DraftPodPage.handlePreferencesChange` publishes synchronously for the
-    // same reason, against its own unguarded `viewUpdated` broadcasts.
+    // The drafting screen's `handlePreferencesChange` in `DraftPodPage` — one of
+    // three same-named handlers there, and the only one that publishes —
+    // publishes synchronously for the same reason, against its own unguarded
+    // `viewUpdated` broadcasts.
     //
     // This is the only path that changes `deck`; `setPackScale` below spreads
     // `workspacePreferences` and touches one numeric field.

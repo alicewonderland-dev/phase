@@ -1845,6 +1845,39 @@ describe("multiplayerDraftStore", () => {
       expect(placement.column).toBe(0);
     });
 
+    // The pod sibling of the solo store's
+    // `leaves_a_row_less_hint_on_a_two_row_board_in_the_reconcile_default_row`.
+    // `DraftPodPage`'s drop handler passes `request.placementHint` straight to
+    // `submitPick`, so the pod path sends the same column-only hint shape a drag
+    // produces when it misses the row bands. Without the `placementHint` arm of
+    // the exclusion the arriving pass resolves that card's row from the engine
+    // classification and the drop lands somewhere the player did not choose.
+    it("leaves a row-less hint on a two-row board in the reconcile default row", async () => {
+      setArrivingCardBoardPreferences({
+        sort: "cmc", columnCount: 7, rows: "two", showHeaders: true,
+      });
+      await useMultiplayerDraftStore.getState().hostDraft({
+        poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
+        kind: "Premier",
+        podSize: 8,
+        hostDisplayName: "Host",
+        tournamentFormat: "Swiss",
+        podPolicy: "Competitive",
+      });
+      capturedHostEventHandler!({ type: "viewUpdated", view: mockView("Drafting") });
+      mockHostAdapter.submitPick.mockResolvedValueOnce({
+        ...mockView("Drafting"),
+        pool: [{ ...card("costly"), cmc: 5, type_line: "Creature — Bear" }],
+      });
+
+      await expect(useMultiplayerDraftStore.getState().submitPick("costly", "deck", { column: 2 }))
+        .resolves.toEqual({ status: "acknowledged" });
+
+      const placement = useMultiplayerDraftStore.getState().workspaceState!.placements.costly;
+      expect(placement.column).toBe(2);
+      expect(placement.row).toBe(0);
+    });
+
     it("ignores selection replacement while pick interaction is locked", () => {
       useMultiplayerDraftStore.setState({ selectedCard: "prior", pickInteractionLocked: true });
 
