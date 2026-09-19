@@ -3,8 +3,21 @@ import type { FormatMetadata, GameFormat } from "../adapter/types";
 // The Rust engine at crates/engine/src/types/format.rs is the canonical source
 // of truth for this list; the `getFormatRegistry` WASM export emits the same
 // shape. This file mirrors that registry so React components can render
-// synchronously before the WASM module loads. A verification test compares
-// this constant to the WASM output to catch drift between the two.
+// synchronously before the WASM module loads.
+//
+// TWO tests guard this mirror and only ONE of them runs.
+// `format::tests::client_format_registry_matches_the_engine_registry`, in
+// crates/engine/src/types/format.rs, reads THIS FILE with `include_str!` and
+// compares its `format:` sequence to `GameFormat::registry()`. It runs in CI
+// job `rust-test` step "Run tests" and in Tilt's `test-engine`, so a format
+// added, removed, reordered or duplicated here reds a named assertion.
+// client/src/data/__tests__/formatRegistry.integration.test.ts compares the
+// full `FormatMetadata` shape against the live WASM export, and is the only
+// check on the mirrored VALUES — labels, deck sizes, sideboard policy — but it
+// RUNS IN NO LANE: client/vitest.config.ts excludes
+// src/**/*.integration.test.{ts,tsx} from the default run, and nothing invokes
+// `test:integration`, which is its only runner. Until that changes, treat every
+// field except `format` as unguarded.
 export const FORMAT_REGISTRY: readonly FormatMetadata[] = [
   {
     format: "Standard",

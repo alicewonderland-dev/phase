@@ -111,6 +111,12 @@ export interface RoomMarkerPoint {
  * payload and appears in `getFormatRegistry`. Split out from `GameFormat` so
  * registry-shaped lookups (`FORMAT_DEFAULTS`, per-format metadata) can say they
  * only cover built-ins.
+ *
+ * `format::tests::client_builtin_game_format_union_matches_the_engine`, in
+ * crates/engine/src/types/format.rs, reads this file with `include_str!` and
+ * asserts this union names exactly `GameFormat::iter()`, so a member added,
+ * removed or renamed on either side reds in CI job `rust-test` step "Run tests"
+ * and in Tilt's `test-engine`.
  */
 export type BuiltInGameFormat =
   | "Standard"

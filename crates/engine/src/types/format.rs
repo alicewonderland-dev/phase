@@ -39,7 +39,54 @@ pub struct FormatMetadata {
 }
 
 /// Supported game formats.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `GameFormat::iter()` yields exactly the **built-in** formats, in declaration
+/// order: `Custom(CustomFormatId)` is `#[strum(disabled)]` because it is not a
+/// member of a fixed set and cannot be enumerated.
+///
+/// What this iterator is the authority for, at the width it actually holds.
+/// FIVE named tests check something against it, and that is the whole list:
+/// `tests::registry_lists_every_builtin_format` and
+/// `tests::client_builtin_game_format_union_matches_the_engine` below, and in
+/// `tests/integration/custom_format_schema.rs`
+/// `game_format_from_str_display_roundtrip_builtins` (which iterates it
+/// directly) plus the ordered-coverage asserts in
+/// `commander_eligibility_rule_from_source_format_covers_every_builtin` and
+/// `game_format_serialization_is_byte_identical_to_old_derive_for_builtins`.
+/// Adding or renaming a format reds one of those five by name.
+///
+/// THREE KINDS of neighbouring guard do NOT work that way, and the difference
+/// matters if this comment is read as a promise. The exhaustive `match`
+/// statements over the format set — in this file, in `types/custom_format.rs`,
+/// in `game/deck_validation.rs` and in `crates/engine-wasm/src/lib.rs` — are
+/// held by the COMPILER: a new variant reds them with `E0004`, not against this
+/// iterator and not with an assertion name. And
+/// the client's `FORMAT_SHAPES` table in
+/// `client/src/services/__tests__/deckUrlImport.test.ts` is keyed by
+/// `BuiltInGameFormat`, so the TypeScript compiler is what forces its key set;
+/// it reaches this iterator only transitively, through
+/// `tests::client_builtin_game_format_union_matches_the_engine`. And
+/// `tests::client_format_registry_matches_the_engine_registry` compares the
+/// client mirror against `registry()`, not against this iterator; it reaches
+/// this iterator only transitively, through
+/// `tests::registry_lists_every_builtin_format`.
+///
+/// Exhaustiveness comes from `EnumIter`, not from the length of a hand-written
+/// array, which is why no `BUILTINS` constant exists here to drift from the
+/// declaration below. The in-crate precedents for an `EnumIter` derive are
+/// `parser/oracle_ir/feature.rs` and `parser/oracle_ir/diagnostic.rs`;
+/// `types/keywords.rs` and `types/statics.rs` carry the same IDIOM — a derived
+/// figure rather than a hand-maintained one — but through `strum::EnumCount`,
+/// not `EnumIter`.
+///
+/// Two things are worth knowing before editing this derive. A second
+/// payload-carrying variant left without `#[strum(disabled)]` is a COMPILE
+/// ERROR, because `strum` needs `Default` for the payload and `CustomFormatId`
+/// does not implement it. But `#[strum(disabled)]` on a UNIT variant removes it
+/// from `iter()` SILENTLY; the independent authority that catches that is
+/// `tests::registry_lists_every_builtin_format`, which compares `iter()` to the
+/// hand-written `registry()` below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
 pub enum GameFormat {
     Standard,
     Limited,
@@ -82,6 +129,7 @@ pub enum GameFormat {
     /// `GameFormat::Custom(id)` alone cannot fully answer several of this
     /// enum's methods; see each method's doc comment for how it handles
     /// `Custom`.
+    #[strum(disabled)]
     Custom(CustomFormatId),
 }
 
@@ -3949,6 +3997,195 @@ mod tests {
                 format.default_deck_copy_limit()
             );
         }
+    }
+
+    /// `GameFormat::registry()` must carry an entry for every built-in format,
+    /// exactly once.
+    ///
+    /// Measured before this test existed: the registry DID list all 23, and
+    /// NOTHING asserted that. What the existing `registry()` consumers do
+    /// instead — measured, not assumed, with
+    /// `rg -n 'GameFormat::registry\(\)' crates/engine/src/types/format.rs`,
+    /// which prints ELEVEN hits, ten of them consumers (the first is this
+    /// file's `FormatMetadata` doc comment): they sit in NINE test fns, of
+    /// which FIVE never pin a format — they iterate it, and one also bounds a
+    /// count by `registry().len()`, which fails open the same way — so a
+    /// variant missing from it is silently skipped by those;
+    /// and FOUR pin one specific format with `.find(..)` / `.position(..)`
+    /// followed by `.expect(..)`, so a missing entry panics there —
+    /// `limited_in_registry`, `format_registry_includes_two_headed_giant`,
+    /// `archenemy_registry_entry_uses_default_topology` and
+    /// `premodern_registry_entry_is_ordered_with_constructed_formats`, pinning
+    /// Limited, TwoHeadedGiant, Archenemy, Modern, Premodern and Legacy.
+    /// So SIX of the 23 were guarded against ABSENCE and seventeen were not;
+    /// none of the 23 was guarded against a DUPLICATE or against an entry the
+    /// enum does not carry, and nothing asserted totality in either direction.
+    /// Those three gaps are what this test closes.
+    ///
+    /// Compared as SORTED sets, deliberately. Measured: `registry()`'s order is
+    /// the frontend picker's grouping (`Standard, Pioneer, Modern, …`) and is
+    /// NOT declaration order (`Standard, Limited, Commander, Pioneer, …`);
+    /// `premodern_registry_entry_is_ordered_with_constructed_formats` is what
+    /// pins the grouping, and this test must not duplicate or contradict it.
+    /// Sorted-vector equality still catches a DUPLICATE, because a duplicate
+    /// changes the length.
+    ///
+    /// This is also the independent authority on `#[strum(disabled)]`: a
+    /// built-in disabled out of `iter()` while `registry()` still lists it reds
+    /// here.
+    ///
+    /// A future built-in that should NOT be user-selectable will red this test.
+    /// That is intended: the exclusion is a decision to make explicitly, not one
+    /// to reach by omission.
+    #[test]
+    fn registry_lists_every_builtin_format() {
+        use strum::IntoEnumIterator;
+
+        let mut listed: Vec<String> = GameFormat::registry()
+            .iter()
+            .map(|meta| meta.format.to_string())
+            .collect();
+        let mut expected: Vec<String> = GameFormat::iter().map(|f| f.to_string()).collect();
+        listed.sort();
+        expected.sort();
+        assert_eq!(
+            listed, expected,
+            "GameFormat::registry() must list every built-in format exactly once"
+        );
+    }
+
+    /// Built-in format names carried on the CODE half of each line in `region`
+    /// that begins with `prefix`, taking the first double-quoted token.
+    ///
+    /// `source_census::code` is this repository's single authority on which
+    /// part of a line is code; TypeScript's `//` is lexically the same as
+    /// Rust's for that purpose, so the policy is REUSED rather than
+    /// re-invented. Measured reason it matters: `HomeDashboard.tsx` names a
+    /// format inside a comment, and a census that counts comment text reports a
+    /// 9-entry table as 10.
+    ///
+    /// `region` is a parameter because `types.ts` carries 239 lines matching
+    /// `| "…"` across all its unions and only 23 of them belong to
+    /// `BuiltInGameFormat`; `formatRegistry.ts` needs no region because all 46
+    /// of its `format: "…"` lines are entry fields.
+    fn client_format_names(region: &str, prefix: &str) -> Vec<String> {
+        region
+            .lines()
+            .map(crate::source_census::code)
+            .filter_map(|line| line.trim().strip_prefix(prefix))
+            .filter_map(|rest| rest.split('"').nth(1).map(str::to_owned))
+            .collect()
+    }
+
+    /// `client/src/adapter/types.ts`'s `BuiltInGameFormat` union must name
+    /// exactly the engine's built-in formats.
+    ///
+    /// This runs in the lane this branch already runs — CI job `rust-test`
+    /// step "Run tests", Tilt `test-engine` — and needs no WASM artifact. The
+    /// client-side assertion that binds the mirror through the real WASM export
+    /// lives in `client/src/data/__tests__/formatRegistry.integration.test.ts`,
+    /// which `client/vitest.config.ts` excludes from the default run and which
+    /// no workflow, Tiltfile target or verify.sh path invokes. An assertion no
+    /// lane executes guards nothing; this one does.
+    ///
+    /// `include_str!` rather than `read_to_string`: a moved or deleted client
+    /// file is then a COMPILE error, not a silently skipped test. Same idiom as
+    /// `tests/integration/interaction_contract.rs`.
+    ///
+    /// SORTED, deliberately: measured, the union's declaration order is neither
+    /// the engine's declaration order nor `registry()`'s, and pinning an order
+    /// nothing owns would be a test of formatting.
+    ///
+    /// No separate non-vacuity premise is needed. The comparison is against a
+    /// non-empty left side, so an extraction that finds nothing FAILS rather
+    /// than passing.
+    #[test]
+    fn client_builtin_game_format_union_matches_the_engine() {
+        use strum::IntoEnumIterator;
+
+        const TYPES_TS: &str = include_str!("../../../../client/src/adapter/types.ts");
+
+        // The union's own span: from its declaration header to the first
+        // subsequent line whose code half ends in `;`.
+        let mut lines = TYPES_TS
+            .lines()
+            .skip_while(|line| !line.starts_with("export type BuiltInGameFormat ="));
+        let _header = lines
+            .next()
+            .expect("client/src/adapter/types.ts must declare `export type BuiltInGameFormat =`");
+        let mut region = String::new();
+        for line in lines {
+            region.push_str(line);
+            region.push('\n');
+            if crate::source_census::code(line).trim_end().ends_with(';') {
+                break;
+            }
+        }
+
+        let mut found = client_format_names(&region, "| ");
+        let mut expected: Vec<String> = GameFormat::iter().map(|f| f.to_string()).collect();
+        found.sort();
+        expected.sort();
+        assert_eq!(
+            found, expected,
+            "client/src/adapter/types.ts's BuiltInGameFormat union must name \
+             exactly the engine's built-in formats"
+        );
+    }
+
+    /// `client/src/data/formatRegistry.ts`'s `FORMAT_REGISTRY` must mirror
+    /// `GameFormat::registry()` — the same formats, in the same order, with no
+    /// duplicated or half-written entry.
+    ///
+    /// Each entry writes `format: "X"` TWICE (the entry's own key and its
+    /// `default_config.format`), measured at 46 occurrences for 23 entries, so
+    /// the entry SEQUENCE is recovered by collapsing CONSECUTIVE duplicates
+    /// rather than by matching an indentation the next reformat would move.
+    ///
+    /// The collapse alone is NOT enough, and this was measured rather than
+    /// reasoned: with only the collapse, an adjacent duplicated entry, an entry
+    /// missing one of its two `format:` lines, and an entry whose
+    /// `default_config.format` disagrees with its own key ALL still produce the
+    /// exact expected sequence. The multiplicity check below is what reds them.
+    /// It requires the count to be UNIFORM rather than equal to two, so a
+    /// future shape change reds as "come and look" instead of silently.
+    #[test]
+    fn client_format_registry_matches_the_engine_registry() {
+        const REGISTRY_TS: &str = include_str!("../../../../client/src/data/formatRegistry.ts");
+
+        let raw = client_format_names(REGISTRY_TS, "format: ");
+
+        let mut entries: Vec<String> = Vec::new();
+        for name in &raw {
+            if entries.last() != Some(name) {
+                entries.push(name.clone());
+            }
+        }
+        let expected: Vec<String> = GameFormat::registry()
+            .iter()
+            .map(|meta| meta.format.to_string())
+            .collect();
+        assert_eq!(
+            entries, expected,
+            "client/src/data/formatRegistry.ts must mirror GameFormat::registry(), \
+             in the same order"
+        );
+
+        let mut counts: Vec<(String, usize)> = expected
+            .iter()
+            .map(|name| (name.clone(), raw.iter().filter(|n| *n == name).count()))
+            .collect();
+        counts.sort_by_key(|(_, n)| *n);
+        let (lowest, highest) = (counts.first().unwrap(), counts.last().unwrap());
+        assert_eq!(
+            lowest.1, highest.1,
+            "every FORMAT_REGISTRY entry must write `format:` the same number of \
+             times; {} writes it {} and {} writes it {}. A duplicated entry, a \
+             half-written entry, or a default_config.format that disagrees with \
+             its own key all look like this — and all of them survive the \
+             sequence check above",
+            lowest.0, lowest.1, highest.0, highest.1
+        );
     }
 
     #[test]
