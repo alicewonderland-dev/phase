@@ -741,11 +741,13 @@ fn game_format_from_str_display_roundtrip_builtins() {
     use strum::IntoEnumIterator;
 
     // Was a hand-written 22-element array guarded by `assert_eq!(all.len(), 22)`
-    // — an assertion that can never fail, and which was blind to
-    // `GameFormat::CommanderDraft` being absent. Iterating the enum means a new
-    // format arrives here on its own and reds if `FromStr` has no arm for it.
-    // `FromStr` ends in `other => Err(..)` and is NOT compiler-forced, which
-    // makes this test its only guard.
+    // — which cannot fail from the enum growing (22 == 22 holds however many
+    // variants exist), and which was blind to `GameFormat::CommanderDraft`
+    // being absent. Iterating the enum means a new format arrives here on its
+    // own and reds if `FromStr` has no arm for it. `FromStr` ends in
+    // `other => Err(..)` and is NOT compiler-forced; `Deserialize` for
+    // `GameFormat` delegates to it, so the registry-iterating deserialization
+    // tests below also exercise every arm, not just this test.
     for format in GameFormat::iter() {
         let s = format.to_string();
         let back: GameFormat = s.parse().unwrap();

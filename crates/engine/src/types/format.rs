@@ -4147,12 +4147,18 @@ mod tests {
     /// rather than by matching an indentation the next reformat would move.
     ///
     /// The collapse alone is NOT enough, and this was measured rather than
-    /// reasoned: with only the collapse, an adjacent duplicated entry, an entry
-    /// missing one of its two `format:` lines, and an entry whose
-    /// `default_config.format` disagrees with its own key ALL still produce the
-    /// exact expected sequence. The multiplicity check below is what reds them.
-    /// It requires the count to be UNIFORM rather than equal to two, so a
-    /// future shape change reds as "come and look" instead of silently.
+    /// reasoned. An adjacent duplicated entry and an entry missing one of its
+    /// two `format:` lines both still produce the exact expected sequence with
+    /// only the collapse; the multiplicity check below is what reds those two.
+    /// An entry whose `default_config.format` disagrees with its own key is
+    /// caught by the sequence check itself in the general case; it only
+    /// survives the sequence check when the disagreeing value happens to
+    /// equal the following entry's own name (the collapse then swallows the
+    /// run into that name), and the multiplicity check is what reds that
+    /// narrower case. The multiplicity check requires every entry to write
+    /// `format:` the same number of times, rather than hardcoding an
+    /// assertion that it equals two, so a uniform change to how many times
+    /// every entry writes `format:` continues to pass.
     #[test]
     fn client_format_registry_matches_the_engine_registry() {
         const REGISTRY_TS: &str = include_str!("../../../../client/src/data/formatRegistry.ts");

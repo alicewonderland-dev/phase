@@ -74,12 +74,15 @@ ENGINE_TESTS = ['crates/engine/tests/']
 # 'test-engine' (which holds the mirror-drift assertions) needs this list in
 # ITS OWN `deps`, or a client-only edit never re-executes them and the mirror
 # can drift while Tilt stays green -- listing it on 'build-native' alone would
-# NOT close that gap. 'build-native' (which does the actual compile, see that
-# resource's comment) also lists it, so this is the one compile input that
-# does not silently diverge between the two lists, which are otherwise
-# identical on ENGINE_SRC + ENGINE_TESTS; 'build-native' omitting it alone
-# would not itself reopen the drift gap, since 'test-engine' recompiles on
-# this edit regardless of 'build-native''s freshness.
+# NOT close that gap. 'build-native' also lists it so that its precompile
+# actually covers this compile input -- omitting it there would not reopen
+# the drift gap (test-engine still recompiles on its own deps regardless of
+# build-native's freshness), but it WOULD push this compile onto test-engine
+# itself and defeat the reason build-native exists at all (see that
+# resource's comment: avoiding serialization on the cargo build lock).
+# 'clippy' lists it too, for an unrelated reason: `cargo clippy --all-targets`
+# compiles this same test binary, so a client-only edit is a clippy
+# compile-input change same as anything in its own 'crates/' dep.
 FORMAT_CLIENT_MIRRORS = [
     'client/src/adapter/types.ts',
     'client/src/data/formatRegistry.ts',
@@ -273,11 +276,19 @@ local_resource('test-frontend',
 # mutually invalidating artifacts (rebuild thrash). A separate CARGO_TARGET_DIR
 # also gives it its own build lock, so it never queues behind the native test
 # builds. Cost: a second debug tree on disk (reclaimed by cargo-sweep).
+# `--all-targets` compiles the same `phase-engine` test lib as `build-native`/
+# `test-engine`, including the `include_str!` mirror-drift assertions in
+# `format.rs` -- MEASURED: editing only `client/src/data/formatRegistry.ts`
+# forces a `Compiling phase-engine` rebuild of that lib-test target. So this
+# resource needs FORMAT_CLIENT_MIRRORS in its own `deps` too, for the same
+# reason `test-engine` does above -- without it, renaming or deleting either
+# client file leaves the engine failing to compile while clippy stays green
+# until an unrelated `crates/` edit fires it.
 local_resource('clippy',
     # List-form cmd: see the 'wasm' resource above for why (a STRING 'bash -c "..."'
     # gets its quotes mangled by cmd.exe on Windows; list-form bypasses that).
     cmd = ['bash', '-c', 'CARGO_TARGET_DIR=target/clippy cargo clippy --all-targets -- -D warnings && CARGO_TARGET_DIR=target/clippy ./scripts/check-interaction-bindings.sh --check'],
-    deps = ['crates/', 'client/src/adapter/generated/interaction/index.ts', 'scripts/check-interaction-bindings.sh'],
+    deps = ['crates/', 'client/src/adapter/generated/interaction/index.ts', 'scripts/check-interaction-bindings.sh'] + FORMAT_CLIENT_MIRRORS,
     ignore = TMP_IGNORE,
     auto_init = 'lint' in enabled,
     allow_parallel = True,
