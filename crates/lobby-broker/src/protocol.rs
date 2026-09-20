@@ -1736,19 +1736,17 @@ mod tests {
         assert_eq!(LOBBY_PROTOCOL_VERSION, 10);
         // Deliberately still 2, not 10: every lobby version past 2 keeps this
         // floor's guarantee — that a version-2 client can still parse every
-        // frame it already understands. Individually: 3 adds one optional
-        // field (`default_deck_copy_limit`); 4 adds twelve new lobby variants
-        // and no optional field on an existing one; 5 adds two new variants
-        // plus four optional fields; 6 adds two new variants and three
-        // required fields, additive in the only direction this floor
-        // governs — its server → client fields are ignored by a consumer
-        // that does not name them — and its one relaxation (`scoring`)
-        // makes the broker MORE permissive, not less; 7 adds
-        // three optional fields; 8 adds one optional field; 9 adds one
-        // optional field (`RenewTournamentCredential::rotation_nonce`) on a
-        // client → broker message, which a version-2 client, predating the
-        // field, never sends; 10 adds no field and no variant at all. See
-        // the constant's own changelog.
+        // frame it already understands. Individually: 3 is additive in both
+        // directions (an optional, defaulted field); 4 adds variants only,
+        // harmless to a v2 client's `UnknownTag`/`JSON.parse` handling; 5 is
+        // additive in both directions (variants plus an optional, defaulted
+        // field); 6 is additive in the only direction this floor governs — its
+        // server → client fields are ignored by a consumer that doesn't name
+        // them — and its relaxation (`scoring`) makes the broker MORE
+        // permissive, not less; 7 and 8 are additive, optional fields only; 9
+        // is additive, a client → broker field a version-2 client, predating
+        // it, never sends; 10 adds no field or variant. See the constant's own
+        // changelog.
         assert_eq!(MIN_SUPPORTED_LOBBY_PROTOCOL, 2);
         assert_ne!(
             LOBBY_PROTOCOL_VERSION, PROTOCOL_VERSION,
