@@ -81,9 +81,13 @@ pub struct FormatMetadata {
 ///
 /// Two things are worth knowing before editing this derive. A second
 /// payload-carrying variant left without `#[strum(disabled)]` is a COMPILE
-/// ERROR, because `strum` needs `Default` for the payload and `CustomFormatId`
-/// does not implement it. But `#[strum(disabled)]` on a UNIT variant removes it
-/// from `iter()` SILENTLY; the independent authority that catches that is
+/// ERROR only if ITS OWN payload type does not implement `Default` — true of
+/// `CustomFormatId` today (a newtype over `u16`, one `#[derive(Default)]` away
+/// from no longer gating anything), but the gate is the new variant's payload,
+/// not `CustomFormatId` itself. When the payload DOES implement `Default`,
+/// `iter()` instead SILENTLY gains a default-valued member — the same failure
+/// shape as `#[strum(disabled)]` on a UNIT variant removing it from `iter()`
+/// SILENTLY. Both silent cases are caught only by the independent authority
 /// `tests::registry_lists_every_builtin_format`, which compares `iter()` to the
 /// hand-written `registry()` below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
@@ -4097,7 +4101,7 @@ mod tests {
     /// nothing owns would be a test of formatting.
     ///
     /// No separate non-vacuity premise is needed. The comparison is against a
-    /// non-empty left side, so an extraction that finds nothing FAILS rather
+    /// non-empty right side, so an extraction that finds nothing FAILS rather
     /// than passing.
     #[test]
     fn client_builtin_game_format_union_matches_the_engine() {

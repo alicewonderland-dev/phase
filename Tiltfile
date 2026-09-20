@@ -64,6 +64,26 @@ ENGINE_SRC = [
     'crates/engine/Cargo.toml',
 ]
 ENGINE_TESTS = ['crates/engine/tests/']
+# `crates/engine/src/types/format.rs` `include_str!`s both of these client
+# files into `phase-engine`'s own test binary (mirror-drift assertions), so a
+# client-only edit to either one is an ENGINE compile-input change same as
+# anything in ENGINE_SRC. `resource_deps` orders STARTUP only -- MEASURED on
+# Tilt 0.37.7 with `tilt alpha tiltfile-result` plus a scratch local_resource
+# pair: a resource named in another's `resource_deps` is NOT retriggered by
+# it; each resource re-runs only off its OWN `deps` file watch. So
+# 'test-engine' (which holds the mirror-drift assertions) needs this list in
+# ITS OWN `deps`, or a client-only edit never re-executes them and the mirror
+# can drift while Tilt stays green -- listing it on 'build-native' alone would
+# NOT close that gap. 'build-native' (which does the actual compile, see that
+# resource's comment) also lists it, so this is the one compile input that
+# does not silently diverge between the two lists, which are otherwise
+# identical on ENGINE_SRC + ENGINE_TESTS; 'build-native' omitting it alone
+# would not itself reopen the drift gap, since 'test-engine' recompiles on
+# this edit regardless of 'build-native''s freshness.
+FORMAT_CLIENT_MIRRORS = [
+    'client/src/adapter/types.ts',
+    'client/src/data/formatRegistry.ts',
+]
 AI_SRC = ['crates/phase-ai/src/']
 AI_TESTS = ['crates/phase-ai/tests/']
 WASM_SRC = ['crates/engine-wasm/src/']
@@ -206,7 +226,7 @@ local_resource('server',
 # force a rebuild.
 local_resource('build-native',
     cmd = 'cargo nextest run -p phase-engine -p phase-ai --no-run',
-    deps = ENGINE_SRC + ENGINE_TESTS + AI_SRC + AI_TESTS,
+    deps = ENGINE_SRC + ENGINE_TESTS + AI_SRC + AI_TESTS + FORMAT_CLIENT_MIRRORS,
     ignore = TMP_IGNORE,
     allow_parallel = True,
     auto_init = 'test' in enabled,
@@ -215,7 +235,7 @@ local_resource('build-native',
 
 local_resource('test-engine',
     cmd = 'cargo nextest run -p phase-engine',
-    deps = ENGINE_SRC + ENGINE_TESTS,
+    deps = ENGINE_SRC + ENGINE_TESTS + FORMAT_CLIENT_MIRRORS,
     ignore = TMP_IGNORE,
     resource_deps = ['build-native'],
     allow_parallel = True,
