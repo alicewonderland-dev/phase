@@ -20,22 +20,12 @@
  *     `active_pile` says nothing about whose turn it is;
  *   * WHICH pile is being decided on comes from `active_pile`, and is rendered
  *     for every viewer — an onlooker sees the highlight but gets no controls;
- *   * what may be shown face up comes from `pile.revealed` — and this surface
- *     shows LESS than that, deliberately. The engine keeps publishing the prefix
- *     of every pile the active seat has looked at this turn, which is correct:
- *     that seat did look at them, so nothing is being withheld that it does not
- *     already know. But at a physical table a declined pile goes back face down,
- *     and remembering it is the player's job rather than the screen's — so only
- *     the pile under decision is drawn face up, and a pile the seat has passed
- *     goes dark the instant the cursor leaves it.
- *
- *     The DIRECTION of that gap is what makes it safe: rendering fewer cards
- *     than the projection permits can never leak, while rendering more is a bug
- *     no projection could catch. It is the one place this file narrows what the
- *     engine allows, and it narrows on `active_pile` — the engine's own cursor —
- *     never on a rule of its own. The remainder, including the card a decline
- *     just added, is face down and drawn as card BACKS: a real height, still no
- *     contents;
+ *   * what may be shown face up comes from `pile.revealed`, the prefix the
+ *     engine publishes to the active seat. A declined pile keeps the cards that
+ *     seat inspected, while the card the decline added remains outside that
+ *     prefix and therefore face down; the engine clears every prefix when the
+ *     turn ends. This surface renders that published boundary directly rather
+ *     than adding a second visibility authority;
  *   * what the viewer's own forced draw was comes from `forced_draw`, which the
  *     engine publishes to that seat alone and is the SOLE authority for it.
  *     This component adds only a `viewerSeat !== null` test, which excludes a
@@ -405,6 +395,7 @@ function RevealedCard({
       role="button"
       tabIndex={0}
       aria-label={card.name}
+      aria-pressed={lifted}
       onKeyDown={(event) => {
         if (event.key !== "Enter" && event.key !== " ") return;
         event.preventDefault();

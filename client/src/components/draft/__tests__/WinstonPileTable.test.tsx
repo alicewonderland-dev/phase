@@ -1189,14 +1189,18 @@ describe("WinstonPileTable", () => {
     );
 
     const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card='c1']")!;
+    expect(revealed).toHaveAttribute("aria-pressed", "false");
     fireEvent.focus(revealed);
     expect(revealed).toHaveClass("z-10");
+    expect(revealed).toHaveAttribute("aria-pressed", "true");
 
     fireEvent.keyDown(revealed, { key: "Enter" });
     expect(revealed).not.toHaveClass("z-10");
+    expect(revealed).toHaveAttribute("aria-pressed", "false");
 
     fireEvent.keyDown(revealed, { key: "Enter" });
     expect(revealed).toHaveClass("z-10");
+    expect(revealed).toHaveAttribute("aria-pressed", "true");
   });
 
   it("toggles the lift when the focused card takes Space", () => {
