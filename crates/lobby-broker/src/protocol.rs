@@ -644,9 +644,10 @@ pub const MIN_SUPPORTED_PROTOCOL: u32 = PROTOCOL_VERSION.saturating_sub(1);
 ///      arrives there as an ordinary string. The break is one-directional.
 ///      On THIS surface the broker -> client direction still decodes a
 ///      payload naming a format it predates: the deserializer there is the
-///      browser's `JSON.parse`, and `--seed LobbyServerMessage` reaches
-///      `FormatConfig -> GameFormat`, so a v10 broker's `JoinTargetInfo` /
-///      `PeerInfo` genuinely carries one. Client -> broker for every frame
+///      browser's `JSON.parse`, and `JoinTargetInfo` / `PeerInfo` on
+///      [`LobbyServerMessage`] (this file's entry 2 names both carriers)
+///      each reach `FormatConfig -> GameFormat`, so a v10 broker's replies
+///      genuinely carry one. Client -> broker for every frame
 ///      a pre-run client actually sends is unaffected, because such a
 ///      client can only name formats that existed at base. The single
 ///      failing pairing is a post-run client naming a new format to a
@@ -1738,16 +1739,16 @@ mod tests {
         // frame it already understands. Individually: 3 adds one optional
         // field (`default_deck_copy_limit`); 4 adds twelve new lobby variants
         // and no optional field on an existing one; 5 adds two new variants
-        // plus four optional fields; 6 is additive in the only direction this
-        // floor governs — its server → client fields are ignored by a
-        // consumer that does not name them, and its one relaxation
-        // (`scoring`) makes the broker MORE permissive, not less; 7 adds
+        // plus four optional fields; 6 adds two new variants and three
+        // required fields, additive in the only direction this floor
+        // governs — its server → client fields are ignored by a consumer
+        // that does not name them — and its one relaxation (`scoring`)
+        // makes the broker MORE permissive, not less; 7 adds
         // three optional fields; 8 adds one optional field; 9 adds one
-        // optional field (`RenewTournamentCredential::rotation_nonce`) — new
-        // wire surface, but additive (`#[serde(default)]`, so a version-2
-        // client that never sends it still parses every frame that does);
-        // 10 adds no field and no variant at all. See the constant's own
-        // changelog.
+        // optional field (`RenewTournamentCredential::rotation_nonce`) on a
+        // client → broker message, which a version-2 client, predating the
+        // field, never sends; 10 adds no field and no variant at all. See
+        // the constant's own changelog.
         assert_eq!(MIN_SUPPORTED_LOBBY_PROTOCOL, 2);
         assert_ne!(
             LOBBY_PROTOCOL_VERSION, PROTOCOL_VERSION,

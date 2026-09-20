@@ -3,14 +3,14 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-// Upstream's Winston draft frames are v71. This branch's v72 combines the
-// independent policy carrier with upstream's paid graveyard cast offer; v73
-// adds face-qualified variants and preserves a paid addition while a resolution
+// Upstream's Winston draft frames are v71. Upstream's v72 combines its
+// independent policy carrier with the paid graveyard cast offer; v73 adds
+// face-qualified variants and preserves a paid addition while a resolution
 // modal-face prompt is paused; v74 carries exact delayed-trigger receipts;
-// v75 carries producer-owned paid-offer cleanup authority; upstream's v76
-// carries CR 601.2f caster-elected cost-reduction ordering (#8885); this
-// branch's v77 is a pre-emptive bump moved ahead of its own new `GameFormat`
-// variants, carrying no wire-shape change of its own.
+// v75 carries producer-owned paid-offer cleanup authority; v76 carries CR
+// 601.2f caster-elected cost-reduction ordering (#8885). This branch's v77
+// is a pre-emptive bump moved ahead of its own new `GameFormat` variants,
+// carrying no wire-shape change of its own.
 // Keep the measured base so a future merge cannot collapse independent wire
 // changes onto one number.
 const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
