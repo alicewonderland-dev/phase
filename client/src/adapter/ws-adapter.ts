@@ -209,6 +209,14 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 77 — Prospective: no GameState or GameAction shape change lands in this
+ *      bump. Moved ahead of this branch's new GameFormat variants so every
+ *      intermediate commit on this branch is internally consistent once
+ *      they land — see PROTOCOL_VERSION's own `/// 77` entry in
+ *      crates/lobby-broker/src/protocol.rs. Full-game sessions stay
+ *      exact-match on both ends (MIN_SUPPORTED_SERVER_PROTOCOL below and
+ *      MIN_SUPPORTED_PROTOCOL in crates/server-core/src/protocol.rs), so no
+ *      pre-run peer ever receives a v77 GameState at all.
  * 73 — `CastingVariantChoiceOption` gained required `face`, making a paused
  *      Fuse split-card menu an exact `(variant, face)` tuple. This integrated
  *      state also carries a resolution-owned modal choice's additional cost so
@@ -529,7 +537,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      into a MulliganDecisionPhase::BottomCards sub-phase on
  *      WaitingFor::MulliganDecision.
  */
-export const PROTOCOL_VERSION = 76;
+export const PROTOCOL_VERSION = 77;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
@@ -560,6 +568,18 @@ export const LOBBY_MIN_SUPPORTED_SERVER_PROTOCOL = PROTOCOL_VERSION - 1;
  * PROTOCOL_VERSION moved twice for GameState-only changes and the derived lobby
  * window went disjoint from the deployed broker's.
  *
+ * 10 — Prospective: no lobby variant or field changes shape in this bump.
+ *      Moved ahead of this branch's new GameFormat variants so every
+ *      intermediate commit on this branch is internally consistent once
+ *      they land — see LOBBY_PROTOCOL_VERSION's own `/// 10` entry in
+ *      crates/lobby-broker/src/protocol.rs. MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL
+ *      stays at 2: this client already decodes broker → client frames with
+ *      JSON.parse, which arrives at an unknown-yet format name as an
+ *      ordinary string with no parse error either way, and moving the floor
+ *      would evict every v2–v9 broker over a value most of them will never
+ *      encounter. The one pairing this bump does not protect — a v10+
+ *      client naming a new format to a pre-10 Rust broker — is a P4/P5
+ *      client-side capability-floor obligation, not this one's.
  * 9 — Recoverable credential rotation via idempotent-nonce replay.
  *     RenewTournamentCredential gains an optional `rotation_nonce` field
  *     (#[serde(default)]) — the "a lobby field is added" trigger;
@@ -651,7 +671,7 @@ export const LOBBY_MIN_SUPPORTED_SERVER_PROTOCOL = PROTOCOL_VERSION - 1;
  * 1 — Initial lobby-owned version, covering the lobby variant set unchanged
  *     since #1880.
  */
-export const LOBBY_PROTOCOL_VERSION = 9;
+export const LOBBY_PROTOCOL_VERSION = 10;
 
 /**
  * Lowest broker LOBBY_PROTOCOL_VERSION this client accepts.

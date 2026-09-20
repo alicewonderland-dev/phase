@@ -3248,20 +3248,23 @@ mod tests {
         }
     }
 
-    /// `CastingVariantChoiceOption` now serializes a required `face`; the
-    /// resumed `ModalFaceChoice` also preserves an added paid-cast cost. The
-    /// cleanup, its delayed-trigger receipts, and receipt-eligible origins now
-    /// carry the producer-issued paid-offer owner; a v74 peer cannot preserve
-    /// that cross-offer isolation through a paused offer, so it must be refused
-    /// before it receives v75 state.
+    /// Prospective: no `GameState` or `GameAction` shape changes land in
+    /// this bump. Moved ahead of this branch's new `GameFormat` variants so
+    /// every intermediate commit on this branch is internally consistent
+    /// once they land — see `PROTOCOL_VERSION`'s own `/// 77` entry in
+    /// `crates/lobby-broker/src/protocol.rs`. A v76 peer is refused anyway:
+    /// full-game sessions are exact-match on both ends (see
+    /// `full_game_floor_is_current_only_not_a_rollout_window` below), so
+    /// admitting one is a rollout-window regression independent of whether
+    /// THIS particular bump changed any wire shape.
     ///
     /// The name embeds the numeral deliberately: `assert_eq!(PROTOCOL_VERSION,
     /// <n>)` under a function named for `<n-1>` is green, so
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_76_for_cost_reduction_order_election() {
-        assert_eq!(PROTOCOL_VERSION, 76);
+    fn protocol_version_is_77_ahead_of_freeform_format_names() {
+        assert_eq!(PROTOCOL_VERSION, 77);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3272,7 +3275,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_76_for_cost_reduction_order_election` stays
+    /// `protocol_version_is_77_ahead_of_freeform_format_names` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
