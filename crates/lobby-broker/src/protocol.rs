@@ -82,7 +82,7 @@ pub struct TournamentRequestId(pub u64);
 ///      deserializer asymmetry above never gets a chance to matter here —
 ///      see [`LOBBY_PROTOCOL_VERSION`]'s own `/// 10` entry for the surface
 ///      where it does. (Written as one unbroken paragraph on purpose, per
-///      the reason entries 5 and 4 give: a blank `///` line before 4-space
+///      the reason entry 5 gives: a blank `///` line before 4-space
 ///      indented prose is an indented CODE block to rustdoc.)
 ///
 /// 76 — CR 601.2f caster-elected cost-reduction ordering:
@@ -661,7 +661,7 @@ pub const MIN_SUPPORTED_PROTOCOL: u32 = PROTOCOL_VERSION.saturating_sub(1);
 ///      fully prevent anyway (the client-side floor above is what closes
 ///      it). [`PROTOCOL_VERSION`] does not move alongside it either: no
 ///      variant here carries `GameState` or `GameAction`. (Written as one
-///      unbroken paragraph on purpose, per the reason entries 5 and 4 give:
+///      unbroken paragraph on purpose, per the reason entry 5 gives:
 ///      a blank `///` line before 4-space indented prose is an indented
 ///      CODE block to rustdoc.)
 /// 9 — Recoverable credential rotation via idempotent replay.
@@ -1738,7 +1738,7 @@ mod tests {
         // floor's guarantee — that a version-2 client can still parse every
         // frame it already understands. Individually: 3 is additive in both
         // directions (an optional, defaulted field); 4 adds variants only,
-        // harmless to a v2 client's `UnknownTag`/`JSON.parse` handling; 5 is
+        // harmless to a v2 client's `JSON.parse` handling; 5 is
         // additive in both directions (variants plus an optional, defaulted
         // field); 6 is additive in the only direction this floor governs — its
         // server → client fields are ignored by a consumer that doesn't name
