@@ -654,6 +654,8 @@
     "takeAria": "Pegar o monte {{index}}",
     "decline": "Recusar",
     "declineAria": "Recusar o monte {{index}}",
+    "spreadPile": "Espalhar o monte {{index}}",
+    "stackPile": "Empilhar o monte {{index}}",
     "refusal": {
       "PileNotActive": "Você não está decidindo sobre este monte.",
       "PileEmpty": "Este monte está vazio, não há nada para pegar.",

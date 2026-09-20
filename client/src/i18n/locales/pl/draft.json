@@ -654,6 +654,8 @@
     "takeAria": "Weź kupkę {{index}}",
     "decline": "Odrzuć",
     "declineAria": "Odrzuć kupkę {{index}}",
+    "spreadPile": "Rozłóż kupkę {{index}}",
+    "stackPile": "Spiętrz kupkę {{index}}",
     "refusal": {
       "PileNotActive": "Nie podejmujesz decyzji o tej kupce.",
       "PileEmpty": "Ta kupka jest pusta, nie ma czego brać.",

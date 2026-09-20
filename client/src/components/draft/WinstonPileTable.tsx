@@ -90,7 +90,12 @@
  * "releases a lifted card when the pointer drops below its exposed strip, and
  * lifts the one under it instead". Why the band and not the whole box is
  * REASONING about browser hit-testing, written out at `RevealedCard`'s
- * `updateLift`.
+ * `updateLift`. A touch tap on that same strip does the same thing —
+ * REASONING, not measured; no lane here drives a real tap, and `RevealedCard`'s
+ * own `onPointerDown`/`onClick` comment says what that reasoning rests on —
+ * or the pile header's own spread toggle un-stacks that pile's faces outright
+ * and needs no gesture at all ("un-stacks a pile's revealed faces when the
+ * player spreads it").
  *
  * What a lift shows is the card's OWN FACE at the pile scale, and nothing
  * larger: this surface renders NO enlarged preview of its own ("renders no
@@ -118,7 +123,7 @@
  * surface's own stored value.
  */
 
-import { useState, type PointerEvent } from "react";
+import { useRef, useState, type PointerEvent } from "react";
 import { useTranslation } from "react-i18next";
 
 import type { ResponsiveDraftLayout } from "./workspace/workspacePreferences";
@@ -179,9 +184,27 @@ const STACK_EXPOSED_WIDTH_RATIO = 0.16;
  */
 const STACK_OVERLAP_PERCENT = (CARD_HEIGHT_TO_WIDTH - STACK_EXPOSED_WIDTH_RATIO) * 100;
 
-/** The stacking margin one card deep into a stack, or none at its top. */
-function stackMarginTop(stackIndex: number): string | undefined {
-  return stackIndex === 0 ? undefined : `-${STACK_OVERLAP_PERCENT}%`;
+/**
+ * The gap between a spread pile's un-stacked cards: the same `0.5rem` this
+ * column already puts between its own header, stack and actions block
+ * (`git grep -n 'gap-2' -- client/src/components/draft/WinstonPileTable.tsx`),
+ * so a spread column's inter-card gap is the column's own gap, not a new
+ * number.
+ */
+const SPREAD_GAP = "0.5rem";
+
+/**
+ * The stacking margin one card deep into a stack, or none at its top.
+ * `spread` swaps the negative overlap for the plain gap above, which is what
+ * `Pile`'s per-pile spread toggle un-stacks. `FaceDownStack` never passes it —
+ * every call there stays one argument, so the fan of card BACKS keeps
+ * overlapping even in a spread pile: a back is a height, never contents (see
+ * `FaceDownStack`'s own doc), and spreading it would buy card-heights of
+ * nothing.
+ */
+function stackMarginTop(stackIndex: number, spread = false): string | undefined {
+  if (stackIndex === 0) return undefined;
+  return spread ? SPREAD_GAP : `-${STACK_OVERLAP_PERCENT}%`;
 }
 
 export interface WinstonPileTableProps {
@@ -250,6 +273,9 @@ function RevealedCard({
   card,
   width,
   stackIndex = 0,
+  spread = false,
+  lifted,
+  onLiftChange,
 }: {
   card: DraftCardInstance;
   width: number;
@@ -257,6 +283,18 @@ function RevealedCard({
    *  pulled up over the one before it, leaving one strip of it showing.
    *  Omitted by `ForcedDrawNotice`, which draws one card and no stack. */
   stackIndex?: number;
+  /** Un-stack this card from the one before it. Owned by `Pile`; see
+   *  `stackMarginTop`. Omitted by `ForcedDrawNotice`, which draws a lone card
+   *  with nothing to spread. */
+  spread?: boolean;
+  /** Whether THIS card is the one raised clear of its neighbour. Controlled
+   *  by the caller (`Pile`, or `ForcedDrawNotice`'s own local flag) rather
+   *  than owned here, because a pile must keep at most one card lifted at a
+   *  time — a lifted card takes `z-10` and paints over the one after it, so a
+   *  second stale lift would make that card untappable. Pinned by "lifts one
+   *  card at a time in a pile". */
+  lifted: boolean;
+  onLiftChange: (next: boolean) => void;
 }) {
   const sourcePrinting = { setCode: card.set_code, collectorNumber: card.collector_number };
   const { src, isLoading, displayName } = useDraftCardFace(card.name, sourcePrinting);
@@ -269,7 +307,22 @@ function RevealedCard({
   // but the attribute sits a level up, on the `[data-winston-pile-table]`
   // section: "scrolls its own columns wherever the page will not scroll for
   // it" asserts the attribute and the class on different elements.
-  const [lifted, setLifted] = useState(false);
+  //
+  // Records what a TAP needs to know before its own side effects run: the
+  // pointer type off a genuine `PointerEvent` (`onPointerDown` always gets
+  // one, unlike the compatibility `click` that follows it, whose OWN
+  // `pointerType` field is inconsistently populated across browsers) and the
+  // lift this card held before this tap started. A browser that focuses a
+  // `tabIndex={0}` div on tap delivers that focus BETWEEN `pointerdown` and
+  // `click`, so reading the live `lifted` prop at click time would read a
+  // value this same tap's own focus just wrote and toggle the wrong way on
+  // the first tap. Reading the pre-tap snapshot instead is what survives that
+  // write — pinned by "survives a browser that focuses the card on tap before
+  // the click fires", the one row here where something writes `lifted`
+  // between `pointerdown` and `click`. MEASURED: reading the live `lifted`
+  // prop in `onClick` instead of this snapshot reddens that row alone, across
+  // this file and `DraftPodPage.winston.test.tsx`.
+  const tapRef = useRef<{ pointerType: string; wasLifted: boolean } | null>(null);
   // The card pool's own band predicate, against this file's own
   // `STACK_EXPOSED_WIDTH_RATIO` — see the LAYOUT note at the top for the grep
   // that checks the two declarations still agree, and
@@ -301,12 +354,13 @@ function RevealedCard({
   // `useInspectHoverProps.ts::useInspectHoverProps`, and
   // `useCardHover.test.tsx` runs its hover rows over `["mouse", "pen"]` on the
   // stated ground that only touch synthesizes its enter from a tap. Both
-  // halves are pinned here, by "gives a touch pointer no lift" and "lifts a
-  // covered card for a pen pointer too".
+  // halves are pinned here, by "gives a touch pointer no hover lift" and
+  // "lifts a covered card for a pen pointer too". Touch gets its OWN lift, off
+  // a tap rather than a hover — see `onPointerDown`/`onClick` below.
   const updateLift = (event: PointerEvent<HTMLDivElement>) => {
     if (event.pointerType === "touch") return;
     const rect = event.currentTarget.getBoundingClientRect();
-    setLifted(event.clientY - rect.top <= rect.width * STACK_EXPOSED_WIDTH_RATIO);
+    onLiftChange(event.clientY - rect.top <= rect.width * STACK_EXPOSED_WIDTH_RATIO);
   };
 
   return (
@@ -323,32 +377,103 @@ function RevealedCard({
       className={`relative shrink-0 max-w-full overflow-hidden rounded-md ring-1 ring-white/15 focus-visible:outline focus-visible:outline-2 focus-visible:outline-amber-300/70 ${
         lifted ? "z-10" : ""
       }`}
-      style={{ width, aspectRatio: CARD_ASPECT, marginTop: stackMarginTop(stackIndex) }}
+      style={{ width, aspectRatio: CARD_ASPECT, marginTop: stackMarginTop(stackIndex, spread) }}
       // Keyboard parity with the decision buttons below, which are real
       // `<button>`s: a player who tabs to Take must be able to reach what they
-      // are taking. The card is not itself a control, so it takes focus and
-      // publishes its name — it does not take Enter.
+      // are taking. `role="button"` and the Enter/Space handler below are for
+      // a DIFFERENT reason than keyboard reach, though — REASONING, not
+      // measured; no lane here drives a real tap against a real browser's
+      // click-synthesis rules (see the module doc's LAYOUT paragraph): iOS
+      // Safari only synthesises its compatibility `click` on an element it
+      // considers clickable — a link, a form control, `cursor: pointer`, `role="button"`
+      // or an own `onclick` — and this card had none of those, so a tap could
+      // silently never fire `onClick` there at all. Every other clickable
+      // focusable `div` in this client already carries this same
+      // `role="button"` plus Enter/Space pair (`MyDecks.tsx`,
+      // `HomeDashboard.tsx`), and `WorkspaceCard.tsx::WorkspaceCard` — the
+      // real `<button>` this `onClick` was modelled on — gets Enter and Space
+      // for free from being a native button rather than needing them written
+      // out. Enter/Space toggle the SAME lift a tap does, but read the live
+      // `lifted` prop directly rather than going through `tapRef`: the ref
+      // exists to survive a browser inserting its own focus-write BETWEEN
+      // `pointerdown` and `click`, and no such write can land between a
+      // keydown and its own handler on an element that is already focused by
+      // the time the key is pressed — there is nothing here for a snapshot to
+      // protect against. Pinned by "toggles the lift when the focused card
+      // takes Enter" and "toggles the lift when the focused card takes
+      // Space".
+      role="button"
       tabIndex={0}
       aria-label={card.name}
+      onKeyDown={(event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        onLiftChange(!lifted);
+      }}
       onPointerEnter={updateLift}
       onPointerMove={updateLift}
-      // The leave clears the lift unconditionally, focused or not, and each
-      // half has its own row: "lifts a covered card clear of its neighbour
-      // when the pointer is on its exposed strip" enters here off a hover
-      // lift, and "drops a focus lift when the pointer leaves the card" off a
-      // focus lift. Deleting this binding reds both; guarding it with a second
-      // focus-only flag reds only the second.
-      onPointerLeave={() => setLifted(false)}
+      onPointerDown={(event) => {
+        tapRef.current = { pointerType: event.pointerType, wasLifted: lifted };
+      }}
+      // The leave clears the lift for non-touch pointers, focused or not, and
+      // each half has its own row: "lifts a covered card clear of its
+      // neighbour when the pointer is on its exposed strip" enters here off a
+      // hover lift, and "drops a focus lift when the pointer leaves the card"
+      // off a focus lift. Deleting this binding reds both; guarding it with a
+      // second focus-only flag reds only the second.
+      //
+      // GUARDED against touch. The finger-lift a tap fires between
+      // `pointerup` and `click` (the same event this repo already documents
+      // at `useCardHover.ts`/`useInspectHoverProps.ts`) would otherwise clear
+      // whatever this card held mid-tap; `onClick` below computes the tap's
+      // own final state from `tapRef`'s pre-tap snapshot rather than this
+      // card's live `lifted`, which already covers every ordering this repo
+      // CAN drive (pointerdown, then this leave, then click). Whether some
+      // browser could ever deliver that leave AFTER the click instead is a
+      // claim about BROWSER EVENT ORDERING — REASONING, not measured; no lane
+      // here drives a real tap (see the module doc's LAYOUT paragraph). If it
+      // did, the snapshot would not help — the click has already computed and
+      // applied its toggle by then — and the first tap's lift would be wiped,
+      // restoring the original bug. The guard closes that gap directly, at
+      // zero measured cost: MEASURED, adding it reddens nothing in this file
+      // or `DraftPodPage.winston.test.tsx`. Behavioural consequence: a touch
+      // PAN that starts on a lifted card no longer clears it through this
+      // leave.
+      onPointerLeave={(event) => {
+        if (event.pointerType === "touch") return;
+        onLiftChange(false);
+      }}
       // A focus has no cursor, so there is no `clientY` to band-test and the
-      // lift is unconditional. ONE flag serves focus and hover both, so a
+      // lift is unconditional. ONE flag serves focus, hover and tap, so a
       // pointer move below the strip drops a lift a focus put there — pinned
       // by "drops a focus lift once the pointer moves below the card's exposed
       // strip", and deliberate rather than incidental. REASONING about browser
       // hit-testing again: a focus-lifted card's `z-10` box covers the card
       // under it, so separate focus and hover flags would leave that card
-      // unreachable by pointer for as long as the focus held.
-      onFocus={() => setLifted(true)}
-      onBlur={() => setLifted(false)}
+      // unreachable by pointer for as long as the focus held. The flag itself
+      // now lives one level up, in `Pile`'s `liftedCard`, so at most one card
+      // in a pile holds it at a time — pinned by "lifts one card at a time in
+      // a pile".
+      onFocus={() => onLiftChange(true)}
+      onBlur={() => onLiftChange(false)}
+      // Allowlisted on the PRECEDING `pointerdown`'s own `pointerType`, never
+      // on this click's — a compatibility `click`'s own `pointerType` field is
+      // populated inconsistently across browsers (Chromium and WebKit dispatch
+      // it as a `PointerEvent`; Firefox has historically dispatched a bare
+      // `MouseEvent`), while a genuine `pointerdown` always carries one. Fails
+      // CLOSED on anything but touch: a mouse tap gets nothing here, because
+      // the hover band above already serves it, and a click toggle would fight
+      // `updateLift` on the very next `pointermove`. `tapRef.current` is
+      // cleared after reading so a later bare `click` with no preceding
+      // `pointerdown` (a mouse click synthesized without one, or a bare test
+      // `fireEvent.click`) reads `null` and does nothing — pinned by "clears
+      // a completed tap's own record before a later bare click reads it".
+      onClick={() => {
+        const tap = tapRef.current;
+        tapRef.current = null;
+        if (tap?.pointerType !== "touch") return;
+        onLiftChange(!tap.wasLifted);
+      }}
     >
       {isLoading || src === null ? (
         <span className="flex h-full items-center justify-center bg-white/5 px-1 text-center text-[10px] leading-tight text-white/60">
@@ -488,6 +613,19 @@ function Pile({
   // the only number this component derives at all.
   const label = pile.index + 1;
 
+  // At most one revealed card in THIS pile is lifted at a time — `null` when
+  // none is. Owned here rather than by each `RevealedCard` because a lifted
+  // card takes `z-10` over the one after it: two lifted at once in the same
+  // stack would make the covered one untappable. Pinned by "lifts one card at
+  // a time in a pile".
+  const [liftedCard, setLiftedCard] = useState<string | null>(null);
+  // Un-stacks this pile's revealed faces, per the header button below.
+  // Ephemeral and NOT persisted: a spread is about the cards CURRENTLY in this
+  // pile, and piles turn over every turn, so restoring "this pile was spread"
+  // next session would restore a state whose subject no longer exists (unlike
+  // pile SCALE, which has no such subject and is why that one persists).
+  const [spread, setSpread] = useState(false);
+
   // Same device as `PICK_STATUS_KEY` in the spectator dashboard, for the same
   // reason: interpolating a refusal into a translation key builds that key out
   // of a serialized engine value, and a refusal the engine grows later reaches
@@ -604,6 +742,35 @@ function Pile({
             {t("winston.deciding")}
           </span>
         )}
+        {/* Rendered on every pile, including one with nothing to spread: a
+            `shownRevealed.length > 1` gate would make a LENGTH COMPARISON feed
+            a control. The file already ships a control that is a no-op
+            at an extreme on purpose: `PileScaleControls` stays `disabled={false}`
+            and the "-" button does nothing at the scale floor.
+            Never disabled on `interactionLocked`, same rule and the same
+            reason as `PileScaleControls`: resizing which cards you can see is
+            not a game action, and a player waiting out an opponent's turn is
+            exactly who wants to use it. Pinned by "offers the spread toggle on
+            every pile, including one with nothing to spread". `self-center`
+            overrides the header's own `items-baseline` — a 44px button
+            baseline-aligned against the uppercase labels beside it would sit
+            low against them. */}
+        <button
+          type="button"
+          data-winston-pile-spread={spread ? "true" : "false"}
+          aria-expanded={spread}
+          aria-label={t(spread ? "winston.stackPile" : "winston.spreadPile", { index: label })}
+          title={t(spread ? "winston.stackPile" : "winston.spreadPile", { index: label })}
+          onClick={() => setSpread((current) => !current)}
+          className={menuButtonClass({
+            tone: "neutral",
+            size: "sm",
+            disabled: false,
+            className: "ml-auto self-center",
+          })}
+        >
+          <span aria-hidden="true">{spread ? "▲" : "▼"}</span>
+        </button>
       </div>
 
       {/* A pile this seat already declined stays READABLE but is visibly spent:
@@ -646,6 +813,22 @@ function Pile({
             // The fan, when there is one, is the top of the column, so the
             // first revealed card stacks onto it rather than sitting flush.
             stackIndex={(drawsFaceDownStack(faceDownCount, pile.total) ? 1 : 0) + index}
+            spread={spread}
+            lifted={liftedCard === card.instance_id}
+            // Identity-guarded: a card's OWN "off" call (leave, blur, or a
+            // hover band going false) only clears `liftedCard` when THIS card
+            // is the one currently holding it. Without the guard, card A's
+            // `onBlur` firing while card B is lifted by a live mouse hover
+            // would wipe B's lift out from under the cursor still sitting on
+            // it — pinned by "leaves a hovered card's lift alone when a
+            // different card loses focus". A card's "on" call (`next === true`)
+            // stays unconditional: focusing or hovering onto a card always
+            // takes over the pile's one lift slot.
+            onLiftChange={(next) =>
+              setLiftedCard((current) =>
+                next ? card.instance_id : current === card.instance_id ? null : current
+              )
+            }
           />
         ))}
         {/* No "you have not looked at this pile yet" placeholder, and its
@@ -673,8 +856,8 @@ function Pile({
           the count is the same wherever they sit
           (`grep -rn data-winston-decision client/src`). MEASURED: rendering the
           actions block as a sibling of `[data-winston-pile]` instead of a child
-          reddens 8 of that file's 41 rows — exactly the 8 that call the helper
-          — and both of `DraftPodPage.winston.test.tsx`'s scoped rows. */}
+          reddens exactly the rows that call the helper and no others, plus
+          both of `DraftPodPage.winston.test.tsx`'s scoped rows. */}
       {canDecide && (
         <div data-winston-pile-actions className="flex flex-col gap-1">
           {decisionButton("Take", "emerald")}
@@ -722,6 +905,10 @@ function ForcedDrawNotice({
   gridColumn: string;
 }) {
   const { t } = useTranslation("draft");
+  // Its own flag rather than a share of any pile's `liftedCard`: this is not a
+  // pile and stacks nothing (no `stackIndex`, no `spread`), so there is no
+  // sibling card to hand the slot off to.
+  const [lifted, setLifted] = useState(false);
 
   return (
     <div
@@ -730,7 +917,7 @@ function ForcedDrawNotice({
       className="flex items-center gap-3 rounded-[16px] border border-sky-300/30 bg-sky-400/[0.07] p-3"
       style={{ gridColumn }}
     >
-      <RevealedCard card={card} width={width} />
+      <RevealedCard card={card} width={width} lifted={lifted} onLiftChange={setLifted} />
       <div className="flex min-w-0 flex-col gap-0.5">
         <span className="text-[0.6rem] font-semibold uppercase tracking-[0.18em] text-sky-200/80">
           {t("winston.forcedDrawLabel")}

@@ -616,9 +616,8 @@ describe("WinstonPileTable", () => {
     // instead of heading them — is a layout consequence this lane cannot
     // measure, which is why the order is pinned directly. MEASURED: moving
     // `<FaceDownStack>` in `Pile` to after the `shownRevealed.map` reddens this
-    // row and only this row across both Winston files (1 failed | 47 passed);
-    // with this assertion removed the same mutation reddens nothing
-    // (48 passed).
+    // row and only this row across both Winston files; with this assertion
+    // removed the same mutation reddens nothing.
     expect(fan!.compareDocumentPosition(cards[0]!) & Node.DOCUMENT_POSITION_FOLLOWING)
       .toBeTruthy();
   });
@@ -680,26 +679,18 @@ describe("WinstonPileTable", () => {
     expect(revealed).not.toHaveClass("z-10");
   });
 
-  it("gives a touch pointer no lift", () => {
-    // The paired negative for the row above, and the only thing in this file
-    // that enters the touch gate — `grep -n '"touch"'` over this file prints
-    // the two `fireEvent` lines below and, apart from this comment, nothing
-    // else. Same fixture, same stubbed rect, same in-band `clientY` of 115, so
-    // `pointerType` is the only difference the GATE can see and the row above
-    // is this one's positive control. The two rows are not otherwise
-    // identical, and every difference cuts the safe way: this one fires an
-    // extra `pointerMove`, which only gives the negative a second chance to
-    // fail, and carries a `pointerId: 1` that nothing in `RevealedCard` reads
-    // and that matches this repo's touch idiom (`grep -n pointerId
-    // client/src/hooks/__tests__/useCardHover.test.tsx` prints five lines, all
-    // of them on touch events); the row above additionally asserts the
-    // pre-state and fires a `pointerLeave`, neither of which a negative needs.
+  it("gives a touch pointer no hover lift", () => {
+    // The paired negative for the row above: same fixture, same stubbed rect,
+    // same in-band `clientY` of 115, so `pointerType` is the only difference
+    // the hover GATE can see. A touch pointer merely entering or moving over a
+    // card raises nothing — touch gets its lift from a TAP instead, which is
+    // the paired POSITIVE below, "lifts a covered card when a touch player
+    // taps it". `pointerId: 1` matches this repo's touch idiom (`grep -n
+    // pointerId client/src/hooks/__tests__/useCardHover.test.tsx` prints five
+    // lines, all on touch events) but nothing in `RevealedCard` reads it.
     // Without the stub happy-dom's 0x0 rect would reduce the band to
     // `clientY <= 0` and a `fireEvent` default `clientY` of 0 would satisfy
-    // it, which is a pass nobody chose. Touch drives card inspection by tap
-    // and long-press instead (`useCardHover.ts::useCardHover` composes
-    // `useLongPress`), so a lift a touch player never asked for would raise a
-    // card over the one they were reading.
+    // it, which is a pass nobody chose.
     renderTable(
       activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
     );
@@ -711,6 +702,182 @@ describe("WinstonPileTable", () => {
     fireEvent.pointerMove(revealed, { clientY: 115, pointerId: 1, pointerType: "touch" });
 
     expect(revealed).not.toHaveClass("z-10");
+  });
+
+  it("lifts a covered card when a touch player taps it", () => {
+    // The tap toggle's positive arm. `fireEvent.click(el, { pointerType })`
+    // silently DROPS `pointerType` under happy-dom — `MouseEvent` declares no
+    // such field, and `@testing-library/dom` constructs the event with no
+    // `Object.assign` onto it — so the click here is a BARE `fireEvent.click`,
+    // and the touch signal comes entirely from the real `PointerEvent`
+    // `fireEvent.pointerDown` fires first, matching this repo's own idiom
+    // (`useDraftWorkspaceDrag.test.tsx::firePointerActivation`). `RevealedCard`
+    // reads that pointerdown's `pointerType`, not the click's own.
+    renderTable(
+      activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
+    );
+
+    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card='c1']")!;
+    fireEvent.pointerDown(revealed, { pointerType: "touch" });
+    fireEvent.click(revealed);
+
+    expect(revealed).toHaveClass("z-10");
+  });
+
+  it("drops a tapped lift when the same card is tapped again", () => {
+    // A plain double-tap toggle: the second tap must release what the first
+    // one lifted, which requires `onPointerDown` to snapshot the CURRENT
+    // `lifted` prop on every tap rather than a value fixed once. MEASURED:
+    // hard-coding that snapshot's `wasLifted` to `false` (so it never reads
+    // the live prop) reddens the second assertion below and nothing else
+    // across this file or `DraftPodPage.winston.test.tsx`.
+    renderTable(
+      activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
+    );
+
+    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card='c1']")!;
+
+    fireEvent.pointerDown(revealed, { pointerType: "touch" });
+    fireEvent.click(revealed);
+    expect(revealed).toHaveClass("z-10");
+
+    fireEvent.pointerDown(revealed, { pointerType: "touch" });
+    fireEvent.click(revealed);
+    expect(revealed).not.toHaveClass("z-10");
+  });
+
+  it("survives a browser that focuses the card on tap before the click fires", () => {
+    // No lane here observes REAL browser hit-testing, or whether any given
+    // mobile browser focuses a `tabIndex={0}` div on tap — REASONING, not
+    // measured (see the module doc's LAYOUT paragraph and `RevealedCard`'s own
+    // `onPointerDown` comment). What this row pins is that IF a browser does,
+    // the toggle still lands right: `fireEvent.focus` here stands in for that
+    // browser's default focus-on-tap action, landing between `pointerdown` and
+    // `click` exactly as it would there. MEASURED: reading the live `lifted`
+    // prop in `onClick` instead of the ref's pre-tap snapshot makes the tap
+    // read the lift ITS OWN focus just wrote and toggle it back off —
+    // reddening this row and nothing else across this file or
+    // `DraftPodPage.winston.test.tsx`.
+    renderTable(
+      activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
+    );
+
+    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card='c1']")!;
+
+    fireEvent.pointerDown(revealed, { pointerType: "touch" });
+    fireEvent.focus(revealed);
+    fireEvent.click(revealed);
+
+    expect(revealed).toHaveClass("z-10");
+  });
+
+  it("gives a mouse click no lift", () => {
+    // Two genuinely different code paths, not decoration: a click's own
+    // `pointerType` is never read (that field is populated inconsistently
+    // across browsers — Chromium/WebKit dispatch a compatibility `click` as a
+    // `PointerEvent`, Firefox has historically dispatched a bare `MouseEvent`
+    // — which is why the allowlist reads the PRECEDING `pointerdown`'s
+    // `pointerType` instead). The first probe has no preceding `pointerdown`
+    // at all, so the ref is `null` and the allowlist fails closed on that.
+    // The second probe has a real `pointerdown`, but recorded as `"mouse"`,
+    // so the allowlist fails closed on the recorded value instead.
+    renderTable(
+      activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
+    );
+
+    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card='c1']")!;
+
+    fireEvent.click(revealed);
+    expect(revealed).not.toHaveClass("z-10");
+
+    fireEvent.pointerDown(revealed, { pointerType: "mouse" });
+    fireEvent.click(revealed);
+    expect(revealed).not.toHaveClass("z-10");
+  });
+
+  it("clears a completed tap's own record before a later bare click reads it", () => {
+    // Pins the `tapRef.current = null` clear the `onClick` comment claims.
+    // Without it, a later bare `click` (no preceding `pointerdown`) would
+    // replay the FIRST tap's stale record and re-toggle the lift even though
+    // something else — here, a blur — already dropped it in between. Uses
+    // focus/blur rather than a second touch tap to change `lifted` in
+    // between, because a second real tap would itself write a fresh
+    // `tapRef` entry and so could never observe a STALE one.
+    // MEASURED: deleting `tapRef.current = null;` reddens the final
+    // assertion below.
+    renderTable(
+      activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
+    );
+
+    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card='c1']")!;
+
+    fireEvent.pointerDown(revealed, { pointerType: "touch" });
+    fireEvent.click(revealed);
+    expect(revealed).toHaveClass("z-10");
+
+    fireEvent.focus(revealed);
+    fireEvent.blur(revealed);
+    expect(revealed).not.toHaveClass("z-10");
+
+    fireEvent.click(revealed); // bare click, no preceding pointerdown
+    expect(revealed).not.toHaveClass("z-10");
+  });
+
+  it("lifts one card at a time in a pile", () => {
+    // The hoist's own regression test: `lifted` used to be local `useState`
+    // inside `RevealedCard`, so two cards in the same pile could each hold
+    // their own lift. `Pile` now owns a single `liftedCard`, so tapping the
+    // second card must release the first — required for touch to work at all,
+    // since a lifted card takes `z-10` and paints over the strip of the card
+    // after it. MEASURED: reverting the hoist (restoring `RevealedCard`'s own
+    // `useState`) reddens the final assertion below.
+    renderTable(
+      activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
+    );
+
+    const c1 = document.querySelector<HTMLElement>("[data-winston-revealed-card='c1']")!;
+    const c2 = document.querySelector<HTMLElement>("[data-winston-revealed-card='c2']")!;
+
+    fireEvent.pointerDown(c1, { pointerType: "touch" });
+    fireEvent.click(c1);
+    expect(c1).toHaveClass("z-10");
+
+    fireEvent.pointerDown(c2, { pointerType: "touch" });
+    fireEvent.click(c2);
+    expect(c2).toHaveClass("z-10");
+    expect(c1).not.toHaveClass("z-10");
+  });
+
+  it("leaves a hovered card's lift alone when a different card loses focus", () => {
+    // The hoist's other regression, caught in review rather than by a test
+    // written blind: under a single `liftedCard`, an UNGUARDED "off" call from
+    // any card would clear it unconditionally, so card A losing focus could
+    // wipe card B's live MOUSE hover lift out from under the cursor still
+    // sitting on B. `Pile`'s reducer only clears `liftedCard` when the card
+    // calling `onLiftChange(false)` IS the one currently holding it.
+    // MEASURED: dropping that identity guard (clearing unconditionally on
+    // `next === false`, as the naive hoist first did) reddens the final
+    // assertion below.
+    renderTable(
+      activeTurn(
+        [pile(0, 3, [card("c1", "Ponder"), card("c2", "Opt"), card("c3", "Brainstorm")], null, null)],
+        0,
+      ),
+    );
+
+    const a = document.querySelector<HTMLElement>("[data-winston-revealed-card='c1']")!;
+    const b = document.querySelector<HTMLElement>("[data-winston-revealed-card='c2']")!;
+    stubCardRect(b, 100);
+
+    fireEvent.focus(a);
+    expect(a).toHaveClass("z-10");
+
+    fireEvent.pointerEnter(b, { clientY: 115, pointerType: "mouse" });
+    expect(b).toHaveClass("z-10");
+    expect(a).not.toHaveClass("z-10"); // sanity: the pile's one slot moved to B
+
+    fireEvent.blur(a);
+    expect(b).toHaveClass("z-10");
   });
 
   it("lifts a covered card for a pen pointer too", () => {
@@ -733,10 +900,12 @@ describe("WinstonPileTable", () => {
   });
 
   it("releases a lifted card when the pointer drops below its exposed strip, and lifts the one under it instead", () => {
-    // The reported defect, and MEASURED to be the row that catches it:
-    // replacing the band predicate with a bare `setLifted(true)` — the
-    // behaviour before this commit, where a lift was held for as long as the
-    // pointer was anywhere inside the card — reddens this row.
+    // The reported defect. Replacing the band predicate with a bare
+    // `onLiftChange(true)` — the behaviour before this commit, where a lift
+    // was held for as long as the pointer was anywhere inside the card —
+    // reddens this row. MEASURED: it also reddens "drops a focus lift once
+    // the pointer moves below the card's exposed strip" below, since both
+    // rows read the same predicate.
     //
     // What a real browser then does — re-route the pointer to the card
     // underneath the instant the one above stops being `z-10` — is hit-testing,
@@ -788,16 +957,16 @@ describe("WinstonPileTable", () => {
   });
 
   it("drops a focus lift when the pointer leaves the card", () => {
-    // The other half of the ONE-flag design, and the half that was unmeasured:
-    // `onPointerLeave` clears the lift whether a pointer or a focus put it
-    // there. The sibling row above drives the same flag through a move that
-    // lands below the strip; this one drives it through the leave, which is a
-    // different binding and is band-gated by nothing. MEASURED: giving focus
-    // its own flag and guarding the leave with it
-    // (`onPointerLeave={() => { if (!focused) setLifted(false); }}`, plus an
-    // `onFocus`/`onBlur` pair that sets it) reddens this row and no other
-    // across this file and `DraftPodPage.winston.test.tsx`. No rect is stubbed
-    // and none is wanted: neither a focus nor a leave reads one.
+    // The other half of the ONE-flag design: `onPointerLeave` clears the lift
+    // whether a pointer or a focus put it there. The sibling row above drives
+    // the same flag through a move that lands below the strip; this one
+    // drives it through the leave, which is a different binding and is
+    // band-gated by nothing. MEASURED: giving focus its own flag and guarding
+    // the leave with it (`onPointerLeave={(e) => { if (!focusedRef.current)
+    // onLiftChange(false); }}`, plus an `onFocus`/`onBlur` pair that sets the
+    // ref) reddens this row and no other across this file and
+    // `DraftPodPage.winston.test.tsx`. No rect is stubbed and none is wanted:
+    // neither a focus nor a leave reads one.
     renderTable(
       activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
     );
@@ -856,8 +1025,8 @@ describe("WinstonPileTable", () => {
     // and that count is the same wherever they sit
     // (`grep -rn data-winston-decision client/src`).
     // MEASURED: rendering the actions block as a sibling of
-    // `[data-winston-pile]` instead of a child reddens 8 of this file's 41
-    // rows — exactly the 8 that call the helper, this one among them.
+    // `[data-winston-pile]` instead of a child reddens exactly the rows that
+    // call the helper and no others, this one among them.
     renderTable(activeTurn([pile(0, 1, [card("c1", "Ponder")], null, null)], 0));
 
     const pileEl = document.querySelector("[data-winston-pile='0']")!;
@@ -994,10 +1163,10 @@ describe("WinstonPileTable", () => {
   it("reaches the card a keyboard player is deciding on", () => {
     // The decision controls are real buttons, so a keyboard player can Take a
     // pile. Focusing its cards is how they can first read one, and the name is
-    // declared on the card itself. The `aria-label` DECLARATION is what this
-    // pins and all it pins: the element is a `div` with no `role`, and whether
-    // the label then reaches assistive technology on a role-less element is
-    // not established anywhere in this repo. Nothing else in this file asserts
+    // declared on the card itself. The `aria-label` and `role` DECLARATIONS
+    // are what this pins and all it pins: whether the label then reaches
+    // assistive technology through a `div` carrying `role="button"` is not
+    // established anywhere in this repo. Nothing else in this file asserts
     // it.
     renderTable(activeTurn([pile(0, 3, [card("c1", "Ponder")], null, null)], 0));
 
@@ -1005,5 +1174,184 @@ describe("WinstonPileTable", () => {
     expect(revealed).not.toBeNull();
     expect(revealed!.tabIndex).toBe(0);
     expect(revealed!.getAttribute("aria-label")).toBe("Ponder");
+    expect(revealed!.getAttribute("role")).toBe("button");
+  });
+
+  it("toggles the lift when the focused card takes Enter", () => {
+    // The card is a control now (`role="button"`), and iOS Safari's
+    // compatibility-click gate is the reason -- see `RevealedCard`'s own
+    // `role`/`onKeyDown` comment. `onFocus` above already lifts the card
+    // unconditionally, so this row starts from lifted and pins that Enter
+    // TOGGLES rather than only ever re-lifting. MEASURED: deleting the
+    // `onKeyDown` handler reddens the second assertion below.
+    renderTable(
+      activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
+    );
+
+    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card='c1']")!;
+    fireEvent.focus(revealed);
+    expect(revealed).toHaveClass("z-10");
+
+    fireEvent.keyDown(revealed, { key: "Enter" });
+    expect(revealed).not.toHaveClass("z-10");
+
+    fireEvent.keyDown(revealed, { key: "Enter" });
+    expect(revealed).toHaveClass("z-10");
+  });
+
+  it("toggles the lift when the focused card takes Space", () => {
+    // The paired key for the row above: ARIA authoring practice for a
+    // `role="button"` element requires BOTH keys, since only a native
+    // `<button>` gets either for free. MEASURED: deleting the `onKeyDown`
+    // handler reddens the second assertion below.
+    renderTable(
+      activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
+    );
+
+    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card='c1']")!;
+    fireEvent.focus(revealed);
+    expect(revealed).toHaveClass("z-10");
+
+    fireEvent.keyDown(revealed, { key: " " });
+    expect(revealed).not.toHaveClass("z-10");
+
+    fireEvent.keyDown(revealed, { key: " " });
+    expect(revealed).toHaveClass("z-10");
+  });
+
+  it("gives an unrelated key no lift toggle", () => {
+    // The allowlist's negative: only Enter and Space are meant to toggle.
+    // MEASURED: removing the `event.key !== "Enter" && event.key !== " "`
+    // check (so `onKeyDown` toggles on any key) reddens this row's own
+    // assertion; nothing else in this file or `DraftPodPage.winston.test.tsx`
+    // presses a key other than Enter or Space on a revealed card, so no other
+    // row catches it.
+    renderTable(
+      activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
+    );
+
+    const revealed = document.querySelector<HTMLElement>("[data-winston-revealed-card='c1']")!;
+    fireEvent.focus(revealed);
+    expect(revealed).toHaveClass("z-10");
+
+    fireEvent.keyDown(revealed, { key: "Tab" });
+    expect(revealed).toHaveClass("z-10");
+  });
+
+  // ── Spread toggle ────────────────────────────────────────────────────
+  //
+  // The other route to a covered card, alongside the tap above: a real
+  // `<button>` per pile that un-stacks its revealed faces outright, reaching
+  // the same cards with no dependence on a pointer's own reported type.
+
+  it("un-stacks a pile's revealed faces when the player spreads it", () => {
+    renderTable(
+      activeTurn(
+        [pile(0, 3, [card("c1", "Ponder"), card("c2", "Opt"), card("c3", "Brainstorm")], null, null)],
+        0,
+      ),
+    );
+
+    const cards = Array.from(document.querySelectorAll<HTMLElement>("[data-winston-revealed-card]"));
+    // Positive control: stacked by default, so the toggle below has something
+    // to undo.
+    expect(cards[1]!.style.marginTop).toMatch(/^-[\d.]+%$/);
+
+    const spreadToggle = screen.getByRole("button", { name: "Spread out pile 1" });
+    // The 44px touch target the decision buttons carry
+    // (`buttonStyles.ts::menuButtonClass`'s `sm` size), asserted directly
+    // rather than left to the commit message: MEASURED, flipping this
+    // button's `size` from `"sm"` to `"icon"` reddens this assertion.
+    expect(spreadToggle).toHaveClass("min-h-11");
+    fireEvent.click(spreadToggle);
+
+    expect(cards[1]!.style.marginTop).not.toMatch(/^-/);
+    // A plain gap, uniform down the column, not a scaled-up overlap.
+    expect(cards[1]!.style.marginTop).toBe(cards[2]!.style.marginTop);
+    // The top card takes no margin whether spread or stacked.
+    expect(cards[0]!.style.marginTop).toBe("");
+  });
+
+  it("leaves the face-down fan stacked when a pile is spread", () => {
+    // Backs are a height, never contents (`FaceDownStack`'s own doc), so
+    // spreading them would buy card-heights of nothing — `stackMarginTop`'s
+    // `spread` argument reaches `RevealedCard` only, never `FaceDownStack`.
+    renderTable(
+      activeTurn([pile(0, 4, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
+    );
+
+    const fan = document.querySelector<HTMLElement>("[data-winston-pile-facedown]")!;
+    const backs = Array.from(fan.querySelectorAll<HTMLElement>(":scope > *"));
+    // Positive control: the fan exists and still overlaps before the toggle.
+    expect(backs).toHaveLength(2);
+    expect(backs[1]!.style.marginTop).toMatch(/^-[\d.]+%$/);
+
+    fireEvent.click(screen.getByRole("button", { name: "Spread out pile 1" }));
+
+    // Unchanged: the fan still overlaps.
+    expect(backs[1]!.style.marginTop).toMatch(/^-[\d.]+%$/);
+    // The first revealed card, which stacks ONTO the fan, now clears it with
+    // the plain gap instead of the negative overlap.
+    const cards = Array.from(document.querySelectorAll<HTMLElement>("[data-winston-revealed-card]"));
+    expect(cards[0]!.style.marginTop).not.toMatch(/^-/);
+  });
+
+  it("restacks a pile when the spread toggle is pressed again", () => {
+    renderTable(
+      activeTurn([pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null)], 0),
+    );
+
+    const spreadToggle = screen.getByRole("button", { name: "Spread out pile 1" });
+    expect(spreadToggle).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(spreadToggle);
+    // `getByRole` with the STACKED label throws if the label ever freezes on
+    // one string instead of tracking the toggle.
+    const stackToggle = screen.getByRole("button", { name: "Stack up pile 1" });
+    expect(stackToggle).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.click(stackToggle);
+    expect(screen.getByRole("button", { name: "Spread out pile 1" }))
+      .toHaveAttribute("aria-expanded", "false");
+    const cards = Array.from(document.querySelectorAll<HTMLElement>("[data-winston-revealed-card]"));
+    expect(cards[1]!.style.marginTop).toMatch(/^-[\d.]+%$/);
+  });
+
+  it("spreads one pile without spreading its neighbours", () => {
+    renderTable(
+      activeTurn(
+        [
+          pile(0, 2, [card("c1", "Ponder"), card("c2", "Opt")], null, null),
+          pile(1, 2, [card("c3", "Brainstorm"), card("c4", "Preordain")], null, null),
+        ],
+        0,
+      ),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Spread out pile 1" }));
+
+    const pile0Cards = document.querySelectorAll<HTMLElement>(
+      "[data-winston-pile='0'] [data-winston-revealed-card]",
+    );
+    const pile1Cards = document.querySelectorAll<HTMLElement>(
+      "[data-winston-pile='1'] [data-winston-revealed-card]",
+    );
+    expect(pile0Cards[1]!.style.marginTop).not.toMatch(/^-/);
+    expect(pile1Cards[1]!.style.marginTop).toMatch(/^-[\d.]+%$/);
+  });
+
+  it("offers the spread toggle on every pile, including one with nothing to spread", () => {
+    // No `shownRevealed.length > 1` gate: a length comparison feeding a
+    // control would be a THIRD sum in a file whose module doc names exactly
+    // two ("splitting a published total into its face-up and face-down halves
+    // and turning two counts into a bar width are the only sums here").
+    renderTable(
+      activeTurn(
+        [pile(0, 1, [card("c1", "Ponder")], null, null), pile(1, 3, [], null, null)],
+        0,
+      ),
+    );
+
+    expect(document.querySelectorAll("[data-winston-pile-spread]")).toHaveLength(2);
   });
 });

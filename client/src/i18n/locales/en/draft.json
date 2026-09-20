@@ -679,6 +679,8 @@
     "takeAria": "Take pile {{index}}",
     "decline": "Decline",
     "declineAria": "Decline pile {{index}}",
+    "spreadPile": "Spread out pile {{index}}",
+    "stackPile": "Stack up pile {{index}}",
     "refusal": {
       "PileNotActive": "You are not deciding on this pile.",
       "PileEmpty": "This pile is empty, so there is nothing to take.",

@@ -654,6 +654,8 @@
     "takeAria": "Prendre le tas {{index}}",
     "decline": "Refuser",
     "declineAria": "Refuser le tas {{index}}",
+    "spreadPile": "Étaler le tas {{index}}",
+    "stackPile": "Empiler le tas {{index}}",
     "refusal": {
       "PileNotActive": "Vous ne décidez pas sur ce tas.",
       "PileEmpty": "Ce tas est vide, il n'y a rien à prendre.",

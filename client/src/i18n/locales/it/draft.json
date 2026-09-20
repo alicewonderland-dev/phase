@@ -654,6 +654,8 @@
     "takeAria": "Prendi il mucchio {{index}}",
     "decline": "Rifiuta",
     "declineAria": "Rifiuta il mucchio {{index}}",
+    "spreadPile": "Distendi il mucchio {{index}}",
+    "stackPile": "Impila il mucchio {{index}}",
     "refusal": {
       "PileNotActive": "Non stai decidendo su questo mucchio.",
       "PileEmpty": "Questo mucchio è vuoto, non c'è nulla da prendere.",

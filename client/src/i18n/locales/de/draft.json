@@ -654,6 +654,8 @@
     "takeAria": "Häufchen {{index}} nehmen",
     "decline": "Ablehnen",
     "declineAria": "Häufchen {{index}} ablehnen",
+    "spreadPile": "Häufchen {{index}} ausbreiten",
+    "stackPile": "Häufchen {{index}} stapeln",
     "refusal": {
       "PileNotActive": "Du entscheidest nicht über dieses Häufchen.",
       "PileEmpty": "Dieses Häufchen ist leer, es gibt nichts zu nehmen.",
