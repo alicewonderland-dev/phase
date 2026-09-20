@@ -87,9 +87,10 @@ pub struct FormatMetadata {
 /// not `CustomFormatId` itself. When the payload DOES implement `Default`,
 /// `iter()` instead SILENTLY gains a default-valued member — the same failure
 /// shape as `#[strum(disabled)]` on a UNIT variant removing it from `iter()`
-/// SILENTLY. Both silent cases are caught only by the independent authority
-/// `tests::registry_lists_every_builtin_format`, which compares `iter()` to the
-/// hand-written `registry()` below.
+/// SILENTLY. Both silent cases are caught by
+/// `tests::registry_lists_every_builtin_format`, which compares `iter()` to
+/// the hand-written `registry()` below (mutation-tested: `#[strum(disabled)]`
+/// on `Momir` reds it, plus three other `iter()`-vs-hand-written-list guards).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
 pub enum GameFormat {
     Standard,
@@ -4004,43 +4005,18 @@ mod tests {
     }
 
     /// `GameFormat::registry()` must carry an entry for every built-in format,
-    /// exactly once.
+    /// exactly once, with no entry the enum does not carry.
     ///
-    /// Measured before this test existed: the registry DID list all 23, and
-    /// NOTHING asserted that. What the existing `registry()` consumers do
-    /// instead — measured, not assumed, with
-    /// `rg -n 'GameFormat::registry\(\)' crates/engine/src/types/format.rs`,
-    /// which prints ELEVEN hits, ten of them consumers (the first is this
-    /// file's `FormatMetadata` doc comment): they sit in NINE test fns, of
-    /// which FIVE never pin a format — they iterate it, and one also bounds a
-    /// count by `registry().len()`, which fails open the same way — so a
-    /// variant missing from it is silently skipped by those;
-    /// and FOUR pin one specific format with `.find(..)` / `.position(..)`
-    /// followed by `.expect(..)`, so a missing entry panics there —
-    /// `limited_in_registry`, `format_registry_includes_two_headed_giant`,
-    /// `archenemy_registry_entry_uses_default_topology` and
-    /// `premodern_registry_entry_is_ordered_with_constructed_formats`, pinning
-    /// Limited, TwoHeadedGiant, Archenemy, Modern, Premodern and Legacy.
-    /// So SIX of the 23 were guarded against ABSENCE and seventeen were not;
-    /// none of the 23 was guarded against a DUPLICATE or against an entry the
-    /// enum does not carry, and nothing asserted totality in either direction.
-    /// Those three gaps are what this test closes.
+    /// Compared as SORTED sets, deliberately: `registry()`'s row order is a
+    /// separate contract, pinned by
+    /// `premodern_registry_entry_is_ordered_with_constructed_formats`, and
+    /// this test must not duplicate or contradict it. Sorted-vector equality
+    /// still catches a duplicate, because a duplicate changes the length.
     ///
-    /// Compared as SORTED sets, deliberately. Measured: `registry()`'s order is
-    /// the frontend picker's grouping (`Standard, Pioneer, Modern, …`) and is
-    /// NOT declaration order (`Standard, Limited, Commander, Pioneer, …`);
-    /// `premodern_registry_entry_is_ordered_with_constructed_formats` is what
-    /// pins the grouping, and this test must not duplicate or contradict it.
-    /// Sorted-vector equality still catches a DUPLICATE, because a duplicate
-    /// changes the length.
-    ///
-    /// This is also the independent authority on `#[strum(disabled)]`: a
-    /// built-in disabled out of `iter()` while `registry()` still lists it reds
-    /// here.
-    ///
-    /// A future built-in that should NOT be user-selectable will red this test.
-    /// That is intended: the exclusion is a decision to make explicitly, not one
-    /// to reach by omission.
+    /// Also the independent authority on `#[strum(disabled)]`: a built-in
+    /// disabled out of `iter()` while `registry()` still lists it unbalances
+    /// the two sorted sets and reds here (mutation-tested alongside the
+    /// enum's own doc comment above).
     #[test]
     fn registry_lists_every_builtin_format() {
         use strum::IntoEnumIterator;
@@ -4063,10 +4039,10 @@ mod tests {
     ///
     /// `source_census::code` is this repository's single authority on which
     /// part of a line is code; TypeScript's `//` is lexically the same as
-    /// Rust's for that purpose, so the policy is REUSED rather than
-    /// re-invented. Measured reason it matters: `HomeDashboard.tsx` names a
-    /// format inside a comment, and a census that counts comment text reports a
-    /// 9-entry table as 10.
+    /// Rust's for that purpose, so it is reused per `source_census`'s
+    /// single-authority rule rather than re-invented. Mutation-tested:
+    /// bypassing both call sites here leaves both callers below green
+    /// against the current file contents — no line depends on it today.
     ///
     /// `region` is a parameter because `types.ts` carries 239 lines matching
     /// `| "…"` across all its unions and only 23 of them belong to

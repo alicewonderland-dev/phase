@@ -114,9 +114,14 @@ export interface RoomMarkerPoint {
  *
  * `format::tests::client_builtin_game_format_union_matches_the_engine`, in
  * crates/engine/src/types/format.rs, reads this file with `include_str!` and
- * asserts this union names exactly `GameFormat::iter()`, so a member added,
- * removed or renamed on either side reds in CI job `rust-test` step "Run tests"
- * and in Tilt's `test-engine`.
+ * asserts this union names exactly `GameFormat::iter()`. A CLIENT-side
+ * member added, removed or renamed reds that assertion at runtime, in Tilt's
+ * `test-engine` and in CI job `rust-test` step "Run tests" (mutation-tested:
+ * renaming a member here reds the assertion above by name). An ENGINE-side
+ * variant change instead reds the compiler first (`E0004` in this crate's
+ * exhaustive `match`es over `GameFormat`), which in CI fails the earlier
+ * `rust-test-build` job rather than `rust-test`'s "Run tests" step, which
+ * only extracts and executes an already-built archive.
  */
 export type BuiltInGameFormat =
   | "Standard"
