@@ -66,9 +66,11 @@ ENGINE_SRC = [
 ENGINE_TESTS = ['crates/engine/tests/']
 # `crates/engine/src/types/format.rs` `include_str!`s the first two files
 # below into `phase-engine`'s own test binary (mirror-drift assertions), and
-# `tests/integration/interaction_contract.rs`, compiled into that same
-# binary, `include_str!`s the third. A client-only edit to any of them is
-# therefore an ENGINE compile-input change same as anything in ENGINE_SRC.
+# `tests/integration/interaction_contract.rs`, compiled into the crate's
+# separate `integration` test binary, `include_str!`s the third -- both
+# binaries are built by every one of the three resources below. A
+# client-only edit to any of them is therefore an ENGINE compile-input
+# change same as anything in ENGINE_SRC.
 #
 # `resource_deps` orders STARTUP only, it does not retrigger on a file change
 # -- MEASURED on Tilt 0.37.7 with a live `tilt up` against a scratch

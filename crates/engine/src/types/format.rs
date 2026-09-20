@@ -4009,8 +4009,11 @@ mod tests {
     ///
     /// Compared as SORTED sets, deliberately: `registry()`'s row order is a
     /// separate contract, pinned by
-    /// `premodern_registry_entry_is_ordered_with_constructed_formats`, and
-    /// this test must not duplicate or contradict it. Sorted-vector equality
+    /// `client_format_registry_matches_the_engine_registry` (mutation-tested:
+    /// swapping two `registry()` rows reds only that test, not this one).
+    /// `premodern_registry_entry_is_ordered_with_constructed_formats`
+    /// additionally pins the Modern→Premodern→Legacy run specifically. This
+    /// test must not duplicate or contradict either. Sorted-vector equality
     /// still catches a duplicate, because a duplicate changes the length.
     ///
     /// Also the independent authority on `#[strum(disabled)]`: a built-in
