@@ -188,14 +188,32 @@ fn tangle_angler_forces_a_block_before_it_attacks() {
     // effect resolves"` and is not in `should_exclude_event`'s drop set, so
     // this is a coverage gap, not a defect (confirmed by running it here,
     // not by reading the source alone).
-    let rendered = format!(
-        "{:?}",
-        engine::game::log::resolve_log_entries(outcome.events(), &before, outcome.state())
-    );
+    let entries =
+        engine::game::log::resolve_log_entries(outcome.events(), &before, outcome.state());
+    // Checked against the EffectResolved entry's OWN segments, not a
+    // flattened-log substring search: measured this round that
+    // `rendered.contains("Tangle Angler") && rendered.contains("effect
+    // resolves")` stayed green even after replacing `card_seg(state,
+    // *source_id)` in `log.rs` with a literal (rendering `"Nobody's effect
+    // resolves"`), because the unrelated `activates ability` entry still
+    // supplies "Tangle Angler" on its own. Matching this entry's segments
+    // directly against `LogSegment::CardName { object_id: angler, .. }`
+    // followed by `LogSegment::Text("'s effect resolves")` ties the
+    // assertion to the EffectResolved rendering specifically, and reddens
+    // under that exact mutation (confirmed this round, then reverted).
+    let effect_resolved_entry = entries.iter().find(|entry| {
+        matches!(
+            entry.segments.as_slice(),
+            [
+                engine::types::log::LogSegment::CardName { object_id, .. },
+                engine::types::log::LogSegment::Text(suffix)
+            ] if *object_id == angler && suffix == "'s effect resolves"
+        )
+    });
     assert!(
-        rendered.contains("Tangle Angler") && rendered.contains("effect resolves"),
-        "the ForceBlock ability's resolution must produce a game-log entry \
-         naming its source, got: {rendered}"
+        effect_resolved_entry.is_some(),
+        "the ForceBlock ability's resolution must produce an EffectResolved \
+         log entry naming Angler as its own source, got entries: {entries:?}"
     );
 
     attack_and_reach_declare_blockers(&mut runner, &[angler]);
@@ -257,9 +275,6 @@ fn tangle_angler_requirement_persists_into_a_second_combat_phase() {
     // `Phase::DeclareBlockers`, and the phase trace between the two combats
     // read `[DeclareBlockers, BeginCombat, DeclareAttackers]` —
     // `Phase::EndCombat` was never in it, so the teardown never ran.
-    // `phases_visited` records every phase this drive observes so the reach
-    // guard below can confirm the boundary was actually crossed.
-    let mut phases_visited = vec![runner.state().phase];
     for _ in 0..40 {
         if runner.state().phase == Phase::EndCombat
             && matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
@@ -283,12 +298,10 @@ fn tangle_angler_requirement_persists_into_a_second_combat_phase() {
         } else if runner.act(GameAction::PassPriority).is_err() {
             break;
         }
-        phases_visited.push(runner.state().phase);
     }
-    // Reach guard: combat 1 must have actually reached the EndCombat step's
-    // priority window — otherwise the `ExtraPhase` below is anchored to a
-    // phase the engine may never leave via the ordinary path, and everything
-    // after it is vacuous.
+    // Reach guard, proven load-bearing this round: replacing this loop's
+    // `0..40` with `0..0` (so combat 1's drive never runs) reddens this
+    // assertion directly (`left: DeclareBlockers, right: EndCombat`).
     assert_eq!(
         runner.state().phase,
         Phase::EndCombat,
@@ -301,7 +314,12 @@ fn tangle_angler_requirement_persists_into_a_second_combat_phase() {
     // documents the same anchor choice: "the trigger resolver pushes with
     // anchor = EndCombat and the engine then advances out of EndCombat into
     // the extra BeginCombat" (CR 500.8: an extra phase is inserted directly
-    // after its anchor phase).
+    // after its anchor phase). This `anchor: Phase::EndCombat` literal is the
+    // line this test actually discriminates: proven this round by changing
+    // it to `Phase::DeclareBlockers`, which reddens the `DeclareAttackers`
+    // reach guard below (`left: Draw, right: DeclareAttackers` — the extra
+    // phase is never inserted, so the drive below runs out its 60 iterations
+    // into the next turn instead).
     runner.state_mut().extra_phases.push(ExtraPhase {
         anchor: Phase::EndCombat,
         phase: Phase::BeginCombat,
@@ -310,7 +328,6 @@ fn tangle_angler_requirement_persists_into_a_second_combat_phase() {
     });
 
     for _ in 0..60 {
-        phases_visited.push(runner.state().phase);
         if runner.state().phase == Phase::DeclareAttackers
             && matches!(
                 runner.state().waiting_for,
@@ -323,19 +340,6 @@ fn tangle_angler_requirement_persists_into_a_second_combat_phase() {
             break;
         }
     }
-    // Phase-trace assertion: the `ExtraPhase` pushed above is only consumed by
-    // `advance_phase_once` when LEAVING `Phase::EndCombat` (the same call that
-    // runs `complete_end_combat_teardown`), so reaching `DeclareAttackers`
-    // below is only possible if the trace actually crossed `Phase::EndCombat`.
-    // This is asserted directly, rather than left as an inference from the
-    // `DeclareAttackers` reach guard, so a future edit that short-circuits the
-    // drive (e.g. reintroducing this round's bug) cannot silently regress
-    // past this line.
-    assert!(
-        phases_visited.contains(&Phase::EndCombat),
-        "reach guard: the phase trace must cross Phase::EndCombat for the real \
-         end-of-combat teardown to run; got {phases_visited:?}"
-    );
     // Reach guard: the second combat's declare-attackers step must actually
     // have been reached — otherwise everything below is vacuous.
     assert_eq!(
