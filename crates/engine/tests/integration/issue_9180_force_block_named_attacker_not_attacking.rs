@@ -164,6 +164,7 @@ fn tangle_angler_forces_a_block_before_it_attacks() {
 
     assert_sole_ability_is_force_block(&runner, angler);
 
+    let before = runner.state().clone();
     add_mana(&mut runner, ManaType::Green, 1);
     let outcome = runner.activate(angler, 0).target_object(bear).resolve();
     // I1-RG: the cost was actually paid and the ability actually resolved off
@@ -177,6 +178,24 @@ fn tangle_angler_forces_a_block_before_it_attacks() {
         outcome.stack_size(),
         0,
         "reach guard: the ability must have resolved off the stack"
+    );
+
+    // The issue's actual user-visible symptom: the player reported seeing
+    // nothing in the game log for this resolution. `resolve_log_entries`
+    // (`engine::game::log`) is the single production authority that turns
+    // engine events into the log the frontend renders — `EffectResolved`
+    // (`log.rs`'s `GameEvent::EffectResolved` arm) renders as `"<source>'s
+    // effect resolves"` and is not in `should_exclude_event`'s drop set, so
+    // this is a coverage gap, not a defect (confirmed by running it here,
+    // not by reading the source alone).
+    let rendered = format!(
+        "{:?}",
+        engine::game::log::resolve_log_entries(outcome.events(), &before, outcome.state())
+    );
+    assert!(
+        rendered.contains("Tangle Angler") && rendered.contains("effect resolves"),
+        "the ForceBlock ability's resolution must produce a game-log entry \
+         naming its source, got: {rendered}"
     );
 
     attack_and_reach_declare_blockers(&mut runner, &[angler]);
@@ -228,17 +247,70 @@ fn tangle_angler_requirement_persists_into_a_second_combat_phase() {
         .declare_blockers(&[(bear, angler)])
         .expect("combat 1's required block must be legal");
 
-    // CR 500.8: schedule an extra combat phase, mirroring
-    // `ureni_attack_trigger.rs::ureni_attacks_in_second_combat_fires_again`.
-    let current_phase = runner.state().phase;
+    // Drive combat 1 through the combat-damage step and INTO the EndCombat
+    // step's priority window — not just past declare-blockers.
+    // `turns.rs::advance_phase_once` only calls `complete_end_combat_teardown`
+    // (the sole production site that prunes combat-scoped transient continuous
+    // effects, CR 511.3) when LEAVING `Phase::EndCombat`. Measured this
+    // session: capturing the `ExtraPhase` anchor immediately after
+    // `declare_blockers` (as this test did before this round's fix) captures
+    // `Phase::DeclareBlockers`, and the phase trace between the two combats
+    // read `[DeclareBlockers, BeginCombat, DeclareAttackers]` —
+    // `Phase::EndCombat` was never in it, so the teardown never ran.
+    // `phases_visited` records every phase this drive observes so the reach
+    // guard below can confirm the boundary was actually crossed.
+    let mut phases_visited = vec![runner.state().phase];
+    for _ in 0..40 {
+        if runner.state().phase == Phase::EndCombat
+            && matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
+        {
+            break;
+        }
+        if matches!(runner.state().waiting_for, WaitingFor::OrderTriggers { .. }) {
+            let n = if let WaitingFor::OrderTriggers { triggers, .. } = &runner.state().waiting_for
+            {
+                triggers.len()
+            } else {
+                0
+            };
+            runner
+                .act(GameAction::OrderTriggers {
+                    order: (0..n).collect(),
+                })
+                .expect("OrderTriggers should succeed");
+        } else if !runner.state().stack.is_empty() {
+            runner.advance_until_stack_empty();
+        } else if runner.act(GameAction::PassPriority).is_err() {
+            break;
+        }
+        phases_visited.push(runner.state().phase);
+    }
+    // Reach guard: combat 1 must have actually reached the EndCombat step's
+    // priority window — otherwise the `ExtraPhase` below is anchored to a
+    // phase the engine may never leave via the ordinary path, and everything
+    // after it is vacuous.
+    assert_eq!(
+        runner.state().phase,
+        Phase::EndCombat,
+        "combat 1 must reach the EndCombat step's priority window before the \
+         second combat is scheduled"
+    );
+
+    // CR 500.8: schedule an extra combat phase anchored to `Phase::EndCombat`.
+    // `ureni_attack_trigger.rs::ureni_attacks_in_second_combat_fires_again`
+    // documents the same anchor choice: "the trigger resolver pushes with
+    // anchor = EndCombat and the engine then advances out of EndCombat into
+    // the extra BeginCombat" (CR 500.8: an extra phase is inserted directly
+    // after its anchor phase).
     runner.state_mut().extra_phases.push(ExtraPhase {
-        anchor: current_phase,
+        anchor: Phase::EndCombat,
         phase: Phase::BeginCombat,
         attacker_restriction: None,
         attacker_restriction_source: None,
     });
 
     for _ in 0..60 {
+        phases_visited.push(runner.state().phase);
         if runner.state().phase == Phase::DeclareAttackers
             && matches!(
                 runner.state().waiting_for,
@@ -251,6 +323,19 @@ fn tangle_angler_requirement_persists_into_a_second_combat_phase() {
             break;
         }
     }
+    // Phase-trace assertion: the `ExtraPhase` pushed above is only consumed by
+    // `advance_phase_once` when LEAVING `Phase::EndCombat` (the same call that
+    // runs `complete_end_combat_teardown`), so reaching `DeclareAttackers`
+    // below is only possible if the trace actually crossed `Phase::EndCombat`.
+    // This is asserted directly, rather than left as an inference from the
+    // `DeclareAttackers` reach guard, so a future edit that short-circuits the
+    // drive (e.g. reintroducing this round's bug) cannot silently regress
+    // past this line.
+    assert!(
+        phases_visited.contains(&Phase::EndCombat),
+        "reach guard: the phase trace must cross Phase::EndCombat for the real \
+         end-of-combat teardown to run; got {phases_visited:?}"
+    );
     // Reach guard: the second combat's declare-attackers step must actually
     // have been reached — otherwise everything below is vacuous.
     assert_eq!(
