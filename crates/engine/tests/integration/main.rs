@@ -908,6 +908,7 @@ mod issue_8760_airbend_any_number;
 mod issue_8773_class_copy_enters_at_level_one;
 mod issue_879_obsessive_pursuit;
 mod issue_8807_void_mirror_colored_mana;
+mod issue_9180_force_block_named_attacker_not_attacking;
 mod issue_924_offspring;
 mod issue_927_tireless_provisioner;
 mod issue_934_ring_goes_south;
