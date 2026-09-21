@@ -47,10 +47,7 @@ pub struct FormatMetadata {
 /// What this iterator is the authority for, at the width it actually holds.
 /// Not every test that calls `GameFormat::iter()` is coupled to this exact
 /// membership — a test that loops it to assert a per-format property is
-/// coupled only to that property. The guards coupled to membership are the
-/// ones that collect `iter()` into a `Vec`/set and assert it equal to
-/// another such collection; those red by name (or on a set-equality
-/// mismatch) the moment a format is added, renamed, or removed.
+/// coupled only to that property.
 /// `grep -rn 'GameFormat::iter()' crates/engine/` finds every call site
 /// (filter out doc-comment mentions like this one) — that search, not a
 /// hand-copied list here, is what enumerates them.
@@ -90,8 +87,7 @@ pub struct FormatMetadata {
 /// SILENTLY. Both silent cases are caught by
 /// `tests::registry_lists_every_builtin_format`, which compares `iter()` to
 /// the hand-written `registry()` below (mutation-tested: `#[strum(disabled)]`
-/// on `Momir` reds it; `grep -rn 'GameFormat::iter()' crates/engine/` finds
-/// this test's siblings — the other set-equality guards in the same class).
+/// on `Momir` reds it; `grep -rn 'GameFormat::iter()' crates/engine/`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
 pub enum GameFormat {
     Standard,
@@ -4514,7 +4510,7 @@ mod tests {
     /// alone at every call site, and
     /// `no_caller_reintroduces_a_commander_count_literal` in
     /// `format_axis_census.rs` asserts zero surviving per-format
-    /// commander-count literals. Three groups, one per `CommanderPairing`
+    /// commander-count literals. One group per `CommanderPairing`
     /// variant: `partner_families` admits iff count is 1 or 2 (CR 702.124g),
     /// `solo` admits iff count == 1, and `no_commander_per_count` — every
     /// built-in that never designates a commander — admits iff count == 0.
@@ -4587,14 +4583,11 @@ mod tests {
             }
         }
 
-        // Second authority on the same claim: none of `no_commander_per_count`
-        // hold a command zone, cross-checked against an axis independent of
-        // `admits_count`.
         for format in no_commander_per_count {
             assert_eq!(format.command_zone_holds_decklist_commander(), Ok(false));
         }
 
-        // Every built-in appears in exactly one of the three groups above.
+        // Every built-in appears in exactly one of the groups above.
         let mut all: Vec<GameFormat> = partner_families.to_vec();
         all.extend(solo);
         all.extend(no_commander_per_count);
@@ -4610,9 +4603,9 @@ mod tests {
 
     /// Cross-checks `commander_pairing()`'s placement against an existing,
     /// already-pinned axis. Cannot distinguish `Solo` from `PartnerFamilies` —
-    /// only whether a format has a command zone at all — so it catches a
-    /// placement typo the per-count test above would also catch, from an
-    /// independent authority.
+    /// only what `command_zone_holds_decklist_commander` answers — so it
+    /// catches a placement typo the per-count test above would also catch,
+    /// from an independent authority.
     #[test]
     fn commander_pairing_agrees_with_the_command_zone_axis() {
         use strum::IntoEnumIterator;
@@ -4620,12 +4613,13 @@ mod tests {
         for format in GameFormat::iter() {
             // Custom answers `Err` here by design; excluded, as its own doc
             // states.
-            let Ok(has_command_zone) = format.command_zone_holds_decklist_commander() else {
+            let Ok(holds_decklist_commander) = format.command_zone_holds_decklist_commander()
+            else {
                 continue;
             };
             assert_eq!(
                 format.commander_pairing() == CommanderPairing::NoCommander,
-                !has_command_zone,
+                !holds_decklist_commander,
                 "{format:?}: commander_pairing() disagrees with \
                  command_zone_holds_decklist_commander()"
             );
@@ -4636,18 +4630,20 @@ mod tests {
     /// existing axis. Deliberately partial: it cannot separate
     /// `MainDeckAndCommanders` from `MainDeckAndCommandZone` — no existing
     /// method can make that distinction — so it only catches a format placed
-    /// at `MainDeck` that should hold a command zone, or vice versa.
+    /// at `MainDeck` for which `command_zone_holds_decklist_commander` is
+    /// `Ok(true)`, or vice versa.
     #[test]
     fn deck_size_subject_agrees_with_the_command_zone_axis() {
         use strum::IntoEnumIterator;
 
         for format in GameFormat::iter() {
-            let Ok(has_command_zone) = format.command_zone_holds_decklist_commander() else {
+            let Ok(holds_decklist_commander) = format.command_zone_holds_decklist_commander()
+            else {
                 continue;
             };
             assert_eq!(
                 format.deck_size_subject() == DeckSizeSubject::MainDeck,
-                !has_command_zone,
+                !holds_decklist_commander,
                 "{format:?}: deck_size_subject() disagrees with \
                  command_zone_holds_decklist_commander()"
             );
