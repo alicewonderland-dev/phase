@@ -240,7 +240,8 @@ impl CommanderEligibilityRule {
             | GameFormat::TwoHeadedGiant
             | GameFormat::Archenemy
             | GameFormat::Planechase
-            | GameFormat::Momir => Ok(None),
+            | GameFormat::Momir
+            | GameFormat::Freeform => Ok(None),
             GameFormat::Custom(id) => Err(FormatConfigError(format!(
                 "from_source_format: source must be a built-in GameFormat, never Custom({})",
                 id.0

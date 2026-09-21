@@ -2585,7 +2585,8 @@ fn evaluate_selected_format_summary(
         | GameFormat::Vintage
         | GameFormat::Historic
         | GameFormat::Timeless
-        | GameFormat::Pauper => quick_constructed_check(
+        | GameFormat::Pauper
+        | GameFormat::Freeform => quick_constructed_check(
             db,
             request,
             &format_rules,
@@ -3037,7 +3038,8 @@ fn evaluate_selected_format(
         | GameFormat::Vintage
         | GameFormat::Historic
         | GameFormat::Timeless
-        | GameFormat::Pauper => {
+        | GameFormat::Pauper
+        | GameFormat::Freeform => {
             let check = evaluate_constructed(
                 db,
                 request,

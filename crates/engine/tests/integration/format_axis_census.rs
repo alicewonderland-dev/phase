@@ -248,23 +248,20 @@ fn format_axis_methods_carry_no_wildcard_arm() {
     assert_axis_method_has_no_wildcard_arm("pub fn deck_size_subject(");
 }
 
-/// Row 5's durable, in-lane check: `CardPool::Unrestricted` has zero
-/// construction sites among the built-ins today. Paired positive controls
-/// (at least one `NoEngineAuthority` and at least one `LegalityTable`) so the
-/// main assertion is not vacuously true of an axis that never produces
-/// either sibling.
-///
-/// A P3 seam pin that P4 inverts, not a permanent prohibition.
+/// P3's seam pin, inverted as its own doc anticipates ("A P3 seam pin that P4
+/// inverts, not a permanent prohibition"). What is pinned is the
+/// DECLARATION — which built-ins positively declare `CardPool::Unrestricted`
+/// — and not an inference from how permissive a format is.
+/// [`CardPool::Unrestricted`] draws that line itself: "Silence is not such a
+/// declaration", and a format that states no deck-construction rule at all
+/// stays `NoEngineAuthority` however little it restricts. Declaring
+/// `Unrestricted` is a deliberate act; this list is what keeps it one.
 #[test]
-fn no_builtin_format_declares_an_unrestricted_pool_yet() {
-    assert!(
-        GameFormat::iter().all(|format| format.card_pool() != CardPool::Unrestricted),
-        "no built-in format should declare CardPool::Unrestricted yet"
-    );
-    assert!(GameFormat::iter().any(|format| format.card_pool() == CardPool::NoEngineAuthority));
-    assert!(
-        GameFormat::iter().any(|format| matches!(format.card_pool(), CardPool::LegalityTable(_)))
-    );
+fn unrestricted_card_pool_declarations_match_the_committed_list() {
+    let declared: Vec<GameFormat> = GameFormat::iter()
+        .filter(|format| format.card_pool() == CardPool::Unrestricted)
+        .collect();
+    assert_eq!(declared, vec![GameFormat::Freeform]);
 }
 
 /// Census clause 5 + Row 13: no format axis reaches either client mirror.

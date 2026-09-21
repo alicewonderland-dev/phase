@@ -839,12 +839,13 @@ fn commander_eligibility_rule_from_source_format_covers_every_builtin() {
         // already returns, read off its arm rather than chosen here. This row
         // was MISSING; see the commit message.
         (GameFormat::CommanderDraft, Some(Standard)),
+        (GameFormat::Freeform, None),
     ];
     // This table had NO length assertion at all, despite its name. Ordered
     // equality against the enum is what makes the name true and keeps it true:
-    // a new format reds here until its expected rule is stated. Measured: the
-    // table is in declaration order for the 22 it listed, and `CommanderDraft`
-    // is the last built-in, so appending is sufficient and no row moves.
+    // a new format reds here until its expected rule is stated. The table is
+    // compared in declaration order, so a format appended to the enum is
+    // appended here and no existing row moves.
     let covered: Vec<GameFormat> = cases.iter().map(|(format, _)| *format).collect();
     assert_eq!(
         covered,
@@ -899,6 +900,7 @@ fn game_format_serialization_is_byte_identical_to_old_derive_for_builtins() {
         (GameFormat::Planechase, "Planechase"),
         (GameFormat::Momir, "Momir"),
         (GameFormat::CommanderDraft, "CommanderDraft"),
+        (GameFormat::Freeform, "Freeform"),
     ];
     // Replaces `assert_eq!(expectations.len(), 22)`, which could not fail:
     // 22 == 22 holds however the enum grows, and it did — `CommanderDraft`'s

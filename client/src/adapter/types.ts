@@ -146,7 +146,8 @@ export type BuiltInGameFormat =
   | "Planechase"
   | "Limited"
   | "Momir"
-  | "CommanderDraft";
+  | "CommanderDraft"
+  | "Freeform";
 
 /**
  * Wire form of `GameFormat::Custom(CustomFormatId)`.

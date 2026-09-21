@@ -253,6 +253,7 @@ const FORMAT_SHAPES: Record<BuiltInGameFormat, DeckShape> = {
   TinyLeaders: "commanderWithSideboard",
   Limited: "mainOnly",
   Momir: "mainOnly",
+  Freeform: "constructed",
 };
 
 describe("fetchDeckFromUrl — format coverage", () => {
