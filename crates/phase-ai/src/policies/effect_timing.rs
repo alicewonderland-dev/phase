@@ -1,7 +1,7 @@
 use engine::ai_support::current_target_selection_targets;
 use engine::game::combat::{
     attacker_blockability_in_maximum_free_declaration, defending_player_for_attacker,
-    get_valid_attacker_ids, MaximumBlockDeclarationBlockability,
+    get_valid_attacker_ids, is_on_attacking_team, MaximumBlockDeclarationBlockability,
 };
 use engine::game::{players, turn_control};
 use engine::types::ability::{
@@ -292,39 +292,40 @@ fn ai_controlled_declared_attacker_blockability(
     }
 }
 
-/// CR 508.1a + CR 805.10a: the attacking team is the active player together
-/// with their teammates, and `get_valid_attacker_ids` answers only about that
-/// team. For any other team's creature its exclusion is a scope artifact
-/// rather than a rules fact, so callers must gate on this first.
-///
-/// Mirrors the private `combat::active_attacking_team` through the same public
-/// `players::teammates` authority `prompt_has_team_defender` already composes.
-fn on_attacking_team(state: &GameState, player: PlayerId) -> bool {
-    state.active_player == player
-        || players::teammates(state, state.active_player).contains(&player)
-}
-
 /// CR 509.1b: "can't be blocked" is an evasion restriction, and a restriction is
 /// only ever checked when blockers are declared against an attacking creature.
 /// A target that cannot be an attacker in this turn's combat therefore gains
 /// nothing from the grant, in any phase — which is why this guard sits ahead of
 /// the declare-attackers phase gate rather than behind it.
 ///
+/// Gated on `is_on_attacking_team(state, ai_player)` first: the guard suppresses
+/// itself on turns when the AI's own team is not the attacking team, since
+/// `get_valid_attacker_ids` answers only about the active team (CR 508.1a +
+/// CR 805.10a) and says nothing about a non-attacking-team creature's ability
+/// to attack a future combat.
+///
 /// The per-creature question goes to `get_valid_attacker_ids`, never to
 /// `tapped` or to the phase label: that authority also folds in summoning
 /// sickness (CR 302.6), Defender (CR 702.3b), phased-out permanents
 /// (CR 702.26b) and "can't attack" restrictions (CR 508.1c).
 ///
-/// A creature already declared as an attacker is exempt. CR 508.1f taps it as
-/// part of the declaration, so CR 508.1a then excludes it from the eligible set
-/// even though it is precisely the target the grant exists for; its worth is
-/// judged by the blockability comparison in `evasion_target_verdict` instead.
+/// A creature already declared as a non-vigilant attacker (CR 702.20b) is
+/// exempt. CR 508.1f taps it as part of the declaration, so CR 508.1a then
+/// excludes it from the eligible set even though it is precisely the target
+/// the grant exists for; its worth is judged by the blockability comparison in
+/// `evasion_target_verdict` instead.
+///
+/// This answers "can this be declared as an attacker in the current game
+/// state", not "can this ever attack again this turn": an untapper or an
+/// extra-combat effect (e.g. Aggravated Assault, Relentless Assault) can make
+/// a creature this function rejects attack later in the same turn. This guard
+/// only measures eligibility at the current game state.
 fn target_cannot_attack_this_turn(
     state: &GameState,
     ai_player: PlayerId,
     target_id: engine::types::identifiers::ObjectId,
 ) -> bool {
-    on_attacking_team(state, ai_player)
+    is_on_attacking_team(state, ai_player)
         && defending_player_for_attacker(state, target_id).is_none()
         && !get_valid_attacker_ids(state).contains(&target_id)
 }
@@ -862,7 +863,10 @@ mod tests {
             .id();
         let futile = scenario.add_creature(P0, "Tapped Sick Body", 3, 3).id();
         let useful = scenario.add_creature(P0, "Ready Attacker", 1, 1).id();
-        let new_sick = scenario.add_creature(P0, "Sick Rookie", 1, 1).id();
+        let new_sick = scenario
+            .add_creature(P0, "Sick Rookie", 1, 1)
+            .with_summoning_sickness()
+            .id();
         let blocker = scenario
             .add_creature(PlayerId(1), "Ready Blocker", 2, 2)
             .id();
@@ -877,10 +881,9 @@ mod tests {
         let futile_object = state.objects.get_mut(&futile).unwrap();
         futile_object.tapped = true;
         futile_object.summoning_sick = true;
-        // `GameScenario::add_creature` sets `summoning_sick = false`
-        // (scenario.rs:387), so the untapped/summoning-sick axis is set
-        // post-`build()`, exactly as `futile`'s flags are set above.
-        state.objects.get_mut(&new_sick).unwrap().summoning_sick = true;
+        // `futile` needs both `tapped` and `summoning_sick`, and there is no
+        // `tapped` builder, so it is set post-`build()` here; `new_sick` uses
+        // `CardBuilder::with_summoning_sickness()` above instead.
 
         runner
             .act(GameAction::ActivateAbility {
@@ -971,8 +974,8 @@ mod tests {
                     && reason.kind == "effect_timing_futile_unattacking_evasion_target"
         ));
 
-        // Assertion 4 (chooser-level, deterministic; BL-2 resolved).
-        let mut rng = SmallRng::seed_from_u64(0); // any seed: P13 measured rank/score/probability seed-invariant
+        // Assertion 4 (chooser-level, deterministic).
+        let mut rng = SmallRng::seed_from_u64(0); // any seed: rank/score/probability are seed-invariant here
         let selection = crate::search::choose_action_with_session_diagnostic(
             state,
             P0,
@@ -1003,7 +1006,7 @@ mod tests {
         assert_eq!(row.rank, Some(3));
         assert!(!row.is_top_ranked);
 
-        // Assertion 5 (the untapped / summoning-sick axis -- added by F3).
+        // Assertion 5 (the untapped / summoning-sick axis).
         // Assertion 1 cannot reach this axis, because `futile` is tapped as
         // well as sick, so a `.tapped` substitute still fires on it.
         assert!(matches!(
@@ -1024,7 +1027,9 @@ mod tests {
             .id();
         let futile = scenario.add_creature(P0, "Tapped Sick Body", 3, 3).id();
         let useful = scenario.add_creature(P0, "Ready Attacker", 1, 1).id();
-        let new_sick = scenario.add_creature(P0, "Sick Rookie", 1, 1).id();
+        scenario
+            .add_creature(P0, "Sick Rookie", 1, 1)
+            .with_summoning_sickness();
         scenario.add_creature(PlayerId(1), "Ready Blocker", 2, 2);
         scenario
             .add_creature(P0, "Thopter Payment One", 1, 1)
@@ -1037,7 +1042,6 @@ mod tests {
         let futile_object = state.objects.get_mut(&futile).unwrap();
         futile_object.tapped = true;
         futile_object.summoning_sick = true;
-        state.objects.get_mut(&new_sick).unwrap().summoning_sick = true;
 
         runner.advance_to_phase(Phase::DeclareAttackers);
         runner
@@ -1054,12 +1058,12 @@ mod tests {
             .expect("reach guard: Whirler Rogue's two-artifact activation must be payable");
         let state = runner.state();
 
-        // P5's measurement written into the suite, so the exemption's
-        // necessity is visible in the test rather than only in the plan: CR
-        // 508.1f tapped `useful` out of the eligible set, so both it and its
-        // non-declared tapped sibling are absent from `get_valid_attacker_ids`.
-        // Do NOT assert `.is_empty()` -- the untapped, non-sick Whirler Rogue
-        // source remains eligible (P5).
+        // This measurement is written into the suite so the exemption's
+        // necessity is visible in the test: CR 508.1f tapped `useful` out of
+        // the eligible set, so both it and its non-declared tapped sibling
+        // are absent from `get_valid_attacker_ids`. Do NOT assert
+        // `.is_empty()` -- the untapped, non-sick Whirler Rogue source
+        // remains eligible.
         assert!(state.objects[&useful].tapped);
         assert!(!get_valid_attacker_ids(state).contains(&useful));
         assert!(!get_valid_attacker_ids(state).contains(&futile));
@@ -1102,21 +1106,24 @@ mod tests {
             .get(&blocker)
             .is_some_and(|targets| targets.contains(&enemy_attacker)));
 
-        // (a) P4's scope artifact, asserted directly so the reason for the
-        // team gate is legible from the test: `own_ready` is untapped and
-        // ready, but on the opponent's turn `get_valid_attacker_ids` answers
-        // about the *opponent's* attacking team, so it excludes a perfectly
-        // eligible AI creature.
+        // (a) Asserted directly so the reason for the team gate is legible
+        // from the test: on the opponent's turn
+        // `get_valid_attacker_ids` answers about the *opponent's* attacking
+        // team, so `own_ready`'s absence from that team-scoped set says
+        // nothing about whether `own_ready` itself could attack — it is
+        // excluded purely because its controller's team is not this turn's
+        // attacking team.
         assert!(!state.objects[&own_ready].tapped);
         assert!(!get_valid_attacker_ids(&state).contains(&own_ready));
 
         let own_candidate = target_candidate(own_ready);
         let config = AiConfig::default();
 
-        // (b) The instrument has no standing here (M4: exact kind, not a bare
-        // "neutral" check): the guard abstains on `on_attacking_team`, so the
-        // verdict falls through to the unchanged blockability comparison,
-        // matching the adjacent
+        // (b) The instrument has no standing here (exact kind, not a bare
+        // "neutral" check): the guard abstains because `is_on_attacking_team`
+        // is false for the AI on the opponent's turn, so the verdict falls
+        // through to the unchanged blockability comparison, matching the
+        // adjacent
         // `opponent_combat_does_not_penalize_own_target_for_enemy_blockable_attacker`
         // fixture this test extends.
         assert!(matches!(
@@ -1252,6 +1259,113 @@ mod tests {
             effect_timing_verdict(&state, &target_candidate(futile), &AiConfig::default()),
             PolicyVerdict::Score { delta: 0.0, reason }
                 if reason.kind == "effect_timing_evasion_target_na"
+        ));
+    }
+
+    /// Pins the guard-before-stand-down ordering in
+    /// `evasion_target_verdict` -- `target_cannot_attack_this_turn` must run
+    /// ahead of `prompt_has_team_defender`'s stand-down, not behind it. Same
+    /// 2HG board as `team_defender_prompt_stands_down_despite_a_mapped_sibling`
+    /// above, but `futile` is tapped here, so it genuinely cannot attack this
+    /// turn regardless of the team-blockability ambiguity affecting its
+    /// sibling `mapped`. Hoisting `prompt_has_team_defender` above the guard
+    /// must flip this assertion to neutral -- verified by mutation.
+    #[test]
+    fn team_defender_stand_down_does_not_mask_a_genuinely_unattacking_sibling() {
+        let mut state = GameState::new(FormatConfig::two_headed_giant(), 4, 42);
+        state.phase = Phase::DeclareAttackers;
+        let source = creature(&mut state, P0, "Source");
+        let mapped = creature(&mut state, P0, "Mapped Attacker");
+        let futile = creature(&mut state, P0, "Futile Target");
+        let defender_blocker = creature(&mut state, PlayerId(2), "Defender Blocker");
+        let teammate_blocker = creature(&mut state, PlayerId(3), "Teammate Blocker");
+        state.combat = Some(CombatState {
+            attackers: vec![declared_attacker(mapped, PlayerId(2))],
+            ..Default::default()
+        });
+        state.objects.get_mut(&futile).unwrap().tapped = true;
+        install_whirler_prompt(&mut state, source, vec![futile, mapped]);
+
+        assert!(players::teammates(&state, PlayerId(2)).contains(&PlayerId(3)));
+        assert!(get_valid_block_targets(&state)
+            .get(&defender_blocker)
+            .is_some_and(|targets| targets.contains(&mapped)));
+        assert!(engine::game::combat::validate_blockers_for_player(
+            &state,
+            PlayerId(3),
+            &[(teammate_blocker, mapped)],
+        )
+        .is_ok());
+
+        // Reach guard: the stand-down condition is genuinely live in this
+        // fixture -- `mapped`'s defending player 2 has a teammate, exactly as
+        // in the sibling fixture above, so a reviewer cannot dismiss this as
+        // testing a fixture where the stand-down never applied.
+        assert!(prompt_has_team_defender(&state));
+
+        // Reach guard: `futile` is genuinely tapped and absent from the
+        // eligible-attacker set, so the guard this test pins is the one that
+        // actually fires (not a `.tapped` substitute elsewhere).
+        assert!(state.objects[&futile].tapped);
+        assert!(!get_valid_attacker_ids(&state).contains(&futile));
+
+        // Primary revert-failing assertion: with the guard checked ahead of
+        // the stand-down (current code), `futile` scores strongly negative
+        // even though `prompt_has_team_defender` is true. If the ordering is
+        // reverted (stand-down checked first), this becomes
+        // `Score { delta: 0.0, "effect_timing_evasion_target_na" }` instead.
+        assert!(matches!(
+            effect_timing_verdict(&state, &target_candidate(futile), &AiConfig::default()),
+            PolicyVerdict::Score { delta, reason }
+                if delta < 0.0
+                    && reason.kind == "effect_timing_futile_unattacking_evasion_target"
+        ));
+    }
+
+    /// The `players::teammates(...).contains(&player)` arm of
+    /// `is_on_attacking_team` is reachable only in a team format (Two-Headed
+    /// Giant here) when the AI itself is not the active player but is the
+    /// active player's teammate. Nothing else in this file exercises it —
+    /// every other fixture either has the AI as the active player or on the
+    /// opponent's (non-teammate) side.
+    #[test]
+    fn two_headed_giant_teammate_evasion_target_is_judged_by_the_attacking_teams_authority() {
+        let mut state = GameState::new(FormatConfig::two_headed_giant(), 4, 42);
+        state.phase = Phase::DeclareAttackers;
+        state.active_player = PlayerId(1);
+        let source = creature(&mut state, P0, "Source");
+        let futile = creature(&mut state, P0, "Futile Teammate Target");
+        let ready = creature(&mut state, P0, "Ready Teammate Target");
+        state.objects.get_mut(&futile).unwrap().tapped = true;
+        install_whirler_prompt(&mut state, source, vec![futile, ready]);
+
+        // Reach guard: P0 is not the active player but is its teammate, so
+        // this fixture is on the teammate arm, not the `active_player ==
+        // player` arm `team_defender_prompt_stands_down_despite_a_mapped_sibling`
+        // and every other fixture above exercise.
+        assert_ne!(state.active_player, P0);
+        assert!(players::teammates(&state, PlayerId(1)).contains(&P0));
+        assert!(!get_valid_attacker_ids(&state).contains(&futile));
+
+        assert!(matches!(
+            effect_timing_verdict(&state, &target_candidate(futile), &AiConfig::default()),
+            PolicyVerdict::Score { delta, reason }
+                if delta < 0.0
+                    && reason.kind == "effect_timing_futile_unattacking_evasion_target"
+        ));
+
+        // Negative control: `ready` is untapped and unrestricted, so on the
+        // same team-scoped `get_valid_attacker_ids` authority it IS eligible
+        // to be declared. A regression that made the eligible-attacker scan
+        // active-player-only (instead of whole-team, CR 508.1a + CR 805.10a)
+        // would make the guard misfire on every creature P0 controls on its
+        // teammate's turn; this sibling assertion would catch that even
+        // though the primary assertion above stays green.
+        assert!(get_valid_attacker_ids(&state).contains(&ready));
+        assert!(matches!(
+            effect_timing_verdict(&state, &target_candidate(ready), &AiConfig::default()),
+            PolicyVerdict::Score { delta: 0.0, reason }
+                if reason.kind == "effect_timing_no_pair_blockable_evasion_target"
         ));
     }
 

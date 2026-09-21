@@ -4555,6 +4555,13 @@ fn active_attacking_team(state: &GameState) -> Vec<PlayerId> {
         .collect()
 }
 
+/// CR 508.1a + CR 805.10a: whether `player` is a member of the team that
+/// would attack this turn (the active player and their teammates),
+/// independent of whether combat has started.
+pub fn is_on_attacking_team(state: &GameState, player: PlayerId) -> bool {
+    active_attacking_team(state).contains(&player)
+}
+
 /// CR 508.1a + CR 805.10a: eligible attacker ids for the whole attacking team,
 /// applying every creature-level restriction `get_valid_attacker_ids` applies,
 /// but keyed to team membership rather than the literal active player.
@@ -12017,6 +12024,25 @@ mod tests {
         // CR 805.10a: attacking your own team is a hard target-validity restriction,
         // now surfaced through the unified per-pairing restriction message.
         assert!(err.contains("can't attack"), "err={err}");
+    }
+
+    /// CR 508.1a + CR 805.10a: `is_on_attacking_team` answers about the whole
+    /// attacking team (active player ∪ teammates), not only the literal
+    /// active player.
+    #[test]
+    fn is_on_attacking_team_covers_the_active_player_and_their_teammate() {
+        let mut state = GameState::new(FormatConfig::two_headed_giant(), 4, 42);
+        state.turn_number = 2;
+        state.active_player = PlayerId(0);
+
+        // Plain active-player arm.
+        assert!(is_on_attacking_team(&state, PlayerId(0)));
+        // Teammate arm: PlayerId(1) is not the active player but shares
+        // PlayerId(0)'s team in Two-Headed Giant.
+        assert!(is_on_attacking_team(&state, PlayerId(1)));
+        // Defending team: neither opponent is on the attacking team.
+        assert!(!is_on_attacking_team(&state, PlayerId(2)));
+        assert!(!is_on_attacking_team(&state, PlayerId(3)));
     }
 
     #[test]
