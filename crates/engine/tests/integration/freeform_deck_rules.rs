@@ -396,9 +396,10 @@ fn freeform_accepts_a_card_the_legacy_ban_list_refuses() {
 ///
 /// Both classes reach each dispatcher through DIFFERENT code: the full leg's
 /// accumulating `copy_limit_violations` in `evaluate_constructed` vs. the
-/// summary leg's early-returning one in `quick_constructed_check`, and the
-/// full leg's `ante_deck_violations` call inside `evaluate_constructed` vs.
-/// the summary dispatcher's own post-`match` `ante_deck_violations` block.
+/// summary leg's early-returning one in `quick_constructed_check`, and
+/// `ante_deck_violations`, which neither dispatcher's per-format arms call —
+/// `evaluate_selected_format_summary` and `evaluate_selected_format` each
+/// call it once, from their own post-`match` block.
 /// Looped over `summary_only` like this file's other dispatcher-agreement
 /// tests, so a future edit that makes the two legs disagree reds here instead
 /// of only surfacing through the deck-builder hint accepting what game

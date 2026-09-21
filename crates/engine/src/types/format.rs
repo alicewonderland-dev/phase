@@ -45,12 +45,15 @@ pub struct FormatMetadata {
 /// member of a fixed set and cannot be enumerated.
 ///
 /// What this iterator is the authority for, at the width it actually holds.
-/// Any test that calls `GameFormat::iter()` — directly, or transitively
-/// through a `Vec`/set built from it — is coupled to this exact membership
-/// and reds by name (or on a set-equality mismatch) the moment a format is
-/// added, renamed, or removed. `grep -rn 'GameFormat::iter()' crates/engine/`
-/// finds every such call site (filter out doc-comment mentions like this
-/// one); that search, not a hand-copied list here, is the whole list.
+/// Not every test that calls `GameFormat::iter()` is coupled to this exact
+/// membership — a test that loops it to assert a per-format property is
+/// coupled only to that property. The guards coupled to membership are the
+/// ones that collect `iter()` into a `Vec`/set and assert it equal to
+/// another such collection; those red by name (or on a set-equality
+/// mismatch) the moment a format is added, renamed, or removed.
+/// `grep -rn 'GameFormat::iter()' crates/engine/` finds every call site
+/// (filter out doc-comment mentions like this one) — that search, not a
+/// hand-copied list here, is what enumerates them.
 ///
 /// THREE KINDS of neighbouring guard do NOT work that way, and the difference
 /// matters if this comment is read as a promise. The exhaustive `match`
@@ -87,7 +90,8 @@ pub struct FormatMetadata {
 /// SILENTLY. Both silent cases are caught by
 /// `tests::registry_lists_every_builtin_format`, which compares `iter()` to
 /// the hand-written `registry()` below (mutation-tested: `#[strum(disabled)]`
-/// on `Momir` reds it, plus three other `iter()`-vs-hand-written-list guards).
+/// on `Momir` reds it; `grep -rn 'GameFormat::iter()' crates/engine/` finds
+/// this test's siblings — the other set-equality guards in the same class).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
 pub enum GameFormat {
     Standard,
@@ -4510,11 +4514,14 @@ mod tests {
     /// alone at every call site, and
     /// `no_caller_reintroduces_a_commander_count_literal` in
     /// `format_axis_census.rs` asserts zero surviving per-format
-    /// commander-count literals. The four groups below split only on what
-    /// this test can additionally assert per format: a per-count admission
-    /// curve for the first three, and, for formats that never designate a
-    /// commander and get no per-count curve here, the `NoCommander`
-    /// placement plus `command_zone_holds_decklist_commander() == Ok(false)`.
+    /// commander-count literals. Three groups, one per `CommanderPairing`
+    /// variant: `partner_families` admits iff count is 1 or 2 (CR 702.124g),
+    /// `solo` admits iff count == 1, and `no_commander_per_count` — every
+    /// built-in that never designates a commander — admits iff count == 0.
+    /// `no_commander_per_count` also gets the cross-check against the
+    /// command-zone axis (`command_zone_holds_decklist_commander() ==
+    /// Ok(false)`), a genuine second authority on the same claim rather than
+    /// a restatement of the per-count curve.
     #[test]
     fn commander_pairing_admits_exactly_todays_counts() {
         use strum::IntoEnumIterator;
@@ -4544,8 +4551,6 @@ mod tests {
             GameFormat::Planechase,
             GameFormat::Archenemy,
             GameFormat::Momir,
-        ];
-        let no_commander_placement_only = [
             GameFormat::FreeForAll,
             GameFormat::TwoHeadedGiant,
             GameFormat::Limited,
@@ -4582,22 +4587,17 @@ mod tests {
             }
         }
 
-        // These formats get no per-count curve above; this is a placement
-        // pin only — see this test's doc comment.
-        for format in no_commander_placement_only {
-            assert_eq!(
-                format.commander_pairing(),
-                CommanderPairing::NoCommander,
-                "{format:?} should be placed at NoCommander"
-            );
+        // Second authority on the same claim: none of `no_commander_per_count`
+        // hold a command zone, cross-checked against an axis independent of
+        // `admits_count`.
+        for format in no_commander_per_count {
             assert_eq!(format.command_zone_holds_decklist_commander(), Ok(false));
         }
 
-        // Every built-in appears in exactly one of the four groups above.
+        // Every built-in appears in exactly one of the three groups above.
         let mut all: Vec<GameFormat> = partner_families.to_vec();
         all.extend(solo);
         all.extend(no_commander_per_count);
-        all.extend(no_commander_placement_only);
         let mut all_strings: Vec<String> = all.iter().map(GameFormat::to_string).collect();
         let mut expected: Vec<String> = GameFormat::iter().map(|f| f.to_string()).collect();
         all_strings.sort();
