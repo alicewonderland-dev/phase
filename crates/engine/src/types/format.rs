@@ -447,7 +447,10 @@ pub enum CardPool {
     LegalityTable(LegalityFormat),
     /// No legality table answers this format's pool, and the engine makes no
     /// claim that nothing is restricted — that is the whole distinction from
-    /// `Unrestricted`. Every card the database holds is admitted.
+    /// `Unrestricted`. No `CardPoolAuthority` built from this variant ever
+    /// refuses a card on pool grounds, but a format may still restrict its
+    /// own deck by a construction rule that lives outside `CardPool`
+    /// entirely, as `evaluate_momir` does for Momir's five snow basics.
     NoEngineAuthority,
     /// The format's own rules positively declare that no card is restricted.
     /// Silence is not such a declaration: a multiplayer variant that states no
@@ -1425,9 +1428,10 @@ impl GameFormat {
         }
     }
 
-    /// How many commanders this format's decklist may designate — the single
-    /// authority. Callers must not re-derive it with `is_empty()`, `> 2` or
-    /// `!= 1`.
+    /// How many commanders this format's decklist may designate. Whether a
+    /// specific count is admitted is `CommanderPairing::admits_count`'s call
+    /// — the single authority for that decision, documented there along with
+    /// its one carve-out. Callers must not re-derive admission themselves.
     ///
     /// `Custom(_)` answers `NoCommander`: reachable via both custom
     /// evaluators (`evaluate_custom_format`, `quick_custom_format_check`),
