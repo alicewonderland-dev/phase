@@ -1,7 +1,8 @@
 use engine::ai_support::current_target_selection_targets;
 use engine::game::combat::{
-    attacker_blockability_in_maximum_free_declaration, defending_player_for_attacker,
-    get_valid_attacker_ids, is_on_attacking_team, MaximumBlockDeclarationBlockability,
+    attacker_blockability_in_maximum_free_declaration, attacker_declaration_pending_this_turn,
+    defending_player_for_attacker, get_valid_attacker_ids, is_on_attacking_team,
+    MaximumBlockDeclarationBlockability,
 };
 use engine::game::{players, turn_control};
 use engine::types::ability::{
@@ -305,21 +306,13 @@ fn ai_controlled_declared_attacker_blockability(
 /// to attack a future combat.
 ///
 /// The per-creature question goes to `get_valid_attacker_ids`, never to
-/// `tapped` or to the phase label: that authority also folds in summoning
-/// sickness (CR 302.6), Defender (CR 702.3b), phased-out permanents
-/// (CR 702.26b) and "can't attack" restrictions (CR 508.1c).
+/// `tapped`: that authority also folds in summoning sickness (CR 302.6),
+/// Defender (CR 702.3b), phased-out permanents (CR 702.26b) and "can't
+/// attack" restrictions (CR 508.1c).
 ///
-/// A creature already declared as a non-vigilant attacker (CR 702.20b) is
-/// exempt. CR 508.1f taps it as part of the declaration, so CR 508.1a then
-/// excludes it from the eligible set even though it is precisely the target
-/// the grant exists for; its worth is judged by the blockability comparison in
-/// `evasion_target_verdict` instead.
-///
-/// This answers "can this be declared as an attacker in the current game
-/// state", not "can this ever attack again this turn": an untapper or an
-/// extra-combat effect (e.g. Aggravated Assault, Relentless Assault) can make
-/// a creature this function rejects attack later in the same turn. This guard
-/// only measures eligibility at the current game state.
+/// CR 508.1k + CR 511.3: a creature that is currently an attacking creature in
+/// the combat in progress is exempt — the exemption reads the live
+/// `CombatState`, which CR 511.3 empties at end of combat.
 fn target_cannot_attack_this_turn(
     state: &GameState,
     ai_player: PlayerId,
@@ -327,7 +320,8 @@ fn target_cannot_attack_this_turn(
 ) -> bool {
     is_on_attacking_team(state, ai_player)
         && defending_player_for_attacker(state, target_id).is_none()
-        && !get_valid_attacker_ids(state).contains(&target_id)
+        && !(attacker_declaration_pending_this_turn(state)
+            && get_valid_attacker_ids(state).contains(&target_id))
 }
 
 fn score_action_shape(ctx: &PolicyContext<'_>) -> f64 {
@@ -1058,12 +1052,8 @@ mod tests {
             .expect("reach guard: Whirler Rogue's two-artifact activation must be payable");
         let state = runner.state();
 
-        // This measurement is written into the suite so the exemption's
-        // necessity is visible in the test: CR 508.1f tapped `useful` out of
-        // the eligible set, so both it and its non-declared tapped sibling
-        // are absent from `get_valid_attacker_ids`. Do NOT assert
-        // `.is_empty()` -- the untapped, non-sick Whirler Rogue source
-        // remains eligible.
+        // Do NOT assert `.is_empty()` -- the untapped, non-sick Whirler Rogue
+        // source remains eligible.
         assert!(state.objects[&useful].tapped);
         assert!(!get_valid_attacker_ids(state).contains(&useful));
         assert!(!get_valid_attacker_ids(state).contains(&futile));
@@ -1239,8 +1229,17 @@ mod tests {
         let futile = creature(&mut state, P0, "Futile Target");
         let defender_blocker = creature(&mut state, PlayerId(2), "Defender Blocker");
         let teammate_blocker = creature(&mut state, PlayerId(3), "Teammate Blocker");
+        state
+            .objects
+            .get_mut(&futile)
+            .unwrap()
+            .keywords
+            .push(Keyword::Flying);
         state.combat = Some(CombatState {
-            attackers: vec![declared_attacker(mapped, PlayerId(2))],
+            attackers: vec![
+                declared_attacker(mapped, PlayerId(2)),
+                declared_attacker(futile, PlayerId(2)),
+            ],
             ..Default::default()
         });
         install_whirler_prompt(&mut state, source, vec![futile, mapped]);
@@ -1255,6 +1254,14 @@ mod tests {
             &[(teammate_blocker, mapped)],
         )
         .is_ok());
+        assert_eq!(
+            declared_attacker_blockability(&state, futile),
+            MaximumBlockDeclarationBlockability::NotBlockable
+        );
+        assert_eq!(
+            declared_attacker_blockability(&state, mapped),
+            MaximumBlockDeclarationBlockability::Blockable
+        );
         assert!(matches!(
             effect_timing_verdict(&state, &target_candidate(futile), &AiConfig::default()),
             PolicyVerdict::Score { delta: 0.0, reason }
@@ -1264,9 +1271,8 @@ mod tests {
 
     /// Pins the guard-before-stand-down ordering in
     /// `evasion_target_verdict` -- `target_cannot_attack_this_turn` must run
-    /// ahead of `prompt_has_team_defender`'s stand-down, not behind it. Same
-    /// 2HG board as `team_defender_prompt_stands_down_despite_a_mapped_sibling`
-    /// above, but `futile` is tapped here, so it genuinely cannot attack this
+    /// ahead of `prompt_has_team_defender`'s stand-down, not behind it.
+    /// `futile` is tapped here, so it genuinely cannot attack this
     /// turn regardless of the team-blockability ambiguity affecting its
     /// sibling `mapped`. Hoisting `prompt_has_team_defender` above the guard
     /// must flip this assertion to neutral -- verified by mutation.
@@ -1303,9 +1309,6 @@ mod tests {
         // testing a fixture where the stand-down never applied.
         assert!(prompt_has_team_defender(&state));
 
-        // Reach guard: `futile` is genuinely tapped and absent from the
-        // eligible-attacker set, so the guard this test pins is the one that
-        // actually fires (not a `.tapped` substitute elsewhere).
         assert!(state.objects[&futile].tapped);
         assert!(!get_valid_attacker_ids(&state).contains(&futile));
 
@@ -1367,6 +1370,416 @@ mod tests {
             PolicyVerdict::Score { delta: 0.0, reason }
                 if reason.kind == "effect_timing_no_pair_blockable_evasion_target"
         ));
+    }
+
+    #[test]
+    fn a_ready_undeclared_creature_is_penalised_once_attackers_have_been_declared() {
+        let mut scenario = GameScenario::new_n_player(2, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        let source = scenario
+            .add_creature(P0, "Whirler Rogue", 2, 2)
+            .with_ability_definition(whirler_ability())
+            .id();
+        let raider = scenario
+            .add_creature(P0, "Skyway Raider", 2, 2)
+            .flying()
+            .id();
+        let serra = scenario
+            .add_creature(P0, "Watchful Serra", 2, 2)
+            .flying()
+            .vigilance()
+            .id();
+        let ready = scenario.add_creature(P0, "Ready Undeclared", 2, 2).id();
+        scenario.add_creature(PlayerId(1), "Ground Blocker", 2, 2);
+        scenario
+            .add_creature(P0, "Thopter Payment One", 1, 1)
+            .as_artifact();
+        scenario
+            .add_creature(P0, "Thopter Payment Two", 1, 1)
+            .as_artifact();
+        let mut runner = scenario.build();
+
+        runner.advance_to_phase(Phase::DeclareAttackers);
+        runner
+            .act(GameAction::DeclareAttackers {
+                attacks: vec![
+                    (raider, AttackTarget::Player(PlayerId(1))),
+                    (serra, AttackTarget::Player(PlayerId(1))),
+                ],
+                bands: Vec::new(),
+            })
+            .expect("reach guard: both fliers must be an engine-legal declaration");
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: 0,
+            })
+            .expect("reach guard: Whirler Rogue's two-artifact activation must be payable");
+        let state = runner.state();
+
+        assert!(matches!(state.phase, Phase::DeclareAttackers));
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::TargetSelection { .. }
+        ));
+        assert!(state.combat.as_ref().is_some_and(|combat| {
+            combat.attackers.iter().any(|a| a.object_id == raider)
+                && combat.attackers.iter().any(|a| a.object_id == serra)
+        }));
+        assert!(!state.objects[&ready].tapped && !state.objects[&ready].summoning_sick);
+        assert!(get_valid_attacker_ids(state).contains(&ready));
+        assert!(defending_player_for_attacker(state, ready).is_none());
+
+        // Vacuity guard: without this, the pre-existing relative-futility
+        // sibling comparison in `evasion_target_verdict` fires ahead of the
+        // guard under test and the primary assertion below would be green at
+        // HEAD too.
+        assert_eq!(
+            declared_attacker_blockability(state, raider),
+            MaximumBlockDeclarationBlockability::NotBlockable
+        );
+        assert_eq!(
+            declared_attacker_blockability(state, serra),
+            MaximumBlockDeclarationBlockability::NotBlockable
+        );
+
+        let config = AiConfig::default();
+        assert!(matches!(
+            effect_timing_verdict(state, &target_candidate(ready), &config),
+            PolicyVerdict::Score { delta, reason }
+                if delta < 0.0
+                    && reason.kind == "effect_timing_futile_unattacking_evasion_target"
+        ));
+
+        // Cell 2, vigilance: `serra` is a currently-attacking creature and
+        // stays untapped, so it is exempt and judged by the unchanged
+        // blockability comparison rather than by this guard.
+        assert!(!state.objects[&serra].tapped);
+        assert!(get_valid_attacker_ids(state).contains(&serra));
+        assert!(matches!(
+            effect_timing_verdict(state, &target_candidate(serra), &config),
+            PolicyVerdict::Score { delta: 0.0, reason }
+                if reason.kind == "effect_timing_no_pair_blockable_evasion_target"
+        ));
+
+        // Cell 2, non-vigilant: `raider` is tapped by the declaration but is
+        // exempt for the same reason -- it is currently an attacking
+        // creature.
+        assert!(state.objects[&raider].tapped);
+        assert!(matches!(
+            effect_timing_verdict(state, &target_candidate(raider), &config),
+            PolicyVerdict::Score { delta: 0.0, reason }
+                if reason.kind == "effect_timing_no_pair_blockable_evasion_target"
+        ));
+    }
+
+    /// Drives past the declare-attackers step to postcombat main, answering
+    /// `WaitingFor::DeclareBlockers` if the board's opponent chooses to block.
+    /// Bounded loop: a combat phase has finitely many priority windows.
+    fn drive_to_postcombat_main(runner: &mut engine::game::scenario::GameRunner) {
+        for _ in 0..40 {
+            if runner.state().phase == Phase::PostCombatMain {
+                return;
+            }
+            if matches!(
+                runner.state().waiting_for,
+                WaitingFor::DeclareBlockers { .. }
+            ) {
+                runner
+                    .declare_blockers(&[])
+                    .expect("reach guard: declining to block must be legal");
+                continue;
+            }
+            if runner.act(GameAction::PassPriority).is_err() {
+                break;
+            }
+        }
+        assert_eq!(
+            runner.state().phase,
+            Phase::PostCombatMain,
+            "drive_to_postcombat_main must reach PostCombatMain within its bounded loop"
+        );
+    }
+
+    #[test]
+    fn a_ready_creature_is_penalised_in_postcombat_main_after_its_combat() {
+        let mut scenario = GameScenario::new_n_player(2, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        let source = scenario
+            .add_creature(P0, "Whirler Rogue", 2, 2)
+            .with_ability_definition(whirler_ability())
+            .id();
+        let declared = scenario.add_creature(P0, "Declared Attacker", 2, 2).id();
+        let ready = scenario.add_creature(P0, "Ready Undeclared", 2, 2).id();
+        scenario.add_creature(PlayerId(1), "Ready Opposing Blocker", 2, 2);
+        scenario
+            .add_creature(P0, "Thopter Payment One", 1, 1)
+            .as_artifact();
+        scenario
+            .add_creature(P0, "Thopter Payment Two", 1, 1)
+            .as_artifact();
+        let mut runner = scenario.build();
+
+        runner.advance_to_phase(Phase::DeclareAttackers);
+        runner
+            .act(GameAction::DeclareAttackers {
+                attacks: vec![(declared, AttackTarget::Player(PlayerId(1)))],
+                bands: Vec::new(),
+            })
+            .expect("reach guard: the declaration must be engine-legal");
+        drive_to_postcombat_main(&mut runner);
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: 0,
+            })
+            .expect("reach guard: Whirler Rogue's two-artifact activation must be payable");
+        let state = runner.state();
+
+        assert!(matches!(state.phase, Phase::PostCombatMain));
+        assert!(state.combat.is_none());
+        assert!(get_valid_attacker_ids(state).contains(&ready));
+        assert!(!state.objects[&ready].tapped);
+
+        assert!(matches!(
+            effect_timing_verdict(state, &target_candidate(ready), &AiConfig::default()),
+            PolicyVerdict::Score { delta, reason }
+                if delta < 0.0
+                    && reason.kind == "effect_timing_futile_unattacking_evasion_target"
+        ));
+    }
+
+    #[test]
+    fn a_creature_that_already_attacked_is_penalised_in_postcombat_main() {
+        let mut scenario = GameScenario::new_n_player(2, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        let source = scenario
+            .add_creature(P0, "Whirler Rogue", 2, 2)
+            .with_ability_definition(whirler_ability())
+            .id();
+        let raider = scenario
+            .add_creature(P0, "Skyway Raider", 2, 2)
+            .flying()
+            .id();
+        let serra = scenario
+            .add_creature(P0, "Watchful Serra", 2, 2)
+            .flying()
+            .vigilance()
+            .id();
+        let ready = scenario.add_creature(P0, "Ready Undeclared", 2, 2).id();
+        scenario.add_creature(PlayerId(1), "Ground Blocker", 2, 2);
+        scenario
+            .add_creature(P0, "Thopter Payment One", 1, 1)
+            .as_artifact();
+        scenario
+            .add_creature(P0, "Thopter Payment Two", 1, 1)
+            .as_artifact();
+        let mut runner = scenario.build();
+
+        runner.advance_to_phase(Phase::DeclareAttackers);
+        runner
+            .act(GameAction::DeclareAttackers {
+                attacks: vec![
+                    (raider, AttackTarget::Player(PlayerId(1))),
+                    (serra, AttackTarget::Player(PlayerId(1))),
+                ],
+                bands: Vec::new(),
+            })
+            .expect("reach guard: both fliers must be an engine-legal declaration");
+        drive_to_postcombat_main(&mut runner);
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: 0,
+            })
+            .expect("reach guard: Whirler Rogue's two-artifact activation must be payable");
+        let state = runner.state();
+
+        assert!(matches!(state.phase, Phase::PostCombatMain));
+        assert!(state.combat.is_none());
+        // The CR 511.3 teardown, asserted rather than assumed: neither
+        // creature that attacked this turn remains a live attacking creature
+        // once the combat phase is over.
+        assert!(defending_player_for_attacker(state, serra).is_none());
+        assert!(defending_player_for_attacker(state, raider).is_none());
+        assert!(!state.objects[&serra].tapped);
+        assert!(get_valid_attacker_ids(state).contains(&serra));
+
+        let config = AiConfig::default();
+        assert!(matches!(
+            effect_timing_verdict(state, &target_candidate(serra), &config),
+            PolicyVerdict::Score { delta, reason }
+                if delta < 0.0
+                    && reason.kind == "effect_timing_futile_unattacking_evasion_target"
+        ), "primary, revert-failing: the vigilant attacker is no longer exempt once combat is over");
+        assert!(
+            matches!(
+                effect_timing_verdict(state, &target_candidate(ready), &config),
+                PolicyVerdict::Score { delta, reason }
+                    if delta < 0.0
+                        && reason.kind == "effect_timing_futile_unattacking_evasion_target"
+            ),
+            "paired sibling: the never-declared creature is penalised the same way"
+        );
+        // Negative control, not revert-failing: `raider` is already tapped
+        // and already absent from the eligible set at HEAD, so this row is
+        // unchanged by the fix -- included so a reader does not mistake it
+        // for discrimination.
+        assert!(state.objects[&raider].tapped);
+        assert!(matches!(
+            effect_timing_verdict(state, &target_candidate(raider), &config),
+            PolicyVerdict::Score { delta, reason }
+                if delta < 0.0
+                    && reason.kind == "effect_timing_futile_unattacking_evasion_target"
+        ));
+    }
+
+    #[test]
+    fn a_scheduled_additional_combat_phase_keeps_a_ready_creature_unpenalised() {
+        let mut scenario = GameScenario::new_n_player(2, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        let source = scenario
+            .add_creature(P0, "Whirler Rogue", 2, 2)
+            .with_ability_definition(whirler_ability())
+            .id();
+        let declared = scenario.add_creature(P0, "Declared Attacker", 2, 2).id();
+        let ready = scenario.add_creature(P0, "Ready Undeclared", 2, 2).id();
+        let extra_combat_source = scenario
+            .add_creature(P0, "Aggravated Assault Stand-In", 1, 1)
+            .with_ability_definition(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::AdditionalPhase {
+                        target: TargetFilter::Controller,
+                        phase: Phase::BeginCombat,
+                        after: Phase::PreCombatMain,
+                        followed_by: vec![Phase::PostCombatMain],
+                        count: engine::types::ability::QuantityExpr::Fixed { value: 1 },
+                        attacker_restriction: None,
+                    },
+                )
+                .cost(AbilityCost::Tap),
+            )
+            .id();
+        scenario.add_creature(PlayerId(1), "Ready Opposing Blocker", 2, 2);
+        scenario
+            .add_creature(P0, "Thopter Payment One", 1, 1)
+            .as_artifact();
+        scenario
+            .add_creature(P0, "Thopter Payment Two", 1, 1)
+            .as_artifact();
+        let mut runner = scenario.build();
+
+        runner.advance_to_phase(Phase::DeclareAttackers);
+        runner
+            .act(GameAction::DeclareAttackers {
+                attacks: vec![(declared, AttackTarget::Player(PlayerId(1)))],
+                bands: Vec::new(),
+            })
+            .expect("reach guard: the declaration must be engine-legal");
+        drive_to_postcombat_main(&mut runner);
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: extra_combat_source,
+                ability_index: 0,
+            })
+            .expect("reach guard: the extra-combat activation must be legal");
+        runner.advance_until_stack_empty();
+        assert!(runner
+            .state()
+            .extra_phases
+            .iter()
+            .any(|extra| extra.phase == Phase::BeginCombat));
+        assert!(get_valid_attacker_ids(runner.state()).contains(&ready));
+
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: 0,
+            })
+            .expect("reach guard: Whirler Rogue's two-artifact activation must be payable");
+        let state = runner.state();
+        assert!(matches!(
+            effect_timing_verdict(state, &target_candidate(ready), &AiConfig::default()),
+            PolicyVerdict::Score { delta: 0.0, reason }
+                if reason.kind == "effect_timing_evasion_target_na"
+        ));
+    }
+
+    #[test]
+    fn a_scheduled_additional_combat_phase_is_actually_entered() {
+        let mut scenario = GameScenario::new_n_player(2, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        let declared = scenario.add_creature(P0, "Declared Attacker", 2, 2).id();
+        // A creature that stays untapped through the first combat: without a
+        // potential attacker, the engine auto-skips the extra combat's
+        // declare-attackers step entirely (straight to EndCombat), and this
+        // test would never reach the state it is pinning.
+        scenario.add_creature(P0, "Ready Undeclared", 2, 2);
+        let extra_combat_source = scenario
+            .add_creature(P0, "Aggravated Assault Stand-In", 1, 1)
+            .with_ability_definition(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::AdditionalPhase {
+                        target: TargetFilter::Controller,
+                        phase: Phase::BeginCombat,
+                        after: Phase::PreCombatMain,
+                        followed_by: vec![Phase::PostCombatMain],
+                        count: engine::types::ability::QuantityExpr::Fixed { value: 1 },
+                        attacker_restriction: None,
+                    },
+                )
+                .cost(AbilityCost::Tap),
+            )
+            .id();
+        scenario.add_creature(PlayerId(1), "Ready Opposing Blocker", 2, 2);
+        let mut runner = scenario.build();
+
+        runner.advance_to_phase(Phase::DeclareAttackers);
+        runner
+            .act(GameAction::DeclareAttackers {
+                attacks: vec![(declared, AttackTarget::Player(PlayerId(1)))],
+                bands: Vec::new(),
+            })
+            .expect("reach guard: the declaration must be engine-legal");
+        drive_to_postcombat_main(&mut runner);
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: extra_combat_source,
+                ability_index: 0,
+            })
+            .expect("reach guard: the extra-combat activation must be legal");
+        runner.advance_until_stack_empty();
+
+        for _ in 0..40 {
+            if runner.state().phase == Phase::DeclareAttackers {
+                break;
+            }
+            if matches!(
+                runner.state().waiting_for,
+                WaitingFor::DeclareBlockers { .. }
+            ) {
+                runner
+                    .declare_blockers(&[])
+                    .expect("reach guard: declining to block must be legal");
+                continue;
+            }
+            if runner.act(GameAction::PassPriority).is_err() {
+                break;
+            }
+        }
+        let state = runner.state();
+
+        assert_eq!(state.phase, Phase::DeclareAttackers);
+        assert!(!state
+            .extra_phases
+            .iter()
+            .any(|e| e.phase == Phase::BeginCombat));
+        assert!(state
+            .combat
+            .as_ref()
+            .is_some_and(|combat| combat.attackers.is_empty()));
     }
 
     #[test]

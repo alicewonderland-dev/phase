@@ -13,6 +13,7 @@ use crate::types::game_state::GameState;
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use crate::types::keywords::Keyword;
 use crate::types::mana::ManaColor;
+use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
 use crate::types::resolved_commands::{
     ResolvedCombatMembershipCommand, ResolvedCombatMembershipEdit,
@@ -4560,6 +4561,63 @@ fn active_attacking_team(state: &GameState) -> Vec<PlayerId> {
 /// independent of whether combat has started.
 pub fn is_on_attacking_team(state: &GameState, player: PlayerId) -> bool {
     active_attacking_team(state).contains(&player)
+}
+
+/// CR 500.8 + CR 508.1: whether a declare-attackers step at which the attacking
+/// team has yet to declare is still ahead in this turn.
+///
+/// CR 508.1 performs the declaration once per combat phase as a turn-based
+/// action, and CR 508.2 gives priority only afterwards, so a creature not
+/// chosen then cannot join the combat in progress — CR 506.4 lists the ways a
+/// permanent leaves combat and has no counterpart for joining one late. This is
+/// the lifecycle question `get_valid_attacker_ids` does not answer: that helper
+/// applies CR 508.1a's per-creature restrictions to the whole team whatever the
+/// phase, so a ready creature that sat out the declaration stays in its result
+/// (pinned by `attacker_declaration_pending_this_turn_is_false_once_attackers_are_declared`).
+///
+/// CR 500.8: a scheduled additional combat phase carries its own CR 508.1
+/// declaration, so it reopens the answer whatever the current phase is.
+/// `Phase::BeginCombat` is the `ExtraPhase::phase` every additional-combat
+/// producer emits — `parser/oracle_effect/imperative.rs` lowers "additional
+/// combat phase" to `Effect::AdditionalPhase { phase: Phase::BeginCombat, .. }`
+/// and `game/effects/additional_phase.rs` pushes that value unchanged. The same
+/// `extra_phases` filter is how `analysis/resource.rs` already counts queued
+/// extra combats.
+///
+/// Conservative in one direction only: it answers from the current game state,
+/// so an additional combat that no effect has scheduled yet reads as absent,
+/// and a creature at a step this returns `false` for may still attack later if
+/// one is scheduled after this call.
+pub fn attacker_declaration_pending_this_turn(state: &GameState) -> bool {
+    if state
+        .extra_phases
+        .iter()
+        .any(|extra| extra.phase == Phase::BeginCombat)
+    {
+        return true;
+    }
+    match state.phase {
+        // CR 500.1 + CR 506.1: the declare-attackers step of this turn's combat
+        // phase is still ahead.
+        Phase::Untap | Phase::Upkeep | Phase::Draw | Phase::PreCombatMain | Phase::BeginCombat => {
+            true
+        }
+        // CR 508.1k: the chosen creatures become attacking creatures, so an
+        // attacking creature is the mark that the turn-based action has run.
+        // CR 508.8 keeps the empty declaration out of this arm: the engine
+        // leaves the step immediately when nothing is declared (pinned by
+        // `attacker_declaration_pending_this_turn_survives_an_empty_declaration`).
+        Phase::DeclareAttackers => state
+            .combat
+            .as_ref()
+            .is_none_or(|combat| combat.attackers.is_empty()),
+        Phase::DeclareBlockers
+        | Phase::CombatDamage
+        | Phase::EndCombat
+        | Phase::PostCombatMain
+        | Phase::End
+        | Phase::Cleanup => false,
+    }
 }
 
 /// CR 508.1a + CR 805.10a: eligible attacker ids for the whole attacking team,
@@ -12043,6 +12101,139 @@ mod tests {
         // Defending team: neither opponent is on the attacking team.
         assert!(!is_on_attacking_team(&state, PlayerId(2)));
         assert!(!is_on_attacking_team(&state, PlayerId(3)));
+    }
+
+    /// CR 500.1 + CR 506.1: the whole `=> true` arm group reads as pending
+    /// with no combat state yet, and so does a `DeclareAttackers` board whose
+    /// `CombatState` exists but has no attackers declared (the `is_none_or`
+    /// pre-declaration arm).
+    #[test]
+    fn attacker_declaration_pending_this_turn_is_true_before_the_declaration() {
+        let mut state = setup();
+        for phase in [
+            Phase::Untap,
+            Phase::Upkeep,
+            Phase::Draw,
+            Phase::PreCombatMain,
+            Phase::BeginCombat,
+        ] {
+            state.phase = phase;
+            state.combat = None;
+            assert!(
+                attacker_declaration_pending_this_turn(&state),
+                "{phase:?} must read as pending with no combat state yet"
+            );
+        }
+
+        state.phase = Phase::DeclareAttackers;
+        state.combat = Some(CombatState::default());
+        assert!(attacker_declaration_pending_this_turn(&state));
+    }
+
+    /// CR 508.1k: once attackers are declared, the whole `=> false` arm group
+    /// reads as no longer pending -- not just the immediate post-declaration
+    /// `DeclareAttackers` board. A split of any member out of that arm group
+    /// (M14) is what this loop is written to catch.
+    #[test]
+    fn attacker_declaration_pending_this_turn_is_false_once_attackers_are_declared() {
+        let mut state = setup();
+        let ready = create_creature(&mut state, PlayerId(0), "Ready", 2, 2);
+        let declared = create_creature(&mut state, PlayerId(0), "Declared", 2, 2);
+        state.phase = Phase::DeclareAttackers;
+        state.combat = Some(CombatState {
+            attackers: vec![AttackerInfo::attacking_player(declared, PlayerId(1))],
+            ..Default::default()
+        });
+        assert!(!attacker_declaration_pending_this_turn(&state));
+        // The AI guard this predicate feeds rests on this fact holding
+        // alongside it: a ready creature stays in the eligible set even
+        // though the window the predicate reports is closed.
+        assert!(get_valid_attacker_ids(&state).contains(&ready));
+
+        for phase in [
+            Phase::DeclareBlockers,
+            Phase::CombatDamage,
+            Phase::EndCombat,
+            Phase::PostCombatMain,
+            Phase::End,
+            Phase::Cleanup,
+        ] {
+            state.phase = phase;
+            assert!(
+                !attacker_declaration_pending_this_turn(&state),
+                "{phase:?} must stay non-pending once attackers are declared"
+            );
+        }
+    }
+
+    /// CR 508.8: an empty declaration is a legal declare-attackers turn-based
+    /// action, and the engine leaves the step immediately when it happens --
+    /// this drives that through the real engine rather than assuming it.
+    #[test]
+    fn attacker_declaration_pending_this_turn_survives_an_empty_declaration() {
+        use crate::game::scenario::GameScenario;
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        // A legal potential attacker must exist, or
+        // `WaitingFor::DeclareAttackers` is never surfaced to the caller --
+        // there would be nothing for `declare_attackers(&[])` to decline.
+        scenario.add_creature(PlayerId(0), "Ready Non-Attacker", 2, 2);
+        let mut runner = scenario.build();
+        runner.advance_to_phase(Phase::DeclareAttackers);
+        assert!(matches!(
+            runner.state().waiting_for,
+            crate::types::game_state::WaitingFor::DeclareAttackers { .. }
+        ));
+        runner
+            .declare_attackers(&[])
+            .expect("CR 508.8: an empty declaration must be legal");
+
+        assert_ne!(
+            runner.state().phase,
+            Phase::DeclareAttackers,
+            "CR 508.8: an empty declaration must skip past declare-attackers"
+        );
+        assert!(!attacker_declaration_pending_this_turn(runner.state()));
+    }
+
+    /// CR 500.8: a scheduled additional combat phase reopens the answer
+    /// whatever the current phase is, and a non-combat scheduled extra phase
+    /// (the shape `additional_phase.rs` handles in its `phase == Phase::Untap`
+    /// branch) must not.
+    #[test]
+    fn attacker_declaration_pending_this_turn_reopens_for_a_scheduled_additional_combat() {
+        use crate::types::game_state::ExtraPhase;
+
+        let mut state = setup();
+        let ready = create_creature(&mut state, PlayerId(0), "Ready", 2, 2);
+        let declared = create_creature(&mut state, PlayerId(0), "Declared", 2, 2);
+        state.phase = Phase::PostCombatMain;
+        state.combat = Some(CombatState {
+            attackers: vec![AttackerInfo::attacking_player(declared, PlayerId(1))],
+            ..Default::default()
+        });
+        assert!(!attacker_declaration_pending_this_turn(&state));
+
+        state.extra_phases.push(ExtraPhase {
+            anchor: Phase::PostCombatMain,
+            phase: Phase::BeginCombat,
+            attacker_restriction: None,
+            attacker_restriction_source: None,
+        });
+        assert!(attacker_declaration_pending_this_turn(&state));
+        assert!(get_valid_attacker_ids(&state).contains(&ready));
+
+        // Negative sibling: a non-combat extra phase must not reopen the
+        // window.
+        state.extra_phases.clear();
+        state.extra_phases.push(ExtraPhase {
+            anchor: Phase::PostCombatMain,
+            phase: Phase::Untap,
+            attacker_restriction: None,
+            attacker_restriction_source: None,
+        });
+        assert!(!attacker_declaration_pending_this_turn(&state));
     }
 
     #[test]
