@@ -483,14 +483,25 @@ impl CommanderPairing {
     /// authority for the ADMISSION decision. Callers deciding admission must
     /// not re-derive it with `is_empty()`, `> 2` or `!= 1`.
     ///
-    /// Carve-out: `evaluate_commander_with_format`'s post-admission
-    /// consequence gate (`!request.commander.is_empty() &&
-    /// request.commander.len() <= 2`) re-derives the same range, but only to
-    /// guard whether the eligibility/partner-pairing checks below it are
-    /// safe to run — admission itself was already decided by this method a
-    /// few lines earlier. `format_axis_census`'s
-    /// `no_caller_reintroduces_a_commander_count_literal` brace-anchors this
-    /// site by name so a future ratchet does not sweep it up.
+    /// Post-admission re-derivation is a separate, legitimate pattern: an
+    /// evaluator that accumulates `reasons` and keeps running after a failed
+    /// admission check needs its own guard at every later point that indexes
+    /// or iterates the commander slot, because nothing stops execution when
+    /// admission fails. A function that early-returns on admission failure
+    /// instead, like `quick_commander_check`, carries no such guard. Current
+    /// sites, as illustration rather than as the full set:
+    /// `evaluate_commander_with_format`
+    /// (`!request.commander.is_empty() && request.commander.len() <= 2`,
+    /// guarding its eligibility/partner-pairing checks); `evaluate_brawl`,
+    /// twice (`request.commander.len() == 1`, each immediately indexing
+    /// `request.commander[0]` — deleting either panics on an empty Brawl
+    /// decklist, not merely mis-validates); and `evaluate_tiny_leaders`
+    /// (`request.commander.len() <= 2`, guarding its
+    /// eligibility/ban/partner loop). `format_axis_census`'s
+    /// `no_caller_reintroduces_a_commander_count_literal` brace-anchors only
+    /// the first of these by name; its banned spellings do not match the
+    /// other three, so a future ratchet will not flag a deleted guard
+    /// there.
     pub fn admits_count(self, count: usize) -> bool {
         match self {
             CommanderPairing::NoCommander => count == 0,
@@ -1431,7 +1442,8 @@ impl GameFormat {
     /// How many commanders this format's decklist may designate. Whether a
     /// specific count is admitted is `CommanderPairing::admits_count`'s call
     /// — the single authority for that decision, documented there along with
-    /// its one carve-out. Callers must not re-derive admission themselves.
+    /// the legitimate post-admission guards that re-derive it. Callers must
+    /// not re-derive admission itself.
     ///
     /// `Custom(_)` answers `NoCommander`: reachable via both custom
     /// evaluators (`evaluate_custom_format`, `quick_custom_format_check`),
