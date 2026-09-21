@@ -1,6 +1,6 @@
 //! Structural guards for the three format-axis methods `GameFormat` gained in
-//! Phase 3 (`card_pool`, and — as later units land — `commander_pairing` and
-//! `deck_size_subject`). Each guard scans production-scope source text
+//! Phase 3: `card_pool`, `commander_pairing`, and `deck_size_subject`. Each
+//! guard scans production-scope source text
 //! through `include_str!`, so a moved or renamed file is a compile error, not
 //! a silently empty scan.
 //!
@@ -237,7 +237,7 @@ fn card_pool_authority_tables_are_built_in_one_place() {
     );
 }
 
-/// Census clause 4 (card-pool half; extended as later units add axes) + Row 6
+/// Census clause 4 (all three axis methods) + Row 6
 /// secondary instrument: `E0004` catches a deleted arm, but not a future
 /// `_ => CardPool::NoEngineAuthority` silencing the compiler and re-creating
 /// the implied default this phase removes.

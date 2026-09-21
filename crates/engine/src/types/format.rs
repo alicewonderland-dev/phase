@@ -476,8 +476,18 @@ pub enum CommanderPairing {
 }
 
 impl CommanderPairing {
-    /// How many designated commanders this rule admits — the single authority.
-    /// Callers must not re-derive it with `is_empty()`, `> 2` or `!= 1`.
+    /// How many designated commanders this rule admits — the single
+    /// authority for the ADMISSION decision. Callers deciding admission must
+    /// not re-derive it with `is_empty()`, `> 2` or `!= 1`.
+    ///
+    /// Carve-out: `evaluate_commander_with_format`'s post-admission
+    /// consequence gate (`!request.commander.is_empty() &&
+    /// request.commander.len() <= 2`) re-derives the same range, but only to
+    /// guard whether the eligibility/partner-pairing checks below it are
+    /// safe to run — admission itself was already decided by this method a
+    /// few lines earlier. `format_axis_census`'s
+    /// `no_caller_reintroduces_a_commander_count_literal` brace-anchors this
+    /// site by name so a future ratchet does not sweep it up.
     pub fn admits_count(self, count: usize) -> bool {
         match self {
             CommanderPairing::NoCommander => count == 0,
@@ -1389,11 +1399,14 @@ impl GameFormat {
             | GameFormat::TwoHeadedGiant
             | GameFormat::Archenemy
             | GameFormat::Planechase
-            | GameFormat::Momir
             // CR 903.13e: the drafted cards become the card pool, so no
             // constructed legality table applies — as for Limited.
             | GameFormat::CommanderDraft
             | GameFormat::Limited => CardPool::NoEngineAuthority,
+            // Momir's main deck is fixed by the format's own rule, not by a
+            // legality table: `evaluate_momir` enforces exactly 12 copies
+            // each of the five CR 305.6 snow basic land types.
+            GameFormat::Momir => CardPool::NoEngineAuthority,
             // A custom format's legality is entirely governed by its own
             // `LegalityRules` (legal_sets/legal_cards/banned/restricted), never by the
             // built-in `LegalityFormat` table.
@@ -1416,10 +1429,11 @@ impl GameFormat {
     /// authority. Callers must not re-derive it with `is_empty()`, `> 2` or
     /// `!= 1`.
     ///
-    /// `Custom(_)` answers `NoCommander`: reachable only via
-    /// `evaluate_constructed`'s custom path, and correct there because every
-    /// command-zone custom format is already refused upstream by
-    /// `custom_format_pool`'s `CUSTOM_FORMAT_COMMAND_ZONE_UNSUPPORTED` gate.
+    /// `Custom(_)` answers `NoCommander`: reachable via both custom
+    /// evaluators (`evaluate_custom_format`, `quick_custom_format_check`),
+    /// and correct on either because every command-zone custom format is
+    /// already refused upstream by `custom_format_pool`'s
+    /// `CUSTOM_FORMAT_COMMAND_ZONE_UNSUPPORTED` gate.
     pub fn commander_pairing(self) -> CommanderPairing {
         match self {
             GameFormat::Commander
@@ -1622,8 +1636,9 @@ impl GameFormat {
     /// Which pile this format's `DeckSizeRule` measures — the single
     /// authority.
     ///
-    /// `Custom(_)` answers `MainDeck`, disclosed fail-closed: the custom
-    /// evaluator is constructed-shaped only.
+    /// `Custom(_)` answers `MainDeck`, disclosed fail-closed: both custom
+    /// evaluators (`evaluate_custom_format`, `quick_custom_format_check`) are
+    /// constructed-shaped only.
     pub fn deck_size_subject(self) -> DeckSizeSubject {
         match self {
             GameFormat::Commander
