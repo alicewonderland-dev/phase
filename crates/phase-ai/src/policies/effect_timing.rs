@@ -1,7 +1,7 @@
 use engine::ai_support::current_target_selection_targets;
 use engine::game::combat::{
     attacker_blockability_in_maximum_free_declaration, defending_player_for_attacker,
-    MaximumBlockDeclarationBlockability,
+    get_valid_attacker_ids, MaximumBlockDeclarationBlockability,
 };
 use engine::game::{players, turn_control};
 use engine::types::ability::{
@@ -108,16 +108,27 @@ impl TacticalPolicy for EffectTimingPolicy {
 /// Scores only an ordinary, one-slot activated ability that grants its creature
 /// target bare, until-end-of-turn unblockability.
 fn evasion_target_verdict(ctx: &PolicyContext<'_>, target: &TargetRef) -> PolicyVerdict {
-    if !is_single_target_unblockable_activation(ctx)
-        || !matches!(ctx.state.phase, Phase::DeclareAttackers)
-        || prompt_has_team_defender(ctx.state)
-    {
+    if !is_single_target_unblockable_activation(ctx) {
         return PolicyVerdict::neutral(PolicyReason::new("effect_timing_evasion_target_na"));
     }
-
     let TargetRef::Object(target_id) = target else {
         return PolicyVerdict::neutral(PolicyReason::new("effect_timing_evasion_target_na"));
     };
+
+    // CR 509.1b + CR 508.1a: a grant that cannot reach a declare-blockers step
+    // is wasted no matter which phase it was activated in, so this runs ahead
+    // of the declare-attackers gate below rather than inside it.
+    if target_cannot_attack_this_turn(ctx.state, ctx.ai_player, *target_id) {
+        return PolicyVerdict::strong(
+            -STRONG_MAX,
+            PolicyReason::new("effect_timing_futile_unattacking_evasion_target"),
+        );
+    }
+
+    if !matches!(ctx.state.phase, Phase::DeclareAttackers) || prompt_has_team_defender(ctx.state) {
+        return PolicyVerdict::neutral(PolicyReason::new("effect_timing_evasion_target_na"));
+    }
+
     if !matches!(
         ai_controlled_declared_attacker_blockability(ctx.state, ctx.ai_player, *target_id),
         MaximumBlockDeclarationBlockability::NotBlockable
@@ -279,6 +290,43 @@ fn ai_controlled_declared_attacker_blockability(
     } else {
         MaximumBlockDeclarationBlockability::NotBlockable
     }
+}
+
+/// CR 508.1a + CR 805.10a: the attacking team is the active player together
+/// with their teammates, and `get_valid_attacker_ids` answers only about that
+/// team. For any other team's creature its exclusion is a scope artifact
+/// rather than a rules fact, so callers must gate on this first.
+///
+/// Mirrors the private `combat::active_attacking_team` through the same public
+/// `players::teammates` authority `prompt_has_team_defender` already composes.
+fn on_attacking_team(state: &GameState, player: PlayerId) -> bool {
+    state.active_player == player
+        || players::teammates(state, state.active_player).contains(&player)
+}
+
+/// CR 509.1b: "can't be blocked" is an evasion restriction, and a restriction is
+/// only ever checked when blockers are declared against an attacking creature.
+/// A target that cannot be an attacker in this turn's combat therefore gains
+/// nothing from the grant, in any phase — which is why this guard sits ahead of
+/// the declare-attackers phase gate rather than behind it.
+///
+/// The per-creature question goes to `get_valid_attacker_ids`, never to
+/// `tapped` or to the phase label: that authority also folds in summoning
+/// sickness (CR 302.6), Defender (CR 702.3b), phased-out permanents
+/// (CR 702.26b) and "can't attack" restrictions (CR 508.1c).
+///
+/// A creature already declared as an attacker is exempt. CR 508.1f taps it as
+/// part of the declaration, so CR 508.1a then excludes it from the eligible set
+/// even though it is precisely the target the grant exists for; its worth is
+/// judged by the blockability comparison in `evasion_target_verdict` instead.
+fn target_cannot_attack_this_turn(
+    state: &GameState,
+    ai_player: PlayerId,
+    target_id: engine::types::identifiers::ObjectId,
+) -> bool {
+    on_attacking_team(state, ai_player)
+        && defending_player_for_attacker(state, target_id).is_none()
+        && !get_valid_attacker_ids(state).contains(&target_id)
 }
 
 fn score_action_shape(ctx: &PolicyContext<'_>) -> f64 {
@@ -800,7 +848,281 @@ mod tests {
         assert!(matches!(
             effect_timing_verdict(state, &futile_candidate, &config),
             PolicyVerdict::Score { delta, reason }
-                if delta < 0.0 && reason.kind == "effect_timing_futile_evasion_target"
+                if delta < 0.0 && reason.kind == "effect_timing_futile_unattacking_evasion_target"
+        ));
+    }
+
+    #[test]
+    fn whirler_rogue_refuses_a_main_phase_evasion_grant_to_a_creature_that_cannot_attack() {
+        let mut scenario = GameScenario::new_n_player(2, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        let source = scenario
+            .add_creature(P0, "Whirler Rogue", 1, 1)
+            .with_ability_definition(whirler_ability())
+            .id();
+        let futile = scenario.add_creature(P0, "Tapped Sick Body", 3, 3).id();
+        let useful = scenario.add_creature(P0, "Ready Attacker", 1, 1).id();
+        let new_sick = scenario.add_creature(P0, "Sick Rookie", 1, 1).id();
+        let blocker = scenario
+            .add_creature(PlayerId(1), "Ready Blocker", 2, 2)
+            .id();
+        scenario
+            .add_creature(P0, "Thopter Payment One", 1, 1)
+            .as_artifact();
+        scenario
+            .add_creature(P0, "Thopter Payment Two", 1, 1)
+            .as_artifact();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        let futile_object = state.objects.get_mut(&futile).unwrap();
+        futile_object.tapped = true;
+        futile_object.summoning_sick = true;
+        // `GameScenario::add_creature` sets `summoning_sick = false`
+        // (scenario.rs:387), so the untapped/summoning-sick axis is set
+        // post-`build()`, exactly as `futile`'s flags are set above.
+        state.objects.get_mut(&new_sick).unwrap().summoning_sick = true;
+
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: 0,
+            })
+            .expect("reach guard: Whirler Rogue's two-artifact activation must be payable");
+        let state = runner.state();
+        assert_eq!(
+            state.phase,
+            Phase::PreCombatMain,
+            "this pins the old phase gate as the defect"
+        );
+        let WaitingFor::TargetSelection {
+            pending_cast,
+            selection,
+            ..
+        } = &state.waiting_for
+        else {
+            panic!("Whirler Rogue's ordinary activation must reach TargetSelection");
+        };
+        assert_eq!(
+            pending_cast.activation_ability_index,
+            Some(0),
+            "reach guard: target prompt must retain the activated-ability index"
+        );
+        assert!(
+            pending_cast.activation_cost.is_some(),
+            "reach guard: target prompt must retain the activation cost"
+        );
+        assert!(selection
+            .current_legal_targets
+            .contains(&TargetRef::Object(futile)));
+        assert!(selection
+            .current_legal_targets
+            .contains(&TargetRef::Object(useful)));
+        assert!(
+            selection
+                .current_legal_targets
+                .contains(&TargetRef::Object(blocker)),
+            "reach guard: the opponent's creature must be a production-reachable candidate, \
+             not merely a synthetic candidate built by hand"
+        );
+        assert!(selection
+            .current_legal_targets
+            .contains(&TargetRef::Object(new_sick)));
+        assert_eq!(
+            selection.current_legal_targets.len(),
+            5,
+            "pre-beam guard: a sixth legal target would truncate the root beam at \
+             max_branching, dropping the lowest beam_priority candidate and silently \
+             changing the ranking basis assertion 4 asserts against"
+        );
+
+        assert!(get_valid_attacker_ids(state).contains(&useful));
+        assert!(!get_valid_attacker_ids(state).contains(&futile));
+        assert!(!state.objects[&new_sick].tapped);
+        assert!(!get_valid_attacker_ids(state).contains(&new_sick));
+
+        let config = AiConfig::default();
+
+        // Assertion 1 (primary revert-failing assertion): pre-fix this is
+        // `Score { delta: 0.0, kind: "effect_timing_evasion_target_na" }`,
+        // deterministic and independent of search and softmax.
+        assert!(matches!(
+            effect_timing_verdict(state, &target_candidate(futile), &config),
+            PolicyVerdict::Score { delta, reason }
+                if delta < 0.0
+                    && reason.kind == "effect_timing_futile_unattacking_evasion_target"
+        ));
+
+        // Assertion 2 (paired negative sibling / negative control): proves the
+        // guard discriminates rather than blanket-penalising.
+        assert!(matches!(
+            effect_timing_verdict(state, &target_candidate(useful), &config),
+            PolicyVerdict::Score { delta: 0.0, reason }
+                if reason.kind == "effect_timing_evasion_target_na"
+        ));
+
+        // Assertion 3 (the enumerated opponent-controlled cell, measured
+        // reachable): on the AI's own turn the opponent's creature genuinely
+        // cannot attack either, and `whirler_ability()` imposes no controller
+        // restriction on its target.
+        assert!(matches!(
+            effect_timing_verdict(state, &target_candidate(blocker), &config),
+            PolicyVerdict::Score { delta, reason }
+                if delta < 0.0
+                    && reason.kind == "effect_timing_futile_unattacking_evasion_target"
+        ));
+
+        // Assertion 4 (chooser-level, deterministic; BL-2 resolved).
+        let mut rng = SmallRng::seed_from_u64(0); // any seed: P13 measured rank/score/probability seed-invariant
+        let selection = crate::search::choose_action_with_session_diagnostic(
+            state,
+            P0,
+            &config,
+            &mut rng,
+            &crate::AiSession::arc_from_game(state),
+        );
+        let receipt = selection
+            .receipt
+            .expect("reach guard: the ranked chooser must emit a receipt");
+        assert_eq!(
+            receipt.candidates.len(),
+            5,
+            "reach guard: nothing was gated out below the beam width. This canNOT detect a \
+             sixth candidate -- the root beam truncates to max_branching before the receipt \
+             is built; current_legal_targets.len() is the guard for that"
+        );
+        let row = receipt
+            .candidates
+            .iter()
+            .find(|c| {
+                c.action
+                    == GameAction::ChooseTarget {
+                        target: Some(TargetRef::Object(futile)),
+                    }
+            })
+            .expect("reach guard: the futile candidate must appear in the receipt");
+        assert_eq!(row.rank, Some(3));
+        assert!(!row.is_top_ranked);
+
+        // Assertion 5 (the untapped / summoning-sick axis -- added by F3).
+        // Assertion 1 cannot reach this axis, because `futile` is tapped as
+        // well as sick, so a `.tapped` substitute still fires on it.
+        assert!(matches!(
+            effect_timing_verdict(state, &target_candidate(new_sick), &config),
+            PolicyVerdict::Score { delta, reason }
+                if delta < 0.0
+                    && reason.kind == "effect_timing_futile_unattacking_evasion_target"
+        ));
+    }
+
+    #[test]
+    fn a_declared_attacker_is_exempt_from_the_unattacking_evasion_guard() {
+        let mut scenario = GameScenario::new_n_player(2, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        let source = scenario
+            .add_creature(P0, "Whirler Rogue", 1, 1)
+            .with_ability_definition(whirler_ability())
+            .id();
+        let futile = scenario.add_creature(P0, "Tapped Sick Body", 3, 3).id();
+        let useful = scenario.add_creature(P0, "Ready Attacker", 1, 1).id();
+        let new_sick = scenario.add_creature(P0, "Sick Rookie", 1, 1).id();
+        scenario.add_creature(PlayerId(1), "Ready Blocker", 2, 2);
+        scenario
+            .add_creature(P0, "Thopter Payment One", 1, 1)
+            .as_artifact();
+        scenario
+            .add_creature(P0, "Thopter Payment Two", 1, 1)
+            .as_artifact();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        let futile_object = state.objects.get_mut(&futile).unwrap();
+        futile_object.tapped = true;
+        futile_object.summoning_sick = true;
+        state.objects.get_mut(&new_sick).unwrap().summoning_sick = true;
+
+        runner.advance_to_phase(Phase::DeclareAttackers);
+        runner
+            .act(GameAction::DeclareAttackers {
+                attacks: vec![(useful, AttackTarget::Player(PlayerId(1)))],
+                bands: Vec::new(),
+            })
+            .expect("reach guard: declared attacker must be engine-legal");
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: 0,
+            })
+            .expect("reach guard: Whirler Rogue's two-artifact activation must be payable");
+        let state = runner.state();
+
+        // P5's measurement written into the suite, so the exemption's
+        // necessity is visible in the test rather than only in the plan: CR
+        // 508.1f tapped `useful` out of the eligible set, so both it and its
+        // non-declared tapped sibling are absent from `get_valid_attacker_ids`.
+        // Do NOT assert `.is_empty()` -- the untapped, non-sick Whirler Rogue
+        // source remains eligible (P5).
+        assert!(state.objects[&useful].tapped);
+        assert!(!get_valid_attacker_ids(state).contains(&useful));
+        assert!(!get_valid_attacker_ids(state).contains(&futile));
+
+        let config = AiConfig::default();
+        // Two authorities on one board, opposite verdicts: `useful` is a
+        // legitimately declared (and therefore tapped) attacker, exempt from
+        // the new guard and judged instead by the unchanged blockability
+        // comparison; `futile` is not a declared attacker and is judged by
+        // the new guard.
+        assert!(matches!(
+            effect_timing_verdict(state, &target_candidate(useful), &config),
+            PolicyVerdict::Score { delta: 0.0, reason }
+                if reason.kind == "effect_timing_pair_blockable_evasion_target"
+        ));
+        assert!(matches!(
+            effect_timing_verdict(state, &target_candidate(futile), &config),
+            PolicyVerdict::Score { delta, reason }
+                if delta < 0.0
+                    && reason.kind == "effect_timing_futile_unattacking_evasion_target"
+        ));
+    }
+
+    #[test]
+    fn an_opponents_turn_evasion_target_is_not_judged_by_the_attacking_teams_authority() {
+        let mut state = GameState::new_two_player(42);
+        state.phase = Phase::DeclareAttackers;
+        state.active_player = PlayerId(1);
+        let source = creature(&mut state, P0, "Whirler Rogue");
+        let own_ready = creature(&mut state, P0, "Own Ready Nonattacker");
+        let enemy_attacker = creature(&mut state, PlayerId(1), "Enemy Attacker");
+        let blocker = creature(&mut state, P0, "Ready Blocker");
+        state.combat = Some(CombatState {
+            attackers: vec![declared_attacker(enemy_attacker, P0)],
+            ..Default::default()
+        });
+        install_whirler_prompt(&mut state, source, vec![own_ready, enemy_attacker]);
+
+        assert!(get_valid_block_targets(&state)
+            .get(&blocker)
+            .is_some_and(|targets| targets.contains(&enemy_attacker)));
+
+        // (a) P4's scope artifact, asserted directly so the reason for the
+        // team gate is legible from the test: `own_ready` is untapped and
+        // ready, but on the opponent's turn `get_valid_attacker_ids` answers
+        // about the *opponent's* attacking team, so it excludes a perfectly
+        // eligible AI creature.
+        assert!(!state.objects[&own_ready].tapped);
+        assert!(!get_valid_attacker_ids(&state).contains(&own_ready));
+
+        let own_candidate = target_candidate(own_ready);
+        let config = AiConfig::default();
+
+        // (b) The instrument has no standing here (M4: exact kind, not a bare
+        // "neutral" check): the guard abstains on `on_attacking_team`, so the
+        // verdict falls through to the unchanged blockability comparison,
+        // matching the adjacent
+        // `opponent_combat_does_not_penalize_own_target_for_enemy_blockable_attacker`
+        // fixture this test extends.
+        assert!(matches!(
+            effect_timing_verdict(&state, &own_candidate, &config),
+            PolicyVerdict::Score { delta: 0.0, reason }
+                if reason.kind == "effect_timing_no_pair_blockable_evasion_target"
         ));
     }
 
