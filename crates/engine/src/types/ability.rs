@@ -10443,12 +10443,14 @@ pub enum AttackSubject {
     Source,
 }
 
-/// CR 508.6: The time window over which "attacked [a player]" is measured.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AttackScope {
-    /// Across the whole turn, accumulated over every combat (CR 508.5).
+/// CR 500.8 + CR 511.3: The time window a combat-history predicate is measured over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CombatHistoryScope {
+    /// CR 500.8: the whole turn, accumulated across every combat phase in it —
+    /// effects can add phases to a turn, so a turn is not limited to one combat.
     ThisTurn,
-    /// Within the current combat only (CR 702.121a Melee).
+    /// CR 511.3: the current combat phase only — the window that ends when the
+    /// end of combat step ends.
     ThisCombat,
 }
 
@@ -10518,7 +10520,7 @@ pub enum PlayerFilter {
     /// Destiny), and adds the combat-scoped form used by Melee (CR 702.121a).
     OpponentAttacked {
         subject: AttackSubject,
-        scope: AttackScope,
+        scope: CombatHistoryScope,
     },
     /// CR 508.6 + CR 102.2 + CR 508.1b: The INVERSE combat relation of
     /// `OpponentAttacked` — each opponent of the controller who is *attacking the

@@ -24855,21 +24855,23 @@ impl GameState {
     pub fn opponent_attacked(
         &self,
         subject: AttackSubject,
-        scope: crate::types::ability::AttackScope,
+        scope: crate::types::ability::CombatHistoryScope,
         controller: PlayerId,
         source_id: ObjectId,
         target: PlayerId,
     ) -> bool {
-        use crate::types::ability::{AttackScope, AttackSubject};
+        use crate::types::ability::{AttackSubject, CombatHistoryScope};
         match (subject, scope) {
-            (AttackSubject::You, AttackScope::ThisTurn) => self.has_attacked(controller, target),
-            (AttackSubject::Source, AttackScope::ThisTurn) => {
+            (AttackSubject::You, CombatHistoryScope::ThisTurn) => {
+                self.has_attacked(controller, target)
+            }
+            (AttackSubject::Source, CombatHistoryScope::ThisTurn) => {
                 self.creature_attacked_player_this_turn(source_id, target)
             }
-            (AttackSubject::You, AttackScope::ThisCombat) => {
+            (AttackSubject::You, CombatHistoryScope::ThisCombat) => {
                 self.player_attacked_player_this_combat(controller, target)
             }
-            (AttackSubject::Source, AttackScope::ThisCombat) => {
+            (AttackSubject::Source, CombatHistoryScope::ThisCombat) => {
                 self.creature_attacked_player_this_combat(source_id, target)
             }
         }

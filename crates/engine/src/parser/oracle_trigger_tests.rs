@@ -8,16 +8,17 @@ use crate::parser::oracle_ir::doc::PrintedTriggerIndex;
 use crate::parser::oracle_ir::effect_chain::PlayerScopeRewrite;
 use crate::parser::test_support::assert_no_unimplemented;
 use crate::types::ability::{
-    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction, AttackScope,
+    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction,
     AttackSubject, BounceSelection, CardSelectionMode, CardTypeSetSource, CastingPermission,
-    ChosenAttribute, Comparator, ContinuousModification, ControllerRef, CopyChooseScope,
-    CopyRetargetPermission, CountScope, DamageAmountScope, DamageAmountThreshold, DamageChannel,
-    DamageModification, DamageSource, DelayedTriggerCondition, DiscardSelfScope, Duration, Effect,
-    EffectScope, FilterProp, ManaContribution, ManaProduction, ManaSpendPermission, ModalChoice,
-    ObjectProperty, ObjectScope, PerpetualModification, PlayerFilter, PlayerScope,
-    PropertyAggregate, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef, SeatDirection,
-    SharedQuality, SiblingCondition, SubAbilityLink, TapStateChange, TargetFilter,
-    TriggerCondition, TriggerDefinition, TurnJournalKind, TypeFilter, TypedFilter, ZoneRef,
+    ChosenAttribute, CombatHistoryScope, Comparator, ContinuousModification, ControllerRef,
+    CopyChooseScope, CopyRetargetPermission, CountScope, DamageAmountScope, DamageAmountThreshold,
+    DamageChannel, DamageModification, DamageSource, DelayedTriggerCondition, DiscardSelfScope,
+    Duration, Effect, EffectScope, FilterProp, ManaContribution, ManaProduction,
+    ManaSpendPermission, ModalChoice, ObjectProperty, ObjectScope, PerpetualModification,
+    PlayerFilter, PlayerScope, PropertyAggregate, PtStat, PtValue, PtValueScope, QuantityExpr,
+    QuantityRef, SeatDirection, SharedQuality, SiblingCondition, SubAbilityLink, TapStateChange,
+    TargetFilter, TriggerCondition, TriggerDefinition, TurnJournalKind, TypeFilter, TypedFilter,
+    ZoneRef,
 };
 use crate::types::card_type::Supertype;
 use crate::types::counter::{CounterMatch, CounterType};
@@ -7641,7 +7642,7 @@ fn parse_angel_of_destiny_end_step_loss_issue_1599() {
         execute.player_scope,
         Some(PlayerFilter::OpponentAttacked {
             subject: AttackSubject::Source,
-            scope: AttackScope::ThisTurn,
+            scope: CombatHistoryScope::ThisTurn,
         }),
         "LoseTheGame must scope to players the source attacked this turn (issue #1599), got {:?}",
         execute.player_scope,

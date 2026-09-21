@@ -24,7 +24,7 @@ use crate::types::ability::{
     TargetRef, ThisWayCause, TypedFilter, ZoneChoiceCandidateSource, ZoneChoiceChooser,
 };
 #[cfg(test)]
-use crate::types::ability::{AttackScope, AttackSubject};
+use crate::types::ability::{AttackSubject, CombatHistoryScope};
 use crate::types::events::{GameEvent, PlayerActionKind};
 use crate::types::game_state::{
     AutoMayChoice, CastOfferKind, ClauseMinimumSnapshot, DayNight, DiscardBatchCursor,
@@ -21356,7 +21356,7 @@ mod tests {
                 PlayerId(2),
                 &PlayerFilter::OpponentAttacked {
                     subject: AttackSubject::You,
-                    scope: AttackScope::ThisTurn,
+                    scope: CombatHistoryScope::ThisTurn,
                 },
                 PlayerId(0),
                 angel,
@@ -21369,7 +21369,7 @@ mod tests {
                 PlayerId(2),
                 &PlayerFilter::OpponentAttacked {
                     subject: AttackSubject::Source,
-                    scope: AttackScope::ThisTurn,
+                    scope: CombatHistoryScope::ThisTurn,
                 },
                 PlayerId(0),
                 angel,
@@ -21382,7 +21382,7 @@ mod tests {
                 PlayerId(1),
                 &PlayerFilter::OpponentAttacked {
                     subject: AttackSubject::Source,
-                    scope: AttackScope::ThisTurn,
+                    scope: CombatHistoryScope::ThisTurn,
                 },
                 PlayerId(0),
                 angel,

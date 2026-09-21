@@ -16,9 +16,9 @@ use crate::game::filter::{
 };
 use crate::game::speed::effective_speed;
 use crate::types::ability::{
-    AbilityCondition, AbilityCost, AbilityDefinition, AggregateFunction, AttackScope,
-    BasicLandType, CardTypeSetSource, CastManaObjectScope, CastManaSpentMetric,
-    CastPermissionConstraint, CastingPermission, ContinuousModification, ControllerRef, CountScope,
+    AbilityCondition, AbilityCost, AbilityDefinition, AggregateFunction, BasicLandType,
+    CardTypeSetSource, CastManaObjectScope, CastManaSpentMetric, CastPermissionConstraint,
+    CastingPermission, CombatHistoryScope, ContinuousModification, ControllerRef, CountScope,
     DamageChannel, Duration, Effect, FilterProp, ModalSelectionCondition, ModalSelectionConstraint,
     ObjectProperty, ObjectScope, ParsedCondition, PlayerFilter, PlayerScope, PossessionAxis,
     QuantityExpr, QuantityRef, RepeatContinuation, ResolvedAbility, RoundingMode,
@@ -8809,7 +8809,7 @@ pub(crate) fn resolve_player_count(
 
     if let PlayerFilter::OpponentAttacked {
         subject,
-        scope: AttackScope::ThisCombat,
+        scope: CombatHistoryScope::ThisCombat,
     } = filter
     {
         return usize_to_i32_saturating(

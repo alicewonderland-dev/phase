@@ -31,15 +31,15 @@ use crate::parser::oracle_ir::context::ParseContext;
 use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
 use crate::parser::oracle_ir::effect_chain::{ClauseIr, EffectChainIr};
 use crate::types::ability::{
-    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction, AttackScope,
+    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction,
     AttackSubject, CastCostModifier, CastFromZoneDriver, CastPermissionConstraint,
-    CastingPermission, Comparator, ConjureSource, ContinuousModification, ControllerRef,
-    DamageChannel, DamageSource, DelayedTriggerCondition, Duration, Effect, EffectScope,
-    ExiledSpellRider, FilterProp, GameRestriction, LibraryPosition, ManaSpendPermission,
-    MultiTargetSpec, ObjectScope, PermissionGrantee, PlayerFilter, PreventionAmount,
-    PreventionScope, PtValue, QuantityExpr, QuantityRef, RestrictionPlayerScope, RoundingMode,
-    SpellStackToGraveyardReplacement, StaticCondition, StaticDefinition, SubAbilityLink,
-    TargetChoiceTiming, TargetFilter, TypeFilter, TypedFilter,
+    CastingPermission, CombatHistoryScope, Comparator, ConjureSource, ContinuousModification,
+    ControllerRef, DamageChannel, DamageSource, DelayedTriggerCondition, Duration, Effect,
+    EffectScope, ExiledSpellRider, FilterProp, GameRestriction, LibraryPosition,
+    ManaSpendPermission, MultiTargetSpec, ObjectScope, PermissionGrantee, PlayerFilter,
+    PreventionAmount, PreventionScope, PtValue, QuantityExpr, QuantityRef, RestrictionPlayerScope,
+    RoundingMode, SpellStackToGraveyardReplacement, StaticCondition, StaticDefinition,
+    SubAbilityLink, TargetChoiceTiming, TargetFilter, TypeFilter, TypedFilter,
 };
 use crate::types::counter::CounterType;
 use crate::types::game_state::{DistributionUnit, TargetSelectionConstraint};
@@ -5607,7 +5607,7 @@ pub(super) fn strip_each_player_subject(text: &str) -> (Option<PlayerFilter>, St
         return (
             Some(PlayerFilter::OpponentAttacked {
                 subject: AttackSubject::Source,
-                scope: AttackScope::ThisTurn,
+                scope: CombatHistoryScope::ThisTurn,
             }),
             deconjugated,
         );
