@@ -433,6 +433,83 @@ impl DeckSizeAuthority {
     }
 }
 
+/// Which authority decides whether a card is in a format's deck-construction
+/// card pool.
+///
+/// CR 100.6 is why this is an engine axis rather than a Comprehensive Rules
+/// one: ban and restricted lists live in the tournament rules, not the CR
+/// ("These rules may limit the use of some cards, including barring all cards
+/// from some older sets"). A format declaring that nothing is restricted is
+/// making a statement the CR permits, not overriding one it makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardPool {
+    /// The engine's legality table for this `LegalityFormat` answers each card.
+    LegalityTable(LegalityFormat),
+    /// No legality table answers this format's pool, and the engine makes no
+    /// claim that nothing is restricted — that is the whole distinction from
+    /// `Unrestricted`. Every card the database holds is admitted.
+    NoEngineAuthority,
+    /// The format's own rules positively declare that no card is restricted.
+    /// Silence is not such a declaration: a multiplayer variant that states no
+    /// deck-construction rule at all is `NoEngineAuthority`. This variant is
+    /// what lets a Constructed-group format decline a legality table without
+    /// the registry invariant reading it as an unplaced default.
+    Unrestricted,
+    /// `GameFormat::Custom` only: the authority is the format's own declared
+    /// `LegalityRules`, which a bare `GameFormat` cannot see. The declaration
+    /// names the authority, never the answer.
+    DeclaredRules,
+}
+
+/// CR 702.124a: partner abilities "modify the rules for deck construction in
+/// the Commander variant," so whether a format honors them is a per-format
+/// deck-construction fact, not a card fact. CR 702.124g caps any partner
+/// combination at two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommanderPairing {
+    /// No commander is designated from the decklist.
+    NoCommander,
+    /// Exactly one commander; CR 702.124's partner families are not consulted.
+    Solo,
+    /// One commander, or two when CR 702.124's partner families permit.
+    PartnerFamilies,
+}
+
+impl CommanderPairing {
+    /// How many designated commanders this rule admits — the single authority.
+    /// Callers must not re-derive it with `is_empty()`, `> 2` or `!= 1`.
+    pub fn admits_count(self, count: usize) -> bool {
+        match self {
+            CommanderPairing::NoCommander => count == 0,
+            CommanderPairing::Solo => count == 1,
+            // CR 702.124g: no partner combination exceeds two.
+            CommanderPairing::PartnerFamilies => (1..=2).contains(&count),
+        }
+    }
+}
+
+/// CR 100.2a / CR 903.5a: which pile a format's `DeckSizeRule` measures.
+///
+/// CR 903.5a fixes Commander's 100 "including its commander"; CR 100.2a's
+/// constructed 60 has no commander to include. The magnitude alone cannot say
+/// which, and `command_zone_holds_decklist_commander()` cannot either — it
+/// answers `true` for Oathbreaker, whose subject additionally includes the
+/// signature spell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeckSizeSubject {
+    /// The main deck alone. The sideboard is a group of ADDITIONAL cards
+    /// (CR 100.4) and so is never in this count; its own cap is
+    /// `sideboard_policy` (CR 100.4a). No command-zone card is counted.
+    MainDeck,
+    /// CR 903.5a ("including its commander"): the main deck plus the
+    /// designated commanders, netting a commander also listed in the main deck
+    /// down to the one physical card it is.
+    MainDeckAndCommanders,
+    /// Oathbreaker RC: the main deck plus the oathbreaker AND the signature
+    /// spell, each netted the same way.
+    MainDeckAndCommandZone,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnStructure {
     IndividualTurns,
@@ -1282,40 +1359,93 @@ impl<'de> Deserialize<'de> for SelectedFormat {
 }
 
 impl GameFormat {
-    /// Maps a playable game format to its corresponding legality format for card pool validation.
-    /// Returns `None` for formats that don't restrict card pools (FreeForAll, TwoHeadedGiant).
-    pub fn legality_format(self) -> Option<LegalityFormat> {
+    /// Which authority decides this format's deck-construction card pool —
+    /// the single authority: [`Self::legality_format`] is a projection of
+    /// this, not a second list.
+    pub fn card_pool(self) -> CardPool {
         match self {
-            GameFormat::Standard => Some(LegalityFormat::Standard),
-            GameFormat::Commander => Some(LegalityFormat::Commander),
-            GameFormat::Pioneer => Some(LegalityFormat::Pioneer),
-            GameFormat::Modern => Some(LegalityFormat::Modern),
-            GameFormat::Premodern => Some(LegalityFormat::Premodern),
-            GameFormat::Legacy => Some(LegalityFormat::Legacy),
-            GameFormat::Vintage => Some(LegalityFormat::Vintage),
-            GameFormat::Historic => Some(LegalityFormat::Historic),
-            GameFormat::Timeless => Some(LegalityFormat::Timeless),
-            GameFormat::Pauper => Some(LegalityFormat::Pauper),
-            GameFormat::PauperCommander => Some(LegalityFormat::PauperCommander),
-            GameFormat::DuelCommander => Some(LegalityFormat::DuelCommander),
-            GameFormat::Brawl => Some(LegalityFormat::StandardBrawl),
-            GameFormat::HistoricBrawl => Some(LegalityFormat::Brawl),
+            GameFormat::Standard => CardPool::LegalityTable(LegalityFormat::Standard),
+            GameFormat::Commander => CardPool::LegalityTable(LegalityFormat::Commander),
+            GameFormat::Pioneer => CardPool::LegalityTable(LegalityFormat::Pioneer),
+            GameFormat::Modern => CardPool::LegalityTable(LegalityFormat::Modern),
+            GameFormat::Premodern => CardPool::LegalityTable(LegalityFormat::Premodern),
+            GameFormat::Legacy => CardPool::LegalityTable(LegalityFormat::Legacy),
+            GameFormat::Vintage => CardPool::LegalityTable(LegalityFormat::Vintage),
+            GameFormat::Historic => CardPool::LegalityTable(LegalityFormat::Historic),
+            GameFormat::Timeless => CardPool::LegalityTable(LegalityFormat::Timeless),
+            GameFormat::Pauper => CardPool::LegalityTable(LegalityFormat::Pauper),
+            GameFormat::PauperCommander => {
+                CardPool::LegalityTable(LegalityFormat::PauperCommander)
+            }
+            GameFormat::DuelCommander => CardPool::LegalityTable(LegalityFormat::DuelCommander),
+            GameFormat::Brawl => CardPool::LegalityTable(LegalityFormat::StandardBrawl),
+            GameFormat::HistoricBrawl => CardPool::LegalityTable(LegalityFormat::Brawl),
             GameFormat::TinyLeaders
             | GameFormat::Oathbreaker
+            // These state no main-deck card-pool rule at all, so the engine
+            // holds no answer — which is not the positive "nothing is
+            // restricted" claim `Unrestricted` makes.
             | GameFormat::FreeForAll
             | GameFormat::TwoHeadedGiant
             | GameFormat::Archenemy
             | GameFormat::Planechase
-            // Momir's pool is the entire creature corpus — no legality restriction.
             | GameFormat::Momir
             // CR 903.13e: the drafted cards become the card pool, so no
             // constructed legality table applies — as for Limited.
             | GameFormat::CommanderDraft
-            | GameFormat::Limited => None,
+            | GameFormat::Limited => CardPool::NoEngineAuthority,
             // A custom format's legality is entirely governed by its own
             // `LegalityRules` (legal_sets/legal_cards/banned/restricted), never by the
             // built-in `LegalityFormat` table.
-            GameFormat::Custom(_) => None,
+            GameFormat::Custom(_) => CardPool::DeclaredRules,
+        }
+    }
+
+    /// The legality table that answers this format's card pool, if the engine
+    /// holds one. A projection of [`Self::card_pool`], which is the single
+    /// authority: the three pool kinds that answer `None` here are not the
+    /// same fact, and only `card_pool` distinguishes them.
+    pub fn legality_format(self) -> Option<LegalityFormat> {
+        match self.card_pool() {
+            CardPool::LegalityTable(format) => Some(format),
+            CardPool::NoEngineAuthority | CardPool::Unrestricted | CardPool::DeclaredRules => None,
+        }
+    }
+
+    /// How many commanders this format's decklist may designate — the single
+    /// authority. Callers must not re-derive it with `is_empty()`, `> 2` or
+    /// `!= 1`.
+    ///
+    /// `Custom(_)` answers `NoCommander`: reachable only via
+    /// `evaluate_constructed`'s custom path, and correct there because every
+    /// command-zone custom format is already refused upstream by
+    /// `custom_format_pool`'s `CUSTOM_FORMAT_COMMAND_ZONE_UNSUPPORTED` gate.
+    pub fn commander_pairing(self) -> CommanderPairing {
+        match self {
+            GameFormat::Commander
+            | GameFormat::DuelCommander
+            | GameFormat::PauperCommander
+            | GameFormat::CommanderDraft
+            | GameFormat::TinyLeaders => CommanderPairing::PartnerFamilies,
+            GameFormat::Brawl | GameFormat::HistoricBrawl | GameFormat::Oathbreaker => {
+                CommanderPairing::Solo
+            }
+            GameFormat::Standard
+            | GameFormat::Limited
+            | GameFormat::Pioneer
+            | GameFormat::Modern
+            | GameFormat::Premodern
+            | GameFormat::Legacy
+            | GameFormat::Vintage
+            | GameFormat::Historic
+            | GameFormat::Timeless
+            | GameFormat::Pauper
+            | GameFormat::FreeForAll
+            | GameFormat::TwoHeadedGiant
+            | GameFormat::Archenemy
+            | GameFormat::Planechase
+            | GameFormat::Momir
+            | GameFormat::Custom(_) => CommanderPairing::NoCommander,
         }
     }
 
@@ -1486,6 +1616,40 @@ impl GameFormat {
             // `FormatConfig::for_custom_rules`. `RulesFixed` is the
             // total-function answer for other callers, not a policy choice.
             GameFormat::Custom(_) => DeckSizeAuthority::RulesFixed,
+        }
+    }
+
+    /// Which pile this format's `DeckSizeRule` measures — the single
+    /// authority.
+    ///
+    /// `Custom(_)` answers `MainDeck`, disclosed fail-closed: the custom
+    /// evaluator is constructed-shaped only.
+    pub fn deck_size_subject(self) -> DeckSizeSubject {
+        match self {
+            GameFormat::Commander
+            | GameFormat::DuelCommander
+            | GameFormat::PauperCommander
+            | GameFormat::CommanderDraft
+            | GameFormat::Brawl
+            | GameFormat::HistoricBrawl
+            | GameFormat::TinyLeaders => DeckSizeSubject::MainDeckAndCommanders,
+            GameFormat::Oathbreaker => DeckSizeSubject::MainDeckAndCommandZone,
+            GameFormat::Standard
+            | GameFormat::Limited
+            | GameFormat::Pioneer
+            | GameFormat::Modern
+            | GameFormat::Premodern
+            | GameFormat::Legacy
+            | GameFormat::Vintage
+            | GameFormat::Historic
+            | GameFormat::Timeless
+            | GameFormat::Pauper
+            | GameFormat::FreeForAll
+            | GameFormat::TwoHeadedGiant
+            | GameFormat::Archenemy
+            | GameFormat::Planechase
+            | GameFormat::Momir
+            | GameFormat::Custom(_) => DeckSizeSubject::MainDeck,
         }
     }
 
@@ -4230,15 +4394,202 @@ mod tests {
     }
 
     #[test]
-    fn registry_constructed_formats_have_legality_mapping() {
+    fn registry_constructed_formats_declare_a_deck_construction_pool() {
+        use strum::IntoEnumIterator;
+
+        // Clause 1: a constructed format may decline a table only by
+        // positively declaring that its rules restrict nothing; it may never
+        // simply lack an authority.
         for meta in GameFormat::registry()
             .into_iter()
             .filter(|meta| meta.group == FormatGroup::Constructed)
         {
             assert!(
-                meta.format.legality_format().is_some(),
-                "{:?} is constructed but has no legality mapping",
+                matches!(
+                    meta.format.card_pool(),
+                    CardPool::LegalityTable(_) | CardPool::Unrestricted
+                ),
+                "{:?} is constructed but declares no deck-construction pool",
                 meta.format
+            );
+        }
+
+        // Clause 2: no two built-in formats declare the same legality table.
+        let mut seen = std::collections::HashSet::new();
+        for format in GameFormat::iter() {
+            if let CardPool::LegalityTable(table) = format.card_pool() {
+                assert!(
+                    seen.insert(table),
+                    "{format:?} declares {table:?}, already declared by another built-in"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legality_format_is_the_card_pool_projection() {
+        use strum::IntoEnumIterator;
+
+        for format in
+            GameFormat::iter().chain(std::iter::once(GameFormat::Custom(CustomFormatId(0))))
+        {
+            let projected = match format.card_pool() {
+                CardPool::LegalityTable(table) => Some(table),
+                CardPool::NoEngineAuthority | CardPool::Unrestricted | CardPool::DeclaredRules => {
+                    None
+                }
+            };
+            assert_eq!(
+                format.legality_format(),
+                projected,
+                "{format:?}: legality_format() disagrees with the card_pool() projection"
+            );
+        }
+    }
+
+    /// Twenty of the twenty-three built-ins REPRODUCE a commander-count site
+    /// literal: the declared pairing's verdict at each count equals the verdict
+    /// that validator's literal gives today. The other three — FreeForAll,
+    /// TwoHeadedGiant and Limited — have no such literal: their dispatch arms read
+    /// `request.commander` nowhere, and today they admit any count. For those three
+    /// this test PINS the declared placement, on the authority of
+    /// `command_zone_holds_decklist_commander() == Ok(false)`.
+    #[test]
+    fn commander_pairing_admits_exactly_todays_counts() {
+        use strum::IntoEnumIterator;
+
+        let partner_families = [
+            GameFormat::Commander,
+            GameFormat::PauperCommander,
+            GameFormat::DuelCommander,
+            GameFormat::CommanderDraft,
+            GameFormat::TinyLeaders,
+        ];
+        let solo = [
+            GameFormat::Brawl,
+            GameFormat::HistoricBrawl,
+            GameFormat::Oathbreaker,
+        ];
+        let no_commander_with_literal = [
+            GameFormat::Standard,
+            GameFormat::Pioneer,
+            GameFormat::Modern,
+            GameFormat::Premodern,
+            GameFormat::Legacy,
+            GameFormat::Vintage,
+            GameFormat::Historic,
+            GameFormat::Timeless,
+            GameFormat::Pauper,
+            GameFormat::Planechase,
+            GameFormat::Archenemy,
+            GameFormat::Momir,
+        ];
+        let declared_no_literal = [
+            GameFormat::FreeForAll,
+            GameFormat::TwoHeadedGiant,
+            GameFormat::Limited,
+        ];
+
+        for count in 0usize..=3 {
+            for format in partner_families {
+                // Today's literal: `is_empty() || len() > 2` refuses; admits
+                // iff count is 1 or 2.
+                let literal_admits = (1..=2).contains(&count);
+                assert_eq!(
+                    format.commander_pairing().admits_count(count),
+                    literal_admits,
+                    "{format:?} at count {count}"
+                );
+            }
+            for format in solo {
+                // Today's literal: `len() != 1` refuses; admits iff count == 1.
+                let literal_admits = count == 1;
+                assert_eq!(
+                    format.commander_pairing().admits_count(count),
+                    literal_admits,
+                    "{format:?} at count {count}"
+                );
+            }
+            for format in no_commander_with_literal {
+                // Today's literal: `!is_empty()` (Momir: the left operand of
+                // its compound disjunction) refuses; admits iff count == 0.
+                let literal_admits = count == 0;
+                assert_eq!(
+                    format.commander_pairing().admits_count(count),
+                    literal_admits,
+                    "{format:?} at count {count}"
+                );
+            }
+        }
+
+        // The three formats with no site literal: a placement pin, not a
+        // reproduction — see this test's doc comment.
+        for format in declared_no_literal {
+            assert_eq!(
+                format.commander_pairing(),
+                CommanderPairing::NoCommander,
+                "{format:?} should be placed at NoCommander"
+            );
+            assert_eq!(format.command_zone_holds_decklist_commander(), Ok(false));
+        }
+
+        // Every built-in appears in exactly one of the four groups above.
+        let mut all: Vec<GameFormat> = partner_families.to_vec();
+        all.extend(solo);
+        all.extend(no_commander_with_literal);
+        all.extend(declared_no_literal);
+        let mut all_strings: Vec<String> = all.iter().map(GameFormat::to_string).collect();
+        let mut expected: Vec<String> = GameFormat::iter().map(|f| f.to_string()).collect();
+        all_strings.sort();
+        expected.sort();
+        assert_eq!(
+            all_strings, expected,
+            "every built-in format must appear in exactly one group"
+        );
+    }
+
+    /// Cross-checks `commander_pairing()`'s placement against an existing,
+    /// already-pinned axis. Cannot distinguish `Solo` from `PartnerFamilies` —
+    /// only whether a format has a command zone at all — so it catches a
+    /// placement typo the per-count test above would also catch, from an
+    /// independent authority.
+    #[test]
+    fn commander_pairing_agrees_with_the_command_zone_axis() {
+        use strum::IntoEnumIterator;
+
+        for format in GameFormat::iter() {
+            // Custom answers `Err` here by design; excluded, as its own doc
+            // states.
+            let Ok(has_command_zone) = format.command_zone_holds_decklist_commander() else {
+                continue;
+            };
+            assert_eq!(
+                format.commander_pairing() == CommanderPairing::NoCommander,
+                !has_command_zone,
+                "{format:?}: commander_pairing() disagrees with \
+                 command_zone_holds_decklist_commander()"
+            );
+        }
+    }
+
+    /// Cross-checks `deck_size_subject()`'s placement against the same
+    /// existing axis. Deliberately partial: it cannot separate
+    /// `MainDeckAndCommanders` from `MainDeckAndCommandZone` — no existing
+    /// method can make that distinction — so it only catches a format placed
+    /// at `MainDeck` that should hold a command zone, or vice versa.
+    #[test]
+    fn deck_size_subject_agrees_with_the_command_zone_axis() {
+        use strum::IntoEnumIterator;
+
+        for format in GameFormat::iter() {
+            let Ok(has_command_zone) = format.command_zone_holds_decklist_commander() else {
+                continue;
+            };
+            assert_eq!(
+                format.deck_size_subject() == DeckSizeSubject::MainDeck,
+                !has_command_zone,
+                "{format:?}: deck_size_subject() disagrees with \
+                 command_zone_holds_decklist_commander()"
             );
         }
     }
