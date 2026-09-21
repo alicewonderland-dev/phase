@@ -388,12 +388,21 @@ fn freeform_accepts_a_card_the_legacy_ban_list_refuses() {
 
 /// §Row 3(c) — out-of-pool refusal classes that DO NOT consult the card-pool
 /// axis, so Freeform's unrestricted pool does not suppress them: CR 407.3's
-/// ante-card refusal (`ante_deck_violations`, applied by both dispatchers
-/// regardless of format) and a card's own PRINTED deck-construction limit
+/// ante-card refusal and a card's own PRINTED deck-construction limit
 /// (`effective_copy_limit`'s `deck_copy_limit_for(..).unwrap_or(format_default)`,
 /// which lets a printed override replace Freeform's `Unlimited` default). No
 /// class asserted here is fixed by this phase — the charter's Non-goal clause
 /// forbids altering either authority; each is reported to P6/5.
+///
+/// Both classes reach each dispatcher through DIFFERENT code: the full leg's
+/// accumulating `copy_limit_violations` in `evaluate_constructed` vs. the
+/// summary leg's early-returning one in `quick_constructed_check`, and the
+/// full leg's `ante_deck_violations` call inside `evaluate_constructed` vs.
+/// the summary dispatcher's own post-`match` `ante_deck_violations` block.
+/// Looped over `summary_only` like this file's other dispatcher-agreement
+/// tests, so a future edit that makes the two legs disagree reds here instead
+/// of only surfacing through the deck-builder hint accepting what game
+/// creation refuses.
 #[test]
 fn freeform_still_refuses_an_ante_card_and_a_printed_copy_limit_overrun() {
     let Some(db) = db() else {
@@ -401,76 +410,67 @@ fn freeform_still_refuses_an_ante_card_and_a_printed_copy_limit_overrun() {
         return;
     };
 
-    let mut ante_deck = vec!["Contract from Below".to_string()];
-    ante_deck.extend(repeat("Forest", 59));
-    assert_eq!(
-        validate_name_deck_for_format_full(
+    for summary_only in [false, true] {
+        let mut ante_deck = vec!["Contract from Below".to_string()];
+        ante_deck.extend(repeat("Forest", 59));
+        let result = evaluate_deck_compatibility(
             db,
-            &ante_deck,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &FormatConfig::freeform(),
-            None,
-            2,
-        ),
-        Err(vec![
-            "Can't be in a deck or sideboard unless the game is played for ante: Contract from Below"
-                .to_string()
-        ]),
-        "CR 407.3 applies to every format whose AntePolicy is not Enabled, \
-         and ante::policy_of's own doc records that no built-in plays for ante"
-    );
+            &DeckCompatibilityRequest {
+                main_deck: ante_deck,
+                selected_format: Some(SelectedFormat::Tag(GameFormat::Freeform)),
+                summary_only,
+                ..DeckCompatibilityRequest::default()
+            },
+        );
+        assert_eq!(
+            result.selected_format_reasons,
+            vec![
+                "Can't be in a deck or sideboard unless the game is played for ante: Contract from Below"
+                    .to_string()
+            ],
+            "summary_only={summary_only}: CR 407.3 applies to every format whose AntePolicy is \
+             not Enabled, and ante::policy_of's own doc records that no built-in plays for ante"
+        );
 
-    let mut over_limit = repeat("Vazal, the Compleat", 2);
-    over_limit.extend(repeat("Forest", 58));
-    assert_eq!(
-        validate_name_deck_for_format_full(
+        let mut over_limit = repeat("Vazal, the Compleat", 2);
+        over_limit.extend(repeat("Forest", 58));
+        let result = evaluate_deck_compatibility(
             db,
-            &over_limit,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &FormatConfig::freeform(),
-            None,
-            2,
-        ),
-        Err(vec![
-            "More than the allowed copies (main + sideboard combined): Vazal, the Compleat (2 copies)"
-                .to_string()
-        ]),
-        "a card's own printed deck-construction limit still binds under \
-         Freeform's Unlimited default"
-    );
+            &DeckCompatibilityRequest {
+                main_deck: over_limit,
+                selected_format: Some(SelectedFormat::Tag(GameFormat::Freeform)),
+                summary_only,
+                ..DeckCompatibilityRequest::default()
+            },
+        );
+        assert_eq!(
+            result.selected_format_reasons,
+            vec![
+                "More than the allowed copies (main + sideboard combined): Vazal, the Compleat (2 copies)"
+                    .to_string()
+            ],
+            "summary_only={summary_only}: a card's own printed deck-construction limit still \
+             binds under Freeform's Unlimited default"
+        );
 
-    let mut at_limit = vec!["Vazal, the Compleat".to_string()];
-    at_limit.extend(repeat("Forest", 59));
-    assert_eq!(
-        validate_name_deck_for_format_full(
+        let mut at_limit = vec!["Vazal, the Compleat".to_string()];
+        at_limit.extend(repeat("Forest", 59));
+        let result = evaluate_deck_compatibility(
             db,
-            &at_limit,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &FormatConfig::freeform(),
-            None,
-            2,
-        ),
-        Ok(()),
-        "one copy is within the card's own printed limit"
-    );
+            &DeckCompatibilityRequest {
+                main_deck: at_limit,
+                selected_format: Some(SelectedFormat::Tag(GameFormat::Freeform)),
+                summary_only,
+                ..DeckCompatibilityRequest::default()
+            },
+        );
+        assert_eq!(
+            result.selected_format_compatible,
+            Some(true),
+            "summary_only={summary_only}: one copy is within the card's own printed limit: {:?}",
+            result.selected_format_reasons
+        );
+    }
 }
 
 /// §Row 4 — the boundary pair `FormatConfig::freeform().validate_for_player_count`

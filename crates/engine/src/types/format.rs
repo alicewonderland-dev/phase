@@ -45,15 +45,12 @@ pub struct FormatMetadata {
 /// member of a fixed set and cannot be enumerated.
 ///
 /// What this iterator is the authority for, at the width it actually holds.
-/// FIVE named tests check something against it, and that is the whole list:
-/// `tests::registry_lists_every_builtin_format` and
-/// `tests::client_builtin_game_format_union_matches_the_engine` below, and in
-/// `tests/integration/custom_format_schema.rs`
-/// `game_format_from_str_display_roundtrip_builtins` (which iterates it
-/// directly) plus the ordered-coverage asserts in
-/// `commander_eligibility_rule_from_source_format_covers_every_builtin` and
-/// `game_format_serialization_is_byte_identical_to_old_derive_for_builtins`.
-/// Adding or renaming a format reds one of those five by name.
+/// Any test that calls `GameFormat::iter()` — directly, or transitively
+/// through a `Vec`/set built from it — is coupled to this exact membership
+/// and reds by name (or on a set-equality mismatch) the moment a format is
+/// added, renamed, or removed. `grep -rn 'GameFormat::iter()' crates/engine/`
+/// finds every such call site (filter out doc-comment mentions like this
+/// one); that search, not a hand-copied list here, is the whole list.
 ///
 /// THREE KINDS of neighbouring guard do NOT work that way, and the difference
 /// matters if this comment is read as a promise. The exhaustive `match`
@@ -1598,10 +1595,8 @@ impl GameFormat {
     /// `Minimum`/`Exactly` discriminant is always rules-fixed — see
     /// [`DeckSizeAuthority`], which cannot express one.
     ///
-    /// `RulesFixed` for every sanctioned format: CR 100.2a's 60-card
-    /// constructed minimum, CR 100.2b's 40-card limited minimum, CR 903.5a's
-    /// exact 100, and the supplementary-deck formats that build a constructed
-    /// deck (CR 100.2d).
+    /// `RulesFixed` — the magnitude each format's own rules already fix,
+    /// whatever that magnitude is.
     ///
     /// `HostChoiceAmong(&[60, 40])` for Free-for-All alone. CR 806
     /// ("Free-for-All Variant") specifies seating, attack options and range of
@@ -4510,15 +4505,16 @@ mod tests {
         }
     }
 
-    /// Most built-ins REPRODUCE a commander-count site literal: the declared
-    /// pairing's verdict at each count equals the verdict that validator's
-    /// literal gives today. FreeForAll, TwoHeadedGiant and Limited have no
-    /// such literal: their dispatch arms read `request.commander` nowhere,
-    /// and today they admit any count. Freeform has no such literal either,
-    /// for a different reason — the format did not exist when the site
-    /// literals did, so there is nothing pre-existing to reproduce. For every
-    /// format with no site literal, this test PINS the declared placement, on
-    /// the authority of `command_zone_holds_decklist_commander() == Ok(false)`.
+    /// Every group here pins declared behavior, not a validator literal.
+    /// Production admission reads `pairing.admits_count(request.commander.len())`
+    /// alone at every call site, and
+    /// `no_caller_reintroduces_a_commander_count_literal` in
+    /// `format_axis_census.rs` asserts zero surviving per-format
+    /// commander-count literals. The four groups below split only on what
+    /// this test can additionally assert per format: a per-count admission
+    /// curve for the first three, and, for formats that never designate a
+    /// commander and get no per-count curve here, the `NoCommander`
+    /// placement plus `command_zone_holds_decklist_commander() == Ok(false)`.
     #[test]
     fn commander_pairing_admits_exactly_todays_counts() {
         use strum::IntoEnumIterator;
@@ -4535,7 +4531,7 @@ mod tests {
             GameFormat::HistoricBrawl,
             GameFormat::Oathbreaker,
         ];
-        let no_commander_with_literal = [
+        let no_commander_per_count = [
             GameFormat::Standard,
             GameFormat::Pioneer,
             GameFormat::Modern,
@@ -4549,7 +4545,7 @@ mod tests {
             GameFormat::Archenemy,
             GameFormat::Momir,
         ];
-        let declared_no_literal = [
+        let no_commander_placement_only = [
             GameFormat::FreeForAll,
             GameFormat::TwoHeadedGiant,
             GameFormat::Limited,
@@ -4558,39 +4554,37 @@ mod tests {
 
         for count in 0usize..=3 {
             for format in partner_families {
-                // Today's literal: `is_empty() || len() > 2` refuses; admits
-                // iff count is 1 or 2.
-                let literal_admits = (1..=2).contains(&count);
+                // Pinned expected admission per CR 702.124g: iff count is 1 or 2.
+                let expected_admits = (1..=2).contains(&count);
                 assert_eq!(
                     format.commander_pairing().admits_count(count),
-                    literal_admits,
+                    expected_admits,
                     "{format:?} at count {count}"
                 );
             }
             for format in solo {
-                // Today's literal: `len() != 1` refuses; admits iff count == 1.
-                let literal_admits = count == 1;
+                // Pinned expected admission: iff count == 1.
+                let expected_admits = count == 1;
                 assert_eq!(
                     format.commander_pairing().admits_count(count),
-                    literal_admits,
+                    expected_admits,
                     "{format:?} at count {count}"
                 );
             }
-            for format in no_commander_with_literal {
-                // Today's literal: `!is_empty()` (Momir: the left operand of
-                // its compound disjunction) refuses; admits iff count == 0.
-                let literal_admits = count == 0;
+            for format in no_commander_per_count {
+                // Pinned expected admission: iff count == 0.
+                let expected_admits = count == 0;
                 assert_eq!(
                     format.commander_pairing().admits_count(count),
-                    literal_admits,
+                    expected_admits,
                     "{format:?} at count {count}"
                 );
             }
         }
 
-        // The formats with no site literal to reproduce: a placement pin,
-        // not a reproduction — see this test's doc comment.
-        for format in declared_no_literal {
+        // These formats get no per-count curve above; this is a placement
+        // pin only — see this test's doc comment.
+        for format in no_commander_placement_only {
             assert_eq!(
                 format.commander_pairing(),
                 CommanderPairing::NoCommander,
@@ -4602,8 +4596,8 @@ mod tests {
         // Every built-in appears in exactly one of the four groups above.
         let mut all: Vec<GameFormat> = partner_families.to_vec();
         all.extend(solo);
-        all.extend(no_commander_with_literal);
-        all.extend(declared_no_literal);
+        all.extend(no_commander_per_count);
+        all.extend(no_commander_placement_only);
         let mut all_strings: Vec<String> = all.iter().map(GameFormat::to_string).collect();
         let mut expected: Vec<String> = GameFormat::iter().map(|f| f.to_string()).collect();
         all_strings.sort();
