@@ -7578,7 +7578,7 @@ mod tests {
         // (3) FORMAT-SCOPING CONTROL: Commander refuses both pairs, but at
         // ELIGIBILITY (a non-legendary card cannot be a commander at all),
         // not at pairing — proving admission is THIS FORMAT's rule, not that
-        // the pairing check itself is selective. Padded to a legal 100-card
+        // the pairing check itself is selective. Padded to a 100-card
         // Commander deck (`quick_commander_check`, the summary leg, checks
         // deck size before eligibility on its first-failure return). Uses
         // the full leg, whose reasons this control actually inspects.

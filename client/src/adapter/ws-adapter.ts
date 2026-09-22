@@ -211,13 +211,12 @@ export class NativeEngineVersionMismatchError extends Error {
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
  * 77 — Prospective: no GameState or GameAction shape change lands in this
- *      bump. Moved ahead of new GameFormat variants so every
- *      intermediate commit is internally consistent once
- *      they land — see PROTOCOL_VERSION's own `/// 77` entry in
+ *      bump. Moved ahead of new GameFormat variants — see PROTOCOL_VERSION's
+ *      own `/// 77` entry in
  *      crates/lobby-broker/src/protocol.rs. Full-game sessions stay
  *      exact-match on both ends (MIN_SUPPORTED_SERVER_PROTOCOL below and
  *      MIN_SUPPORTED_PROTOCOL in crates/server-core/src/protocol.rs), so no
- *      pre-run peer ever receives a v77 GameState at all.
+ *      older peer ever receives a v77 GameState at all.
  * 73 — `CastingVariantChoiceOption` gained required `face`, making a paused
  *      Fuse split-card menu an exact `(variant, face)` tuple. This integrated
  *      state also carries a resolution-owned modal choice's additional cost so
@@ -570,9 +569,8 @@ export const LOBBY_MIN_SUPPORTED_SERVER_PROTOCOL = PROTOCOL_VERSION - 1;
  * window went disjoint from the deployed broker's.
  *
  * 10 — Prospective: no lobby variant or field changes shape in this bump.
- *      Moved ahead of new GameFormat variants so every
- *      intermediate commit is internally consistent once
- *      they land — see LOBBY_PROTOCOL_VERSION's own `/// 10` entry in
+ *      Moved ahead of new GameFormat variants — see LOBBY_PROTOCOL_VERSION's
+ *      own `/// 10` entry in
  *      crates/lobby-broker/src/protocol.rs. MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL
  *      stays at 2: this client already decodes broker → client frames with
  *      JSON.parse, which arrives at an unknown-yet format name as an

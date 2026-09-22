@@ -9,13 +9,13 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // modal-face prompt is paused; v74 carries exact delayed-trigger receipts;
 // v75 carries producer-owned paid-offer cleanup authority; v76 carries CR
 // 601.2f caster-elected cost-reduction ordering (#8885). v77
-// is a pre-emptive bump moved ahead of its own new `GameFormat` variants,
+// is a pre-emptive bump moved ahead of new `GameFormat` variants,
 // carrying no wire-shape change of its own.
 // Keep the measured base so a future merge cannot collapse independent wire
 // changes onto one number.
 const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // +6: upstream's v76 CR 601.2f caster-elected cost-reduction ordering, plus
-// the v77 pre-emptive bump ahead of its new format names.
+// the v77 pre-emptive bump ahead of new format names.
 const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 6;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this

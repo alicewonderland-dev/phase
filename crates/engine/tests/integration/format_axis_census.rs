@@ -42,8 +42,8 @@ fn count_needle(text: &str, needle: &str) -> usize {
 /// The source text of the brace-delimited declaration whose header line's
 /// code half, trimmed of leading whitespace, starts with `header` — from that
 /// line through the line whose code half is exactly the closing brace at the
-/// header's own indentation. Callers pass `fn ` headers (clauses 3 and 4) and
-/// a `pub struct ` header (clause 6), so `header` is the literal opening text
+/// header's own indentation. Callers pass `fn ` headers and
+/// a `pub struct ` header, so `header` is the literal opening text
 /// of a declaration and not a function name. Comment halves are stripped by
 /// `source_census::code` before either test is applied, so a brace inside a
 /// doc comment cannot close a span. Panics unless exactly one line matches
@@ -92,7 +92,7 @@ pub(super) fn fn_span<'a>(src: &'a str, header: &str) -> &'a str {
 /// Asserts that the exhaustive `match` inside `GameFormat`'s axis method whose
 /// header is `header` has gained no `_ =>` wildcard arm.
 ///
-/// Non-vacuity is mandatory here (unlike clauses 3 and 6): this assertion is
+/// Non-vacuity is mandatory here: this assertion is
 /// an ABSENCE, so a failed extraction yields an empty span, which trivially
 /// contains no `_ =>` and would pass. Each span must be non-empty and mention
 /// `GameFormat::` at least once before the wildcard check is trusted.
@@ -154,18 +154,17 @@ fn no_caller_unwraps_legality_format() {
     );
 }
 
-/// Zero occurrences of the four commander-count spellings
-/// this migration removes, in production scope. The fourth spelling is
+/// Zero occurrences of the four commander-count spellings,
+/// in production scope. The fourth spelling is
 /// brace-anchored by measurement, not by taste: the bare form also matches
 /// `evaluate_commander_with_format`'s post-admission consequence gate
-/// (`… && request.commander.len() <= 2`), which this migration deliberately
-/// leaves in place.
+/// (`… && request.commander.len() <= 2`).
 ///
-/// This is a ratchet against the four spellings the migration removes, not a
+/// This is a ratchet against the four spellings, not a
 /// proof that no caller re-derives a commander count some other way.
 ///
-/// Positive reach-guard: the consequence gates and arithmetic this migration
-/// leaves in place must still be found — at least six `commander_pairing()`
+/// Positive reach-guard: the consequence gates and arithmetic
+/// must still be found — at least six `commander_pairing()`
 /// calls and at least one `request.commander.len()` read.
 #[test]
 fn no_caller_reintroduces_a_commander_count_literal() {
@@ -298,7 +297,7 @@ fn no_format_axis_key_reaches_the_client_mirror() {
 /// `FormatMetadata`'s field list is exactly its
 /// committed shape. A presence assertion against a non-empty expected list,
 /// so a failed extraction fails rather than passing vacuously — no separate
-/// non-vacuity premise is needed (contrast the wildcard-arm clause above).
+/// non-vacuity premise is needed.
 #[test]
 fn format_metadata_declares_exactly_its_committed_field_list() {
     let span = fn_span(FORMAT_RS, "pub struct FormatMetadata {");

@@ -57,9 +57,8 @@ pub struct TournamentRequestId(pub u64);
 /// can be refused. See 24.
 ///
 /// 77 — Prospective: no `GameState` or `GameAction` shape change lands in
-///      this commit. Moved ahead of new `GameFormat` variants
-///      so every intermediate commit is internally
-///      consistent once they land. `GameFormat` serializes as its `Display`
+///      this commit. Moved ahead of new `GameFormat` variants.
+///      `GameFormat` serializes as its `Display`
 ///      string and deserializes through `FromStr`
 ///      (`crates/engine/src/types/format.rs`), whose unknown-name arm
 ///      returns `Err`, so a build that predates the new format
@@ -78,7 +77,7 @@ pub struct TournamentRequestId(pub u64);
 ///      handshake (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`,
 ///      `MIN_SUPPORTED_SERVER_PROTOCOL == PROTOCOL_VERSION`, plus the
 ///      client's `info.protocolVersion > PROTOCOL_VERSION` ceiling), so no
-///      pre-run peer ever receives a v77 `GameState` at all and the
+///      older peer ever receives a v77 `GameState` at all and the
 ///      deserializer asymmetry above never gets a chance to matter here —
 ///      see [`LOBBY_PROTOCOL_VERSION`]'s own `/// 10` entry for the surface
 ///      where it does. (Written as one unbroken paragraph on purpose, per
@@ -624,9 +623,8 @@ pub const MIN_SUPPORTED_PROTOCOL: u32 = PROTOCOL_VERSION.saturating_sub(1);
 /// the fix — it moves only for reasons the lobby can actually observe.
 ///
 /// 10 — Prospective: no lobby variant or field changes shape in this
-///      commit. Moved ahead of new `GameFormat` variants so
-///      every intermediate commit is internally consistent
-///      once they land. [`MIN_SUPPORTED_LOBBY_PROTOCOL`] stays at 2 — see
+///      commit. Moved ahead of new `GameFormat` variants.
+///      [`MIN_SUPPORTED_LOBBY_PROTOCOL`] stays at 2 — see
 ///      below for why. `GameFormat` serializes as its `Display` string and
 ///      deserializes through `FromStr`
 ///      (`crates/engine/src/types/format.rs`), whose unknown-name arm
@@ -1920,8 +1918,7 @@ mod tests {
     /// broker ignores it; a pre-9 client simply never sends the frame), so
     /// it extends the chain the same way 3 through 8 did rather than forcing
     /// a floor move. Version 10 is the one true non-surface step: no field,
-    /// no variant, moved ahead of new `GameFormat` variants so
-    /// every intermediate commit stays internally consistent; see that
+    /// no variant, moved ahead of new `GameFormat` variants; see that
     /// constant's own `/// 10` entry.
     #[test]
     fn the_tournament_chain_spans_lobby_versions_four_through_ten() {

@@ -3249,9 +3249,7 @@ mod tests {
     }
 
     /// Prospective: no `GameState` or `GameAction` shape changes land in
-    /// this bump. Moved ahead of new `GameFormat` variants so
-    /// every intermediate commit is internally consistent
-    /// once they land — see `PROTOCOL_VERSION`'s own `/// 77` entry in
+    /// this bump. Moved ahead of new `GameFormat` variants — see `PROTOCOL_VERSION`'s own `/// 77` entry in
     /// `crates/lobby-broker/src/protocol.rs`. A v76 peer is refused anyway:
     /// full-game sessions are exact-match on both ends (see
     /// `full_game_floor_is_current_only_not_a_rollout_window` below), so

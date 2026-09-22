@@ -107,15 +107,13 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  *
  * Bumps to date:
  *  59 — Prospective: no GameState shape change lands in this bump. Moved
- *       ahead of new GameFormat variants so every
- *       intermediate commit is internally consistent once
- *       they land — the same precedent as 32's CommanderDraft variant: the
+ *       ahead of new GameFormat variants — the same precedent as 32's CommanderDraft variant: the
  *       break, when it lands, will be conditional on a new variant actually
  *       being serialized in a game_setup/state_update payload, not
  *       unconditional like FormatConfig.deck_size's 32 retype. First
  *       contact stays exact-match on both roles (guest `hostVersion !==
  *       WIRE_PROTOCOL_VERSION`, host `guestVersion !== WIRE_PROTOCOL_VERSION`),
- *       so no pre-run peer ever completes a pairing that could carry a v59
+ *       so no older peer ever completes a pairing that could carry a v59
  *       payload.
  *  57 — game_setup and state_update carry GameState, whose paid resolution
  *       cleanup, receipt, and delayed-install origin now carry a
