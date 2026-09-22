@@ -282,6 +282,15 @@ pub struct CombatState {
         serialize_with = "crate::types::deterministic_serde::hash_set"
     )]
     pub attacking_incarnations_this_combat: HashSet<ObjectIncarnationRef>,
+    /// CR 509.1g + CR 400.7: For each creature that blocked this combat, the
+    /// exact attacker incarnations it was recorded as blocking. Historical
+    /// record, not live blocker membership, so a trigger that resolves after
+    /// CR 506.4 removed the blocker from combat still enumerates what it blocked.
+    #[serde(
+        default,
+        serialize_with = "crate::types::deterministic_serde::hash_map_of_hash_set"
+    )]
+    pub creature_blocked_attackers_this_combat: HashMap<ObjectId, HashSet<ObjectIncarnationRef>>,
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub damage_assignments: HashMap<ObjectId, Vec<DamageAssignment>>,
     pub first_strike_done: bool,
@@ -312,6 +321,8 @@ impl PartialEq for CombatState {
             && self.creature_attacked_defenders_this_combat
                 == other.creature_attacked_defenders_this_combat
             && self.attacking_incarnations_this_combat == other.attacking_incarnations_this_combat
+            && self.creature_blocked_attackers_this_combat
+                == other.creature_blocked_attackers_this_combat
             && self.first_strike_done == other.first_strike_done
             && self.first_strike_participants == other.first_strike_participants
     }
@@ -507,6 +518,33 @@ fn record_combat_membership_edit(
             cause,
         })
         .expect("resolved combat membership must have a live journal cause");
+}
+
+/// CR 509.1g + CR 400.7: Records one (blocker, attacker) pair into the
+/// block-history windows. Single authority, so the live declaration path, the
+/// CR 506.3e put-onto-the-battlefield-blocking path and the CR 733 replay applier
+/// cannot drift. The attacker's incarnation is captured from the live object; an
+/// attacker with no live object has no incarnation to pin and records nothing.
+fn record_block_history(state: &mut GameState, blocker_id: ObjectId, attacker_id: ObjectId) {
+    let Some(attacker_ref) = state
+        .objects
+        .get(&attacker_id)
+        .map(ObjectIncarnationRef::from_object)
+    else {
+        return;
+    };
+    if let Some(combat) = state.combat.as_mut() {
+        combat
+            .creature_blocked_attackers_this_combat
+            .entry(blocker_id)
+            .or_default()
+            .insert(attacker_ref);
+    }
+    state
+        .creature_blocked_attackers_this_turn
+        .entry(blocker_id)
+        .or_default()
+        .insert(attacker_ref);
 }
 
 /// CR 508.4: Place a permanent onto the battlefield attacking.
@@ -785,13 +823,15 @@ pub fn place_blocking(state: &mut GameState, blocker_id: ObjectId, attacker_id: 
         .push(blocker_id);
     // CR 509.1a tracking: record the blocker for per-turn "blocked this turn" queries.
     state.creatures_blocked_this_turn.insert(blocker_id);
+    // CR 509.1g + CR 400.7: record the pair into the block-history
+    // windows through the single write authority.
+    record_block_history(state, blocker_id, attacker_id);
     // CR 506.4 + CR 613.1f: a new blocking creature can satisfy Layer 6
     // `FilterProp::Blocking` grants; re-evaluate continuous effects.
     state.layers_dirty.mark_full();
-    // CR 733: journal the settled block. All four writes above (the sticky
-    // blocked bit, both blocker maps, and the per-turn blocked set) follow
-    // structurally from this blocker/attacker pair, so the pair plus the prior
-    // blocked bit is the whole receipt.
+    // CR 733: journal the settled block. Every write above follows structurally
+    // from this blocker/attacker pair, so the pair plus the prior blocked bit is
+    // the whole receipt.
     record_combat_membership_edit(
         state,
         reference,
@@ -925,7 +965,7 @@ pub fn apply_resolved_combat_membership(
                     },
                 );
             }
-            // CR 509.1h then CR 509.1g: the same four writes the live authority
+            // CR 509.1h then CR 509.1g: the same writes the live authority
             // performed, in the same order.
             info.blocked = true;
             combat
@@ -939,6 +979,7 @@ pub fn apply_resolved_combat_membership(
                 .or_default()
                 .push(object_id);
             state.creatures_blocked_this_turn.insert(object_id);
+            record_block_history(state, object_id, *resulting_attacker);
         }
         ResolvedCombatMembershipEdit::MarkBlocked => {
             let combat = state
@@ -6259,6 +6300,24 @@ pub fn declare_blockers_for_player(
 
     propagate_banding_block_state(combat);
 
+    // CR 509.1g + CR 702.22h: read the pairs back from the live authority AFTER
+    // banding propagation, so a band member the defending player never chose —
+    // which CR 702.22h makes blocked by this blocker — is recorded with the
+    // explicitly chosen ones. Scoped to the blockers this declaration named, so a
+    // co-defender's earlier declaration is not re-recorded.
+    let declared_pairs: Vec<(ObjectId, ObjectId)> = assignments
+        .iter()
+        .flat_map(|(blocker_id, _)| {
+            combat
+                .blocker_to_attacker
+                .get(blocker_id)
+                .into_iter()
+                .flatten()
+                .map(|attacker_id| (*blocker_id, *attacker_id))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
     // CR 509.1a: Record blocker object IDs for per-turn tracking.
     state
         .creatures_blocked_this_turn
@@ -6271,6 +6330,10 @@ pub fn declare_blockers_for_player(
         .pending_blocker_declaration_events
         .push(event.clone());
     events.push(event);
+
+    for (blocker_id, attacker_id) in declared_pairs {
+        record_block_history(state, blocker_id, attacker_id);
+    }
 
     Ok(())
 }

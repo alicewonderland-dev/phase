@@ -88,6 +88,7 @@ mod bishop_of_binding_where_x_exiled_card_power;
 mod black_bolt_lethal_voice_destroys_triggering_opponents_permanent;
 mod blessed_orator_other_anthem;
 mod blizzard_brawl_snow_indestructible;
+mod blocked_history_primitive;
 mod bolas_citadel_regression;
 mod bombur_gentle_dreamer_conditional_untap;
 mod boneyard_parley_pile_separation;

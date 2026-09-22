@@ -6211,6 +6211,15 @@ fn is_default_shared_quality_relation(value: &SharedQualityRelation) -> bool {
 pub enum CombatRelation {
     /// CR 509.1g/509.1h: Candidate is blocking the subject or is blocked by it.
     BlockingOrBlockedBy,
+    /// CR 509.1g + CR 400.7: Candidate is an attacking creature the subject was
+    /// recorded as blocking, within `scope`. Unlike `BlockingOrBlockedBy`, which
+    /// reads live `combat.blocker_to_attacker` and empties when CR 506.4 removes
+    /// either creature from combat, this reads the block-history ledgers
+    /// (`CombatState::creature_blocked_attackers_this_combat` /
+    /// `GameState::creature_blocked_attackers_this_turn`), so it still answers
+    /// after the subject has left the battlefield. Values carry the attacker's
+    /// incarnation, so an attacker that left and returned does not match.
+    BlockedBySubject { scope: CombatHistoryScope },
 }
 
 /// Context object for a combat relationship filter.

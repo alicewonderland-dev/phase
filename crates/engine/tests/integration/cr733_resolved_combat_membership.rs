@@ -33,7 +33,7 @@ use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
 use engine::types::game_state::GameState;
 use engine::types::game_state::WaitingFor;
-use engine::types::identifiers::ObjectId;
+use engine::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::resolved_commands::{
@@ -547,12 +547,11 @@ fn become_blocked_journals_a_mark_blocked_edit_and_replays_it() {
 /// CR 509.1g + CR 506.3e via `place_blocking`: a token put onto the battlefield
 /// already blocking. Driven through a real Mirror Match cast.
 ///
-/// L3: the authority writes FOUR places — the attacker's sticky `blocked` bit,
-/// `blocker_to_attacker`, `blocker_assignments`, and `creatures_blocked_this_turn`
-/// (which lives on `GameState`, not `CombatState`). All four are asserted after
-/// replay, individually.
+/// L3: the authority writes the attacker's sticky `blocked` bit, the blocker
+/// maps, the per-turn blocked set, and the block-history ledgers. Each is
+/// asserted after replay, individually.
 #[test]
-fn place_blocking_journals_a_block_edit_and_replays_all_four_writes() {
+fn place_blocking_journals_a_block_edit_and_replays_every_write() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let attacker = scenario.add_creature(P0, "Charging Ox", 3, 3).id();
@@ -611,6 +610,27 @@ fn place_blocking_journals_a_block_edit_and_replays_all_four_writes() {
         "CR 509.1h: the token is the FIRST blocker, so the sticky bit was clear"
     );
 
+    // CR 509.1g + CR 400.7: the live path (`place_blocking`, E6) must already
+    // have written the block-history ledgers before the replay clone is taken
+    // — without this pre-replay guard, deleting the live write is invisible
+    // once the clone below re-derives the same entries from an absent state.
+    let attacker_ref =
+        ObjectIncarnationRef::from_object(state.objects.get(&attacker).expect("attacker is live"));
+    assert!(
+        combat
+            .creature_blocked_attackers_this_combat
+            .get(&token)
+            .is_some_and(|attackers| attackers.contains(&attacker_ref)),
+        "CR 509.1g: the live combat-scoped block-history ledger"
+    );
+    assert!(
+        state
+            .creature_blocked_attackers_this_turn
+            .get(&token)
+            .is_some_and(|attackers| attackers.contains(&attacker_ref)),
+        "CR 509.1g: the live turn-scoped block-history ledger"
+    );
+
     // Replay exactness: undo only this family's edit, then reinstall it.
     let mut replay = state.clone();
     if let Some(combat) = replay.combat.as_mut() {
@@ -621,35 +641,52 @@ fn place_blocking_journals_a_block_edit_and_replays_all_four_writes() {
                 info.blocked = false;
             }
         }
+        combat.creature_blocked_attackers_this_combat.remove(&token);
     }
     replay.creatures_blocked_this_turn.remove(&token);
+    replay.creature_blocked_attackers_this_turn.remove(&token);
 
     apply_resolved_combat_membership(&mut replay, &commands[0])
         .expect("the recorded block must replay against its predecessor");
 
-    // All four writes, asserted individually. `CombatState`'s hand-written
-    // `PartialEq` omits four fields, so a whole-struct equality check here
-    // would be blind to exactly the bookkeeping this family edits.
+    // Every write is asserted individually. `CombatState`'s hand-written
+    // `PartialEq` deliberately omits the damage-step scratch fields, so a
+    // whole-struct equality check here would be blind to exactly the
+    // bookkeeping this family edits.
     let replayed = replay.combat.as_ref().expect("combat is live after replay");
     assert!(
         replayed
             .attackers
             .iter()
             .any(|a| a.object_id == attacker && a.blocked),
-        "write 1 — CR 509.1h: the attacker's sticky blocked bit"
+        "CR 509.1h: the attacker's sticky blocked bit"
     );
     assert_eq!(
         replayed.blocker_to_attacker.get(&token),
         Some(&vec![attacker]),
-        "write 2 — CR 509.1g: the blocker -> attacker reverse lookup"
+        "CR 509.1g: the blocker -> attacker reverse lookup"
     );
     assert_eq!(
         replayed.blocker_assignments.get(&attacker),
         Some(&vec![token]),
-        "write 3 — CR 509.1g: the attacker -> blocker forward assignment"
+        "CR 509.1g: the attacker -> blocker forward assignment"
     );
     assert!(
         replay.creatures_blocked_this_turn.contains(&token),
-        "write 4 — CR 509.1a: the per-turn blocked-this-turn set on GameState"
+        "CR 509.1a: the per-turn blocked-this-turn set on GameState"
+    );
+    assert!(
+        replayed
+            .creature_blocked_attackers_this_combat
+            .get(&token)
+            .is_some_and(|attackers| attackers.contains(&attacker_ref)),
+        "CR 509.1g: the combat-scoped block-history ledger"
+    );
+    assert!(
+        replay
+            .creature_blocked_attackers_this_turn
+            .get(&token)
+            .is_some_and(|attackers| attackers.contains(&attacker_ref)),
+        "CR 509.1g: the turn-scoped block-history ledger"
     );
 }

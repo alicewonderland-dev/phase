@@ -21,7 +21,7 @@ use engine::types::game_state::{
     StackResolutionEntryFence, StackResolutionPolicy, StackResolutionSession, TokenProjection,
     WaitingFor,
 };
-use engine::types::identifiers::{CardId, ObjectId, TrackedSetId};
+use engine::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef, TrackedSetId};
 use engine::types::keywords::ProtectionTarget;
 use engine::types::mana::{ManaColor, ManaCost};
 use engine::types::phase::{PhaseStop, PhaseStopScope};
@@ -119,6 +119,7 @@ const NUMERIC_MAP_ROUND_TRIP_OWNERS: &[NumericRoundTripOwner] = &[
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::attacked_defenders_this_turn", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::attacked_defenders_last_turn", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::creature_attacked_defenders_this_turn", map_key_types: &["ObjectId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
+    NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::creature_blocked_attackers_this_turn", map_key_types: &["ObjectId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::cards_discarded_this_turn_by_player", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::mana_spent_on_spells_this_turn", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::last_effect_counts_by_player", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
@@ -136,6 +137,7 @@ const NUMERIC_MAP_ROUND_TRIP_OWNERS: &[NumericRoundTripOwner] = &[
     NumericRoundTripOwner { id: "src/game/combat.rs::CombatState::blocker_to_attacker", map_key_types: &["ObjectId"], group: RoundTripGroup::CombatState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/game/combat.rs::CombatState::attacked_defenders_this_combat", map_key_types: &["PlayerId"], group: RoundTripGroup::CombatState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/game/combat.rs::CombatState::creature_attacked_defenders_this_combat", map_key_types: &["ObjectId"], group: RoundTripGroup::CombatState, numeric_deserializer: None },
+    NumericRoundTripOwner { id: "src/game/combat.rs::CombatState::creature_blocked_attackers_this_combat", map_key_types: &["ObjectId"], group: RoundTripGroup::CombatState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/game/combat.rs::CombatState::damage_assignments", map_key_types: &["ObjectId"], group: RoundTripGroup::CombatState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::WaitingFor::DeclareAttackers::valid_attack_targets_by_attacker", map_key_types: &["ObjectId"], group: RoundTripGroup::DeclareAttackers, numeric_deserializer: Some(OPTION_NUMERIC_HASH_MAP_DESERIALIZER) },
     NumericRoundTripOwner { id: "src/types/game_state.rs::WaitingFor::DeclareAttackers::attacker_constraints", map_key_types: &["ObjectId"], group: RoundTripGroup::DeclareAttackers, numeric_deserializer: Some(NUMERIC_HASH_MAP_DESERIALIZER) },
@@ -328,6 +330,7 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
     for field in [
         "attacked_defenders_this_turn",
         "creature_attacked_defenders_this_turn",
+        "creature_blocked_attackers_this_turn",
     ] {
         add_spec(
             &mut specs,
@@ -683,6 +686,14 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
             "attacking_incarnations_this_combat",
             "HashSet",
             Classification::Canonical(HASH_SET),
+        ),
+        (
+            "src/game/combat.rs",
+            "CombatState",
+            None,
+            "creature_blocked_attackers_this_combat",
+            "HashMap<HashSet>",
+            Classification::Canonical(HASH_MAP_OF_HASH_SET),
         ),
         (
             "src/game/combat.rs",
@@ -1160,7 +1171,7 @@ fn serde_hash_owner_census_is_exhaustive_and_every_canonical_owner_names_its_ada
 
     assert_eq!(
         NUMERIC_MAP_ROUND_TRIP_OWNERS.len(),
-        52,
+        54,
         "the reviewed numeric-map owner matrix must remain exact"
     );
     for group in [
@@ -1632,6 +1643,20 @@ fn build_all_direct_numeric_maps_state() -> GameState {
             [PlayerId(0), PlayerId(1)].into_iter().collect(),
         ),
     ]);
+    state.creature_blocked_attackers_this_turn = HashMap::from([
+        (
+            ObjectId(1),
+            [ObjectIncarnationRef::of(ObjectId(3), 0)]
+                .into_iter()
+                .collect(),
+        ),
+        (
+            ObjectId(2),
+            [ObjectIncarnationRef::of(ObjectId(4), 0)]
+                .into_iter()
+                .collect(),
+        ),
+    ]);
     state.cards_discarded_this_turn_by_player = HashMap::from([(PlayerId(0), 1), (PlayerId(1), 2)]);
     state.mana_spent_on_spells_this_turn = HashMap::from([(PlayerId(0), 3), (PlayerId(1), 4)]);
     state.last_effect_counts_by_player = HashMap::from([(PlayerId(0), -1), (PlayerId(1), 2)]);
@@ -1758,6 +1783,7 @@ fn every_direct_numeric_key_game_state_map_round_trips_populated() {
         "attacked_defenders_this_turn",
         "attacked_defenders_last_turn",
         "creature_attacked_defenders_this_turn",
+        "creature_blocked_attackers_this_turn",
         "cards_discarded_this_turn_by_player",
         "mana_spent_on_spells_this_turn",
         "last_effect_counts_by_player",
@@ -1773,7 +1799,7 @@ fn every_direct_numeric_key_game_state_map_round_trips_populated() {
     ];
     assert_eq!(
         direct_fields.len(),
-        41,
+        42,
         "private stack_trigger_firings is covered by its unit test"
     );
     for field in direct_fields {
@@ -1839,6 +1865,20 @@ fn every_numeric_key_combat_map_round_trips_populated() {
                 [PlayerId(1), PlayerId(0)].into_iter().collect(),
             ),
         ]),
+        creature_blocked_attackers_this_combat: HashMap::from([
+            (
+                ObjectId(1),
+                [ObjectIncarnationRef::of(ObjectId(11), 0)]
+                    .into_iter()
+                    .collect(),
+            ),
+            (
+                ObjectId(2),
+                [ObjectIncarnationRef::of(ObjectId(22), 0)]
+                    .into_iter()
+                    .collect(),
+            ),
+        ]),
         damage_assignments: HashMap::from([
             (
                 ObjectId(1),
@@ -1869,6 +1909,7 @@ fn every_numeric_key_combat_map_round_trips_populated() {
         "blocker_to_attacker",
         "attacked_defenders_this_combat",
         "creature_attacked_defenders_this_combat",
+        "creature_blocked_attackers_this_combat",
         "damage_assignments",
     ] {
         assert_eq!(

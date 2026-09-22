@@ -19419,6 +19419,14 @@ declare_game_state! {
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_map_of_hash_set")]
     pub creature_attacked_defenders_this_turn: HashMap<ObjectId, HashSet<PlayerId>>,
+    /// CR 509.1g + CR 400.7 + CR 500.8: The turn-scoped counterpart to
+    /// `CombatState::creature_blocked_attackers_this_combat`, accumulated across
+    /// every combat phase of the turn — effects can add phases to a turn
+    /// (CR 500.8), so this ledger is not limited to a single combat's worth of
+    /// records.
+    #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map_of_hash_set")]
+    pub creature_blocked_attackers_this_turn: HashMap<ObjectId, HashSet<ObjectIncarnationRef>>,
     /// CR 500.8 + CR 506.1: Number of combat phases that have begun this turn.
     /// Used by intervening-if triggers that only fire during the first combat phase.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
@@ -25118,6 +25126,7 @@ impl GameState {
             attacked_defenders_this_turn: HashMap::new(),
             attacked_defenders_last_turn: Box::default(),
             creature_attacked_defenders_this_turn: HashMap::new(),
+            creature_blocked_attackers_this_turn: HashMap::new(),
             combat_phases_started_this_turn: 0,
             end_steps_started_this_turn: 0,
             creatures_attacked_this_turn: HashSet::new(),
@@ -27354,6 +27363,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         attacked_defenders_this_turn: _,
         attacked_defenders_last_turn: _,
         creature_attacked_defenders_this_turn: _,
+        creature_blocked_attackers_this_turn: _,
         combat_phases_started_this_turn: _,
         end_steps_started_this_turn: _,
         creatures_attacked_this_turn: _,
@@ -27691,6 +27701,8 @@ impl PartialEq for GameState {
             && self.attacked_defenders_last_turn == other.attacked_defenders_last_turn
             && self.creature_attacked_defenders_this_turn
                 == other.creature_attacked_defenders_this_turn
+            && self.creature_blocked_attackers_this_turn
+                == other.creature_blocked_attackers_this_turn
             && self.combat_phases_started_this_turn == other.combat_phases_started_this_turn
             && self.end_steps_started_this_turn == other.end_steps_started_this_turn
             && self.creatures_attacked_this_turn == other.creatures_attacked_this_turn

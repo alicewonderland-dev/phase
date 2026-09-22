@@ -12,10 +12,10 @@ use crate::game::quantity::{
     resolve_quantity_with_targets,
 };
 use crate::types::ability::{
-    CardTypeSetSource, CastManaSpentMetric, ChoiceValue, ChosenAttribute, CombatRelation,
-    CombatRelationSubject, ControllerRef, CountScope, FilterProp, Parity, ParitySource,
-    PlayerFilter, PtStat, PtValueScope, QuantityExpr, QuantityRef, ResolvedAbility, SharedQuality,
-    SharedQualityRelation, TargetFilter, TargetRef, TypeFilter, TypedFilter,
+    CardTypeSetSource, CastManaSpentMetric, ChoiceValue, ChosenAttribute, CombatHistoryScope,
+    CombatRelation, CombatRelationSubject, ControllerRef, CountScope, FilterProp, Parity,
+    ParitySource, PlayerFilter, PtStat, PtValueScope, QuantityExpr, QuantityRef, ResolvedAbility,
+    SharedQuality, SharedQualityRelation, TargetFilter, TargetRef, TypeFilter, TypedFilter,
 };
 use crate::types::card::CardFace;
 use crate::types::card_type::{CoreType, Supertype};
@@ -4059,6 +4059,7 @@ pub(crate) fn matches_target_filter_on_event_snapshot(
         snapshot.zone,
     );
     object.controller = snapshot.controller;
+    object.incarnation = snapshot.identity.incarnation;
     object.power = snapshot.power;
     object.toughness = snapshot.toughness;
     object.base_power = snapshot.base_power;
@@ -6628,6 +6629,7 @@ fn combat_relation_subject_id(
 fn matches_combat_relation(
     state: &GameState,
     object_id: ObjectId,
+    candidate: ObjectIncarnationRef,
     relation: CombatRelation,
     subject: CombatRelationSubject,
     source: &SourceContext<'_>,
@@ -6647,6 +6649,22 @@ fn matches_combat_relation(
                 .is_some_and(|attackers| attackers.contains(&object_id));
             candidate_blocks_subject || subject_blocks_candidate
         }),
+        // CR 509.1g + CR 400.7: the block-history ledgers are never pruned by
+        // CR 506.4, so this answers even after the subject has left combat.
+        // Values carry the attacker's incarnation, so a candidate that left and
+        // returned (CR 400.7: a new object) does not match its predecessor's entry.
+        CombatRelation::BlockedBySubject { scope } => match scope {
+            CombatHistoryScope::ThisCombat => state.combat.as_ref().is_some_and(|combat| {
+                combat
+                    .creature_blocked_attackers_this_combat
+                    .get(&subject_id)
+                    .is_some_and(|attackers| attackers.contains(&candidate))
+            }),
+            CombatHistoryScope::ThisTurn => state
+                .creature_blocked_attackers_this_turn
+                .get(&subject_id)
+                .is_some_and(|attackers| attackers.contains(&candidate)),
+        },
     }
 }
 
@@ -6931,9 +6949,14 @@ fn matches_filter_prop(
                 .get(&object_id)
                 .is_some_and(|attackers| attackers.contains(&source.id))
         }),
-        FilterProp::CombatRelation { relation, subject } => {
-            matches_combat_relation(state, object_id, *relation, *subject, source)
-        }
+        FilterProp::CombatRelation { relation, subject } => matches_combat_relation(
+            state,
+            object_id,
+            ObjectIncarnationRef::from_object(obj),
+            *relation,
+            *subject,
+            source,
+        ),
         // CR 509.1h: Unblocked = attacking creature that was never assigned blockers.
         // unblocked_attackers checks the permanent `blocked` flag, not the current blocker list.
         FilterProp::Unblocked => combat::unblocked_attackers(state).contains(&object_id),
@@ -8090,8 +8113,44 @@ fn zone_change_record_matches_property(
         }
         FilterProp::Blocking => record.combat_status.blocking,
         // `ZoneChangeCombatStatus` snapshots role, not the blocker-to-attacker
-        // relation. Source-relative blocker checks require live combat state.
-        FilterProp::BlockingSource | FilterProp::CombatRelation { .. } => false,
+        // relation, and this predicate reads live `combat.blocker_to_attacker`.
+        FilterProp::BlockingSource => false,
+        FilterProp::CombatRelation { relation, subject } => match relation {
+            // CR 506.4: the live map is pruned when either creature leaves
+            // combat, so there is nothing for a departed record to match.
+            CombatRelation::BlockingOrBlockedBy => false,
+            // CR 509.1g + CR 608.2i: the block-history ledgers `matches_combat_relation`
+            // reads are never pruned, so this leg answers from the same storage
+            // (`CombatState::creature_blocked_attackers_this_combat` /
+            // `GameState::creature_blocked_attackers_this_turn`) the live leg does.
+            // CR 400.7: the record's exact departing incarnation is its own
+            // pre-change authority; a record without one fails closed.
+            CombatRelation::BlockedBySubject { scope } => {
+                let Some(subject_id) = combat_relation_subject_id(*subject, source) else {
+                    return false;
+                };
+                let Some(candidate) = record
+                    .trigger_source_context()
+                    .map(|context| context.identity.reference)
+                else {
+                    return false;
+                };
+                match scope {
+                    CombatHistoryScope::ThisCombat => {
+                        state.combat.as_ref().is_some_and(|combat| {
+                            combat
+                                .creature_blocked_attackers_this_combat
+                                .get(&subject_id)
+                                .is_some_and(|attackers| attackers.contains(&candidate))
+                        })
+                    }
+                    CombatHistoryScope::ThisTurn => state
+                        .creature_blocked_attackers_this_turn
+                        .get(&subject_id)
+                        .is_some_and(|attackers| attackers.contains(&candidate)),
+                }
+            }
+        },
         FilterProp::Unblocked => {
             record.combat_status.attacking && !record.combat_status.blocked
         }
@@ -12412,6 +12471,71 @@ mod tests {
             &filter,
             &ctx
         ));
+    }
+
+    /// T12c (E15): `matches_target_filter_on_event_snapshot` must answer
+    /// `BlockedBySubject` from the SNAPSHOT's own captured incarnation, not the
+    /// live object's — otherwise a live object bumped past the snapshot (blink,
+    /// re-entry) would silently override the event-time fact the snapshot exists
+    /// to freeze. The snapshot's incarnation is pinned NON-zero, because
+    /// `GameObject::new` defaults `incarnation: 0` and a zero-incarnation
+    /// snapshot would make a dropped `E15` assignment invisible.
+    #[test]
+    fn event_snapshot_answers_from_its_captured_identity_not_the_live_object() {
+        let mut state = setup();
+        let blocker = add_creature(&mut state, PlayerId(1), "Blocker");
+        let attacker = add_creature(&mut state, PlayerId(0), "Attacker");
+
+        // Bump the attacker to a non-zero incarnation, then capture the snapshot
+        // at that incarnation.
+        state
+            .objects
+            .get_mut(&attacker)
+            .expect("attacker is live")
+            .bump_incarnation();
+        let snapshot = state
+            .capture_connive_subject(attacker)
+            .expect("a live object must capture a snapshot")
+            .snapshot;
+        assert_ne!(
+            snapshot.identity.incarnation, 0,
+            "reach guard: the snapshot's own incarnation must be non-zero"
+        );
+
+        // The ledger records the SNAPSHOT's incarnation.
+        state
+            .creature_blocked_attackers_this_turn
+            .entry(blocker)
+            .or_default()
+            .insert(snapshot.identity);
+
+        // The LIVE object then moves further — a real re-entry would land here
+        // too — so the live incarnation now disagrees with the snapshot's.
+        state
+            .objects
+            .get_mut(&attacker)
+            .expect("attacker is live")
+            .bump_incarnation();
+        assert_ne!(
+            state.objects[&attacker].incarnation, snapshot.identity.incarnation,
+            "reach guard: the live object must have moved past the snapshot's incarnation"
+        );
+
+        let ctx = FilterContext::from_source_with_controller(blocker, PlayerId(1));
+        let filter = TargetFilter::Typed(TypedFilter::creature().properties(vec![
+            FilterProp::CombatRelation {
+                relation: CombatRelation::BlockedBySubject {
+                    scope: CombatHistoryScope::ThisTurn,
+                },
+                subject: CombatRelationSubject::Source,
+            },
+        ]));
+
+        assert!(
+            matches_target_filter_on_event_snapshot(&state, &snapshot, &filter, &ctx),
+            "the snapshot's own captured incarnation must match the ledger, \
+             regardless of where the live object has since moved"
+        );
     }
 
     #[test]
