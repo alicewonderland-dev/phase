@@ -3206,13 +3206,15 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
           console.error("[openBroker] no hosting server selected");
           return null;
         }
+        let broker: BrokerClient | null = null;
         try {
-          const broker = await openBrokerClient(url);
+          broker = await openBrokerClient(url);
           const registered = await broker.registerHost(req);
           activeBroker = broker;
           activeBrokerGameCode = registered.gameCode;
           return { broker, gameCode: registered.gameCode };
         } catch (err) {
+          broker?.close();
           console.error("[openBroker] failed:", err);
           toastLobbyCapabilityRefusal(get, err);
           return null;
