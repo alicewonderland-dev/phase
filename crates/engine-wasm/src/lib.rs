@@ -6680,8 +6680,8 @@ mod deck_list_seat_validation_tests {
                 2,
             ),
             Some(vec![
-                "Player deck: Freeform Commander commanders must be cards that can be cast; \
-                 a land is played rather than cast: Plains"
+                "Player deck: Freeform Commander commanders must be cards that can be cast: \
+                 Plains"
                     .to_string()
             ]),
         );
@@ -6713,8 +6713,8 @@ mod deck_list_seat_validation_tests {
                 2,
             ),
             Some(vec![
-                "Player deck: Freeform Commander commanders must be cards that can be cast; \
-                 a land is played rather than cast: Plains"
+                "Player deck: Freeform Commander commanders must be cards that can be cast: \
+                 Plains"
                     .to_string()
             ]),
         );

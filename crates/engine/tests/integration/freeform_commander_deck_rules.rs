@@ -36,6 +36,7 @@ use engine::types::player::PlayerId;
 use strum::IntoEnumIterator;
 
 use super::format_axis_census;
+use super::source_census;
 use super::support;
 
 fn repeat(name: &str, n: usize) -> Vec<String> {
@@ -132,8 +133,7 @@ fn freeform_commander_refuses_a_land_as_commander() {
             assert_eq!(
                 result.selected_format_reasons,
                 vec![format!(
-                    "Freeform Commander commanders must be cards that can be cast; a land is \
-                     played rather than cast: {card}"
+                    "Freeform Commander commanders must be cards that can be cast: {card}"
                 )],
                 "summary_only={summary_only} {card}"
             );
@@ -143,6 +143,70 @@ fn freeform_commander_refuses_a_land_as_commander() {
                 "summary_only={summary_only} {card}"
             );
         }
+    }
+}
+
+/// §Row 2, subject 2's other half: the widened predicate's own coverage
+/// boundary (the fix this round makes). A nontraditional command-zone card
+/// type (CR 108.2a) is refused the same way a land is — CR 311.2 (Plane),
+/// CR 314.2 (Scheme), and CR 312.2 (Phenomenon) each say explicitly "They...
+/// can't be cast" — covering more than one such type so the assertion is
+/// checked against the CLASS the predicate's exhaustive match now judges, not
+/// only the single type a prior review round measured. The positive control
+/// in the same loop is an ordinary castable, non-legendary, non-creature
+/// card: without it, a predicate that refused every commander would also
+/// satisfy the refusals above.
+#[test]
+fn freeform_commander_refuses_a_nontraditional_card_as_commander() {
+    let Some(db) = db() else {
+        eprintln!("skipping: card database not available");
+        return;
+    };
+
+    for summary_only in [false, true] {
+        for card in [
+            "Bad Wolf Bay",
+            "A Premonition of Your Demise",
+            "Caught in a Parallel Universe",
+        ] {
+            let request = DeckCompatibilityRequest {
+                commander: vec![card.to_string()],
+                selected_format: Some(SelectedFormat::Tag(GameFormat::FreeformCommander)),
+                summary_only,
+                ..DeckCompatibilityRequest::default()
+            };
+            let result = evaluate_deck_compatibility(db, &request);
+            assert_eq!(
+                result.selected_format_reasons,
+                vec![format!(
+                    "Freeform Commander commanders must be cards that can be cast: {card}"
+                )],
+                "summary_only={summary_only} {card}"
+            );
+            assert_eq!(
+                result.selected_format_compatible,
+                Some(false),
+                "summary_only={summary_only} {card}"
+            );
+        }
+
+        let control = DeckCompatibilityRequest {
+            commander: vec!["Sol Ring".to_string()],
+            selected_format: Some(SelectedFormat::Tag(GameFormat::FreeformCommander)),
+            summary_only,
+            ..DeckCompatibilityRequest::default()
+        };
+        let result = evaluate_deck_compatibility(db, &control);
+        assert_eq!(
+            result.selected_format_compatible,
+            Some(true),
+            "summary_only={summary_only}: {:?}",
+            result.selected_format_reasons
+        );
+        assert!(
+            result.selected_format_reasons.is_empty(),
+            "summary_only={summary_only}"
+        );
     }
 }
 
@@ -185,8 +249,7 @@ fn freeform_commander_judges_the_double_faced_card_face_the_decklist_names() {
         assert_eq!(
             result.selected_format_reasons,
             vec![
-                "Freeform Commander commanders must be cards that can be cast; a land is played \
-                 rather than cast: Kazandu Valley"
+                "Freeform Commander commanders must be cards that can be cast: Kazandu Valley"
                     .to_string()
             ],
             "summary_only={summary_only}"
@@ -251,9 +314,8 @@ fn freeform_commander_eligibility_governs_each_commander_slot() {
                 ..DeckCompatibilityRequest::default()
             };
             let result = evaluate_deck_compatibility(db, &request);
-            let eligibility = "Freeform Commander commanders must be cards that can be cast; a \
-                                land is played rather than cast: Forest"
-                .to_string();
+            let eligibility =
+                "Freeform Commander commanders must be cards that can be cast: Forest".to_string();
             let expected = if summary_only {
                 vec![eligibility]
             } else {
@@ -274,6 +336,20 @@ fn freeform_commander_eligibility_governs_each_commander_slot() {
     }
 }
 
+/// How many of `text`'s own lines contain `needle` on the CODE half — this
+/// file's own route through the comment-stripping authority
+/// (`super::source_census::code`), mirroring `format_axis_census`'s private
+/// `count_needle`. Not that sibling's function itself: this file independently
+/// `include_str!`s a `.rs` path (`ENGINE_WASM_LIB_RS` below) and counts a
+/// needle in it, so it is itself in `source_census`'s producer population
+/// (see `source_census::tests::no_source_reading_file_carries_a_private_comment_policy`)
+/// and must route directly rather than through a peer's private routing.
+fn count_needle(text: &str, needle: &str) -> usize {
+    text.lines()
+        .filter(|line| source_census::code(line).contains(needle))
+        .count()
+}
+
 /// Charter row 2's "establish separately that the verdict is reached through
 /// the surface the client actually calls" — the OTHER client-called surface,
 /// `engine-wasm::is_card_commander_eligible_for_format`. This export takes
@@ -292,12 +368,26 @@ fn freeform_commander_eligibility_is_answered_by_the_surface_the_client_calls() 
         ENGINE_WASM_LIB_RS,
         "pub fn is_card_commander_eligible_for_format(",
     );
-    assert!(
-        span.contains("GameFormat::FreeformCommander => is_freeform_commander_eligible(face)"),
+    // `count_needle` (not `str::contains`) so a needle written inside a
+    // comment in this span cannot satisfy the assertion — `fn_span` strips
+    // comments only to find the span's BOUNDARIES; the slice it returns is
+    // raw source. `== 1` rather than `>= 1`: each needle names a single
+    // match arm, so a duplicate arm is itself a defect this assertion
+    // should catch, not tolerate.
+    assert_eq!(
+        count_needle(
+            span,
+            "GameFormat::FreeformCommander => is_freeform_commander_eligible(face)"
+        ),
+        1,
         "{span}"
     );
-    assert!(
-        span.contains("GameFormat::TinyLeaders => is_tiny_leader_eligible(face)"),
+    assert_eq!(
+        count_needle(
+            span,
+            "GameFormat::TinyLeaders => is_tiny_leader_eligible(face)"
+        ),
+        1,
         "{span}"
     );
 }
@@ -652,9 +742,8 @@ fn freeform_commander_has_no_main_deck_size_floor() {
             ..DeckCompatibilityRequest::default()
         };
         let result = evaluate_deck_compatibility(db, &control);
-        let eligibility = "Freeform Commander commanders must be cards that can be cast; a \
-                            land is played rather than cast: Forest"
-            .to_string();
+        let eligibility =
+            "Freeform Commander commanders must be cards that can be cast: Forest".to_string();
         let expected = if summary_only {
             vec![eligibility]
         } else {
@@ -878,9 +967,8 @@ fn freeform_commander_has_no_copy_limit() {
             ..DeckCompatibilityRequest::default()
         };
         let result = evaluate_deck_compatibility(db, &control);
-        let eligibility = "Freeform Commander commanders must be cards that can be cast; a \
-                            land is played rather than cast: Forest"
-            .to_string();
+        let eligibility =
+            "Freeform Commander commanders must be cards that can be cast: Forest".to_string();
         let expected = if summary_only {
             vec![eligibility]
         } else {

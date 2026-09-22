@@ -1262,8 +1262,7 @@ impl CommanderVariantRules {
     fn freeform_commander() -> Self {
         Self {
             eligible: is_freeform_commander_eligible,
-            eligibility_error:
-                "Freeform Commander commanders must be cards that can be cast; a land is played rather than cast",
+            eligibility_error: "Freeform Commander commanders must be cards that can be cast",
             skip_commander_legality: false,
             partner_grant: None,
         }
@@ -4216,8 +4215,56 @@ pub fn is_commander_eligible(face: &CardFace) -> bool {
 /// naming the non-land face of such a card reaches a castable face and one
 /// naming the land face does not. That resolution is not this format's: it is
 /// how every commander-eligibility predicate here already behaves.
+///
+/// Every core type on the face must be castable, and the type list must be
+/// NONEMPTY: `Iterator::all` is vacuously `true` on an empty list, which
+/// would re-admit a face with no recognized `CoreType` at all (the fixture
+/// carries such faces — Vanguard/Avatar cards, whose CR 313 card type has no
+/// `CoreType` variant) as though it were castable.
 pub fn is_freeform_commander_eligible(face: &CardFace) -> bool {
-    !face.card_type.core_types.contains(&CoreType::Land)
+    let core_types = &face.card_type.core_types;
+    !core_types.is_empty()
+        && core_types
+            .iter()
+            .all(|core_type| core_type_can_be_cast(*core_type))
+}
+
+/// Whether a `CoreType` is ever CAST (as opposed to played, or put into the
+/// command zone some other way), independent of any specific card face.
+/// EXHAUSTIVE, deliberately, with no wildcard arm: a future `CoreType`
+/// variant must be classified here at compile time rather than silently
+/// admitted the way `is_freeform_commander_eligible`'s prior `Land`-only
+/// check admitted every other nontraditional type.
+fn core_type_can_be_cast(core_type: CoreType) -> bool {
+    match core_type {
+        CoreType::Artifact
+        | CoreType::Creature
+        | CoreType::Enchantment
+        | CoreType::Instant
+        | CoreType::Planeswalker
+        | CoreType::Sorcery
+        // CR 310.1: a battle card is cast.
+        | CoreType::Battle
+        // CR 308.1: a kindred (or legacy-errata'd tribal, CR 308.3) card
+        // follows the casting rules of its OTHER card type. That other type
+        // is a separate entry in the same face's `core_types` and is judged
+        // on its own arm, so this arm only has to avoid vetoing the `all()`
+        // check above by itself.
+        | CoreType::Kindred
+        | CoreType::Tribal => true,
+        // CR 305.1: a land is PLAYED, not cast. CR 305.9 extends this to a
+        // face that is a land and another type at once.
+        CoreType::Land => false,
+        // CR 108.2a: nontraditional card types, each of which its own CR
+        // section says explicitly "can't be cast": CR 309.2c (Dungeon),
+        // CR 311.2 (Plane), CR 312.2 (Phenomenon), CR 314.2 (Scheme),
+        // CR 315.3 (Conspiracy).
+        CoreType::Dungeon
+        | CoreType::Plane
+        | CoreType::Phenomenon
+        | CoreType::Scheme
+        | CoreType::Conspiracy => false,
+    }
 }
 
 fn is_pauper_commander_eligible(face: &CardFace) -> bool {

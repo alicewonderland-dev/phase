@@ -32,8 +32,10 @@ fn production_count(src: &str, needle: &str) -> usize {
 
 /// How many of `text`'s own lines contain `needle`, on the code half. Used on
 /// an already-extracted span, whose lines are never inside `#[cfg(test)]`
-/// for any header this file passes to [`fn_span`].
-fn count_needle(text: &str, needle: &str) -> usize {
+/// for any header this file passes to [`fn_span`]. `pub(super)` for the same
+/// reason as [`fn_span`]: available to sibling censuses in this binary that
+/// need the identical comment-stripped count rather than a re-derived one.
+pub(super) fn count_needle(text: &str, needle: &str) -> usize {
     text.lines()
         .filter(|line| code(line).contains(needle))
         .count()

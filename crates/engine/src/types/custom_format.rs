@@ -201,8 +201,9 @@ pub enum CommanderEligibilityRule {
     TinyLeaders,
     OathbreakerSignatureSpell,
     BrawlColorIdentity,
-    /// `GameFormat::FreeformCommander`'s rule: any card that can be cast; a
-    /// land is played rather than cast — CR 305.1, CR 305.9.
+    /// `GameFormat::FreeformCommander`'s rule: any card that can be cast.
+    /// See `deck_validation::is_freeform_commander_eligible` for which
+    /// `CoreType`s it admits.
     FreeformAnyCastableCard,
 }
 
