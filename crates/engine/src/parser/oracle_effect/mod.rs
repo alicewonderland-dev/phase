@@ -109,11 +109,11 @@ use crate::parser::oracle_effect::subject::parse_subject_application;
 use crate::parser::oracle_ir::diagnostic::{ClauseGapKind, OracleDiagnostic};
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag, AggregateFunction,
-    BounceSelection, CardPlayMode, CardTypeSetSource, CastFromZoneDriver, CastMechanism,
-    CastPermissionConstraint, CastingPermission, ChoiceType, ChooseFromZoneConstraint, Chooser,
-    CombatDamageScope, Comparator, ConjureCard, ConjureSource, ContinuousModification,
-    ControlWindow, ControllerRef, CopyChooseScope, CopyRetargetPermission, CopyScale,
-    DamageModification, DamageSource, DelayedTriggerCondition, DelayedTriggerLifetime,
+    AttachCardinality, AttachSelection, BounceSelection, CardPlayMode, CardTypeSetSource,
+    CastFromZoneDriver, CastMechanism, CastPermissionConstraint, CastingPermission, ChoiceType,
+    ChooseFromZoneConstraint, Chooser, CombatDamageScope, Comparator, ConjureCard, ConjureSource,
+    ContinuousModification, ControlWindow, ControllerRef, CopyChooseScope, CopyRetargetPermission,
+    CopyScale, DamageModification, DamageSource, DelayedTriggerCondition, DelayedTriggerLifetime,
     DieResultBranch, Duration, Effect, EffectOutcomeSignal, EffectScope, FilterProp,
     GameRestriction, GuardReading, GuessSubject, IntensityScope, IterationKindBinding,
     KeeperConstraint, KeeperCounterMark, LibraryPosition, ManaProduction, ManaSpendPermission,
@@ -15472,6 +15472,10 @@ fn build_aura_attach_clause(
         Effect::Attach {
             attachment: TargetFilter::SelfRef,
             target: TargetFilter::ParentTarget,
+            // The reanimated permanent is the host; the attachment is the source.
+            selection: AttachSelection::AtResolution {
+                count: AttachCardinality::One,
+            },
         },
     )
     .sub_ability(delayed);
@@ -22802,11 +22806,14 @@ fn replace_target_with_parent(effect: &mut Effect) {
 /// `replace_target_with_parent`, but assigns `TargetFilter::SelfRef`.
 ///
 /// Only the effect arms reachable for the "name ~ then refer back" class are
-/// populated: zone changes (the issue card), single-object tap/untap, and
-/// `Transform` for the DFC family. Arms with
-/// `ParentTargetController`/`LastCreated` guards (`Sacrifice`, `Attach`) are
-/// intentionally omitted — those guards are meaningless for a `SelfRef` rebind,
-/// and no card in this class reaches them.
+/// populated: zone changes (the issue card), single-object tap/untap,
+/// `Transform` for the DFC family, and `Attach`'s ATTACHMENT operand for the
+/// FIN "transform ~, then attach it to <host>" class. `Attach` is the one arm
+/// whose rebind is limited to `ParentTarget` (see the arm comment); the
+/// `TriggeringSource` encoding names the trigger event's object and must not
+/// be re-pointed. Arms with `ParentTargetController`/`LastCreated` guards
+/// (`Sacrifice`) remain intentionally omitted — those guards are meaningless
+/// for a `SelfRef` rebind, and no card in this class reaches them.
 fn replace_target_with_self(effect: &mut Effect) {
     match effect {
         Effect::ChangeZone { target, .. } | Effect::ChangeZoneAll { target, .. } => {
@@ -22828,6 +22835,24 @@ fn replace_target_with_self(effect: &mut Effect) {
         // same source-binding fixup applies.
         Effect::FlipPermanent { target, .. } => {
             *target = TargetFilter::SelfRef;
+        }
+        // CR 608.2c + CR 701.3a (FIN Sidequest class — Sidequest: Play Blitzball):
+        // in "transform ~, then attach it to <host>", the bare-pronoun ATTACHMENT
+        // operand names the source the previous clause just transformed. Rewrite
+        // ONLY `attachment`; the fully-named host (`target`) keeps its own
+        // binding.
+        //
+        // `ParentTarget` is the only admitted encoding. The bare-pronoun
+        // attachment route (`imperative::parse_attachment_anaphor`) parses
+        // through a default `ParseContext` and therefore yields `ParentTarget`
+        // (the declared-slot and source-animation branches are the only
+        // alternatives, and neither applies here). The corpus's single
+        // `TriggeringSource` attachment operand (Ajani's Chosen, "you may attach
+        // it to the token") legitimately names the trigger event's object — a
+        // DIFFERENT antecedent — so admitting that encoding here would re-point
+        // a valid binding.
+        Effect::Attach { attachment, .. } if matches!(attachment, TargetFilter::ParentTarget) => {
+            *attachment = TargetFilter::SelfRef;
         }
         Effect::GenericEffect {
             target,
@@ -39956,7 +39981,31 @@ pub(crate) fn parse_effect_chain_ir(
                 }
             )
         });
-        if (typed_trigger_subject || exile_then_return_transformed)
+        // CR 608.2c (FIN Sidequest class): "transform ~, then attach it to <host>".
+        // The previous clause named the source via `~` (a `SelfRef` Transform), so this
+        // clause's bare-pronoun attachment operand names that same source. Admitted as
+        // a third structural class beside the typed-subject and exile-then-return
+        // branches; the shared `has_anaphoric_reference` + prior-SelfRef-clause
+        // conjuncts below are the same authorities those two branches use.
+        let attach_anaphor_after_self_ref_transform =
+            matches!(
+                &clause.effect,
+                Effect::Attach {
+                    attachment: TargetFilter::ParentTarget,
+                    ..
+                }
+            ) && builder.clauses().last().is_some_and(|prev| {
+                matches!(
+                    &prev.parsed.effect,
+                    Effect::Transform {
+                        target: TargetFilter::SelfRef,
+                        ..
+                    }
+                )
+            });
+        if (typed_trigger_subject
+            || exile_then_return_transformed
+            || attach_anaphor_after_self_ref_transform)
             && has_anaphoric_reference(&text_lower)
             && builder
                 .clauses()
