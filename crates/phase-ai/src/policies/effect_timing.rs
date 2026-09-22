@@ -1,8 +1,7 @@
 use engine::ai_support::current_target_selection_targets;
 use engine::game::combat::{
-    attacker_blockability_in_maximum_free_declaration, attacker_declaration_pending_this_turn,
-    defending_player_for_attacker, get_valid_attacker_ids, is_on_attacking_team,
-    MaximumBlockDeclarationBlockability,
+    attacker_blockability_in_maximum_free_declaration, attacker_declaration_pending_for,
+    defending_player_for_attacker, is_on_attacking_team, MaximumBlockDeclarationBlockability,
 };
 use engine::game::{players, turn_control};
 use engine::types::ability::{
@@ -301,14 +300,14 @@ fn ai_controlled_declared_attacker_blockability(
 ///
 /// Gated on `is_on_attacking_team(state, ai_player)` first: the guard suppresses
 /// itself on turns when the AI's own team is not the attacking team, since
-/// `get_valid_attacker_ids` answers only about the active team (CR 508.1a +
-/// CR 805.10a) and says nothing about a non-attacking-team creature's ability
-/// to attack a future combat.
+/// `attacker_declaration_pending_for` answers only about the team that would
+/// attack this turn (CR 508.1a + CR 805.10a) and says nothing about a
+/// non-attacking-team creature's ability to attack a future turn's combat.
 ///
-/// The per-creature question goes to `get_valid_attacker_ids`, never to
-/// `tapped`: that authority also folds in summoning sickness (CR 302.6),
-/// Defender (CR 702.3b), phased-out permanents (CR 702.26b) and "can't
-/// attack" restrictions (CR 508.1c).
+/// The per-creature question goes to `combat::attacker_declaration_pending_for`,
+/// never to `tapped`: that authority is the single place where every declaration
+/// still ahead this turn — the current phase's and each scheduled combat's, each
+/// under its own CR 508.1c restriction — is checked against this one object.
 ///
 /// CR 508.1k + CR 511.3: a creature that is currently an attacking creature in
 /// the combat in progress is exempt — the exemption reads the live
@@ -320,8 +319,7 @@ fn target_cannot_attack_this_turn(
 ) -> bool {
     is_on_attacking_team(state, ai_player)
         && defending_player_for_attacker(state, target_id).is_none()
-        && !(attacker_declaration_pending_this_turn(state)
-            && get_valid_attacker_ids(state).contains(&target_id))
+        && !attacker_declaration_pending_for(state, target_id)
 }
 
 fn score_action_shape(ctx: &PolicyContext<'_>) -> f64 {
@@ -601,7 +599,9 @@ mod tests {
         build_decision_context, validated_candidate_actions_for_semantic_owner, ActionMetadata,
         AiDecisionContext, CandidateAction, TacticalClass,
     };
-    use engine::game::combat::{get_valid_block_targets, AttackTarget, AttackerInfo, CombatState};
+    use engine::game::combat::{
+        get_valid_attacker_ids, get_valid_block_targets, AttackTarget, AttackerInfo, CombatState,
+    };
     use engine::game::scenario::{GameScenario, P0};
     use engine::game::zones::create_object;
     use engine::types::ability::{
@@ -611,8 +611,8 @@ mod tests {
     };
     use engine::types::format::FormatConfig;
     use engine::types::game_state::{
-        GameState, PendingCast, StackEntryKind, TargetEffectDetail, TargetSelectionProgress,
-        TargetSelectionSlot, WaitingFor,
+        ExtraPhase, GameState, PendingCast, StackEntryKind, TargetEffectDetail,
+        TargetSelectionProgress, TargetSelectionSlot, WaitingFor,
     };
     use engine::types::identifiers::{CardId, ObjectId};
     use engine::types::mana::ManaCost;
@@ -1358,7 +1358,7 @@ mod tests {
         ));
 
         // Negative control: `ready` is untapped and unrestricted, so on the
-        // same team-scoped `get_valid_attacker_ids` authority it IS eligible
+        // team-scoped `get_valid_attacker_ids` authority it IS eligible
         // to be declared. A regression that made the eligible-attacker scan
         // active-player-only (instead of whole-team, CR 508.1a + CR 805.10a)
         // would make the guard misfire on every creature P0 controls on its
@@ -1703,6 +1703,144 @@ mod tests {
             effect_timing_verdict(state, &target_candidate(ready), &AiConfig::default()),
             PolicyVerdict::Score { delta: 0.0, reason }
                 if reason.kind == "effect_timing_evasion_target_na"
+        ));
+    }
+
+    /// CR 508.1c + CR 611.2c: a restriction attached to a scheduled (not yet
+    /// begun) combat phase penalises a creature it excludes, even though the
+    /// current phase's own declare-attackers step is closed. Cast Last Night
+    /// Together through the real pipeline — the `attacker_restriction` this
+    /// row depends on is only produced by `additional_phase.rs::resolve`
+    /// concretizing the spell's chosen targets into a `TrackedSet`, not by any
+    /// hand-built `ExtraPhase`.
+    #[test]
+    fn a_restricted_scheduled_combat_penalises_a_creature_it_excludes() {
+        use engine::types::mana::{ManaType, ManaUnit};
+
+        const LNT_ORACLE: &str = "Choose two target creatures. Untap them. Put two +1/+1 \
+            counters on each of them. They gain vigilance, indestructible, and haste until end \
+            of turn. After this main phase, there is an additional combat phase. Only the \
+            chosen creatures can attack during that combat phase.";
+
+        let mut scenario = GameScenario::new_n_player(2, 42);
+        scenario.at_phase(Phase::PostCombatMain);
+        let source = scenario
+            .add_creature(P0, "Whirler Rogue", 2, 2)
+            .with_ability_definition(whirler_ability())
+            .id();
+        let chosen_a = scenario.add_creature(P0, "Chosen A", 2, 2).id();
+        let chosen_b = scenario.add_creature(P0, "Chosen B", 2, 2).id();
+        let unchosen = scenario.add_creature(P0, "Unchosen", 2, 2).id();
+        scenario
+            .add_creature(P0, "Thopter Payment One", 1, 1)
+            .as_artifact();
+        scenario
+            .add_creature(P0, "Thopter Payment Two", 1, 1)
+            .as_artifact();
+        scenario.add_creature(PlayerId(1), "Ready Opposing Blocker", 2, 2);
+        let lnt = scenario
+            .add_spell_to_hand_from_oracle(P0, "Last Night Together", false, LNT_ORACLE)
+            .with_mana_cost(ManaCost::generic(2))
+            .id();
+        scenario.with_mana_pool(
+            P0,
+            vec![
+                ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]),
+                ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]),
+            ],
+        );
+        let mut runner = scenario.build();
+
+        let outcome = runner
+            .cast(lnt)
+            .target_objects(&[chosen_a, chosen_b])
+            .resolve();
+
+        // Reach guards.
+        assert!(outcome.state().stack.is_empty());
+        assert!(
+            runner
+                .state()
+                .extra_phases
+                .iter()
+                .any(|extra| extra.phase == Phase::BeginCombat
+                    && extra.attacker_restriction.is_some())
+        );
+        assert!(get_valid_attacker_ids(runner.state()).contains(&unchosen));
+
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: 0,
+            })
+            .expect("reach guard: Whirler Rogue's two-artifact activation must be payable");
+
+        let state = runner.state();
+        assert!(matches!(
+            effect_timing_verdict(state, &target_candidate(unchosen), &AiConfig::default()),
+            PolicyVerdict::Score { delta, reason }
+                if delta < 0.0
+                    && reason.kind == "effect_timing_futile_unattacking_evasion_target"
+        ));
+        // Paired positive row: the restriction, not any queued combat and not
+        // any creature, is what moved the verdict.
+        assert!(matches!(
+            effect_timing_verdict(state, &target_candidate(chosen_a), &AiConfig::default()),
+            PolicyVerdict::Score { delta: 0.0, reason }
+                if reason.kind == "effect_timing_evasion_target_na"
+        ));
+    }
+
+    /// CR 508.1c + CR 500.8: a restriction CURRENT on the combat in progress
+    /// must not penalise a creature an UNRESTRICTED queued combat would still
+    /// admit — the false-penalty direction, at the policy verdict rather than
+    /// at the engine predicate (V4's board, one layer up).
+    #[test]
+    fn a_queued_unrestricted_combat_keeps_a_creature_the_live_restriction_excludes_unpenalised() {
+        let mut state = GameState::new_two_player(42);
+        state.phase = Phase::BeginCombat;
+        let source = creature(&mut state, P0, "Source");
+        let plain = creature(&mut state, P0, "Plain");
+        let land_creature = creature(&mut state, P0, "Land Creature");
+        state
+            .objects
+            .get_mut(&land_creature)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Land);
+        install_whirler_prompt(&mut state, source, vec![plain, land_creature]);
+
+        state.current_combat_attacker_restriction = Some(TargetFilter::Typed(
+            TypedFilter::land().with_type(TypeFilter::Creature),
+        ));
+        state.current_combat_attacker_restriction_source = Some(source);
+        state.extra_phases.push(ExtraPhase {
+            anchor: Phase::PostCombatMain,
+            phase: Phase::BeginCombat,
+            attacker_restriction: None,
+            attacker_restriction_source: None,
+        });
+
+        // Reach guard: this is exactly the value HEAD's conjunct reads, so
+        // with it false HEAD cannot produce the asserted verdict.
+        assert!(!get_valid_attacker_ids(&state).contains(&plain));
+
+        assert!(matches!(
+            effect_timing_verdict(&state, &target_candidate(plain), &AiConfig::default()),
+            PolicyVerdict::Score { delta: 0.0, reason }
+                if reason.kind == "effect_timing_evasion_target_na"
+        ));
+
+        // Paired positive control: without the queued unrestricted combat,
+        // `plain` IS penalised -- proving `plain` is otherwise attack-eligible
+        // on this board and that the primary assertion above is not vacuous.
+        state.extra_phases.clear();
+        assert!(matches!(
+            effect_timing_verdict(&state, &target_candidate(plain), &AiConfig::default()),
+            PolicyVerdict::Score { delta, reason }
+                if delta < 0.0
+                    && reason.kind == "effect_timing_futile_unattacking_evasion_target"
         ));
     }
 
