@@ -130,6 +130,15 @@ pub enum GameFormat {
     /// no copy limit and no main-deck minimum. It keeps CR 100.4a's
     /// fifteen-card sideboard.
     Freeform,
+    /// Casual multiplayer command-zone variant. Any card that can be CAST may
+    /// be designated as its commander — a departure from CR 903.3's legendary
+    /// creature / Vehicle / Spacecraft requirement — but a land may not: a
+    /// commander is cast from the command zone under an additional cost
+    /// (CR 903.8) and a land is played as a special action rather than cast
+    /// (CR 305.1), so the tax has nothing to attach to. Every set is in the
+    /// pool, there is no ban list, no copy limit and no main-deck minimum.
+    /// Two commanders only where CR 702.124's partner families admit the pair.
+    FreeformCommander,
     /// An engine-validated custom format. Resolves via
     /// `FormatConfig.custom_rules` (see `types::custom_format`) — a bare
     /// `GameFormat::Custom(id)` alone cannot fully answer several of this
@@ -187,6 +196,7 @@ impl std::str::FromStr for GameFormat {
             "Momir" => Ok(GameFormat::Momir),
             "CommanderDraft" => Ok(GameFormat::CommanderDraft),
             "Freeform" => Ok(GameFormat::Freeform),
+            "FreeformCommander" => Ok(GameFormat::FreeformCommander),
             other => Err(GameFormatParseError(format!(
                 "unknown GameFormat: {other:?}"
             ))),
@@ -222,6 +232,7 @@ impl std::fmt::Display for GameFormat {
             GameFormat::Momir => write!(f, "Momir"),
             GameFormat::CommanderDraft => write!(f, "CommanderDraft"),
             GameFormat::Freeform => write!(f, "Freeform"),
+            GameFormat::FreeformCommander => write!(f, "FreeformCommander"),
         }
     }
 }
@@ -1395,6 +1406,11 @@ impl GameFormat {
             // names. (The CR 100.6 rationale for the axis existing at all is
             // on `CardPool` itself; do not restate it here.)
             GameFormat::Freeform => CardPool::Unrestricted,
+            // Freeform Commander's own rules make the same positive
+            // declaration Freeform's does; it is a separate arm rather than
+            // joining Freeform's so a later editor does not merge them and
+            // put Freeform's comment over a second format it does not name.
+            GameFormat::FreeformCommander => CardPool::Unrestricted,
             GameFormat::TinyLeaders
             | GameFormat::Oathbreaker
             // These state no main-deck card-pool rule at all, so the engine
@@ -1446,7 +1462,11 @@ impl GameFormat {
             | GameFormat::DuelCommander
             | GameFormat::PauperCommander
             | GameFormat::CommanderDraft
-            | GameFormat::TinyLeaders => CommanderPairing::PartnerFamilies,
+            | GameFormat::TinyLeaders
+            // Fixed decision 10(b): this format widens WHO may be a
+            // commander but leaves CR 702.124's partner rule alone, so the
+            // existing `PartnerFamilies` pairing applies unchanged.
+            | GameFormat::FreeformCommander => CommanderPairing::PartnerFamilies,
             GameFormat::Brawl | GameFormat::HistoricBrawl | GameFormat::Oathbreaker => {
                 CommanderPairing::Solo
             }
@@ -1507,7 +1527,17 @@ impl GameFormat {
             // CR 903.13f routes deck construction through CR 903.5, and the
             // Commander family has no sideboard.
             | GameFormat::CommanderDraft
-            | GameFormat::HistoricBrawl => SideboardPolicy::Forbidden,
+            | GameFormat::HistoricBrawl
+            // No deck-compatibility verdict distinguishes this format's
+            // sideboard value at all: `request_without_sideboard` strips the
+            // sideboard before every commander check. `Forbidden` is the
+            // only value under which the engine stays consistent for this
+            // format with no edit anywhere else (`load_deck_into_state`'s
+            // `drop_sideboard` keys on `Forbidden` alone), and this format
+            // has no best-of-three shape for a real sideboard to serve
+            // (`evaluate_deck_compatibility` derives `bo3_ready` false for
+            // any deck that designates a commander).
+            | GameFormat::FreeformCommander => SideboardPolicy::Forbidden,
             GameFormat::TinyLeaders => SideboardPolicy::Limited(10),
             GameFormat::FreeForAll
             | GameFormat::TwoHeadedGiant
@@ -1579,6 +1609,12 @@ impl GameFormat {
             // A card's PRINTED deck-construction limit still binds underneath
             // this default -- see `effective_copy_limit`.
             GameFormat::Freeform => DeckCopyLimit::Unlimited,
+            // Freeform Commander's own rules lift CR 100.2a's four-card limit
+            // outright, the same as Freeform's — a separate arm for the same
+            // reason `card_pool`'s is: a card's PRINTED deck-construction
+            // limit still binds underneath this default (MEASURED: 2 copies
+            // of a card with a printed singleton limit are refused).
+            GameFormat::FreeformCommander => DeckCopyLimit::Unlimited,
             // Phase 1a: disclosed, temporary, bare-GameFormat-context
             // fallback — not this custom format's real declared limit.
             // UpTo(1) (the same value already used for command-zone
@@ -1633,7 +1669,8 @@ impl GameFormat {
             | GameFormat::Planechase
             | GameFormat::Momir
             | GameFormat::CommanderDraft
-            | GameFormat::Freeform => DeckSizeAuthority::RulesFixed,
+            | GameFormat::Freeform
+            | GameFormat::FreeformCommander => DeckSizeAuthority::RulesFixed,
             // R6 (review round 3): exhaustive, no wildcard. Unreachable by
             // construction from the admission gate: `for_format` returns Err
             // for Custom before any verdict row runs, and a Custom payload is
@@ -1658,7 +1695,17 @@ impl GameFormat {
             | GameFormat::CommanderDraft
             | GameFormat::Brawl
             | GameFormat::HistoricBrawl
-            | GameFormat::TinyLeaders => DeckSizeSubject::MainDeckAndCommanders,
+            | GameFormat::TinyLeaders
+            // `deck_loading.rs::place_commanders` reads
+            // `command_zone_holds_decklist_commander()`, which this format
+            // answers `Ok(true)`; netting without placing starts the game a
+            // card short. This format's own rules state no deck-size
+            // requirement, so the declaration is a pinned property rather
+            // than a magnitude any verdict reads (MEASURED:
+            // `deck_size_subject_count`'s only consumer is
+            // `deck_size.accepts`, and `Minimum(0).accepts(n)` holds for
+            // every count).
+            | GameFormat::FreeformCommander => DeckSizeSubject::MainDeckAndCommanders,
             GameFormat::Oathbreaker => DeckSizeSubject::MainDeckAndCommandZone,
             GameFormat::Standard
             | GameFormat::Limited
@@ -1724,6 +1771,10 @@ impl GameFormat {
             | GameFormat::PauperCommander
             | GameFormat::Brawl
             | GameFormat::HistoricBrawl
+            // Fixed decision 9: `command_zone: true` and
+            // `commander_damage_threshold: Some(21)` travel together for this
+            // format — `Derived` in `built_in_axes_no_looser_than_rules`.
+            | GameFormat::FreeformCommander
             // CR 903.13g: Commander Draft games follow the same rules as
             // Commander games, so CR 903.10a's commander-damage SBA applies.
             | GameFormat::CommanderDraft => Ok(true),
@@ -1808,6 +1859,7 @@ impl GameFormat {
             | GameFormat::Brawl
             | GameFormat::HistoricBrawl
             | GameFormat::CommanderDraft
+            | GameFormat::FreeformCommander
             // Tiny Leaders and Oathbreaker seat a decklist card in the command
             // zone without a commander-damage threshold, which is precisely the
             // case `uses_commander` cannot express.
@@ -1874,6 +1926,7 @@ impl GameFormat {
             | GameFormat::TwoHeadedGiant
             | GameFormat::Archenemy
             | GameFormat::Freeform
+            | GameFormat::FreeformCommander
             // CR 903.13e: the drafted cards become the player's card pool and
             // they build a deck from it, so the engine supplies nothing.
             | GameFormat::CommanderDraft
@@ -1927,7 +1980,8 @@ impl GameFormat {
             | GameFormat::FreeForAll
             | GameFormat::TwoHeadedGiant
             | GameFormat::CommanderDraft
-            | GameFormat::Freeform => false,
+            | GameFormat::Freeform
+            | GameFormat::FreeformCommander => false,
             // Exhaustive rather than `matches!`, matching `supplies_fixed_deck`'s
             // style: a future built-in that grants its own deck_loading.rs
             // auxiliary component must force a deliberate `true`/`false` choice
@@ -1971,6 +2025,7 @@ impl GameFormat {
             GameFormat::Momir => Cow::Borrowed("Momir's Madness"),
             GameFormat::CommanderDraft => Cow::Borrowed("Commander Draft"),
             GameFormat::Freeform => Cow::Borrowed("Freeform"),
+            GameFormat::FreeformCommander => Cow::Borrowed("Freeform Commander"),
             GameFormat::Custom(id) => custom_format_registry()
                 .into_iter()
                 .find(|def| def.rules.id == id)
@@ -2129,6 +2184,14 @@ impl GameFormat {
                 description: "Drafted 60-card minimum Commander, 3\u{2013}8 players",
                 group: FormatGroup::Commander,
                 default_config: FormatConfig::commander_draft(),
+            },
+            FormatMetadata {
+                format: GameFormat::FreeformCommander,
+                label: "Freeform Commander",
+                short_label: "FFC",
+                description: "Any card as your commander, every set, no deck minimum",
+                group: FormatGroup::Commander,
+                default_config: FormatConfig::freeform_commander(),
             },
             FormatMetadata {
                 format: GameFormat::FreeForAll,
@@ -2678,6 +2741,38 @@ impl FormatConfig {
         }
     }
 
+    /// Freeform Commander: a Commander-shaped casual variant whose deck
+    /// construction takes fixed decisions 9 and 10 rather than CR 903.3 and
+    /// CR 903.5. CR 903.7 fixes the Commander variant's starting life at 40,
+    /// which this format declares as its default; the host adjusts it in the
+    /// lobby, which is the mechanism fixed decision 2 requires and the reason
+    /// this run adds none.
+    pub fn freeform_commander() -> Self {
+        FormatConfig {
+            format: GameFormat::FreeformCommander,
+            // CR 903.7: each player sets their life total to 40.
+            starting_life: 40,
+            min_players: 2,
+            max_players: 4,
+            // No main-deck floor: the deck-size MAGNITUDE rule at its
+            // degenerate end, not a new shape.
+            deck_size: DeckSizeRule::Minimum(0),
+            singleton: false,
+            command_zone: true,
+            // CR 903.10a: 21 combat damage from one commander.
+            commander_damage_threshold: Some(21),
+            range_of_influence: None,
+            team_based: false,
+            archenemy_player: None,
+            uses_commander: true,
+            sideboard_policy: GameFormat::FreeformCommander.sideboard_policy(),
+            default_deck_copy_limit: GameFormat::FreeformCommander.default_deck_copy_limit(),
+            supplies_fixed_deck: false,
+            allow_debug_actions: false,
+            custom_rules: None,
+        }
+    }
+
     /// Brawl: 60-card singleton with a commander, 25 starting life.
     /// Uses Standard-legal card pool (CR 903 variant for Brawl).
     pub fn brawl() -> Self {
@@ -2945,6 +3040,7 @@ impl FormatConfig {
             GameFormat::Momir => Self::momir(),
             GameFormat::CommanderDraft => Self::commander_draft(),
             GameFormat::Freeform => Self::freeform(),
+            GameFormat::FreeformCommander => Self::freeform_commander(),
             GameFormat::Custom(id) => {
                 return Err(FormatConfigError(format!(
                     "for_format cannot resolve ad-hoc Custom format {} structural rules — read custom_rules from the resolved FormatConfig/CustomFormatRules instead",
@@ -4528,6 +4624,7 @@ mod tests {
             GameFormat::DuelCommander,
             GameFormat::CommanderDraft,
             GameFormat::TinyLeaders,
+            GameFormat::FreeformCommander,
         ];
         let solo = [
             GameFormat::Brawl,

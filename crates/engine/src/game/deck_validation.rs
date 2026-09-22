@@ -1249,6 +1249,26 @@ impl CommanderVariantRules {
         }
     }
 
+    /// Fixed decisions 9 and 10(b): this format widens WHO may be designated
+    /// (see `is_freeform_commander_eligible`) and leaves the partner rule
+    /// alone, so `partner_grant` is `None` exactly as it is for every variant
+    /// CR 903.13f(3) does not reach.
+    ///
+    /// `skip_commander_legality` is `false` because it exempts the commander
+    /// from a LEGALITY TABLE, and this format declares
+    /// `CardPool::Unrestricted`, so `legality_format()` is `None` and the block
+    /// the flag guards never runs. `false` is the honest value rather than a
+    /// meaningless `true`.
+    fn freeform_commander() -> Self {
+        Self {
+            eligible: is_freeform_commander_eligible,
+            eligibility_error:
+                "Freeform Commander commanders must be cards that can be cast; a land is played rather than cast",
+            skip_commander_legality: false,
+            partner_grant: None,
+        }
+    }
+
     /// CR 903.13f: "Commander Draft deck construction follows the same rules as
     /// Commander deck construction (see rule 903.5) with three exceptions."
     ///
@@ -2599,6 +2619,12 @@ fn evaluate_selected_format_summary(
             CommanderVariantRules::commander(),
             &format_rules,
         ),
+        GameFormat::FreeformCommander => quick_commander_check(
+            db,
+            request,
+            CommanderVariantRules::freeform_commander(),
+            &format_rules,
+        ),
         GameFormat::PauperCommander | GameFormat::DuelCommander => quick_commander_check(
             db,
             request,
@@ -3047,6 +3073,19 @@ fn evaluate_selected_format(
                 &format_rules,
                 CardPoolAuthority::for_format(format),
                 &format.label(),
+            );
+            if !check.compatible {
+                reasons.extend(check.reasons);
+            }
+            check.compatible
+        }
+        GameFormat::FreeformCommander => {
+            let check = evaluate_commander_with_format(
+                db,
+                request,
+                unknown_cards,
+                CommanderVariantRules::freeform_commander(),
+                &format_rules,
             );
             if !check.compatible {
                 reasons.extend(check.reasons);
@@ -4160,6 +4199,25 @@ pub fn is_commander_eligible(face: &CardFace) -> bool {
         return true;
     }
     crate::database::synthesis::type_line_commander_eligible(face)
+}
+
+/// Fixed decision 9's commander eligibility for `GameFormat::FreeformCommander`:
+/// any card that can be CAST. A land cannot — CR 305.1 makes playing a land a
+/// special action rather than casting a spell, and CR 305.9 extends that to a
+/// card that is both a land and another type ("it can be played only as a land.
+/// It can't be cast as a spell"). CR 903.8 is why castability is the test at
+/// all: the commander tax is an additional cost on casting from the command
+/// zone, so a card that can never be cast from there has nothing to pay it.
+///
+/// A deliberate departure from CR 903.3, which this format does not apply.
+///
+/// Judges the face the decklist NAMES. `CardDatabase::get_face_by_name`
+/// resolves each face of a double-faced card under its own name, so a decklist
+/// naming the non-land face of such a card reaches a castable face and one
+/// naming the land face does not. That resolution is not this format's: it is
+/// how every commander-eligibility predicate here already behaves.
+pub fn is_freeform_commander_eligible(face: &CardFace) -> bool {
+    !face.card_type.core_types.contains(&CoreType::Land)
 }
 
 fn is_pauper_commander_eligible(face: &CardFace) -> bool {

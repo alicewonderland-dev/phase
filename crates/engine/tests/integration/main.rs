@@ -350,6 +350,7 @@ mod forced_retarget_multi_role_mana_6056;
 mod foretell_pipeline;
 mod format_axis_census;
 mod fra_bloodline_recollector;
+mod freeform_commander_deck_rules;
 mod freeform_deck_rules;
 mod frenzy_attacker_unblocked_pump;
 mod frodo_ringbearer_must_be_blocked_gate;

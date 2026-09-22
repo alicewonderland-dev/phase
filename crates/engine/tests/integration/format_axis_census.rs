@@ -49,7 +49,7 @@ fn count_needle(text: &str, needle: &str) -> usize {
 /// doc comment cannot close a span. Panics unless exactly one line matches
 /// `header`: an ambiguous header would otherwise silently select the first
 /// match.
-fn fn_span<'a>(src: &'a str, header: &str) -> &'a str {
+pub(super) fn fn_span<'a>(src: &'a str, header: &str) -> &'a str {
     let mut offsets: Vec<(usize, &str)> = Vec::new();
     let mut pos = 0usize;
     for line in src.split_inclusive('\n') {
@@ -261,7 +261,10 @@ fn unrestricted_card_pool_declarations_match_the_committed_list() {
     let declared: Vec<GameFormat> = GameFormat::iter()
         .filter(|format| format.card_pool() == CardPool::Unrestricted)
         .collect();
-    assert_eq!(declared, vec![GameFormat::Freeform]);
+    assert_eq!(
+        declared,
+        vec![GameFormat::Freeform, GameFormat::FreeformCommander]
+    );
 }
 
 /// Census clause 5 + Row 13: no format axis reaches either client mirror.

@@ -840,6 +840,7 @@ fn commander_eligibility_rule_from_source_format_covers_every_builtin() {
         // was MISSING; see the commit message.
         (GameFormat::CommanderDraft, Some(Standard)),
         (GameFormat::Freeform, None),
+        (GameFormat::FreeformCommander, Some(FreeformAnyCastableCard)),
     ];
     // This table had NO length assertion at all, despite its name. Ordered
     // equality against the enum is what makes the name true and keeps it true:
@@ -901,6 +902,7 @@ fn game_format_serialization_is_byte_identical_to_old_derive_for_builtins() {
         (GameFormat::Momir, "Momir"),
         (GameFormat::CommanderDraft, "CommanderDraft"),
         (GameFormat::Freeform, "Freeform"),
+        (GameFormat::FreeformCommander, "FreeformCommander"),
     ];
     // Replaces `assert_eq!(expectations.len(), 22)`, which could not fail:
     // 22 == 22 holds however the enum grows, and it did — `CommanderDraft`'s

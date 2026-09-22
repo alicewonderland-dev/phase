@@ -33,11 +33,11 @@ use engine::game::CardDbRehydrationFinalization;
 use engine::game::{
     can_pair_commanders, companion_candidates, deck_copy_limit_for, estimate_bracket,
     evaluate_deck_compatibility, filter_state_for_viewer, is_brawl_commander_eligible,
-    is_commander_eligible, is_tiny_leader_eligible, load_and_hydrate_decks, max_deck_copies,
-    rehydrate_game_from_card_db_with_finalization, resolve_deck_list,
-    signature_spell_selection_policy, start_game, start_game_with_starting_player,
-    validate_name_deck_for_format_full, BracketEstimate, DeckCompatibilityRequest, DeckList,
-    PlayerDeckList, ReplayPlayer,
+    is_commander_eligible, is_freeform_commander_eligible, is_tiny_leader_eligible,
+    load_and_hydrate_decks, max_deck_copies, rehydrate_game_from_card_db_with_finalization,
+    resolve_deck_list, signature_spell_selection_policy, start_game,
+    start_game_with_starting_player, validate_name_deck_for_format_full, BracketEstimate,
+    DeckCompatibilityRequest, DeckList, PlayerDeckList, ReplayPlayer,
 };
 use engine::types::actions::{DebugAction, DebugCardCreationKind};
 use engine::types::custom_format::{CustomFormatDef, CustomFormatRules};
@@ -1104,6 +1104,7 @@ pub fn is_card_commander_eligible_for_format(name: &str, format: JsValue) -> boo
             // affects PAIRING, not eligibility, so Commander Draft uses
             // Commander's own predicate.
             GameFormat::CommanderDraft => is_commander_eligible(face),
+            GameFormat::FreeformCommander => is_freeform_commander_eligible(face),
             GameFormat::TinyLeaders => is_tiny_leader_eligible(face),
             GameFormat::Oathbreaker => face.is_oathbreaker,
             GameFormat::Brawl | GameFormat::HistoricBrawl => is_brawl_commander_eligible(face),
@@ -6634,6 +6635,111 @@ mod deck_list_seat_validation_tests {
         assert_eq!(
             validate_deck_list_seats(&db, &three_seat_list(&[]), &FormatConfig::momir(), None, 4),
             None,
+        );
+    }
+
+    fn n_plains(n: usize) -> Vec<String> {
+        std::iter::repeat_n("Plains".to_string(), n).collect()
+    }
+
+    fn seat_with_commander(main_deck: Vec<String>, commander: &str) -> PlayerDeckList {
+        PlayerDeckList {
+            main_deck,
+            commander: vec![commander.to_string()],
+            ..Default::default()
+        }
+    }
+
+    fn two_seat_list(player: PlayerDeckList, opponent: PlayerDeckList) -> DeckList {
+        DeckList {
+            player,
+            opponent,
+            ..Default::default()
+        }
+    }
+
+    /// Charter row 2's "establish separately that the verdict is reached
+    /// through the surface the client actually calls" — driven through
+    /// `validate_deck_list_seats`, the seat loop `initialize_game_impl` runs
+    /// at the game-creation boundary, rather than censused from source.
+    #[test]
+    fn freeform_commander_is_refused_a_land_commander_through_the_seat_validation_loop() {
+        let db = test_db();
+
+        // The land commander is refused, with this format's own eligibility
+        // reason, behind the loop's own "Player deck: " prefix. This format's
+        // absent deck-size floor (`Minimum(0)`) means a 10-card main deck is
+        // itself accepted, so eligibility is the only reason in play.
+        let land_seat = seat_with_commander(n_plains(10), "Plains");
+        assert_eq!(
+            validate_deck_list_seats(
+                &db,
+                &two_seat_list(land_seat.clone(), land_seat.clone()),
+                &FormatConfig::freeform_commander(),
+                None,
+                2,
+            ),
+            Some(vec![
+                "Player deck: Freeform Commander commanders must be cards that can be cast; \
+                 a land is played rather than cast: Plains"
+                    .to_string()
+            ]),
+        );
+
+        // The paired ACCEPT: a legendary creature commander is not a land, so
+        // every seat passes and the loop returns None.
+        let legend_seat = seat_with_commander(n_plains(10), LEGEND_A);
+        assert_eq!(
+            validate_deck_list_seats(
+                &db,
+                &two_seat_list(legend_seat.clone(), legend_seat),
+                &FormatConfig::freeform_commander(),
+                None,
+                2,
+            ),
+            None,
+        );
+
+        // The degenerate end: an empty main deck with the same land commander
+        // still refuses with the same reason — this format's absent deck-size
+        // floor does not exempt the commander slot from eligibility.
+        let empty_main_land_seat = seat_with_commander(Vec::new(), "Plains");
+        assert_eq!(
+            validate_deck_list_seats(
+                &db,
+                &two_seat_list(empty_main_land_seat.clone(), empty_main_land_seat),
+                &FormatConfig::freeform_commander(),
+                None,
+                2,
+            ),
+            Some(vec![
+                "Player deck: Freeform Commander commanders must be cards that can be cast; \
+                 a land is played rather than cast: Plains"
+                    .to_string()
+            ]),
+        );
+
+        // The contrast: the SAME land-commander shape refused by Commander
+        // with Commander's own eligibility reason — not this format's
+        // string. Sized to Commander's exact 100-card requirement (the
+        // commander "Plains" is represented/netted against the identically
+        // named main-deck entries, so the count is the main deck's own
+        // length) so the deck-size reason does not also fire and the vector
+        // isolates the eligibility reason alone.
+        let commander_sized_land_seat = seat_with_commander(n_plains(100), "Plains");
+        assert_eq!(
+            validate_deck_list_seats(
+                &db,
+                &two_seat_list(commander_sized_land_seat.clone(), commander_sized_land_seat,),
+                &FormatConfig::commander(),
+                None,
+                2,
+            ),
+            Some(vec![
+                "Player deck: Commander cards must be legendary creatures or explicitly allow \
+                 being a commander: Plains"
+                    .to_string()
+            ]),
         );
     }
 }

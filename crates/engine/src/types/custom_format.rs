@@ -201,6 +201,9 @@ pub enum CommanderEligibilityRule {
     TinyLeaders,
     OathbreakerSignatureSpell,
     BrawlColorIdentity,
+    /// `GameFormat::FreeformCommander`'s rule: any card that can be cast; a
+    /// land is played rather than cast — CR 305.1, CR 305.9.
+    FreeformAnyCastableCard,
 }
 
 impl CommanderEligibilityRule {
@@ -226,6 +229,11 @@ impl CommanderEligibilityRule {
             GameFormat::TinyLeaders => Ok(Some(Self::TinyLeaders)),
             GameFormat::Oathbreaker => Ok(Some(Self::OathbreakerSignatureSpell)),
             GameFormat::Brawl | GameFormat::HistoricBrawl => Ok(Some(Self::BrawlColorIdentity)),
+            // Fixed decision 9's departure from CR 903.3: `Ok(None)` would
+            // claim this format has no commander-eligibility concept, and
+            // `Ok(Some(Standard))` would claim it applies CR 903.3's test —
+            // the rule this format departs from. Neither is true.
+            GameFormat::FreeformCommander => Ok(Some(Self::FreeformAnyCastableCard)),
             GameFormat::Standard
             | GameFormat::Limited
             | GameFormat::Pioneer

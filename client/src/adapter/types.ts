@@ -147,7 +147,8 @@ export type BuiltInGameFormat =
   | "Limited"
   | "Momir"
   | "CommanderDraft"
-  | "Freeform";
+  | "Freeform"
+  | "FreeformCommander";
 
 /**
  * Wire form of `GameFormat::Custom(CustomFormatId)`.
@@ -232,7 +233,8 @@ export type CommanderEligibilityRule =
   | "Standard"
   | "TinyLeaders"
   | "OathbreakerSignatureSpell"
-  | "BrawlColorIdentity";
+  | "BrawlColorIdentity"
+  | "FreeformAnyCastableCard";
 
 /**
  * Whether a custom format uses the command zone (CR 903) and, if so, its
