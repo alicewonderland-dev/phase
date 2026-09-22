@@ -47,7 +47,7 @@ fn db() -> Option<&'static engine::database::CardDatabase> {
     support::shared_card_db()
 }
 
-/// §Row 2, subject 1 — any card that is not a legendary creature is
+/// §Row 2, subject 1 — a card that is not a legendary creature is
 /// admitted, on both legs. The Commander contrast pads its main deck to
 /// exactly 100 `Wastes` so the deck-size check (which the summary dispatcher
 /// consults BEFORE eligibility) does not displace the eligibility refusal —
@@ -149,13 +149,11 @@ fn freeform_commander_refuses_a_land_as_commander() {
 /// §Row 2, subject 2's other half: the widened predicate's own coverage
 /// boundary (the fix this round makes). A nontraditional command-zone card
 /// type (CR 108.2a) is refused the same way a land is — CR 311.2 (Plane),
-/// CR 314.2 (Scheme), and CR 312.2 (Phenomenon) each say explicitly "They...
-/// can't be cast" — covering more than one such type so the assertion is
-/// checked against the CLASS the predicate's exhaustive match now judges, not
-/// only the single type a prior review round measured. The positive control
-/// in the same loop is an ordinary castable, non-legendary, non-creature
-/// card: without it, a predicate that refused every commander would also
-/// satisfy the refusals above.
+/// CR 314.2 (Scheme), CR 312.2 (Phenomenon), and CR 315.3 (Conspiracy) each
+/// say explicitly "They... can't be cast". The positive control in the same
+/// loop is an ordinary castable, non-legendary, non-creature card: without
+/// it, a predicate that refused every commander would also satisfy the
+/// refusals above.
 #[test]
 fn freeform_commander_refuses_a_nontraditional_card_as_commander() {
     let Some(db) = db() else {
@@ -168,6 +166,7 @@ fn freeform_commander_refuses_a_nontraditional_card_as_commander() {
             "Bad Wolf Bay",
             "A Premonition of Your Demise",
             "Caught in a Parallel Universe",
+            "Power Play",
         ] {
             let request = DeckCompatibilityRequest {
                 commander: vec![card.to_string()],
@@ -189,6 +188,63 @@ fn freeform_commander_refuses_a_nontraditional_card_as_commander() {
                 "summary_only={summary_only} {card}"
             );
         }
+
+        let control = DeckCompatibilityRequest {
+            commander: vec!["Sol Ring".to_string()],
+            selected_format: Some(SelectedFormat::Tag(GameFormat::FreeformCommander)),
+            summary_only,
+            ..DeckCompatibilityRequest::default()
+        };
+        let result = evaluate_deck_compatibility(db, &control);
+        assert_eq!(
+            result.selected_format_compatible,
+            Some(true),
+            "summary_only={summary_only}: {:?}",
+            result.selected_format_reasons
+        );
+        assert!(
+            result.selected_format_reasons.is_empty(),
+            "summary_only={summary_only}"
+        );
+    }
+}
+
+/// §Row 2, subject 2's other coverage boundary: `is_freeform_commander_eligible`'s
+/// `!core_types.is_empty()` guard. `Iterator::all` is vacuously `true` on an
+/// empty iterator, so without the guard a face with no recognized `CoreType`
+/// would be admitted rather than refused. `Ashnod` is a Vanguard face
+/// (CR 313.1 + CR 313.2: "can't be cast"), a CR 313 card type this engine's
+/// `CoreType` enum has no variant for, so MTGJSON's card-type extraction
+/// leaves `core_types` empty rather than populating a `Vanguard` arm. The
+/// positive control is the same admitted, castable, non-legendary card used
+/// above.
+#[test]
+fn freeform_commander_refuses_a_card_with_no_recognized_core_type() {
+    let Some(db) = db() else {
+        eprintln!("skipping: card database not available");
+        return;
+    };
+
+    for summary_only in [false, true] {
+        let request = DeckCompatibilityRequest {
+            commander: vec!["Ashnod".to_string()],
+            selected_format: Some(SelectedFormat::Tag(GameFormat::FreeformCommander)),
+            summary_only,
+            ..DeckCompatibilityRequest::default()
+        };
+        let result = evaluate_deck_compatibility(db, &request);
+        assert_eq!(
+            result.selected_format_reasons,
+            vec![
+                "Freeform Commander commanders must be cards that can be cast: Ashnod".to_string()
+            ],
+            "summary_only={summary_only}"
+        );
+        assert_eq!(
+            result.selected_format_compatible,
+            Some(false),
+            "summary_only={summary_only}"
+        );
 
         let control = DeckCompatibilityRequest {
             commander: vec!["Sol Ring".to_string()],

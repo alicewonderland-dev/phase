@@ -2183,7 +2183,7 @@ impl GameFormat {
                 format: GameFormat::FreeformCommander,
                 label: "Freeform Commander",
                 short_label: "FFC",
-                description: "Any card as your commander, every set, no deck minimum",
+                description: "Any castable card as your commander, every set, no deck minimum",
                 group: FormatGroup::Commander,
                 default_config: FormatConfig::freeform_commander(),
             },

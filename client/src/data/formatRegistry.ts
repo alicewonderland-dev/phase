@@ -455,7 +455,7 @@ export const FORMAT_REGISTRY: readonly FormatMetadata[] = [
     format: "FreeformCommander",
     label: "Freeform Commander",
     short_label: "FFC",
-    description: "Any card as your commander, every set, no deck minimum",
+    description: "Any castable card as your commander, every set, no deck minimum",
     group: "Commander",
     default_config: {
       format: "FreeformCommander",

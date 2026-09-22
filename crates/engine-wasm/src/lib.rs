@@ -6686,8 +6686,8 @@ mod deck_list_seat_validation_tests {
             ]),
         );
 
-        // The paired ACCEPT: a legendary creature commander is not a land, so
-        // every seat passes and the loop returns None.
+        // The paired ACCEPT: a legendary creature commander passes every seat,
+        // and the loop returns None.
         let legend_seat = seat_with_commander(n_plains(10), LEGEND_A);
         assert_eq!(
             validate_deck_list_seats(
