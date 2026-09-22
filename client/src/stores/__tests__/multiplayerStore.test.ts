@@ -1540,6 +1540,7 @@ describe("multiplayerStore", () => {
       const result = await useMultiplayerStore.getState().openBroker(openBrokerRequest());
 
       expect(result).toBeNull();
+      expect(brokerMocks.close).toHaveBeenCalledOnce();
       expect(useMultiplayerStore.getState().toasts.get("generic")?.message).toBe(
         i18n.t("multiplayer:lobbyCapability.formatNeedsNewerServer", { needed: 10 }),
       );
