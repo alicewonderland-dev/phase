@@ -1554,6 +1554,16 @@ describe("multiplayerStore", () => {
       expect(result).toBeNull();
       expect(useMultiplayerStore.getState().toasts.get("generic")).toBeUndefined();
     });
+
+    it("closes the broker socket it opened when registerHost rejects", async () => {
+      useMultiplayerStore.getState().setHostingServer("wss://broker.example/ws");
+      brokerMocks.registerHost.mockRejectedValueOnce(new Error("boom"));
+
+      const result = await useMultiplayerStore.getState().openBroker(openBrokerRequest());
+
+      expect(result).toBeNull();
+      expect(brokerMocks.close).toHaveBeenCalledOnce();
+    });
   });
 
   it("removes open P2P seats in order before starting with current players", async () => {
