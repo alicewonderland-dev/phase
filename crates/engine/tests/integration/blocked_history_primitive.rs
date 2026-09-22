@@ -8,7 +8,7 @@
 //! / `place_blocking` / phase machinery), never hand-built `GameState` literals,
 //! so a reverted edit actually reaches them.
 
-use engine::game::combat::AttackTarget;
+use engine::game::combat::{AttackTarget, BlockHistoryPair};
 use engine::game::filter::{
     matches_target_filter, matches_target_filter_on_zone_change_record, FilterContext,
 };
@@ -18,7 +18,7 @@ use engine::types::ability::{
     TypedFilter,
 };
 use engine::types::actions::GameAction;
-use engine::types::game_state::WaitingFor;
+use engine::types::game_state::{StackEntryKind, WaitingFor};
 use engine::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use engine::types::keywords::Keyword;
 use engine::types::mana::ManaCost;
@@ -148,11 +148,11 @@ fn combat_relation_filter(relation: CombatRelation) -> TargetFilter {
     )
 }
 
-/// T1: after a real declare-blockers step, the block-history ledgers hold
-/// `{blocker -> {attacker incarnation}}`, `BlockedBySubject` matches the
-/// blocked attacker with the blocker as source, and — the whole reason this
-/// primitive is pairwise rather than the unary `creatures_blocked_this_turn` —
-/// a second attacker the blocker never blocked matches on NEITHER window.
+/// T1: after a real declare-blockers step, the block-history ledgers hold the
+/// exact `(blocker, attacker)` incarnation pair, `BlockedBySubject` matches
+/// the blocked attacker with the blocker as source, and — the whole reason
+/// this primitive is pairwise rather than the unary `creatures_blocked_this_turn`
+/// — a second attacker the blocker never blocked matches on NEITHER window.
 #[test]
 fn declare_blockers_records_each_blocker_to_attacker_pair() {
     let mut scenario = GameScenario::new();
@@ -184,26 +184,35 @@ fn declare_blockers_records_each_blocker_to_attacker_pair() {
         "reach guard: the live reverse lookup must name only the blocked attacker"
     );
 
+    let blocker_ref = ObjectIncarnationRef::from_object(&state.objects[&blocker]);
     let blocked_ref = ObjectIncarnationRef::from_object(&state.objects[&blocked]);
     let unblocked_ref = ObjectIncarnationRef::from_object(&state.objects[&unblocked]);
+    let blocked_pair = BlockHistoryPair {
+        blocker: blocker_ref,
+        attacker: blocked_ref,
+    };
+    let unblocked_pair = BlockHistoryPair {
+        blocker: blocker_ref,
+        attacker: unblocked_ref,
+    };
 
     // Direct ledger reads (E3, E4, E5).
     assert!(
         combat
             .creature_blocked_attackers_this_combat
-            .get(&blocker)
-            .is_some_and(
-                |attackers| attackers.contains(&blocked_ref) && !attackers.contains(&unblocked_ref)
-            ),
+            .contains(&blocked_pair)
+            && !combat
+                .creature_blocked_attackers_this_combat
+                .contains(&unblocked_pair),
         "the combat-scoped ledger must hold exactly the declared pair"
     );
     assert!(
         state
             .creature_blocked_attackers_this_turn
-            .get(&blocker)
-            .is_some_and(
-                |attackers| attackers.contains(&blocked_ref) && !attackers.contains(&unblocked_ref)
-            ),
+            .contains(&blocked_pair)
+            && !state
+                .creature_blocked_attackers_this_turn
+                .contains(&unblocked_pair),
         "the turn-scoped ledger must hold exactly the declared pair"
     );
 
@@ -258,28 +267,46 @@ fn banding_block_records_the_whole_band_not_just_the_chosen_attacker() {
         "reach guard: CR 702.22h must propagate the block across the band"
     );
 
+    let blocker_ref = ObjectIncarnationRef::from_object(&state.objects[&blocker]);
     let banded_ref = ObjectIncarnationRef::from_object(&state.objects[&banded]);
     let plain_ref = ObjectIncarnationRef::from_object(&state.objects[&plain]);
-    let recorded = combat
-        .creature_blocked_attackers_this_combat
-        .get(&blocker)
-        .expect("the blocker must have a ledger entry");
     assert!(
-        recorded.contains(&banded_ref) && recorded.contains(&plain_ref),
+        combat
+            .creature_blocked_attackers_this_combat
+            .contains(&BlockHistoryPair {
+                blocker: blocker_ref,
+                attacker: banded_ref,
+            })
+            && combat
+                .creature_blocked_attackers_this_combat
+                .contains(&BlockHistoryPair {
+                    blocker: blocker_ref,
+                    attacker: plain_ref,
+                }),
         "CR 702.22h + CR 702.22k: the ledger must hold the whole band, not just the chosen attacker"
     );
 }
 
-/// T3: the combat-scoped history ledger survives the blocker leaving the
-/// battlefield, while the live `BlockingOrBlockedBy` relation — read straight
-/// off `combat.blocker_to_attacker`, which CR 506.4 prunes — goes empty. This
-/// pairing is the primitive's entire reason to exist.
+/// T3: a dying blocker's OWN dies trigger still finds what it blocked,
+/// because the resolving trigger's captured identity (`ability.trigger_source`)
+/// names the exact incarnation that blocked — not the live graveyard
+/// incarnation the blocker becomes once SBAs move it (CR 400.7). The live
+/// `BlockingOrBlockedBy` relation still fails closed here (CR 506.4): the live
+/// map was pruned the moment the blocker left combat.
 #[test]
-fn history_survives_the_blocker_leaving_the_battlefield_while_the_live_relation_goes_empty() {
+fn a_dying_blocker_still_finds_what_it_blocked_through_its_trigger_source() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let attacker = scenario.add_creature(P0, "Attacker", 2, 2).id();
-    let blocker = scenario.add_creature(P1, "Blocker", 2, 2).id();
+    let blocker = scenario
+        .add_creature_from_oracle(
+            P1,
+            "Blocker",
+            2,
+            2,
+            "When this creature dies, you gain 1 life.",
+        )
+        .id();
     let murder = scenario
         .add_spell_to_hand_from_oracle(P1, "Murder", true, MURDER)
         .with_mana_cost(ManaCost::zero())
@@ -292,40 +319,56 @@ fn history_survives_the_blocker_leaving_the_battlefield_while_the_live_relation_
         vec![],
         vec![(blocker, attacker)],
     );
-
-    // Reach guard, before destroying the blocker.
-    assert!(
-        runner
-            .state()
-            .combat
-            .as_ref()
-            .expect("combat is live")
-            .blocker_to_attacker
-            .get(&blocker)
-            .is_some_and(|a| a.contains(&attacker)),
-        "reach guard: the live reverse lookup must name the attacker before the blocker dies"
-    );
+    let blocker_ref_at_block = ObjectIncarnationRef::from_object(&runner.state().objects[&blocker]);
 
     give_priority(&mut runner, P1);
-    runner.cast(murder).target_object(blocker).resolve();
-    runner.advance_until_stack_empty();
+    let mut commit = runner.cast(murder).target_object(blocker).commit();
+    commit
+        .act(GameAction::PassPriority)
+        .expect("P1 passes priority back");
+    commit
+        .act(GameAction::PassPriority)
+        .expect("P0 passes; Murder resolves and the blocker dies");
 
-    let state = runner.state();
-    assert!(
-        state.objects[&blocker].zone == Zone::Graveyard,
+    let state = commit.state();
+    assert_eq!(
+        state.objects[&blocker].zone,
+        Zone::Graveyard,
         "reach guard: the blocker must actually have died"
     );
-
-    let ctx = FilterContext::from_source_with_controller(blocker, P1);
-    let history_filter = combat_relation_filter(CombatRelation::BlockedBySubject {
-        scope: CombatHistoryScope::ThisCombat,
-    });
-    let live_filter = combat_relation_filter(CombatRelation::BlockingOrBlockedBy);
-
-    assert!(
-        matches_target_filter(state, attacker, &history_filter, &ctx),
-        "CR 509.1g + CR 400.7: the history relation must still answer after the blocker died"
+    let entry = state
+        .stack
+        .iter()
+        .find(|entry| {
+            matches!(&entry.kind, StackEntryKind::TriggeredAbility { source_id, .. } if *source_id == blocker)
+        })
+        .expect("reach guard: the dies trigger must be on the stack, unresolved");
+    let StackEntryKind::TriggeredAbility { ability, .. } = &entry.kind else {
+        unreachable!("matched above")
+    };
+    let trigger_source = ability
+        .trigger_source
+        .as_ref()
+        .expect("reach guard: a dies trigger must carry its captured source identity");
+    assert_eq!(
+        trigger_source.identity.reference, blocker_ref_at_block,
+        "reach guard: the trigger's captured identity is the incarnation that blocked"
     );
+    assert_ne!(
+        trigger_source.identity.reference,
+        ObjectIncarnationRef::from_object(&state.objects[&blocker]),
+        "reach guard: the trigger's captured identity must differ from the live graveyard incarnation"
+    );
+
+    let ctx = FilterContext::from_ability(ability);
+    for scope in [CombatHistoryScope::ThisCombat, CombatHistoryScope::ThisTurn] {
+        let history_filter = combat_relation_filter(CombatRelation::BlockedBySubject { scope });
+        assert!(
+            matches_target_filter(state, attacker, &history_filter, &ctx),
+            "{scope:?}: CR 509.1g + CR 400.7: the dying blocker's own trigger must still find what it blocked"
+        );
+    }
+    let live_filter = combat_relation_filter(CombatRelation::BlockingOrBlockedBy);
     assert!(
         !matches_target_filter(state, attacker, &live_filter, &ctx),
         "CR 506.4: the live relation must be pruned once the blocker leaves combat"
@@ -382,6 +425,80 @@ fn look_back_evaluator_answers_the_history_relation_for_a_departed_candidate() {
     );
 }
 
+/// T4b: the look-back leg also answers when the SUBJECT itself is departed —
+/// every zone-change record carries its own trigger-bound identity
+/// (`GameObject::snapshot_for_zone_change`), not only records for objects with
+/// their own triggered ability, so a plain dead blocker's death record still
+/// names the exact incarnation that blocked.
+#[test]
+fn look_back_answers_with_a_departed_subject_named_by_its_trigger_identity() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let attacker = scenario.add_creature(P0, "Attacker", 2, 2).id();
+    let blocker = scenario.add_creature(P1, "Blocker", 2, 2).id();
+    let murder_blocker = scenario
+        .add_spell_to_hand_from_oracle(P1, "Murder", true, MURDER)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let murder_attacker = scenario
+        .add_spell_to_hand_from_oracle(P1, "Murder", true, MURDER)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+
+    drive_declare_blockers(
+        &mut runner,
+        vec![(attacker, AttackTarget::Player(P1))],
+        vec![],
+        vec![(blocker, attacker)],
+    );
+
+    give_priority(&mut runner, P1);
+    runner.cast(murder_blocker).target_object(blocker).resolve();
+    runner.advance_until_stack_empty();
+
+    // CR 117.3b: after Murder's resolution the active player (P0) receives
+    // priority; hand it back to P1 to cast the second Murder.
+    give_priority(&mut runner, P1);
+    runner
+        .cast(murder_attacker)
+        .target_object(attacker)
+        .resolve();
+    runner.advance_until_stack_empty();
+
+    let state = runner.state();
+    let blocker_record = state
+        .zone_changes_this_turn
+        .iter()
+        .rev()
+        .find(|r| r.object_id == blocker && r.to_zone == Zone::Graveyard)
+        .expect("reach guard: the blocker's death must be recorded as a zone change");
+    let attacker_record = state
+        .zone_changes_this_turn
+        .iter()
+        .rev()
+        .find(|r| r.object_id == attacker && r.to_zone == Zone::Graveyard)
+        .expect("reach guard: the attacker's death must be recorded as a zone change");
+
+    let blocker_trigger_source = blocker_record
+        .trigger_source_context()
+        .expect("reach guard: the blocker's own death record must carry its trigger identity");
+    assert_ne!(
+        blocker_trigger_source.identity.reference,
+        ObjectIncarnationRef::from_object(&state.objects[&blocker]),
+        "reach guard: the departed subject's captured identity must differ from its live graveyard incarnation"
+    );
+
+    let ctx = FilterContext::from_trigger_source(blocker_trigger_source);
+    let history_filter = combat_relation_filter(CombatRelation::BlockedBySubject {
+        scope: CombatHistoryScope::ThisTurn,
+    });
+    assert!(
+        matches_target_filter_on_zone_change_record(state, attacker_record, &history_filter, &ctx),
+        "CR 509.1g + CR 608.2i: the look-back leg must answer even though the subject itself is departed"
+    );
+}
+
 /// T5: `ThisCombat` and `ThisTurn` disagree across two combat phases in one
 /// turn (CR 500.8). A block declared in combat 1 is absent from `ThisCombat`
 /// once combat 2's fresh `CombatState` is installed, but still present in
@@ -391,12 +508,12 @@ fn look_back_evaluator_answers_the_history_relation_for_a_departed_candidate() {
 fn this_combat_and_this_turn_disagree_across_two_combat_phases() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
-    // Asymmetric P/T so only the blocker dies in combat 1's damage step: a
-    // dead attacker would leave no legal attacker for combat 2's
-    // DeclareAttackers window to offer, and the engine skips straight past an
-    // attacker-less declare-attackers step without ever raising it.
+    // Asymmetric P/T: a dead attacker would leave no legal attacker for
+    // combat 2's DeclareAttackers window to offer, and the engine skips
+    // straight past an attacker-less declare-attackers step without ever
+    // raising it.
     let attacker = scenario.add_creature(P0, "Attacker", 3, 3).id();
-    let blocker = scenario.add_creature(P1, "Blocker", 2, 2).id();
+    let blocker = scenario.add_creature(P1, "Blocker", 2, 4).id();
     let throttle = scenario
         .add_spell_to_hand_from_oracle(P0, "Full Throttle", false, FULL_THROTTLE)
         .with_mana_cost(ManaCost::generic(0))
@@ -425,19 +542,24 @@ fn this_combat_and_this_turn_disagree_across_two_combat_phases() {
                     // `Phase::BeginCombat` entry (§4.1: unconditional replacement).
                     let state = runner.state();
                     let combat = state.combat.as_ref().expect("combat 2 is live");
+                    // Reach guard: neither creature died in combat 1, so their
+                    // incarnations are unchanged and directly comparable here.
+                    let blocker_ref = ObjectIncarnationRef::from_object(&state.objects[&blocker]);
+                    let attacker_ref = ObjectIncarnationRef::from_object(&state.objects[&attacker]);
                     assert!(
                         !combat
                             .creature_blocked_attackers_this_combat
-                            .contains_key(&blocker),
+                            .iter()
+                            .any(|pair| pair.blocker.object_id == blocker),
                         "combat 1's block must not survive into combat 2's fresh CombatState"
                     );
                     assert!(
                         state
                             .creature_blocked_attackers_this_turn
-                            .get(&blocker)
-                            .is_some_and(|a| a.contains(&ObjectIncarnationRef::from_object(
-                                &state.objects[&attacker]
-                            ))),
+                            .contains(&BlockHistoryPair {
+                                blocker: blocker_ref,
+                                attacker: attacker_ref,
+                            }),
                         "reach guard: the turn-scoped ledger must still hold combat 1's block"
                     );
 
@@ -533,20 +655,23 @@ fn turn_boundary_clears_the_per_turn_block_history() {
         !runner
             .state()
             .creature_blocked_attackers_this_turn
-            .contains_key(&blocker),
+            .iter()
+            .any(|pair| pair.blocker.object_id == blocker),
         "the turn-scoped ledger must clear at the next turn's boundary"
     );
 }
 
 /// T7: the combat-scoped ledger is unreachable once `state.combat` is `None`
-/// (CR 511.3, the end of the end of combat step) — no edit of its own, a guard
-/// for §4.1's lifetime claim.
+/// (CR 511.3, the end of the end of combat step); the turn-scoped ledger
+/// still answers for the same recorded block. Toughness high enough that
+/// neither creature dies in combat, or a CR 400.7 incarnation bump would hide
+/// the answer either way.
 #[test]
 fn combat_scoped_history_is_gone_after_the_end_of_combat_step() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
-    let attacker = scenario.add_creature(P0, "Attacker", 2, 2).id();
-    let blocker = scenario.add_creature(P1, "Blocker", 2, 2).id();
+    let attacker = scenario.add_creature(P0, "Attacker", 2, 4).id();
+    let blocker = scenario.add_creature(P1, "Blocker", 2, 4).id();
     let mut runner = scenario.build();
 
     drive_declare_blockers(
@@ -569,9 +694,31 @@ fn combat_scoped_history_is_gone_after_the_end_of_combat_step() {
 
     advance_until_combat_ends(&mut runner);
 
+    let state = runner.state();
     assert!(
-        runner.state().combat.is_none(),
+        state.combat.is_none(),
         "CR 511.3: combat must actually have ended for this test to mean anything"
+    );
+    assert!(
+        state.objects[&attacker].zone == Zone::Battlefield
+            && state.objects[&blocker].zone == Zone::Battlefield,
+        "reach guard: neither creature dies, so a CR 400.7 incarnation bump cannot hide the answer"
+    );
+
+    let ctx = FilterContext::from_source_with_controller(blocker, P1);
+    let this_combat = combat_relation_filter(CombatRelation::BlockedBySubject {
+        scope: CombatHistoryScope::ThisCombat,
+    });
+    let this_turn = combat_relation_filter(CombatRelation::BlockedBySubject {
+        scope: CombatHistoryScope::ThisTurn,
+    });
+    assert!(
+        !matches_target_filter(state, attacker, &this_combat, &ctx),
+        "CR 511.3: the combat-scoped ledger is gone once combat has ended"
+    );
+    assert!(
+        matches_target_filter(state, attacker, &this_turn, &ctx),
+        "the turn-scoped ledger must still hold the block after combat ends"
     );
 }
 
@@ -620,6 +767,122 @@ fn an_attacker_that_left_and_returned_is_a_new_object_and_does_not_match() {
     assert!(
         !matches_target_filter(runner.state(), attacker, &filter, &ctx),
         "CR 400.7: a re-entered object is a new object the ledger never blocked"
+    );
+}
+
+/// T13 — the CR 400.7 test on the SUBJECT side, the maintainer's reported bug:
+/// a BLOCKER that left and returned (blink) is a new object at the same
+/// `ObjectId` and must not inherit its predecessor's recorded blocks. A
+/// trigger-bound subject is named by its captured identity (`pre`), so it
+/// still finds the block after the blink; a live-object lookup (no trigger
+/// source, or the returned object's own latch) finds nothing, because the
+/// returned blocker never blocked anything.
+#[test]
+fn a_blocker_that_left_and_returned_does_not_inherit_its_predecessors_blocks() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let attacker = scenario.add_creature(P0, "Attacker", 2, 2).id();
+    let blocker = scenario.add_creature(P1, "Blocker", 2, 2).id();
+    let ephemerate = scenario
+        .add_spell_to_hand_from_oracle(P1, "Ephemerate", true, EPHEMERATE)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let murder = scenario
+        .add_spell_to_hand_from_oracle(P1, "Murder", true, MURDER)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+
+    drive_declare_blockers(
+        &mut runner,
+        vec![(attacker, AttackTarget::Player(P1))],
+        vec![],
+        vec![(blocker, attacker)],
+    );
+
+    // `pre`: the blocker's identity as it was WHILE it blocked, captured
+    // before the blink.
+    let pre = engine::game::triggers::trigger_source_context_for_latch(
+        runner.state(),
+        &runner.state().objects[&blocker],
+    );
+
+    let incarnation_before = runner.state().objects[&blocker].incarnation;
+    give_priority(&mut runner, P1);
+    runner.cast(ephemerate).target_object(blocker).resolve();
+    runner.advance_until_stack_empty();
+
+    // Reach guard: the blocker really did leave and return as a new object.
+    let state = runner.state();
+    assert_eq!(
+        state.objects[&blocker].zone,
+        Zone::Battlefield,
+        "reach guard: the blinked blocker must be back on the battlefield"
+    );
+    assert_ne!(
+        state.objects[&blocker].incarnation, incarnation_before,
+        "reach guard: the blink must bump the blocker's incarnation (CR 400.7)"
+    );
+
+    // `post`: the returned blocker's own latch, at its NEW incarnation.
+    let post =
+        engine::game::triggers::trigger_source_context_for_latch(state, &state.objects[&blocker]);
+
+    let filter_combat = combat_relation_filter(CombatRelation::BlockedBySubject {
+        scope: CombatHistoryScope::ThisCombat,
+    });
+    let filter_turn = combat_relation_filter(CombatRelation::BlockedBySubject {
+        scope: CombatHistoryScope::ThisTurn,
+    });
+
+    // (a) The predecessor's captured identity still finds its own record.
+    let pre_ctx = FilterContext::from_trigger_source(&pre);
+    assert!(
+        matches_target_filter(state, attacker, &filter_combat, &pre_ctx)
+            && matches_target_filter(state, attacker, &filter_turn, &pre_ctx),
+        "the predecessor's trigger-bound identity must still find its own recorded block"
+    );
+
+    // (b) A live-object lookup (no trigger source) reads the RETURNED
+    // blocker's new incarnation, which never blocked anything.
+    let live_ctx = FilterContext::from_source_with_controller(blocker, P1);
+    assert!(
+        !matches_target_filter(state, attacker, &filter_combat, &live_ctx)
+            && !matches_target_filter(state, attacker, &filter_turn, &live_ctx),
+        "CR 400.7: the returned blocker is a new object and must not inherit its predecessor's blocks"
+    );
+
+    // (c) The returned object's own latch names the same new incarnation and
+    // finds nothing either.
+    let post_ctx = FilterContext::from_trigger_source(&post);
+    assert!(
+        !matches_target_filter(state, attacker, &filter_combat, &post_ctx)
+            && !matches_target_filter(state, attacker, &filter_turn, &post_ctx),
+        "CR 400.7: the returned object's own identity must not find its predecessor's block either"
+    );
+
+    // CR 117.3b: after Ephemerate's resolution the active player (P0)
+    // receives priority; hand it back to P1 to cast the second spell.
+    give_priority(&mut runner, P1);
+    runner.cast(murder).target_object(attacker).resolve();
+    runner.advance_until_stack_empty();
+
+    // (d) Look-back: the attacker's death record is answered by the
+    // predecessor's trigger-bound identity, not by the live fallback.
+    let state = runner.state();
+    let record = state
+        .zone_changes_this_turn
+        .iter()
+        .rev()
+        .find(|r| r.object_id == attacker && r.to_zone == Zone::Graveyard)
+        .expect("reach guard: the attacker's death must be recorded as a zone change");
+    assert!(
+        matches_target_filter_on_zone_change_record(state, record, &filter_combat, &pre_ctx),
+        "the look-back leg must still find the block through the predecessor's identity"
+    );
+    assert!(
+        !matches_target_filter_on_zone_change_record(state, record, &filter_combat, &live_ctx),
+        "the look-back leg must not find the block through the returned blocker's live identity"
     );
 }
 

@@ -79,7 +79,7 @@ use crate::analysis::resource::{
     object_class, CounterClass, ObjectClass, ResourceAxis, UnboundedMarkKind,
 };
 use crate::game::bracket_estimate::CommanderBracketTier;
-use crate::game::combat::{AttackTarget, CombatState};
+use crate::game::combat::{AttackTarget, BlockHistoryPair, CombatState};
 use crate::game::deck_loading::DeckEntry;
 
 use crate::game::game_object::{AttachTarget, BackFaceData, CaseState, GameObject, PhaseStatus};
@@ -19425,8 +19425,8 @@ declare_game_state! {
     /// (CR 500.8), so this ledger is not limited to a single combat's worth of
     /// records.
     #[serde(default)]
-    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map_of_hash_set")]
-    pub creature_blocked_attackers_this_turn: HashMap<ObjectId, HashSet<ObjectIncarnationRef>>,
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+    pub creature_blocked_attackers_this_turn: HashSet<BlockHistoryPair>,
     /// CR 500.8 + CR 506.1: Number of combat phases that have begun this turn.
     /// Used by intervening-if triggers that only fire during the first combat phase.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
@@ -24885,6 +24885,27 @@ impl GameState {
         }
     }
 
+    /// CR 509.1g + CR 400.7: Did exactly `blocker` block exactly `attacker` within `scope`?
+    pub fn creature_blocked_attacker(
+        &self,
+        blocker: ObjectIncarnationRef,
+        attacker: ObjectIncarnationRef,
+        scope: crate::types::ability::CombatHistoryScope,
+    ) -> bool {
+        use crate::types::ability::CombatHistoryScope;
+        let pair = BlockHistoryPair { blocker, attacker };
+        match scope {
+            CombatHistoryScope::ThisCombat => self.combat.as_ref().is_some_and(|combat| {
+                combat
+                    .creature_blocked_attackers_this_combat
+                    .contains(&pair)
+            }),
+            CombatHistoryScope::ThisTurn => {
+                self.creature_blocked_attackers_this_turn.contains(&pair)
+            }
+        }
+    }
+
     /// CR 508.6 + CR 506.1: Within the CURRENT combat, did `attacker_controller`
     /// declare any creature attacking `defender`? Read from the combat's
     /// declaration ledger, so it reflects only this combat while surviving
@@ -25126,7 +25147,7 @@ impl GameState {
             attacked_defenders_this_turn: HashMap::new(),
             attacked_defenders_last_turn: Box::default(),
             creature_attacked_defenders_this_turn: HashMap::new(),
-            creature_blocked_attackers_this_turn: HashMap::new(),
+            creature_blocked_attackers_this_turn: HashSet::new(),
             combat_phases_started_this_turn: 0,
             end_steps_started_this_turn: 0,
             creatures_attacked_this_turn: HashSet::new(),

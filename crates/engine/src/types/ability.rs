@@ -6216,9 +6216,10 @@ pub enum CombatRelation {
     /// reads live `combat.blocker_to_attacker` and empties when CR 506.4 removes
     /// either creature from combat, this reads the block-history ledgers
     /// (`CombatState::creature_blocked_attackers_this_combat` /
-    /// `GameState::creature_blocked_attackers_this_turn`), so it still answers
-    /// after the subject has left the battlefield. Values carry the attacker's
-    /// incarnation, so an attacker that left and returned does not match.
+    /// `GameState::creature_blocked_attackers_this_turn`), which CR 506.4 does
+    /// not prune. Each record pins both creatures' exact incarnations, so a
+    /// creature that left and returned matches none of its predecessor's
+    /// records.
     BlockedBySubject { scope: CombatHistoryScope },
 }
 

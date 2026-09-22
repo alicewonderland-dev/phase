@@ -12,10 +12,10 @@ use crate::game::quantity::{
     resolve_quantity_with_targets,
 };
 use crate::types::ability::{
-    CardTypeSetSource, CastManaSpentMetric, ChoiceValue, ChosenAttribute, CombatHistoryScope,
-    CombatRelation, CombatRelationSubject, ControllerRef, CountScope, FilterProp, Parity,
-    ParitySource, PlayerFilter, PtStat, PtValueScope, QuantityExpr, QuantityRef, ResolvedAbility,
-    SharedQuality, SharedQualityRelation, TargetFilter, TargetRef, TypeFilter, TypedFilter,
+    CardTypeSetSource, CastManaSpentMetric, ChoiceValue, ChosenAttribute, CombatRelation,
+    CombatRelationSubject, ControllerRef, CountScope, FilterProp, Parity, ParitySource,
+    PlayerFilter, PtStat, PtValueScope, QuantityExpr, QuantityRef, ResolvedAbility, SharedQuality,
+    SharedQualityRelation, TargetFilter, TargetRef, TypeFilter, TypedFilter,
 };
 use crate::types::card::CardFace;
 use crate::types::card_type::{CoreType, Supertype};
@@ -6626,6 +6626,42 @@ fn combat_relation_subject_id(
     }
 }
 
+/// CR 400.7 + CR 608.2h: The exact incarnation `subject` names. A triggered
+/// source is named by the identity its trigger captured — for a
+/// leaves-the-battlefield trigger, the incarnation that left (CR 603.10a).
+/// Otherwise the live object at the referenced id is used; an object that left
+/// and returned is a new object (CR 400.7) and finds nothing its predecessor
+/// recorded. `ParentTarget` prefers the incarnation pinned when it was chosen.
+fn combat_relation_subject_ref(
+    state: &GameState,
+    subject: CombatRelationSubject,
+    source: &SourceContext<'_>,
+) -> Option<ObjectIncarnationRef> {
+    let live = |id: ObjectId| {
+        state
+            .objects
+            .get(&id)
+            .map(ObjectIncarnationRef::from_object)
+    };
+    match subject {
+        CombatRelationSubject::Source => source
+            .trigger_source
+            .map(|context| context.identity.reference)
+            .or_else(|| live(source.id)),
+        CombatRelationSubject::ParentTarget => {
+            let ability = source.ability?;
+            let id = first_object_target(ability)?;
+            ability
+                .target_incarnations
+                .iter()
+                .chain(&ability.selected_target_incarnations)
+                .find(|pin| pin.object_id == id)
+                .copied()
+                .or_else(|| live(id))
+        }
+    }
+}
+
 fn matches_combat_relation(
     state: &GameState,
     object_id: ObjectId,
@@ -6634,37 +6670,30 @@ fn matches_combat_relation(
     subject: CombatRelationSubject,
     source: &SourceContext<'_>,
 ) -> bool {
-    let Some(subject_id) = combat_relation_subject_id(subject, source) else {
-        return false;
-    };
     match relation {
-        CombatRelation::BlockingOrBlockedBy => state.combat.as_ref().is_some_and(|combat| {
-            let candidate_blocks_subject = combat
-                .blocker_to_attacker
-                .get(&object_id)
-                .is_some_and(|attackers| attackers.contains(&subject_id));
-            let subject_blocks_candidate = combat
-                .blocker_to_attacker
-                .get(&subject_id)
-                .is_some_and(|attackers| attackers.contains(&object_id));
-            candidate_blocks_subject || subject_blocks_candidate
-        }),
-        // CR 509.1g + CR 400.7: the block-history ledgers are never pruned by
-        // CR 506.4, so this answers even after the subject has left combat.
-        // Values carry the attacker's incarnation, so a candidate that left and
-        // returned (CR 400.7: a new object) does not match its predecessor's entry.
-        CombatRelation::BlockedBySubject { scope } => match scope {
-            CombatHistoryScope::ThisCombat => state.combat.as_ref().is_some_and(|combat| {
-                combat
-                    .creature_blocked_attackers_this_combat
+        CombatRelation::BlockingOrBlockedBy => {
+            let Some(subject_id) = combat_relation_subject_id(subject, source) else {
+                return false;
+            };
+            state.combat.as_ref().is_some_and(|combat| {
+                let candidate_blocks_subject = combat
+                    .blocker_to_attacker
+                    .get(&object_id)
+                    .is_some_and(|attackers| attackers.contains(&subject_id));
+                let subject_blocks_candidate = combat
+                    .blocker_to_attacker
                     .get(&subject_id)
-                    .is_some_and(|attackers| attackers.contains(&candidate))
-            }),
-            CombatHistoryScope::ThisTurn => state
-                .creature_blocked_attackers_this_turn
-                .get(&subject_id)
-                .is_some_and(|attackers| attackers.contains(&candidate)),
-        },
+                    .is_some_and(|attackers| attackers.contains(&object_id));
+                candidate_blocks_subject || subject_blocks_candidate
+            })
+        }
+        // CR 509.1g + CR 400.7: answered from the block-history ledgers, which
+        // CR 506.4 does not prune, by the exact subject and candidate
+        // incarnations.
+        CombatRelation::BlockedBySubject { scope } => {
+            combat_relation_subject_ref(state, subject, source)
+                .is_some_and(|blocker| state.creature_blocked_attacker(blocker, candidate, scope))
+        }
     }
 }
 
@@ -8119,36 +8148,20 @@ fn zone_change_record_matches_property(
             // CR 506.4: the live map is pruned when either creature leaves
             // combat, so there is nothing for a departed record to match.
             CombatRelation::BlockingOrBlockedBy => false,
-            // CR 509.1g + CR 608.2i: the block-history ledgers `matches_combat_relation`
-            // reads are never pruned, so this leg answers from the same storage
-            // (`CombatState::creature_blocked_attackers_this_combat` /
-            // `GameState::creature_blocked_attackers_this_turn`) the live leg does.
+            // CR 509.1g + CR 608.2i: answered from the same block-history
+            // ledgers as the live leg, through GameState::creature_blocked_attacker.
             // CR 400.7: the record's exact departing incarnation is its own
             // pre-change authority; a record without one fails closed.
             CombatRelation::BlockedBySubject { scope } => {
-                let Some(subject_id) = combat_relation_subject_id(*subject, source) else {
-                    return false;
-                };
                 let Some(candidate) = record
                     .trigger_source_context()
                     .map(|context| context.identity.reference)
                 else {
                     return false;
                 };
-                match scope {
-                    CombatHistoryScope::ThisCombat => {
-                        state.combat.as_ref().is_some_and(|combat| {
-                            combat
-                                .creature_blocked_attackers_this_combat
-                                .get(&subject_id)
-                                .is_some_and(|attackers| attackers.contains(&candidate))
-                        })
-                    }
-                    CombatHistoryScope::ThisTurn => state
-                        .creature_blocked_attackers_this_turn
-                        .get(&subject_id)
-                        .is_some_and(|attackers| attackers.contains(&candidate)),
-                }
+                combat_relation_subject_ref(state, *subject, source).is_some_and(|blocker| {
+                    state.creature_blocked_attacker(blocker, candidate, *scope)
+                })
             }
         },
         FilterProp::Unblocked => {
@@ -9386,10 +9399,10 @@ mod tests {
     use crate::game::zones::create_object;
     use crate::types::ability::{
         AbilityDefinition, AbilityKind, AggregateFunction, AttachmentKind, ChosenAttribute,
-        Comparator, ControllerRef, DamageKindFilter, Effect, FilterProp, ManaContribution,
-        ManaProduction, PlayerScope, QuantityExpr, QuantityRef, ReplacementDefinition,
-        ResolvedAbility, StaticDefinition, TargetFilter, TargetRef, TriggerDefinition, TypeFilter,
-        TypedFilter,
+        CombatHistoryScope, Comparator, ControllerRef, DamageKindFilter, Effect, FilterProp,
+        ManaContribution, ManaProduction, PlayerScope, QuantityExpr, QuantityRef,
+        ReplacementDefinition, ResolvedAbility, StaticDefinition, TargetFilter, TargetRef,
+        TriggerDefinition, TypeFilter, TypedFilter,
     };
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::events::GameEvent;
@@ -12473,6 +12486,95 @@ mod tests {
         ));
     }
 
+    /// U1: `combat_relation_subject_ref`'s `ParentTarget` arm prefers a pinned
+    /// incarnation over the live object, and `target_incarnations` (the
+    /// delayed-trigger referent pin) over `selected_target_incarnations` when
+    /// both are populated. This path is production-unreachable today — no
+    /// parser emits `BlockedBySubject { subject: ParentTarget, .. }` — so it is
+    /// exercised only here.
+    #[test]
+    fn parent_target_subject_prefers_the_selected_pin_over_the_live_object() {
+        let mut state = setup();
+        let source = add_creature(&mut state, PlayerId(0), "Source");
+        let blocker = add_creature(&mut state, PlayerId(1), "Blocker");
+        let attacker = add_creature(&mut state, PlayerId(0), "Attacker");
+
+        let blocked_at = ObjectIncarnationRef::from_object(&state.objects[&blocker]);
+        let attacker_ref = ObjectIncarnationRef::from_object(&state.objects[&attacker]);
+        state
+            .creature_blocked_attackers_this_turn
+            .insert(crate::game::combat::BlockHistoryPair {
+                blocker: blocked_at,
+                attacker: attacker_ref,
+            });
+
+        // Bump the blocker past the recorded incarnation.
+        state.objects.get_mut(&blocker).unwrap().bump_incarnation();
+        assert_ne!(
+            ObjectIncarnationRef::from_object(&state.objects[&blocker]),
+            blocked_at,
+            "reach guard: the live object must have moved past the recorded incarnation"
+        );
+
+        let filter = TargetFilter::Typed(TypedFilter::creature().properties(vec![
+            FilterProp::CombatRelation {
+                relation: CombatRelation::BlockedBySubject {
+                    scope: CombatHistoryScope::ThisTurn,
+                },
+                subject: CombatRelationSubject::ParentTarget,
+            },
+        ]));
+        let ability = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 0 },
+                target: TargetFilter::Controller,
+            },
+            vec![TargetRef::Object(blocker)],
+            source,
+            PlayerId(0),
+        );
+
+        // With the selected-target pin, the parent target's recorded
+        // incarnation is used and the block is found.
+        let mut pinned = ability.clone();
+        pinned.selected_target_incarnations = vec![blocked_at];
+        let ctx = FilterContext::from_ability(&pinned);
+        assert!(
+            crate::game::filter::matches_target_filter(&state, attacker, &filter, &ctx),
+            "with the selected-target pin, the parent target's recorded incarnation must be found"
+        );
+
+        // Without any pin, the live (bumped) incarnation is used and nothing matches.
+        let unpinned = ability.clone();
+        let ctx = FilterContext::from_ability(&unpinned);
+        assert!(
+            !crate::game::filter::matches_target_filter(&state, attacker, &filter, &ctx),
+            "without a pin, the live (bumped) blocker incarnation must not match its predecessor's block"
+        );
+
+        // (a) When both pin lists are populated with DIFFERENT incarnations,
+        // `target_incarnations` (the delayed-trigger referent) must be
+        // preferred over `selected_target_incarnations`.
+        let live_incarnation = ObjectIncarnationRef::from_object(&state.objects[&blocker]);
+        let mut both_pinned = ability.clone();
+        both_pinned.target_incarnations = vec![blocked_at];
+        both_pinned.selected_target_incarnations = vec![live_incarnation];
+        let ctx = FilterContext::from_ability(&both_pinned);
+        assert!(
+            crate::game::filter::matches_target_filter(&state, attacker, &filter, &ctx),
+            "target_incarnations must be preferred over selected_target_incarnations"
+        );
+
+        // (b) With no pins at all and the live object left at the recorded
+        // incarnation (no bump), the fallback to the live object finds the block.
+        state.objects.get_mut(&blocker).unwrap().incarnation = blocked_at.incarnation;
+        let ctx = FilterContext::from_ability(&unpinned);
+        assert!(
+            crate::game::filter::matches_target_filter(&state, attacker, &filter, &ctx),
+            "with no pin, the live object at its recorded incarnation must be found via fallback"
+        );
+    }
+
     /// T12c (E15): `matches_target_filter_on_event_snapshot` must answer
     /// `BlockedBySubject` from the SNAPSHOT's own captured incarnation, not the
     /// live object's — otherwise a live object bumped past the snapshot (blink,
@@ -12505,9 +12607,10 @@ mod tests {
         // The ledger records the SNAPSHOT's incarnation.
         state
             .creature_blocked_attackers_this_turn
-            .entry(blocker)
-            .or_default()
-            .insert(snapshot.identity);
+            .insert(combat::BlockHistoryPair {
+                blocker: ObjectIncarnationRef::from_object(&state.objects[&blocker]),
+                attacker: snapshot.identity,
+            });
 
         // The LIVE object then moves further — a real re-entry would land here
         // too — so the live incarnation now disagrees with the snapshot's.

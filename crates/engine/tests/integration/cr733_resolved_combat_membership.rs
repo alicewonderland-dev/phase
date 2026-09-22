@@ -26,7 +26,9 @@
 //! when_ambient_derivation_diverges` is the test that pins it, and it carries a
 //! probe proving the ambient path really would answer differently.
 
-use engine::game::combat::{apply_resolved_combat_membership, AttackTarget, CombatParticipation};
+use engine::game::combat::{
+    apply_resolved_combat_membership, AttackTarget, BlockHistoryPair, CombatParticipation,
+};
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::TargetRef;
 use engine::types::actions::GameAction;
@@ -616,18 +618,22 @@ fn place_blocking_journals_a_block_edit_and_replays_every_write() {
     // once the clone below re-derives the same entries from an absent state.
     let attacker_ref =
         ObjectIncarnationRef::from_object(state.objects.get(&attacker).expect("attacker is live"));
+    let token_ref =
+        ObjectIncarnationRef::from_object(state.objects.get(&token).expect("token is live"));
+    let recorded_pair = BlockHistoryPair {
+        blocker: token_ref,
+        attacker: attacker_ref,
+    };
     assert!(
         combat
             .creature_blocked_attackers_this_combat
-            .get(&token)
-            .is_some_and(|attackers| attackers.contains(&attacker_ref)),
+            .contains(&recorded_pair),
         "CR 509.1g: the live combat-scoped block-history ledger"
     );
     assert!(
         state
             .creature_blocked_attackers_this_turn
-            .get(&token)
-            .is_some_and(|attackers| attackers.contains(&attacker_ref)),
+            .contains(&recorded_pair),
         "CR 509.1g: the live turn-scoped block-history ledger"
     );
 
@@ -641,10 +647,14 @@ fn place_blocking_journals_a_block_edit_and_replays_every_write() {
                 info.blocked = false;
             }
         }
-        combat.creature_blocked_attackers_this_combat.remove(&token);
+        combat
+            .creature_blocked_attackers_this_combat
+            .retain(|pair| pair.blocker.object_id != token);
     }
     replay.creatures_blocked_this_turn.remove(&token);
-    replay.creature_blocked_attackers_this_turn.remove(&token);
+    replay
+        .creature_blocked_attackers_this_turn
+        .retain(|pair| pair.blocker.object_id != token);
 
     apply_resolved_combat_membership(&mut replay, &commands[0])
         .expect("the recorded block must replay against its predecessor");
@@ -678,15 +688,13 @@ fn place_blocking_journals_a_block_edit_and_replays_every_write() {
     assert!(
         replayed
             .creature_blocked_attackers_this_combat
-            .get(&token)
-            .is_some_and(|attackers| attackers.contains(&attacker_ref)),
+            .contains(&recorded_pair),
         "CR 509.1g: the combat-scoped block-history ledger"
     );
     assert!(
         replay
             .creature_blocked_attackers_this_turn
-            .get(&token)
-            .is_some_and(|attackers| attackers.contains(&attacker_ref)),
+            .contains(&recorded_pair),
         "CR 509.1g: the turn-scoped block-history ledger"
     );
 }
