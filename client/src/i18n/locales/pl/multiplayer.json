@@ -97,6 +97,9 @@
     "message": "Twoja gra nie będzie publicznie wyświetlana. Nadal możesz być gospodarzem przez P2P — po prostu udostępnij kod pokoju bezpośrednio przeciwnikowi.",
     "continueWithoutLobby": "Kontynuuj bez poczekalni"
   },
+  "lobbyCapability": {
+    "formatNeedsNewerServer": "Ten serwer poczekalni jest za stary, aby wyświetlać gry w wybranym formacie (wymaga protokołu lobby {{needed}})."
+  },
   "joinErrorDialog": {
     "dismiss": "Zamknij"
   },

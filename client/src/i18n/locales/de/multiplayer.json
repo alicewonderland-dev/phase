@@ -97,6 +97,9 @@
     "message": "Dein Spiel wird nicht öffentlich gelistet. Du kannst trotzdem über P2P hosten — teile einfach den Raumcode direkt mit deinem Gegner.",
     "continueWithoutLobby": "Ohne Lobby fortfahren"
   },
+  "lobbyCapability": {
+    "formatNeedsNewerServer": "Dieser Lobby-Server ist zu alt, um Spiele im gewählten Format aufzulisten (er benötigt Lobby-Protokoll {{needed}})."
+  },
   "joinErrorDialog": {
     "dismiss": "Schließen"
   },

@@ -647,19 +647,14 @@ pub const MIN_SUPPORTED_PROTOCOL: u32 = PROTOCOL_VERSION.saturating_sub(1);
 ///      browser's `JSON.parse`, and `JoinTargetInfo` / `PeerInfo` on
 ///      [`LobbyServerMessage`] (this file's entry 2 names both carriers)
 ///      each reach `FormatConfig -> GameFormat`, so a v10 broker's replies
-///      genuinely carry one. Client -> broker for every frame
-///      a pre-run client actually sends is unaffected, because such a
-///      client can only name formats that existed at base. The single
-///      failing pairing is a post-run client naming a new format to a
-///      pre-run Rust broker, which `GameFormat::deserialize` rejects — the
-///      client-side capability floor for that pairing is a P4/P5
-///      obligation, not this one's; adding it now would change client
-///      behaviour ahead of the feature it gates. [`MIN_SUPPORTED_LOBBY_PROTOCOL`]
+///      genuinely carry one. A client naming `Freeform` or
+///      `FreeformCommander` to a Rust broker below 10 fails:
+///      `GameFormat::deserialize` rejects the frame. The client-side floor
+///      for that pairing is `MIN_LOBBY_PROTOCOL_FOR_FREEFORM_FORMATS` in
+///      `client/src/adapter/ws-adapter.ts`. [`MIN_SUPPORTED_LOBBY_PROTOCOL`]
 ///      does not move: moving it would evict every v2–v9 lobby client from
 ///      browsing and joining over a value most of them will never
-///      encounter, to protect against a pairing a version floor cannot
-///      fully prevent anyway (the client-side floor above is what closes
-///      it). [`PROTOCOL_VERSION`] does not move alongside it either: no
+///      encounter. [`PROTOCOL_VERSION`] does not move alongside it either: no
 ///      variant here carries `GameState` or `GameAction`. (Written as one
 ///      unbroken paragraph on purpose, per the reason entry 5 gives:
 ///      a blank `///` line before 4-space indented prose is an indented

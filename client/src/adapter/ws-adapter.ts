@@ -5,6 +5,7 @@ import type {
   EngineSnapshot,
   GameAction,
   GameEvent,
+  GameFormat,
   GameLogEntry,
   GameState,
   LegalActionsResult,
@@ -23,7 +24,7 @@ import type {
   InteractionPreviewRequest,
   InteractionSubmission,
 } from "./generated/interaction";
-import { AdapterError, AdapterErrorCode, EMPTY_LEGAL_ACTIONS, actionRejectionError, isActionRejection, nextSnapshotSeq } from "./types";
+import { AdapterError, AdapterErrorCode, EMPTY_LEGAL_ACTIONS, actionRejectionError, isActionRejection, isCustomGameFormat, nextSnapshotSeq } from "./types";
 import type { BracketDeckRequest, BracketEstimate } from "../types/bracketEstimate";
 import {
   HandshakeError,
@@ -577,9 +578,9 @@ export const LOBBY_MIN_SUPPORTED_SERVER_PROTOCOL = PROTOCOL_VERSION - 1;
  *      JSON.parse, which arrives at an unknown-yet format name as an
  *      ordinary string with no parse error either way, and moving the floor
  *      would evict every v2–v9 broker over a value most of them will never
- *      encounter. The one pairing this bump does not protect — a v10+
- *      client naming a new format to a pre-10 Rust broker — is a P4/P5
- *      client-side capability-floor obligation, not this one's.
+ *      encounter. A pre-10 Rust broker rejects a lobby frame naming
+ *      Freeform or FreeformCommander; MIN_LOBBY_PROTOCOL_FOR_FREEFORM_FORMATS
+ *      below is this client's floor for them.
  * 9 — Recoverable credential rotation via idempotent-nonce replay.
  *     RenewTournamentCredential gains an optional `rotation_nonce` field
  *     (#[serde(default)]) — the "a lobby field is added" trigger;
@@ -787,6 +788,63 @@ export const MIN_LOBBY_PROTOCOL_FOR_MATCH_TYPE = 8;
  * start refusing v9 brokers that recover perfectly.
  */
 export const MIN_LOBBY_PROTOCOL_FOR_RECOVERABLE_ROTATION = 9;
+
+/**
+ * Lowest broker `LOBBY_PROTOCOL_VERSION` whose `GameFormat` deserializer knows
+ * `Freeform` and `FreeformCommander`; below it a lobby frame naming either is
+ * rejected as malformed.
+ *
+ * Frozen at 10 and written as a bare literal, never derived from
+ * LOBBY_PROTOCOL_VERSION, so a later bump cannot drag it forward and start
+ * refusing v10 brokers. `scripts/check-protocol-version.mjs` refuses a derived
+ * right-hand side for it.
+ */
+export const MIN_LOBBY_PROTOCOL_FOR_FREEFORM_FORMATS = 10;
+
+/**
+ * The lowest broker `LOBBY_PROTOCOL_VERSION` that parses `format` in a lobby
+ * frame, or `null` when every broker this client connects to parses it (see
+ * MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL). Consult it before sending any lobby
+ * frame that carries a `GameFormat`. The switch is exhaustive over
+ * `BuiltInGameFormat`, so a format added there does not type-check until it is
+ * classified here.
+ */
+export function lobbyProtocolRequiredForFormat(format: GameFormat): number | null {
+  if (isCustomGameFormat(format)) return null;
+  switch (format) {
+    case "Freeform":
+    case "FreeformCommander":
+      return MIN_LOBBY_PROTOCOL_FOR_FREEFORM_FORMATS;
+    case "Standard":
+    case "Commander":
+    case "Pioneer":
+    case "Modern":
+    case "Premodern":
+    case "Legacy":
+    case "Vintage":
+    case "Historic":
+    case "Timeless":
+    case "Pauper":
+    case "PauperCommander":
+    case "DuelCommander":
+    case "TinyLeaders":
+    case "Oathbreaker":
+    case "Brawl":
+    case "HistoricBrawl":
+    case "FreeForAll":
+    case "TwoHeadedGiant":
+    case "Archenemy":
+    case "Planechase":
+    case "Limited":
+    case "Momir":
+    case "CommanderDraft":
+      return null;
+    default: {
+      const unclassified: never = format;
+      return unclassified;
+    }
+  }
+}
 
 /** Identity advertised by the server in its `ServerHello`. */
 export interface ServerInfo {

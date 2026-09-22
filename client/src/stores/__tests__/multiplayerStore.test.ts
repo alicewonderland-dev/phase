@@ -78,6 +78,8 @@ import {
   saveWsSession,
 } from "../../services/multiplayerSession";
 import { HandshakeError, openPhaseSocket, withReconnect } from "../../services/openPhaseSocket";
+import { LobbyCapabilityError, type RegisterHostRequest } from "../../services/brokerClient";
+import i18n from "i18next";
 
 const p2pMocks = vi.hoisted(() => ({
   hostDestroy: vi.fn(),
@@ -143,12 +145,17 @@ vi.mock("../../adapter/p2p-adapter", () => ({
   }),
 }));
 
-vi.mock("../../services/brokerClient", () => ({
-  openBrokerClient: brokerMocks.openBrokerClient,
-  subscribeLobbyOver: brokerMocks.subscribeLobbyOver,
-  lookupJoinTargetOver: brokerMocks.lookupJoinTargetOver,
-  resolveGuestOver: brokerMocks.resolveGuestOver,
-}));
+vi.mock("../../services/brokerClient", async (importActual) => {
+  const actual =
+    await importActual<typeof import("../../services/brokerClient")>();
+  return {
+    LobbyCapabilityError: actual.LobbyCapabilityError,
+    openBrokerClient: brokerMocks.openBrokerClient,
+    subscribeLobbyOver: brokerMocks.subscribeLobbyOver,
+    lookupJoinTargetOver: brokerMocks.lookupJoinTargetOver,
+    resolveGuestOver: brokerMocks.resolveGuestOver,
+  };
+});
 
 // Only `renewTournamentCredentialOver` is stubbed — every other tournament
 // sender stays real (importActual) so unrelated store tests are untouched.
@@ -1461,6 +1468,85 @@ describe("multiplayerStore", () => {
       );
     },
   );
+
+  describe("registerHost lobby-capability toast", () => {
+    beforeEach(() => {
+      useMultiplayerStore.setState({ toasts: new Map() });
+    });
+
+    function openBrokerRequest(): RegisterHostRequest {
+      return {
+        hostPeerId: "peer-host",
+        displayName: "Host",
+        public: true,
+        password: null,
+        timerSeconds: null,
+        playerCount: 2,
+        matchConfig: { match_type: "Bo1" },
+        formatConfig: null,
+        roomName: null,
+        draftMetadata: null,
+      };
+    }
+
+    it("startP2PHostingSession resolves false and toasts on LobbyCapabilityError", async () => {
+      brokerMocks.registerHost.mockRejectedValueOnce(new LobbyCapabilityError(10, 9));
+
+      const ok = await useMultiplayerStore.getState().startP2PHostingSession(
+        hostingSettings(),
+        {
+          main_deck: ["Forest"],
+          sideboard: [],
+          commander: ["Goreclaw, Terror of Qal Sisma"],
+        },
+        { brokerUrl: "wss://broker.example/ws" },
+      );
+
+      expect(ok).toBe(false);
+      expect(useMultiplayerStore.getState().toasts.get("generic")?.message).toBe(
+        i18n.t("multiplayer:lobbyCapability.formatNeedsNewerServer", { needed: 10 }),
+      );
+    });
+
+    it("startP2PHostingSession resolves false with no capability toast on a generic error", async () => {
+      brokerMocks.registerHost.mockRejectedValueOnce(new Error("boom"));
+
+      const ok = await useMultiplayerStore.getState().startP2PHostingSession(
+        hostingSettings(),
+        {
+          main_deck: ["Forest"],
+          sideboard: [],
+          commander: ["Goreclaw, Terror of Qal Sisma"],
+        },
+        { brokerUrl: "wss://broker.example/ws" },
+      );
+
+      expect(ok).toBe(false);
+      expect(useMultiplayerStore.getState().toasts.get("generic")).toBeUndefined();
+    });
+
+    it("openBroker resolves null and toasts on LobbyCapabilityError", async () => {
+      useMultiplayerStore.getState().setHostingServer("wss://broker.example/ws");
+      brokerMocks.registerHost.mockRejectedValueOnce(new LobbyCapabilityError(10, 9));
+
+      const result = await useMultiplayerStore.getState().openBroker(openBrokerRequest());
+
+      expect(result).toBeNull();
+      expect(useMultiplayerStore.getState().toasts.get("generic")?.message).toBe(
+        i18n.t("multiplayer:lobbyCapability.formatNeedsNewerServer", { needed: 10 }),
+      );
+    });
+
+    it("openBroker resolves null with no capability toast on a generic error", async () => {
+      useMultiplayerStore.getState().setHostingServer("wss://broker.example/ws");
+      brokerMocks.registerHost.mockRejectedValueOnce(new Error("boom"));
+
+      const result = await useMultiplayerStore.getState().openBroker(openBrokerRequest());
+
+      expect(result).toBeNull();
+      expect(useMultiplayerStore.getState().toasts.get("generic")).toBeUndefined();
+    });
+  });
 
   it("removes open P2P seats in order before starting with current players", async () => {
     const ok = await useMultiplayerStore.getState().startP2PHostingSession(

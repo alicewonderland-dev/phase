@@ -194,6 +194,8 @@ const AUTHORED_LITERALS = [
     // no shared Rust constant to mirror, and must stay a bare literal so a future
     // bump cannot re-derive it and start refusing v9 brokers that recover.
     "MIN_LOBBY_PROTOCOL_FOR_RECOVERABLE_ROTATION",
+    // Client-only frozen floor for the format names lobby 10 introduced; no Rust mirror.
+    "MIN_LOBBY_PROTOCOL_FOR_FREEFORM_FORMATS",
     "MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL",
     "PROTOCOL_VERSION",
   ]],

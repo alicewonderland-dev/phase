@@ -97,6 +97,9 @@
     "message": "ゲームは公開リストに表示されません。P2Pでホストし、対戦相手にルームコードを直接共有できます。",
     "continueWithoutLobby": "ロビーなしで続行"
   },
+  "lobbyCapability": {
+    "formatNeedsNewerServer": "このロビーサーバーは古いため、選択したフォーマットのゲームを掲載できません（ロビープロトコル{{needed}}が必要です）。"
+  },
   "joinErrorDialog": {
     "dismiss": "閉じる"
   },

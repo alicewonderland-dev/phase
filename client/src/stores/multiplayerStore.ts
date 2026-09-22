@@ -37,6 +37,7 @@ import {
   saveWsSession,
 } from "../services/multiplayerSession";
 import {
+  LobbyCapabilityError,
   lookupJoinTargetOver,
   openBrokerClient,
   resolveGuestOver,
@@ -47,6 +48,7 @@ import {
   type RegisterHostRequest,
   type ResolveResult,
 } from "../services/brokerClient";
+import i18n from "i18next";
 import {
   createTournamentOver,
   dropFromTournamentOver,
@@ -593,6 +595,19 @@ function closeChannel(set: MultiplayerSet, get: MultiplayerGet, url: string): vo
   subscriptionChannels.delete(url);
   const status = new Map(get().sourceStatus);
   if (status.delete(url)) set({ sourceStatus: status });
+}
+
+/** Show the shared toast for a `registerHost` refusal from
+ * {@link LobbyCapabilityError}. A no-op for any other rejection, since the
+ * two `registerHost` callers already have their own handling for a generic
+ * transport error. */
+function toastLobbyCapabilityRefusal(get: MultiplayerGet, err: unknown): void {
+  if (!(err instanceof LobbyCapabilityError)) return;
+  get().showToast(
+    i18n.t("multiplayer:lobbyCapability.formatNeedsNewerServer", {
+      needed: err.neededLobbyVersion,
+    }),
+  );
 }
 
 function setSourceStatus(
@@ -3182,6 +3197,7 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
           return { broker, gameCode: registered.gameCode };
         } catch (err) {
           console.error("[openBroker] failed:", err);
+          toastLobbyCapabilityRefusal(get, err);
           return null;
         }
       },
@@ -3432,6 +3448,7 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
           ) {
             get().showToast(err.message);
           }
+          toastLobbyCapabilityRefusal(get, err);
           resetFailedHosting();
           return false;
         }

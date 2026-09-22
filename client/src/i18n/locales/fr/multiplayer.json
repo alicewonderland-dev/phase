@@ -97,6 +97,9 @@
     "message": "Votre partie ne sera pas répertoriée publiquement. Vous pouvez toujours héberger en P2P — partagez simplement le code de la salle directement avec votre adversaire.",
     "continueWithoutLobby": "Continuer sans salon"
   },
+  "lobbyCapability": {
+    "formatNeedsNewerServer": "Ce serveur de salon est trop ancien pour lister des parties dans le format choisi (il faut le protocole de lobby {{needed}})."
+  },
   "joinErrorDialog": {
     "dismiss": "Ignorer"
   },
