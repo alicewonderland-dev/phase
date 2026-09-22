@@ -568,17 +568,28 @@ export const LOBBY_MIN_SUPPORTED_SERVER_PROTOCOL = PROTOCOL_VERSION - 1;
  * PROTOCOL_VERSION moved twice for GameState-only changes and the derived lobby
  * window went disjoint from the deployed broker's.
  *
- * 10 — Prospective: no lobby variant or field changes shape in this bump.
+ * 11 — Prospective: no lobby variant or field changes shape in this bump.
  *      Moved ahead of new GameFormat variants — see LOBBY_PROTOCOL_VERSION's
- *      own `/// 10` entry in
+ *      own `/// 11` entry in
  *      crates/lobby-broker/src/protocol.rs. MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL
  *      stays at 2: this client already decodes broker → client frames with
  *      JSON.parse, which arrives at an unknown-yet format name as an
  *      ordinary string with no parse error either way, and moving the floor
- *      would evict every v2–v9 broker over a value most of them will never
- *      encounter. A pre-10 Rust broker rejects a lobby frame naming
+ *      would evict every v2–v10 broker over a value most of them will never
+ *      encounter. A pre-11 Rust broker rejects a lobby frame naming
  *      Freeform or FreeformCommander; MIN_LOBBY_PROTOCOL_FOR_FREEFORM_FORMATS
  *      below is this client's floor for them.
+ * 10 — Requested room codes. CreateGameWithSettings gains an optional
+ *     `requested_code` (#[serde(default)]) — the "a lobby field is added"
+ *     trigger — a caller-pre-minted `[A-Z0-9]{6}` code the host claims instead
+ *     of a broker-minted one. ServerErrorCode, carried server -> client on
+ *     Error.code, gains `game_not_found` and `code_in_use`. Additive, so
+ *     MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL stays at 2. This client sends
+ *     `requested_code` for Discord-link hosts and reads `code_in_use` /
+ *     `game_not_found`. No capability floor: a pre-10 broker or server silently
+ *     drops the field and mints its own code, which the host detects as
+ *     `GameCreated.game_code !== requested` and handles; `game_not_found` falls
+ *     back to the legacy message classification.
  * 9 — Recoverable credential rotation via idempotent-nonce replay.
  *     RenewTournamentCredential gains an optional `rotation_nonce` field
  *     (#[serde(default)]) — the "a lobby field is added" trigger;
@@ -670,7 +681,7 @@ export const LOBBY_MIN_SUPPORTED_SERVER_PROTOCOL = PROTOCOL_VERSION - 1;
  * 1 — Initial lobby-owned version, covering the lobby variant set unchanged
  *     since #1880.
  */
-export const LOBBY_PROTOCOL_VERSION = 10;
+export const LOBBY_PROTOCOL_VERSION = 11;
 
 /**
  * Lowest broker LOBBY_PROTOCOL_VERSION this client accepts.
@@ -792,12 +803,12 @@ export const MIN_LOBBY_PROTOCOL_FOR_RECOVERABLE_ROTATION = 9;
  * `Freeform` and `FreeformCommander`; below it a lobby frame naming either is
  * rejected as malformed.
  *
- * Frozen at 10 and written as a bare literal, never derived from
+ * Frozen at 11 and written as a bare literal, never derived from
  * LOBBY_PROTOCOL_VERSION, so a later bump cannot drag it forward and start
- * refusing v10 brokers. `scripts/check-protocol-version.mjs` refuses a derived
+ * refusing v11 brokers. `scripts/check-protocol-version.mjs` refuses a derived
  * right-hand side for it.
  */
-export const MIN_LOBBY_PROTOCOL_FOR_FREEFORM_FORMATS = 10;
+export const MIN_LOBBY_PROTOCOL_FOR_FREEFORM_FORMATS = 11;
 
 /**
  * The lowest broker `LOBBY_PROTOCOL_VERSION` that parses `format` in a lobby

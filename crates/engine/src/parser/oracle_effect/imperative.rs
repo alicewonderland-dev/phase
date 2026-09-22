@@ -6230,6 +6230,39 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
         } => {
             let mut zones = zones.into_iter();
             let zone = zones.next().unwrap_or(Zone::Hand);
+            // CR 608.2c + CR 608.2d: this clause NAMES its own zone ("a creature
+            // card in your graveyard"), so its candidate pool is that zone — not
+            // whatever set an earlier instruction in the same chain happened to
+            // publish. `Legacy` prefers the chain's tracked set whenever one
+            // exists, which silently substituted the preceding clause's output
+            // for the named zone: Rejoin the Fight offered only the three cards
+            // it had just milled and never the rest of the graveyard.
+            //
+            // EXCEPT when the filter carries `TargetFilter::ExiledBySource` —
+            // the "exiled this way" anaphor. Those clauses name a zone AND
+            // refer back to the set an EARLIER INSTRUCTION OF THIS SAME ABILITY
+            // put there, which is still CR 608.2c (the instructions are
+            // followed in the order written, and the later one refers to the
+            // earlier one's result). Deliberately NOT CR 607.2a: that rule
+            // links two SEPARATE abilities printed on one object (CR 607.1),
+            // whereas Author of Shadows and Plargg and Nassari each carry a
+            // single triggered ability whose second sentence refers to its own
+            // first sentence.
+            //
+            // Keeping `Legacy` here preserves pool PROVENANCE: the printed pool
+            // is "what this instruction exiled", which is exactly the chain's
+            // tracked set. `ExiledBySource` would independently reject cards
+            // this source never exiled, so this is not the difference between
+            // offering unrelated exile and not — it is the difference between a
+            // pool defined by the instruction and one re-derived from the zone.
+            // The `FromTrackedSet` sibling arm above covers the anaphors that
+            // name no zone ("choose one of them"); `ExiledBySource` covers the
+            // ones that do.
+            let candidate_source = if super::lower::filter_mentions_exiled_by_source(&filter) {
+                crate::types::ability::ZoneChoiceCandidateSource::Legacy
+            } else {
+                crate::types::ability::ZoneChoiceCandidateSource::Direct
+            };
             Effect::ChooseFromZone {
                 count,
                 zone,
@@ -6237,7 +6270,7 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
                 zone_owner,
                 filter: Some(filter),
                 chooser: chooser.into(),
-                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                candidate_source,
                 reciprocal_role: None,
                 up_to,
                 selection,

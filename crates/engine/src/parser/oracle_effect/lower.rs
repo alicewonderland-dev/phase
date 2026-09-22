@@ -1841,7 +1841,7 @@ pub(super) fn ensure_remember_card_after_object_choice(def: &mut AbilityDefiniti
 
 /// Recursively detect a `TargetFilter::ExiledBySource` leaf (possibly nested under
 /// `And`/`Or`) — the "exiled with ~" linked-exile marker.
-fn filter_mentions_exiled_by_source(filter: &TargetFilter) -> bool {
+pub(super) fn filter_mentions_exiled_by_source(filter: &TargetFilter) -> bool {
     match filter {
         TargetFilter::ExiledBySource => true,
         TargetFilter::And { filters } | TargetFilter::Or { filters } => {
