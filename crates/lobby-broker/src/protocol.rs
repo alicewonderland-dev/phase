@@ -1955,11 +1955,13 @@ mod tests {
     /// again at 6, once more at 7 for the format label and the "automatic + N"
     /// round option, and again at 8 for the match structure (Bo1 / Bo3): the
     /// chain grows a step and the name grows with it, rather than the tail
-    /// constant being quietly re-pointed. Version 9 breaks the pattern the
-    /// earlier steps share — it adds NO wire surface, because rotation's
-    /// SEMANTICS changed while its frames stayed byte-identical — so it extends
-    /// the chain as a BEHAVIORAL step rather than a surface one, named to say so,
-    /// all the same rather than re-pointing the tail. Version 10 is the first
+    /// constant being quietly re-pointed. Version 9 DOES add wire surface —
+    /// `RenewTournamentCredential` gains `rotation_nonce`, `#[serde(default)]`
+    /// but with no `skip_serializing_if`, so it serializes unconditionally
+    /// once present — but the field is additive on both sides (a pre-9
+    /// broker ignores it; a pre-9 client simply never sends the frame), so
+    /// it extends the chain the same way 3 through 8 did rather than forcing
+    /// a floor move. Version 10 is the first
     /// step outside the tournament surface (requested room codes); it extends
     /// the chain so the tail stays pinned rather than re-pointed, and the name
     /// grows with it, by the same rule. Version 11 is the one true non-surface

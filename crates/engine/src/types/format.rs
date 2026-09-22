@@ -1746,15 +1746,44 @@ impl GameFormat {
     /// Multiplayer games (3+ seats) always get the free first mulligan per
     /// CR 103.5c regardless of format; this predicate is the *duel* override.
     pub fn grants_free_first_mulligan(self) -> bool {
-        matches!(
-            self,
+        match self {
             GameFormat::Commander
-                | GameFormat::PauperCommander
-                | GameFormat::DuelCommander
-                | GameFormat::Oathbreaker
-                | GameFormat::Brawl
-                | GameFormat::HistoricBrawl,
-        )
+            | GameFormat::PauperCommander
+            | GameFormat::DuelCommander
+            | GameFormat::Oathbreaker
+            | GameFormat::Brawl
+            | GameFormat::HistoricBrawl
+            // Freeform Commander grants the free first mulligan, matching
+            // every other Commander-style duel above.
+            | GameFormat::FreeformCommander => true,
+            GameFormat::Standard
+            | GameFormat::Limited
+            | GameFormat::Pioneer
+            | GameFormat::Modern
+            | GameFormat::Premodern
+            | GameFormat::Legacy
+            | GameFormat::Vintage
+            | GameFormat::Historic
+            | GameFormat::Timeless
+            | GameFormat::Pauper
+            | GameFormat::TinyLeaders
+            | GameFormat::FreeForAll
+            | GameFormat::TwoHeadedGiant
+            | GameFormat::Archenemy
+            | GameFormat::Planechase
+            | GameFormat::Momir
+            | GameFormat::CommanderDraft
+            // Plain Freeform is an unrestricted constructed format, not a
+            // Commander-style or Brawl variant, so it gets neither
+            // CR 103.5c's Brawl clause nor the Commander Rules Committee's
+            // supplementary rule.
+            | GameFormat::Freeform => false,
+            // Exhaustive rather than `matches!`, matching `supplies_fixed_deck`'s
+            // and `has_unrepresentable_auxiliary_deck_component`'s style: a
+            // future built-in must force a deliberate `true`/`false` choice
+            // here.
+            GameFormat::Custom(_) => false,
+        }
     }
 
     /// Whether this format uses a commander card and the commander-damage
@@ -4039,6 +4068,16 @@ mod tests {
     #[test]
     fn limited_no_free_first_mulligan() {
         assert!(!GameFormat::Limited.grants_free_first_mulligan());
+    }
+
+    #[test]
+    fn freeform_commander_grants_free_first_mulligan() {
+        assert!(GameFormat::FreeformCommander.grants_free_first_mulligan());
+    }
+
+    #[test]
+    fn freeform_no_free_first_mulligan() {
+        assert!(!GameFormat::Freeform.grants_free_first_mulligan());
     }
 
     #[test]
