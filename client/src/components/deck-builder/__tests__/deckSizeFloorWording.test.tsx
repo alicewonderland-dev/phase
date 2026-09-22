@@ -109,4 +109,22 @@ describe("deck-size floor wording — neither component receives a format", () =
     );
     expect(screen.getByText("11/60 cards")).toBeInTheDocument();
   });
+
+  it("panel: a count of 1 takes the singular noun, not the denominator's plural", () => {
+    const name = "The Prismatic Piper";
+    render(
+      <CommanderPanel
+        commanders={[name]}
+        deck={[]}
+        deckComposition="commanders-outside"
+        cardDataCache={new Map([[name, makeLegendaryCreature(name)]])}
+        isCommanderEligible={() => true}
+        onSetCommander={vi.fn()}
+        onRemoveCommander={vi.fn()}
+        deckSizeRule={formatMetadata("FreeformCommander")!.default_config.deck_size}
+      />,
+    );
+    expect(screen.getByText("1 card")).toBeInTheDocument();
+    expect(screen.queryByText("1 cards")).toBeNull();
+  });
 });

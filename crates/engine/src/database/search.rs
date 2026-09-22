@@ -600,7 +600,7 @@ mod tests {
         }
     }
 
-    /// Row 3's pin: a format whose card data records no legality table (e.g.
+    /// A format whose card data records no legality table (e.g.
     /// Freeform, Freeform Commander) searches unfiltered rather than through a
     /// fallthrough — paired against a table-backed format that still filters.
     #[test]
