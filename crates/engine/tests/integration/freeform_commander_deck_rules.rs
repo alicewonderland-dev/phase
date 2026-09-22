@@ -11,14 +11,13 @@
 //! `GameFormat::FreeformCommander`'s doc comment in
 //! `crates/engine/src/types/format.rs`.
 //!
-//! `Wastes` is used as a universal main-deck filler wherever a Commander-family
-//! contrast needs padding to its own exact/minimum deck size without
-//! introducing a color-identity or copy-limit reason of its own: it is a
-//! Basic land (exempt from every singleton rule), its own color identity is
-//! empty (a subset of every commander's identity, so it can never be "outside"
-//! one), and it carries a `"commander": "legal"` row in the fixture. Every
-//! card name below is verified against the real card export at plan time, not
-//! from memory — see `phase5-plan-v2.md` §Step 0 and §0.3.
+//! `Wastes` is used as a main-deck filler for Commander-family deck-size
+//! padding without introducing a color-identity or copy-limit reason of its
+//! own: it is a Basic land (exempt from every singleton rule), its own color
+//! identity is empty (a subset of every commander's identity, so it can never
+//! be "outside" one), and it carries a `"commander": "legal"` row in the
+//! fixture. Every card name below is verified against the real card export at
+//! plan time, not from memory — see `phase5-plan-v2.md` §Step 0 and §0.3.
 
 use engine::database::legality::LegalityFormat;
 use engine::game::deck_loading::{load_deck_into_state, DeckEntry, DeckPayload, PlayerDeckPayload};
@@ -47,14 +46,14 @@ fn db() -> Option<&'static engine::database::CardDatabase> {
     support::shared_card_db()
 }
 
-/// §Row 2, subject 1 — any card that is neither legendary nor a creature is
+/// §Row 2, subject 1 — any card that is not a legendary creature is
 /// admitted, on both legs. The Commander contrast pads its main deck to
 /// exactly 100 `Wastes` so the deck-size check (which the summary dispatcher
 /// consults BEFORE eligibility) does not displace the eligibility refusal —
 /// without the padding, an empty main deck would make the summary leg
 /// early-return on deck size and never reach eligibility at all.
 #[test]
-fn freeform_commander_admits_a_card_that_is_neither_legendary_nor_a_creature() {
+fn freeform_commander_admits_a_card_that_is_not_a_legendary_creature() {
     let Some(db) = db() else {
         eprintln!("skipping: card database not available");
         return;
@@ -1096,7 +1095,7 @@ fn freeform_commander_declares_forty_starting_life_and_the_host_can_change_it() 
 /// §Row 9 — the main deck and the commander slot both admit a card printed
 /// only in an unreleased/preview set (FRA — Reality Fracture, no legality
 /// row at plan time); Premodern refuses the identical 60 with the legality
-/// reason alone.
+/// reason alone. Both legs.
 #[test]
 fn freeform_commander_admits_a_card_printed_only_in_reality_fracture() {
     let Some(db) = db() else {
@@ -1106,73 +1105,70 @@ fn freeform_commander_admits_a_card_printed_only_in_reality_fracture() {
     let mut deck = repeat("Craterclaw Colossus", 4);
     deck.extend(repeat("Mountain", 56));
 
-    assert_eq!(
-        validate_name_deck_for_format_full(
+    for summary_only in [false, true] {
+        let result = evaluate_deck_compatibility(
             db,
-            &deck,
-            &[],
-            &["Craterclaw Colossus".to_string()],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &FormatConfig::freeform_commander(),
-            None,
-            2,
-        ),
-        Ok(()),
-        "Freeform Commander's unrestricted pool admits a card with no legality row, in both \
-         the main deck and the commander slot"
-    );
+            &DeckCompatibilityRequest {
+                main_deck: deck.clone(),
+                commander: vec!["Craterclaw Colossus".to_string()],
+                selected_format: Some(SelectedFormat::Tag(GameFormat::FreeformCommander)),
+                summary_only,
+                ..DeckCompatibilityRequest::default()
+            },
+        );
+        assert_eq!(
+            result.selected_format_compatible,
+            Some(true),
+            "summary_only={summary_only}: Freeform Commander's unrestricted pool admits a \
+             card with no legality row, in both the main deck and the commander slot: {:?}",
+            result.selected_format_reasons
+        );
+        assert!(
+            result.selected_format_reasons.is_empty(),
+            "summary_only={summary_only}"
+        );
 
-    assert_eq!(
-        validate_name_deck_for_format_full(
+        let result = evaluate_deck_compatibility(
             db,
-            &[],
-            &[],
-            &["Craterclaw Colossus".to_string()],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &FormatConfig::freeform_commander(),
-            None,
-            2,
-        ),
-        Ok(()),
-        "the commander slot alone, with an empty main deck, must also be accepted"
-    );
+            &DeckCompatibilityRequest {
+                commander: vec!["Craterclaw Colossus".to_string()],
+                selected_format: Some(SelectedFormat::Tag(GameFormat::FreeformCommander)),
+                summary_only,
+                ..DeckCompatibilityRequest::default()
+            },
+        );
+        assert_eq!(
+            result.selected_format_compatible,
+            Some(true),
+            "summary_only={summary_only}: the commander slot alone, with an empty main deck, \
+             must also be accepted: {:?}",
+            result.selected_format_reasons
+        );
+        assert!(
+            result.selected_format_reasons.is_empty(),
+            "summary_only={summary_only}, empty main deck"
+        );
 
-    assert_eq!(
-        validate_name_deck_for_format_full(
+        let result = evaluate_deck_compatibility(
             db,
-            &deck,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &FormatConfig::premodern(),
-            None,
-            2,
-        ),
-        Err(vec![
-            "Not Premodern legal: Craterclaw Colossus (not legal in Premodern)".to_string()
-        ]),
-    );
+            &DeckCompatibilityRequest {
+                main_deck: deck.clone(),
+                selected_format: Some(SelectedFormat::Tag(GameFormat::Premodern)),
+                summary_only,
+                ..DeckCompatibilityRequest::default()
+            },
+        );
+        assert_eq!(
+            result.selected_format_reasons,
+            vec!["Not Premodern legal: Craterclaw Colossus (not legal in Premodern)".to_string()],
+            "summary_only={summary_only}"
+        );
+    }
 }
 
 /// §Row 9 — "the pool this format admits is the pool P4/3 censused",
 /// established at the axis: both formats declare the SAME `CardPool`
-/// variant. `CardPoolAuthority::for_format` (private to
-/// `game::deck_validation`, tested in that module's own `#[cfg(test)]` unit
-/// tests per `custom_format_schema.rs`'s own doc comment) maps that
-/// variant to `AdmitsEveryCard` with no per-format arm — a READ from source,
-/// not independently assertable from this integration crate.
+/// variant.
 #[test]
 fn freeform_commander_admits_the_same_pool_as_freeform() {
     assert_eq!(
@@ -1286,8 +1282,7 @@ fn freeform_commander_declares_no_sideboard() {
 /// NOT a deck-level pair, and a reader must not take it for one. The pair is
 /// taken instead at `match_flow::handle_submit_sideboard` (the function
 /// `engine.rs::apply_non_priority_pass_action` dispatches a player's
-/// `GameAction::SubmitSideboard` into) and at `load_deck_into_state`, with
-/// `Freeform` as the contrast showing a validator that DOES read the policy.
+/// `GameAction::SubmitSideboard` into) and at `load_deck_into_state`.
 #[test]
 fn freeform_commanders_sideboard_bound_is_behavioural() {
     fn card_entry(name: &str) -> DeckEntry {
@@ -1566,7 +1561,11 @@ fn no_other_command_zone_format_s_rules_moved() {
 
 /// The eligibility half of the class sweep — the leak charter row 2 says no
 /// other row would catch: `commander = [Sol Ring]` is refused by every OTHER
-/// command-zone format, each naming its own eligibility message.
+/// command-zone format, each naming its own eligibility message. Membership
+/// (`.any`), not the file's usual full-vector equality: with an empty main
+/// deck each format also emits its own deck-size reason (and Oathbreaker
+/// wants a signature spell), so a full-vector form would need a bespoke
+/// vector per format.
 #[test]
 fn no_other_command_zone_format_admits_a_card_this_format_now_admits() {
     let Some(db) = db() else {

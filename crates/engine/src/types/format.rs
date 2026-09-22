@@ -1696,15 +1696,9 @@ impl GameFormat {
             | GameFormat::Brawl
             | GameFormat::HistoricBrawl
             | GameFormat::TinyLeaders
-            // `deck_loading.rs::place_commanders` reads
-            // `command_zone_holds_decklist_commander()`, which this format
-            // answers `Ok(true)`; netting without placing starts the game a
-            // card short. This format's own rules state no deck-size
-            // requirement, so the declaration is a pinned property rather
-            // than a magnitude any verdict reads (MEASURED:
-            // `deck_size_subject_count`'s only consumer is
-            // `deck_size.accepts`, and `Minimum(0).accepts(n)` holds for
-            // every count).
+            // This format's own rules state no deck-size requirement, so
+            // the declaration is a pinned property rather than a magnitude
+            // any verdict reads.
             | GameFormat::FreeformCommander => DeckSizeSubject::MainDeckAndCommanders,
             GameFormat::Oathbreaker => DeckSizeSubject::MainDeckAndCommandZone,
             GameFormat::Standard
