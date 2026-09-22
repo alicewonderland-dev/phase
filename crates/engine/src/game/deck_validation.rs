@@ -7416,6 +7416,251 @@ mod tests {
         assert!(!are_valid_partners(&commander, &bg, None));
     }
 
+    /// In Freeform Commander, a
+    /// pairing is decided by the partner keywords the two cards carry, not by
+    /// whether either card is legendary — a deliberate departure from
+    /// CR 702.124a's "two legendary cards", matching the format's admission of
+    /// a non-legendary solo commander. The fixture is synthetic: the integration
+    /// fixture carries no non-legendary "Partner with" pair, and no printed
+    /// Background is non-legendary.
+    /// Every face here leaves `is_commander` absent — a real Background
+    /// carries `is_commander: true`, and `is_commander_eligible` returns early
+    /// on it, which would make Commander's control leg (3) pass for the wrong
+    /// reason (the flag, not CR 903.3's legendary-creature test).
+    fn freeform_commander_anything_goes_db_json() -> String {
+        fn face(
+            name: &str,
+            supertypes: &[&str],
+            core_types: &[&str],
+            subtypes: &[&str],
+            keywords: serde_json::Value,
+        ) -> Value {
+            serde_json::json!({
+                "name": name,
+                "mana_cost": { "type": "NoCost" },
+                "card_type": {
+                    "supertypes": supertypes,
+                    "core_types": core_types,
+                    "subtypes": subtypes
+                },
+                "power": if core_types.contains(&"Creature") { Value::String("1".to_string()) } else { Value::Null },
+                "toughness": if core_types.contains(&"Creature") { Value::String("1".to_string()) } else { Value::Null },
+                "loyalty": null, "defense": null,
+                "oracle_text": null, "non_ability_text": null, "flavor_name": null,
+                "keywords": keywords,
+                "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": null, "scryfall_oracle_id": null, "legalities": {}
+            })
+        }
+        let mut cards = Map::new();
+        // Pair (1): two NON-LEGENDARY creatures, each "Partner with" the other.
+        cards.insert(
+            "test partner alpha".to_string(),
+            face(
+                "Test Partner Alpha",
+                &[],
+                &["Creature"],
+                &["Human"],
+                serde_json::json!([{ "Partner": { "type": "With", "data": "Test Partner Beta" } }]),
+            ),
+        );
+        cards.insert(
+            "test partner beta".to_string(),
+            face(
+                "Test Partner Beta",
+                &[],
+                &["Creature"],
+                &["Human"],
+                serde_json::json!([{ "Partner": { "type": "With", "data": "Test Partner Alpha" } }]),
+            ),
+        );
+        // Pair (2): a legendary Choose-a-Background commander + a NON-LEGENDARY
+        // Background enchantment.
+        cards.insert(
+            "test background commander".to_string(),
+            face(
+                "Test Background Commander",
+                &["Legendary"],
+                &["Creature"],
+                &["Human"],
+                serde_json::json!([{ "Partner": { "type": "ChooseABackground" } }]),
+            ),
+        );
+        cards.insert(
+            "test non-legendary background".to_string(),
+            face(
+                "Test Non-Legendary Background",
+                &[],
+                &["Enchantment"],
+                &["Background"],
+                serde_json::json!([]),
+            ),
+        );
+        // Selectivity control (4): a NON-Background, non-partner card.
+        cards.insert(
+            "test generic artifact".to_string(),
+            face(
+                "Test Generic Artifact",
+                &[],
+                &["Artifact"],
+                &[],
+                serde_json::json!([]),
+            ),
+        );
+        // Format-scoping control (3): padding so Commander's exact-100 deck
+        // size check passes without itself contributing a legality/singleton
+        // violation (CR 100.2a's basic-land exemption).
+        cards.insert(
+            "test wastes".to_string(),
+            face(
+                "Test Wastes",
+                &["Basic"],
+                &["Land"],
+                &["Wastes"],
+                serde_json::json!([]),
+            ),
+        );
+        Value::Object(cards).to_string()
+    }
+
+    /// Pins the Freeform Commander pairing rule directly. This format declares
+    /// no partner grant, and without one pairing reads only the partner
+    /// keywords the two cards carry, never whether either is legendary.
+    #[test]
+    fn freeform_commander_admits_non_legendary_partner_pairs() {
+        let db = CardDatabase::from_json_str(&freeform_commander_anything_goes_db_json()).unwrap();
+        let wastes_98 = expand("Test Wastes", 98);
+
+        // (1) ADMIT: two non-legendary creatures, each "Partner with" the other.
+        let pair_1 = vec![
+            "Test Partner Alpha".to_string(),
+            "Test Partner Beta".to_string(),
+        ];
+        // (2) ADMIT: legendary Choose-a-Background commander + non-legendary Background.
+        let pair_2 = vec![
+            "Test Background Commander".to_string(),
+            "Test Non-Legendary Background".to_string(),
+        ];
+
+        for (label, pair) in [("pair 1", &pair_1), ("pair 2", &pair_2)] {
+            for summary_only in [false, true] {
+                let request = DeckCompatibilityRequest {
+                    main_deck: Vec::new(),
+                    commander: pair.clone(),
+                    selected_format: Some(SelectedFormat::Tag(GameFormat::FreeformCommander)),
+                    summary_only,
+                    ..DeckCompatibilityRequest::default()
+                };
+                let result = evaluate_deck_compatibility(&db, &request);
+                assert_eq!(
+                    result.selected_format_compatible,
+                    Some(true),
+                    "{label} summary_only={summary_only}: {:?}",
+                    result.selected_format_reasons
+                );
+            }
+
+            let full = validate_name_deck_for_format_full(
+                &db,
+                &[],
+                &[],
+                pair,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &FormatConfig::freeform_commander(),
+                None,
+                2,
+            );
+            assert_eq!(full, Ok(()), "{label} full leg");
+        }
+
+        // (3) FORMAT-SCOPING CONTROL: Commander refuses both pairs, but at
+        // ELIGIBILITY (a non-legendary card cannot be a commander at all),
+        // not at pairing — proving admission is THIS FORMAT's rule, not that
+        // the pairing check itself is selective. Padded to a legal 100-card
+        // Commander deck (`quick_commander_check`, the summary leg, checks
+        // deck size before eligibility on its first-failure return) so the
+        // isolated reasons are eligibility/pairing alone. Uses the full leg,
+        // whose reasons this control actually inspects.
+        for pair in [&pair_1, &pair_2] {
+            let full = validate_name_deck_for_format_full(
+                &db,
+                &wastes_98,
+                &[],
+                pair,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &FormatConfig::commander(),
+                None,
+                2,
+            );
+            let Err(reasons) = full else {
+                panic!("expected Commander to refuse {pair:?}, got Ok(())");
+            };
+            // Membership, not an exact list: synthetic cards also draw a
+            // "Not Commander legal" reason from the empty `legalities` map,
+            // which is not what this control is pinning.
+            assert!(
+                reasons
+                    .iter()
+                    .any(|r| r.contains("must be legendary creatures")),
+                "{pair:?}: {reasons:?}"
+            );
+        }
+
+        // (4) SELECTIVITY CONTROL: the Choose-a-Background commander refuses
+        // pairing with a card that is neither Background nor a partner —
+        // "anything goes" did not become "any two cards".
+        let pair_4 = vec![
+            "Test Background Commander".to_string(),
+            "Test Generic Artifact".to_string(),
+        ];
+        for summary_only in [false, true] {
+            let request = DeckCompatibilityRequest {
+                main_deck: Vec::new(),
+                commander: pair_4.clone(),
+                selected_format: Some(SelectedFormat::Tag(GameFormat::FreeformCommander)),
+                summary_only,
+                ..DeckCompatibilityRequest::default()
+            };
+            let result = evaluate_deck_compatibility(&db, &request);
+            assert_eq!(
+                result.selected_format_compatible,
+                Some(false),
+                "pair 4 summary_only={summary_only}: {:?}",
+                result.selected_format_reasons
+            );
+        }
+        let full_4 = validate_name_deck_for_format_full(
+            &db,
+            &[],
+            &[],
+            &pair_4,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &FormatConfig::freeform_commander(),
+            None,
+            2,
+        );
+        assert_eq!(
+            full_4,
+            Err(vec![
+                "Invalid partner pairing: Test Background Commander and Test Generic Artifact do \
+                 not have compatible partner keywords"
+                    .to_string()
+            ])
+        );
+    }
+
     #[test]
     fn commander_eligibility_uses_parsed_permission_text() {
         let mut face = CardFace {

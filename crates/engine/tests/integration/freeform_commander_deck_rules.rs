@@ -627,8 +627,7 @@ fn freeform_commander_pairing_still_refuses_a_card_its_eligibility_admits() {
     };
     let wastes_98 = repeat("Wastes", 98);
 
-    // Sub-class A: not legendary. CR 702.124a restricts every partner
-    // ability to designating two LEGENDARY cards.
+    // Sub-class A: no partner ability at all.
     let ffc_a = validate_name_deck_for_format_full(
         db,
         &[],
