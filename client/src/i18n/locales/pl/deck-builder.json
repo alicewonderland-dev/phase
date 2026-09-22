@@ -222,6 +222,7 @@
     "identity": "Tożsamość:",
     "setAsCommander": "Ustaw jako dowódcę:",
     "cardCount": "{{count}}/{{expected}} kart",
+    "cardCountNoMinimum": "{{count}} kart",
     "singletonViolations": "Naruszenia zasady singletona: {{cards}}",
     "colorViolations": "Naruszenia tożsamości kolorów: {{cards}}",
     "signatureSpell": {

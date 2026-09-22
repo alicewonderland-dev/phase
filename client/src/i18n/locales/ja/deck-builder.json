@@ -222,6 +222,7 @@
     "identity": "アイデンティティ:",
     "setAsCommander": "統率者に設定:",
     "cardCount": "{{count}}/{{expected}}枚",
+    "cardCountNoMinimum": "{{count}}枚",
     "singletonViolations": "1枚制限違反: {{cards}}",
     "colorViolations": "固有色違反: {{cards}}",
     "signatureSpell": {

@@ -79,6 +79,7 @@
     "draws_one": " ({{count}} draw)",
     "draws_other": " ({{count}} draws)",
     "main": "Main ({{count}}, min {{min}})",
+    "mainNoMinimum": "Main ({{count}})",
     "sideboard": "Sideboard ({{count}})",
     "sideboardCapped": "Sideboard ({{count}}/{{max}})",
     "moveFromSideboard": "Move cards from the sideboard.",

@@ -79,6 +79,7 @@
     "draws_one": " ({{count}} pareggio)",
     "draws_other": " ({{count}} pareggi)",
     "main": "Principale ({{count}}, min {{min}})",
+    "mainNoMinimum": "Principale ({{count}})",
     "sideboard": "Sideboard ({{count}})",
     "sideboardCapped": "Sideboard ({{count}}/{{max}})",
     "moveFromSideboard": "Sposta carte dalla sideboard.",

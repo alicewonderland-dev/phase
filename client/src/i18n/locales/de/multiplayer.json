@@ -79,6 +79,7 @@
     "draws_one": " ({{count}} Unentschieden)",
     "draws_other": " ({{count}} Unentschieden)",
     "main": "Haupt ({{count}}, min. {{min}})",
+    "mainNoMinimum": "Haupt ({{count}})",
     "sideboard": "Sideboard ({{count}})",
     "sideboardCapped": "Sideboard ({{count}}/{{max}})",
     "moveFromSideboard": "Karten aus dem Sideboard verschieben.",

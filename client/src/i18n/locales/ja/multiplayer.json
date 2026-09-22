@@ -79,6 +79,7 @@
     "draws_one": "（{{count}}引き分け）",
     "draws_other": "（{{count}}引き分け）",
     "main": "メイン（{{count}}、最低{{min}}）",
+    "mainNoMinimum": "メイン（{{count}}）",
     "sideboard": "サイドボード（{{count}}）",
     "sideboardCapped": "サイドボード（{{count}}/{{max}}）",
     "moveFromSideboard": "サイドボードからカードを移動します。",

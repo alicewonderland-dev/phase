@@ -35,6 +35,10 @@ pub struct FormatMetadata {
     /// One-line human description suitable for a card or tooltip.
     pub description: &'static str,
     pub group: FormatGroup,
+    /// `GameFormat::legality_key` of `format`: the key the engine's legality
+    /// maps record this format's legality table under, or `None` when the card
+    /// data records no table for it.
+    pub legality_key: Option<&'static str>,
     pub default_config: FormatConfig,
 }
 
@@ -1446,6 +1450,20 @@ impl GameFormat {
         }
     }
 
+    /// The legality table the card data records for this format, if any —
+    /// whether or not this format's deck validation consults it, which is
+    /// `card_pool`'s question.
+    pub fn recorded_legality_table(self) -> Option<LegalityFormat> {
+        LegalityFormat::ALL
+            .into_iter()
+            .find(|table| legality_table_format(*table) == self)
+    }
+
+    /// [`Self::recorded_legality_table`]'s key in the engine's legality maps.
+    pub fn legality_key(self) -> Option<&'static str> {
+        self.recorded_legality_table().map(LegalityFormat::as_key)
+    }
+
     /// How many commanders this format's decklist may designate. Whether a
     /// specific count is admitted is `CommanderPairing::admits_count`'s call
     /// — the single authority for that decision. Callers must not re-derive
@@ -2041,6 +2059,7 @@ impl GameFormat {
                 short_label: "STD",
                 description: "Rotating card pool",
                 group: FormatGroup::Constructed,
+                legality_key: GameFormat::Standard.legality_key(),
                 default_config: FormatConfig::standard(),
             },
             FormatMetadata {
@@ -2049,6 +2068,7 @@ impl GameFormat {
                 short_label: "PIO",
                 description: "Non-rotating from 2012",
                 group: FormatGroup::Constructed,
+                legality_key: GameFormat::Pioneer.legality_key(),
                 default_config: FormatConfig::pioneer(),
             },
             FormatMetadata {
@@ -2057,6 +2077,7 @@ impl GameFormat {
                 short_label: "MOD",
                 description: "Non-rotating from Mirrodin onward",
                 group: FormatGroup::Constructed,
+                legality_key: GameFormat::Modern.legality_key(),
                 default_config: FormatConfig::modern(),
             },
             FormatMetadata {
@@ -2065,6 +2086,7 @@ impl GameFormat {
                 short_label: "PRE",
                 description: "Old-frame constructed through Scourge",
                 group: FormatGroup::Constructed,
+                legality_key: GameFormat::Premodern.legality_key(),
                 default_config: FormatConfig::premodern(),
             },
             FormatMetadata {
@@ -2073,6 +2095,7 @@ impl GameFormat {
                 short_label: "LEG",
                 description: "Eternal format, all sets legal",
                 group: FormatGroup::Constructed,
+                legality_key: GameFormat::Legacy.legality_key(),
                 default_config: FormatConfig::legacy(),
             },
             FormatMetadata {
@@ -2081,6 +2104,7 @@ impl GameFormat {
                 short_label: "VIN",
                 description: "Broadest pool, Power Nine restricted",
                 group: FormatGroup::Constructed,
+                legality_key: GameFormat::Vintage.legality_key(),
                 default_config: FormatConfig::vintage(),
             },
             FormatMetadata {
@@ -2089,6 +2113,7 @@ impl GameFormat {
                 short_label: "HIS",
                 description: "Arena's eternal format",
                 group: FormatGroup::Constructed,
+                legality_key: GameFormat::Historic.legality_key(),
                 default_config: FormatConfig::historic(),
             },
             FormatMetadata {
@@ -2097,6 +2122,7 @@ impl GameFormat {
                 short_label: "TML",
                 description: "Arena's eternal non-rotating format",
                 group: FormatGroup::Constructed,
+                legality_key: GameFormat::Timeless.legality_key(),
                 default_config: FormatConfig::timeless(),
             },
             FormatMetadata {
@@ -2105,6 +2131,7 @@ impl GameFormat {
                 short_label: "PAU",
                 description: "Commons only",
                 group: FormatGroup::Constructed,
+                legality_key: GameFormat::Pauper.legality_key(),
                 default_config: FormatConfig::pauper(),
             },
             FormatMetadata {
@@ -2113,6 +2140,7 @@ impl GameFormat {
                 short_label: "FRF",
                 description: "Every set, no bans, no copy limit, no deck minimum",
                 group: FormatGroup::Constructed,
+                legality_key: GameFormat::Freeform.legality_key(),
                 default_config: FormatConfig::freeform(),
             },
             FormatMetadata {
@@ -2121,6 +2149,7 @@ impl GameFormat {
                 short_label: "CMD",
                 description: "100-card singleton, 2\u{2013}4 players",
                 group: FormatGroup::Commander,
+                legality_key: GameFormat::Commander.legality_key(),
                 default_config: FormatConfig::commander(),
             },
             FormatMetadata {
@@ -2129,6 +2158,7 @@ impl GameFormat {
                 short_label: "DUC",
                 description: "Tournament 1v1 Commander, 30 life",
                 group: FormatGroup::Commander,
+                legality_key: GameFormat::DuelCommander.legality_key(),
                 default_config: FormatConfig::duel_commander(),
             },
             FormatMetadata {
@@ -2137,6 +2167,7 @@ impl GameFormat {
                 short_label: "PDH",
                 description: "Commons-only singleton Commander",
                 group: FormatGroup::Commander,
+                legality_key: GameFormat::PauperCommander.legality_key(),
                 default_config: FormatConfig::pauper_commander(),
             },
             FormatMetadata {
@@ -2145,6 +2176,7 @@ impl GameFormat {
                 short_label: "TLR",
                 description: "50-card Tiny singleton",
                 group: FormatGroup::Commander,
+                legality_key: GameFormat::TinyLeaders.legality_key(),
                 default_config: FormatConfig::tiny_leaders(),
             },
             FormatMetadata {
@@ -2153,6 +2185,7 @@ impl GameFormat {
                 short_label: "OBK",
                 description: "60-card singleton, Planeswalker + signature spell",
                 group: FormatGroup::Commander,
+                legality_key: GameFormat::Oathbreaker.legality_key(),
                 default_config: FormatConfig::oathbreaker(),
             },
             FormatMetadata {
@@ -2161,6 +2194,7 @@ impl GameFormat {
                 short_label: "BRL",
                 description: "60-card Standard singleton",
                 group: FormatGroup::Commander,
+                legality_key: GameFormat::Brawl.legality_key(),
                 default_config: FormatConfig::brawl(),
             },
             FormatMetadata {
@@ -2169,6 +2203,7 @@ impl GameFormat {
                 short_label: "HBR",
                 description: "100-card eternal singleton",
                 group: FormatGroup::Commander,
+                legality_key: GameFormat::HistoricBrawl.legality_key(),
                 default_config: FormatConfig::historic_brawl(),
             },
             FormatMetadata {
@@ -2177,6 +2212,7 @@ impl GameFormat {
                 short_label: "CDR",
                 description: "Drafted 60-card minimum Commander, 3\u{2013}8 players",
                 group: FormatGroup::Commander,
+                legality_key: GameFormat::CommanderDraft.legality_key(),
                 default_config: FormatConfig::commander_draft(),
             },
             FormatMetadata {
@@ -2185,6 +2221,7 @@ impl GameFormat {
                 short_label: "FFC",
                 description: "Any castable card as your commander, every set, no deck minimum",
                 group: FormatGroup::Commander,
+                legality_key: GameFormat::FreeformCommander.legality_key(),
                 default_config: FormatConfig::freeform_commander(),
             },
             FormatMetadata {
@@ -2193,6 +2230,7 @@ impl GameFormat {
                 short_label: "FFA",
                 description: "3\u{2013}6 player battle royale",
                 group: FormatGroup::Multiplayer,
+                legality_key: GameFormat::FreeForAll.legality_key(),
                 default_config: FormatConfig::free_for_all(),
             },
             FormatMetadata {
@@ -2201,6 +2239,7 @@ impl GameFormat {
                 short_label: "2HG",
                 description: "4 players, two teams of two",
                 group: FormatGroup::Multiplayer,
+                legality_key: GameFormat::TwoHeadedGiant.legality_key(),
                 default_config: FormatConfig::two_headed_giant(),
             },
             FormatMetadata {
@@ -2209,6 +2248,7 @@ impl GameFormat {
                 short_label: "ARC",
                 description: "One archenemy against a team of heroes",
                 group: FormatGroup::Multiplayer,
+                legality_key: GameFormat::Archenemy.legality_key(),
                 default_config: FormatConfig::archenemy(),
             },
             FormatMetadata {
@@ -2217,6 +2257,7 @@ impl GameFormat {
                 short_label: "PLC",
                 description: "60-card multiplayer with a communal planar deck",
                 group: FormatGroup::Multiplayer,
+                legality_key: GameFormat::Planechase.legality_key(),
                 default_config: FormatConfig::planechase(),
             },
             FormatMetadata {
@@ -2225,6 +2266,7 @@ impl GameFormat {
                 short_label: "LIM",
                 description: "Draft or sealed, 40-card deck",
                 group: FormatGroup::Limited,
+                legality_key: GameFormat::Limited.legality_key(),
                 default_config: FormatConfig::limited(),
             },
             FormatMetadata {
@@ -2233,9 +2275,32 @@ impl GameFormat {
                 short_label: "MOM",
                 description: "60 snow basic lands, random creature tokens",
                 group: FormatGroup::Multiplayer,
+                legality_key: GameFormat::Momir.legality_key(),
                 default_config: FormatConfig::momir(),
             },
         ]
+    }
+}
+
+/// The built-in format each legality table records. Exhaustive, so a new
+/// table cannot compile until it names its format.
+fn legality_table_format(table: LegalityFormat) -> GameFormat {
+    match table {
+        LegalityFormat::Standard => GameFormat::Standard,
+        LegalityFormat::Commander => GameFormat::Commander,
+        LegalityFormat::Modern => GameFormat::Modern,
+        LegalityFormat::Premodern => GameFormat::Premodern,
+        LegalityFormat::Pioneer => GameFormat::Pioneer,
+        LegalityFormat::Legacy => GameFormat::Legacy,
+        LegalityFormat::Vintage => GameFormat::Vintage,
+        LegalityFormat::Pauper => GameFormat::Pauper,
+        LegalityFormat::Historic => GameFormat::Historic,
+        LegalityFormat::Brawl => GameFormat::HistoricBrawl,
+        LegalityFormat::StandardBrawl => GameFormat::Brawl,
+        LegalityFormat::Timeless => GameFormat::Timeless,
+        LegalityFormat::PauperCommander => GameFormat::PauperCommander,
+        LegalityFormat::DuelCommander => GameFormat::DuelCommander,
+        LegalityFormat::Oathbreaker => GameFormat::Oathbreaker,
     }
 }
 
@@ -4486,6 +4551,91 @@ mod tests {
              its own key all look like this — and all of them survive the \
              sequence check above",
             lowest.0, lowest.1, highest.0, highest.1
+        );
+    }
+
+    #[test]
+    fn recorded_legality_table_agrees_with_every_table_backed_card_pool() {
+        use strum::IntoEnumIterator;
+
+        let mut saw_table_backed = false;
+        let mut saw_unrestricted = false;
+        for format in GameFormat::iter() {
+            match format.card_pool() {
+                CardPool::LegalityTable(t) => {
+                    saw_table_backed = true;
+                    assert_eq!(format.recorded_legality_table(), Some(t));
+                }
+                CardPool::Unrestricted => {
+                    saw_unrestricted = true;
+                    assert_eq!(format.recorded_legality_table(), None);
+                }
+                CardPool::NoEngineAuthority | CardPool::DeclaredRules => {}
+            }
+        }
+        assert!(saw_table_backed, "the set must not be empty");
+        assert!(saw_unrestricted, "the set must not be empty");
+    }
+
+    #[test]
+    fn every_legality_table_records_exactly_one_registry_format() {
+        let registry = GameFormat::registry();
+        for t in LegalityFormat::ALL {
+            let format = legality_table_format(t);
+            assert!(registry.iter().any(|meta| meta.format == format));
+            assert_eq!(format.recorded_legality_table(), Some(t));
+        }
+    }
+
+    #[test]
+    fn registry_entries_publish_their_own_formats_legality_key() {
+        for meta in GameFormat::registry() {
+            assert_eq!(
+                meta.legality_key,
+                meta.format.legality_key(),
+                "{:?}",
+                meta.format
+            );
+        }
+    }
+
+    /// `client/src/data/formatRegistry.ts`'s `legality_key` lines must equal
+    /// the engine's, entry by entry. The client names its deck-browser
+    /// legality lens from them.
+    #[test]
+    fn client_format_registry_legality_keys_match_the_engine() {
+        const REGISTRY_TS: &str = include_str!("../../../../client/src/data/formatRegistry.ts");
+
+        let found: Vec<Option<String>> = REGISTRY_TS
+            .lines()
+            .map(crate::source_census::code)
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                trimmed.strip_prefix("legality_key: ")
+            })
+            .map(|rest| {
+                let rest = rest.trim().strip_suffix(',').unwrap_or(rest.trim());
+                if rest == "null" {
+                    None
+                } else if let Some(token) = rest.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+                {
+                    Some(token.to_owned())
+                } else {
+                    panic!("unrecognized legality_key line: {rest:?}");
+                }
+            })
+            .collect();
+
+        let expected: Vec<Option<String>> = GameFormat::registry()
+            .iter()
+            .map(|meta| meta.legality_key.map(str::to_owned))
+            .collect();
+
+        assert!(!expected.is_empty());
+        assert_eq!(
+            found, expected,
+            "client/src/data/formatRegistry.ts's legality_key lines must equal \
+             the engine's, entry by entry"
         );
     }
 

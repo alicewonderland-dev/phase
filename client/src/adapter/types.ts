@@ -412,6 +412,8 @@ export interface FormatMetadata {
   short_label: string;
   description: string;
   group: FormatGroup;
+  /** Engine-published key of this format's legality table; null when the card data records none. */
+  legality_key: string | null;
   default_config: FormatConfig;
 }
 

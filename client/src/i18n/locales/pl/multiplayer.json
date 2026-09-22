@@ -79,6 +79,7 @@
     "draws_one": " ({{count}} remis)",
     "draws_other": " ({{count}} remisów)",
     "main": "Główna ({{count}}, min {{min}})",
+    "mainNoMinimum": "Główna ({{count}})",
     "sideboard": "Karty boczne ({{count}})",
     "sideboardCapped": "Karty boczne ({{count}}/{{max}})",
     "moveFromSideboard": "Przenieś karty z kart bocznych.",

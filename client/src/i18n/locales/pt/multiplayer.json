@@ -79,6 +79,7 @@
     "draws_one": " ({{count}} empate)",
     "draws_other": " ({{count}} empates)",
     "main": "Principal ({{count}}, mín. {{min}})",
+    "mainNoMinimum": "Principal ({{count}})",
     "sideboard": "Sideboard ({{count}})",
     "sideboardCapped": "Sideboard ({{count}}/{{max}})",
     "moveFromSideboard": "Mova cartas do sideboard.",
