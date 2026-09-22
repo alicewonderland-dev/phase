@@ -6628,9 +6628,13 @@ fn combat_relation_subject_id(
 
 /// CR 400.7 + CR 608.2h: The exact incarnation `subject` names. A triggered
 /// source is named by the identity its trigger captured — for a
-/// leaves-the-battlefield trigger, the incarnation that left (CR 603.10a).
-/// Otherwise the live object at the referenced id is used; an object that left
-/// and returned is a new object (CR 400.7) and finds nothing its predecessor
+/// leaves-the-battlefield trigger, the incarnation that left (CR 603.10a). An
+/// activated ability carries no trigger identity, so it falls to the
+/// incarnation stamped onto it when it reached the stack
+/// (CR 113.7a's "last known information" for a source that has since left the
+/// zone it was expected to be in). Only when neither is available does this
+/// fall to the live object at the referenced id; an object that left and
+/// returned is a new object (CR 400.7) and finds nothing its predecessor
 /// recorded. `ParentTarget` prefers the incarnation pinned when it was chosen.
 fn combat_relation_subject_ref(
     state: &GameState,
@@ -6647,6 +6651,12 @@ fn combat_relation_subject_ref(
         CombatRelationSubject::Source => source
             .trigger_source
             .map(|context| context.identity.reference)
+            .or_else(|| {
+                source
+                    .ability
+                    .and_then(|ability| ability.source_incarnation)
+                    .map(|incarnation| ObjectIncarnationRef::of(source.id, incarnation))
+            })
             .or_else(|| live(source.id)),
         CombatRelationSubject::ParentTarget => {
             let ability = source.ability?;
@@ -12566,7 +12576,7 @@ mod tests {
         );
 
         // (b) With no pins at all and the live object left at the recorded
-        // incarnation (no bump), the fallback to the live object finds the block.
+        // incarnation, the fallback to the live object finds the block.
         state.objects.get_mut(&blocker).unwrap().incarnation = blocked_at.incarnation;
         let ctx = FilterContext::from_ability(&unpinned);
         assert!(

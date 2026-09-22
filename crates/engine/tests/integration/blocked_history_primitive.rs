@@ -886,6 +886,119 @@ fn a_blocker_that_left_and_returned_does_not_inherit_its_predecessors_blocks() {
     );
 }
 
+/// T14 — an ACTIVATED ability's `Source` must resolve through the incarnation
+/// stamped at push time (CR 400.7 + CR 113.7a), not fall
+/// straight to the live object the way T13's untriggered lookup does. The
+/// blocker's no-cost activated ability reaches the stack while it is still the
+/// incarnation that blocked; it is then blinked in response, so by the time the
+/// filter is evaluated the live object is a new, unrelated incarnation (CR
+/// 400.7) and only the stamped `source_incarnation` still names what blocked.
+#[test]
+fn an_activated_ability_finds_its_stamped_incarnation_not_the_live_object() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let attacker = scenario.add_creature(P0, "Attacker", 2, 2).id();
+    let blocker = scenario
+        .add_creature_from_oracle(P1, "Blocker", 2, 2, "{0}: You gain 1 life.")
+        .id();
+    let ephemerate = scenario
+        .add_spell_to_hand_from_oracle(P1, "Ephemerate", true, EPHEMERATE)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+
+    drive_declare_blockers(
+        &mut runner,
+        vec![(attacker, AttackTarget::Player(P1))],
+        vec![],
+        vec![(blocker, attacker)],
+    );
+    let blocker_ref_at_block = ObjectIncarnationRef::from_object(&runner.state().objects[&blocker]);
+
+    give_priority(&mut runner, P1);
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: blocker,
+            ability_index: 0,
+        })
+        .expect("activating the blocker's {0} ability must succeed");
+
+    {
+        let state = runner.state();
+        let entry = state
+            .stack
+            .iter()
+            .find(|entry| {
+                matches!(&entry.kind, StackEntryKind::ActivatedAbility { source_id, .. } if *source_id == blocker)
+            })
+            .expect("reach guard: the activated ability must be on the stack, unresolved");
+        let StackEntryKind::ActivatedAbility { ability, .. } = &entry.kind else {
+            unreachable!("matched above")
+        };
+        assert!(
+            ability.trigger_source.is_none(),
+            "reach guard: an activated ability carries no trigger-captured identity"
+        );
+        assert_eq!(
+            ability.source_incarnation,
+            Some(blocker_ref_at_block.incarnation),
+            "reach guard: the ability must carry the incarnation that just blocked"
+        );
+    }
+
+    // In response, blink the blocker — it returns as a new object (CR 400.7)
+    // while its OWN activated ability is still unresolved beneath Ephemerate
+    // on the stack.
+    let mut commit = runner.cast(ephemerate).target_object(blocker).commit();
+    commit
+        .act(GameAction::PassPriority)
+        .expect("P1 passes priority back");
+    commit
+        .act(GameAction::PassPriority)
+        .expect("P0 passes; Ephemerate resolves, blinking the blocker");
+
+    let state = commit.state();
+    assert_eq!(
+        state.objects[&blocker].zone,
+        Zone::Battlefield,
+        "reach guard: the blinked blocker must be back on the battlefield"
+    );
+    assert_ne!(
+        state.objects[&blocker].incarnation, blocker_ref_at_block.incarnation,
+        "reach guard: the blink must bump the blocker's incarnation (CR 400.7)"
+    );
+    let entry = state
+        .stack
+        .iter()
+        .find(|entry| {
+            matches!(&entry.kind, StackEntryKind::ActivatedAbility { source_id, .. } if *source_id == blocker)
+        })
+        .expect("reach guard: the activated ability must still be on the stack, unresolved");
+    let StackEntryKind::ActivatedAbility { ability, .. } = &entry.kind else {
+        unreachable!("matched above")
+    };
+
+    let ctx = FilterContext::from_ability(ability);
+    for scope in [CombatHistoryScope::ThisCombat, CombatHistoryScope::ThisTurn] {
+        let history_filter = combat_relation_filter(CombatRelation::BlockedBySubject { scope });
+        assert!(
+            matches_target_filter(state, attacker, &history_filter, &ctx),
+            "{scope:?}: CR 608.2h: the activated ability's stamped incarnation must still find what it blocked"
+        );
+    }
+
+    // Negative control: a context for the RETURNED object, carrying no stored
+    // incarnation, must not inherit its predecessor's blocks.
+    let live_ctx = FilterContext::from_source_with_controller(blocker, P1);
+    for scope in [CombatHistoryScope::ThisCombat, CombatHistoryScope::ThisTurn] {
+        let history_filter = combat_relation_filter(CombatRelation::BlockedBySubject { scope });
+        assert!(
+            !matches_target_filter(state, attacker, &history_filter, &live_ctx),
+            "{scope:?}: CR 400.7: the returned blocker's live incarnation must not inherit its predecessor's blocks"
+        );
+    }
+}
+
 /// T12a: `CombatState::creature_blocked_attackers_this_combat` must participate
 /// in `impl PartialEq for CombatState` (E3), or an omission from the loop-cover
 /// gate (`analysis::resource::eq_except_growable`) would be indistinguishable
