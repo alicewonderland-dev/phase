@@ -6658,8 +6658,8 @@ mod deck_list_seat_validation_tests {
         }
     }
 
-    /// Charter row 2's "establish separately that the verdict is reached
-    /// through the surface the client actually calls" — driven through
+    /// Establishes separately that the verdict is reached
+    /// through the surface the client actually calls — driven through
     /// `validate_deck_list_seats`, the seat loop `initialize_game_impl` runs
     /// at the game-creation boundary, rather than censused from source.
     #[test]

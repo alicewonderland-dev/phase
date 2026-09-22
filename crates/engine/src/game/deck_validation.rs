@@ -1249,7 +1249,7 @@ impl CommanderVariantRules {
         }
     }
 
-    /// Fixed decisions 9 and 10(b): this format widens WHO may be designated
+    /// This format widens WHO may be designated
     /// (see `is_freeform_commander_eligible`); `partner_grant` is `None`
     /// exactly as it is for every variant CR 903.13f(3) does not reach.
     ///
@@ -4199,7 +4199,7 @@ pub fn is_commander_eligible(face: &CardFace) -> bool {
     crate::database::synthesis::type_line_commander_eligible(face)
 }
 
-/// Fixed decision 9's commander eligibility for `GameFormat::FreeformCommander`:
+/// Commander eligibility for `GameFormat::FreeformCommander`:
 /// any card that can be CAST. A land cannot — CR 305.1 makes playing a land a
 /// special action rather than casting a spell, and CR 305.9 extends that to a
 /// card that is both a land and another type ("it can be played only as a land.
@@ -6659,7 +6659,7 @@ mod tests {
     fn an_unresolved_custom_pool_refuses_rather_than_admits() {
         let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
         // `for_format`'s `DeclaredRules` arm, asserted rather than assumed
-        // unreachable — no production dispatch reaches it (§V.R5).
+        // unreachable — no production dispatch reaches it.
         assert_eq!(
             CardPoolAuthority::for_format(GameFormat::Custom(CustomFormatId(0)))
                 .status(&db, "Plains"),
@@ -6762,7 +6762,7 @@ mod tests {
         // No production path delivers the reverse fixture (a signature spell
         // with the commander empty): both dispatch entries' signature-spell
         // pre-guard refuses any non-Oathbreaker request carrying one, with a
-        // different message, before `evaluate_momir` ever runs (§V.R8).
+        // different message, before `evaluate_momir` ever runs.
         let mut request = momir_request(momir_madness_deck());
         request.commander = vec!["Legal Commander".to_string()];
         let result = evaluate_deck_compatibility(&db, &request);

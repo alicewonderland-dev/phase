@@ -1481,7 +1481,7 @@ impl GameFormat {
             | GameFormat::PauperCommander
             | GameFormat::CommanderDraft
             | GameFormat::TinyLeaders
-            // Fixed decision 10(b): this format widens WHO may be a
+            // This format widens WHO may be a
             // commander.
             | GameFormat::FreeformCommander => CommanderPairing::PartnerFamilies,
             GameFormat::Brawl | GameFormat::HistoricBrawl | GameFormat::Oathbreaker => {
@@ -1782,7 +1782,7 @@ impl GameFormat {
             | GameFormat::PauperCommander
             | GameFormat::Brawl
             | GameFormat::HistoricBrawl
-            // Fixed decision 9: `command_zone: true` and
+            // `command_zone: true` and
             // `commander_damage_threshold: Some(21)` travel together for this
             // format — `Derived` in `built_in_axes_no_looser_than_rules`.
             | GameFormat::FreeformCommander
@@ -2799,12 +2799,9 @@ impl FormatConfig {
         }
     }
 
-    /// Freeform Commander: a Commander-shaped casual variant whose deck
-    /// construction takes fixed decisions 9 and 10 rather than CR 903.3 and
-    /// CR 903.5. CR 903.7 fixes the Commander variant's starting life at 40,
-    /// which this format declares as its default; the host adjusts it in the
-    /// lobby, which is the mechanism fixed decision 2 requires and the reason
-    /// this run adds none.
+    /// Freeform Commander: a Commander-shaped casual variant. CR 903.7 fixes
+    /// the Commander variant's starting life at 40, which this format
+    /// declares as its default; the host adjusts it in the lobby.
     pub fn freeform_commander() -> Self {
         FormatConfig {
             format: GameFormat::FreeformCommander,
@@ -4439,7 +4436,7 @@ mod tests {
     /// `client/src/adapter/types.ts`'s `BuiltInGameFormat` union must name
     /// exactly the engine's built-in formats.
     ///
-    /// This runs in the lane this branch already runs — CI job `rust-test`
+    /// This runs in the lane — CI job `rust-test`
     /// step "Run tests", Tilt `test-engine` — and needs no WASM artifact. The
     /// client-side assertion that binds the mirror through the real WASM export
     /// lives in `client/src/data/__tests__/formatRegistry.integration.test.ts`,

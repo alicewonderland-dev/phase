@@ -1,5 +1,5 @@
-//! Structural guards for the three format-axis methods `GameFormat` gained in
-//! Phase 3: `card_pool`, `commander_pairing`, and `deck_size_subject`. Each
+//! Structural guards for the three format-axis methods `GameFormat` gained:
+//! `card_pool`, `commander_pairing`, and `deck_size_subject`. Each
 //! guard scans production-scope source text
 //! through `include_str!`, so a moved or renamed file is a compile error, not
 //! a silently empty scan.
@@ -113,14 +113,14 @@ fn assert_axis_method_has_no_wildcard_arm(header: &str) {
     );
 }
 
-/// Census clause 1 + Row 4a source half: zero occurrences of
+/// Zero occurrences of
 /// `legality_format()` chained straight into `.unwrap()`/`.expect(` in
-/// production scope, across both files this phase edits.
+/// production scope, across both files.
 ///
 /// Positive reach-guard: the same scan must still find at least one BARE
 /// `legality_format()` call — `evaluate_commander_with_format`,
 /// `quick_commander_check` and `max_deck_copies` already respect the
-/// `Option` and are deliberately not migrated (§U1b), so a scan finding zero
+/// `Option` and are deliberately not migrated, so a scan finding zero
 /// bare calls would mean the scan itself is broken, not that every caller was
 /// migrated.
 #[test]
@@ -154,7 +154,7 @@ fn no_caller_unwraps_legality_format() {
     );
 }
 
-/// Census clause 2: zero occurrences of the four commander-count spellings
+/// Zero occurrences of the four commander-count spellings
 /// this migration removes, in production scope. The fourth spelling is
 /// brace-anchored by measurement, not by taste: the bare form also matches
 /// `evaluate_commander_with_format`'s post-admission consequence gate
@@ -194,7 +194,7 @@ fn no_caller_reintroduces_a_commander_count_literal() {
     );
 }
 
-/// Census clause 3 + Row 4a "no construction outside `for_format`" half.
+/// No construction outside `for_format`.
 ///
 /// A textual count cannot tell a `match` PATTERN naming `LegalityTable` from
 /// a CONSTRUCTION of one, so this subtracts the one known consumption site
@@ -228,7 +228,7 @@ fn card_pool_authority_tables_are_built_in_one_place() {
     assert_eq!(
         status_count, 1,
         "CardPoolAuthority::status's own match arm is the one disclosed consumption \
-         site this phase does not touch"
+         site"
     );
     assert_eq!(
         remainder, 1,
@@ -237,10 +237,9 @@ fn card_pool_authority_tables_are_built_in_one_place() {
     );
 }
 
-/// Census clause 4 (all three axis methods) + Row 6
-/// secondary instrument: `E0004` catches a deleted arm, but not a future
+/// Secondary instrument: `E0004` catches a deleted arm, but not a future
 /// `_ => CardPool::NoEngineAuthority` silencing the compiler and re-creating
-/// the implied default this phase removes.
+/// the implied default.
 #[test]
 fn format_axis_methods_carry_no_wildcard_arm() {
     assert_axis_method_has_no_wildcard_arm("pub fn card_pool(");
@@ -248,8 +247,7 @@ fn format_axis_methods_carry_no_wildcard_arm() {
     assert_axis_method_has_no_wildcard_arm("pub fn deck_size_subject(");
 }
 
-/// P3's seam pin, inverted as its own doc anticipates ("A P3 seam pin that P4
-/// inverts, not a permanent prohibition"). What is pinned is the
+/// What is pinned is the
 /// DECLARATION — which built-ins positively declare `CardPool::Unrestricted`
 /// — and not an inference from how permissive a format is.
 /// [`CardPool::Unrestricted`] draws that line itself: "Silence is not such a
@@ -267,7 +265,7 @@ fn unrestricted_card_pool_declarations_match_the_committed_list() {
     );
 }
 
-/// Census clause 5 + Row 13: no format axis reaches either client mirror.
+/// No format axis reaches either client mirror.
 /// These axes are `GameFormat` methods, not `FormatConfig`/`FormatMetadata`
 /// fields, so they have no wire surface by design; this asserts the absence
 /// the design promises.
@@ -297,7 +295,7 @@ fn no_format_axis_key_reaches_the_client_mirror() {
     }
 }
 
-/// Census clause 6 + Row 14: `FormatMetadata`'s field list is exactly its
+/// `FormatMetadata`'s field list is exactly its
 /// committed shape. A presence assertion against a non-empty expected list,
 /// so a failed extraction fails rather than passing vacuously — no separate
 /// non-vacuity premise is needed (contrast the wildcard-arm clause above).

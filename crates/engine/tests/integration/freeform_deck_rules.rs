@@ -1,4 +1,4 @@
-//! Phase 4 — `GameFormat::Freeform`, through the production entry points
+//! `GameFormat::Freeform`, through the production entry points
 //! `evaluate_deck_compatibility` and `validate_name_deck_for_format_full` (the
 //! latter is what `engine-wasm::validate_deck_list_seats` and
 //! `phase-server/src/main.rs` both call at the real game-creation boundary).
@@ -8,8 +8,8 @@
 //! minimum, no copy limit, and CR 100.4a's fifteen-card sideboard cap. See
 //! `GameFormat::Freeform`'s doc comment in `crates/engine/src/types/format.rs`.
 //!
-//! Every card name below is verified against the real card export at plan
-//! time, not from memory: `Craterclaw Colossus` (printed only in FRA, no
+//! Every card name below is verified against the real card export,
+//! not from memory: `Craterclaw Colossus` (printed only in FRA, no
 //! legality row), `Black Lotus` (`legacy: banned`, `vintage: restricted`),
 //! `Contract from Below` ("Remove this card from your deck before playing if
 //! you're not playing for ante"), `Vazal, the Compleat` ("Your deck can have
@@ -30,7 +30,7 @@ fn db() -> Option<&'static CardDatabase> {
     crate::support::shared_card_db()
 }
 
-/// §Row 2, degenerate end. `DeckSizeRule::Minimum(0).accepts(n)` holds for
+/// Degenerate end. `DeckSizeRule::Minimum(0).accepts(n)` holds for
 /// every `usize`, so the deck-size refusal path is unreachable for this
 /// format — including at the smallest input the request type admits.
 #[test]
@@ -59,7 +59,7 @@ fn freeform_accepts_an_empty_main_deck() {
     );
 }
 
-/// §Row 2, subject 1 (ABSENCE) — no main-deck size floor. Legacy is the
+/// No main-deck size floor. Legacy is the
 /// contrast because its pool never shrinks, so the refusal stays attributable
 /// to the deck-size subject rather than to a rotated card; the same-format
 /// control shows Freeform's own validator reached this deck and refused it on
@@ -135,7 +135,7 @@ fn freeform_has_no_main_deck_size_floor() {
     );
 }
 
-/// §Row 2, subject 2 (ABSENCE) — no copy limit. Same contrast/control
+/// No copy limit. Same contrast/control
 /// discipline as the floor test.
 #[test]
 fn freeform_has_no_copy_limit() {
@@ -207,8 +207,8 @@ fn freeform_has_no_copy_limit() {
     );
 }
 
-/// §Row 2, subject 3 (BOUND) — CR 100.4a's fifteen-card sideboard, the one
-/// constructed-play rule Freeform keeps (decision 10(a)). A bound straddles,
+/// CR 100.4a's fifteen-card sideboard, the one
+/// constructed-play rule Freeform keeps. A bound straddles,
 /// so no contrast/control pair is needed on either side.
 #[test]
 fn freeform_caps_the_sideboard_at_fifteen() {
@@ -260,7 +260,7 @@ fn freeform_caps_the_sideboard_at_fifteen() {
     );
 }
 
-/// §Row 3(a) — Freeform's unrestricted pool admits a card with no legality
+/// Freeform's unrestricted pool admits a card with no legality
 /// row at all. Premodern is the durable contrast: its pool closed in 2003, so
 /// an FRA card will never become Premodern-legal, unlike a Standard contrast
 /// that would invert on the set's release.
@@ -313,7 +313,7 @@ fn freeform_admits_a_card_printed_only_in_reality_fracture() {
     );
 }
 
-/// §Row 9 — Freeform's `AdmitsEveryCard` authority never consults a ban or
+/// Freeform's `AdmitsEveryCard` authority never consults a ban or
 /// restricted list; those are a distinct authority from the absence of a
 /// legality table. Vintage's `restricted` verdict demonstrates the second
 /// half of "banned or restricted" through a different authority
@@ -386,13 +386,11 @@ fn freeform_accepts_a_card_the_legacy_ban_list_refuses() {
     );
 }
 
-/// §Row 3(c) — out-of-pool refusal classes that DO NOT consult the card-pool
+/// Out-of-pool refusal classes that DO NOT consult the card-pool
 /// axis, so Freeform's unrestricted pool does not suppress them: CR 407.3's
 /// ante-card refusal and a card's own PRINTED deck-construction limit
 /// (`effective_copy_limit`'s `deck_copy_limit_for(..).unwrap_or(format_default)`,
-/// which lets a printed override replace Freeform's `Unlimited` default). No
-/// class asserted here is fixed by this phase — the charter's Non-goal clause
-/// forbids altering either authority; each is reported to P6/5.
+/// which lets a printed override replace Freeform's `Unlimited` default).
 ///
 /// Both classes reach each dispatcher through DIFFERENT code: the full leg's
 /// accumulating `copy_limit_violations` in `evaluate_constructed` vs. the
@@ -474,7 +472,7 @@ fn freeform_still_refuses_an_ante_card_and_a_printed_copy_limit_overrun() {
     }
 }
 
-/// §Row 4 — the boundary pair `FormatConfig::freeform().validate_for_player_count`
+/// The boundary pair `FormatConfig::freeform().validate_for_player_count`
 /// draws.
 #[test]
 fn freeform_admits_exactly_two_seats() {
@@ -493,7 +491,7 @@ fn freeform_admits_exactly_two_seats() {
     );
 }
 
-/// §Row 4 — Freeform's registry entry keeps it inside
+/// Freeform's registry entry keeps it inside
 /// `registry_constructed_formats_declare_a_deck_construction_pool`'s clause 1:
 /// a Constructed-group format must declare `LegalityTable(_)` or
 /// `Unrestricted`, never merely lack an authority.
@@ -508,7 +506,7 @@ fn freeform_is_in_the_constructed_group() {
     assert_eq!(entry.short_label, "FRF");
 }
 
-/// B1 / §V.R9 — the wrong-LABEL discriminator, on BOTH dispatches.
+/// The wrong-LABEL discriminator, on BOTH dispatches.
 /// `Forest` occupies the commander slot deliberately: it is in the curated
 /// fixture, so `collect_unknown_cards` adds no second reason, and
 /// `CommanderPairing::NoCommander` refuses on the SLOT COUNT, never on
@@ -569,7 +567,7 @@ fn freeform_refuses_a_populated_commander_slot_on_both_dispatches() {
     }
 }
 
-/// B1 / §V.R10 — the wrong-EVALUATOR discriminator: the summary dispatcher's
+/// The wrong-EVALUATOR discriminator: the summary dispatcher's
 /// `QuickCheckResult::compatible()` arm (`FreeForAll | TwoHeadedGiant |
 /// Limited`) is a live sibling of Freeform's membership, and a membership
 /// landing there would make the summary leg accept decks the full leg
@@ -669,7 +667,7 @@ fn freeform_axes_give_the_same_verdict_on_both_dispatches() {
     }
 }
 
-/// M3 / §V.R7 — the multi-authority hostile fixture. `evaluate_standard`
+/// The multi-authority hostile fixture. `evaluate_standard`
 /// reads `&FormatConfig::standard()` regardless of what the request selected,
 /// so a Freeform deck's `standard` reference column is computed against
 /// Standard's own rules and can disagree with `selected_format_compatible`.

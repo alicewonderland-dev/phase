@@ -1,9 +1,9 @@
-//! Phase 5 — `GameFormat::FreeformCommander`, through the production entry
+//! `GameFormat::FreeformCommander`, through the production entry
 //! points `evaluate_deck_compatibility` and `validate_name_deck_for_format_full`
 //! (the latter is what `engine-wasm::validate_deck_list_seats` and
 //! `phase-server/src/main.rs` both call at the real game-creation boundary).
 //!
-//! Freeform Commander's rules are fixed decisions 9 and 10(b), not derived:
+//! Freeform Commander's rules are not derived:
 //! any card that can be CAST may be its commander (a departure from CR 903.3),
 //! a land may not (CR 305.1 + CR 305.9 + CR 903.8), every set is in the pool,
 //! there is no ban list, no copy limit, no main-deck minimum, and no
@@ -16,8 +16,7 @@
 //! own: it is a Basic land (exempt from every singleton rule), its own color
 //! identity is empty (a subset of every commander's identity, so it can never
 //! be "outside" one), and it carries a `"commander": "legal"` row in the
-//! fixture. Every card name below is verified against the real card export at
-//! plan time, not from memory — see `phase5-plan-v2.md` §Step 0 and §0.3.
+//! fixture. Every card name below is verified against the real card export.
 
 use engine::database::legality::LegalityFormat;
 use engine::game::deck_loading::{load_deck_into_state, DeckEntry, DeckPayload, PlayerDeckPayload};
@@ -47,7 +46,7 @@ fn db() -> Option<&'static engine::database::CardDatabase> {
     support::shared_card_db()
 }
 
-/// §Row 2, subject 1 — a card that is not a legendary creature is
+/// A card that is not a legendary creature is
 /// admitted, on both legs. The Commander contrast pads its main deck to
 /// exactly 100 `Wastes` so the deck-size check (which the summary dispatcher
 /// consults BEFORE eligibility) does not displace the eligibility refusal —
@@ -106,7 +105,7 @@ fn freeform_commander_admits_a_card_that_is_not_a_legendary_creature() {
     }
 }
 
-/// §Row 2, subject 2 — a land may not be this format's commander, including
+/// A land may not be this format's commander, including
 /// the land-plus-another-type boundary case (CR 305.9) and a transforming
 /// DFC's land front face.
 #[test]
@@ -146,8 +145,8 @@ fn freeform_commander_refuses_a_land_as_commander() {
     }
 }
 
-/// §Row 2, subject 2's other half: the widened predicate's own coverage
-/// boundary (the fix this round makes). A nontraditional command-zone card
+/// The widened predicate's own coverage
+/// boundary. A nontraditional command-zone card
 /// type (CR 108.2a) is refused the same way a land is — CR 311.2 (Plane),
 /// CR 314.2 (Scheme), CR 312.2 (Phenomenon), and CR 315.3 (Conspiracy) each
 /// say explicitly "They... can't be cast". The positive control in the same
@@ -209,7 +208,7 @@ fn freeform_commander_refuses_a_nontraditional_card_as_commander() {
     }
 }
 
-/// §Row 2, subject 2's other coverage boundary: `is_freeform_commander_eligible`'s
+/// `is_freeform_commander_eligible`'s
 /// `!core_types.is_empty()` guard. `Iterator::all` is vacuously `true` on an
 /// empty iterator, so without the guard a face with no recognized `CoreType`
 /// would be admitted rather than refused. `Ashnod` is a Vanguard face
@@ -266,12 +265,12 @@ fn freeform_commander_refuses_a_card_with_no_recognized_core_type() {
     }
 }
 
-/// Charter row 2's second boundary case, PINNED: the predicate judges the
+/// The predicate judges the
 /// face the decklist NAMES. `Kazandu Mammoth` (the non-land face of a modal
 /// DFC) is accepted and `Kazandu Valley` (the land face) is refused; the same
 /// pair is asserted for Commander's own `Ormendahl, Profane Prince` /
 /// `Westvale Abbey` (a transforming DFC) to record that this face-per-name
-/// resolution is pre-existing (§0.7), not this phase's invention.
+/// resolution is pre-existing.
 #[test]
 fn freeform_commander_judges_the_double_faced_card_face_the_decklist_names() {
     let Some(db) = db() else {
@@ -406,8 +405,8 @@ fn count_needle(text: &str, needle: &str) -> usize {
         .count()
 }
 
-/// Charter row 2's "establish separately that the verdict is reached through
-/// the surface the client actually calls" — the OTHER client-called surface,
+/// Establishes separately that the verdict is reached through
+/// the surface the client actually calls — the OTHER client-called surface,
 /// `engine-wasm::is_card_commander_eligible_for_format`. This export takes
 /// `JsValue` and is reachable only from a wasm target, so unlike
 /// `validate_deck_list_seats` (driven natively — see
@@ -547,15 +546,13 @@ fn freeform_commander_admits_a_pair_the_ordinary_partner_rule_admits() {
     }
 }
 
-/// The row-3 trap: an implementation gating on "both members carry a partner
-/// keyword" refuses this pair and satisfies fixed decision 10's headline
-/// sentence while being wrong. `Veteran Soldier` carries no partner keyword
+/// An implementation gating on "both members carry a partner
+/// keyword" refuses this pair while being wrong. `Veteran Soldier` carries no partner keyword
 /// at all — it pairs with `Abdel Adrian, Gorion's Ward`'s "Choose a
 /// Background" (CR 702.124k) through `subtype_partner_match`, on its
 /// Background subtype. The SAME pair is asserted `Ok` under
-/// `FormatConfig::commander()` too: that pairing already held before this
-/// phase (§0.3(b)), so this pair alone establishes nothing this format
-/// created — the baseline the charter demands.
+/// `FormatConfig::commander()` too: that pairing already held, so this pair alone establishes nothing this format
+/// created.
 #[test]
 fn freeform_commander_admits_an_asymmetric_partner_family_pair() {
     let Some(db) = db() else {
@@ -611,7 +608,7 @@ fn freeform_commander_admits_an_asymmetric_partner_family_pair() {
     }
 }
 
-/// Row 3's two sub-classes, each pinned with its measured answer, on the
+/// Two sub-classes, each pinned with its measured answer, on the
 /// FULL leg (`validate_name_deck_for_format_full`): a card offered as one of
 /// a pair, and a legendary non-creature that is NOT a Background. Both are
 /// refused for pairing under Freeform Commander (this
@@ -740,11 +737,11 @@ fn freeform_commander_pairing_still_refuses_a_card_its_eligibility_admits() {
     );
 }
 
-/// §Row 4(a) — CONTRAST pair and SAME-FORMAT control (§0.11). The control is
+/// CONTRAST pair and SAME-FORMAT control. The control is
 /// `Forest` added as a second commander to the deck under test: its refusal
 /// is `CommanderVariantRules::freeform_commander()`'s own `eligibility_error`
 /// field, which differs from Commander's when the wrong variant rules are
-/// handed to the shared evaluator — MEASURED by mutation (§0.11) to
+/// handed to the shared evaluator — MEASURED by mutation to
 /// discriminate the mis-dispatch, unlike the withdrawn v1 signature-spell
 /// control, which returns before the format dispatch and cannot.
 #[test]
@@ -816,7 +813,7 @@ fn freeform_commander_has_no_main_deck_size_floor() {
     }
 }
 
-/// §Row 4(b) — the degenerate end: an empty main deck, a 1-card main deck,
+/// The degenerate end: an empty main deck, a 1-card main deck,
 /// and a main deck that names the commander itself are all accepted.
 #[test]
 fn freeform_commander_accepts_an_empty_main_deck() {
@@ -883,11 +880,10 @@ fn freeform_commander_accepts_an_empty_main_deck() {
     );
 }
 
-/// §Row 4's declaration route: the deck-size subject is declared, not
+/// The deck-size subject is declared, not
 /// fallen through. `GameFormat::FreeformCommander.deck_size_subject()` is
-/// `MainDeckAndCommanders` (the orchestrator's ruling, `phase-fit` entry
-/// 159 — measurably inert for this format's verdicts either way, since
-/// `DeckSizeRule::Minimum(0).accepts(n)` holds for every count), and every
+/// `MainDeckAndCommanders` — measurably inert for this format's verdicts either way, since
+/// `DeckSizeRule::Minimum(0).accepts(n)` holds for every count — and every
 /// other command-zone format still answers its own subject from the
 /// property that generates the set, never a hand-copied list.
 #[test]
@@ -945,9 +941,9 @@ fn freeform_commander_declares_its_deck_size_subject() {
     }
 }
 
-/// §Row 5 — no copy limit, with a Commander contrast, a positive control
+/// No copy limit, with a Commander contrast, a positive control
 /// showing the Commander refusal is the copy rule and nothing else, and the
-/// SAME-FORMAT control (§0.11): the same 8-copy deck and commander slots
+/// SAME-FORMAT control: the same 8-copy deck and commander slots
 /// under `FormatConfig::commander()` DO carry a copy-limit reason in the
 /// same accumulating vector, so its absence under Freeform Commander is
 /// informative rather than a silent gap.
@@ -1042,10 +1038,10 @@ fn freeform_commander_has_no_copy_limit() {
     }
 }
 
-/// §Row 6 — colour identity comes from the commander(s), including the case
-/// row 2's widened eligibility creates: a sole commander that is neither
+/// Colour identity comes from the commander(s), including the case:
+/// a sole commander that is neither
 /// legendary nor a creature still contributes its own identity. The
-/// sole-commander shape is used deliberately so row 3's pairing answer is
+/// sole-commander shape is used deliberately so the pairing answer is
 /// not presumed.
 #[test]
 fn freeform_commander_colour_identity_comes_from_the_commanders() {
@@ -1121,7 +1117,7 @@ fn freeform_commander_colour_identity_comes_from_the_commanders() {
     }
 }
 
-/// §Row 6, the empty-identity end as its own pair: a colourless sole
+/// A colourless sole
 /// commander admits only colourless cards — a BASIC LAND is not exempt from
 /// CR 903.4's subset test.
 #[test]
@@ -1177,7 +1173,7 @@ fn freeform_commander_empty_identity_commander_admits_only_colourless_cards() {
     }
 }
 
-/// §Row 7 — 2 to 4 seats.
+/// 2 to 4 seats.
 #[test]
 fn freeform_commander_admits_two_to_four_seats() {
     let config = FormatConfig::freeform_commander();
@@ -1194,7 +1190,7 @@ fn freeform_commander_admits_two_to_four_seats() {
     );
 }
 
-/// §Row 7 — the registry entry's group and short label, pinned.
+/// The registry entry's group and short label, pinned.
 #[test]
 fn freeform_commander_is_in_the_commander_group() {
     let registry = GameFormat::registry();
@@ -1206,7 +1202,7 @@ fn freeform_commander_is_in_the_commander_group() {
     assert_eq!(entry.short_label, "FFC");
 }
 
-/// §Row 8 — CR 903.7's 40 starting life, declared and pinned; the host can
+/// CR 903.7's 40 starting life, declared and pinned; the host can
 /// adjust it through the existing `FormatConfig` admission gate (the paired
 /// control is that a widened `max_players` is refused by that SAME gate,
 /// showing it is actually running).
@@ -1235,9 +1231,9 @@ fn freeform_commander_declares_forty_starting_life_and_the_host_can_change_it() 
     );
 }
 
-/// §Row 9 — the main deck and the commander slot both admit a card printed
+/// The main deck and the commander slot both admit a card printed
 /// only in an unreleased/preview set (FRA — Reality Fracture, no legality
-/// row at plan time); Premodern refuses the identical 60 with the legality
+/// row); Premodern refuses the identical 60 with the legality
 /// reason alone. Both legs.
 #[test]
 fn freeform_commander_admits_a_card_printed_only_in_reality_fracture() {
@@ -1309,8 +1305,7 @@ fn freeform_commander_admits_a_card_printed_only_in_reality_fracture() {
     }
 }
 
-/// §Row 9 — "the pool this format admits is the pool P4/3 censused",
-/// established at the axis: both formats declare the SAME `CardPool`
+/// Established at the axis: both formats declare the SAME `CardPool`
 /// variant.
 #[test]
 fn freeform_commander_admits_the_same_pool_as_freeform() {
@@ -1324,7 +1319,7 @@ fn freeform_commander_admits_the_same_pool_as_freeform() {
     );
 }
 
-/// §Row 9 — out-of-pool refusal classes that do NOT consult the card-pool
+/// Out-of-pool refusal classes that do NOT consult the card-pool
 /// axis survive unchanged: CR 407.3's ante-card refusal, and a card's own
 /// PRINTED deck-construction limit still binds under this format's
 /// `Unlimited` default. No revert: this test pins UNCHANGED behaviour.
@@ -1396,7 +1391,7 @@ fn freeform_commander_still_refuses_an_ante_card_and_a_printed_copy_limit_overru
     }
 }
 
-/// §Row 13 — this format declares `Forbidden`, pinned; the test reds if the
+/// This format declares `Forbidden`, pinned; the test reds if the
 /// value changes.
 #[test]
 fn freeform_commander_declares_no_sideboard() {
@@ -1417,11 +1412,11 @@ fn freeform_commander_declares_no_sideboard() {
     assert!(serde_json::from_value::<FormatConfig>(json).is_ok());
 }
 
-/// §Row 13's behavioural half — the declaration is a BOUND AT ZERO, and the
+/// The declaration is a BOUND AT ZERO, and the
 /// pair straddles it at the surface that enforces it. STATED PLAINLY: no
 /// deck-compatibility verdict distinguishes this format's sideboard value at
 /// all, because `request_without_sideboard` strips the sideboard before
-/// every commander check runs (MEASURED, §0.3(j)) — so the straddle below is
+/// every commander check runs (MEASURED) — so the straddle below is
 /// NOT a deck-level pair, and a reader must not take it for one. The pair is
 /// taken instead at `match_flow::handle_submit_sideboard` (the function
 /// `engine.rs::apply_non_priority_pass_action` dispatches a player's
@@ -1702,8 +1697,8 @@ fn no_other_command_zone_format_s_rules_moved() {
     }
 }
 
-/// The eligibility half of the class sweep — the leak charter row 2 says no
-/// other row would catch: `commander = [Sol Ring]` is refused by every OTHER
+/// The eligibility half of the class sweep:
+/// `commander = [Sol Ring]` is refused by every OTHER
 /// command-zone format, each naming its own eligibility message. Membership
 /// (`.any`), not the file's usual full-vector equality: with an empty main
 /// deck each format also emits its own deck-size reason (and Oathbreaker

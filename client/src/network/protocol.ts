@@ -107,8 +107,8 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  *
  * Bumps to date:
  *  59 — Prospective: no GameState shape change lands in this bump. Moved
- *       ahead of this branch's new GameFormat variants so every
- *       intermediate commit on this branch is internally consistent once
+ *       ahead of new GameFormat variants so every
+ *       intermediate commit is internally consistent once
  *       they land — the same precedent as 32's CommanderDraft variant: the
  *       break, when it lands, will be conditional on a new variant actually
  *       being serialized in a game_setup/state_update payload, not

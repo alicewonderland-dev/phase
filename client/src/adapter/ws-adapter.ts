@@ -211,8 +211,8 @@ export class NativeEngineVersionMismatchError extends Error {
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
  * 77 — Prospective: no GameState or GameAction shape change lands in this
- *      bump. Moved ahead of this branch's new GameFormat variants so every
- *      intermediate commit on this branch is internally consistent once
+ *      bump. Moved ahead of new GameFormat variants so every
+ *      intermediate commit is internally consistent once
  *      they land — see PROTOCOL_VERSION's own `/// 77` entry in
  *      crates/lobby-broker/src/protocol.rs. Full-game sessions stay
  *      exact-match on both ends (MIN_SUPPORTED_SERVER_PROTOCOL below and
@@ -570,8 +570,8 @@ export const LOBBY_MIN_SUPPORTED_SERVER_PROTOCOL = PROTOCOL_VERSION - 1;
  * window went disjoint from the deployed broker's.
  *
  * 10 — Prospective: no lobby variant or field changes shape in this bump.
- *      Moved ahead of this branch's new GameFormat variants so every
- *      intermediate commit on this branch is internally consistent once
+ *      Moved ahead of new GameFormat variants so every
+ *      intermediate commit is internally consistent once
  *      they land — see LOBBY_PROTOCOL_VERSION's own `/// 10` entry in
  *      crates/lobby-broker/src/protocol.rs. MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL
  *      stays at 2: this client already decodes broker → client frames with

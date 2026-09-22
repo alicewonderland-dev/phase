@@ -230,7 +230,7 @@ impl CommanderEligibilityRule {
             GameFormat::TinyLeaders => Ok(Some(Self::TinyLeaders)),
             GameFormat::Oathbreaker => Ok(Some(Self::OathbreakerSignatureSpell)),
             GameFormat::Brawl | GameFormat::HistoricBrawl => Ok(Some(Self::BrawlColorIdentity)),
-            // Fixed decision 9's departure from CR 903.3: `Ok(None)` would
+            // Departure from CR 903.3: `Ok(None)` would
             // claim this format has no commander-eligibility concept, and
             // `Ok(Some(Standard))` would claim it applies CR 903.3's test —
             // the rule this format departs from. Neither is true.
