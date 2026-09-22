@@ -223,6 +223,8 @@
     "setAsCommander": "Imposta come comandante:",
     "cardCount": "{{count}}/{{expected}} carte",
     "cardCountNoMinimum_one": "{{count}} carta",
+    "cardCountNoMinimum_few": "{{count}} carte",
+    "cardCountNoMinimum_many": "{{count}} carte",
     "cardCountNoMinimum_other": "{{count}} carte",
     "singletonViolations": "Violazioni singleton: {{cards}}",
     "colorViolations": "Violazioni dell'identità di colore: {{cards}}",

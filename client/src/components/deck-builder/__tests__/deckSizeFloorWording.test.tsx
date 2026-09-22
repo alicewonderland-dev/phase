@@ -1,10 +1,13 @@
 import { cleanup, render, screen } from "@testing-library/react";
+import { createInstance } from "i18next";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { BetweenGamesSideboardModal } from "../../multiplayer/BetweenGamesSideboardModal";
 import { CommanderPanel } from "../CommanderPanel";
 import { formatMetadata } from "../../../data/formatRegistry";
 import type { ScryfallCard } from "../../../services/scryfall";
+import plDeckBuilder from "../../../i18n/locales/pl/deck-builder.json";
+import enDeckBuilder from "../../../i18n/locales/en/deck-builder.json";
 
 afterEach(cleanup);
 
@@ -126,5 +129,30 @@ describe("deck-size floor wording — neither component receives a format", () =
     );
     expect(screen.getByText("1 card")).toBeInTheDocument();
     expect(screen.queryByText("1 cards")).toBeNull();
+  });
+
+  // Same idiom as localeParity.test.ts's resolves_polish_one_few_many_and_other_without_fallback:
+  // an isolated i18next instance resolving the real catalogues, so a missing _few/_many
+  // form falls back to fallbackLng "en" exactly as the app's i18n instance is configured
+  // (client/src/i18n/index.ts), reproducing the regression this pins against instead of
+  // just asserting a string literal.
+  it("panel: Polish few and many counts take Polish nouns, not the English fallback", async () => {
+    const instance = createInstance();
+    await instance.init({
+      lng: "pl",
+      fallbackLng: "en",
+      resources: {
+        pl: { "deck-builder": plDeckBuilder },
+        en: { "deck-builder": enDeckBuilder },
+      },
+      interpolation: { escapeValue: false },
+    });
+
+    const few = instance.t("commanderPanel.cardCountNoMinimum", { ns: "deck-builder", count: 2 });
+    const many = instance.t("commanderPanel.cardCountNoMinimum", { ns: "deck-builder", count: 5 });
+    expect(few).toBe("2 karty");
+    expect(many).toBe("5 kart");
+    expect(few).not.toBe("2 cards");
+    expect(many).not.toBe("5 cards");
   });
 });
