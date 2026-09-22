@@ -1250,9 +1250,8 @@ impl CommanderVariantRules {
     }
 
     /// Fixed decisions 9 and 10(b): this format widens WHO may be designated
-    /// (see `is_freeform_commander_eligible`) and leaves the partner rule
-    /// alone, so `partner_grant` is `None` exactly as it is for every variant
-    /// CR 903.13f(3) does not reach.
+    /// (see `is_freeform_commander_eligible`); `partner_grant` is `None`
+    /// exactly as it is for every variant CR 903.13f(3) does not reach.
     ///
     /// `skip_commander_legality` is `false` because it exempts the commander
     /// from a LEGALITY TABLE, and this format declares
@@ -7417,12 +7416,12 @@ mod tests {
     }
 
     /// In Freeform Commander, a
-    /// pairing is decided by the partner keywords the two cards carry, not by
-    /// whether either card is legendary — a deliberate departure from
-    /// CR 702.124a's "two legendary cards", matching the format's admission of
-    /// a non-legendary solo commander. The fixture is synthetic: the integration
-    /// fixture carries no non-legendary "Partner with" pair, and no printed
-    /// Background is non-legendary.
+    /// pairing is not decided by whether either card is legendary — a
+    /// deliberate departure from CR 702.124a's "two legendary cards",
+    /// matching the format's admission of a non-legendary solo commander.
+    /// The fixture is synthetic: the integration fixture carries no
+    /// non-legendary "Partner with" pair, and no printed Background is
+    /// non-legendary.
     /// Every face here leaves `is_commander` absent — a real Background
     /// carries `is_commander: true`, and `is_commander_eligible` returns early
     /// on it, which would make Commander's control leg (3) pass for the wrong
@@ -7508,8 +7507,7 @@ mod tests {
             ),
         );
         // Format-scoping control (3): padding so Commander's exact-100 deck
-        // size check passes without itself contributing a legality/singleton
-        // violation (CR 100.2a's basic-land exemption).
+        // size check passes (CR 903.5b's basic-land exemption).
         cards.insert(
             "test wastes".to_string(),
             face(
@@ -7524,8 +7522,8 @@ mod tests {
     }
 
     /// Pins the Freeform Commander pairing rule directly. This format declares
-    /// no partner grant, and without one pairing reads only the partner
-    /// keywords the two cards carry, never whether either is legendary.
+    /// no partner grant, and without one pairing never reads whether either
+    /// is legendary.
     #[test]
     fn freeform_commander_admits_non_legendary_partner_pairs() {
         let db = CardDatabase::from_json_str(&freeform_commander_anything_goes_db_json()).unwrap();
@@ -7582,9 +7580,8 @@ mod tests {
         // not at pairing — proving admission is THIS FORMAT's rule, not that
         // the pairing check itself is selective. Padded to a legal 100-card
         // Commander deck (`quick_commander_check`, the summary leg, checks
-        // deck size before eligibility on its first-failure return) so the
-        // isolated reasons are eligibility/pairing alone. Uses the full leg,
-        // whose reasons this control actually inspects.
+        // deck size before eligibility on its first-failure return). Uses
+        // the full leg, whose reasons this control actually inspects.
         for pair in [&pair_1, &pair_2] {
             let full = validate_name_deck_for_format_full(
                 &db,

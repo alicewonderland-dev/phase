@@ -598,9 +598,7 @@ function closeChannel(set: MultiplayerSet, get: MultiplayerGet, url: string): vo
 }
 
 /** Show the shared toast for a `registerHost` refusal from
- * {@link LobbyCapabilityError}. A no-op for any other rejection, since the
- * two `registerHost` callers already have their own handling for a generic
- * transport error. */
+ * {@link LobbyCapabilityError}. A no-op for any other rejection. */
 function toastLobbyCapabilityRefusal(get: MultiplayerGet, err: unknown): void {
   if (!(err instanceof LobbyCapabilityError)) return;
   get().showToast(

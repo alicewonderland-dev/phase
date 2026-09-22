@@ -141,7 +141,7 @@ pub enum GameFormat {
     /// (CR 903.8) and a land is played as a special action rather than cast
     /// (CR 305.1), so the tax has nothing to attach to. Every set is in the
     /// pool, there is no ban list, no copy limit and no main-deck minimum.
-    /// Two commanders only where CR 702.124's partner families admit the pair.
+    /// Two commanders only where partner families admit the pair.
     FreeformCommander,
     /// An engine-validated custom format. Resolves via
     /// `FormatConfig.custom_rules` (see `types::custom_format`) — a bare
@@ -1482,8 +1482,7 @@ impl GameFormat {
             | GameFormat::CommanderDraft
             | GameFormat::TinyLeaders
             // Fixed decision 10(b): this format widens WHO may be a
-            // commander but leaves CR 702.124's partner rule alone, so the
-            // existing `PartnerFamilies` pairing applies unchanged.
+            // commander.
             | GameFormat::FreeformCommander => CommanderPairing::PartnerFamilies,
             GameFormat::Brawl | GameFormat::HistoricBrawl | GameFormat::Oathbreaker => {
                 CommanderPairing::Solo

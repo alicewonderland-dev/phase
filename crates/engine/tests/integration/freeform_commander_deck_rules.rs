@@ -5,9 +5,9 @@
 //!
 //! Freeform Commander's rules are fixed decisions 9 and 10(b), not derived:
 //! any card that can be CAST may be its commander (a departure from CR 903.3),
-//! a land may not (CR 305.1 + CR 305.9 + CR 903.8), the ordinary CR 702.124
-//! partner rule applies unchanged, every set is in the pool, there is no ban
-//! list, no copy limit, no main-deck minimum, and no sideboard. See
+//! a land may not (CR 305.1 + CR 305.9 + CR 903.8), every set is in the pool,
+//! there is no ban list, no copy limit, no main-deck minimum, and no
+//! sideboard. See
 //! `GameFormat::FreeformCommander`'s doc comment in
 //! `crates/engine/src/types/format.rs`.
 //!
@@ -612,9 +612,9 @@ fn freeform_commander_admits_an_asymmetric_partner_family_pair() {
 }
 
 /// Row 3's two sub-classes, each pinned with its measured answer, on the
-/// FULL leg (`validate_name_deck_for_format_full`): a non-legendary card
-/// offered as one of a pair, and a legendary non-creature that is NOT a
-/// Background. Both are refused for pairing under Freeform Commander (this
+/// FULL leg (`validate_name_deck_for_format_full`): a card offered as one of
+/// a pair, and a legendary non-creature that is NOT a Background. Both are
+/// refused for pairing under Freeform Commander (this
 /// format's widened eligibility admits the card itself), and for BOTH
 /// eligibility and pairing under Commander. The Commander contrast pads to
 /// exactly 100 `Wastes` so the isolated reason is the pairing/eligibility
