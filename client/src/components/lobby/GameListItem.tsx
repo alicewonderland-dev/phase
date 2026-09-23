@@ -146,7 +146,6 @@ export function GameListItem({
           </span>
         )}
 
-      {/* Draft badge — rendered when the lobby entry is a draft pod. */}
         {game.draft_metadata && (
           <span
             className="flex-shrink-0 rounded-[5px] border border-purple-300/20 bg-purple-500/15 px-1.5 py-0.5 text-xs font-semibold text-purple-200"

@@ -85,9 +85,7 @@ vi.mock("../../stores/gameStore", () => ({
 }));
 
 // `importOriginal` rather than a bespoke stub: `multiplayerDraftStore` runs
-// real (unlike `joinOrigin.test.tsx`, which stubs it), and its Commander
-// launch path transitively imports other constants from this module — a
-// hand-rolled three-export stub breaks that unrelated import.
+// real (unlike `joinOrigin.test.tsx`, which stubs it).
 vi.mock("../../constants/storage", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../constants/storage")>()),
   loadActiveDeck: () => ({ main: ["Island"], sideboard: [] }),
@@ -145,7 +143,7 @@ function toastMessages(): string[] {
   return [...useMultiplayerStore.getState().toasts.values()].map((t) => t.message);
 }
 
-/** The path/params the page navigated to, ignoring the initial no-op call. */
+/** The path/params the page navigated to. */
 function navigatedParams(): { path: string; params: URLSearchParams } {
   const call = harness.navigate.mock.calls.find(
     ([target]) => typeof target === "string" && target !== "/multiplayer" && target !== "/",
@@ -159,11 +157,7 @@ describe("MultiplayerPage draft join routing", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     // `clearAllMocks` drops calls but keeps queued `mockResolvedValueOnce`
-    // implementations (e.g. a queued password_required→ok sequence) — an
-    // explicit `mockReset` on every mock this suite queues per-test is what
-    // stops a test whose base run never drains its queue (because the code
-    // path that would call it doesn't exist yet) from leaking that queue
-    // into the next test.
+    // implementations (e.g. a queued password_required→ok sequence).
     storeMocks.findLobbyGameByCode.mockReset();
     connectionMocks.joinRoom.mockReset();
     connectionMocks.joinRoom.mockImplementation(async () => {
