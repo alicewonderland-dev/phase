@@ -89,8 +89,7 @@ export const LOBBY_HOST_NAME_MAX_CHARS = 20;
 export const LOBBY_LABEL_MAX_CHARS = 40;
 export const LOBBY_PASSWORD_MAX_BYTES = 128;
 
-/** Sentinel `draft_metadata.setCode` for a cube pod, matching the server's
- * own source label for a custom cube list. */
+/** Sentinel `draft_metadata.setCode` for a cube pod. */
 const CUSTOM_CUBE_SET_CODE = "custom-cube";
 
 /** A pool source that can carry a truthful lobby-listing label. The legacy
@@ -125,8 +124,7 @@ export function podLobbyMetadata(
 
 /**
  * The broker registration request for a listed pod. A blank room name lists
- * under the same default HostSetup shows as its placeholder, so the lobby
- * title matches what the host was shown.
+ * under the same default HostSetup shows as its placeholder.
  */
 export function podListingRequest(
   poolInput: ListablePoolInput,
@@ -502,12 +500,10 @@ function procedurePublication(
 type HostPodOutcome = "hosted" | "failed" | "refused";
 
 /**
- * Host `hostConfig`'s pod, registering it on the public lobby first when
- * `listing` names a seat count the broker can advertise truthfully. From the
- * moment an opened broker client is available until `hostDraft` resolves
- * `true`, this function owns it and closes it on every other outcome —
- * `hostDraft` can return `false` before its own `initialize` runs (a
- * superseding pod, or going offline).
+ * Host `hostConfig`'s pod. From the moment an opened broker client is
+ * available until `hostDraft` resolves `true`, this function owns it and
+ * closes it on every other outcome — `hostDraft` can return `false` before
+ * its own `initialize` runs (a superseding pod, or going offline).
  */
 async function hostPod(
   set: (partial: Partial<DraftPodState>) => void,

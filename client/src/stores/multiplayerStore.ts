@@ -1739,8 +1739,7 @@ interface MultiplayerActions {
   ensureSubscriptionSocket: (url: string) => Promise<PhaseSocket | null>;
   /**
    * Choose and probe the broker a P2P registration uses. Preserve a custom
-   * broker anchor, but never use a server known or probed to be `"Full"` for
-   * P2P registration; the official broker is the fallback. Unknown custom
+   * broker anchor; the official broker is the fallback. Unknown custom
    * endpoints are probed before deciding.
    */
   resolveP2PBroker: (anchor: string | null) => Promise<{ url: string; socket: PhaseSocket | null }>;

@@ -690,6 +690,19 @@ describe("draftPodStore", () => {
     });
   });
 
+  describe("setListing", () => {
+    it("merges into the existing listing rather than replacing it", () => {
+      useDraftPodStore.getState().setListing({ isPublic: true, roomName: "Friday" });
+      useDraftPodStore.getState().setListing({ password: "secret" });
+
+      expect(useDraftPodStore.getState().listing).toEqual({
+        isPublic: true,
+        roomName: "Friday",
+        password: "secret",
+      });
+    });
+  });
+
   describe("resumeHostedPod", () => {
     it("returns absent silently without changing setup state", async () => {
       const outcome = await useDraftPodStore.getState().resumeHostedPod({ silent: true, routeToken: 1 });
@@ -1080,7 +1093,9 @@ describe("draftPodStore", () => {
     it("does not list a resumed pod", async () => {
       useDraftPodStore.getState().setListing({ isPublic: true });
       mocks.inspectActiveDraftPod.mockReturnValue({ type: "present", meta: activeMeta, capture: { id: activeMeta.id, roomCode: activeMeta.roomCode, updatedAt: activeMeta.updatedAt } });
-      mocks.loadDraftHostSession.mockResolvedValue(persistedSession);
+      // Seated within LOBBY_LISTING_MAX_SEATS so only the resume path's own
+      // no-relist behaviour, not the seat gate, can keep this pod unlisted.
+      mocks.loadDraftHostSession.mockResolvedValue({ ...persistedSession, podSize: 6 });
 
       const outcome = await useDraftPodStore.getState().resumeHostedPod();
 
@@ -1559,7 +1574,7 @@ describe("draftPodStore", () => {
       };
     }
 
-    /** Configure a set pod of `podSize` seats from a two-pack, two-set order. */
+    /** Configure a set pod of `podSize` seats. */
     function configureSetPod(podSize = 6): void {
       useDraftPodStore.setState((prev) => ({
         config: {
@@ -1646,6 +1661,65 @@ describe("draftPodStore", () => {
         setCode: "Chaos:AAA+BBB",
         draftKind: "Premier",
       });
+    });
+
+    it("labels a Chaos pod's candidates without deduplicating repeated sets", async () => {
+      stubPools(["AAA", "BBB"]);
+      mocks.draftProcedure.mockResolvedValue(listableProcedure());
+      useDraftPodStore.setState((prev) => ({
+        config: {
+          ...prev.config,
+          packs: [
+            { code: "AAA", name: "Set AAA" },
+            { code: "AAA", name: "Set AAA" },
+            { code: "BBB", name: "Set BBB" },
+          ],
+          setCode: "AAA+BBB",
+          podSize: 6,
+        },
+        hostDisplayName: "Host",
+        setDraftMode: "chaos",
+      }));
+      useDraftPodStore.getState().setListing({ isPublic: true });
+
+      await useDraftPodStore.getState().createPod();
+
+      expect(dispatchedHostConfig().listing?.request.draftMetadata).toEqual({
+        setCode: "Chaos:AAA+AAA+BBB",
+        draftKind: "Premier",
+      });
+    });
+
+    it("labels a listed pod by its selected draft kind, not a hardcoded one", async () => {
+      stubPools(["TST"]);
+      mocks.draftProcedure.mockResolvedValue(listableProcedure());
+      configureSetPod(6);
+      useDraftPodStore.setState((prev) => ({ config: { ...prev.config, kind: "Sealed" } }));
+      useDraftPodStore.getState().setListing({ isPublic: true });
+
+      await useDraftPodStore.getState().createPod();
+
+      expect(dispatchedHostConfig().listing?.request.draftMetadata).toEqual({
+        setCode: "TST",
+        draftKind: "Sealed",
+      });
+    });
+
+    it("dispatches the listing snapshotted at createPod's start, not a later edit", async () => {
+      stubPools(["TST"]);
+      let resolveCreateProcedure!: (procedure: DraftProcedure | PromiseLike<DraftProcedure>) => void;
+      mocks.draftProcedure.mockImplementationOnce(() => new Promise((resolve) => {
+        resolveCreateProcedure = resolve;
+      }));
+      configureSetPod(6);
+      useDraftPodStore.getState().setListing({ isPublic: true, roomName: "Before" });
+
+      const creating = useDraftPodStore.getState().createPod();
+      useDraftPodStore.getState().setListing({ roomName: "After" });
+      resolveCreateProcedure(listableProcedure());
+      await creating;
+
+      expect(dispatchedHostConfig().listing?.request.roomName).toBe("Before");
     });
 
     it("lists a cube pod by its name and Pod Size", async () => {
@@ -1776,6 +1850,12 @@ describe("draftPodStore", () => {
           "a password past the byte bound",
           // 65 code points, 130 UTF-8 bytes (2 bytes each) — over the 128-byte bound.
           { password: "é".repeat(65) },
+          "To list this pod in the lobby, use a shorter password.",
+        ],
+        [
+          "a password one byte past the byte bound",
+          // 64 "é" (128 bytes) + one ASCII byte = 129 bytes — exactly LOBBY_PASSWORD_MAX_BYTES + 1.
+          { password: "é".repeat(64) + "a" },
           "To list this pod in the lobby, use a shorter password.",
         ],
       ] as const)("refuses %s before contacting the lobby", async (_label, overrides, message) => {

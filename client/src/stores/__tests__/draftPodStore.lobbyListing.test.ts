@@ -1,13 +1,13 @@
 /**
  * Creating a listed pod through the real chain: `draftPodStore.createPod`
- * resolves a broker, registers over it with `brokerClient`, and hands the
- * open client to the real `DraftPodHostAdapter` / `P2PDraftHost`, which
- * updates and withdraws the listing as the pod's occupancy changes.
+ * resolves a broker and hands the open client to the real
+ * `DraftPodHostAdapter` / `P2PDraftHost`, which registers, updates and
+ * withdraws the listing as the pod's occupancy changes.
  *
- * Real: `draftPodStore`, `multiplayerDraftStore`, `multiplayerStore`,
- * `DraftPodHostAdapter`, `P2PDraftHost`, `brokerClient`.
- * Mocked (below the broker's own socket handshake and the PeerJS mesh):
- * `adapter/draft-adapter`'s `DraftAdapter` class, `network/connection`'s
+ * Real: `draftPodStore`, `multiplayerDraftStore`, `multiplayerStore` (its
+ * `ensureSubscriptionSocket` stubbed below), `DraftPodHostAdapter`,
+ * `P2PDraftHost`, `brokerClient`.
+ * Mocked: `adapter/draft-adapter`'s `DraftAdapter` class, `network/connection`'s
  * `hostRoom`, `network/draftPeerSession`'s `createDraftPeerSession`,
  * `services/draftPersistence`'s IndexedDB session functions,
  * `services/openPhaseSocket`'s `openPhaseSocket`, and global `fetch`.
