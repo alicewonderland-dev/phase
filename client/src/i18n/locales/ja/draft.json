@@ -633,7 +633,12 @@
     "tabs": {
       "set": "セット",
       "cube": "キューブ"
-    }
+    },
+    "lobbyUnavailable": "ロビーに接続できなかったため、この卓を掲載できませんでした。",
+    "listingHostNameTooLong": "この卓をロビーに掲載するには、表示名を{{max}}文字以内にしてください。",
+    "listingRoomNameTooLong": "この卓をロビーに掲載するには、ルーム名を{{max}}文字以内にしてください。",
+    "listingCubeNameTooLong": "この卓をロビーに掲載するには、キューブ名を{{max}}文字以内にしてください。",
+    "listingPasswordTooLong": "この卓をロビーに掲載するには、もっと短いパスワードを使用してください。"
   },
   "podPhaseView": {
     "tournamentPairings": "大会の組み合わせ",

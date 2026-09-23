@@ -605,26 +605,21 @@ function MultiplayerPageContent({
 
         const store = useMultiplayerStore.getState();
         // A dedicated game server and the lobby broker can both be connected.
-        // Preserve a custom broker anchor, but never use a Full server for
-        // P2P registration. Unknown custom endpoints are probed before deciding.
         // A Discord host (`requestedCode`) registers on the build's official
         // broker regardless of the browsing anchor: that is the broker its
         // guest links name.
-        const anchor = store.hostingServer;
-        let target = action.connectionMode === "p2p"
-          ? action.settings.requestedCode !== undefined
-            ? OFFICIAL_MULTIPLAYER_SERVER_URL
-            : anchor !== null && store.sourceStatus.get(anchor)?.serverInfo?.mode !== "Full"
-              ? anchor
-              : OFFICIAL_MULTIPLAYER_SERVER_URL
-          : action.serverUrl;
-        let socket = target === null
-          ? null
-          : await store.ensureSubscriptionSocket(target);
-        if (action.connectionMode === "p2p" && socket?.serverInfo.mode === "Full") {
-          target = OFFICIAL_MULTIPLAYER_SERVER_URL;
-          socket = await store.ensureSubscriptionSocket(target);
-        }
+        const resolved = action.connectionMode === "p2p"
+          ? await store.resolveP2PBroker(
+              action.settings.requestedCode !== undefined
+                ? OFFICIAL_MULTIPLAYER_SERVER_URL
+                : store.hostingServer,
+            )
+          : {
+              url: action.serverUrl,
+              socket: action.serverUrl === null ? null : await store.ensureSubscriptionSocket(action.serverUrl),
+            };
+        const target = resolved.url;
+        const socket = resolved.socket;
 
         if (action.connectionMode === "p2p") {
           if (socket?.serverInfo.mode !== "LobbyOnly") {

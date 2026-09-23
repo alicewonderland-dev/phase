@@ -572,7 +572,12 @@
     "tabs": {
       "set": "Espansione",
       "cube": "Cube"
-    }
+    },
+    "lobbyUnavailable": "Impossibile raggiungere la lobby per elencare questo pod.",
+    "listingHostNameTooLong": "Per elencare questo pod nella lobby, usa un nome visualizzato di al massimo {{max}} caratteri.",
+    "listingRoomNameTooLong": "Per elencare questo pod nella lobby, usa un nome stanza di al massimo {{max}} caratteri.",
+    "listingCubeNameTooLong": "Per elencare questo pod nella lobby, usa un nome Cube di al massimo {{max}} caratteri.",
+    "listingPasswordTooLong": "Per elencare questo pod nella lobby, usa una password più corta."
   },
   "podPhaseView": {
     "tournamentPairings": "Accoppiamenti torneo",

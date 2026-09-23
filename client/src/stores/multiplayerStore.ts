@@ -108,6 +108,7 @@ import type { DirectorySource } from "../services/serverDirectory";
 import { reportConnectOutcome } from "../services/serverMetrics";
 import {
   DEFAULT_MULTIPLAYER_SERVER_URL,
+  OFFICIAL_MULTIPLAYER_SERVER_URL,
   isOfficialMultiplayerServerUrl,
 } from "../config/multiplayerServer";
 import { saveActiveGame, useGameStore } from "./gameStore";
@@ -1736,6 +1737,13 @@ interface MultiplayerActions {
    * crash.
    */
   ensureSubscriptionSocket: (url: string) => Promise<PhaseSocket | null>;
+  /**
+   * Choose and probe the broker a P2P registration uses. Preserve a custom
+   * broker anchor, but never use a server known or probed to be `"Full"` for
+   * P2P registration; the official broker is the fallback. Unknown custom
+   * endpoints are probed before deciding.
+   */
+  resolveP2PBroker: (anchor: string | null) => Promise<{ url: string; socket: PhaseSocket | null }>;
   /** Close and discard every source's subscription socket. Called on store
    * teardown. */
   closeSubscriptionSocket: () => void;
@@ -3736,6 +3744,18 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
         });
 
         return channel.firstOpen;
+      },
+
+      resolveP2PBroker: async (anchor) => {
+        let url = anchor !== null && get().sourceStatus.get(anchor)?.serverInfo?.mode !== "Full"
+          ? anchor
+          : OFFICIAL_MULTIPLAYER_SERVER_URL;
+        let socket = await get().ensureSubscriptionSocket(url);
+        if (socket?.serverInfo.mode === "Full") {
+          url = OFFICIAL_MULTIPLAYER_SERVER_URL;
+          socket = await get().ensureSubscriptionSocket(url);
+        }
+        return { url, socket };
       },
 
       closeSubscriptionSocket: () => {

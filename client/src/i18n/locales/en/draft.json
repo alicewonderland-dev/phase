@@ -580,7 +580,12 @@
     "tabs": {
       "set": "Set",
       "cube": "Cube"
-    }
+    },
+    "lobbyUnavailable": "Couldn't reach the lobby to list this pod.",
+    "listingHostNameTooLong": "To list this pod in the lobby, use a display name of at most {{max}} characters.",
+    "listingRoomNameTooLong": "To list this pod in the lobby, use a room name of at most {{max}} characters.",
+    "listingCubeNameTooLong": "To list this pod in the lobby, use a cube name of at most {{max}} characters.",
+    "listingPasswordTooLong": "To list this pod in the lobby, use a shorter password."
   },
   "podPhaseView": {
     "tournamentPairings": "Tournament Pairings",

@@ -572,7 +572,12 @@
     "tabs": {
       "set": "Colección",
       "cube": "Cube"
-    }
+    },
+    "lobbyUnavailable": "No se pudo conectar con la sala para publicar este pod.",
+    "listingHostNameTooLong": "Para publicar este pod en la sala, usa un nombre visible de máximo {{max}} caracteres.",
+    "listingRoomNameTooLong": "Para publicar este pod en la sala, usa un nombre de sala de máximo {{max}} caracteres.",
+    "listingCubeNameTooLong": "Para publicar este pod en la sala, usa un nombre de Cube de máximo {{max}} caracteres.",
+    "listingPasswordTooLong": "Para publicar este pod en la sala, usa una contraseña más corta."
   },
   "podPhaseView": {
     "tournamentPairings": "Emparejamientos del torneo",
