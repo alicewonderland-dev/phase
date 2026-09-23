@@ -273,17 +273,19 @@ mod tests {
     use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
     use engine::game::zones::create_object;
     use engine::types::ability::{
-        AbilityCost, AbilityDefinition, AbilityKind, ContinuousModification, PtValue, QuantityExpr,
-        StaticDefinition, TargetFilter,
+        AbilityCost, AbilityDefinition, AbilityKind, ContinuousModification,
+        CopyRetargetPermission, PtValue, QuantityExpr, StaticDefinition, TargetFilter,
     };
-    use engine::types::ability::{Duration, ResolvedAbility};
-    use engine::types::game_state::WaitingFor;
+    use engine::types::ability::{Duration, ResolvedAbility, TargetRef};
+    use engine::types::game_state::{StackEntry, StackEntryKind, WaitingFor};
     use engine::types::identifiers::CardId;
     use engine::types::keywords::Keyword;
     use engine::types::mana::{ManaColor, ManaCost, ManaCostShard};
     use engine::types::phase::Phase;
     use engine::types::statics::StaticMode;
     use engine::types::zones::Zone;
+
+    use crate::policies::effect_classify::{effect_polarity, EffectPolarity};
 
     const AI: PlayerId = PlayerId(0);
 
@@ -966,5 +968,300 @@ mod tests {
             matches!(verdict, PolicyVerdict::Score { .. }),
             "got {verdict:?}"
         );
+    }
+
+    const STIFLE: &str =
+        "Counter target activated or triggered ability. (Mana abilities can't be targeted.)";
+    const LIGHTNING_BOLT: &str = "Lightning Bolt deals 3 damage to any target.";
+    const BEAST_WITHIN: &str =
+        "Destroy target permanent. Its controller creates a 3/3 green Beast creature token.";
+
+    /// Treetop Village for the AI plus an instant in `responder_controller`'s
+    /// hand, with the AI holding priority in its own precombat main phase.
+    fn responder_board(
+        responder_card: &str,
+        responder_oracle: &str,
+        responder_controller: PlayerId,
+    ) -> (GameRunner, ObjectId, usize, ObjectId) {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let village = scenario
+            .add_land_from_oracle(P0, "Treetop Village", TREETOP_VILLAGE)
+            .id();
+        for _ in 0..8 {
+            scenario.add_basic_land(P0, ManaColor::Green);
+        }
+        let responder = scenario
+            .add_spell_to_hand_from_oracle(
+                responder_controller,
+                responder_card,
+                true,
+                responder_oracle,
+            )
+            .id();
+        scenario.add_basic_land(responder_controller, ManaColor::Blue);
+        let mut runner = scenario.build();
+        {
+            let s = runner.state_mut();
+            s.turn_number = 3;
+            s.active_player = P0;
+            s.phase = Phase::PreCombatMain;
+            s.waiting_for = WaitingFor::Priority { player: P0 };
+        }
+        let index = runner.state().objects[&village]
+            .abilities
+            .iter()
+            .position(crate::manland::animates_source)
+            .expect("the Oracle text parses to a self-animating ability");
+        (runner, village, index, responder)
+    }
+
+    /// CR 117.4: one pass is not all players passing in succession, so the
+    /// activation stays on the stack while the opponent takes priority.
+    /// Returns the pending entry's id.
+    fn pass_to_opponent(runner: &mut GameRunner) -> ObjectId {
+        let pending = runner.state().stack.back().expect("pending entry").id;
+        apply_as_current_for_simulation(runner.state_mut(), GameAction::PassPriority)
+            .expect("the AI passes priority");
+        pending
+    }
+
+    fn entry_targets(state: &GameState, entry_id: ObjectId) -> Vec<TargetRef> {
+        state
+            .stack
+            .iter()
+            .find(|e| e.id == entry_id)
+            .and_then(|e| e.ability())
+            .map(|a| a.targets.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn counter_targeting_a_pending_animation_allows_a_response_activation() {
+        let (mut runner, village, index, stifle) = responder_board("Stifle", STIFLE, P1);
+        announce(&mut runner, village, index);
+        assert!(
+            is_redundant_reject(&verdict_at(runner.state(), village, index)),
+            "control: with nothing answering it, the pending activation vetoes"
+        );
+        let pending = pass_to_opponent(&mut runner);
+        {
+            let commit = runner.cast(stifle).target_object(pending).commit();
+            assert_eq!(
+                commit.state().stack.len(),
+                2,
+                "reach guard: both on the stack"
+            );
+        }
+        let top = runner.state().stack.back().unwrap().id;
+        assert!(
+            entry_targets(runner.state(), top).contains(&TargetRef::Object(pending)),
+            "reach guard: the counter targets the pending activation"
+        );
+        assert!(
+            !is_creature(runner.state(), village),
+            "reach guard: only the stack half can answer"
+        );
+        let verdict = verdict_at(runner.state(), village, index);
+        assert!(
+            matches!(verdict, PolicyVerdict::Score { .. }),
+            "got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_object_above_a_pending_animation_still_vetoes() {
+        let (mut runner, village, index, bolt) =
+            responder_board("Lightning Bolt", LIGHTNING_BOLT, P1);
+        announce(&mut runner, village, index);
+        let pending = pass_to_opponent(&mut runner);
+        {
+            let commit = runner.cast(bolt).target_player(P0).commit();
+            assert_eq!(
+                commit.state().stack.len(),
+                2,
+                "reach guard: both on the stack"
+            );
+        }
+        let top = runner.state().stack.back().unwrap().id;
+        assert_ne!(
+            top, pending,
+            "reach guard: the bolt sits above the activation"
+        );
+        assert!(
+            !entry_targets(runner.state(), top).contains(&TargetRef::Object(pending)),
+            "reach guard: the bolt does not target the pending activation"
+        );
+        assert!(
+            !is_creature(runner.state(), village),
+            "reach guard: only the stack half can answer"
+        );
+        let verdict = verdict_at(runner.state(), village, index);
+        assert!(is_redundant_reject(&verdict), "got {verdict:?}");
+    }
+
+    #[test]
+    fn removal_aimed_at_the_land_not_at_the_pending_activation_still_vetoes() {
+        let (mut runner, village, index, beast_within) =
+            responder_board("Beast Within", BEAST_WITHIN, P1);
+        announce(&mut runner, village, index);
+        let pending = pass_to_opponent(&mut runner);
+        {
+            let commit = runner.cast(beast_within).target_object(village).commit();
+            assert_eq!(
+                commit.state().stack.len(),
+                2,
+                "reach guard: both on the stack"
+            );
+        }
+        let top = runner.state().stack.back().unwrap().id;
+        assert!(
+            entry_targets(runner.state(), top).contains(&TargetRef::Object(village)),
+            "reach guard: the removal targets the land permanent"
+        );
+        assert!(
+            !entry_targets(runner.state(), top).contains(&TargetRef::Object(pending)),
+            "reach guard: it does not target the pending activation"
+        );
+        let verdict = verdict_at(runner.state(), village, index);
+        assert!(is_redundant_reject(&verdict), "got {verdict:?}");
+    }
+
+    /// CR 117.3c: activating keeps priority with the same player, so P0 can
+    /// immediately follow the activation with its own Stifle — no
+    /// `pass_to_opponent` step is needed to reach this board. Reuses
+    /// `responder_board` with the responder controlled by P0 instead of P1.
+    #[test]
+    fn same_controller_counter_targeting_a_pending_animation_also_allows_a_response_activation() {
+        let (mut runner, village, index, stifle) = responder_board("Stifle", STIFLE, P0);
+        announce(&mut runner, village, index);
+        let pending = runner.state().stack.back().unwrap().id;
+        {
+            let commit = runner.cast(stifle).target_object(pending).commit();
+            assert_eq!(
+                commit.state().stack.len(),
+                2,
+                "reach guard: both on the stack"
+            );
+        }
+        let top = runner.state().stack.back().unwrap().id;
+        assert_eq!(
+            runner.state().stack.back().unwrap().controller,
+            P0,
+            "reach guard: the counter's controller is P0, the same as the pending entry's"
+        );
+        assert!(
+            entry_targets(runner.state(), top).contains(&TargetRef::Object(pending)),
+            "reach guard: the counter targets the pending activation"
+        );
+        let verdict = verdict_at(runner.state(), village, index);
+        assert!(
+            matches!(verdict, PolicyVerdict::Score { .. }),
+            "got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_unanswered_pending_animation_still_vetoes_a_third_activation() {
+        // After Stifle answers the first pending animation and both
+        // players pass back to P0, the AI is free to activate again — but the
+        // resulting second pending animation is itself unanswered, so a third
+        // activation must stay vetoed.
+        let (mut runner, village, index, stifle) = responder_board("Stifle", STIFLE, P1);
+        announce(&mut runner, village, index);
+        let pending = pass_to_opponent(&mut runner);
+        {
+            let commit = runner.cast(stifle).target_object(pending).commit();
+            assert_eq!(
+                commit.state().stack.len(),
+                2,
+                "reach guard: both on the stack"
+            );
+        }
+        apply_as_current_for_simulation(runner.state_mut(), GameAction::PassPriority)
+            .expect("P1 passes priority back to P0 after casting Stifle");
+        let second_verdict = verdict_at(runner.state(), village, index);
+        assert!(
+            matches!(second_verdict, PolicyVerdict::Score { .. }),
+            "second activation: got {second_verdict:?}"
+        );
+        announce(&mut runner, village, index);
+        assert_eq!(
+            runner
+                .state()
+                .stack
+                .iter()
+                .filter(|entry| matches!(
+                    &entry.kind,
+                    StackEntryKind::ActivatedAbility { source_id, .. } if *source_id == village
+                ))
+                .count(),
+            2,
+            "reach guard: both pending copies of the animation are on the stack"
+        );
+        let verdict = verdict_at(runner.state(), village, index);
+        assert!(
+            is_redundant_reject(&verdict),
+            "third activation: got {verdict:?}"
+        );
+    }
+
+    /// CR 707.10: a copy effect's polarity is `Contextual`
+    /// (`effect_classify::effect_polarity`), not `Harmful` — confirmed below —
+    /// so it must not count as an answer to a pending animation the way
+    /// Stifle's `Effect::Counter` does.
+    fn copy_spell_effect() -> Effect {
+        Effect::CopySpell {
+            target: TargetFilter::Any,
+            retarget: CopyRetargetPermission::KeepOriginalTargets,
+            copier: None,
+            additional_modifications: Vec::new(),
+            starting_loyalty_from_casualty_sacrifice: false,
+        }
+    }
+
+    #[test]
+    fn copy_effect_targeting_a_pending_animation_does_not_lift_the_veto() {
+        let (mut runner, village, index) =
+            oracle_board("Treetop Village", TREETOP_VILLAGE, &[(ManaColor::Green, 8)]);
+        announce(&mut runner, village, index);
+        let pending = runner.state().stack.back().expect("pending entry").id;
+        assert!(
+            is_redundant_reject(&verdict_at(runner.state(), village, index)),
+            "control: with nothing answering it, the pending activation vetoes"
+        );
+        assert_eq!(
+            effect_polarity(&copy_spell_effect()),
+            EffectPolarity::Contextual,
+            "reach guard: CopySpell must not classify as Harmful for this test to discriminate"
+        );
+
+        let copy_entry_id = ObjectId(runner.state().next_object_id);
+        {
+            let state = runner.state_mut();
+            let ability = ResolvedAbility::new(
+                copy_spell_effect(),
+                vec![TargetRef::Object(pending)],
+                ObjectId(9998),
+                P1,
+            );
+            state.stack.push_back(StackEntry {
+                id: copy_entry_id,
+                source_id: ObjectId(9998),
+                controller: P1,
+                kind: StackEntryKind::ActivatedAbility {
+                    source_id: ObjectId(9998),
+                    ability: Box::new(ability),
+                },
+            });
+            state.next_object_id += 1;
+        }
+        assert!(
+            entry_targets(runner.state(), copy_entry_id).contains(&TargetRef::Object(pending)),
+            "reach guard: the copy entry targets the pending activation"
+        );
+
+        let verdict = verdict_at(runner.state(), village, index);
+        assert!(is_redundant_reject(&verdict), "got {verdict:?}");
     }
 }

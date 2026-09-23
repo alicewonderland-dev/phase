@@ -257,9 +257,12 @@ pub(crate) fn activation_leaves_source_tapped(
     )
 }
 
-/// CR 611.2 + CR 602.2a: true when the man-land's animation payoff is
-/// already applied or already owed — the source is a creature now, or a
-/// self-animating activated ability of that source is still on the stack.
+/// CR 611.2 + CR 602.2a: true when the man-land's animation payoff is already
+/// applied or still owed — the source is a creature now, or a self-animating
+/// activated ability of that source is on the stack and
+/// [`crate::policies::stack_awareness::has_pending_removal`] finds nothing.
+/// CR 602.2a: the ability is owed only until it is
+/// countered, so an answer already on the stack means it is not owed.
 /// The stack half covers the CR 117.3c window between announcement and
 /// resolution, when the source is not yet a creature.
 pub(crate) fn animation_payoff_in_force(state: &GameState, source_id: ObjectId) -> bool {
@@ -279,6 +282,7 @@ pub(crate) fn animation_payoff_in_force(state: &GameState, source_id: ObjectId) 
                 && crate::policies::context::collect_ability_effects(ability)
                     .into_iter()
                     .any(effect_animates_self)
+                && !crate::policies::stack_awareness::has_pending_removal(state, entry.id)
         }
         _ => false,
     })
