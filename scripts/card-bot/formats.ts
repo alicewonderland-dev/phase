@@ -24,6 +24,7 @@ export const FORMATS: readonly LfgFormat[] = [
   { format: "Historic", label: "Historic", min_players: 2, max_players: 2 },
   { format: "Timeless", label: "Timeless", min_players: 2, max_players: 2 },
   { format: "Pauper", label: "Pauper", min_players: 2, max_players: 2 },
+  { format: "Freeform", label: "Freeform", min_players: 2, max_players: 2 },
   { format: "Commander", label: "Commander", min_players: 2, max_players: 6 },
   { format: "DuelCommander", label: "Duel Commander", min_players: 2, max_players: 2 },
   { format: "PauperCommander", label: "Pauper Commander", min_players: 2, max_players: 6 },
@@ -32,6 +33,7 @@ export const FORMATS: readonly LfgFormat[] = [
   { format: "Brawl", label: "Brawl", min_players: 2, max_players: 2 },
   { format: "HistoricBrawl", label: "Historic Brawl", min_players: 2, max_players: 2 },
   { format: "CommanderDraft", label: "Commander Draft", min_players: 3, max_players: 8 },
+  { format: "FreeformCommander", label: "Freeform Commander", min_players: 2, max_players: 4 },
   { format: "FreeForAll", label: "Free-for-All", min_players: 2, max_players: 6 },
   { format: "TwoHeadedGiant", label: "Two-Headed Giant", min_players: 4, max_players: 4 },
   { format: "Archenemy", label: "Archenemy", min_players: 2, max_players: 6 },
@@ -54,4 +56,15 @@ export const MAX_SEATS = Math.max(...FORMATS.map((f) => f.max_players));
 /** Most seats an /lfg game of this format can have in this mode. */
 export function seatCap(f: LfgFormat, mode: LfgMode): number {
   return mode === "p2p" ? Math.min(f.max_players, P2P_MAX_PEERS) : f.max_players;
+}
+
+/** Formats whose usual table is smaller than their cap. Kept apart from FORMATS,
+ *  which mirrors the client registry and has no such field. */
+const PREFERRED_SEATS: Readonly<Record<string, number>> = { Commander: 4 };
+
+/** Seats an /lfg game gets when the `seats` option is omitted. */
+export function defaultSeats(f: LfgFormat, mode: LfgMode): number {
+  const cap = seatCap(f, mode);
+  const preferred = PREFERRED_SEATS[f.format];
+  return preferred === undefined ? cap : Math.min(preferred, cap);
 }
