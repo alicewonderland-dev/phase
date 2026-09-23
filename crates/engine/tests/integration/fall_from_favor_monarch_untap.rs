@@ -2,8 +2,11 @@
 //! current controller, and CR 725.5 makes it inactive while no one is monarch.
 
 use engine::game::effects::attach::attach_to;
+use engine::game::layers::evaluate_layers;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::types::ability::{PlayerScope, StaticCondition};
+use engine::types::ability::{
+    ContinuousModification, Duration, PlayerScope, StaticCondition, TargetFilter,
+};
 use engine::types::identifiers::ObjectId;
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
@@ -139,38 +142,57 @@ fn two_auras_bind_their_own_recipients() {
 
 #[test]
 fn control_change_rebinds_the_untap_subject() {
-    let mut scenario = GameScenario::new();
-    scenario.at_phase(Phase::PreCombatMain);
-    for player in [P0, P1] {
-        scenario.with_library_top(player, &["Plains", "Plains", "Plains"]);
+    for (monarch, stays_tapped) in [(P1, false), (P0, true)] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        for player in [P0, P1] {
+            scenario.with_library_top(player, &["Plains", "Plains", "Plains"]);
+        }
+        let enchanted = scenario.add_creature(P0, "Enchanted Bear", 2, 2).id();
+        let free = scenario.add_creature(P1, "P1 Free Bear", 2, 2).id();
+        let fall = scenario
+            .add_enchantment_from_oracle(P0, "Fall from Favor", FALL_FROM_FAVOR)
+            .with_subtypes(vec!["Aura"])
+            .id();
+        let mut runner = scenario.build();
+        attach_aura(&mut runner, fall, enchanted);
+        assert_parsed_gate(&runner, fall);
+        // CR 613.1b: install the same layer-2 transient control effect used by
+        // gain_control::resolve, with a P1-controlled source.
+        runner.state_mut().add_transient_continuous_effect(
+            free,
+            P1,
+            Duration::Permanent,
+            TargetFilter::SpecificObject { id: enchanted },
+            vec![ContinuousModification::ChangeController],
+            None,
+        );
+        // Layer 2 changes the creature's live controller, while Fall from Favor
+        // remains controlled by P0 and the creature's base controller stays P0.
+        runner.state_mut().layers_dirty.mark_full();
+        evaluate_layers(runner.state_mut());
+        assert_eq!(runner.state().objects[&enchanted].base_controller, Some(P0));
+        assert_eq!(runner.state().objects[&enchanted].controller, P1);
+        assert_eq!(runner.state().objects[&fall].controller, P0);
+
+        for id in [enchanted, free] {
+            runner.state_mut().objects.get_mut(&id).unwrap().tapped = true;
+        }
+        runner.state_mut().monarch = Some(monarch);
+        runner.state_mut().layers_dirty.mark_full();
+        runner.advance_to_phase(Phase::Upkeep);
+        assert_eq!(runner.state().phase, Phase::Upkeep);
+        assert_eq!(runner.state().active_player, P1);
+        assert_eq!(runner.state().objects[&enchanted].controller, P1);
+        assert_eq!(runner.state().objects[&fall].controller, P0);
+        assert_eq!(
+            runner.state().objects[&enchanted].tapped,
+            stays_tapped,
+            "monarch={monarch:?}"
+        );
+        assert!(
+            !runner.state().objects[&free].tapped,
+            "P1's free creature must untap"
+        );
     }
-    let enchanted = scenario.add_creature(P1, "Enchanted Bear", 2, 2).id();
-    let free = scenario.add_creature(P0, "P0 Free Bear", 2, 2).id();
-    let aura = scenario
-        .add_enchantment_from_oracle(P0, "Fall from Favor", FALL_FROM_FAVOR)
-        .with_subtypes(vec!["Aura"])
-        .id();
-    let mut runner = scenario.build();
-    attach_aura(&mut runner, aura, enchanted);
-    assert_parsed_gate(&runner, aura);
-    {
-        let object = runner.state_mut().objects.get_mut(&enchanted).unwrap();
-        // Layer recomputation rehydrates from base_controller. Seed both parts
-        // of the changed-control state so the next untap reads P0 live.
-        object.base_controller = Some(P0);
-        object.controller = P0;
-    }
-    for id in [enchanted, free] {
-        runner.state_mut().objects.get_mut(&id).unwrap().tapped = true;
-    }
-    runner.state_mut().monarch = Some(P0);
-    runner.state_mut().layers_dirty.mark_full();
-    runner.advance_to_combat();
-    runner.declare_attackers(&[]).expect("P0 can pass combat");
-    runner.advance_to_phase(Phase::Upkeep);
-    runner.advance_to_phase(Phase::Draw);
-    runner.advance_to_phase(Phase::Upkeep);
-    assert_eq!(runner.state().active_player, P0);
-    assert!(!runner.state().objects[&enchanted].tapped);
-    assert!(!runner.state().objects[&free].tapped);
 }
