@@ -2,7 +2,7 @@
  * Creating a listed pod through the real chain: `draftPodStore.createPod`
  * resolves a broker and hands the open client to the real
  * `DraftPodHostAdapter` / `P2PDraftHost`, which registers, updates and
- * withdraws the listing as the pod's occupancy changes.
+ * withdraws the listing.
  *
  * Real: `draftPodStore`, `multiplayerDraftStore`, `multiplayerStore` (its
  * `ensureSubscriptionSocket` stubbed below), `DraftPodHostAdapter`,

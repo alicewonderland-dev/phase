@@ -1730,7 +1730,7 @@ describe("draftPodStore", () => {
           cubeName: "  My Cube  ",
           cubeListText: "1 Lightning Bolt\n",
           settings: {
-            pod_size: 4,
+            pod_size: 8,
             pack_count: 1,
             cards_per_pack: 2,
             min_deck_size: 4,
@@ -1789,6 +1789,7 @@ describe("draftPodStore", () => {
     it.each([
       ["pw", "pw"],
       ["", null],
+      [" pw ", " pw "],
     ])("carries the listing password %j", async (password, expected) => {
       stubPools(["TST"]);
       mocks.draftProcedure.mockResolvedValue(listableProcedure());
@@ -2078,6 +2079,27 @@ describe("draftPodStore", () => {
 
       expect(useDraftPodStore.getState().configError).toBeNull();
       expect(mocks.openBrokerClient).not.toHaveBeenCalled();
+    });
+
+    it("does not open the lobby connection for a config edited while the broker is chosen", async () => {
+      stubPools(["TST"]);
+      mocks.draftProcedure.mockResolvedValue(listableProcedure());
+      configureSetPod(6);
+      useDraftPodStore.getState().setListing({ isPublic: true });
+      let resolveBroker!: (result: { url: string; socket: { serverInfo: { mode: string } } | null }) => void;
+      mocks.multiplayerConfig.resolveP2PBroker = vi.fn(() => new Promise((resolve) => {
+        resolveBroker = resolve;
+      }));
+
+      const creating = useDraftPodStore.getState().createPod();
+      await vi.waitFor(() => expect(mocks.multiplayerConfig.resolveP2PBroker).toHaveBeenCalledOnce());
+      useDraftPodStore.getState().setConfig({ podSize: 4 });
+      resolveBroker({ url: "wss://broker.example/ws", socket: { serverInfo: { mode: "LobbyOnly" } } });
+
+      await creating;
+
+      expect(mocks.openBrokerClient).not.toHaveBeenCalled();
+      expect(mocks.multiplayerState.hostDraft).not.toHaveBeenCalled();
     });
   });
 
