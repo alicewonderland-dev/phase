@@ -924,7 +924,7 @@ export function HostSetup({
               (edited in the `PlayerIdentityBanner` above this form). Blank falls
               back to the player's name on the server side. */}
           <Field
-            label={`${t("hostSetup.roomName")} (${t("hostSetup.optional")})`}
+            label={t("hostSetup.roomNameOptional")}
             htmlFor="host-setup-room"
             hint={`${t("hostSetup.roomNameHelp")}${displayName ? t("hostSetup.roomNameHelpDefault", { name: displayName }) : ""}`}
           >

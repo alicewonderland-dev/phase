@@ -97,6 +97,7 @@ import {
 import { saveCustomFormat } from "../../../services/customFormats";
 import enMultiplayer from "../../../i18n/locales/en/multiplayer.json";
 import deMultiplayer from "../../../i18n/locales/de/multiplayer.json";
+import { resources, SUPPORTED_LNGS } from "../../../i18n/resources";
 import {
   LOBBY_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
@@ -734,6 +735,22 @@ describe("HostSetup", () => {
     }
     expect(sandboxSwitch).toHaveAccessibleDescription(deMultiplayer.hostSetup.sandboxModeHelp);
     expect(startSwitch).not.toBeChecked();
+  });
+
+  it.each([...SUPPORTED_LNGS])("labels the room-name field with one bracket pair in %s", async (lng) => {
+    const multiplayer = resources[lng].multiplayer as { hostSetup: { roomNameOptional: string } };
+    i18n.addResourceBundle(lng, "multiplayer", multiplayer, true, true);
+    await i18n.changeLanguage(lng);
+    const { container } = render(<HostSetup onHost={vi.fn()} onBack={vi.fn()} connectionMode="server" onConnectionModeChange={vi.fn()} />);
+    const label = container.querySelector('label[for="host-setup-room"]')?.textContent ?? "";
+    const open = label.match(/[(（]/gu)?.length ?? 0;
+    const close = label.match(/[)）]/gu)?.length ?? 0;
+    expect({ lng, label, open, close }).toEqual({
+      lng,
+      label: multiplayer.hostSetup.roomNameOptional,
+      open: 1,
+      close: 1,
+    });
   });
 
   it("keeps sandbox descriptions associated with their own mounted form", () => {
