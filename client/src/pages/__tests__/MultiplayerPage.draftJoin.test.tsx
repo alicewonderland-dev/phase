@@ -26,9 +26,7 @@ vi.mock("../../stores/multiplayerStore", async (importOriginal) => ({
 /**
  * `network/connection` stays real except for `joinRoom`, which is the one
  * seam that would otherwise open a live PeerJS signaling connection. A
- * rejecting stub ends the guest's "new"-seat dial after exactly one call
- * (F-8) — the same pattern `multiplayerDraftStore.persistenceFence.test.ts`
- * uses for `hostRoom`.
+ * rejecting stub ends the guest's "new"-seat dial after exactly one call.
  */
 const connectionMocks = vi.hoisted(() => ({
   joinRoom: vi.fn(async (_code: string, _signal?: AbortSignal, _timeoutMs?: number) => {
@@ -161,11 +159,11 @@ describe("MultiplayerPage draft join routing", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     // `clearAllMocks` drops calls but keeps queued `mockResolvedValueOnce`
-    // implementations (e.g. T8's password_required→ok sequence) — an explicit
-    // `mockReset` on every mock this suite queues per-test is what stops a
-    // test whose base run never drains its queue (because the code path that
-    // would call it doesn't exist yet) from leaking that queue into the next
-    // test.
+    // implementations (e.g. a queued password_required→ok sequence) — an
+    // explicit `mockReset` on every mock this suite queues per-test is what
+    // stops a test whose base run never drains its queue (because the code
+    // path that would call it doesn't exist yet) from leaking that queue
+    // into the next test.
     storeMocks.findLobbyGameByCode.mockReset();
     connectionMocks.joinRoom.mockReset();
     connectionMocks.joinRoom.mockImplementation(async () => {
@@ -205,7 +203,7 @@ describe("MultiplayerPage draft join routing", () => {
     cleanup();
   });
 
-  it("T6: resolves through the broker and dials the host peer, never the listing code", async () => {
+  it("resolves through the broker and dials the host peer, never the listing code", async () => {
     harness.lobbyAction = (props) => {
       (
         props.onJoinGame as (
@@ -230,7 +228,7 @@ describe("MultiplayerPage draft join routing", () => {
     expect(connectionMocks.joinRoom.mock.calls[0][0]).not.toBe("ABC123");
   });
 
-  it("T7: forwards the row's password into the first resolve", async () => {
+  it("forwards the row's password into the first resolve", async () => {
     harness.lobbyAction = (props) => {
       (
         props.onJoinGame as (
@@ -251,7 +249,7 @@ describe("MultiplayerPage draft join routing", () => {
     expect(resolveGuest).toHaveBeenCalledWith("ABC123", ORIGIN, "pw");
   });
 
-  it("T8: re-prompts on password_required and retries on the same socket", async () => {
+  it("re-prompts on password_required and retries on the same socket", async () => {
     resolveGuest
       .mockResolvedValueOnce({ ok: false, reason: "password_required", message: "Password required" })
       .mockResolvedValueOnce({
@@ -264,8 +262,8 @@ describe("MultiplayerPage draft join routing", () => {
           filled_seats: 1,
         },
       });
-    // jsdom does not implement `window.prompt`, so `vi.spyOn` has nothing to
-    // wrap — `vi.stubGlobal` is the idiom this codebase uses elsewhere
+    // happy-dom does not implement `window.prompt`, so `vi.spyOn` has nothing
+    // to wrap — `vi.stubGlobal` is the idiom this codebase uses elsewhere
     // (`MyDecks.test.tsx`). A failed assertion below must not leave it
     // stubbed for later tests, hence the `finally`.
     vi.stubGlobal("prompt", vi.fn(() => "pw2"));
@@ -296,7 +294,7 @@ describe("MultiplayerPage draft join routing", () => {
     }
   });
 
-  it("T9: shows the 'Can't join this room' dialog on room_full, without dialing", async () => {
+  it("shows the 'Can't join this room' dialog on room_full, without dialing", async () => {
     resolveGuest.mockResolvedValue({
       ok: false,
       reason: "room_full",
@@ -321,7 +319,7 @@ describe("MultiplayerPage draft join routing", () => {
     expect(connectionMocks.joinRoom).not.toHaveBeenCalled();
   });
 
-  it("T10: classifies a typed code from the join origin's own listing", async () => {
+  it("classifies a typed code from the join origin's own listing", async () => {
     storeMocks.findLobbyGameByCode.mockImplementation(
       (code: string, sourceUrl?: string) =>
         code === "ABC123" && sourceUrl === ORIGIN_URL
@@ -343,7 +341,7 @@ describe("MultiplayerPage draft join routing", () => {
     expect(storeMocks.findLobbyGameByCode).toHaveBeenCalledWith("ABC123", ORIGIN_URL);
   });
 
-  it("T12: refuses to watch a P2P draft row", async () => {
+  it("refuses to watch a P2P draft row", async () => {
     harness.lobbyAction = (props) => {
       (
         props.onSpectate as (code: string, origin: LobbySource, context: LobbyGame) => void
@@ -360,7 +358,7 @@ describe("MultiplayerPage draft join routing", () => {
     );
   });
 
-  it("T13: refuses a non-P2P draft row without contacting the broker", async () => {
+  it("refuses a non-P2P draft row without contacting the broker", async () => {
     harness.lobbyAction = (props) => {
       (
         props.onJoinGame as (
@@ -382,7 +380,7 @@ describe("MultiplayerPage draft join routing", () => {
     expect(connectionMocks.joinRoom).not.toHaveBeenCalled();
   });
 
-  it("T14: refuses to join while already in a live draft pod", async () => {
+  it("refuses to join while already in a live draft pod", async () => {
     useMultiplayerDraftStore.setState({ role: "host", phase: "lobby" });
     harness.lobbyAction = (props) => {
       (
@@ -407,7 +405,7 @@ describe("MultiplayerPage draft join routing", () => {
     expect(connectionMocks.joinRoom).not.toHaveBeenCalled();
   });
 
-  it("T14b: a non-live phase with a role set does not block the join", async () => {
+  it("a non-live phase with a role set does not block the join", async () => {
     useMultiplayerDraftStore.setState({ role: "guest", phase: "complete" });
     harness.lobbyAction = (props) => {
       (
@@ -429,7 +427,7 @@ describe("MultiplayerPage draft join routing", () => {
     expect(connectionMocks.joinRoom.mock.calls[0][0]).toBe("ABCDE");
   });
 
-  it("T15: a constructed P2P row still resolves and navigates to /game", async () => {
+  it("a constructed P2P row still resolves and navigates to /game", async () => {
     lookupJoinTarget.mockResolvedValue({
       ok: true,
       info: { is_p2p: true, format_config: null },

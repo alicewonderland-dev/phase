@@ -444,11 +444,8 @@ function MultiplayerPageContent({
    * has been shown. No `throw`-based control flow: failures come back as
    * a discriminated `ResolveResult`.
    *
-   * Declared above `executeAction` so the deck-select → re-dispatch
-   * path can route LobbyOnly joins through the broker too. `setJoinErrorDialog`
-   * is referenced as an identifier (stable across renders via React). Two
-   * consumers dial the room this returns: the constructed guest join
-   * (`joinP2PRoom`) and the P2P draft join (`handleJoinDraftFromLobby`).
+   * `setJoinErrorDialog` is referenced as an identifier (stable across
+   * renders via React).
    */
   const resolveP2PDialTarget = useCallback(
     async (
@@ -496,7 +493,8 @@ function MultiplayerPageContent({
     [refreshToLatestBuild, resolveGuestFromStore, showToast, t],
   );
 
-  // Resolves, then navigates on success.
+  // Declared above `executeAction` so the deck-select → re-dispatch
+  // path can route LobbyOnly joins through the broker too.
   const joinP2PRoom = useCallback(
     async (
       code: string,
@@ -770,8 +768,6 @@ function MultiplayerPageContent({
       // colliding row from another source and route a game to the draft
       // spectator (or the reverse).
       const resolved = context ?? findLobbyGameByCode(code, origin.url)?.game;
-      // C1.4 found no draft-spectate route a P2P listing can use; refuse
-      // rather than send a watcher into a socket the broker never answers.
       if (resolved?.draft_metadata && resolved.is_p2p === true) {
         showToast(t("page.p2pDraftSpectateUnsupported"));
         return;
