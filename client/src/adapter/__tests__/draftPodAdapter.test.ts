@@ -1135,6 +1135,27 @@ describe("DraftPodHostAdapter", () => {
       expect(broker.close).toHaveBeenCalledTimes(1);
       expect(broker.unregister).not.toHaveBeenCalled();
     });
+
+    it("sends nothing to its listing once disposal begins", async () => {
+      const broker = makeBroker();
+      let reentrantDispose: Promise<void> | undefined;
+      const unsub = adapter.onEvent((e) => {
+        if (e.type === "statusChanged" && e.status === "lobby") {
+          reentrantDispose = adapter.dispose();
+          const hostEventHandler = mockHostOnEvent.mock.calls[0][0];
+          hostEventHandler({ type: "lobbyUpdate", seats: [], joined: 4, total: 6 });
+        }
+      });
+
+      await adapter.initialize(listingCfg(broker));
+      unsub();
+      await reentrantDispose;
+
+      expect(broker.updateMetadata).not.toHaveBeenCalled();
+      expect(broker.unregister).toHaveBeenCalledTimes(1);
+      expect(broker.unregister).toHaveBeenCalledWith("GAME01");
+      expect(broker.close).toHaveBeenCalledTimes(1);
+    });
   });
 });
 
