@@ -1637,6 +1637,17 @@ describe("draftPodStore", () => {
       });
     });
 
+    it("advertises the pod's own seat count, not the lobby's ceiling", async () => {
+      stubPools(["TST"]);
+      mocks.draftProcedure.mockResolvedValue(listableProcedure());
+      configureSetPod(4);
+      useDraftPodStore.getState().setListing({ isPublic: true });
+
+      await useDraftPodStore.getState().createPod();
+
+      expect(dispatchedHostConfig().listing?.request.playerCount).toBe(4);
+    });
+
     it("labels a Chaos pod by its candidate sets", async () => {
       stubPools(["AAA", "BBB"]);
       mocks.draftProcedure.mockResolvedValue(listableProcedure());
@@ -1875,6 +1886,8 @@ describe("draftPodStore", () => {
         ["a display name of 20 astral characters", { hostDisplayName: "🂡".repeat(20) }],
         ["a room name at the bound", { roomName: "A".repeat(40) }],
         ["a cube name at the bound", { cubeName: "A".repeat(40) }],
+        // 21 code points, 42 UTF-16 units — code points are what the bound counts.
+        ["a cube name of 21 astral characters", { cubeName: "🂡".repeat(21) }],
         // 64 code points, 128 UTF-8 bytes — at, not over, the byte bound.
         ["a password at the byte bound", { password: "é".repeat(64) }],
       ] as const)("lists a pod with %s", async (_label, overrides) => {
