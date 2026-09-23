@@ -52,6 +52,7 @@ import {
 } from "../stores/multiplayerStore";
 import { DEFAULT_MULTIPLAYER_SERVER_URL, OFFICIAL_MULTIPLAYER_SERVER_URL } from "../config/multiplayerServer";
 import {
+  isMultiplayerDraftPodLive,
   useMultiplayerDraftStore,
   type MultiplayerDraftPhase,
 } from "../stores/multiplayerDraftStore";
@@ -438,33 +439,32 @@ function MultiplayerPageContent({
    * Guest-path P2P resolve loop. Tries `resolveGuest` over the shared
    * subscription socket, prompts for a password on `password_required`
    * and retries on the same socket, surfaces explicit UI for
-   * `build_mismatch` / `connection_lost` / etc., and navigates on
-   * success. No `throw`-based control flow: failures come back as a
-   * discriminated `ResolveResult`.
+   * `build_mismatch` / `connection_lost` / etc., and returns the stripped
+   * host peer id to dial on success, or `null` once the failure's own UI
+   * has been shown. No `throw`-based control flow: failures come back as
+   * a discriminated `ResolveResult`.
    *
    * Declared above `executeAction` so the deck-select → re-dispatch
    * path can route LobbyOnly joins through the broker too. `setJoinErrorDialog`
-   * is referenced as an identifier (stable across renders via React).
+   * is referenced as an identifier (stable across renders via React). Two
+   * consumers dial the room this returns: the constructed guest join
+   * (`joinP2PRoom`) and the P2P draft join (`handleJoinDraftFromLobby`).
    */
-  const joinP2PRoom = useCallback(
+  const resolveP2PDialTarget = useCallback(
     async (
       code: string,
       origin: LobbySource,
       initialPassword?: string,
-    ): Promise<boolean> => {
+    ): Promise<string | null> => {
       let password = initialPassword;
       while (true) {
         const result = await resolveGuestFromStore(code, origin, password);
         if (result.ok) {
-          const gameId = crypto.randomUUID();
-          useGameStore.setState({ gameId });
-          const roomCode = stripPeerIdPrefix(result.peerInfo.host_peer_id);
-          navigate(`/game/${gameId}?mode=p2p-join&code=${roomCode}`);
-          return true;
+          return stripPeerIdPrefix(result.peerInfo.host_peer_id);
         }
         if (result.reason === "password_required") {
           const entered = window.prompt(t("page.passwordPrompt"));
-          if (!entered) return false;
+          if (!entered) return null;
           password = entered;
           continue;
         }
@@ -477,7 +477,7 @@ function MultiplayerPageContent({
               onClick: () => void refreshToLatestBuild(),
             },
           });
-          return false;
+          return null;
         }
         if (
           result.reason === "not_found" ||
@@ -487,13 +487,30 @@ function MultiplayerPageContent({
             title: t("page.joinErrorCantJoinTitle"),
             message: result.message,
           });
-          return false;
+          return null;
         }
         showToast(result.message);
-        return false;
+        return null;
       }
     },
-    [navigate, refreshToLatestBuild, resolveGuestFromStore, showToast, t],
+    [refreshToLatestBuild, resolveGuestFromStore, showToast, t],
+  );
+
+  // Resolves, then navigates on success.
+  const joinP2PRoom = useCallback(
+    async (
+      code: string,
+      origin: LobbySource,
+      initialPassword?: string,
+    ): Promise<boolean> => {
+      const roomCode = await resolveP2PDialTarget(code, origin, initialPassword);
+      if (roomCode === null) return false;
+      const gameId = crypto.randomUUID();
+      useGameStore.setState({ gameId });
+      navigate(`/game/${gameId}?mode=p2p-join&code=${roomCode}`);
+      return true;
+    },
+    [navigate, resolveP2PDialTarget],
   );
 
   // Execute a pending action (host or join) with the currently active deck.
@@ -705,19 +722,39 @@ function MultiplayerPageContent({
     navigate("/draft?mode=multiplayer");
   }, [navigate]);
 
-  // Join a draft pod from the lobby. Draft entries carry `draft_metadata`
-  // and are always P2P — the guest joins via PeerJS room code.
+  // Join a P2P draft pod from the lobby. A row's `game_code` names the
+  // broker listing, not the host's PeerJS room — the room to dial is the
+  // host peer the broker returns from `resolveP2PDialTarget`.
   const handleJoinDraftFromLobby = useCallback(
-    async (code: string, _context?: LobbyGame) => {
+    async (
+      code: string,
+      origin: LobbySource | null,
+      password: string | undefined,
+      listed: LobbyGame,
+    ) => {
+      if (listed.is_p2p !== true) {
+        showToast(t("page.serverDraftJoinUnsupported"));
+        return;
+      }
+      if (isMultiplayerDraftPodLive(useMultiplayerDraftStore.getState())) {
+        showToast(t("page.alreadyInDraftPod"));
+        return;
+      }
+      if (origin === null) {
+        showToast(t("page.joinNeedsServer"));
+        return;
+      }
+      const roomCode = await resolveP2PDialTarget(code, origin, password);
+      if (roomCode === null) return;
       const playerName = useMultiplayerStore.getState().displayName ?? "Player";
       try {
-        await joinDraft({ kind: "new", roomCode: code, displayName: playerName });
+        await joinDraft({ kind: "new", roomCode, displayName: playerName });
         setView("draft-lobby");
       } catch {
         showToast(t("page.failedToJoinDraft"));
       }
     },
-    [joinDraft, showToast, t],
+    [joinDraft, resolveP2PDialTarget, showToast, t],
   );
 
   const handleSpectate = useCallback(
@@ -733,6 +770,12 @@ function MultiplayerPageContent({
       // colliding row from another source and route a game to the draft
       // spectator (or the reverse).
       const resolved = context ?? findLobbyGameByCode(code, origin.url)?.game;
+      // C1.4 found no draft-spectate route a P2P listing can use; refuse
+      // rather than send a watcher into a socket the broker never answers.
+      if (resolved?.draft_metadata && resolved.is_p2p === true) {
+        showToast(t("page.p2pDraftSpectateUnsupported"));
+        return;
+      }
       // Every spectate navigation carries the origin — the draft-spectator
       // socket opens on it exactly as the game socket does.
       const spectatorParams = new URLSearchParams({ code, server: origin.url });
@@ -772,14 +815,20 @@ function MultiplayerPageContent({
       context?: LobbyGame,
       onNotFound?: () => void,
     ) => {
+      const trimmedCode = code.trim();
+
       // Draft entries bypass the normal join-with-deck flow entirely — draft
-      // pods handle their own deck building after the draft completes.
-      if (context?.draft_metadata) {
-        void handleJoinDraftFromLobby(code, context);
+      // pods handle their own deck building after the draft completes. A
+      // row click already carries `context`; a typed code of a listed pod
+      // is recovered from the join origin's own listing, mirroring
+      // `handleSpectate`'s scoped `findLobbyGameByCode` lookup.
+      const listed =
+        context ?? (origin !== null ? findLobbyGameByCode(trimmedCode, origin.url)?.game : undefined);
+      if (listed?.draft_metadata) {
+        void handleJoinDraftFromLobby(trimmedCode, origin, password, listed);
         return;
       }
 
-      const trimmedCode = code.trim();
       const directP2PCode = parseRoomCode(trimmedCode);
 
       // Raw 5-character room codes are direct PeerJS joins with no server
