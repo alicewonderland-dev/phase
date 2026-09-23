@@ -3,6 +3,7 @@ import i18n from "i18next";
 import type { DraftKind, DraftProcedure, TournamentFormat } from "../../adapter/draft-adapter";
 import { draftProcedureFixture } from "../../adapter/__tests__/draftProcedureFixture";
 import deMultiplayer from "../../i18n/locales/de/multiplayer.json";
+import { resources, SUPPORTED_LNGS } from "../../i18n/resources";
 
 const mocks = vi.hoisted(() => ({
   clearActiveDraftPod: vi.fn(),
@@ -30,6 +31,8 @@ const mocks = vi.hoisted(() => ({
     displayName: "",
     userLobbySources: [],
     sourceStatus: new Map(),
+    lastPodListingPublic: null as boolean | null,
+    rememberPodListingPublic: vi.fn<(isPublic: boolean) => void>(),
     resolveP2PBroker: vi.fn<(anchor: string | null) => Promise<{
       url: string;
       socket: { serverInfo: { mode: string } } | null;
@@ -123,6 +126,8 @@ describe("draftPodStore", () => {
     mocks.multiplayerState.joinDraft = vi.fn<(config: unknown) => Promise<boolean>>(async () => true);
     mocks.multiplayerConfig.hostingServer = "wss://phase.example/ws";
     mocks.multiplayerConfig.displayName = "";
+    mocks.multiplayerConfig.lastPodListingPublic = null;
+    mocks.multiplayerConfig.rememberPodListingPublic = vi.fn<(isPublic: boolean) => void>();
     mocks.multiplayerConfig.resolveP2PBroker = vi.fn(async () => ({
       url: "wss://broker.example/ws",
       socket: { serverInfo: { mode: "LobbyOnly" } },
@@ -1933,9 +1938,66 @@ describe("draftPodStore", () => {
 
       await useDraftPodStore.getState().createPod();
 
-      expect(useDraftPodStore.getState().configError).toBe("Couldn't reach the lobby to list this pod.");
+      expect(useDraftPodStore.getState().configError).toBe(
+        "Couldn't reach the lobby to list this pod. Turn off “List in lobby” to host by room code.",
+      );
       expect(mocks.multiplayerState.hostDraft).not.toHaveBeenCalled();
     });
+
+    it.each([
+      [true, 8],
+      [false, 6],
+    ] as const)(
+      "remembers the host's listing choice of %s at %i seats when pod creation starts",
+      async (isPublic, podSize) => {
+        stubPools(["TST"]);
+        mocks.draftProcedure.mockResolvedValue(listableProcedure());
+        configureSetPod(podSize);
+        useDraftPodStore.getState().setListing({ isPublic });
+
+        await useDraftPodStore.getState().createPod();
+
+        expect(mocks.multiplayerConfig.rememberPodListingPublic).toHaveBeenCalledOnce();
+        expect(mocks.multiplayerConfig.rememberPodListingPublic).toHaveBeenCalledWith(isPublic);
+      },
+    );
+
+    it("does not remember a listing choice when creation is refused for a missing display name", async () => {
+      stubPools(["TST"]);
+      mocks.draftProcedure.mockResolvedValue(listableProcedure());
+      configureSetPod(6);
+      useDraftPodStore.setState({ hostDisplayName: "" });
+      useDraftPodStore.getState().setListing({ isPublic: true });
+
+      await useDraftPodStore.getState().createPod();
+
+      expect(mocks.multiplayerConfig.rememberPodListingPublic).not.toHaveBeenCalled();
+      expect(useDraftPodStore.getState().configError).toBe("Enter a display name");
+    });
+
+    it.each(SUPPORTED_LNGS)(
+      "names the listing control in the unreachable-lobby message in %s",
+      async (lng) => {
+        const label = (resources[lng].draft as { podSetup: { listInLobby: string } })
+          .podSetup.listInLobby;
+        i18n.addResourceBundle(lng, "draft", resources[lng].draft, true, true);
+        i18n.addResource(lng, "draft", "podSetup.listInLobby", "Renamed control");
+        await i18n.changeLanguage(lng);
+        try {
+          stubPools(["TST"]);
+          mocks.draftProcedure.mockResolvedValue(listableProcedure());
+          configureSetPod(6);
+          useDraftPodStore.getState().setListing({ isPublic: true });
+          mocks.openBrokerClient.mockReset().mockRejectedValueOnce(new Error("refused"));
+
+          await useDraftPodStore.getState().createPod();
+
+          expect(useDraftPodStore.getState().configError).toContain("Renamed control");
+        } finally {
+          i18n.addResource(lng, "draft", "podSetup.listInLobby", label);
+        }
+      },
+    );
 
     it.each([7, 8])("creates a pod above the lobby's seat ceiling without listing it (%i seats)", async (podSize) => {
       stubPools(["TST"]);

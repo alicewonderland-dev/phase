@@ -83,6 +83,7 @@ vi.mock("../../components/draft/CubeSetupPanel", () => ({ CubeSetupPanel: () => 
 
 import { DraftPodPage } from "../DraftPodPage";
 import { useDraftPodStore } from "../../stores/draftPodStore";
+import { useMultiplayerStore } from "../../stores/multiplayerStore";
 
 /** `draft-pools.json` and `scryfall-sets.json`, as the selector fetches them. */
 const POOLS: Record<string, unknown> = {
@@ -161,6 +162,7 @@ describe("DraftPodPage host set selection", () => {
       match_config: { match_type: "Bo1" },
     }));
     stubFetch();
+    useMultiplayerStore.setState({ lastPodListingPublic: false });
     useDraftPodStore.getState().reset();
   });
 
@@ -304,5 +306,7 @@ describe("DraftPodPage host set selection", () => {
     const poolInput = hostedPoolInput();
     expect(poolInput.type).toBe("Set");
     expect(poolInput.data.sequence).toEqual(["ISD", "DKA"]);
+    const [config] = mocks.multiplayerState.hostDraft.mock.calls[0] as unknown as [Record<string, unknown>];
+    expect(config).not.toHaveProperty("listing");
   });
 });

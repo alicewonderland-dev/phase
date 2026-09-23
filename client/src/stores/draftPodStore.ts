@@ -196,8 +196,10 @@ interface DraftPodState {
   botFillEnabled: boolean;
   /** Host display name for the local player. */
   hostDisplayName: string;
-  /** Public-lobby listing chosen for the next created pod. Starts off; a
-   * pod above `LOBBY_LISTING_MAX_SEATS` is created unlisted regardless. */
+  /** Public-lobby listing chosen for the next created pod. The store's own
+   * initial value is unlisted; the setup form seeds the host's remembered
+   * choice through `adoptRememberedListing`. A pod above
+   * `LOBBY_LISTING_MAX_SEATS` is still created unlisted regardless. */
   listing: PodListing;
   /** Join code entered by guest. */
   joinCode: string;
@@ -287,6 +289,9 @@ interface DraftPodActions {
    * page it lands after this seed rather than before it.
    */
   adoptSavedDisplayName: () => void;
+  /** Seeds the listing choice from the host's last submitted one, on when
+   *  there is none. */
+  adoptRememberedListing: () => void;
   /** Set join code for guest. */
   setJoinCode: (code: string) => void;
   /**
@@ -728,6 +733,13 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
       }));
     },
 
+    adoptRememberedListing: () => {
+      const remembered = useMultiplayerStore.getState().lastPodListingPublic;
+      set((prev) => ({
+        listing: { ...prev.listing, isPublic: remembered ?? true },
+      }));
+    },
+
     setJoinCode: (code) => {
       set({ joinCode: code });
     },
@@ -763,6 +775,10 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
         set({ configError: "Enter a display name" });
         return;
       }
+
+      // The host's toggle is remembered, not whether the pod was listed, so a
+      // choice held off by the seat ceiling is kept.
+      useMultiplayerStore.getState().rememberPodListingPublic(listing.isPublic);
 
       // Cache every engine-published procedure axis before either host branch;
       // both lead to the same lobby. The newest request wins if setup changes
