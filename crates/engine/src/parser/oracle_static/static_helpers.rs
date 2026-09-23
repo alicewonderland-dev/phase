@@ -1724,7 +1724,7 @@ fn rebind_scoped_designation_anaphor(condition: &mut StaticCondition, antecedent
         | StaticCondition::CompletedADungeon
         | StaticCondition::WasStartingPlayer { .. }
         | StaticCondition::SpellCastWithVariantThisTurn { .. }
-        | StaticCondition::AnyPlayerAttackedYouLastTurn
+        | StaticCondition::AnyPlayerAttackedYouLastTurn { .. }
         | StaticCondition::OpponentPoisonAtLeast { .. }
         | StaticCondition::UnlessPay { .. }
         | StaticCondition::Unrecognized { .. }
