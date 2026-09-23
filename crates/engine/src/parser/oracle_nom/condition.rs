@@ -18895,8 +18895,7 @@ mod tests {
 
     /// Row (d, hostile): "you've scried and surveilled this turn" is not a
     /// verb-list separator this grammar accepts (measured vocabulary is
-    /// " or " only) — `separated_list1` rewinds the whole body on the first
-    /// separator mismatch, so this must fail to parse entirely, not partially.
+    /// " or " only), so this must fail to parse entirely, not partially.
     /// Reach-guard: row (a) parses the same verbs joined by " or " in the same
     /// test binary.
     #[test]

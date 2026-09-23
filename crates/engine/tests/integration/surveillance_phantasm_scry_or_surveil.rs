@@ -1,9 +1,6 @@
 //! Surveillance Phantasm (FRA): "As long as you've scried or surveilled this
-//! turn, this creature can attack as though it didn't have defender." Exercises
-//! the `StaticCondition::Or` verb-list parse end to end, through the ability
-//! condition seam (`static_condition_to_ability_condition`) that governs
-//! `can_attack_as_though_defender` — not just that the condition PARSES, but
-//! that its runtime evaluation actually lifts CR 508.1a's Defender restriction.
+//! turn, this creature can attack as though it didn't have defender."
+//! Exercises the `StaticCondition::Or` verb-list parse end to end.
 //!
 //! Every negative row carries a positive reach-guard: a plain non-Defender
 //! creature in the same state IS a valid attacker, so the negative cannot be

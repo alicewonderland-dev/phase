@@ -1009,7 +1009,7 @@ mod tests {
         assert!(state.active_optional_effect_frame().is_none());
     }
 
-    /// CR 608.2c: the scoped (multi-player) search protocol records each
+    /// The scoped (multi-player) search protocol records each
     /// searcher's `SearchedLibrary` action exactly once — this is the
     /// scoped-protocol counterpart to `player_actions_this_way_accumulates_
     /// across_player_scope_iterations`, which exercises the sequential

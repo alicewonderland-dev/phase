@@ -75,7 +75,7 @@ fn proctor_activation_refused_with_no_scry_or_surveil() {
 }
 
 /// P2: after `Surveil 1.` resolves this turn, the activation resolves and the
-/// card returns with a finality counter (CR 121 finality counter mechanics).
+/// card returns with a finality counter.
 #[test]
 fn proctor_activation_resolves_after_surveil() {
     let mut scenario = GameScenario::new();

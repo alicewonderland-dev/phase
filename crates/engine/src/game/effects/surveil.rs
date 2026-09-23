@@ -309,4 +309,39 @@ mod tests {
             }
         )));
     }
+
+    /// CR 107.1b: a negative instructed count (e.g. from `X - 2` bottoming
+    /// out below 0) is clamped to 0 by `resolve`'s `.max(0)`, so it behaves
+    /// exactly like an instructed surveil of 0 (CR 701.25c) — no event, no
+    /// prompt, no library change — even though the library is non-empty.
+    #[test]
+    fn test_surveil_negative_count_emits_no_surveil_event() {
+        let mut state = GameState::new_two_player(42);
+        for i in 0..5 {
+            create_object(
+                &mut state,
+                CardId(i + 1),
+                PlayerId(0),
+                format!("Card {i}"),
+                Zone::Library,
+            );
+        }
+        let library_before: Vec<ObjectId> = state.players[0].library.iter().copied().collect();
+
+        let ability = make_surveil_ability(-3);
+        let mut events = Vec::new();
+
+        let result = resolve(&mut state, &ability, &mut events);
+        assert!(result.is_ok());
+        assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            GameEvent::PlayerPerformedAction {
+                action: PlayerActionKind::Surveil,
+                ..
+            }
+        )));
+        let library_after: Vec<ObjectId> = state.players[0].library.iter().copied().collect();
+        assert_eq!(library_after, library_before);
+    }
 }

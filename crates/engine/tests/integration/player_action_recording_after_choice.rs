@@ -1,14 +1,6 @@
-//! CR 608.2c + CR 701.22a/CR 701.25a/CR 701.34a/CR 701.59a: `player_actions_this_turn`
-//! must record a choice-completed player action exactly once, from whichever
-//! site actually publishes its `PlayerPerformedAction` event.
-//!
-//! `resolve_chain_body`'s own recording loop only scans events pushed inside
-//! its own chain window; the four actions below publish their event from a
-//! `GameAction` handler that runs AFTER the interactive choice, outside every
-//! chain window. Before this fix none of these four sites recorded at all
-//! (finding 2 of the scry/surveil-condition plan), which is what let
-//! `QuantityRef::PlayerActionsThisTurn` silently under-report Scry,
-//! Proliferate and CollectEvidence.
+//! `player_actions_this_turn` must record a choice-completed player action
+//! exactly once, from whichever site actually publishes its
+//! `PlayerPerformedAction` event.
 //!
 //! Each row's assertion is an exact `== 1`, which doubles as the guard against
 //! a second recording site (e.g. accidentally also recording inside
@@ -163,9 +155,8 @@ fn contentious_plan_records_proliferate_once_after_choice() {
 /// R4: a mandatory "As an additional cost to cast this spell, collect
 /// evidence 3." spell, with graveyard fuel of mana value 3. Collect evidence
 /// as a MANDATORY additional cost detours straight to
-/// `WaitingFor::CollectEvidenceChoice` (`casting.rs::find_collect_evidence_
-/// activation_cost`) — no `OptionalCostChoice` step, unlike the "you may
-/// collect evidence" shape.
+/// `WaitingFor::CollectEvidenceChoice` — no `OptionalCostChoice` step, unlike
+/// the "you may collect evidence" shape.
 #[test]
 fn mandatory_collect_evidence_records_once_after_choice() {
     let mut scenario = GameScenario::new();

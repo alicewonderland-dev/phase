@@ -7,8 +7,8 @@
 //! no ledger entry.
 //!
 //! Every row asserts the spell resolved (stack empty) as its reach-guard —
-//! failing to reach that point (an unparsed effect, a stuck prompt) would
-//! satisfy the negative assertions vacuously.
+//! failing to reach that point (a stuck prompt) would satisfy the negative
+//! assertions vacuously.
 
 use engine::game::scenario::{GameScenario, P0};
 use engine::types::actions::GameAction;
@@ -104,7 +104,7 @@ fn scry_against_empty_library_still_fires_whenever_you_scry() {
             .get(&CounterType::Plus1Plus1)
             .unwrap_or(&0),
         1,
-        "CR 701.22d authorizes the reflexive trigger even though nothing was looked at"
+        "CR 701.22d authorizes the trigger even though nothing was looked at"
     );
 }
 
@@ -158,7 +158,7 @@ fn surveil_against_empty_library_still_fires_whenever_you_surveil() {
             .get(&CounterType::Plus1Plus1)
             .unwrap_or(&0),
         1,
-        "CR 701.25d authorizes the reflexive trigger even though nothing was looked at"
+        "CR 701.25d authorizes the trigger even though nothing was looked at"
     );
 }
 
