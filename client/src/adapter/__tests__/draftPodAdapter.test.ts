@@ -1103,6 +1103,18 @@ describe("DraftPodHostAdapter", () => {
       expect(broker.unregister).not.toHaveBeenCalled();
     });
 
+    it("withdraws the listing even when tearing down the pod fails", async () => {
+      const broker = makeBroker();
+      await adapter.initialize(listingCfg(broker));
+      mockHostTerminateDraft.mockRejectedValueOnce(new Error("idb down"));
+
+      await expect(adapter.dispose()).rejects.toThrow("idb down");
+
+      expect(broker.unregister).toHaveBeenCalledTimes(1);
+      expect(broker.unregister).toHaveBeenCalledWith("GAME01");
+      expect(broker.close).toHaveBeenCalledTimes(1);
+    });
+
     it("closes the lobby connection when the pod is disposed while its peer is being created", async () => {
       const { hostRoom } = await import("../../network/connection");
       let resolveHostRoom!: (r: ReturnType<typeof mockHostResult>) => void;
