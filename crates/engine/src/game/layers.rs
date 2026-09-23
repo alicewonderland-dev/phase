@@ -1446,8 +1446,7 @@ fn designation_is_held(state: &GameState, designation: Designation) -> bool {
 /// subject cannot be bound or the designation is vacant. Refusing at entry
 /// prevents `Not` from inverting a missing answer into an applied restriction.
 /// `NoMonarch` carries no designation subject and remains independently true
-/// when no player is monarch. No shipped static puts a monarch leaf under a
-/// Boolean combinator; if one does, reassess this whole-condition boundary.
+/// when no player is monarch.
 fn static_condition_has_unanswerable_designation_anchor(
     state: &GameState,
     condition: &StaticCondition,
