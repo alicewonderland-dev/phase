@@ -13,7 +13,7 @@ use engine::types::game_state::WaitingFor;
 use engine::types::mana::ManaCost;
 use engine::types::phase::Phase;
 
-/// Opt's verbatim Oracle text ("Scry 1.\nDraw a card.") cast and resolved
+/// Opt's Oracle text ("Scry 1.\nDraw a card.") cast and resolved
 /// through the default driver, which answers `ScryChoice` by keeping the
 /// looked-at card on top (CR 701.22a). The Scry must be recorded exactly
 /// once; the `CardDrawn` count is a reach-guard that the whole spell (not
@@ -77,7 +77,7 @@ fn surveil_records_once_via_the_pre_choice_emission_site() {
     );
 }
 
-/// Contentious Plan's verbatim Oracle text ("Proliferate.\nDraw a
+/// Contentious Plan's Oracle text ("Proliferate.\nDraw a
 /// card."), with a +1/+1-counter creature on the battlefield so the
 /// `ProliferateChoice` prompt actually opens (an empty-board proliferate
 /// publishes from `emit_empty_proliferate_action`, a different site, not
