@@ -17,7 +17,7 @@ use engine::types::events::PlayerActionKind;
 use engine::types::game_state::WaitingFor;
 use engine::types::phase::Phase;
 
-/// Kenessos, Priest of Thassa's scry-doubling static line, placed on a plain
+/// Kenessos, Priest of Thassa's static line, placed on a plain
 /// (non-legendary) creature: "If you would scry a number of cards, scry that
 /// many cards plus one instead."
 const KENESSOS_SCRY_STATIC: &str =
@@ -317,11 +317,11 @@ fn surveil_x_graveyard_count_of_zero_is_not_an_instructed_surveil() {
 /// inner` is the only site that records the resulting event, since it runs
 /// outside `resolve_chain_body`'s window.
 #[test]
-fn two_scry_doublers_on_empty_library_via_replacement_choice() {
+fn two_scry_plus_one_replacements_on_empty_library_via_replacement_choice() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
-    scenario.add_creature_from_oracle(P0, "Doubler One", 2, 2, KENESSOS_SCRY_STATIC);
-    scenario.add_creature_from_oracle(P0, "Doubler Two", 2, 2, KENESSOS_SCRY_STATIC);
+    scenario.add_creature_from_oracle(P0, "Scry Plus One A", 2, 2, KENESSOS_SCRY_STATIC);
+    scenario.add_creature_from_oracle(P0, "Scry Plus One B", 2, 2, KENESSOS_SCRY_STATIC);
     let elves = scenario
         .add_creature_from_oracle(P0, "Chance-Met Elves", 3, 2, CHANCE_MET_ELVES)
         .id();
@@ -359,7 +359,7 @@ fn two_scry_doublers_on_empty_library_via_replacement_choice() {
     }
     assert!(
         answered_replacement_choice,
-        "reach-guard: two competing scry doublers must offer a ReplacementChoice"
+        "reach-guard: two competing scry-plus-one replacements must offer a ReplacementChoice"
     );
 
     assert_spell_resolved(&runner);
@@ -377,15 +377,15 @@ fn two_scry_doublers_on_empty_library_via_replacement_choice() {
     );
 }
 
-/// (Single replacement, chain path): one Kenessos-line static doubling an
+/// (Single replacement, chain path): one Kenessos-line static applied to an
 /// empty-library `Scry 1.` — a single applicable replacement auto-applies
 /// with no `ReplacementChoice` prompt, so the event stays inside
 /// `resolve_chain_body`'s own window and is recorded there.
 #[test]
-fn one_scry_doubler_on_empty_library_records_in_chain_window() {
+fn one_scry_plus_one_replacement_on_empty_library_records_in_chain_window() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
-    scenario.add_creature_from_oracle(P0, "Doubler", 2, 2, KENESSOS_SCRY_STATIC);
+    scenario.add_creature_from_oracle(P0, "Scry Plus One", 2, 2, KENESSOS_SCRY_STATIC);
     let spell = scenario
         .add_spell_to_hand_from_oracle(P0, "Test Scry Spell", true, "Scry 1.")
         .id();
@@ -405,6 +405,6 @@ fn one_scry_doubler_on_empty_library_records_in_chain_window() {
     assert_eq!(
         scry_count(&runner),
         1,
-        "a single-doubler empty-library scry must still be recorded exactly once"
+        "a single-replacement empty-library scry must still be recorded exactly once"
     );
 }
