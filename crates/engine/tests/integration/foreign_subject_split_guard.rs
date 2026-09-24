@@ -5,7 +5,8 @@ use engine::game::layers::evaluate_layers;
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::parser::parse_oracle_text;
 use engine::types::ability::{
-    ContinuousModification, ControllerRef, StaticCondition, TargetFilter, TypeFilter,
+    CardTypeSetSource, Comparator, ContinuousModification, ControllerRef, CountScope, QuantityExpr,
+    QuantityRef, StaticCondition, TargetFilter, TypeFilter, ZoneRef,
 };
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::{Keyword, KeywordKind};
@@ -69,9 +70,21 @@ fn the_swarmweaver_compound_subject_anthem_is_not_split() {
         "expected exactly [+1/+1, Deathtouch], got {:?}",
         anthem.modifications
     );
-    assert!(
-        !matches!(anthem.condition, Some(StaticCondition::Unrecognized { .. })),
-        "the Delirium condition must not fall back to Unrecognized, got {:?}",
+    assert_eq!(
+        anthem.condition,
+        Some(StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::DistinctCardTypes {
+                    source: CardTypeSetSource::Zone {
+                        zone: ZoneRef::Graveyard,
+                        scope: CountScope::Controller,
+                    },
+                },
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 4 },
+        }),
+        "expected the Delirium gate (four or more card types among cards in your graveyard), got {:?}",
         anthem.condition
     );
 }
