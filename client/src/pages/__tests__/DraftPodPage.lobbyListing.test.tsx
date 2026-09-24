@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "i18next";
 import { draftProcedureFixture } from "../../adapter/__tests__/draftProcedureFixture";
 import { resources, SUPPORTED_LNGS } from "../../i18n/resources";
+import { refuseRealWebSockets } from "../../test/helpers/refusingWebSocket";
 
 /**
  * The host's public-lobby listing controls, driven through the rendered
@@ -103,18 +104,7 @@ function stubFetch(): void {
   );
 }
 
-/** Records a would-be real socket URL and refuses to open it. */
-const socketUrls: string[] = [];
-class RefusingWebSocket {
-  static readonly CONNECTING = 0;
-  static readonly OPEN = 1;
-  static readonly CLOSING = 2;
-  static readonly CLOSED = 3;
-  constructor(url: string | URL) {
-    socketUrls.push(String(url));
-    throw new Error("a real WebSocket must never open in this suite");
-  }
-}
+let socketUrls: string[] = [];
 
 const ensureSubscriptionSocketMock = vi.fn();
 
@@ -154,8 +144,7 @@ function dispatchedHostConfig(): {
 describe("DraftPodPage lobby listing controls", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    socketUrls.length = 0;
-    vi.stubGlobal("WebSocket", RefusingWebSocket);
+    socketUrls = refuseRealWebSockets();
     mocks.multiplayerState.phase = "idle";
     mocks.multiplayerState.view = null;
     mocks.multiplayerState.role = null;
@@ -272,6 +261,17 @@ describe("DraftPodPage lobby listing controls", () => {
     const dispatched = dispatchedHostConfig();
     expect(dispatched.listing?.request).toMatchObject({ password: "pw", roomName: "Friday" });
     expect(mocks.openBrokerClient).toHaveBeenCalledOnce();
+  });
+
+  it("gives the password field an accessible name", async () => {
+    const user = userEvent.setup();
+    await openHostSetup(user);
+    await setPodSize(user, 6);
+
+    await user.click(screen.getByRole("checkbox", { name: "Set password" }));
+
+    const passwordInput = screen.getByLabelText("Pod password");
+    expect(passwordInput).toHaveAttribute("type", "password");
   });
 
   it("lists a blank room name under the placeholder the host was shown", async () => {

@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { draftProcedureFixture } from "../../adapter/__tests__/draftProcedureFixture";
+import { refuseRealWebSockets } from "../../test/helpers/refusingWebSocket";
 
 /**
  * The pod host's set selection, end to end through the page.
@@ -108,18 +109,7 @@ function stubFetch(): void {
   );
 }
 
-/** Records a would-be real socket URL and refuses to open it. */
-const socketUrls: string[] = [];
-class RefusingWebSocket {
-  static readonly CONNECTING = 0;
-  static readonly OPEN = 1;
-  static readonly CLOSING = 2;
-  static readonly CLOSED = 3;
-  constructor(url: string | URL) {
-    socketUrls.push(String(url));
-    throw new Error("a real WebSocket must never open in this suite");
-  }
-}
+let socketUrls: string[] = [];
 
 /** The `poolInput` the page handed the host adapter. */
 function hostedPoolInput(): { type: string; data: { pools: unknown[]; sequence: string[] } } {
@@ -160,8 +150,7 @@ describe("DraftPodPage host set selection", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    socketUrls.length = 0;
-    vi.stubGlobal("WebSocket", RefusingWebSocket);
+    socketUrls = refuseRealWebSockets();
     mocks.multiplayerState.phase = "idle";
     mocks.multiplayerState.view = null;
     mocks.multiplayerState.role = null;

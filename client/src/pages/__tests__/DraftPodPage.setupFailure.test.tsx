@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { draftProcedureFixture } from "../../adapter/__tests__/draftProcedureFixture";
+import { refuseRealWebSockets } from "../../test/helpers/refusingWebSocket";
 
 /**
  * The setup-failure reason shown on the error screen, driven through the real
@@ -116,18 +117,7 @@ function frames(socket: { sent: string[] }): { type: string; data?: unknown }[] 
     .filter((frame) => frame.type !== "Ping");
 }
 
-/** Records a would-be real socket URL and refuses to open it. */
-const socketUrls: string[] = [];
-class RefusingWebSocket {
-  static readonly CONNECTING = 0;
-  static readonly OPEN = 1;
-  static readonly CLOSING = 2;
-  static readonly CLOSED = 3;
-  constructor(url: string | URL) {
-    socketUrls.push(String(url));
-    throw new Error("a real WebSocket must never open in this suite");
-  }
-}
+let socketUrls: string[] = [];
 
 function stubFetch(): void {
   vi.stubGlobal("__DRAFT_POOLS_URL__", "/draft-pools.json");
@@ -172,10 +162,9 @@ function expectErrorScreenMounted(): void {
 describe("DraftPodPage setup-failure reason", () => {
   beforeEach(async () => {
     vi.clearAllMocks();
-    socketUrls.length = 0;
+    socketUrls = refuseRealWebSockets();
     socketState.sockets = [];
     connectionState.hostRoomShouldFail = false;
-    vi.stubGlobal("WebSocket", RefusingWebSocket);
     stubFetch();
     mocks.draftProcedure.mockResolvedValue(draftProcedureFixture({
       pod_size: 6,

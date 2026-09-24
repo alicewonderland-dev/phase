@@ -506,6 +506,7 @@ function PodSetup() {
                   value={listing.password}
                   onChange={(e) => setListing({ password: e.target.value })}
                   placeholder={t("podSetup.passwordPlaceholder")}
+                  aria-label={t("podSetup.passwordPlaceholder")}
                   maxLength={POD_PASSWORD_MAX_LENGTH}
                   className="rounded-lg border border-white/10 bg-black/30 px-4 py-2 text-white placeholder-white/30 outline-none focus:border-emerald-400/40"
                 />

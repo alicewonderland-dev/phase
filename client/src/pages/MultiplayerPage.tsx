@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateA
 import { useTranslation } from "react-i18next";
 import { useLocation, useNavigate } from "react-router";
 
-import type { GameFormat } from "../adapter/types";
+import type { GameFormat, JoinTargetInfo } from "../adapter/types";
 import { useAudioContext } from "../audio/useAudioContext";
 import { DiscordBadge } from "../components/chrome/DiscordBadge";
 import { ScreenChrome } from "../components/chrome/ScreenChrome";
@@ -723,9 +723,9 @@ function MultiplayerPageContent({
       code: string,
       origin: LobbySource | null,
       password: string | undefined,
-      listed: LobbyGame,
+      target: Pick<LobbyGame, "is_p2p">,
     ) => {
-      if (listed.is_p2p !== true) {
+      if (target.is_p2p !== true) {
         showToast(t("page.serverDraftJoinUnsupported"));
         return;
       }
@@ -758,26 +758,28 @@ function MultiplayerPageContent({
         showToast(t("page.joinNeedsServer"));
         return;
       }
+      // Every spectate navigation carries the origin — the draft-spectator
+      // socket opens on it exactly as the game socket does.
+      const spectatorParams = new URLSearchParams({ code, server: origin.url });
+      const watchDraft = (target: Pick<LobbyGame, "is_p2p">) => {
+        if (target.is_p2p === true) {
+          showToast(t("page.p2pDraftSpectateUnsupported"));
+          return;
+        }
+        navigate(`/draft-spectator?${spectatorParams.toString()}`);
+      };
       // Scoped to the authority being watched (non-null past the guard): a
       // `game_code` is unique per server, so an unscoped rescan could pick a
       // colliding row from another source and route a game to the draft
       // spectator (or the reverse).
       const resolved = context ?? findLobbyGameByCode(code, origin.url)?.game;
-      if (resolved?.draft_metadata && resolved.is_p2p === true) {
-        showToast(t("page.p2pDraftSpectateUnsupported"));
-        return;
-      }
-      // Every spectate navigation carries the origin — the draft-spectator
-      // socket opens on it exactly as the game socket does.
-      const spectatorParams = new URLSearchParams({ code, server: origin.url });
       if (resolved?.draft_metadata) {
-        navigate(`/draft-spectator?${spectatorParams.toString()}`);
+        watchDraft(resolved);
         return;
       }
-      // Past the branch above, `resolved` carries no draft metadata. Typed
-      // codes skip lobby-row context entirely, and a draft that is not in the
-      // public lobby still resolves via SpectateDraft when lookup reports
-      // not_found.
+      // Past the branch above, `resolved` carries no draft metadata. A draft
+      // that is not in the public lobby still resolves via SpectateDraft when
+      // lookup reports not_found.
       const lookup = await lookupJoinTargetFromStore(code, origin);
       if (!lookup.ok && lookup.reason === "not_found") {
         navigate(`/draft-spectator?${spectatorParams.toString()}`);
@@ -785,6 +787,10 @@ function MultiplayerPageContent({
       }
       if (!lookup.ok) {
         showToast(lookup.message);
+        return;
+      }
+      if (lookup.info.draft_metadata) {
+        watchDraft(lookup.info);
         return;
       }
       const gameId = crypto.randomUUID();
@@ -844,41 +850,40 @@ function MultiplayerPageContent({
         return;
       }
 
-      // Typed-code path (no lobby-row context) uses the read-only
-      // `LookupJoinTarget` RPC so the deck picker can filter by format
+      // The read-only `LookupJoinTarget` RPC lets the deck picker filter by format
       // without accidentally consuming a seat on Full servers.
-      let resolvedFormat = format;
       let resolvedPassword = password;
-      let resolvedIsP2P = context?.is_p2p === true;
-      const result = await lookupJoinTargetFromStore(code, origin, resolvedPassword);
-      if (result.ok) {
-        resolvedFormat = result.info.format_config?.format ?? resolvedFormat;
-        resolvedIsP2P = result.info.is_p2p;
-      } else if (result.reason === "password_required") {
+      let info: JoinTargetInfo;
+      const first = await lookupJoinTargetFromStore(code, origin, resolvedPassword);
+      if (first.ok) {
+        info = first.info;
+      } else if (first.reason === "password_required") {
         const entered = window.prompt(t("page.passwordPrompt"));
         if (!entered) return;
         resolvedPassword = entered;
         const retry = await lookupJoinTargetFromStore(code, origin, resolvedPassword);
-        if (retry.ok) {
-          resolvedFormat = retry.info.format_config?.format ?? resolvedFormat;
-          resolvedIsP2P = retry.info.is_p2p;
-        } else {
+        if (!retry.ok) {
           showToast(retry.message);
           return;
         }
-      } else if (result.reason === "not_found" && onNotFound) {
+        info = retry.info;
+      } else if (first.reason === "not_found" && onNotFound) {
         onNotFound();
         return;
       } else {
-        showToast(result.message);
+        showToast(first.message);
+        return;
+      }
+      if (info.draft_metadata) {
+        void handleJoinDraftFromLobby(trimmedCode, origin, resolvedPassword, info);
         return;
       }
       const action: PendingAction = {
         type: "join",
         code,
         password: resolvedPassword,
-        format: resolvedFormat,
-        isP2P: resolvedIsP2P,
+        format: info.format_config?.format ?? format,
+        isP2P: info.is_p2p,
         origin,
         context,
       };

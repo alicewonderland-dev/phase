@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { LobbyGame } from "../../adapter/types";
+import { refuseRealWebSockets } from "../../test/helpers/refusingWebSocket";
 
 /**
  * Drives the real page with a stubbed `LobbyView` that invokes the callback
@@ -15,6 +16,9 @@ import type { LobbyGame } from "../../adapter/types";
 const harness = vi.hoisted(() => ({
   navigate: vi.fn(),
   lobbyAction: null as null | ((props: Record<string, unknown>) => void),
+  /** Every `MyDecks` render's `mode`, in order. Empty means the deck picker
+   * was never mounted with a mode — "no deck selection" for the tests below. */
+  myDecksModes: [] as (string | undefined)[],
 }));
 
 const storeMocks = vi.hoisted(() => ({ findLobbyGameByCode: vi.fn() }));
@@ -62,6 +66,7 @@ vi.mock("../../components/menu/MyDecks", () => ({
     onSelectDeck: (name: string) => void;
   }) => {
     useEffect(() => {
+      harness.myDecksModes.push(mode);
       if (mode === "select") onSelectDeck("Test Deck");
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [mode]);
@@ -154,11 +159,15 @@ function navigatedParams(): { path: string; params: URLSearchParams } {
 }
 
 describe("MultiplayerPage draft join routing", () => {
+  let socketUrls: string[] = [];
+
   beforeEach(() => {
     vi.clearAllMocks();
     // `clearAllMocks` drops calls but keeps queued `mockResolvedValueOnce`
     // implementations (e.g. a queued password_required→ok sequence).
     storeMocks.findLobbyGameByCode.mockReset();
+    harness.myDecksModes = [];
+    socketUrls = refuseRealWebSockets();
     connectionMocks.joinRoom.mockReset();
     connectionMocks.joinRoom.mockImplementation(async () => {
       throw new Error("test stub: no live PeerJS connection");
@@ -193,8 +202,11 @@ describe("MultiplayerPage draft join routing", () => {
   });
 
   afterEach(async () => {
+    const opened = [...socketUrls];
     await useMultiplayerDraftStore.getState().leave(true);
     cleanup();
+    vi.unstubAllGlobals();
+    expect(opened).toEqual([]);
   });
 
   it("resolves through the broker and dials the host peer, never the listing code", async () => {
@@ -258,34 +270,29 @@ describe("MultiplayerPage draft join routing", () => {
       });
     // happy-dom does not implement `window.prompt`, so `vi.spyOn` has nothing
     // to wrap — `vi.stubGlobal` is the idiom this codebase uses elsewhere
-    // (`MyDecks.test.tsx`). A failed assertion below must not leave it
-    // stubbed for later tests, hence the `finally`.
+    // (`MyDecks.test.tsx`).
     vi.stubGlobal("prompt", vi.fn(() => "pw2"));
-    try {
-      harness.lobbyAction = (props) => {
-        (
-          props.onJoinGame as (
-            code: string,
-            origin: LobbySource,
-            password: string | undefined,
-            format: undefined,
-            context: LobbyGame,
-          ) => void
-        )("ABC123", ORIGIN, undefined, undefined, p2pDraftRow);
-      };
+    harness.lobbyAction = (props) => {
+      (
+        props.onJoinGame as (
+          code: string,
+          origin: LobbySource,
+          password: string | undefined,
+          format: undefined,
+          context: LobbyGame,
+        ) => void
+      )("ABC123", ORIGIN, undefined, undefined, p2pDraftRow);
+    };
 
-      renderPage();
+    renderPage();
 
-      await waitFor(() => {
-        expect(connectionMocks.joinRoom).toHaveBeenCalled();
-      });
+    await waitFor(() => {
+      expect(connectionMocks.joinRoom).toHaveBeenCalled();
+    });
 
-      expect(resolveGuest).toHaveBeenNthCalledWith(1, "ABC123", ORIGIN, undefined);
-      expect(resolveGuest).toHaveBeenNthCalledWith(2, "ABC123", ORIGIN, "pw2");
-      expect(connectionMocks.joinRoom.mock.calls[0][0]).toBe("ABCDE");
-    } finally {
-      vi.unstubAllGlobals();
-    }
+    expect(resolveGuest).toHaveBeenNthCalledWith(1, "ABC123", ORIGIN, undefined);
+    expect(resolveGuest).toHaveBeenNthCalledWith(2, "ABC123", ORIGIN, "pw2");
+    expect(connectionMocks.joinRoom.mock.calls[0][0]).toBe("ABCDE");
   });
 
   it("shows the 'Can't join this room' dialog on room_full, without dialing", async () => {
@@ -456,5 +463,132 @@ describe("MultiplayerPage draft join routing", () => {
     expect(params.get("mode")).toBe("p2p-join");
     expect(params.get("code")).toBe("ABCDE");
     expect(connectionMocks.joinRoom).not.toHaveBeenCalled();
+    expect(harness.myDecksModes).toContain("select");
+  });
+
+  it("resolves a typed code of a player-hosted draft with no local lobby row", async () => {
+    lookupJoinTarget.mockResolvedValue({
+      ok: true,
+      info: {
+        is_p2p: true,
+        format_config: null,
+        draft_metadata: { setCode: "MKM", draftKind: "Premier" },
+      },
+    });
+    harness.lobbyAction = (props) => {
+      (props.onJoinGame as (code: string, origin: LobbySource) => void)("ABC123", ORIGIN);
+    };
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(connectionMocks.joinRoom).toHaveBeenCalled();
+    });
+
+    expect(lookupJoinTarget).toHaveBeenCalledWith("ABC123", ORIGIN, undefined);
+    expect(resolveGuest).toHaveBeenCalledWith("ABC123", ORIGIN, undefined);
+    expect(connectionMocks.joinRoom).toHaveBeenCalledTimes(1);
+    expect(connectionMocks.joinRoom.mock.calls[0][0]).toBe("ABCDE");
+    expect(harness.myDecksModes).toEqual([]);
+    expect(harness.navigate).not.toHaveBeenCalledWith(expect.stringContaining("/game/"));
+  });
+
+  it("refuses a typed code of a server-hosted draft with no local lobby row", async () => {
+    lookupJoinTarget.mockResolvedValue({
+      ok: true,
+      info: {
+        is_p2p: false,
+        format_config: null,
+        draft_metadata: { setCode: "MKM", draftKind: "Premier" },
+      },
+    });
+    harness.lobbyAction = (props) => {
+      (props.onJoinGame as (code: string, origin: LobbySource) => void)("ABC123", ORIGIN);
+    };
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(toastMessages()).toContain("Server-hosted draft pods can't be joined from the lobby.");
+    });
+    expect(resolveGuest).not.toHaveBeenCalled();
+    expect(connectionMocks.joinRoom).not.toHaveBeenCalled();
+    expect(harness.myDecksModes).toEqual([]);
+  });
+
+  it("forwards the entered password when resolving a typed draft code's password_required retry", async () => {
+    lookupJoinTarget
+      .mockResolvedValueOnce({ ok: false, reason: "password_required", message: "Password required" })
+      .mockResolvedValueOnce({
+        ok: true,
+        info: {
+          is_p2p: true,
+          format_config: null,
+          draft_metadata: { setCode: "MKM", draftKind: "Premier" },
+        },
+      });
+    vi.stubGlobal("prompt", vi.fn(() => "pw2"));
+    harness.lobbyAction = (props) => {
+      (props.onJoinGame as (code: string, origin: LobbySource) => void)("ABC123", ORIGIN);
+    };
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(connectionMocks.joinRoom).toHaveBeenCalled();
+    });
+
+    expect(lookupJoinTarget).toHaveBeenCalledTimes(2);
+    expect(lookupJoinTarget).toHaveBeenNthCalledWith(2, "ABC123", ORIGIN, "pw2");
+    expect(resolveGuest).toHaveBeenCalledWith("ABC123", ORIGIN, "pw2");
+    expect(connectionMocks.joinRoom.mock.calls[0][0]).toBe("ABCDE");
+    expect(harness.myDecksModes).toEqual([]);
+  });
+
+  it("refuses to watch a player-hosted draft pod with no local lobby row", async () => {
+    lookupJoinTarget.mockResolvedValue({
+      ok: true,
+      info: {
+        is_p2p: true,
+        format_config: null,
+        draft_metadata: { setCode: "MKM", draftKind: "Premier" },
+      },
+    });
+    harness.lobbyAction = (props) => {
+      (props.onSpectate as (code: string, origin: LobbySource) => void)("ABC123", ORIGIN);
+    };
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(toastMessages()).toContain("Player-hosted draft pods can't be watched.");
+    });
+    expect(harness.navigate).not.toHaveBeenCalledWith(
+      expect.stringContaining("/draft-spectator"),
+    );
+  });
+
+  it("routes a typed code of a server-hosted draft to the draft spectator", async () => {
+    lookupJoinTarget.mockResolvedValue({
+      ok: true,
+      info: {
+        is_p2p: false,
+        format_config: null,
+        draft_metadata: { setCode: "MKM", draftKind: "Premier" },
+      },
+    });
+    harness.lobbyAction = (props) => {
+      (props.onSpectate as (code: string, origin: LobbySource) => void)("ABC123", ORIGIN);
+    };
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(harness.navigate).toHaveBeenCalled();
+    });
+    const { path, params } = navigatedParams();
+    expect(path).toBe("/draft-spectator");
+    expect(params.get("code")).toBe("ABC123");
+    expect(params.get("server")).toBe(ORIGIN_URL);
   });
 });
