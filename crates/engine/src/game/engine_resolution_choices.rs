@@ -1894,6 +1894,13 @@ pub(super) fn handle_resolution_choice(
                 scry_bottom_count: Some(bottom_cards.len() as u32),
                 scry_top_count: Some(all_cards.len() as u32 - bottom_cards.len() as u32),
             });
+            // CR 701.22a + CR 701.22d: the scry is complete only once the choice is
+            // made; it is published here, outside any chain window, so record it here.
+            crate::game::effects::record_player_action_this_turn(
+                state,
+                player,
+                crate::types::events::PlayerActionKind::Scry,
+            );
             // CR 401.5 + CR 611.3a: Scry reorders the library top directly (not
             // through the zone-move seam), so a continuous `TopOfLibraryMatches`
             // static must be re-evaluated — self-gated so it's a no-op otherwise.

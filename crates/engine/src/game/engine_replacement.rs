@@ -700,7 +700,21 @@ fn handle_replacement_choice_inner(
                 }
                 // CR 701.22a: Scry accepted after replacement choice.
                 scry @ ProposedEvent::Scry { .. } => {
+                    let events_before = events.len();
                     apply_scry_after_replacement(state, scry, events);
+                    // CR 701.22d: an empty-library scry publishes its event from
+                    // this replacement-choice handler, where resolve_chain_body's
+                    // recording does not see it, so record it here.
+                    for event in &events[events_before..] {
+                        if let GameEvent::PlayerPerformedAction {
+                            player_id, action, ..
+                        } = event
+                        {
+                            crate::game::effects::record_player_action_this_turn(
+                                state, *player_id, *action,
+                            );
+                        }
+                    }
                 }
                 // CR 701.37a: Explore accepted after replacement choice — the
                 // explore resolver handles the actual explore logic; this is a no-op here.

@@ -12300,10 +12300,10 @@ impl StaticCondition {
         })
     }
 
-    /// CR 508.1b (docs/MagicCompRules.txt:2268) announces which player each chosen
+    /// CR 508.1b announces which player each chosen
     /// creature is attacking — THE PAIRING THIS WHOLE MAP IS RELATIVE TO; CR 508.1c
-    /// (:2270) then checks restrictions against that pairing. CR 611.3a (:2926)
-    /// keeps a STATIC-ability continuous effect unlocked, and CR 611.2c (:2913)
+    /// then checks restrictions against that pairing. CR 611.3a
+    /// keeps a STATIC-ability continuous effect unlocked, and CR 611.2c
     /// does the same for a RESOLUTION-generated one (a `CanAttackWithDefender`
     /// grant modifies neither characteristics nor controller, so it is
     /// rules-modifying and its affected set is not locked in) — both are needed
@@ -12340,7 +12340,7 @@ impl StaticCondition {
     /// `parse_inner_condition` declines "a player controls a creature" — so the arm
     /// would be unreachable and undiscriminated.
     ///
-    /// KIND-PRESERVING by inheritance (CR 506.3 :2208): the anchored scope answers
+    /// KIND-PRESERVING by inheritance (CR 506.3): the anchored scope answers
     /// false for a planeswalker or battle target. See
     /// `game::combat::attacked_player_for_target`.
     pub(crate) fn defending_player_anchored_form(&self) -> Option<StaticCondition> {
