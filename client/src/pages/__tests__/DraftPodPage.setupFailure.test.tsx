@@ -11,9 +11,7 @@ import { draftProcedureFixture } from "../../adapter/__tests__/draftProcedureFix
  * whose hosting fails, a guest whose join fails, and the offline sentinel.
  *
  * Real: `draftPodStore`, `multiplayerDraftStore`, the host and guest pod
- * adapters, `multiplayerStore`, `brokerClient`, `connectivityStore`. Only the
- * PeerJS signaling functions, the broker's own socket, session persistence
- * and the procedure fetch are replaced.
+ * adapters, `multiplayerStore`, `brokerClient`, `connectivityStore`.
  */
 
 const connectionState = vi.hoisted(() => ({ hostRoomShouldFail: false }));

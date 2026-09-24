@@ -108,6 +108,19 @@ function stubFetch(): void {
   );
 }
 
+/** Records a would-be real socket URL and refuses to open it. */
+const socketUrls: string[] = [];
+class RefusingWebSocket {
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSING = 2;
+  static readonly CLOSED = 3;
+  constructor(url: string | URL) {
+    socketUrls.push(String(url));
+    throw new Error("a real WebSocket must never open in this suite");
+  }
+}
+
 /** The `poolInput` the page handed the host adapter. */
 function hostedPoolInput(): { type: string; data: { pools: unknown[]; sequence: string[] } } {
   const [config] = mocks.multiplayerState.hostDraft.mock.calls[0] as unknown as [
@@ -141,10 +154,14 @@ describe("DraftPodPage host set selection", () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
+    const opened = [...socketUrls];
+    expect(opened).toEqual([]);
   });
 
   beforeEach(() => {
     vi.clearAllMocks();
+    socketUrls.length = 0;
+    vi.stubGlobal("WebSocket", RefusingWebSocket);
     mocks.multiplayerState.phase = "idle";
     mocks.multiplayerState.view = null;
     mocks.multiplayerState.role = null;

@@ -9,12 +9,9 @@ import { resources, SUPPORTED_LNGS } from "../../i18n/resources";
 
 /**
  * The host's public-lobby listing controls, driven through the rendered
- * PodSetup form and the real `draftPodStore` / `multiplayerStore`.
- *
- * Only the draft transport (`multiplayerDraftStore`), the wasm adapter class,
- * persistence, and the broker socket open are replaced — the listing choice,
- * its seat-ceiling gate, its remembered preference, and the request it builds
- * are all measured where production actually builds them.
+ * PodSetup form and the real `draftPodStore` / `multiplayerStore` — the
+ * listing choice, its seat-ceiling gate, its remembered preference, and the
+ * request it builds are all measured where production actually builds them.
  */
 
 const mocks = vi.hoisted(() => ({
@@ -364,6 +361,20 @@ describe("DraftPodPage lobby listing controls", () => {
 
     await user.click(screen.getByRole("checkbox", { name: "Set password" }));
     expect((screen.getByPlaceholderText("Pod password") as HTMLInputElement).value).toBe("");
+  });
+
+  it("keeps a set password visible after PodSetup remounts without a reset", async () => {
+    const user = userEvent.setup();
+    const first = await openHostSetup(user);
+    await setPodSize(user, 6);
+    await user.click(screen.getByRole("checkbox", { name: "Set password" }));
+    await user.type(screen.getByPlaceholderText("Pod password"), "pw");
+    first.unmount();
+
+    await openHostSetup(user);
+
+    expect(screen.getByRole("checkbox", { name: "Set password" })).toBeChecked();
+    expect((screen.getByPlaceholderText("Pod password") as HTMLInputElement).value).toBe("pw");
   });
 
   it.each(SUPPORTED_LNGS)(
