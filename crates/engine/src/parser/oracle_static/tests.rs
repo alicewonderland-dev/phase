@@ -36721,7 +36721,7 @@ fn during_your_turn_keyword_grant_unchanged() {
 }
 
 // =========================================================================
-// THE INTERPOSED DEFENDER-CLASS GRAMMAR (CR 702.3b :3915 + CR 609.4 :2854),
+// THE INTERPOSED DEFENDER-CLASS GRAMMAR (CR 702.3b + CR 609.4),
 // STATIC SIDE. The `ROW n` / `ARM n` banners below label the sections of this
 // group and match the lowercase `"arm n"` strings the assertions carry; the
 // effect-side counterparts live in `oracle_effect/tests.rs` under the same
@@ -36749,7 +36749,7 @@ const P3_WEATHERED_SENTINELS_L2: &str = "This creature can attack players who \
 
 /// ROW 1's PRODUCTION-ATTRIBUTION TWIN.
 ///
-/// CR 702.3b (docs/MagicCompRules.txt:3915): the card's printed line is consumed
+/// CR 702.3b: the card's printed line is consumed
 /// by production (b) ITSELF — `parse_can_attack_despite_defender`, called
 /// DIRECTLY — and not by some shadowing branch that happens to produce the same
 /// value through `parse_static_line`'s dispatch. The attribution is therefore
@@ -36806,7 +36806,7 @@ fn weathered_sentinels_line_is_consumed_by_the_non_attached_static_production() 
 ///    `"this turn"` to the INERT marker and moves all 20 duration-form corpus
 ///    cards — every one of which lives on production (c), NOT here;
 ///  * reverting the `DurationAdverbial` DECLINE GUARD in production (b) makes it
-///    emit an UNCONDITIONED (permanently ACTIVE, CR 611.3a :2926) permission with
+///    emit an UNCONDITIONED (permanently ACTIVE, CR 611.3a) permission with
 ///    the printed duration DROPPED; reverting (a)'s early return lets the generic
 ///    continuous parser reverse the permission into `AddKeyword(Defender)`.
 ///    Corpus movement is ZERO either way — no corpus card prints a duration-form
@@ -37050,7 +37050,7 @@ fn authority_owned_but_unanchorable_class_reaches_the_inert_marker() {
 
 /// ROW 7 ARM (i): the class is supported on production
 /// (a), the ATTACHED-SUBJECT production `parse_enchanted_equipped_predicate`
-/// (CR 509.1b + CR 604.1 + CR 611.3a :2926).
+/// (CR 509.1b + CR 604.1 + CR 611.3a).
 ///
 /// Attributed by DIRECT CALL, not by dispatch ordering. THREE separate test
 /// functions, one per production, so a widening that lands on only one arm cannot
@@ -37117,7 +37117,7 @@ fn interposed_class_is_supported_on_the_attached_subject_production() {
 
 /// ROW 7 ARM (ii): the class is supported on production
 /// (b), the NON-ATTACHED static production `parse_can_attack_despite_defender`
-/// (CR 702.3b :3915 + CR 611.3a :2926).
+/// (CR 702.3b + CR 611.3a).
 ///
 /// Carries the row's FOURTH SHAPE — the plural/filter-subject class, the only
 /// fixture that exercises the `they` arm of the pronoun `alt`. Its production
@@ -37312,7 +37312,7 @@ fn adjacent_defender_grammars_keep_their_own_parse() {
     );
 
     // ARM 10 — MULTI-AUTHORITY: an interposed class AND a trailing gate on ONE
-    // line. CR 508.1c (:2270): two INDEPENDENT restrictions, so they conjoin.
+    // line. CR 508.1c: two INDEPENDENT restrictions, so they conjoin.
     let arm10 = parse_static_line(&format!(
         "This creature can attack {P3_SEG} as though it didn't have defender as long as you control a Mountain."
     ))
@@ -37678,7 +37678,7 @@ fn spire_serpent_conjunctive_split_composes_both_conditions() {
          degenerate case, reproduced exactly"
     );
 
-    // SUBJECT: the same line with the class interposed. CR 508.1c (:2270): Line A's
+    // SUBJECT: the same line with the class interposed. CR 508.1c: Line A's
     // gate and the interposed class are INDEPENDENT, so they CONJOIN — not
     // `anchored` alone, not `metalcraft` alone.
     let subject = parse_static_line_multi(&format!(
