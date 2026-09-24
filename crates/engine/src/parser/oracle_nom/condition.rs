@@ -18803,7 +18803,7 @@ mod tests {
         );
     }
 
-    /// Row (a): "you've scried or surveilled this turn" (Surveillance
+    /// "you've scried or surveilled this turn" (Surveillance
     /// Phantasm, Proctor of Potential, Desperate Futurescribe) parses as a
     /// disjunction over the shared verb list.
     #[test]
@@ -18839,10 +18839,11 @@ mod tests {
         );
     }
 
-    /// Row (b): a single verb ("you've surveilled this turn", Darkblade
+    /// A single verb ("you've surveilled this turn", Darkblade
     /// Agent) still returns the bare `QuantityComparison` shape, not a
     /// one-element `Or` — this is `surveilled_this_turn_counts_controller_
-    /// player_actions` above, re-asserted here as the sibling of row (a).
+    /// player_actions` above, re-asserted here as the sibling of
+    /// `scried_or_surveilled_this_turn_parses_as_or`.
     #[test]
     fn single_verb_this_turn_stays_bare_quantity_comparison() {
         let (rest, c) = parse_inner_condition("you've surveilled this turn").unwrap();
@@ -18850,7 +18851,7 @@ mod tests {
         assert!(matches!(c, StaticCondition::QuantityComparison { .. }));
     }
 
-    /// Row (c): "an opponent searched their library or surveilled this turn"
+    /// "an opponent searched their library or surveilled this turn"
     /// — a building-block row (no printed card uses this combination) proving
     /// the verb-list disjunction composes with the opponent-scoped subject
     /// dispatcher, both arms sharing `PlayerScope::Opponent { aggregate: Max }`.
@@ -18893,11 +18894,11 @@ mod tests {
         );
     }
 
-    /// Row (d, hostile): "you've scried and surveilled this turn" is not a
+    /// "you've scried and surveilled this turn" is not a
     /// verb-list separator this grammar accepts (measured vocabulary is
     /// " or " only), so this must fail to parse entirely, not partially.
-    /// Reach-guard: row (a) parses the same verbs joined by " or " in the same
-    /// test binary.
+    /// Reach-guard: `scried_or_surveilled_this_turn_parses_as_or` parses the
+    /// same verbs joined by " or " in the same test binary.
     #[test]
     fn scried_and_surveilled_this_turn_does_not_parse() {
         assert!(parse_inner_condition("you've scried and surveilled this turn").is_err());

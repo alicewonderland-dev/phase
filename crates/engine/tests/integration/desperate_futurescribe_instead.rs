@@ -46,7 +46,7 @@ fn resolve_begin_combat_trigger(runner: &mut GameRunner, target: ObjectId) {
     runner.advance_until_stack_empty();
 }
 
-/// F1: no scry or surveil this turn — the plain pump branch applies: +1/+1
+/// No scry or surveil this turn — the plain pump branch applies: +1/+1
 /// until end of turn, zero +1/+1 counters.
 #[test]
 fn futurescribe_pumps_without_counter_when_no_scry_or_surveil() {
@@ -66,7 +66,7 @@ fn futurescribe_pumps_without_counter_when_no_scry_or_surveil() {
     );
 }
 
-/// F2: after `Surveil 1.` in main phase 1, the instead branch fires — a
+/// After `Surveil 1.` in main phase 1, the instead branch fires — a
 /// permanent +1/+1 counter instead of the temporary pump.
 #[test]
 fn futurescribe_grants_counter_after_surveil() {
@@ -95,7 +95,7 @@ fn futurescribe_grants_counter_after_surveil() {
     );
 }
 
-/// F3: the same, but the condition is satisfied by `Scry 1.` instead.
+/// The same, but the condition is satisfied by `Scry 1.` instead.
 #[test]
 fn futurescribe_grants_counter_after_scry() {
     let mut scenario = GameScenario::new();

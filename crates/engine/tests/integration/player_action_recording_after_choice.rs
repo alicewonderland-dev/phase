@@ -13,7 +13,7 @@ use engine::types::game_state::WaitingFor;
 use engine::types::mana::ManaCost;
 use engine::types::phase::Phase;
 
-/// R1: Opt's verbatim Oracle text ("Scry 1.\nDraw a card.") cast and resolved
+/// Opt's verbatim Oracle text ("Scry 1.\nDraw a card.") cast and resolved
 /// through the default driver, which answers `ScryChoice` by keeping the
 /// looked-at card on top (CR 701.22a). The Scry must be recorded exactly
 /// once; the `CardDrawn` count is a reach-guard that the whole spell (not
@@ -48,7 +48,7 @@ fn opt_records_scry_once_after_choice() {
     assert_eq!(draws, 1, "reach-guard: Opt's Draw a card must also resolve");
 }
 
-/// R2: a bare "Surveil 1." instant, driven the same way. Guards against a
+/// A bare "Surveil 1." instant, driven the same way. Guards against a
 /// second recording site for Surveil specifically — `surveil.rs::resolve`
 /// emits its event BEFORE setting `WaitingFor::SurveilChoice` (unlike Scry),
 /// so `resolve_chain_body`'s own window already sees it; this pins that no
@@ -77,7 +77,7 @@ fn surveil_records_once_via_the_pre_choice_emission_site() {
     );
 }
 
-/// R3: Contentious Plan's verbatim Oracle text ("Proliferate.\nDraw a
+/// Contentious Plan's verbatim Oracle text ("Proliferate.\nDraw a
 /// card."), with a +1/+1-counter creature on the battlefield so the
 /// `ProliferateChoice` prompt actually opens (an empty-board proliferate
 /// publishes from `emit_empty_proliferate_action`, a different site, not
@@ -152,7 +152,7 @@ fn contentious_plan_records_proliferate_once_after_choice() {
     );
 }
 
-/// R4: a mandatory "As an additional cost to cast this spell, collect
+/// A mandatory "As an additional cost to cast this spell, collect
 /// evidence 3." spell, with graveyard fuel of mana value 3. Collect evidence
 /// as a MANDATORY additional cost detours straight to
 /// `WaitingFor::CollectEvidenceChoice` — no `OptionalCostChoice` step, unlike

@@ -44,7 +44,7 @@ fn proctor_ability_index(state: &engine::types::game_state::GameState, proctor: 
         .expect("Proctor must have a Graveyard -> Battlefield return ability")
 }
 
-/// P1: with no scry or surveil this turn, the activation must be refused and
+/// With no scry or surveil this turn, the activation must be refused and
 /// the card must stay in the graveyard.
 #[test]
 fn proctor_activation_refused_with_no_scry_or_surveil() {
@@ -74,7 +74,7 @@ fn proctor_activation_refused_with_no_scry_or_surveil() {
     assert_eq!(runner.state().objects[&proctor].zone, Zone::Graveyard);
 }
 
-/// P2: after `Surveil 1.` resolves this turn, the activation resolves and the
+/// After `Surveil 1.` resolves this turn, the activation resolves and the
 /// card returns with a finality counter.
 #[test]
 fn proctor_activation_resolves_after_surveil() {
@@ -109,7 +109,7 @@ fn proctor_activation_resolves_after_surveil() {
     );
 }
 
-/// P3: the same, but the condition is satisfied by `Scry 1.` instead.
+/// The same, but the condition is satisfied by `Scry 1.` instead.
 #[test]
 fn proctor_activation_resolves_after_scry() {
     let mut scenario = GameScenario::new();

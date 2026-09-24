@@ -54,7 +54,7 @@ fn surveil_count(runner: &engine::game::scenario::GameRunner) -> usize {
         .count()
 }
 
-/// L1: `Scry 1.` against an empty library — no `ScryChoice` offered, but the
+/// `Scry 1.` against an empty library — no `ScryChoice` offered, but the
 /// scry is still recorded once.
 #[test]
 fn scry_against_empty_library_records_without_prompt() {
@@ -80,7 +80,7 @@ fn scry_against_empty_library_records_without_prompt() {
     );
 }
 
-/// L2: the same scenario with Chance-Met Elves on the battlefield — its
+/// The same scenario with Chance-Met Elves on the battlefield — its
 /// "whenever you scry" trigger must fire off the published event.
 #[test]
 fn scry_against_empty_library_still_fires_whenever_you_scry() {
@@ -108,7 +108,7 @@ fn scry_against_empty_library_still_fires_whenever_you_scry() {
     );
 }
 
-/// L3: `Surveil 1.` against an empty library — no `SurveilChoice` offered,
+/// `Surveil 1.` against an empty library — no `SurveilChoice` offered,
 /// but the surveil is still recorded once.
 #[test]
 fn surveil_against_empty_library_records_without_prompt() {
@@ -134,7 +134,7 @@ fn surveil_against_empty_library_records_without_prompt() {
     );
 }
 
-/// L4: the same scenario with Dimir Spybug on the battlefield — its
+/// The same scenario with Dimir Spybug on the battlefield — its
 /// "whenever you surveil" trigger must fire off the published event.
 #[test]
 fn surveil_against_empty_library_still_fires_whenever_you_surveil() {
@@ -162,7 +162,7 @@ fn surveil_against_empty_library_still_fires_whenever_you_surveil() {
     );
 }
 
-/// L5 (hostile, CR 701.22b): "Scry X, where X is the number of cards in your
+/// (Hostile, CR 701.22b): "Scry X, where X is the number of cards in your
 /// graveyard." with an EMPTY graveyard never raises an instructed count above
 /// 0 in the first place — no event, no ledger entry, no trigger. Paired
 /// reach-guard in the same test: with graveyard fuel present, the same text
@@ -234,7 +234,8 @@ fn scry_x_graveyard_count_of_zero_is_not_an_instructed_scry() {
     );
 }
 
-/// L6 (hostile, CR 701.25c): the surveil analogue of L5 — "Surveil X, where X
+/// (Hostile, CR 701.25c): the surveil analogue of
+/// `scry_x_graveyard_count_of_zero_is_not_an_instructed_scry` — "Surveil X, where X
 /// is the number of cards in your graveyard." with an empty graveyard is not
 /// an instructed surveil. Reach-guard: with graveyard fuel, the same text
 /// reaches `SurveilChoice`.
@@ -309,7 +310,7 @@ fn surveil_x_graveyard_count_of_zero_is_not_an_instructed_surveil() {
     );
 }
 
-/// L7 (multi-authority, replacement-choice path): two Kenessos-line static
+/// (Multi-authority, replacement-choice path): two Kenessos-line static
 /// abilities compete to apply to the same `Scry 1.` — a `ReplacementChoice`
 /// prompt is offered (reach-guard: the test fails if it is not) even though
 /// the library is empty. `engine_replacement.rs::handle_replacement_choice_
@@ -376,7 +377,7 @@ fn two_scry_doublers_on_empty_library_via_replacement_choice() {
     );
 }
 
-/// L8 (single replacement, chain path): one Kenessos-line static doubling an
+/// (Single replacement, chain path): one Kenessos-line static doubling an
 /// empty-library `Scry 1.` — a single applicable replacement auto-applies
 /// with no `ReplacementChoice` prompt, so the event stays inside
 /// `resolve_chain_body`'s own window and is recorded there.

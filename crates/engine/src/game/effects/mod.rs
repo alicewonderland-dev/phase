@@ -17644,8 +17644,7 @@ fn resolve_chain_body(
 
 /// `resolve_chain_body` records, through this helper, each `PlayerPerformedAction`
 /// emitted inside its window; any other caller must run outside every chain
-/// window, and an emitter that is also reachable from inside a window must not
-/// call it — its outside-window caller records instead.
+/// window.
 pub(crate) fn record_player_action_this_turn(
     state: &mut GameState,
     player: PlayerId,

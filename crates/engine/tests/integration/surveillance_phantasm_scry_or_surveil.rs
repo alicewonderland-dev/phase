@@ -1,11 +1,6 @@
 //! Surveillance Phantasm (FRA): "As long as you've scried or surveilled this
 //! turn, this creature can attack as though it didn't have defender."
 //! Exercises the `StaticCondition::Or` verb-list parse end to end.
-//!
-//! Every negative row carries a positive reach-guard: a plain non-Defender
-//! creature in the same state IS a valid attacker, so the negative cannot be
-//! satisfied merely because `get_valid_attacker_ids`/`declare_attackers` is
-//! broken in general.
 
 use engine::game::combat::{get_valid_attacker_ids, AttackTarget};
 use engine::game::scenario::{GameScenario, P0, P1};
@@ -13,7 +8,7 @@ use engine::types::phase::Phase;
 
 const PHANTASM_ORACLE: &str = "Defender, flying, vigilance\nAs long as you've scried or surveilled this turn, this creature can attack as though it didn't have defender.\n{3}{U}: Surveil 1. (Look at the top card of your library. You may put it into your graveyard.)";
 
-/// S1: no action taken this turn — Phantasm cannot attack, but a vanilla
+/// No action taken this turn — Phantasm cannot attack, but a vanilla
 /// non-Defender creature in the same state can (reach-guard).
 #[test]
 fn phantasm_cannot_attack_with_no_scry_or_surveil() {
@@ -45,7 +40,7 @@ fn phantasm_cannot_attack_with_no_scry_or_surveil() {
     );
 }
 
-/// S2: after `Surveil 1.` resolves this turn, Phantasm becomes a valid
+/// After `Surveil 1.` resolves this turn, Phantasm becomes a valid
 /// attacker.
 #[test]
 fn phantasm_can_attack_after_surveil() {
@@ -74,7 +69,7 @@ fn phantasm_can_attack_after_surveil() {
         .is_ok());
 }
 
-/// S3: after `Scry 1.` resolves this turn, Phantasm becomes a valid attacker.
+/// After `Scry 1.` resolves this turn, Phantasm becomes a valid attacker.
 #[test]
 fn phantasm_can_attack_after_scry() {
     let mut scenario = GameScenario::new();
@@ -102,7 +97,7 @@ fn phantasm_can_attack_after_scry() {
         .is_ok());
 }
 
-/// S4 (multi-authority): P1 resolving a scry does not satisfy P0's Phantasm —
+/// (Multi-authority): P1 resolving a scry does not satisfy P0's Phantasm —
 /// "you've" binds to the controller of the static ability, not to whichever
 /// player last scried. Reach-guard: P1's `(P1, Scry)` is actually recorded,
 /// so the negative isn't explained by P1's scry silently not happening.
