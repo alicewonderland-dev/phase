@@ -15933,7 +15933,7 @@ fn resolve_chain_body(
         } = event
         {
             state.player_actions_this_way.insert((*player_id, *action));
-            state.player_actions_this_turn.push((*player_id, *action));
+            record_player_action_this_turn(state, *player_id, *action);
         }
     }
 
@@ -17640,6 +17640,17 @@ fn resolve_chain_body(
     }
 
     Ok(())
+}
+
+/// `resolve_chain_body` records, through this helper, each `PlayerPerformedAction`
+/// emitted inside its window; any other caller must run outside every chain
+/// window.
+pub(crate) fn record_player_action_this_turn(
+    state: &mut GameState,
+    player: PlayerId,
+    action: PlayerActionKind,
+) {
+    state.player_actions_this_turn.push((player, action));
 }
 
 /// CR 608.2c + CR 609.3: Whether a producer already bound this node's referent
@@ -32905,11 +32916,14 @@ mod tests {
                 .contains(&(PlayerId(1), action)),
             "P1 searched and must be recorded in player_actions_this_way"
         );
-        assert!(
+        assert_eq!(
             state
                 .player_actions_this_turn
-                .contains(&(PlayerId(1), action)),
-            "P1 searched and must be recorded in player_actions_this_turn"
+                .iter()
+                .filter(|entry| **entry == (PlayerId(1), action))
+                .count(),
+            1,
+            "P1 searched and must be recorded in player_actions_this_turn exactly once"
         );
         assert!(
             state
@@ -32917,11 +32931,14 @@ mod tests {
                 .contains(&(PlayerId(2), action)),
             "P2 searched and must be recorded in player_actions_this_way"
         );
-        assert!(
+        assert_eq!(
             state
                 .player_actions_this_turn
-                .contains(&(PlayerId(2), action)),
-            "P2 searched and must be recorded in player_actions_this_turn"
+                .iter()
+                .filter(|entry| **entry == (PlayerId(2), action))
+                .count(),
+            1,
+            "P2 searched and must be recorded in player_actions_this_turn exactly once"
         );
     }
 
