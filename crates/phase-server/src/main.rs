@@ -14603,11 +14603,7 @@ mod issue_4548_full_create_tests {
 
     /// Reads raw text frames as untyped JSON until one carries the
     /// `JoinTargetInfo` tag, returning it alongside the tags of any frames
-    /// skipped along the way. Reading `serde_json::Value` rather than
-    /// deserializing into `ServerMessage` matters here: at base
-    /// `ServerMessage::JoinTargetInfo` has no `draft_metadata` variant field,
-    /// so a typed `recv_server_message` would silently drop the very key this
-    /// test inspects.
+    /// skipped along the way.
     async fn recv_join_target_info_value<S>(
         socket: &mut WebSocketStream<S>,
     ) -> (serde_json::Value, Vec<String>)

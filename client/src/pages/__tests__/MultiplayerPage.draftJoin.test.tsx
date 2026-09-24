@@ -16,8 +16,8 @@ import { refuseRealWebSockets } from "../../test/helpers/refusingWebSocket";
 const harness = vi.hoisted(() => ({
   navigate: vi.fn(),
   lobbyAction: null as null | ((props: Record<string, unknown>) => void),
-  /** Every `MyDecks` render's `mode`, in order. Empty means the deck picker
-   * was never mounted with a mode — "no deck selection" for the tests below. */
+  /** Empty means the deck picker was never mounted with a mode — "no deck
+   * selection" for the tests below. */
   myDecksModes: [] as (string | undefined)[],
 }));
 
