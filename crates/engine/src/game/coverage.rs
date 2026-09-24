@@ -14483,7 +14483,7 @@ mod tests {
 
     /// Build an `AtomicCard` for a `ControlsCommander` static-ability test with
     /// its real MTGJSON keyword array, so the tests exercise the production
-    /// MTGJSON→face path (shaped like `tiered_atomic_card` above).
+    /// MTGJSON→face path (shaped like `tiered_atomic_card`).
     fn commander_condition_atomic_card(case: &CommanderConditionCase) -> AtomicCard {
         AtomicCard {
             name: case.name.to_string(),
