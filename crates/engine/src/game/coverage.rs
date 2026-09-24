@@ -14484,36 +14484,26 @@ mod tests {
     /// Build an `AtomicCard` for a `ControlsCommander` static-ability test with
     /// its real MTGJSON keyword array, so the tests exercise the production
     /// MTGJSON→face path (shaped like `tiered_atomic_card` above).
-    #[allow(clippy::too_many_arguments)]
-    fn commander_condition_atomic_card(
-        name: &str,
-        type_line: &str,
-        types: &[&str],
-        subtypes: &[&str],
-        keywords: &[&str],
-        power: Option<&str>,
-        toughness: Option<&str>,
-        oracle: &str,
-    ) -> AtomicCard {
+    fn commander_condition_atomic_card(case: &CommanderConditionCase) -> AtomicCard {
         AtomicCard {
-            name: name.to_string(),
+            name: case.name.to_string(),
             mana_cost: Some("{1}{G}".to_string()),
             colors: vec!["G".to_string()],
             color_identity: vec!["G".to_string()],
-            power: power.map(|p| p.to_string()),
-            toughness: toughness.map(|t| t.to_string()),
+            power: case.power.map(|p| p.to_string()),
+            toughness: case.toughness.map(|t| t.to_string()),
             loyalty: None,
             defense: None,
-            text: Some(oracle.to_string()),
+            text: Some(case.oracle.to_string()),
             layout: "normal".to_string(),
-            type_line: Some(type_line.to_string()),
-            types: types.iter().map(|t| (*t).to_string()).collect(),
-            subtypes: subtypes.iter().map(|t| (*t).to_string()).collect(),
+            type_line: Some(case.type_line.to_string()),
+            types: case.types.iter().map(|t| (*t).to_string()).collect(),
+            subtypes: case.subtypes.iter().map(|t| (*t).to_string()).collect(),
             supertypes: vec![],
-            keywords: if keywords.is_empty() {
+            keywords: if case.keywords.is_empty() {
                 None
             } else {
-                Some(keywords.iter().map(|k| (*k).to_string()).collect())
+                Some(case.keywords.iter().map(|k| (*k).to_string()).collect())
             },
             side: None,
             face_name: None,
@@ -14524,8 +14514,8 @@ mod tests {
             rulings: Vec::new(),
             is_game_changer: false,
             identifiers: AtomicIdentifiers {
-                scryfall_oracle_id: Some(format!("{}-oracle", name.to_lowercase())),
-                scryfall_id: Some(format!("{}-face", name.to_lowercase())),
+                scryfall_oracle_id: Some(format!("{}-oracle", case.name.to_lowercase())),
+                scryfall_id: Some(format!("{}-face", case.name.to_lowercase())),
             },
             foreign_data: Vec::new(),
             related_cards: crate::database::mtgjson::SetRelatedCards::default(),
@@ -14533,8 +14523,6 @@ mod tests {
     }
 
     /// One row of the `controls_commander_statics_report_supported` table.
-    /// A named struct rather than an 8-tuple so the field list stays readable
-    /// at both the declaration and the call site.
     struct CommanderConditionCase<'a> {
         name: &'a str,
         type_line: &'a str,
@@ -14638,16 +14626,7 @@ mod tests {
         ];
 
         for case in cases {
-            let card = commander_condition_atomic_card(
-                case.name,
-                case.type_line,
-                case.types,
-                case.subtypes,
-                case.keywords,
-                case.power,
-                case.toughness,
-                case.oracle,
-            );
+            let card = commander_condition_atomic_card(case);
             let name = case.name;
             let face = build_oracle_face(&card, None);
             // Reach-guard: the fixture only counts if the parser really produced

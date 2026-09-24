@@ -4,9 +4,11 @@ use engine::game::keywords::has_keyword_kind;
 use engine::game::layers::evaluate_layers;
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::parser::parse_oracle_text;
-use engine::types::ability::{StaticCondition, TargetFilter, TypeFilter};
+use engine::types::ability::{
+    ContinuousModification, ControllerRef, StaticCondition, TargetFilter, TypeFilter,
+};
 use engine::types::identifiers::ObjectId;
-use engine::types::keywords::KeywordKind;
+use engine::types::keywords::{Keyword, KeywordKind};
 use engine::types::phase::Phase;
 
 /// The Swarmweaver's printed Oracle text.
@@ -36,23 +38,37 @@ fn the_swarmweaver_compound_subject_anthem_is_not_split() {
             assert_eq!(
                 filters.len(),
                 2,
-                "expected Insect + Spider conjuncts, got {filters:?}"
+                "expected Insect-you-control + Spider-you-control conjuncts, got {filters:?}"
             );
-            for filter in filters {
-                match filter {
-                    TargetFilter::Typed(tf) => {
-                        assert!(
-                            tf.type_filters.contains(&TypeFilter::Creature),
-                            "expected a creature-typed conjunct, got {:?}",
-                            tf.type_filters
-                        );
-                    }
-                    other => panic!("expected a Typed conjunct, got {other:?}"),
-                }
+            for subtype in ["Insect", "Spider"] {
+                assert!(
+                    filters.iter().any(|filter| matches!(
+                        filter,
+                        TargetFilter::Typed(tf)
+                            if tf.type_filters.contains(&TypeFilter::Creature)
+                                && tf.type_filters.contains(&TypeFilter::Subtype(subtype.to_string()))
+                                && tf.controller == Some(ControllerRef::You)
+                    )),
+                    "expected a Creature+Subtype({subtype:?}) filter scoped to You, got {filters:?}"
+                );
             }
         }
-        other => panic!("affected must be Or(Insect You, Spider You), got {other:?}"),
+        other => {
+            panic!("affected must be Or(Insect You, Spider You) subtype filters, got {other:?}")
+        }
     }
+    assert_eq!(
+        anthem.modifications,
+        vec![
+            ContinuousModification::AddPower { value: 1 },
+            ContinuousModification::AddToughness { value: 1 },
+            ContinuousModification::AddKeyword {
+                keyword: Keyword::Deathtouch
+            },
+        ],
+        "expected exactly [+1/+1, Deathtouch], got {:?}",
+        anthem.modifications
+    );
     assert!(
         !matches!(anthem.condition, Some(StaticCondition::Unrecognized { .. })),
         "the Delirium condition must not fall back to Unrecognized, got {:?}",

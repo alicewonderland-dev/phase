@@ -371,6 +371,17 @@ fn demon_of_wailing_agonies_damaged_player_sacrifices() {
             "P0's creature is untouched by P1's own sacrifice"
         );
         assert!(!runner.state().battlefield.contains(&cards[0]));
+        let p1_graveyard = &runner
+            .state()
+            .players
+            .iter()
+            .find(|p| p.id == P1)
+            .expect("P1 exists")
+            .graveyard;
+        assert!(
+            p1_graveyard.contains(&cards[0]),
+            "the sacrificed creature must be in P1's graveyard, not merely off the battlefield"
+        );
         let remaining = if cards[0] == a { b } else { a };
         assert!(runner.state().battlefield.contains(&remaining));
     }
@@ -442,76 +453,137 @@ fn demon_of_wailing_agonies_damaged_player_sacrifices() {
 /// the uninvolved third player's.
 #[test]
 fn tyrants_familiar_attack_trigger_targets_defending_players_creature() {
-    let p2 = PlayerId(2);
-    let mut scenario = GameScenario::new_n_player(3, 7);
-    scenario.at_phase(Phase::PreCombatMain);
-    let tyrant = scenario
-        .add_creature_from_oracle(P0, "Tyrant's Familiar", 5, 5, TYRANT)
-        .id();
-    scenario
-        .add_creature(P0, "Test Commander", 1, 1)
-        .commander();
-    let p1a = scenario.add_creature(P1, "P1 A", 1, 7).id();
-    let p1b = scenario.add_creature(P1, "P1 B", 1, 7).id();
-    let p2a = scenario.add_creature(p2, "P2 A", 1, 7).id();
-    let p2b = scenario.add_creature(p2, "P2 B", 1, 7).id();
-    let mut runner = scenario.build();
+    // Gate on.
+    {
+        let p2 = PlayerId(2);
+        let mut scenario = GameScenario::new_n_player(3, 7);
+        scenario.at_phase(Phase::PreCombatMain);
+        let tyrant = scenario
+            .add_creature_from_oracle(P0, "Tyrant's Familiar", 5, 5, TYRANT)
+            .id();
+        scenario
+            .add_creature(P0, "Test Commander", 1, 1)
+            .commander();
+        let p1a = scenario.add_creature(P1, "P1 A", 1, 7).id();
+        let p1b = scenario.add_creature(P1, "P1 B", 1, 7).id();
+        let p2a = scenario.add_creature(p2, "P2 A", 1, 7).id();
+        let p2b = scenario.add_creature(p2, "P2 B", 1, 7).id();
+        let mut runner = scenario.build();
 
-    let mut declared = false;
-    let mut legal: Option<HashSet<ObjectId>> = None;
-    for _ in 0..300 {
-        if declared && runner.state().phase == Phase::DeclareBlockers {
-            break;
-        }
-        let wf = runner.state().waiting_for.clone();
-        let res = match wf {
-            WaitingFor::DeclareAttackers { player, .. } if player == P0 && !declared => {
-                declared = true;
-                runner.act(GameAction::DeclareAttackers {
-                    attacks: vec![(tyrant, AttackTarget::Player(P1))],
-                    bands: vec![],
-                })
+        let mut declared = false;
+        let mut legal: Option<HashSet<ObjectId>> = None;
+        for _ in 0..300 {
+            if declared && runner.state().phase == Phase::DeclareBlockers {
+                break;
             }
-            WaitingFor::TriggerTargetSelection {
-                ref target_slots, ..
-            } => {
-                let slot = &target_slots[0];
-                legal = Some(
-                    slot.legal_targets
-                        .iter()
-                        .filter_map(|t| match t {
-                            TargetRef::Object(id) => Some(*id),
-                            _ => None,
-                        })
-                        .collect(),
-                );
-                runner.choose_first_legal_target()
+            let wf = runner.state().waiting_for.clone();
+            let res = match wf {
+                WaitingFor::DeclareAttackers { player, .. } if player == P0 && !declared => {
+                    declared = true;
+                    runner.act(GameAction::DeclareAttackers {
+                        attacks: vec![(tyrant, AttackTarget::Player(P1))],
+                        bands: vec![],
+                    })
+                }
+                WaitingFor::TriggerTargetSelection {
+                    ref target_slots, ..
+                } => {
+                    let slot = &target_slots[0];
+                    legal = Some(
+                        slot.legal_targets
+                            .iter()
+                            .filter_map(|t| match t {
+                                TargetRef::Object(id) => Some(*id),
+                                _ => None,
+                            })
+                            .collect(),
+                    );
+                    runner.choose_first_legal_target()
+                }
+                WaitingFor::Priority { .. } => runner.act(GameAction::PassPriority),
+                _ => break,
+            };
+            if res.is_err() {
+                break;
             }
-            WaitingFor::Priority { .. } => runner.act(GameAction::PassPriority),
-            _ => break,
-        };
-        if res.is_err() {
-            break;
         }
+
+        let legal = legal.expect("the attack must raise a TriggerTargetSelection");
+        assert_eq!(
+            legal,
+            HashSet::from([p1a, p1b]),
+            "legal targets must be exactly the attacked player's (P1's) creatures, excluding P2's"
+        );
+
+        let bf = &runner.state().battlefield;
+        let p1_alive = [p1a, p1b].iter().filter(|id| bf.contains(id)).count();
+        assert_eq!(
+            p1_alive, 1,
+            "exactly one of P1's creatures must have died to the 7 damage"
+        );
+        assert!(
+            bf.contains(&p2a) && bf.contains(&p2b),
+            "P2's creatures must be untouched"
+        );
     }
 
-    let legal = legal.expect("the attack must raise a TriggerTargetSelection");
-    assert_eq!(
-        legal,
-        HashSet::from([p1a, p1b]),
-        "legal targets must be exactly the attacked player's (P1's) creatures, excluding P2's"
-    );
+    // Gate off: reach guard — the attack is declared — but no granted attack
+    // trigger fires, so no TriggerTargetSelection is ever raised and all four
+    // 1/7 creatures survive.
+    {
+        let p2 = PlayerId(2);
+        let mut scenario = GameScenario::new_n_player(3, 7);
+        scenario.at_phase(Phase::PreCombatMain);
+        let tyrant = scenario
+            .add_creature_from_oracle(P0, "Tyrant's Familiar", 5, 5, TYRANT)
+            .id();
+        let p1a = scenario.add_creature(P1, "P1 A", 1, 7).id();
+        let p1b = scenario.add_creature(P1, "P1 B", 1, 7).id();
+        let p2a = scenario.add_creature(p2, "P2 A", 1, 7).id();
+        let p2b = scenario.add_creature(p2, "P2 B", 1, 7).id();
+        let mut runner = scenario.build();
 
-    let bf = &runner.state().battlefield;
-    let p1_alive = [p1a, p1b].iter().filter(|id| bf.contains(id)).count();
-    assert_eq!(
-        p1_alive, 1,
-        "exactly one of P1's creatures must have died to the 7 damage"
-    );
-    assert!(
-        bf.contains(&p2a) && bf.contains(&p2b),
-        "P2's creatures must be untouched"
-    );
+        let mut declared = false;
+        let mut trigger_seen = false;
+        for _ in 0..300 {
+            if declared && runner.state().phase == Phase::PostCombatMain {
+                break;
+            }
+            let wf = runner.state().waiting_for.clone();
+            let res = match wf {
+                WaitingFor::DeclareAttackers { player, .. } if player == P0 && !declared => {
+                    declared = true;
+                    runner.act(GameAction::DeclareAttackers {
+                        attacks: vec![(tyrant, AttackTarget::Player(P1))],
+                        bands: vec![],
+                    })
+                }
+                WaitingFor::TriggerTargetSelection { .. } => {
+                    trigger_seen = true;
+                    break;
+                }
+                WaitingFor::DeclareBlockers { .. } => runner.act(GameAction::DeclareBlockers {
+                    assignments: vec![],
+                }),
+                WaitingFor::Priority { .. } => runner.act(GameAction::PassPriority),
+                _ => break,
+            };
+            if res.is_err() {
+                break;
+            }
+        }
+
+        assert!(declared, "reach guard: the attack must have been declared");
+        assert!(
+            !trigger_seen,
+            "gate off: the granted attack trigger must not fire"
+        );
+        let bf = &runner.state().battlefield;
+        assert!(
+            [p1a, p1b, p2a, p2b].iter().all(|id| bf.contains(id)),
+            "gate off: all four 1/7 creatures must survive"
+        );
+    }
 }
 
 /// CR 702.121a: Skyhunter Strike Force's Lieutenant grant reaches OTHER
