@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { applyBackup, type PhaseBackup } from "./backup";
 import { getSupabaseSessionKey } from "./cloudSync/sessionKey";
 import { isBundledTauriOrigin, isTauri } from "./platform";
+import { withSavedDeckLibrary } from "./savedDeckTransaction";
 
 /** Payload staged by the bundled shell for one-time remote-origin import. */
 export interface LegacyStorageStash {
@@ -45,7 +46,7 @@ export async function importLegacyStorage(): Promise<void> {
   if (!stash) return;
 
   try {
-    applyBackup(stash.backup, "merge");
+    await withSavedDeckLibrary((txn) => applyBackup(txn, stash.backup, "merge"));
     const sessionKey = getSupabaseSessionKey();
     if (
       sessionKey &&

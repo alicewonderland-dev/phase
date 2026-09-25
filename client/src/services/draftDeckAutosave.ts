@@ -2,7 +2,7 @@
  * Autosave the deck a draft submission accepted into the saved-deck library,
  * under the ownership contract `constants/storage.ts::writeDraftAutosaveDeck`
  * enforces. Draft-specific: kind → slot, submission → `ParsedDeck`, and the
- * never-throw wrapper the stores call after a submission succeeds.
+ * never-reject wrapper the stores call after a submission succeeds.
  */
 import i18n from "i18next";
 import type { DraftKind, DraftPlayerView } from "../adapter/draft-adapter";
@@ -67,14 +67,17 @@ export interface DraftDeckAutosave {
   commanders: readonly string[];
 }
 
-/** Never throws: a failed autosave must not fail the deck submission that triggered it. */
-export function autosaveDraftDeck(submission: DraftDeckAutosave): void {
+/** Never rejects: a failed autosave must not fail the deck submission that triggered it. */
+export async function autosaveDraftDeck(submission: DraftDeckAutosave): Promise<void> {
   try {
     const slot = draftAutosaveSlot(submission.view.kind, submission.setCode);
     const label = i18n.t("draft:deckAutosave.deckName", { format: autosaveSlotLabels()[slot] });
     const format = submission.view.commanders_required > 0 ? "CommanderDraft" : "Limited";
     const deck = draftSubmissionToParsedDeck(submission.partition, submission.commanders);
-    writeDraftAutosaveDeck(slot, label, serializeSavedDeck(deck, format, null));
+    const result = await writeDraftAutosaveDeck(slot, label, serializeSavedDeck(deck, format, null));
+    if (result.status === "skipped") {
+      console.warn("[draftDeckAutosave] autosave skipped:", result.reason);
+    }
   } catch (error) {
     console.warn("[draftDeckAutosave] autosave failed:", error);
   }

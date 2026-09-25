@@ -8,10 +8,13 @@ import {
   loadDeckOrigins,
   loadFeedSubscriptions,
   removeDeckMeta,
+  removeSavedDeckData,
   saveDeckOrigins,
   saveFeedSubscriptions,
   stampDeckMeta,
+  writeSavedDeckData,
 } from "../constants/storage";
+import { withSavedDeckLibrary, type SavedDeckTxn } from "./savedDeckTransaction";
 import {
   getCachedFeed,
   hydrateFeedCache,
@@ -144,7 +147,7 @@ export function feedDeckToParsedDeck(deck: FeedDeck): ParsedDeck {
   });
 }
 
-function syncFeedDecksToStorage(feed: Feed): void {
+function syncFeedDecksToStorage(txn: SavedDeckTxn, feed: Feed): void {
   const origins = loadDeckOrigins();
 
   // Add/update decks from the feed
@@ -154,7 +157,7 @@ function syncFeedDecksToStorage(feed: Feed): void {
 
     if (existingOrigin === feed.id) {
       // Origin matches this feed — overwrite (feed is authoritative)
-      localStorage.setItem(key, JSON.stringify(feedDeckToParsedDeck(deck)));
+      writeSavedDeckData(txn, deck.name, JSON.stringify(feedDeckToParsedDeck(deck)));
     } else if (existingOrigin) {
       // Origin is a different feed — skip
       continue;
@@ -163,8 +166,8 @@ function syncFeedDecksToStorage(feed: Feed): void {
       continue;
     } else {
       // New deck — write it
-      localStorage.setItem(key, JSON.stringify(feedDeckToParsedDeck(deck)));
-      stampDeckMeta(deck.name, 0);
+      writeSavedDeckData(txn, deck.name, JSON.stringify(feedDeckToParsedDeck(deck)));
+      stampDeckMeta(txn, deck.name, 0);
     }
 
     origins[deck.name] = feed.id;
@@ -174,8 +177,8 @@ function syncFeedDecksToStorage(feed: Feed): void {
   const feedDeckNames = new Set(feed.decks.map((d) => d.name));
   for (const [deckName, feedId] of Object.entries(origins)) {
     if (feedId === feed.id && !feedDeckNames.has(deckName)) {
-      localStorage.removeItem(STORAGE_KEY_PREFIX + deckName);
-      removeDeckMeta(deckName);
+      removeSavedDeckData(txn, deckName);
+      removeDeckMeta(txn, deckName);
       delete origins[deckName];
 
       // Clear active deck if it was removed
@@ -204,7 +207,7 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
   if (!allowRefresh) {
     for (const sub of subs) {
       const cached = getCachedFeed(sub.sourceId);
-      if (cached) syncFeedDecksToStorage(cached);
+      if (cached) await withSavedDeckLibrary((txn) => syncFeedDecksToStorage(txn, cached));
     }
     return;
   }
@@ -225,7 +228,7 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
       const feedId = source.id;
       const normalizedFeed = { ...feed, id: feedId, format: source.format ?? feed.format };
       const cachePersistence = setCachedFeed(feedId, normalizedFeed);
-      syncFeedDecksToStorage(normalizedFeed);
+      await withSavedDeckLibrary((txn) => syncFeedDecksToStorage(txn, normalizedFeed));
 
       subs.push({
         sourceId: feedId,
@@ -256,7 +259,7 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
     const isStale = now - sub.lastRefreshedAt >= FEED_STALE_AFTER_MS;
     const bundled = sub.type === "bundled";
     if (!bundled && !isStale && cached) {
-      syncFeedDecksToStorage(cached);
+      await withSavedDeckLibrary((txn) => syncFeedDecksToStorage(txn, cached));
       continue;
     }
 
@@ -266,7 +269,7 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
       const registrySource = FEED_REGISTRY.find((r) => r.id === sub.sourceId);
       const normalizedFeed = { ...feed, id: sub.sourceId, format: registrySource?.format ?? feed.format };
       const cachePersistence = setCachedFeed(sub.sourceId, normalizedFeed);
-      syncFeedDecksToStorage(normalizedFeed);
+      await withSavedDeckLibrary((txn) => syncFeedDecksToStorage(txn, normalizedFeed));
       const feedChanged = cached?.updated !== normalizedFeed.updated;
       const metadataChanged = sub.lastVersion !== feed.version || sub.error !== undefined;
       sub.lastVersion = feed.version;
@@ -279,7 +282,7 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
       // Fall back to cached data
       const cached = getCachedFeed(sub.sourceId);
       if (cached) {
-        syncFeedDecksToStorage(cached);
+        await withSavedDeckLibrary((txn) => syncFeedDecksToStorage(txn, cached));
       }
     }
   }
@@ -298,7 +301,7 @@ export async function subscribe(sourceOrUrl: string): Promise<Feed> {
   const feed = await fetchFeed(url);
 
   await setCachedFeed(feed.id, feed);
-  syncFeedDecksToStorage(feed);
+  await withSavedDeckLibrary((txn) => syncFeedDecksToStorage(txn, feed));
 
   const subs = loadFeedSubscriptions();
   const existing = subs.find((s) => s.sourceId === feed.id);
@@ -321,23 +324,25 @@ export async function subscribe(sourceOrUrl: string): Promise<Feed> {
   return feed;
 }
 
-export function unsubscribe(feedId: string): void {
-  const origins = loadDeckOrigins();
+export async function unsubscribe(feedId: string): Promise<void> {
+  await withSavedDeckLibrary((txn) => {
+    const origins = loadDeckOrigins();
 
-  // Remove all decks belonging to this feed
-  for (const [deckName, originFeedId] of Object.entries(origins)) {
-    if (originFeedId === feedId) {
-      localStorage.removeItem(STORAGE_KEY_PREFIX + deckName);
-      removeDeckMeta(deckName);
-      delete origins[deckName];
+    // Remove all decks belonging to this feed
+    for (const [deckName, originFeedId] of Object.entries(origins)) {
+      if (originFeedId === feedId) {
+        removeSavedDeckData(txn, deckName);
+        removeDeckMeta(txn, deckName);
+        delete origins[deckName];
 
-      if (localStorage.getItem(ACTIVE_DECK_KEY) === deckName) {
-        localStorage.removeItem(ACTIVE_DECK_KEY);
+        if (localStorage.getItem(ACTIVE_DECK_KEY) === deckName) {
+          localStorage.removeItem(ACTIVE_DECK_KEY);
+        }
       }
     }
-  }
 
-  saveDeckOrigins(origins);
+    saveDeckOrigins(origins);
+  });
   removeCachedFeed(feedId);
 
   const subs = loadFeedSubscriptions().filter((s) => s.sourceId !== feedId);
@@ -366,7 +371,7 @@ export async function refreshFeed(feedId: string): Promise<Feed> {
   try {
     const feed = await fetchFeed(sub.url);
     await setCachedFeed(feed.id, feed);
-    syncFeedDecksToStorage(feed);
+    await withSavedDeckLibrary((txn) => syncFeedDecksToStorage(txn, feed));
 
     sub.lastRefreshedAt = Date.now();
     sub.lastVersion = feed.version;
@@ -396,28 +401,30 @@ export async function refreshAllFeeds(): Promise<Map<string, Feed | Error>> {
   return results;
 }
 
-export function adoptFeedDeck(deckName: string, newName?: string): string {
-  const origins = loadDeckOrigins();
-  const targetName = newName ?? deckName;
+export function adoptFeedDeck(deckName: string, newName?: string): Promise<string> {
+  return withSavedDeckLibrary((txn) => {
+    const origins = loadDeckOrigins();
+    const targetName = newName ?? deckName;
 
-  if (newName && newName !== deckName) {
-    // Copy deck data to new name
-    const raw = localStorage.getItem(STORAGE_KEY_PREFIX + deckName);
-    if (raw) {
-      localStorage.setItem(STORAGE_KEY_PREFIX + targetName, raw);
-      stampDeckMeta(targetName);
+    if (newName && newName !== deckName) {
+      // Copy deck data to new name
+      const raw = localStorage.getItem(STORAGE_KEY_PREFIX + deckName);
+      if (raw) {
+        writeSavedDeckData(txn, targetName, raw);
+        stampDeckMeta(txn, targetName);
+      }
     }
-  }
 
-  // Remove feed origin tracking (deck is now user-owned)
-  delete origins[deckName];
-  if (newName && newName !== deckName) {
-    // Don't track the new name either
-    delete origins[targetName];
-  }
-  saveDeckOrigins(origins);
+    // Remove feed origin tracking (deck is now user-owned)
+    delete origins[deckName];
+    if (newName && newName !== deckName) {
+      // Don't track the new name either
+      delete origins[targetName];
+    }
+    saveDeckOrigins(origins);
 
-  return targetName;
+    return targetName;
+  });
 }
 
 export function getFeedDecksByFeed(): Map<string, string[]> {

@@ -2026,7 +2026,7 @@ export const useMultiplayerDraftStore = create<
           submittedPartition: partition,
         },
       });
-      autosaveDraftDeck({ view, setCode: null, partition, commanders });
+      await autosaveDraftDeck({ view, setCode: null, partition, commanders });
     } else if (role === "guest" && activeGuestAdapter) {
       await activeGuestAdapter.submitDeck(partition.mainDeck, commanders);
       set({
@@ -2034,7 +2034,7 @@ export const useMultiplayerDraftStore = create<
         submittedWorkspaceState: cloneWorkspace(workspace),
         submittedPartition: partition,
       });
-      autosaveDraftDeck({ view, setCode: null, partition, commanders });
+      await autosaveDraftDeck({ view, setCode: null, partition, commanders });
     }
   },
 
@@ -3467,7 +3467,7 @@ function handleGuestEvent(event: DraftPodGuestEvent, set: SetFn): void {
       break;
     case "recoveredDeckSubmissionAccepted": {
       const partition = recoveredSubmissionPartition(event.mainDeck, event.view.pool);
-      if (partition) autosaveDraftDeck({ view: event.view, setCode: null, partition, commanders: event.commanders });
+      if (partition) void autosaveDraftDeck({ view: event.view, setCode: null, partition, commanders: event.commanders });
       break;
     }
   }

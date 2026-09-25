@@ -505,7 +505,7 @@ describe("cloud sync serialization", () => {
     await useCloudSyncStore.getState().syncNow();
 
     expect(mocks.suppress).toHaveBeenCalled();
-    expect(mocks.applyBackup).toHaveBeenCalledWith(remote(2).backup, "overwrite");
+    expect(mocks.applyBackup).toHaveBeenCalledWith(expect.anything(), remote(2).backup, "overwrite");
     expect(profileReplaced).toHaveBeenCalledTimes(1);
     expect(useCloudSyncStore.getState()).toMatchObject({ lastSyncedRevision: 2, dirty: false });
     window.removeEventListener("phase:profile-replaced", profileReplaced);
@@ -679,7 +679,7 @@ describe("cloud sync serialization", () => {
     await useCloudSyncStore.getState().resolveConflict("merge");
 
     expect(mocks.suppress).toHaveBeenCalled();
-    expect(mocks.applyBackup).toHaveBeenCalledWith(merged, "overwrite");
+    expect(mocks.applyBackup).toHaveBeenCalledWith(expect.anything(), merged, "overwrite");
     expect(profileReplaced).toHaveBeenCalledTimes(1);
     expect(useCloudSyncStore.getState()).toMatchObject({ status: "synced", lastSyncedRevision: 4 });
     window.removeEventListener("phase:profile-replaced", profileReplaced);

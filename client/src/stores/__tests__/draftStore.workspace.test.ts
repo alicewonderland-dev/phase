@@ -95,6 +95,11 @@ import {
   useDraftStore,
   type DraftPickOutcome,
 } from "../draftStore";
+import {
+  installFifoWebLocks,
+  resetSavedDeckLibraryForTests,
+  uninstallWebLocks,
+} from "../../test/helpers/webLocks";
 
 function card(instanceId: string, name = instanceId): DraftCardInstance {
   return {
@@ -1745,7 +1750,16 @@ describe("draft store workspace authority", () => {
   });
 
   describe("draft deck autosave", () => {
+    beforeEach(async () => {
+      // Real timers for this block: fake-indexeddb schedules through setImmediate, which the
+      // outer `beforeEach`'s vi.useFakeTimers() would otherwise stall, including inside the
+      // saved-deck transaction the autosave runs under during the test body.
+      vi.useRealTimers();
+      installFifoWebLocks();
+      await resetSavedDeckLibraryForTests();
+    });
     afterEach(() => {
+      uninstallWebLocks();
       localStorage.clear();
     });
 

@@ -13,6 +13,7 @@ import {
   MAX_FOLDER_NAME_LENGTH,
   type DeckFolder,
 } from "../../constants/storage";
+import { withSavedDeckLibrary } from "../../services/savedDeckTransaction";
 import { PROFILE_REPLACED_EVENT } from "../../stores/cloudSyncStore";
 import { usePreferencesStore } from "../../stores/preferencesStore";
 import { useEffectiveOffline } from "../../stores/connectivityStore";
@@ -1293,20 +1294,20 @@ export function MyDecks({
   const showEvaluationStatus = mode === "manage"
     && (isScanningUserDecks || isScanningCoverage || (isEvaluating && !requiresCompatibilityFilter));
 
-  const materializePreconDeck = useCallback((deckName: string): boolean => {
+  const materializePreconDeck = useCallback(async (deckName: string): Promise<boolean> => {
     const candidate = legalPreconByName.get(deckName);
     if (!candidate || candidate.source.type !== "precon") return false;
-    savePreconDeck(deckName, preconCandidateToDeckEntry(candidate));
+    await savePreconDeck(deckName, preconCandidateToDeckEntry(candidate));
     setDeckNames(listSavedDeckNames());
     return true;
   }, [legalPreconByName]);
 
-  const handleTileClick = useCallback((deckName: string) => {
+  const handleTileClick = useCallback(async (deckName: string) => {
     if (mode === "manage") {
       onEditDeck?.(deckName);
       return;
     }
-    materializePreconDeck(deckName);
+    await materializePreconDeck(deckName);
     onSelectDeck?.(deckName);
   }, [materializePreconDeck, mode, onEditDeck, onSelectDeck]);
 
@@ -1388,15 +1389,15 @@ export function MyDecks({
     }
   };
 
-  const handleAdoptDeck = useCallback((deckName: string) => {
+  const handleAdoptDeck = useCallback(async (deckName: string) => {
     const newName = prompt(t("myDecks.saveAsPrompt"), deckName);
     if (!newName) return;
-    adoptFeedDeck(deckName, newName);
+    await adoptFeedDeck(deckName, newName);
     setDeckNames(listSavedDeckNames());
   }, [t]);
 
-  const handleDeleteDeck = useCallback((deckName: string) => {
-    deleteDeck(deckName);
+  const handleDeleteDeck = useCallback(async (deckName: string) => {
+    await withSavedDeckLibrary((txn) => deleteDeck(txn, deckName));
     setDeckNames(listSavedDeckNames());
   }, []);
 

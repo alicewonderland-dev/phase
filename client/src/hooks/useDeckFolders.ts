@@ -12,6 +12,7 @@ import {
   type DeckFolder,
   type DeckMeta,
 } from "../constants/storage";
+import { withSavedDeckLibrary } from "../services/savedDeckTransaction";
 import { PROFILE_REPLACED_EVENT } from "../stores/cloudSyncStore";
 
 export interface FolderGroup {
@@ -79,9 +80,9 @@ export interface UseDeckFoldersResult {
   group: (deckNames: string[]) => GroupedDecks;
   createFolder: (name: string) => DeckFolder | null;
   renameFolder: (id: string, name: string) => void;
-  deleteFolder: (id: string) => void;
-  assignDeck: (deckName: string, folderId: string | null) => void;
-  toggleStar: (deckName: string) => boolean;
+  deleteFolder: (id: string) => Promise<void>;
+  assignDeck: (deckName: string, folderId: string | null) => Promise<void>;
+  toggleStar: (deckName: string) => Promise<boolean>;
 }
 
 /**
@@ -117,8 +118,8 @@ export function useDeckFolders(): UseDeckFoldersResult {
     group,
     createFolder: createFolderStore,
     renameFolder: renameFolderStore,
-    deleteFolder: deleteFolderStore,
-    assignDeck: setDeckFolder,
-    toggleStar: toggleDeckStar,
+    deleteFolder: (id) => withSavedDeckLibrary((txn) => deleteFolderStore(txn, id)),
+    assignDeck: (deckName, folderId) => withSavedDeckLibrary((txn) => setDeckFolder(txn, deckName, folderId)),
+    toggleStar: (deckName) => withSavedDeckLibrary((txn) => toggleDeckStar(txn, deckName)),
   };
 }

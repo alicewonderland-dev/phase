@@ -632,7 +632,7 @@ describe("manual feed actions while offline", () => {
     expect(localStorage.getItem(FEED_SUBSCRIPTIONS_KEY)).toBe(beforeSubscriptions);
     expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Test Deck")).toBe(beforeDeck);
 
-    unsubscribe("test-feed");
+    await unsubscribe("test-feed");
 
     expect(listSubscriptions()).toEqual([]);
     expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Test Deck")).toBeNull();
@@ -648,7 +648,7 @@ describe("unsubscribe", () => {
     // Verify decks exist
     expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Test Deck")).not.toBeNull();
 
-    unsubscribe("test-feed");
+    await unsubscribe("test-feed");
 
     // Decks removed
     expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Test Deck")).toBeNull();
@@ -669,7 +669,7 @@ describe("unsubscribe", () => {
     await subscribe("https://example.com/feed.json");
     localStorage.setItem(ACTIVE_DECK_KEY, "Test Deck");
 
-    unsubscribe("test-feed");
+    await unsubscribe("test-feed");
 
     expect(localStorage.getItem(ACTIVE_DECK_KEY)).toBeNull();
   });
@@ -728,7 +728,7 @@ describe("adoptFeedDeck", () => {
 
     expect(getDeckFeedOrigin("Test Deck")).toBe("test-feed");
 
-    adoptFeedDeck("Test Deck");
+    await adoptFeedDeck("Test Deck");
 
     expect(getDeckFeedOrigin("Test Deck")).toBeNull();
     // Deck data still exists
@@ -739,7 +739,7 @@ describe("adoptFeedDeck", () => {
     mockFetch(VALID_FEED);
     await subscribe("https://example.com/feed.json");
 
-    const result = adoptFeedDeck("Test Deck", "My Copy");
+    const result = await adoptFeedDeck("Test Deck", "My Copy");
 
     expect(result).toBe("My Copy");
     expect(localStorage.getItem(STORAGE_KEY_PREFIX + "My Copy")).not.toBeNull();

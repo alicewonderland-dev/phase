@@ -12,6 +12,7 @@ import {
   STORAGE_KEY_PREFIX,
 } from "../../../constants/storage";
 import type { ParsedDeck } from "../../../services/deckParser";
+import { testSavedDeckTxn } from "../../../test/helpers/webLocks";
 import { evaluateDeckCompatibilityBatch } from "../../../services/deckCompatibility";
 import { setCachedFeed } from "../../../services/feedPersistence";
 import { loadPreconDeckMap } from "../../../hooks/useDecks";
@@ -371,7 +372,7 @@ describe("MyDecks", () => {
     });
     const folder = createFolder("Archive");
     expect(folder).not.toBeNull();
-    setDeckFolder("Filed Deck", folder!.id);
+    setDeckFolder(testSavedDeckTxn, "Filed Deck", folder!.id);
     vi.mocked(evaluateDeckCompatibilityBatch).mockResolvedValue({});
 
     render(

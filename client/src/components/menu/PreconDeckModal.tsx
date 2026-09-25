@@ -117,12 +117,12 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
 
   if (!open) return null;
 
-  const handlePick = (deck: DeckEntry) => {
+  const handlePick = async (deck: DeckEntry) => {
     const suggested = `${deck.name} (${deck.code})`;
     const chosen = prompt(t("precon.savePrompt"), suggested);
     if (!chosen) return;
     if (preconExists(chosen) && !confirm(t("precon.overwriteConfirm", { name: chosen }))) return;
-    savePreconDeck(chosen, deck);
+    await savePreconDeck(chosen, deck);
     onImported(chosen);
     onClose();
   };
@@ -143,7 +143,7 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
   // confirm, and fires `onImported` exactly once at the end with the last
   // imported name so the parent's deck-list refresh + select-mode auto-pick
   // run as a single transition rather than per-deck.
-  const handleImportSelected = () => {
+  const handleImportSelected = async () => {
     if (!decks || selectedIds.size === 0) return;
     const picks: Array<{ savedName: string; deck: DeckEntry }> = [];
     for (const id of selectedIds) {
@@ -171,7 +171,7 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
         skipped++;
         continue;
       }
-      savePreconDeck(savedName, deck);
+      await savePreconDeck(savedName, deck);
       lastImported = savedName;
       imported++;
     }

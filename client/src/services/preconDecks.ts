@@ -1,6 +1,7 @@
-import { clearDeckAutosaveMarker, STORAGE_KEY_PREFIX } from "../constants/storage";
+import { clearDeckAutosaveMarker, STORAGE_KEY_PREFIX, writeSavedDeckData } from "../constants/storage";
 import type { DeckEntry } from "../hooks/useDecks";
 import type { ParsedDeck } from "./deckParser";
+import { withSavedDeckLibrary } from "./savedDeckTransaction";
 
 export function preconDeckEntryToParsedDeck(deck: DeckEntry): ParsedDeck {
   return {
@@ -22,8 +23,10 @@ export function preconExists(savedName: string): boolean {
  * participates in the normal deck-compatibility / active-deck / tile-render
  * flows without any precon-specific branching downstream.
  */
-export function savePreconDeck(savedName: string, deck: DeckEntry): void {
+export function savePreconDeck(savedName: string, deck: DeckEntry): Promise<void> {
   const parsed = preconDeckEntryToParsedDeck(deck);
-  localStorage.setItem(STORAGE_KEY_PREFIX + savedName, JSON.stringify(parsed));
-  clearDeckAutosaveMarker(savedName);
+  return withSavedDeckLibrary((txn) => {
+    writeSavedDeckData(txn, savedName, JSON.stringify(parsed));
+    clearDeckAutosaveMarker(txn, savedName);
+  });
 }

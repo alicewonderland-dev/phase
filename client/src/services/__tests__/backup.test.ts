@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import { testSavedDeckTxn } from "../../test/helpers/webLocks";
 
 import {
   applyBackup,
@@ -105,7 +106,7 @@ describe("backup — draft workspace preferences", () => {
     expect(backup.draftWorkspacePreferences).toBe(raw);
 
     localStorage.clear();
-    applyBackup(backup, "overwrite");
+    applyBackup(testSavedDeckTxn, backup, "overwrite");
     expect(localStorage.getItem(DRAFT_WORKSPACE_PREFERENCES_KEY)).toBe(raw);
   });
 
@@ -114,10 +115,10 @@ describe("backup — draft workspace preferences", () => {
     const oldBackup = backupWithoutWorkspacePreferences();
     localStorage.setItem(DRAFT_WORKSPACE_PREFERENCES_KEY, raw);
 
-    applyBackup(oldBackup, "merge");
+    applyBackup(testSavedDeckTxn, oldBackup, "merge");
     expect(localStorage.getItem(DRAFT_WORKSPACE_PREFERENCES_KEY)).toBe(raw);
 
-    applyBackup(oldBackup, "overwrite");
+    applyBackup(testSavedDeckTxn, oldBackup, "overwrite");
     expect(localStorage.getItem(DRAFT_WORKSPACE_PREFERENCES_KEY)).toBeNull();
   });
 
@@ -139,7 +140,7 @@ describe("backup — draft workspace preferences", () => {
       };
       localStorage.setItem(DRAFT_WORKSPACE_PREFERENCES_KEY, prior);
 
-      const result = applyBackup(backup, mode);
+      const result = applyBackup(testSavedDeckTxn, backup, mode);
 
       expect(result.malformedKeys).toContain(DRAFT_WORKSPACE_PREFERENCES_KEY);
       expect(localStorage.getItem(DRAFT_WORKSPACE_PREFERENCES_KEY))
@@ -171,7 +172,7 @@ describe("backup — deck folders", () => {
     expect(backup.deckFolders).toBe(FOLDERS_JSON);
 
     localStorage.clear();
-    applyBackup(backup, "overwrite");
+    applyBackup(testSavedDeckTxn, backup, "overwrite");
     expect(localStorage.getItem(DECK_FOLDERS_KEY)).toBe(FOLDERS_JSON);
   });
 
@@ -189,7 +190,7 @@ describe("backup — deck folders", () => {
     };
     localStorage.setItem(DECK_FOLDERS_KEY, JSON.stringify([{ id: "stale", name: "Stale", order: 0 }]));
 
-    applyBackup(oldBackup, "overwrite");
+    applyBackup(testSavedDeckTxn, oldBackup, "overwrite");
 
     // Cleared by the overwrite sweep; the absent field writes nothing back.
     expect(localStorage.getItem(DECK_FOLDERS_KEY)).toBeNull();
@@ -341,7 +342,7 @@ describe("applyBackup — draft autosave ownership (merge mode)", () => {
       feedDeckOrigins: null,
     };
 
-    const result = applyBackup(backup, "merge");
+    const result = applyBackup(testSavedDeckTxn, backup, "merge");
 
     expect(result.decksImported).toBe(1);
     expect(localStorage.getItem(STORAGE_KEY_PREFIX + "X")).toBe("local-bytes");
@@ -367,7 +368,7 @@ describe("applyBackup — draft autosave ownership (merge mode)", () => {
       feedDeckOrigins: null,
     };
 
-    applyBackup(backup, "merge");
+    applyBackup(testSavedDeckTxn, backup, "merge");
 
     expect(getDeckMeta("[Autosave] Sealed")?.autosaveSlot).toBeUndefined();
     // The backup's other metadata entry still wrote through: this proves the
@@ -393,7 +394,7 @@ describe("applyBackup — draft autosave ownership (merge mode)", () => {
       feedDeckOrigins: null,
     };
 
-    applyBackup(backup, "merge");
+    applyBackup(testSavedDeckTxn, backup, "merge");
 
     const raw = JSON.parse(localStorage.getItem(DECK_METADATA_KEY) ?? "{}");
     expect("autosaveSlot" in raw.X).toBe(false);
@@ -415,7 +416,7 @@ describe("applyBackup — draft autosave ownership (merge mode)", () => {
       feedDeckOrigins: null,
     };
 
-    applyBackup(backup, "merge");
+    applyBackup(testSavedDeckTxn, backup, "merge");
 
     expect(getDeckMeta("Y")?.autosaveSlot).toBe("Quick");
   });

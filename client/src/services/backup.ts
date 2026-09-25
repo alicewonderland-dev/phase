@@ -25,6 +25,7 @@ import {
   type DeckFolder,
   type DeckMeta,
 } from "../constants/storage";
+import { withSavedDeckLibrary, type SavedDeckTxn } from "./savedDeckTransaction";
 import type { FeedSubscription } from "../types/feed";
 
 /** Versioned envelope. Future shapes go in a `PhaseBackupV2 | …` union. */
@@ -444,9 +445,11 @@ function isParseableJson(raw: string | null): boolean {
  * re-hydrate from the new localStorage contents.
  */
 export function applyBackup(
+  txn: SavedDeckTxn,
   backup: PhaseBackupV1,
   mode: ImportMode,
 ): ImportResult {
+  void txn;
   if (mode === "overwrite") {
     const toRemove: string[] = [];
     for (let i = 0; i < localStorage.length; i++) {
@@ -546,5 +549,5 @@ export async function importBackupFromFile(
       "File is not a phase backup, or its version is not supported.",
     );
   }
-  return applyBackup(parsed, mode);
+  return withSavedDeckLibrary((txn) => applyBackup(txn, parsed, mode));
 }

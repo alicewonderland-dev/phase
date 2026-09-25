@@ -4,7 +4,8 @@ import { motion, AnimatePresence } from "framer-motion";
 import { useTranslation } from "react-i18next";
 
 import { menuButtonClass } from "./buttonStyles";
-import { STORAGE_KEY_PREFIX, listSavedDeckNames, stampDeckMeta, uniqueDeckName } from "../../constants/storage";
+import { listSavedDeckNames, stampDeckMeta, uniqueDeckName, writeSavedDeckData } from "../../constants/storage";
+import { withSavedDeckLibrary } from "../../services/savedDeckTransaction";
 import {
   assignOathbreakerSlots,
   deriveImportedDeckName,
@@ -99,12 +100,11 @@ export function ImportDeckModal({ open, onClose, onImported }: ImportDeckModalPr
     });
   };
 
-  const persistImport = (name: string, deck: ParsedDeck, format?: "Oathbreaker") => {
-    localStorage.setItem(
-      STORAGE_KEY_PREFIX + name,
-      JSON.stringify(format ? { ...deck, format } : deck),
-    );
-    stampDeckMeta(name);
+  const persistImport = async (name: string, deck: ParsedDeck, format?: "Oathbreaker") => {
+    await withSavedDeckLibrary((txn) => {
+      writeSavedDeckData(txn, name, JSON.stringify(format ? { ...deck, format } : deck));
+      stampDeckMeta(txn, name);
+    });
     finishImport(name);
   };
 
@@ -165,7 +165,7 @@ export function ImportDeckModal({ open, onClose, onImported }: ImportDeckModalPr
 
     const name = resolveImportDeckName(deckName, content, deck, fallbackName);
     if (!importAsOathbreaker) {
-      persistImport(name, deck);
+      await persistImport(name, deck);
       return true;
     }
 
@@ -196,10 +196,10 @@ export function ImportDeckModal({ open, onClose, onImported }: ImportDeckModalPr
     }
   };
 
-  const confirmOathbreakerImport = () => {
+  const confirmOathbreakerImport = async () => {
     const pending = pendingOathbreakerImport;
     if (!pending?.oathbreaker || !pending.signatureSpell) return;
-    persistImport(
+    await persistImport(
       pending.name,
       assignOathbreakerSlots(pending.deck, pending.oathbreaker, pending.signatureSpell),
       "Oathbreaker",

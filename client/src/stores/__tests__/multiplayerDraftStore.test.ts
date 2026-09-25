@@ -17,6 +17,11 @@ import {
   createDefaultDraftWorkspacePreferences,
   setArrivingCardBoardPreferences,
 } from "../../components/draft/workspace/workspacePreferences";
+import {
+  installFifoWebLocks,
+  resetSavedDeckLibraryForTests,
+  uninstallWebLocks,
+} from "../../test/helpers/webLocks";
 import { DraftPodHostAdapter } from "../../adapter/draftPodHostAdapter";
 import { DraftPodGuestAdapter } from "../../adapter/draftPodGuestAdapter";
 import type { DraftPlayerView } from "../../adapter/draft-adapter";
@@ -1640,7 +1645,12 @@ describe("multiplayerDraftStore", () => {
     });
 
     describe("draft deck autosave", () => {
+      beforeEach(async () => {
+        installFifoWebLocks();
+        await resetSavedDeckLibraryForTests();
+      });
       afterEach(() => {
+        uninstallWebLocks();
         localStorage.clear();
       });
 
@@ -1699,8 +1709,8 @@ describe("multiplayerDraftStore", () => {
       });
 
       it("overwrites the solo Sealed autosave with a pod Sealed submission, leaving other slots untouched", async () => {
-        writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", JSON.stringify({ main: [], sideboard: [] }));
-        writeDraftAutosaveDeck("Quick", "[Autosave] Quick Draft", JSON.stringify({ main: [], sideboard: [] }));
+        await writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", JSON.stringify({ main: [], sideboard: [] }));
+        await writeDraftAutosaveDeck("Quick", "[Autosave] Quick Draft", JSON.stringify({ main: [], sideboard: [] }));
 
         await useMultiplayerDraftStore.getState().hostDraft({
           poolInput: { type: "Set", data: { set_pool_json: "{}" } },
@@ -1799,7 +1809,9 @@ describe("multiplayerDraftStore", () => {
           view: winstonView,
         });
 
-        expect(loadSavedDeck("[Autosave] Winston Draft")?.main).toEqual([{ name: "Spell", count: 1 }]);
+        await vi.waitFor(() =>
+          expect(loadSavedDeck("[Autosave] Winston Draft")?.main).toEqual([{ name: "Spell", count: 1 }]),
+        );
       });
 
       // Shared fixture for the rows below: a drafted Plains (`dplains`) in the
@@ -1873,11 +1885,11 @@ describe("multiplayerDraftStore", () => {
           view: sharedPremierView,
         });
 
-        expectSharedFixtureSaved();
+        await vi.waitFor(expectSharedFixtureSaved);
       });
 
       it("writes no autosave for a recovered submission when the restored workspace no longer matches the accepted main deck", async () => {
-        writeDraftAutosaveDeck(
+        await writeDraftAutosaveDeck(
           "Premier", "[Autosave] Premier Draft",
           JSON.stringify({ main: [{ name: "Old", count: 1 }], sideboard: [] }),
         );

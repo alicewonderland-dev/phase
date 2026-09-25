@@ -46,8 +46,8 @@ export function FeedManagerModal({ open, onClose }: FeedManagerModalProps) {
     }
   };
 
-  const handleUnsubscribe = (feedId: string) => {
-    unsubscribe(feedId);
+  const handleUnsubscribe = async (feedId: string) => {
+    await unsubscribe(feedId);
     setSubs(listSubscriptions());
   };
 

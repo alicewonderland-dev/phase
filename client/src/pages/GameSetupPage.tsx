@@ -32,6 +32,7 @@ import {
   loadSavedDeckBracket,
   touchDeckPlayed,
 } from "../constants/storage";
+import { withSavedDeckLibrary } from "../services/savedDeckTransaction";
 import { useCardImage } from "../hooks/useCardImage";
 import { BRACKET_LABEL } from "../types/bracket";
 import { effectiveAiDifficulty, isDeckCedhLegal } from "../services/cedhLock";
@@ -180,7 +181,7 @@ export function GameSetupPage() {
     // active deck is not required to start.
     const suppliesDeck = formatSuppliesDeck(formatConfig.format);
     if (!activeDeckName && !suppliesDeck) return;
-    if (activeDeckName && !isRandomDeckSelection(activeDeckName)) touchDeckPlayed(activeDeckName);
+    if (activeDeckName && !isRandomDeckSelection(activeDeckName)) void withSavedDeckLibrary((txn) => touchDeckPlayed(txn, activeDeckName));
     const gameId = crypto.randomUUID();
     // Snapshot the per-seat AI config from preferences into the active-game
     // record. `AiOpponentConfig`'s `ensureAiSeatCount` effect normally syncs
