@@ -1,4 +1,4 @@
-//! CR 903.3d + CR 611.3a: statics gated on "as long as you control your commander" apply while their controller controls their own commander, and stop when they don't.
+//! CR 903.3 + CR 109.5 + CR 611.3a: statics gated on "as long as you control your commander" apply while their controller controls their own commander, and stop when they don't.
 
 use engine::game::casting::can_activate_ability_now;
 use engine::game::combat::AttackTarget;
@@ -111,6 +111,55 @@ fn thunderfoot_baloth_lieutenant_splits_self_and_other_creatures() {
         !has_kw(&mut runner, bear, &Keyword::Trample),
         "gate off: other creature loses the granted trample"
     );
+
+    // NEGATIVE row (a): the commander is owned by P1 but merely controlled by
+    // P0 (a stolen commander). CR 903.3 + CR 109.5: a commander P0 controls
+    // but does not own is still P1's commander, not "your commander" — the
+    // gate must read OFF.
+    {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let baloth = scenario
+            .add_creature_from_oracle(P0, "Thunderfoot Baloth", 5, 5, BALOTH)
+            .id();
+        let bear = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
+        scenario
+            .add_creature(P1, "Opposing Commander", 1, 1)
+            .commander()
+            .controlled_by(P0);
+        let mut runner = scenario.build();
+        assert_eq!(
+            effective_pt(&mut runner, baloth),
+            (5, 5),
+            "commander owned by P1, controlled by P0: not P0's own commander, gate stays off"
+        );
+        assert_eq!(effective_pt(&mut runner, bear), (2, 2));
+        assert!(!has_kw(&mut runner, bear, &Keyword::Trample));
+    }
+
+    // NEGATIVE row (b): the commander is owned by P0 but controlled by P1.
+    // CR 903.3 + CR 109.5: ownership alone does not satisfy "you control your
+    // commander" — the gate must read OFF.
+    {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let baloth = scenario
+            .add_creature_from_oracle(P0, "Thunderfoot Baloth", 5, 5, BALOTH)
+            .id();
+        let bear = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
+        scenario
+            .add_creature(P0, "Your Commander", 1, 1)
+            .commander()
+            .controlled_by(P1);
+        let mut runner = scenario.build();
+        assert_eq!(
+            effective_pt(&mut runner, baloth),
+            (5, 5),
+            "commander owned by P0, controlled by P1: P0 does not control it, gate stays off"
+        );
+        assert_eq!(effective_pt(&mut runner, bear), (2, 2));
+        assert!(!has_kw(&mut runner, bear, &Keyword::Trample));
+    }
 }
 
 /// CR 601.2f + CR 602.2b + CR 118.7a: Convergence of Dominion's cost reduction

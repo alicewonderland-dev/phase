@@ -9632,7 +9632,8 @@ fn condition_feature(cond: &AbilityCondition) -> (&'static str, FeatureSupport) 
         AbilityCondition::ManaColorSpent { .. } => ("ManaColorSpent", Handled),
         AbilityCondition::HasMaxSpeed => ("HasMaxSpeed", Handled),
         AbilityCondition::IsMonarch => ("IsMonarch", Handled),
-        // CR 903.3d: evaluated at resolution via `game::commander`.
+        // CR 903.3 / CR 903.3d: evaluated at resolution via `game::commander`
+        // (both ownership scopes).
         AbilityCondition::ControlsCommander { .. } => ("ControlsCommander", Handled),
         // CR 309.7: evaluated at resolution via `dungeon::has_completed_dungeon`.
         AbilityCondition::CompletedDungeon { .. } => ("CompletedDungeon", Handled),
@@ -10150,8 +10151,8 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         }
         StaticCondition::OpponentPoisonAtLeast { .. } => ("OpponentPoisonAtLeast", Unhandled),
         StaticCondition::UnlessPay { .. } => ("UnlessPay", Handled),
-        // CR 903.3d: resolved by the `ControlsCommander` arm of
-        // `layers::evaluate_condition_inner`.
+        // CR 903.3 / CR 903.3d: resolved by the `ControlsCommander` arm of
+        // `layers::evaluate_condition_inner` (both ownership scopes).
         StaticCondition::ControlsCommander { .. } => ("ControlsCommander", Handled),
         // SourceIsEquipped resolved by layers::evaluate_condition_inner.
         StaticCondition::SourceIsEquipped => ("SourceIsEquipped", Handled),
@@ -14693,8 +14694,8 @@ mod tests {
         oracle: &'a str,
     }
 
-    /// CR 903.3d: statics gated on `StaticCondition::ControlsCommander` carry no
-    /// resolver gap in `analyze_coverage`.
+    /// CR 903.3: Own-scoped statics gated on `StaticCondition::ControlsCommander`
+    /// carry no resolver gap in `analyze_coverage`.
     #[test]
     fn controls_commander_statics_report_supported() {
         let cases: &[CommanderConditionCase] = &[

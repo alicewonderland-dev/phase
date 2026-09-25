@@ -103,6 +103,91 @@ fn has_kw_kind(
     has_keyword_kind(&runner.state().objects[&id], kind)
 }
 
+/// Recompute layers and read an object's effective (post-layer) power/toughness.
+/// Mirrors `effective_pt` in `controls_commander_statics.rs`.
+fn effective_pt(runner: &mut engine::game::scenario::GameRunner, id: ObjectId) -> (i32, i32) {
+    runner.state_mut().layers_dirty.mark_full();
+    evaluate_layers(runner.state_mut());
+    let obj = &runner.state().objects[&id];
+    (
+        obj.power.expect("creature has power"),
+        obj.toughness.expect("creature has toughness"),
+    )
+}
+
+/// Drives The Swarmweaver's Delirium anthem through `GameScenario` and
+/// `evaluate_layers` for an Insect and a Spider on P0's battlefield, at both
+/// graveyard-type-count states, with an opponent-controlled Insect as a scope
+/// control. This is the discriminating pair the parse-shape assertions above
+/// cannot reach on their own: a dropped gate (the anthem always on) and a
+/// dropped half of the compound subject (only Insects or only Spiders
+/// benefiting) both leave the parsed AST shape from
+/// `the_swarmweaver_compound_subject_anthem_is_not_split` untouched.
+#[test]
+fn the_swarmweaver_delirium_gates_insects_and_spiders_by_graveyard_types() {
+    for at_threshold in [false, true] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.add_creature_from_oracle(P0, "The Swarmweaver", 2, 3, THE_SWARMWEAVER);
+        let insect = scenario
+            .add_creature(P0, "P0 Insect", 1, 1)
+            .with_subtypes(vec!["Insect"])
+            .id();
+        let spider = scenario
+            .add_creature(P0, "P0 Spider", 1, 1)
+            .with_subtypes(vec!["Spider"])
+            .id();
+        // Scope control: an opponent-controlled Insect must never gain the
+        // bonus, at either graveyard-type-count state.
+        let opp_insect = scenario
+            .add_creature(P1, "Opp Insect", 1, 1)
+            .with_subtypes(vec!["Insect"])
+            .id();
+        // CR 207.2c + CR 205.2: three unambiguous card types stay below the
+        // Delirium threshold; a fourth (a creature card) crosses it.
+        scenario.add_land_to_graveyard(P0, "Graveyard Land");
+        scenario.add_spell_to_graveyard(P0, "Graveyard Instant", true);
+        scenario.add_spell_to_graveyard(P0, "Graveyard Sorcery", false);
+        if at_threshold {
+            scenario.add_creature_to_graveyard(P0, "Graveyard Creature", 1, 1);
+        }
+        let mut runner = scenario.build();
+
+        let expected_pt = if at_threshold { (2, 2) } else { (1, 1) };
+        assert_eq!(
+            effective_pt(&mut runner, insect),
+            expected_pt,
+            "at_threshold={at_threshold}: P0's Insect"
+        );
+        assert_eq!(
+            effective_pt(&mut runner, spider),
+            expected_pt,
+            "at_threshold={at_threshold}: P0's Spider"
+        );
+        // CR 702.2: deathtouch is granted only once Delirium is active.
+        assert_eq!(
+            has_kw_kind(&mut runner, insect, KeywordKind::Deathtouch),
+            at_threshold,
+            "at_threshold={at_threshold}: P0's Insect deathtouch"
+        );
+        assert_eq!(
+            has_kw_kind(&mut runner, spider, KeywordKind::Deathtouch),
+            at_threshold,
+            "at_threshold={at_threshold}: P0's Spider deathtouch"
+        );
+
+        assert_eq!(
+            effective_pt(&mut runner, opp_insect),
+            (1, 1),
+            "at_threshold={at_threshold}: opponent's Insect must stay untouched"
+        );
+        assert!(
+            !has_kw_kind(&mut runner, opp_insect, KeywordKind::Deathtouch),
+            "at_threshold={at_threshold}: opponent's Insect must not gain deathtouch"
+        );
+    }
+}
+
 /// Thorin Oakenshield's printed Oracle text.
 const THORIN_OAKENSHIELD: &str = "Trample\nStoried (If you control three or more artifacts, legendaries, and/or Sagas, you have an enduring story for the rest of the game.)\nAs long as you have an enduring story, artifacts and creatures you control have ward {1}.";
 
