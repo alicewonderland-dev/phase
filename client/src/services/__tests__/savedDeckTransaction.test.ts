@@ -306,7 +306,7 @@ describe("withSavedDeckLibrary / withSavedDeckLibraryOrSkip", () => {
     expect(Number(localSeen ?? 0)).toBe(1);
   });
 
-  it("the first transaction on a fresh library commits at generation 0, and a later tab that lags behind the committed IDB generation waits for its local view before committing", async () => {
+  it("the first transaction on a fresh library commits, and a later tab that lags behind the committed IDB generation waits for its local view before committing", async () => {
     expect(await readIdbGenerationForTests()).toBeUndefined();
     await withSavedDeckLibrary(() => undefined);
     expect(await readIdbGenerationForTests()).toBe(1);
