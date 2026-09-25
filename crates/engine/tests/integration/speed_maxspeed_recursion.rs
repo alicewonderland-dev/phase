@@ -54,8 +54,8 @@
 //!     substitutes its owner wherever "you"/"your" is read.
 //!   - CR 508.1c, CR 509.1b: attack/block legality restrictions.
 //!   - CR 601.2f: total-cost cost modification, scoped by caster.
-//!   - CR 613.1g, CR 613.4c: the P/T-modification and keyword-granting
-//!     continuous-effect layers.
+//!   - CR 613.1f: the ability-adding layer for granted menace.
+//!   - CR 613.1g, CR 613.4c: the P/T-modification layer for +1/+1.
 
 use engine::game::casting::spell_objects_available_to_cast;
 use engine::game::combat::{can_block_pair, creature_cant_attack};
@@ -272,7 +272,7 @@ const GASTAL_RAIDER_ORACLE: &str = "Start your engines!\nWhen this creature ente
 // lowercase literal).
 const GASTAL_RAIDER_KEYWORDS: &[&str] = &["max speed", "start your engines!"];
 
-/// CR 613.1g + CR 613.4c + CR 702.178a: Gastal Raider's "Max speed — This
+/// CR 613.1f + CR 613.1g + CR 613.4c + CR 702.178a: Gastal Raider's "Max speed — This
 /// creature gets +1/+1 and has menace" is a continuous P/T + keyword grant
 /// gated by `StaticCondition::HasMaxSpeed`, driven here through the real
 /// `functioning_abilities::active_static_definitions` -> `evaluate_layers`
