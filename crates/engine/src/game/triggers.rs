@@ -16494,6 +16494,106 @@ pub mod tests {
         GameState::new_two_player(42)
     }
 
+    /// CR 103.4e + CR 904.5 + CR 603.4: Cecil's parsed resolution-time
+    /// "half your starting life" gate reads the trigger controller's own
+    /// topology-specific baseline. The same post-loss life (15) is at or
+    /// below half of the archenemy's 40 (so Cecil untaps/transforms), but not
+    /// half of a hero's 20 (so those gated instructions do not happen).
+    #[test]
+    fn cecil_trigger_resolution_uses_archenemy_or_hero_starting_life() {
+        use crate::types::card::LayoutKind;
+        use crate::types::format::FormatConfig;
+
+        const ORACLE: &str = "Whenever ~ deals damage, you lose that much life. Then if your life total is less than or equal to half your starting life total, untap ~ and transform it.";
+        let trigger =
+            crate::parser::oracle_trigger::parse_trigger_line(ORACLE, "Cecil, Dark Knight");
+
+        let run_case = |controller: PlayerId| {
+            let mut state = GameState::new(FormatConfig::archenemy(), 4, 42);
+            let victim = if controller == PlayerId(0) {
+                PlayerId(1)
+            } else {
+                PlayerId(0)
+            };
+            // Hold current life constant across cases. Only the printed rules
+            // starting total differs: Archenemy P0 begins at 40, hero P1 at 20.
+            state.players[0].life = 20;
+            state.players[1].life = 20;
+            let cecil = create_object(
+                &mut state,
+                CardId(901),
+                controller,
+                "Cecil, Dark Knight".to_string(),
+                Zone::Battlefield,
+            );
+            {
+                let obj = state.objects.get_mut(&cecil).expect("Cecil exists");
+                obj.card_types.core_types.push(CoreType::Creature);
+                obj.base_card_types = obj.card_types.clone();
+                obj.tapped = true;
+                obj.back_face = Some(crate::game::game_object::BackFaceData {
+                    layout_kind: Some(LayoutKind::Transform),
+                    ..Default::default()
+                });
+                obj.trigger_definitions.push(trigger.clone());
+                std::sync::Arc::make_mut(&mut obj.base_trigger_definitions).push(trigger.clone());
+            }
+
+            // Produce Cecil's damage event through the production effect
+            // resolver, then use the real trigger collection and stack resolver.
+            let damage = ResolvedAbility::new(
+                Effect::DealDamage {
+                    amount: QuantityExpr::Fixed { value: 5 },
+                    target: TargetFilter::Player,
+                    damage_source: None,
+                    excess: None,
+                },
+                vec![TargetRef::Player(victim)],
+                cecil,
+                controller,
+            );
+            let mut damage_events = Vec::new();
+            crate::game::effects::resolve_ability_chain(&mut state, &damage, &mut damage_events, 0)
+                .expect("Cecil's damage instruction resolves");
+            assert!(
+                damage_events.iter().any(|event| matches!(
+                    event,
+                    GameEvent::DamageDealt { source_id, amount: 5, .. }
+                        if *source_id == cecil
+                )),
+                "positive reach guard: production resolution emitted Cecil's 5 damage"
+            );
+
+            process_triggers(&mut state, &damage_events);
+            assert!(
+                state.stack.iter().any(|entry| {
+                    entry.source_id == cecil
+                        && matches!(entry.kind, StackEntryKind::TriggeredAbility { .. })
+                }),
+                "the parsed Cecil trigger must reach the stack"
+            );
+            let mut resolution_events = Vec::new();
+            crate::game::stack::resolve_top(&mut state, &mut resolution_events);
+
+            assert_eq!(
+                state
+                    .players
+                    .iter()
+                    .find(|p| p.id == controller)
+                    .unwrap()
+                    .life,
+                15,
+                "the queued trigger must resolve its printed 5-life loss"
+            );
+            let resolved_cecil = &state.objects[&cecil];
+            assert_eq!(resolved_cecil.tapped, controller != PlayerId(0));
+            assert_eq!(resolved_cecil.transformed, controller == PlayerId(0));
+        };
+
+        run_case(PlayerId(0));
+        run_case(PlayerId(1));
+    }
+
     #[test]
     fn saga_entry_counter_is_inside_entry_boundary_but_prior_event_is_not() {
         let saga = ObjectId(10);

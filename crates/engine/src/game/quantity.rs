@@ -4515,13 +4515,19 @@ fn resolve_ref(
                 usize_to_i32_saturating(p.graveyard.len())
             })
         }
-        // CR 810.9a + CR 810.4: team total minus the (already team-correct, 30)
-        // starting life. Single controller bind — no double-count.
+        // CR 810.9a + CR 810.4 + CR 904.5: current shared-resource life
+        // (team total in 2HG, individual total elsewhere) minus the selected
+        // controller's rules starting total. Single controller bind — no
+        // double-count, and Archenemy's 40/20 baseline follows that controller.
         QuantityRef::LifeAboveStarting => player.map_or(0, |p| {
-            crate::game::players::team_life_total(state, p.id) - state.format_config.starting_life
+            crate::game::players::team_life_total(state, p.id)
+                - state.format_config.starting_life_total_for_player(p.id)
         }),
-        // CR 103.4: The format's starting life total.
-        QuantityRef::StartingLifeTotal => state.format_config.starting_life,
+        // CR 103.4 + CR 904.5: the rules starting total for the referenced
+        // ability controller, including the archenemy's 40-life baseline.
+        QuantityRef::StartingLifeTotal => state
+            .format_config
+            .starting_life_total_for_player(controller),
         // CR 701.57a: the mana-value limit of the discover that fired the current
         // "whenever you discover" trigger (Curator of Sun's Creation, "the same
         // value"). 0 outside a discover-trigger context.
@@ -11801,6 +11807,55 @@ mod tests {
             resolve_quantity(&state, &expr, PlayerId(0), ObjectId(0)),
             25,
             "team total (55) minus starting life (30) = 25"
+        );
+        assert_eq!(
+            resolve_quantity(
+                &state,
+                &QuantityExpr::Ref {
+                    qty: QuantityRef::StartingLifeTotal,
+                },
+                PlayerId(0),
+                ObjectId(0),
+            ),
+            30,
+            "StartingLifeTotal reads the shared team baseline, not a per-seat half"
+        );
+    }
+
+    /// CR 103.4e + CR 904.5: OneVsMany starting-life references are bound to
+    /// the selected controller, so the same current life can be above the
+    /// hero baseline and below the archenemy baseline.
+    #[test]
+    fn starting_life_quantities_follow_archenemy_or_hero_controller() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::archenemy(), 4, 0);
+        state.players[0].life = 30;
+        state.players[1].life = 30;
+
+        let starting_total = QuantityExpr::Ref {
+            qty: QuantityRef::StartingLifeTotal,
+        };
+        let life_above_starting = QuantityExpr::Ref {
+            qty: QuantityRef::LifeAboveStarting,
+        };
+        assert_eq!(
+            resolve_quantity(&state, &starting_total, PlayerId(0), ObjectId(0)),
+            40,
+            "the archenemy's own ability context reads the 40-life baseline"
+        );
+        assert_eq!(
+            resolve_quantity(&state, &starting_total, PlayerId(1), ObjectId(1)),
+            20,
+            "a hero's ability context reads the 20-life baseline"
+        );
+        assert_eq!(
+            resolve_quantity(&state, &life_above_starting, PlayerId(0), ObjectId(0)),
+            -10,
+            "30 life is 10 below the archenemy's 40-life baseline"
+        );
+        assert_eq!(
+            resolve_quantity(&state, &life_above_starting, PlayerId(1), ObjectId(1)),
+            10,
+            "30 life is 10 above a hero's 20-life baseline"
         );
     }
 

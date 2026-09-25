@@ -9678,7 +9678,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
         QuantityRef::UnspentMana { .. } => ("UnspentMana", Handled),
         QuantityRef::GraveyardSize { .. } => ("GraveyardSize", Handled),
         QuantityRef::LifeAboveStarting => ("LifeAboveStarting", Handled),
-        QuantityRef::StartingLifeTotal => ("StartingLifeTotal", Unhandled),
+        QuantityRef::StartingLifeTotal => ("StartingLifeTotal", Handled),
         QuantityRef::TriggeringDiscoverValue => ("TriggeringDiscoverValue", Handled),
         QuantityRef::TriggeringScryLookCount => ("TriggeringScryLookCount", Handled),
         QuantityRef::TriggeringScryBottomCount => ("TriggeringScryBottomCount", Handled),
@@ -18198,6 +18198,15 @@ have been revealed, Aggressive Detective deals 2 damage to each opponent.";
             support,
             FeatureSupport::Handled,
             "TargetZoneCardCount is resolved by game::quantity and should not block coverage",
+        );
+    }
+
+    #[test]
+    fn starting_life_total_quantity_feature_is_marked_handled() {
+        assert_eq!(
+            quantity_ref_feature(&QuantityRef::StartingLifeTotal),
+            ("StartingLifeTotal", FeatureSupport::Handled),
+            "starting-life totals resolve through the selected player's format topology"
         );
     }
 

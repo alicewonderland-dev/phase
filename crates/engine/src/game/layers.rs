@@ -25359,6 +25359,62 @@ mod tests {
         assert_elenda_characteristics(&state, elenda, 5, true);
     }
 
+    /// CR 103.4e + CR 904.5: Archenemy's baseline is player-specific. Elenda
+    /// controlled by the archenemy uses 40, while the same permanent under a
+    /// hero uses that hero's 20-life baseline even when its owner is the
+    /// archenemy. Every transition uses the production life and layer paths.
+    #[test]
+    fn elenda_life_thresholds_follow_archenemy_and_current_controller() {
+        let mut state = GameState::new(FormatConfig::archenemy(), 4, 42);
+        assert_eq!(state.players[0].life, 40);
+        assert_eq!(state.players[1].life, 20);
+        let statics = parsed_elenda_statics();
+        let archenemy_elenda = make_elenda(&mut state, P0, &statics);
+        let hero_controlled_elenda = make_elenda(&mut state, P0, &statics);
+        evaluate_layers(&mut state);
+        assert_elenda_characteristics(&state, archenemy_elenda, 4, false);
+        assert_elenda_characteristics(&state, hero_controlled_elenda, 4, false);
+
+        resolve_test_life_change(&mut state, archenemy_elenda, P0, 1, true);
+        assert_elenda_characteristics(&state, archenemy_elenda, 5, true);
+        resolve_test_life_change(&mut state, archenemy_elenda, P0, 8, true);
+        assert_elenda_characteristics(&state, archenemy_elenda, 5, true);
+        resolve_test_life_change(&mut state, archenemy_elenda, P0, 1, true);
+        assert_elenda_characteristics(&state, archenemy_elenda, 10, true);
+        resolve_test_life_change(&mut state, archenemy_elenda, P0, 1, false);
+        assert_elenda_characteristics(&state, archenemy_elenda, 5, true);
+
+        // Put owner and current controller on opposite sides of their starting
+        // baselines at the same 30 life: owner P0 is 10 below 40, controller
+        // P1 is 10 above 20. A wrong owner-bound lookup leaves this at 4/4.
+        resolve_test_life_change(&mut state, archenemy_elenda, P0, 19, false);
+        resolve_test_life_change(&mut state, hero_controlled_elenda, P1, 10, true);
+        assert_eq!(state.players[0].life, 30);
+        assert_eq!(state.players[1].life, 30);
+        add_change_controller_effect(
+            &mut state,
+            hero_controlled_elenda,
+            hero_controlled_elenda,
+            P1,
+            Duration::UntilEndOfTurn,
+        );
+        evaluate_layers(&mut state);
+        assert_eq!(state.objects[&hero_controlled_elenda].owner, P0);
+        assert_eq!(state.objects[&hero_controlled_elenda].controller, P1);
+        assert_elenda_characteristics(&state, hero_controlled_elenda, 10, true);
+
+        add_change_controller_effect(
+            &mut state,
+            hero_controlled_elenda,
+            hero_controlled_elenda,
+            P0,
+            Duration::UntilEndOfTurn,
+        );
+        evaluate_layers(&mut state);
+        assert_eq!(state.objects[&hero_controlled_elenda].controller, P0);
+        assert_elenda_characteristics(&state, hero_controlled_elenda, 4, false);
+    }
+
     /// CR 613.1b + CR 119: Elenda's threshold reads the current controller's
     /// life, not its owner's. The owner begins at 20 while the opponent has 30;
     /// gaining control activates the same parsed statics, and control returning

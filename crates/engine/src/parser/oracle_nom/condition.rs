@@ -17538,6 +17538,8 @@ mod tests {
         for text in [
             "you have at least 15 life more than your starting life total",
             "you have 15 or more life more than your starting life total",
+            "your life total is at least 15 greater than your starting life total",
+            "your life total is at least fifteen greater than your starting life total",
         ] {
             let (rest, c) = parse_inner_condition(text).unwrap();
             assert_eq!(rest, "", "must fully consume {text:?}");
@@ -17553,6 +17555,20 @@ mod tests {
                 "expected LifeAboveStarting GE Fixed(15) for {text:?}",
             );
         }
+    }
+
+    #[test]
+    fn less_than_life_offset_does_not_use_life_above_starting() {
+        let (rest, condition) = parse_inner_condition(
+            "your life total is less than 10 greater than your starting life total",
+        )
+        .expect("generic absolute life comparison remains parseable");
+        assert_eq!(rest, " greater than your starting life total");
+        assert_ne!(
+            condition,
+            make_quantity_ge(QuantityRef::LifeAboveStarting, 10),
+            "the specific life-offset grammar is GE-only and must not reinterpret LT as a threshold"
+        );
     }
 
     /// Regression guard: the new life-offset branch must NOT steal the plain
