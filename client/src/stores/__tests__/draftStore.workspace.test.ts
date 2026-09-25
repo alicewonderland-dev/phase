@@ -1761,6 +1761,26 @@ describe("draft store workspace authority", () => {
       expect(getDeckMeta("[Autosave] Quick Draft")?.autosaveSlot).toBe("Quick");
     });
 
+    it("keeps a drafted sideboard card in the autosave when a virtual card of the same name is in the main deck", async () => {
+      await start([card("bolt", "Bolt"), card("dplains", "Plains")]);
+      useDraftStore.getState().setWorkspacePlacement("bolt", { zone: "deck", row: 0, column: 0, order: 0 });
+      useDraftStore.getState().setWorkspacePlacement("dplains", { zone: "sideboard", row: 0, column: 0, order: 0 });
+      useDraftStore.getState().addBasicLand("Plains");
+      wasm.submit_deck.mockReturnValue({
+        ...view([card("bolt", "Bolt"), card("dplains", "Plains")]),
+        status: "Pairing",
+      });
+
+      await useDraftStore.getState().submitDeck();
+
+      expect(wasm.submit_deck).toHaveBeenLastCalledWith(JSON.stringify(["Bolt", "Plains"]), JSON.stringify([]));
+      const saved = loadSavedDeck("[Autosave] Quick Draft");
+      expect(saved?.main).toEqual(expect.arrayContaining([
+        { name: "Bolt", count: 1 }, { name: "Plains", count: 1 },
+      ]));
+      expect(saved?.sideboard).toEqual([{ name: "Plains", count: 1 }]);
+    });
+
     it("saves a solo sealed submission as the Sealed autosave", async () => {
       vi.stubGlobal("fetch", vi.fn(async () => ({ text: async () => "database" })));
       const sealedView = { ...view([card("bolt", "Bolt")]), kind: "Sealed" as const, status: "Deckbuilding" as const };

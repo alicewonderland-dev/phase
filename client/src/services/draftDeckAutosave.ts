@@ -7,7 +7,7 @@
 import i18n from "i18next";
 import type { DraftKind, DraftPlayerView } from "../adapter/draft-adapter";
 import { CUSTOM_CUBE_SET_CODE } from "../adapter/draftKinds";
-import { countProjectedNames } from "../components/draft/workspace/workspaceProjection";
+import { countProjectedNames, type DraftWorkspacePartition } from "../components/draft/workspace/workspaceProjection";
 import { writeDraftAutosaveDeck, type DraftAutosaveSlot } from "../constants/storage";
 import type { ParsedDeck } from "./deckParser";
 import { serializeSavedDeck } from "./savedDeckProjection";
@@ -42,36 +42,28 @@ function autosaveSlotLabels(): Record<DraftAutosaveSlot, string> {
   };
 }
 
-/** The saved-deck form of an accepted draft submission. Saved decks keep commanders out of `main`; the
- *  sideboard is the rest of the pool. */
+/** The saved-deck form of an accepted draft submission. Saved decks keep commanders out of `main`. */
 export function draftSubmissionToParsedDeck(
-  mainDeck: readonly string[],
+  partition: DraftWorkspacePartition,
   commanders: readonly string[],
-  pool: readonly { name: string }[],
 ): ParsedDeck {
-  const mainNames = [...mainDeck];
+  const mainNames = [...partition.mainDeck];
   for (const commander of commanders) {
     const index = mainNames.indexOf(commander);
     if (index !== -1) mainNames.splice(index, 1);
   }
 
-  const remainingPool = pool.map((card) => card.name);
-  for (const name of mainDeck) {
-    const index = remainingPool.indexOf(name);
-    if (index !== -1) remainingPool.splice(index, 1);
-  }
-
   return {
     main: countProjectedNames(mainNames),
-    sideboard: countProjectedNames(remainingPool),
+    sideboard: countProjectedNames(partition.sideboard),
     commander: commanders.length > 0 ? [...commanders] : undefined,
   };
 }
 
 export interface DraftDeckAutosave {
-  view: Pick<DraftPlayerView, "kind" | "pool" | "commanders_required">;
+  view: Pick<DraftPlayerView, "kind" | "commanders_required">;
   setCode: string | null;
-  mainDeck: readonly string[];
+  partition: DraftWorkspacePartition;
   commanders: readonly string[];
 }
 
@@ -81,7 +73,7 @@ export function autosaveDraftDeck(submission: DraftDeckAutosave): void {
     const slot = draftAutosaveSlot(submission.view.kind, submission.setCode);
     const label = i18n.t("draft:deckAutosave.deckName", { format: autosaveSlotLabels()[slot] });
     const format = submission.view.commanders_required > 0 ? "CommanderDraft" : "Limited";
-    const deck = draftSubmissionToParsedDeck(submission.mainDeck, submission.commanders, submission.view.pool);
+    const deck = draftSubmissionToParsedDeck(submission.partition, submission.commanders);
     writeDraftAutosaveDeck(slot, label, serializeSavedDeck(deck, format, null));
   } catch (error) {
     console.warn("[draftDeckAutosave] autosave failed:", error);

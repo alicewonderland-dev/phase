@@ -1775,6 +1775,17 @@ describe("multiplayerDraftStore", () => {
         });
 
         capturedGuestEventHandler!({
+          type: "workspaceRestored",
+          workspaceState: {
+            schemaVersion: 1,
+            placements: { spell: { zone: "deck", row: 0, column: 0, order: 0 } },
+            virtualBasics: [],
+          },
+        });
+        const winstonView = { ...mockView("Deckbuilding"), kind: "Winston" as const, pool: [card("spell", "Spell")] };
+        capturedGuestEventHandler!({ type: "viewUpdated", view: winstonView });
+
+        capturedGuestEventHandler!({
           type: "deckSubmissionAcknowledged",
           submissionId: "ignored",
           view: mockView("Deckbuilding"),
@@ -1785,10 +1796,148 @@ describe("multiplayerDraftStore", () => {
           type: "recoveredDeckSubmissionAccepted",
           mainDeck: ["Spell"],
           commanders: [],
-          view: { ...mockView("Deckbuilding"), kind: "Winston" },
+          view: winstonView,
         });
 
         expect(loadSavedDeck("[Autosave] Winston Draft")?.main).toEqual([{ name: "Spell", count: 1 }]);
+      });
+
+      // Shared fixture for the rows below: a drafted Plains (`dplains`) in the
+      // sideboard, and a virtual Plains (`vplains`) in the main deck. Both
+      // carry the same name, which is the case the workspace partition (not a
+      // name subtraction) must tell apart.
+      const sharedPool = [card("spell", "Spell"), card("dplains", "Plains")];
+      const sharedPremierView = { ...mockView("Deckbuilding"), kind: "Premier" as const, pool: sharedPool };
+      const sharedWorkspace = () => ({
+        schemaVersion: 1 as const,
+        placements: {
+          spell: { zone: "deck" as const, row: 0, column: 0, order: 0 },
+          dplains: { zone: "sideboard" as const, row: 0, column: 0, order: 0 },
+          vplains: { zone: "deck" as const, row: 0, column: 0, order: 1 },
+        },
+        virtualBasics: [{ instanceId: "vplains", name: "Plains" }],
+      });
+      const expectSharedFixtureSaved = () => {
+        const saved = loadSavedDeck("[Autosave] Premier Draft");
+        expect(saved?.main).toEqual(expect.arrayContaining([
+          { name: "Spell", count: 1 }, { name: "Plains", count: 1 },
+        ]));
+        expect(saved?.sideboard).toEqual([{ name: "Plains", count: 1 }]);
+      };
+
+      it("keeps a drafted sideboard card in a host Premier autosave when a virtual card of the same name is in the main deck", async () => {
+        await useMultiplayerDraftStore.getState().hostDraft({
+          poolInput: { type: "Set", data: { set_pool_json: "{}" } },
+          kind: "Premier",
+          podSize: 8,
+          hostDisplayName: "Host",
+          tournamentFormat: "Swiss",
+          podPolicy: "Competitive",
+        });
+        capturedHostEventHandler!({ type: "workspaceRestored", workspaceState: sharedWorkspace() });
+        capturedHostEventHandler!({ type: "viewUpdated", view: sharedPremierView });
+        mockHostAdapter.submitDeck.mockResolvedValueOnce(sharedPremierView);
+
+        await useMultiplayerDraftStore.getState().submitDeck();
+
+        expectSharedFixtureSaved();
+      });
+
+      it("keeps a drafted sideboard card in a guest Premier autosave when a virtual card of the same name is in the main deck", async () => {
+        await useMultiplayerDraftStore.getState().joinDraft({
+          kind: "new",
+          roomCode: "ABCDE",
+          displayName: "Alice",
+        });
+        capturedGuestEventHandler!({ type: "workspaceRestored", workspaceState: sharedWorkspace() });
+        capturedGuestEventHandler!({ type: "viewUpdated", view: sharedPremierView });
+
+        await useMultiplayerDraftStore.getState().submitDeck();
+
+        expectSharedFixtureSaved();
+      });
+
+      it("keeps a drafted sideboard card in a recovered guest submission when a virtual card of the same name is in the main deck", async () => {
+        await useMultiplayerDraftStore.getState().joinDraft({
+          kind: "new",
+          roomCode: "ABCDE",
+          displayName: "Alice",
+        });
+        capturedGuestEventHandler!({ type: "workspaceRestored", workspaceState: sharedWorkspace() });
+        capturedGuestEventHandler!({ type: "viewUpdated", view: sharedPremierView });
+
+        capturedGuestEventHandler!({
+          type: "recoveredDeckSubmissionAccepted",
+          mainDeck: ["Spell", "Plains"],
+          commanders: [],
+          view: sharedPremierView,
+        });
+
+        expectSharedFixtureSaved();
+      });
+
+      it("writes no autosave for a recovered submission when the restored workspace no longer matches the accepted main deck", async () => {
+        writeDraftAutosaveDeck(
+          "Premier", "[Autosave] Premier Draft",
+          JSON.stringify({ main: [{ name: "Old", count: 1 }], sideboard: [] }),
+        );
+        await useMultiplayerDraftStore.getState().joinDraft({
+          kind: "new",
+          roomCode: "ABCDE",
+          displayName: "Alice",
+        });
+        // No virtual Plains this time: the restored workspace projects main
+        // `["Spell"]`, while the accepted event says `["Spell", "Plains"]`.
+        const staleWorkspace = { ...sharedWorkspace(), virtualBasics: [] };
+        delete (staleWorkspace.placements as Record<string, unknown>).vplains;
+        capturedGuestEventHandler!({ type: "workspaceRestored", workspaceState: staleWorkspace });
+        capturedGuestEventHandler!({ type: "viewUpdated", view: sharedPremierView });
+
+        capturedGuestEventHandler!({
+          type: "recoveredDeckSubmissionAccepted",
+          mainDeck: ["Spell", "Plains"],
+          commanders: [],
+          view: sharedPremierView,
+        });
+
+        expect(loadSavedDeck("[Autosave] Premier Draft")?.main).toEqual([{ name: "Old", count: 1 }]);
+      });
+
+      it("writes no autosave for a recovered submission when the store holds no restored workspace", async () => {
+        await useMultiplayerDraftStore.getState().joinDraft({
+          kind: "new",
+          roomCode: "ABCDE",
+          displayName: "Alice",
+        });
+
+        capturedGuestEventHandler!({
+          type: "recoveredDeckSubmissionAccepted",
+          mainDeck: ["Spell", "Plains"],
+          commanders: [],
+          view: sharedPremierView,
+        });
+
+        expect(loadSavedDeck("[Autosave] Premier Draft")).toBeNull();
+      });
+
+      it("writes no autosave for a recovered submission when the event's pool has a card the restored workspace never placed", async () => {
+        await useMultiplayerDraftStore.getState().joinDraft({
+          kind: "new",
+          roomCode: "ABCDE",
+          displayName: "Alice",
+        });
+        capturedGuestEventHandler!({ type: "workspaceRestored", workspaceState: sharedWorkspace() });
+        capturedGuestEventHandler!({ type: "viewUpdated", view: sharedPremierView });
+        const widerView = { ...sharedPremierView, pool: [...sharedPool, card("extra", "Extra")] };
+
+        capturedGuestEventHandler!({
+          type: "recoveredDeckSubmissionAccepted",
+          mainDeck: ["Spell", "Plains"],
+          commanders: [],
+          view: widerView,
+        });
+
+        expect(loadSavedDeck("[Autosave] Premier Draft")).toBeNull();
       });
     });
 

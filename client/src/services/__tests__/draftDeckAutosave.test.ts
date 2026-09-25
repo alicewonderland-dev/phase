@@ -20,15 +20,14 @@ describe("draftAutosaveSlot", () => {
 });
 
 describe("draftSubmissionToParsedDeck", () => {
-  it("removes one main-deck copy per commander and sideboards the rest of the pool", () => {
-    const mainDeck = ["Commander Card", "Commander Card", "Bolt", "Plains"];
+  it("removes one main-deck copy per commander and saves the partition's sideboard", () => {
+    const partition = {
+      mainDeck: ["Commander Card", "Commander Card", "Bolt", "Plains"],
+      sideboard: ["Bear"],
+    };
     const commanders = ["Commander Card"];
-    const pool = [
-      { name: "Commander Card" }, { name: "Commander Card" },
-      { name: "Bolt" }, { name: "Bear" },
-    ];
 
-    const deck = draftSubmissionToParsedDeck(mainDeck, commanders, pool);
+    const deck = draftSubmissionToParsedDeck(partition, commanders);
 
     expect(deck.main).toEqual(expect.arrayContaining([
       { name: "Commander Card", count: 1 },
@@ -41,18 +40,8 @@ describe("draftSubmissionToParsedDeck", () => {
   });
 
   it("omits the commander field for a non-commander submission", () => {
-    const deck = draftSubmissionToParsedDeck(["Bolt"], [], [{ name: "Bolt" }]);
+    const deck = draftSubmissionToParsedDeck({ mainDeck: ["Bolt"], sideboard: [] }, []);
     expect(deck.commander).toBeUndefined();
     expect(deck.sideboard).toEqual([]);
-  });
-
-  it("subtracts nothing from the pool for a virtual basic land in the main deck", () => {
-    const deck = draftSubmissionToParsedDeck(
-      ["Bolt", "Island"], [], [{ name: "Bolt" }, { name: "Bear" }],
-    );
-    expect(deck.main).toEqual(expect.arrayContaining([
-      { name: "Bolt", count: 1 }, { name: "Island", count: 1 },
-    ]));
-    expect(deck.sideboard).toEqual([{ name: "Bear", count: 1 }]);
   });
 });

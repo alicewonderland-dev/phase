@@ -40,6 +40,7 @@ import {
   addVirtualBasic,
   projectDeckNames,
   projectWorkspaceMainDeck,
+  projectWorkspacePartition,
   removeVirtualBasic,
 } from "../components/draft/workspace/workspaceProjection";
 import type {
@@ -1308,13 +1309,13 @@ export const useDraftStore = create<DraftStoreState & DraftStoreActions>()((set,
     }
     const lifecycle = lifecycleGeneration;
     const revision = workspaceRevision;
-    const mainDeck = projectDeckNames(state.workspaceState, state.view.pool);
+    const partition = projectWorkspacePartition(state.workspaceState, state.view.pool);
     try {
       const view = await withDraftEngineOperation((lease) => {
         if (!isExclusive(token, "submit") || lifecycle !== lifecycleGeneration || revision !== workspaceRevision) {
           throw new Error("Stale draft deck submission");
         }
-        return lease.submitDeck(mainDeck, []);
+        return lease.submitDeck(partition.mainDeck, []);
       });
       if (!isExclusive(token, "submit") || lifecycle !== lifecycleGeneration) return;
       retireExclusive(token);
@@ -1327,7 +1328,7 @@ export const useDraftStore = create<DraftStoreState & DraftStoreActions>()((set,
         },
         persistence: "schedule",
       });
-      autosaveDraftDeck({ view: state.view, setCode: state.selectedSet, mainDeck, commanders: [] });
+      autosaveDraftDeck({ view: state.view, setCode: state.selectedSet, partition, commanders: [] });
     } catch (error) {
       retireExclusive(token);
       throw error;
