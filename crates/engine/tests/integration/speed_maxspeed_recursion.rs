@@ -12,13 +12,12 @@
 //! through `apply(PassPriority)` (`resolve_bench` repro: "thread 'main' has
 //! overflowed its stack / fatal runtime error: stack overflow").
 //!
-//! Every assertion in this file drives the REAL layer-derivation path
-//! (`evaluate_layers`), which evaluates the HasMaxSpeed-gated static's condition
-//! via `active_static_definitions` — exactly the recursing path. Each `#[test]`
-//! here STACK-OVERFLOWS on the pre-guard code; with the thread-local re-entrancy
-//! guard in `speed.rs` they terminate. These are pipeline/derivation tests, not
-//! shape tests: the modified power read after `evaluate_layers` is computed by
-//! the engine layer system, not asserted into existence.
+//! The recursion-regression tests above the coverage-promotion section drive
+//! either `evaluate_layers` or `can_increase_speed_beyond_4`; both paths
+//! evaluate a HasMaxSpeed-gated static through `active_static_definitions`,
+//! the recursing seam. The coverage-promotion tests below exercise their
+//! named production consumers. These are runtime pipeline tests rather than
+//! parsed-AST shape tests.
 //!
 //! CR references (verified against docs/MagicCompRules.txt):
 //!   - CR 702.179e: A player has max speed if their speed is 4.
@@ -345,7 +344,7 @@ fn gastal_raider_continuous_pt_and_menace_track_controller_speed() {
 const HAZORET_ORACLE: &str = "Indestructible, haste\nStart your engines! (If you have no speed, it starts at 1. It increases once on each of your turns when an opponent loses life. Max speed is 4.)\n{1}, {T}: Target creature with power 2 or less can't be blocked this turn.\nHazoret can't attack or block unless you have max speed.";
 const HAZORET_KEYWORDS: &[&str] = &["haste", "indestructible", "start your engines!"];
 
-/// CR 508.1c + CR 509.1b + CR 702.178a: Hazoret's "can't attack or block
+/// CR 508.1c + CR 509.1b + CR 702.179e: Hazoret's "can't attack or block
 /// unless you have max speed" is `Not(HasMaxSpeed)`-gated
 /// `CantAttackOrBlock`, driven through the real production combat-legality
 /// entry points `combat::creature_cant_attack` and `combat::can_block_pair`.
@@ -554,7 +553,7 @@ fn racers_scoreboard_reduces_controllers_spells_at_max_speed() {
 
 /// HOSTILE/sibling row: P1 is the active player and caster, at max speed;
 /// P0 controls Racers' Scoreboard. `CostModifierCasterScope::You::admits`
-/// (CR 601.2f) admits only the source's OWN controller (P0), so P1's max
+/// (CR 109.5 + CR 601.2f) admits only the source's OWN controller (P0), so P1's max
 /// speed must not discount P1's own spell — the full {{4}} cost is paid.
 /// Without this row, a modifier that widened `You` to "any player at max
 /// speed" would pass every assertion above (both rows share P0 as both
