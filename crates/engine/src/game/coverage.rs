@@ -14661,6 +14661,7 @@ mod tests {
             keywords: if case.keywords.is_empty() {
                 None
             } else {
+                // allow-raw-authority: fixture copies MTGJSON keyword text, not game-object state.
                 Some(case.keywords.iter().map(|k| (*k).to_string()).collect())
             },
             side: None,
