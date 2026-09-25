@@ -1796,8 +1796,7 @@ describe("draft store workspace authority", () => {
       useDraftStore.getState().setWorkspacePlacement("bolt", { zone: "deck", row: 0, column: 0, order: 0 });
       wasm.submit_deck.mockReturnValue({ ...view([card("bolt", "Bolt")]), status: "Pairing" });
       // A stub object (rather than spying `Storage.prototype.setItem`) is used
-      // deliberately: a `Storage.prototype.setItem` spy does not intercept
-      // calls made from `constants/storage.ts`.
+      // deliberately.
       const backing = new Map<string, string>();
       for (let i = 0; i < localStorage.length; i++) {
         const key = localStorage.key(i)!;

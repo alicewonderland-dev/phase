@@ -708,7 +708,7 @@ describe("P2P draft guest receive ordering", () => {
     });
     await middleConn.receiveRaw(ackMessage);
     await vi.advanceTimersByTimeAsync(0);
-    // The host re-acks duplicate submissions (§0): deliver a second, identical ack.
+    // The host re-acks duplicate submissions: deliver a second, identical ack.
     await middleConn.receiveRaw(ackMessage);
     await vi.advanceTimersByTimeAsync(0);
 

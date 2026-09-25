@@ -351,8 +351,7 @@ describe("applyBackup — draft autosave ownership (merge mode)", () => {
 
   it("strips ownership from a local deck whose backup metadata names it even when the backup's decks lack it", () => {
     // Orphaned/foreign metadata: the backup's metadata mentions a name the
-    // backup's own `decks` does not carry, so the import loop below never
-    // iterates it and "the names the loop skipped" would miss it entirely.
+    // backup's own `decks` does not carry.
     localStorage.setItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed", JSON.stringify({ main: [{ name: "Mine", count: 1 }], sideboard: [] }));
     const backup: PhaseBackupV1 = {
       version: 1,
