@@ -24968,6 +24968,84 @@ mod tests {
         id
     }
 
+    const ELENDA_ORACLE: &str = "As long as your life total is greater than your starting life total, Elenda gets +1/+1 and has menace. Elenda gets an additional +5/+5 as long as your life total is at least 10 greater than your starting life total.";
+
+    fn parsed_elenda_statics() -> Vec<StaticDefinition> {
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            ELENDA_ORACLE,
+            "Elenda, Saint of Dusk",
+            &[],
+            &["Legendary".to_string(), "Creature".to_string()],
+            &["Vampire".to_string(), "Knight".to_string()],
+        );
+        assert_eq!(parsed.statics.len(), 2, "both Elenda statics must parse");
+        parsed.statics
+    }
+
+    fn make_elenda(
+        state: &mut GameState,
+        player: PlayerId,
+        statics: &[StaticDefinition],
+    ) -> ObjectId {
+        let id = make_creature(state, "Elenda, Saint of Dusk", 4, 4, player);
+        state.objects.get_mut(&id).unwrap().static_definitions = statics.to_vec().into();
+        id
+    }
+
+    /// Drive a real life gain/loss effect, which routes through the production
+    /// replacement and layer-invalidation paths, then perform the production
+    /// layer pass before observing Elenda.
+    fn resolve_test_life_change(
+        state: &mut GameState,
+        source: ObjectId,
+        player: PlayerId,
+        amount: u32,
+        gain: bool,
+    ) {
+        let effect = if gain {
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed {
+                    value: amount as i32,
+                },
+                player: TargetFilter::Controller,
+            }
+        } else {
+            Effect::LoseLife {
+                amount: QuantityExpr::Fixed {
+                    value: amount as i32,
+                },
+                target: None,
+            }
+        };
+        let targets = if gain {
+            Vec::new()
+        } else {
+            vec![TargetRef::Player(player)]
+        };
+        let ability = ResolvedAbility::new(effect, targets, source, player);
+        let mut events = Vec::new();
+        if gain {
+            crate::game::effects::life::resolve_gain(state, &ability, &mut events)
+                .expect("production life-gain resolution");
+        } else {
+            crate::game::effects::life::resolve_lose(state, &ability, &mut events)
+                .expect("production life-loss resolution");
+        }
+        evaluate_layers(state);
+    }
+
+    fn assert_elenda_characteristics(
+        state: &GameState,
+        elenda: ObjectId,
+        power_toughness: i32,
+        menace: bool,
+    ) {
+        let object = &state.objects[&elenda];
+        assert_eq!(object.power, Some(power_toughness));
+        assert_eq!(object.toughness, Some(power_toughness));
+        assert_eq!(object.keywords.contains(&Keyword::Menace), menace);
+    }
+
     /// A self-affecting CDA that adds the controller's life total to its own
     /// power (Serra Avatar class) — the canonical dynamic-quantity life reader.
     fn life_total_cda(player_scope: PlayerScope) -> StaticDefinition {
@@ -25235,6 +25313,95 @@ mod tests {
             .modifications(vec![ContinuousModification::AddPower { value: 2 }]);
         make_life_static_source(&mut state, "Serra Ascendant-ish", P0, def);
         assert_full_escalation_on_guard(&mut state);
+    }
+
+    /// CR 119: exercise Elenda's printed thresholds with production life events
+    /// and a fresh layer pass at every boundary. The unsupported-static
+    /// fail-open behavior would make the additional +5/+5 unconditional, so
+    /// the 20/21 and 29/30 transitions discriminate that regression.
+    #[test]
+    fn elenda_life_thresholds_follow_standard_starting_life() {
+        let mut state = setup();
+        let statics = parsed_elenda_statics();
+        let elenda = make_elenda(&mut state, P0, &statics);
+        evaluate_layers(&mut state);
+        assert_elenda_characteristics(&state, elenda, 4, false);
+
+        resolve_test_life_change(&mut state, elenda, P0, 1, true);
+        assert_elenda_characteristics(&state, elenda, 5, true);
+        resolve_test_life_change(&mut state, elenda, P0, 8, true);
+        assert_elenda_characteristics(&state, elenda, 5, true);
+        resolve_test_life_change(&mut state, elenda, P0, 1, true);
+        assert_elenda_characteristics(&state, elenda, 10, true);
+        resolve_test_life_change(&mut state, elenda, P0, 1, false);
+        assert_elenda_characteristics(&state, elenda, 5, true);
+    }
+
+    /// CR 119: Two-Headed Giant uses the shared team total (30 starting life)
+    /// for Elenda's life-above-starting condition.
+    #[test]
+    fn elenda_life_thresholds_follow_two_headed_giant_team_life() {
+        let mut state = GameState::new(FormatConfig::two_headed_giant(), 4, 42);
+        let statics = parsed_elenda_statics();
+        let elenda = make_elenda(&mut state, P0, &statics);
+        assert_eq!(crate::game::players::team_life_total(&state, P0), 30);
+        evaluate_layers(&mut state);
+        assert_elenda_characteristics(&state, elenda, 4, false);
+
+        resolve_test_life_change(&mut state, elenda, P0, 9, true);
+        assert_eq!(crate::game::players::team_life_total(&state, P0), 39);
+        assert_elenda_characteristics(&state, elenda, 5, true);
+        resolve_test_life_change(&mut state, elenda, P0, 1, true);
+        assert_eq!(crate::game::players::team_life_total(&state, P0), 40);
+        assert_elenda_characteristics(&state, elenda, 10, true);
+        resolve_test_life_change(&mut state, elenda, P0, 1, false);
+        assert_eq!(crate::game::players::team_life_total(&state, P0), 39);
+        assert_elenda_characteristics(&state, elenda, 5, true);
+    }
+
+    /// CR 613.1b + CR 119: Elenda's threshold reads the current controller's
+    /// life, not its owner's. The owner begins at 20 while the opponent has 30;
+    /// gaining control activates the same parsed statics, and control returning
+    /// to the owner deactivates them again.
+    #[test]
+    fn elenda_life_threshold_follows_current_controller_after_control_change() {
+        let mut state = setup();
+        let statics = parsed_elenda_statics();
+        let elenda_p0 = make_elenda(&mut state, P0, &statics);
+        let elenda_p1 = make_elenda(&mut state, P1, &statics);
+        evaluate_layers(&mut state);
+        assert_elenda_characteristics(&state, elenda_p0, 4, false);
+        assert_elenda_characteristics(&state, elenda_p1, 4, false);
+
+        resolve_test_life_change(&mut state, elenda_p1, P1, 10, true);
+        assert_eq!(state.players.iter().find(|p| p.id == P0).unwrap().life, 20);
+        assert_eq!(state.players.iter().find(|p| p.id == P1).unwrap().life, 30);
+        assert_elenda_characteristics(&state, elenda_p0, 4, false);
+        assert_elenda_characteristics(&state, elenda_p1, 10, true);
+
+        add_change_controller_effect(
+            &mut state,
+            elenda_p0,
+            elenda_p0,
+            P1,
+            Duration::UntilEndOfTurn,
+        );
+        evaluate_layers(&mut state);
+        assert_eq!(state.objects[&elenda_p0].controller, P1);
+        assert_elenda_characteristics(&state, elenda_p0, 10, true);
+
+        // A later Layer 2 effect returns control to P0, whose life is still 20.
+        add_change_controller_effect(
+            &mut state,
+            elenda_p0,
+            elenda_p0,
+            P0,
+            Duration::UntilEndOfTurn,
+        );
+        evaluate_layers(&mut state);
+        assert_eq!(state.objects[&elenda_p0].controller, P0);
+        assert_elenda_characteristics(&state, elenda_p0, 4, false);
+        assert_elenda_characteristics(&state, elenda_p1, 10, true);
     }
 
     /// `LifeAboveStarting` reader — a CDA keyed on life-above-starting. Reverting

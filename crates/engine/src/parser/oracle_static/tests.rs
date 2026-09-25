@@ -8767,6 +8767,31 @@ fn static_life_more_than_starting_conditional() {
 }
 
 #[test]
+fn static_elenda_additional_buff_uses_life_above_starting_condition() {
+    let def = parse_static_line(
+        "Elenda gets an additional +5/+5 as long as your life total is at least ten greater than your starting life total.",
+    )
+    .expect("Elenda's conditional additional buff must parse");
+    assert_eq!(def.mode, StaticMode::Continuous);
+    assert_eq!(
+        def.condition,
+        Some(StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::LifeAboveStarting,
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 10 },
+        })
+    );
+    assert!(def
+        .modifications
+        .contains(&ContinuousModification::AddPower { value: 5 }));
+    assert!(def
+        .modifications
+        .contains(&ContinuousModification::AddToughness { value: 5 }));
+}
+
+#[test]
 fn static_devotion_condition() {
     use crate::types::mana::ManaColor;
     // CR 110.4b: "less than five" → Not(DevotionGE { threshold: 5 })

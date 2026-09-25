@@ -5813,6 +5813,24 @@ fn parse_life_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
         }
     };
 
+    // CR 119: "your life total is at least N greater than your starting life
+    // total" is a life-offset threshold, not an absolute LifeTotal comparison.
+    // Reuse LifeAboveStarting so the static and intervening-if paths share the
+    // same runtime quantity. Keep this exact suffix ahead of the generic
+    // comparator and numeric fallbacks below.
+    if matches!(scope, LifeTotalScope::Controller) {
+        if let Ok((after_n, n)) =
+            preceded(tag::<_, _, OracleError<'_>>("at least "), parse_number).parse(rest)
+        {
+            if let Ok((rest, _)) =
+                tag::<_, _, OracleError<'_>>(" greater than your starting life total")
+                    .parse(after_n)
+            {
+                return Ok((rest, make_quantity_ge(QuantityRef::LifeAboveStarting, n)));
+            }
+        }
+    }
+
     if let Ok((rest, comparator)) = parse_life_total_comparator(rest) {
         let (rest, rhs) = nom_quantity::parse_quantity(rest)?;
         return Ok((
@@ -17448,6 +17466,65 @@ mod tests {
                 other => panic!("expected life total comparison for {text}, got {other:?}"),
             }
         }
+    }
+
+    /// CR 119: the exact Elenda wording compares the difference from starting
+    /// life, while ordinary life-total comparators remain absolute.
+    #[test]
+    fn your_life_total_at_least_greater_than_starting_life_total() {
+        for text in [
+            "your life total is at least 10 greater than your starting life total",
+            "your life total is at least ten greater than your starting life total",
+        ] {
+            let (rest, condition) = parse_inner_condition(text).unwrap();
+            assert_eq!(rest, "", "must fully consume {text:?}");
+            assert_eq!(
+                condition,
+                StaticCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: QuantityRef::LifeAboveStarting,
+                    },
+                    comparator: Comparator::GE,
+                    rhs: QuantityExpr::Fixed { value: 10 },
+                },
+                "Elenda's threshold is a life-above-starting comparison for {text:?}",
+            );
+        }
+
+        let (rest, absolute) = parse_inner_condition("your life total is greater than 10").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(
+            absolute,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::LifeTotal {
+                        player: PlayerScope::Controller,
+                    },
+                },
+                comparator: Comparator::GT,
+                rhs: QuantityExpr::Fixed { value: 10 },
+            },
+            "an absolute life comparator must keep LifeTotal",
+        );
+
+        assert!(
+            parse_inner_condition(
+                "your life total is at least 10 less than your starting life total"
+            )
+            .is_err(),
+            "the new grammar must not invent a less-than life-offset form",
+        );
+    }
+
+    #[test]
+    fn a_players_life_total_at_least_greater_than_your_starting_life_is_unsupported() {
+        assert!(
+            parse_inner_condition(
+                "a player's life total is at least 10 greater than your starting life total"
+            )
+            .is_err(),
+            "controller-relative life-above-starting syntax must not capture an all-players scope",
+        );
     }
 
     /// CR 119: "you have at least N life more than your starting life total"
