@@ -17,6 +17,13 @@ import {
   writeDraftAutosaveDeck,
 } from "../../../constants/storage";
 import { useAppNotificationStore } from "../../../stores/appToastStore";
+import { withSavedDeckLibrary } from "../../../services/savedDeckTransaction";
+import {
+  installFifoWebLocks,
+  resetSavedDeckLibraryForTests,
+  testSavedDeckTxn,
+  uninstallWebLocks,
+} from "../../../test/helpers/webLocks";
 
 const cacheCardsMock = vi.fn();
 
@@ -102,8 +109,10 @@ vi.mock("../CommanderPanel", () => ({
 }));
 
 describe("DeckBuilder", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     useAppNotificationStore.setState({ notification: null, expiresAt: 0 });
+    installFifoWebLocks();
+    await resetSavedDeckLibraryForTests();
   });
 
   afterEach(() => {
@@ -113,6 +122,7 @@ describe("DeckBuilder", () => {
     vi.mocked(resolveCommander).mockReset();
     vi.mocked(resolveCommander).mockImplementation(async (deck) => deck);
     vi.mocked(useIsMobile).mockReturnValue(false);
+    uninstallWebLocks();
     localStorage.clear();
   });
 
@@ -342,8 +352,8 @@ describe("DeckBuilder", () => {
     );
     localStorage.setItem(ACTIVE_DECK_KEY, "Old Deck");
     const folder = createFolder("Aggro")!;
-    setDeckFolder("Old Deck", folder.id);
-    toggleDeckStar("Old Deck");
+    setDeckFolder(testSavedDeckTxn, "Old Deck", folder.id);
+    toggleDeckStar(testSavedDeckTxn, "Old Deck");
 
     render(
       <DeckBuilder
@@ -374,7 +384,7 @@ describe("DeckBuilder", () => {
 
   it("makes an edited autosave a user deck, freeing its slot for the next autosave", async () => {
     const user = userEvent.setup();
-    writeDraftAutosaveDeck(
+    await writeDraftAutosaveDeck(
       "Sealed",
       "[Autosave] Sealed",
       JSON.stringify({
@@ -404,15 +414,15 @@ describe("DeckBuilder", () => {
     const persisted = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed") ?? "{}");
     expect(persisted.main).toEqual([]);
 
-    const nextAutosaveName = writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", "fresh-autosave-data");
-    expect(nextAutosaveName).toBe("[Autosave] Sealed (2)");
+    const nextAutosaveResult = await writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", "fresh-autosave-data");
+    expect(nextAutosaveResult).toEqual({ status: "committed", value: "[Autosave] Sealed (2)" });
     // The user's edit at the original name is untouched by the new autosave.
     expect(JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed") ?? "{}").main).toEqual([]);
   });
 
   it("makes a renamed autosave a user deck, carrying its folder", async () => {
     const user = userEvent.setup();
-    writeDraftAutosaveDeck(
+    await writeDraftAutosaveDeck(
       "Sealed",
       "[Autosave] Sealed",
       JSON.stringify({
@@ -422,7 +432,7 @@ describe("DeckBuilder", () => {
       }),
     );
     const folder = createFolder("Drafts")!;
-    setDeckFolder("[Autosave] Sealed", folder.id);
+    setDeckFolder(testSavedDeckTxn, "[Autosave] Sealed", folder.id);
 
     render(
       <DeckBuilder
@@ -449,7 +459,7 @@ describe("DeckBuilder", () => {
 
   it("claims an autosave's name for a fresh deck saved under it", async () => {
     const user = userEvent.setup();
-    writeDraftAutosaveDeck(
+    await writeDraftAutosaveDeck(
       "Sealed",
       "[Autosave] Sealed",
       JSON.stringify({
@@ -512,6 +522,81 @@ describe("DeckBuilder", () => {
     // Cancel keeps you in the editor.
     await user.click(screen.getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("button", { name: "Discard" })).not.toBeInTheDocument();
+  });
+
+  it("loading another deck while a save is pending on the lock keeps both decks intact", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "Deck A",
+      JSON.stringify({ main: [{ name: "Lightning Bolt", count: 4 }], sideboard: [], format: "Standard" }),
+    );
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "Deck B",
+      JSON.stringify({ main: [{ name: "Counterspell", count: 4 }], sideboard: [], format: "Standard" }),
+    );
+
+    render(
+      <DeckBuilder
+        format="Standard"
+        onFormatChange={vi.fn()}
+        initialDeckName="Deck A"
+        searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+        onSearchFiltersChange={vi.fn()}
+        onResetSearch={vi.fn()}
+      />,
+    );
+
+    const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+    await waitFor(() => expect(nameInput).toHaveValue("Deck A"));
+    await user.click(screen.getByRole("button", { name: "remove-Lightning Bolt" }));
+
+    let releaseHolder!: () => void;
+    const held = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+    const holder = withSavedDeckLibrary(() => held);
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).pending).toHaveLength(1);
+    });
+
+    // Load Deck B while Deck A's save is still queued behind the lock. The deck is dirty
+    // (from the edit above), so this routes through the discard-confirmation dialog.
+    await user.click(screen.getByRole("button", { name: "Load deck..." }));
+    await user.click(screen.getByRole("option", { name: "Deck B" }));
+    await user.click(screen.getByRole("button", { name: "Discard" }));
+    await waitFor(() => expect(nameInput).toHaveValue("Deck B"));
+
+    releaseHolder();
+    await holder;
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(0);
+      expect((await navigator.locks.query()).pending).toHaveLength(0);
+    });
+
+    // Deck A's save completed with the edited payload.
+    const savedA = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck A") ?? "{}");
+    expect(savedA.main).toEqual([{ name: "Lightning Bolt", count: 3 }]);
+    // Deck B's data is untouched, and the editor still shows Deck B as open — the late-arriving
+    // save of Deck A must not have reverted the deck name back to "Deck A".
+    const savedB = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck B") ?? "{}");
+    expect(savedB.main).toEqual([{ name: "Counterspell", count: 4 }]);
+    expect(nameInput).toHaveValue("Deck B");
+
+    // Editing and saving Deck B now must not take the rename branch against a stale
+    // "savedDeckName: Deck A" — that would move Deck A's data onto Deck B and delete it.
+    await user.click(await screen.findByRole("button", { name: "remove-Counterspell" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck B") ?? "{}").main).toEqual([
+        { name: "Counterspell", count: 3 },
+      ]),
+    );
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck A")).not.toBeNull();
   });
 
   it("toggles between Deck and Info surfaces via the tab bar", async () => {
@@ -677,8 +762,8 @@ describe("DeckBuilder", () => {
       }),
     );
     const folder = createFolder("Commander")!;
-    setDeckFolder("My Deck", folder.id);
-    toggleDeckStar("My Deck");
+    setDeckFolder(testSavedDeckTxn, "My Deck", folder.id);
+    toggleDeckStar(testSavedDeckTxn, "My Deck");
 
     render(
       <DeckBuilder

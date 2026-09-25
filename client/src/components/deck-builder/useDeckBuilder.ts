@@ -12,10 +12,12 @@ import {
   getDeckMeta,
   loadSavedDeck,
   loadSavedDeckBracket,
-  moveSavedDeck,
+  saveBuilderDeck,
   setDeckFolder,
   stampDeckMeta,
+  writeSavedDeckData,
 } from "../../constants/storage";
+import { withSavedDeckLibrary } from "../../services/savedDeckTransaction";
 import { loadPreconDeckMap } from "../../hooks/useDecks";
 import { preconDeckEntryToParsedDeck } from "../../services/preconDecks";
 import { useDeckCardData } from "../../hooks/useDeckCardData";
@@ -82,9 +84,20 @@ export function useDeckBuilder({
   const [deckView, setDeckView] = useState<"list" | "stack">("list");
   // How the main deck is sub-grouped within the canvas (by card type or color).
   const [groupMode, setGroupMode] = useState<GroupMode>("type");
-  // Unsaved-changes flag: set on any deck mutation, cleared on save/clone/load.
+  // Unsaved-changes flag: set on any deck mutation.
   // Drives the leave/load confirmation and the beforeunload guard.
   const [dirty, setDirty] = useState(false);
+  // Bumped by every edit; handleSave captures it before its first await and only clears `dirty`
+  // if nothing edited the deck while the save was pending (on resolveCommander or the lock).
+  const editRevision = useRef(0);
+  const markDirty = useCallback(() => {
+    editRevision.current += 1;
+    setDirty(true);
+  }, []);
+  // Bumped by handleLoad and handleClone: a Load or Clone that lands while a save is pending
+  // means the save's nextName no longer names the deck now open, so handleSave must not apply
+  // savedDeckName/justSaved/toast for it.
+  const deckIdentityRevision = useRef(0);
   const { cardDataCache, cacheCards } = useDeckCardData([
     ...deck.main.map((entry) => entry.name),
     ...deck.sideboard.map((entry) => entry.name),
@@ -285,7 +298,7 @@ export function useDeckBuilder({
 
   const handleAddCard = useCallback((card: ScryfallCard) => {
     cacheCards([card]);
-    setDirty(true);
+    markDirty();
 
     setDeck((prev) => {
       const existing = prev.main.find((e) => e.name === card.name);
@@ -302,7 +315,7 @@ export function useDeckBuilder({
         main: [...prev.main, { count: 1, name: card.name }],
       };
     });
-  }, [cacheCards]);
+  }, [cacheCards, markDirty]);
 
   const handleAddCardByName = useCallback((name: string) => {
     const card = cardDataCache.get(name);
@@ -312,7 +325,7 @@ export function useDeckBuilder({
 
   const handleRemoveCard = useCallback(
     (name: string, section: "main" | "sideboard") => {
-      setDirty(true);
+      markDirty();
       setDeck((prev) => {
         const entries = prev[section];
         const existing = entries.find((e) => e.name === name);
@@ -332,7 +345,7 @@ export function useDeckBuilder({
         };
       });
     },
-    [],
+    [markDirty],
   );
 
   // CR 100.4a: the copy limit applies to the main deck, sideboard, and command
@@ -408,7 +421,7 @@ export function useDeckBuilder({
   const handleIncrementCard = useCallback(
     (name: string, section: "main" | "sideboard") => {
       if (!canIncrement(name)) return;
-      setDirty(true);
+      markDirty();
       setDeck((prev) => {
         const entries = prev[section];
         if (!entries.some((e) => e.name === name)) return prev;
@@ -420,13 +433,13 @@ export function useDeckBuilder({
         };
       });
     },
-    [canIncrement],
+    [canIncrement, markDirty],
   );
 
   const handleMoveCard = useCallback(
     (name: string, from: "main" | "sideboard") => {
       const to: "main" | "sideboard" = from === "main" ? "sideboard" : "main";
-      setDirty(true);
+      markDirty();
       setDeck((prev) => {
         const source = prev[from];
         const target = prev[to];
@@ -455,7 +468,7 @@ export function useDeckBuilder({
         };
       });
     },
-    [],
+    [markDirty],
   );
 
   const applyDeckToEditor = useCallback((next: ParsedDeck, targetFormat: GameFormat = format) => {
@@ -480,11 +493,16 @@ export function useDeckBuilder({
 
   const handleImport = useCallback((imported: ParsedDeck) => {
     applyDeckToEditor(imported);
-    setDirty(true);
-  }, [applyDeckToEditor]);
+    markDirty();
+  }, [applyDeckToEditor, markDirty]);
 
   const handleSave = useCallback(async () => {
     if (!deckName.trim()) return;
+    // Capture both revisions before the first await. `revisionAtSave` detects an edit made while
+    // this save waits (on resolveCommander or the lock); `identityAtSave` detects a Load or Clone
+    // that switched the open deck out from under this save.
+    const revisionAtSave = editRevision.current;
+    const identityAtSave = deckIdentityRevision.current;
     // Save-time commander inference: when a Commander-format deck is shaped
     // like a 100-singleton list with no explicit commander, ask the engine
     // (via resolveCommander → WASM isCardCommanderEligible) to pick one. This
@@ -501,27 +519,17 @@ export function useDeckBuilder({
     }
     const data = serializeSavedDeck(resolved, format, bracket);
     const nextName = deckName.trim();
-    if (
-      savedDeckName
-      && savedDeckName !== nextName
-      && localStorage.getItem(STORAGE_KEY_PREFIX + savedDeckName) !== null
-    ) {
-      // If nextName already names another deck, the setItem below overwrites
-      // its data (pre-existing Save behavior) and moveSavedDeck's metadata
-      // carry likewise replaces its metadata — both correctly reflect the
-      // surviving deck's identity now living under nextName.
-      moveSavedDeck(savedDeckName, nextName);
+    await saveBuilderDeck(savedDeckName, nextName, data);
+    if (deckIdentityRevision.current === identityAtSave) {
+      setSavedDeckName(nextName);
+      setJustSaved(true);
+      if (editRevision.current === revisionAtSave) setDirty(false);
+      showNotification({
+        title: t("toolbar.savedToastTitle"),
+        description: t("toolbar.savedToastDescription", { name: nextName }),
+      });
     }
-    localStorage.setItem(STORAGE_KEY_PREFIX + nextName, data);
-    stampDeckMeta(nextName);
-    setSavedDeckName(nextName);
     setSavedDecks(listSavedDecks());
-    setJustSaved(true);
-    setDirty(false);
-    showNotification({
-      title: t("toolbar.savedToastTitle"),
-      description: t("toolbar.savedToastDescription", { name: nextName }),
-    });
   }, [
     deckName,
     isCommander,
@@ -537,21 +545,26 @@ export function useDeckBuilder({
   // Clone = explicit duplicate. Unlike Save (which renames the current deck in
   // place), this always writes a NEW key and leaves the original untouched, then
   // switches the editor to the copy so further edits/Saves target the clone.
-  const handleClone = useCallback(() => {
+  const handleClone = useCallback(async () => {
     const base = deckName.trim() || "Untitled Deck";
-    let cloneName = `${base} copy`;
-    let suffix = 2;
-    while (localStorage.getItem(STORAGE_KEY_PREFIX + cloneName) !== null) {
-      cloneName = `${base} copy ${suffix++}`;
-    }
-    localStorage.setItem(STORAGE_KEY_PREFIX + cloneName, serializeSavedDeck(currentDeck, format, bracket));
-    stampDeckMeta(cloneName);
-    // A clone lands beside its source: inherit the folder, but start unstarred
-    // (the star is a deliberate per-deck pin, not a copyable property).
-    const sourceFolderId = savedDeckName
-      ? getDeckMeta(savedDeckName)?.folderId ?? null
-      : null;
-    if (sourceFolderId) setDeckFolder(cloneName, sourceFolderId);
+    const data = serializeSavedDeck(currentDeck, format, bracket);
+    const cloneName = await withSavedDeckLibrary((txn) => {
+      let name = `${base} copy`;
+      let suffix = 2;
+      while (localStorage.getItem(STORAGE_KEY_PREFIX + name) !== null) {
+        name = `${base} copy ${suffix++}`;
+      }
+      writeSavedDeckData(txn, name, data);
+      stampDeckMeta(txn, name);
+      // A clone lands beside its source: inherit the folder, but start unstarred
+      // (the star is a deliberate per-deck pin, not a copyable property).
+      const sourceFolderId = savedDeckName
+        ? getDeckMeta(savedDeckName)?.folderId ?? null
+        : null;
+      if (sourceFolderId) setDeckFolder(txn, name, sourceFolderId);
+      return name;
+    });
+    deckIdentityRevision.current += 1;
     setDeckName(cloneName);
     setSavedDeckName(cloneName);
     setSavedDecks(listSavedDecks());
@@ -581,6 +594,7 @@ export function useDeckBuilder({
       const resolved = await resolveCommander(preconDeckEntryToParsedDeck(deckEntry));
       applyDeckToEditor(resolved);
       setActiveSurface("deck");
+      deckIdentityRevision.current += 1;
       setDirty(false);
       setDeckName(`${deckEntry.name} (${deckEntry.code})`);
       setSavedDeckName(null);
@@ -596,6 +610,7 @@ export function useDeckBuilder({
       : undefined;
     applyDeckToEditor(resolved, savedFormat);
     setActiveSurface("deck");
+    deckIdentityRevision.current += 1;
     setDirty(false);
     if (savedFormat) {
       onFormatChange(savedFormat);
@@ -648,7 +663,7 @@ export function useDeckBuilder({
             return;
           }
         }
-        setDirty(true);
+        markDirty();
         const displaced =
           isPartnerAdd || commanders.length === 0 ? [] : commanders;
         const nextCommanders = isPartnerAdd
@@ -685,7 +700,7 @@ export function useDeckBuilder({
         });
       })();
     },
-    [commanderEligibleNames, commanders],
+    [commanderEligibleNames, commanders, markDirty],
   );
 
   // Eligibility predicate consulted by each main-deck row. The set is loaded
@@ -698,7 +713,7 @@ export function useDeckBuilder({
   );
 
   const handleRemoveCommander = useCallback((cardName: string) => {
-    setDirty(true);
+    markDirty();
     setCommanders((prev) => prev.filter((n) => n !== cardName));
     // CR 903.3: the exact inverse of `handleSetCommander`'s decrement. Routed
     // through the merge this file already uses so a card still present in main
@@ -708,11 +723,11 @@ export function useDeckBuilder({
       ...prev,
       main: deduplicateEntries([...prev.main, { count: 1, name: cardName }]),
     }));
-  }, []);
+  }, [markDirty]);
 
   const moveOneMainCardToSpecialSlot = useCallback(
     (cardName: string, slot: "signature_spell" | "companion") => {
-      setDirty(true);
+      markDirty();
       setDeck((prev) => {
         const selected = prev.main.find((entry) => entry.name === cardName);
         if (!selected) return prev;
@@ -730,7 +745,7 @@ export function useDeckBuilder({
           : { ...prev, main, companion: cardName };
       });
     },
-    [],
+    [markDirty],
   );
 
   const handleSetSignatureSpell = useCallback((cardName: string) => {
@@ -739,7 +754,7 @@ export function useDeckBuilder({
   }, [moveOneMainCardToSpecialSlot, signatureSpellCandidates]);
 
   const handleRemoveSignatureSpell = useCallback(() => {
-    setDirty(true);
+    markDirty();
     setDeck((prev) => {
       const signature = prev.signature_spell?.[0];
       if (!signature) return prev;
@@ -749,7 +764,7 @@ export function useDeckBuilder({
         main: deduplicateEntries([...prev.main, { count: 1, name: signature }]),
       };
     });
-  }, []);
+  }, [markDirty]);
 
   const handleSetCompanion = useCallback((cardName: string) => {
     if (!companionCandidateNames?.includes(cardName)) return;
@@ -757,7 +772,7 @@ export function useDeckBuilder({
   }, [companionCandidateNames, moveOneMainCardToSpecialSlot]);
 
   const handleRemoveCompanion = useCallback(() => {
-    setDirty(true);
+    markDirty();
     setDeck((prev) => {
       if (!prev.companion) return prev;
       return {
@@ -766,7 +781,7 @@ export function useDeckBuilder({
         main: deduplicateEntries([...prev.main, { count: 1, name: prev.companion }]),
       };
     });
-  }, []);
+  }, [markDirty]);
 
   // Card metadata supplies CMCs; the engine supplies color identities.
   const cmcValues: number[] = [];
