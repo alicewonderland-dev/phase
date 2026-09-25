@@ -1244,6 +1244,7 @@ mod sprout_inalla_realistic_offer;
 mod squirming_emergence_mana_value_target;
 mod squirrel_mob_dynamic_pump;
 mod stack_ability_kind_axis;
+mod stack_entry_node_reach;
 mod stack_object_keyword_grants;
 mod statecraft_damage_prevention;
 mod std_counters_grammar_axes;
