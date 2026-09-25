@@ -290,9 +290,6 @@ export class DraftPodGuestAdapter {
           view: event.view,
         });
         break;
-      // A pure re-emit, deliberately unlike the arms above: no caller of this
-      // adapter is awaiting the submission that produced it, so there is no
-      // view to install as current.
       case "recoveredDeckSubmissionAccepted":
         this.emit({
           type: "recoveredDeckSubmissionAccepted",

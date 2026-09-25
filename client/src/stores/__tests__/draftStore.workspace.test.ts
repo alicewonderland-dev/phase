@@ -1796,10 +1796,8 @@ describe("draft store workspace authority", () => {
       useDraftStore.getState().setWorkspacePlacement("bolt", { zone: "deck", row: 0, column: 0, order: 0 });
       wasm.submit_deck.mockReturnValue({ ...view([card("bolt", "Bolt")]), status: "Pairing" });
       // A stub object (rather than spying `Storage.prototype.setItem`) is used
-      // deliberately: this environment's real `localStorage.setItem` does not
-      // resolve through `Storage.prototype` at call time, so a prototype spy
-      // is never reached — precedent: `diagnosticHistory.test.ts` also stubs
-      // whole `Storage.prototype` methods rather than patching one call.
+      // deliberately: a `Storage.prototype.setItem` spy does not intercept
+      // calls made from `constants/storage.ts`.
       const backing = new Map<string, string>();
       for (let i = 0; i < localStorage.length; i++) {
         const key = localStorage.key(i)!;

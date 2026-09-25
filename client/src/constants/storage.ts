@@ -121,8 +121,7 @@ export interface DeckMeta {
   folderId?: string;
   /** Whether the deck is starred (pinned above folders in the library). */
   starred?: boolean;
-  /** The draft-autosave slot that owns this deck. Only `writeDraftAutosaveDeck` overwrites or renames a
-   *  deck, and only one carrying its slot; `clearDeckAutosaveMarker` removes it. */
+  /** The draft-autosave slot that owns this deck. */
   autosaveSlot?: DraftAutosaveSlot;
 }
 
