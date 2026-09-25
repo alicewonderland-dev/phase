@@ -164,6 +164,25 @@ describe("useDeckFolders (reactive)", () => {
     expect(result.current.folders.map((f) => f.name)).toEqual(["From Phone"]);
   });
 
+  it("returns stable identities for createFolder/renameFolder/deleteFolder/assignDeck/toggleStar across rerenders", () => {
+    const { result, rerender } = renderHook(() => useDeckFolders());
+    const first = {
+      createFolder: result.current.createFolder,
+      renameFolder: result.current.renameFolder,
+      deleteFolder: result.current.deleteFolder,
+      assignDeck: result.current.assignDeck,
+      toggleStar: result.current.toggleStar,
+    };
+
+    rerender();
+
+    expect(result.current.createFolder).toBe(first.createFolder);
+    expect(result.current.renameFolder).toBe(first.renameFolder);
+    expect(result.current.deleteFolder).toBe(first.deleteFolder);
+    expect(result.current.assignDeck).toBe(first.assignDeck);
+    expect(result.current.toggleStar).toBe(first.toggleStar);
+  });
+
   it("removes the window listeners on unmount", () => {
     const { result, unmount } = renderHook(() => useDeckFolders());
     unmount();

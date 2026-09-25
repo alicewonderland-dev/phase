@@ -74,6 +74,19 @@ export function groupSavedDecks(
   };
 }
 
+/** Module-level so the hook returns the same identity on every render (it closes over nothing). */
+function deleteFolder(id: string): Promise<void> {
+  return withSavedDeckLibrary((txn) => deleteFolderStore(txn, id));
+}
+/** Module-level so the hook returns the same identity on every render (it closes over nothing). */
+function assignDeck(deckName: string, folderId: string | null): Promise<void> {
+  return withSavedDeckLibrary((txn) => setDeckFolder(txn, deckName, folderId));
+}
+/** Module-level so the hook returns the same identity on every render (it closes over nothing). */
+function toggleStar(deckName: string): Promise<boolean> {
+  return withSavedDeckLibrary((txn) => toggleDeckStar(txn, deckName));
+}
+
 export interface UseDeckFoldersResult {
   folders: DeckFolder[];
   /** Group a (pre-sorted) list of saved deck names into Starred/folders/Unfiled. */
@@ -118,8 +131,8 @@ export function useDeckFolders(): UseDeckFoldersResult {
     group,
     createFolder: createFolderStore,
     renameFolder: renameFolderStore,
-    deleteFolder: (id) => withSavedDeckLibrary((txn) => deleteFolderStore(txn, id)),
-    assignDeck: (deckName, folderId) => withSavedDeckLibrary((txn) => setDeckFolder(txn, deckName, folderId)),
-    toggleStar: (deckName) => withSavedDeckLibrary((txn) => toggleDeckStar(txn, deckName)),
+    deleteFolder,
+    assignDeck,
+    toggleStar,
   };
 }

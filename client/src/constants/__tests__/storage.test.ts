@@ -382,42 +382,46 @@ describe("draft autosave ownership", () => {
       releaseHolder = resolve;
     });
     const holder = withSavedDeckLibrary(() => held);
-    await vi.waitFor(async () => {
-      expect((await navigator.locks.query()).held).toHaveLength(1);
-    });
+    try {
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).held).toHaveLength(1);
+      });
 
-    let manualSettled = false;
-    const manual = saveBuilderDeck(null, "Mine", "manual-data").then((v) => {
-      manualSettled = true;
-      return v;
-    });
-    await vi.waitFor(async () => {
-      expect((await navigator.locks.query()).pending).toHaveLength(1);
-    });
-    await vi.advanceTimersByTimeAsync(LOCK_WAIT_TIMEOUT_MS);
-    await manual;
-    await vi.waitFor(() => expect(manualSettled).toBe(true));
-    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Mine")).toBe("manual-data");
-    expect(getDeckMeta("Mine")).toBeDefined();
+      let manualSettled = false;
+      const manual = saveBuilderDeck(null, "Mine", "manual-data").then((v) => {
+        manualSettled = true;
+        return v;
+      });
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).pending).toHaveLength(1);
+      });
+      await vi.advanceTimersByTimeAsync(LOCK_WAIT_TIMEOUT_MS);
+      await manual;
+      await vi.waitFor(() => expect(manualSettled).toBe(true));
+      expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Mine")).toBe("manual-data");
+      expect(getDeckMeta("Mine")).toBeDefined();
 
-    let autosaveSettled: SavedDeckTxnResult<string> | undefined;
-    const autosave = writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", "autosave-data").then((r) => {
-      autosaveSettled = r;
-      return r;
-    });
-    await vi.waitFor(async () => {
-      expect((await navigator.locks.query()).pending).toHaveLength(1);
-    });
-    await vi.advanceTimersByTimeAsync(LOCK_WAIT_TIMEOUT_MS);
-    await autosave;
-    await vi.waitFor(() => expect(autosaveSettled).toBeDefined());
-    expect(autosaveSettled).toEqual({ status: "skipped", reason: "lock-timeout" });
-    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed")).toBeNull();
-
-    releaseHolder();
-    await holder;
-    vi.useRealTimers();
-    setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+      let autosaveSettled: SavedDeckTxnResult<string> | undefined;
+      const autosave = writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", "autosave-data").then((r) => {
+        autosaveSettled = r;
+        return r;
+      });
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).pending).toHaveLength(1);
+      });
+      await vi.advanceTimersByTimeAsync(LOCK_WAIT_TIMEOUT_MS);
+      await autosave;
+      await vi.waitFor(() => expect(autosaveSettled).toBeDefined());
+      expect(autosaveSettled).toEqual({ status: "skipped", reason: "lock-timeout" });
+      expect(localStorage.getItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed")).toBeNull();
+    } finally {
+      // Release the holder and restore real timers/lock-wait even if an assertion above threw,
+      // so a failure here cannot hang the fake-timer lock-wait for later tests.
+      releaseHolder();
+      await holder;
+      vi.useRealTimers();
+      setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+    }
   });
 
   it("creates the slot deck on the first autosave", async () => {

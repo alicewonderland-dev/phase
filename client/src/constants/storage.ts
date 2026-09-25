@@ -233,8 +233,7 @@ export function uniqueDeckName(
   }
 }
 
-/** Write a saved deck's data. The single writer of `STORAGE_KEY_PREFIX` keys outside `applyBackup`
- *  and the `migrateSavedDecks` boot migration. */
+/** Write a saved deck's data. */
 export function writeSavedDeckData(txn: SavedDeckTxn, deckName: string, raw: string): void {
   void txn;
   localStorage.setItem(STORAGE_KEY_PREFIX + deckName, raw);

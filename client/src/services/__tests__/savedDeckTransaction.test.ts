@@ -178,8 +178,31 @@ describe("withSavedDeckLibrary / withSavedDeckLibraryOrSkip", () => {
     });
     expect(bodySpy).not.toHaveBeenCalled();
 
+    // Real delay past the barrier's own IDB read settling, not just past the lock grant that
+    // preceded it: the body must still not have run.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(bodySpy).not.toHaveBeenCalled();
+
     localStorage.setItem(GENERATION_KEY, "3");
     window.dispatchEvent(new StorageEvent("storage", { key: GENERATION_KEY }));
+
+    await expect(result).resolves.toEqual({ status: "committed", value: "value" });
+    expect(bodySpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("the barrier's backstop poll wakes it when the local view catches up with no storage event", async () => {
+    await seedGenerationForTests(3, 2);
+    const bodySpy = vi.fn(() => "value");
+    const result = withSavedDeckLibraryOrSkip(bodySpy);
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(bodySpy).not.toHaveBeenCalled();
+
+    // A same-tab write never dispatches a native `storage` event; only the interval poll can
+    // observe it.
+    localStorage.setItem(GENERATION_KEY, "3");
 
     await expect(result).resolves.toEqual({ status: "committed", value: "value" });
     expect(bodySpy).toHaveBeenCalledTimes(1);
@@ -283,11 +306,7 @@ describe("withSavedDeckLibrary / withSavedDeckLibraryOrSkip", () => {
     expect(Number(localSeen ?? 0)).toBe(1);
   });
 
-  it("deviation from the plan (null read -> generation 0, not skip) is safe: only the very first " +
-    "transaction on a fresh library can see an unconfirmed read; a later tab that lags behind an " +
-    "already-committed IDB generation waits for its local view instead of racing ahead on it", async () => {
-    // Nothing has ever committed: the read settles with no stored value, and the first-ever
-    // transaction proceeds at generation 0 rather than skipping.
+  it("the first transaction on a fresh library commits at generation 0, and a later tab that lags behind the committed IDB generation waits for its local view before committing", async () => {
     expect(await readIdbGenerationForTests()).toBeUndefined();
     await withSavedDeckLibrary(() => undefined);
     expect(await readIdbGenerationForTests()).toBe(1);
@@ -302,8 +321,7 @@ describe("withSavedDeckLibrary / withSavedDeckLibraryOrSkip", () => {
     await vi.waitFor(async () => {
       expect((await navigator.locks.query()).held).toHaveLength(1);
     });
-    // B's own read of IDB sees the real committed value (1), never an unconfirmed/null read, so it
-    // takes the wait-for-local-view branch and does not act on a stale view.
+    await new Promise((resolve) => setTimeout(resolve, 100));
     expect(bodyRan).toBe(false);
 
     localStorage.setItem(GENERATION_KEY, "1");

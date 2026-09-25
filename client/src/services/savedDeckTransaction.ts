@@ -111,17 +111,16 @@ function awaitLibraryView(committed: number): Promise<boolean> {
 }
 
 type BarrierOutcome =
-  // Gave up before step 4 (skip policy only): nothing was published, nothing is armed.
+  // skip policy only: nothing was published, nothing is armed.
   | { armed: false; reason: SavedDeckTxnSkipReason }
-  // Reached step 4: `next` must be published in a `finally` regardless of what happens next.
+  // `next` must be published in a `finally` regardless of what happens next.
   | { armed: true; next: number; proceed: boolean; reason?: SavedDeckTxnSkipReason };
 
 /** `policy: "skip"` may return `armed: false`, giving up before publishing; `policy: "proceed"` always arms. */
 async function runLibraryBarrier(policy: "proceed" | "skip"): Promise<BarrierOutcome> {
   const read = await within(() => get<number>("generation", generationStore()), GENERATION_IO_TIMEOUT_MS);
-  // A read that settles with no stored value means no transaction has ever committed — there is
-  // nothing to catch up to, so treat it as generation 0 rather than as an unconfirmed read. Only a
-  // read that fails to settle (I/O failure or timeout) is genuinely unconfirmed.
+  // Treating an empty store as unconfirmed would make every autosave skip on a fresh library, so
+  // only a read that fails to settle (I/O failure or timeout) is genuinely unconfirmed.
   const committed = !read.settled ? null : typeof read.value === "number" ? read.value : 0;
   if (committed === null && policy === "skip") {
     return { armed: false, reason: "library-view-unconfirmed" };
