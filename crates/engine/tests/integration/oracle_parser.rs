@@ -1400,7 +1400,9 @@ fn elenda_saint_of_dusk_full_card_parser() {
                     },
                     comparator: Comparator::GT,
                     rhs: QuantityExpr::Ref {
-                        qty: QuantityRef::StartingLifeTotal,
+                        qty: QuantityRef::StartingLifeTotal {
+                            player: PlayerScope::Controller,
+                        },
                     },
                 })
         }),

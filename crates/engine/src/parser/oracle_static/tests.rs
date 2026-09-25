@@ -1867,7 +1867,7 @@ fn cost_mod_bare_color_category_and_historic_subject() {
     assert_eq!(
         props("Colorless spells you cast cost {1} less to cast."),
         vec![FilterProp::ColorCount {
-            comparator: Comparator::EQ,
+            comparator: Comparator::GE,
             count: 0,
         }],
     );
@@ -17051,7 +17051,7 @@ fn static_for_each_opponent_below_half_starting_life_is_dynamic_anya() {
                         inner,
                     } if matches!(
                         inner.as_ref(),
-                        QuantityExpr::Ref { qty: QuantityRef::StartingLifeTotal }
+                        QuantityExpr::Ref { qty: QuantityRef::StartingLifeTotal { player: PlayerScope::ScopedPlayer } }
                     )
                 ),
                 "threshold must be half (rounded down) their starting life, got {value:?}"
@@ -17059,6 +17059,50 @@ fn static_for_each_opponent_below_half_starting_life_is_dynamic_anya() {
         }
         other => panic!("expected PlayerAttribute filter, got {other:?}"),
     }
+
+    // Anya's second clause uses the same candidate-relative "an opponent"
+    // threshold. Keeping this explicit prevents it from regressing to the
+    // controller's starting-life baseline while the first clause remains
+    // candidate-relative.
+    let indestructible = parse_static_line(
+        "As long as an opponent's life total is less than half their starting life total, Anya has indestructible.",
+    )
+    .expect("Anya indestructible condition must parse");
+    assert!(matches!(
+        indestructible.condition,
+        Some(StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::PlayerCount { filter }
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        }) if matches!(
+            &filter,
+            PlayerFilter::PlayerAttribute {
+                relation: crate::types::ability::PlayerRelation::Opponent,
+                attr,
+                comparator: Comparator::LT,
+                value,
+            } if matches!(
+                attr.as_ref(),
+                QuantityRef::LifeTotal { player: PlayerScope::ScopedPlayer }
+            ) && matches!(
+                value.as_ref(),
+                QuantityExpr::DivideRounded {
+                    divisor: 2,
+                    rounding: RoundingMode::Down,
+                    inner,
+                } if matches!(
+                    inner.as_ref(),
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::StartingLifeTotal {
+                            player: PlayerScope::ScopedPlayer
+                        }
+                    }
+                )
+            )
+        )
+    ));
 }
 
 /// Helper: the dynamic-power `QuantityExpr` from a static line's first

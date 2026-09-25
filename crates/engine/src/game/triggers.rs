@@ -11822,7 +11822,7 @@ fn quantity_ref_binding_diverges(qty: &QuantityRef) -> bool {
         // (`ctx.source`, the same object `ObjectScope::Source` is adjudicated
         // non-divergent for above).
         QuantityRef::LifeAboveStarting
-        | QuantityRef::StartingLifeTotal
+        | QuantityRef::StartingLifeTotal { .. }
         | QuantityRef::TriggeringDiscoverValue
         | QuantityRef::PlayerCount { .. }
         | QuantityRef::PlayerCounter { .. }
@@ -16008,7 +16008,7 @@ fn quantity_ref_refs_cost_paid_object(qty: &QuantityRef) -> bool {
         | QuantityRef::LifeTotal { .. }
         | QuantityRef::GraveyardSize { .. }
         | QuantityRef::LifeAboveStarting
-        | QuantityRef::StartingLifeTotal
+        | QuantityRef::StartingLifeTotal { .. }
         | QuantityRef::TriggeringDiscoverValue
         | QuantityRef::TriggeringScryLookCount
         | QuantityRef::TriggeringScryBottomCount

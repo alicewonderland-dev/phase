@@ -23249,7 +23249,7 @@ fn quantity_ref_is_board_state_relative(qty: &QuantityRef) -> bool {
         | QuantityRef::LifeLostThisTurn { player }
         | QuantityRef::PartySize { player }
         | QuantityRef::Speed { player } => player_is_concrete(player),
-        QuantityRef::LifeAboveStarting | QuantityRef::StartingLifeTotal => true,
+        QuantityRef::LifeAboveStarting | QuantityRef::StartingLifeTotal { .. } => true,
         QuantityRef::ObjectCount { filter }
         | QuantityRef::ObjectCountDistinct { filter, .. }
         | QuantityRef::CountersOnObjects { filter, .. } => !filter_references_target_player(filter),

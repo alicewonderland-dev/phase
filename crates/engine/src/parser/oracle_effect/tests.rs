@@ -34715,7 +34715,9 @@ fn parse_quantity_comparison_greater_than_dynamic() {
     assert!(matches!(
         rhs,
         QuantityExpr::Ref {
-            qty: QuantityRef::StartingLifeTotal
+            qty: QuantityRef::StartingLifeTotal {
+                player: PlayerScope::Controller,
+            }
         }
     ));
 }
@@ -34757,7 +34759,9 @@ fn parse_condition_text_life_greater_than_starting() {
             },
             comparator: Comparator::GT,
             rhs: QuantityExpr::Ref {
-                qty: QuantityRef::StartingLifeTotal
+                qty: QuantityRef::StartingLifeTotal {
+                    player: PlayerScope::Controller,
+                }
             },
         }
     ));

@@ -3732,7 +3732,7 @@ fn quantity_ref_reads_zone(qty: &QuantityRef, zone: Zone) -> bool {
         QuantityRef::HandSize { .. }
         | QuantityRef::LifeTotal { .. }
         | QuantityRef::LifeAboveStarting
-        | QuantityRef::StartingLifeTotal
+        | QuantityRef::StartingLifeTotal { .. }
         | QuantityRef::TriggeringDiscoverValue
         | QuantityRef::TriggeringScryLookCount
         | QuantityRef::TriggeringScryBottomCount
@@ -4071,7 +4071,7 @@ fn quantity_ref_reads_life(qty: &QuantityRef) -> bool {
         // classification.
         QuantityRef::HandSize { .. }
         | QuantityRef::GraveyardSize { .. }
-        | QuantityRef::StartingLifeTotal
+        | QuantityRef::StartingLifeTotal { .. }
         | QuantityRef::TriggeringDiscoverValue
         | QuantityRef::TriggeringScryLookCount
         | QuantityRef::TriggeringScryBottomCount
@@ -25078,7 +25078,9 @@ mod tests {
             player: PlayerScope::Controller
         }));
         // CR 119.1: a format constant, not a live read.
-        assert!(!quantity_ref_reads_life(&QuantityRef::StartingLifeTotal));
+        assert!(!quantity_ref_reads_life(&QuantityRef::StartingLifeTotal {
+            player: PlayerScope::Controller,
+        }));
         // A non-life player scalar.
         assert!(!quantity_ref_reads_life(&QuantityRef::HandSize {
             player: PlayerScope::Controller

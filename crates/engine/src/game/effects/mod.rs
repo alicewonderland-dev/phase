@@ -574,20 +574,34 @@ pub(crate) fn matches_player_scope(
                     // CR 402.1 / 119.1 / 119.3 / 122.1f / 404.1: "each [player class]
                     // whose [scalar attr] [comparator] [value]" — the candidate
                     // satisfies both `relation` and the per-candidate scalar
-                    // comparison. `value` is the controller-relative threshold,
-                    // resolved once; `attr` is read directly off the candidate.
+                    // comparison. `value` keeps the ability controller and binds
+                    // `scoped_player` to this candidate; `attr` is read directly
+                    // off the candidate.
                     PlayerFilter::PlayerAttribute {
                         relation,
                         attr,
                         comparator,
                         value,
                     } => {
-                        let threshold = crate::game::quantity::resolve_quantity(
-                            state, value, controller, source_id,
-                        );
                         crate::game::players::matches_relation(state, p.id, controller, *relation)
-                            && candidate_player_scalar_with_state(state, p, controller, attr)
-                                .is_some_and(|lhs| comparator.evaluate(lhs, threshold))
+                            && {
+                                let threshold = crate::game::quantity::resolve_quantity_with_ctx(
+                                    state,
+                                    value,
+                                    controller,
+                                    crate::game::quantity::QuantityContext {
+                                        entering: None,
+                                        source: source_id,
+                                        trigger_source: None,
+                                        recipient: None,
+                                        scoped_player: Some(p.id),
+                                        damage_source: None,
+                                        event_amount: None,
+                                    },
+                                );
+                                candidate_player_scalar_with_state(state, p, controller, attr)
+                                    .is_some_and(|lhs| comparator.evaluate(lhs, threshold))
+                            }
                     }
                     // CR 608.2c + CR 608.2h + CR 109.4: "each player who
                     // controlled/owned a <filter> this way" — the candidate must
@@ -5118,7 +5132,7 @@ fn quantity_ref_counts_population_matching(
         | QuantityRef::LifeTotal { .. }
         | QuantityRef::GraveyardSize { .. }
         | QuantityRef::LifeAboveStarting
-        | QuantityRef::StartingLifeTotal
+        | QuantityRef::StartingLifeTotal { .. }
         | QuantityRef::TriggeringDiscoverValue
         | QuantityRef::TriggeringScryLookCount
         | QuantityRef::TriggeringScryBottomCount
@@ -21728,6 +21742,96 @@ mod tests {
             ),
             "Angel must still affect the player it attacked",
         );
+    }
+
+    #[test]
+    fn player_attribute_threshold_binds_starting_life_to_candidate() {
+        use crate::types::ability::{
+            Comparator, PlayerFilter, PlayerRelation, PlayerScope, QuantityExpr, QuantityRef,
+            RoundingMode,
+        };
+
+        let mut format = crate::types::format::FormatConfig::archenemy();
+        format.archenemy_player = Some(PlayerId(1));
+        let mut state = GameState::new(format, 3, 42);
+        state
+            .players
+            .iter_mut()
+            .find(|p| p.id == PlayerId(1))
+            .unwrap()
+            .life = 15;
+        let half_starting_life = QuantityExpr::DivideRounded {
+            inner: Box::new(QuantityExpr::Ref {
+                qty: QuantityRef::StartingLifeTotal {
+                    player: PlayerScope::ScopedPlayer,
+                },
+            }),
+            divisor: 2,
+            rounding: RoundingMode::Down,
+        };
+        let predicate = PlayerFilter::PlayerAttribute {
+            relation: PlayerRelation::Opponent,
+            attr: Box::new(QuantityRef::LifeTotal {
+                player: PlayerScope::ScopedPlayer,
+            }),
+            comparator: Comparator::LT,
+            value: Box::new(half_starting_life),
+        };
+        let controller = PlayerId(0);
+        let source = ObjectId(900);
+
+        assert!(matches_player_scope(
+            &state,
+            PlayerId(1),
+            &predicate,
+            controller,
+            source,
+        ));
+        // Strict boundary: 20 is not less than half of the candidate's 40.
+        state
+            .players
+            .iter_mut()
+            .find(|p| p.id == PlayerId(1))
+            .unwrap()
+            .life = 20;
+        assert!(!matches_player_scope(
+            &state,
+            PlayerId(1),
+            &predicate,
+            controller,
+            source,
+        ));
+
+        // Ordinary baseline sanity: in free-for-all the candidate starts at
+        // 20, so life 11 is below half (10? No: preserve integer rounding; 11
+        // is above). Life 9 is the qualifying control value.
+        let mut ordinary = GameState::new_two_player(43);
+        ordinary
+            .players
+            .iter_mut()
+            .find(|p| p.id == PlayerId(1))
+            .unwrap()
+            .life = 11;
+        assert!(!matches_player_scope(
+            &ordinary,
+            PlayerId(1),
+            &predicate,
+            controller,
+            source,
+        ));
+        ordinary
+            .players
+            .iter_mut()
+            .find(|p| p.id == PlayerId(1))
+            .unwrap()
+            .life = 9;
+        assert!(matches_player_scope(
+            &ordinary,
+            PlayerId(1),
+            &predicate,
+            controller,
+            source,
+        ));
     }
 
     #[test]

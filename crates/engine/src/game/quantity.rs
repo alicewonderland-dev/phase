@@ -744,7 +744,7 @@ pub fn quantity_is_cast_stable_for_pre_cast(expr: &QuantityExpr) -> bool {
 /// expression authority above.
 pub fn quantity_ref_is_cast_stable_for_pre_cast(qty: &QuantityRef) -> bool {
     match qty {
-        QuantityRef::StartingLifeTotal => true,
+        QuantityRef::StartingLifeTotal { .. } => true,
         QuantityRef::ObjectCount { filter } => target_filter_is_property_free_population(filter),
         _ => false,
     }
@@ -1490,7 +1490,7 @@ fn quantity_expr_is_source_context_previewable(
     match expr {
         QuantityExpr::Fixed { .. } => true,
         QuantityExpr::Ref {
-            qty: QuantityRef::StartingLifeTotal,
+            qty: QuantityRef::StartingLifeTotal { .. },
         } => true,
         QuantityExpr::Ref {
             qty: QuantityRef::ObjectCount { filter },
@@ -2091,7 +2091,7 @@ fn quantity_ref_uses_unspent_mana(qty: &QuantityRef) -> bool {
         | QuantityRef::LifeTotal { .. }
         | QuantityRef::GraveyardSize { .. }
         | QuantityRef::LifeAboveStarting
-        | QuantityRef::StartingLifeTotal
+        | QuantityRef::StartingLifeTotal { .. }
         | QuantityRef::TriggeringDiscoverValue
         | QuantityRef::TriggeringScryLookCount
         | QuantityRef::TriggeringScryBottomCount
@@ -2433,7 +2433,7 @@ fn quantity_ref_uses_object_count(qty: &QuantityRef) -> bool {
         | QuantityRef::UnspentMana { .. }
         | QuantityRef::GraveyardSize { .. }
         | QuantityRef::LifeAboveStarting
-        | QuantityRef::StartingLifeTotal
+        | QuantityRef::StartingLifeTotal { .. }
         | QuantityRef::TriggeringDiscoverValue
         | QuantityRef::TriggeringScryLookCount
         | QuantityRef::TriggeringScryBottomCount
@@ -2744,7 +2744,7 @@ fn quantity_ref_characteristic_reads(qty: &QuantityRef, depth: u32) -> Character
         | QuantityRef::LifeTotal { .. }
         | QuantityRef::GraveyardSize { .. }
         | QuantityRef::LifeAboveStarting
-        | QuantityRef::StartingLifeTotal
+        | QuantityRef::StartingLifeTotal { .. }
         | QuantityRef::TriggeringDiscoverValue
         | QuantityRef::TriggeringScryLookCount
         | QuantityRef::TriggeringScryBottomCount
@@ -2998,7 +2998,7 @@ fn entered_object_perturbs_quantity_ref(
         | QuantityRef::UnspentMana { .. }
         | QuantityRef::GraveyardSize { .. }
         | QuantityRef::LifeAboveStarting
-        | QuantityRef::StartingLifeTotal
+        | QuantityRef::StartingLifeTotal { .. }
         | QuantityRef::TriggeringDiscoverValue
         | QuantityRef::TriggeringScryLookCount
         | QuantityRef::TriggeringScryBottomCount
@@ -4525,9 +4525,11 @@ fn resolve_ref(
         }),
         // CR 103.4 + CR 904.5: the rules starting total for the referenced
         // ability controller, including the archenemy's 40-life baseline.
-        QuantityRef::StartingLifeTotal => state
-            .format_config
-            .starting_life_total_for_player(controller),
+        QuantityRef::StartingLifeTotal { player: scope } => {
+            resolve_per_player_scalar(state, scope, controller, ctx, targets, ability, |p| {
+                state.format_config.starting_life_total_for_player(p.id)
+            })
+        }
         // CR 701.57a: the mana-value limit of the discover that fired the current
         // "whenever you discover" trigger (Curator of Sun's Creation, "the same
         // value"). 0 outside a discover-trigger context.
@@ -9061,21 +9063,31 @@ pub(crate) fn resolve_player_count(
                         // candidates satisfying both the `relation` predicate and
                         // the per-candidate scalar comparison. Mirrors the arm in
                         // `effects::mod::matches_player_scope` (the two copies must
-                        // stay in sync). `attr` is read directly off `p`; `value`
-                        // is the controller-relative threshold, resolved once.
+                        // stay in sync). `attr` is read from candidate `p`; `value`
+                        // keeps the ability controller and binds `scoped_player`
+                        // to this candidate for candidate-relative operands.
                         PlayerFilter::PlayerAttribute {
                             relation,
                             attr,
                             comparator,
                             value,
                         } => {
-                            let threshold = resolve_quantity(state, value, controller, source_id);
                             crate::game::players::matches_relation(
                                 state, p.id, controller, *relation,
-                            ) && crate::game::effects::candidate_player_scalar_with_state(
-                                state, p, controller, attr,
-                            )
-                            .is_some_and(|lhs| comparator.evaluate(lhs, threshold))
+                            ) && {
+                                let mut candidate_ctx = ctx.clone();
+                                candidate_ctx.scoped_player = Some(p.id);
+                                let threshold = resolve_quantity_with_ctx(
+                                    state,
+                                    value,
+                                    controller,
+                                    candidate_ctx,
+                                );
+                                crate::game::effects::candidate_player_scalar_with_state(
+                                    state, p, controller, attr,
+                                )
+                                .is_some_and(|lhs| comparator.evaluate(lhs, threshold))
+                            }
                         }
                         // CR 608.2c + CR 608.2h + CR 109.4: "for each opponent
                         // who controlled a creature returned this way" — count
@@ -11812,7 +11824,9 @@ mod tests {
             resolve_quantity(
                 &state,
                 &QuantityExpr::Ref {
-                    qty: QuantityRef::StartingLifeTotal,
+                    qty: QuantityRef::StartingLifeTotal {
+                        player: PlayerScope::Controller,
+                    },
                 },
                 PlayerId(0),
                 ObjectId(0),
@@ -11832,7 +11846,9 @@ mod tests {
         state.players[1].life = 30;
 
         let starting_total = QuantityExpr::Ref {
-            qty: QuantityRef::StartingLifeTotal,
+            qty: QuantityRef::StartingLifeTotal {
+                player: PlayerScope::Controller,
+            },
         };
         let life_above_starting = QuantityExpr::Ref {
             qty: QuantityRef::LifeAboveStarting,

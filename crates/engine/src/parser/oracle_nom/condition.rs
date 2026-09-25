@@ -5833,6 +5833,43 @@ fn parse_life_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
 
     if let Ok((rest, comparator)) = parse_life_total_comparator(rest) {
         let (rest, rhs) = nom_quantity::parse_quantity(rest)?;
+        // Existential subjects need a per-candidate starting-life operand.
+        // A single Min/Max aggregate compared to one controller baseline is
+        // not equivalent when player baselines differ (for example, the
+        // Archenemy's 40 life versus a hero's 20). Keep the original ability
+        // controller on the runtime path; `ScopedPlayer` binds each candidate.
+        if !matches!(scope, LifeTotalScope::Controller)
+            && rhs.any_ref(&mut |qty| {
+                matches!(
+                    qty,
+                    QuantityRef::StartingLifeTotal {
+                        player: PlayerScope::ScopedPlayer
+                    }
+                )
+            })
+        {
+            let relation = match scope {
+                LifeTotalScope::Controller => unreachable!("controller is not existential"),
+                LifeTotalScope::AllPlayers => crate::types::ability::PlayerRelation::All,
+                LifeTotalScope::Opponent => crate::types::ability::PlayerRelation::Opponent,
+            };
+            return Ok((
+                rest,
+                make_quantity_ge(
+                    QuantityRef::PlayerCount {
+                        filter: PlayerFilter::PlayerAttribute {
+                            relation,
+                            attr: Box::new(QuantityRef::LifeTotal {
+                                player: PlayerScope::ScopedPlayer,
+                            }),
+                            comparator,
+                            value: Box::new(rhs),
+                        },
+                    },
+                    1,
+                ),
+            ));
+        }
         return Ok((
             rest,
             StaticCondition::QuantityComparison {
@@ -17289,7 +17326,9 @@ mod tests {
                 assert!(matches!(
                     inner.as_ref(),
                     QuantityExpr::Ref {
-                        qty: QuantityRef::StartingLifeTotal
+                        qty: QuantityRef::StartingLifeTotal {
+                            player: PlayerScope::Controller,
+                        }
                     }
                 ));
             }
@@ -17311,33 +17350,43 @@ mod tests {
                 lhs:
                     QuantityExpr::Ref {
                         qty:
-                            QuantityRef::LifeTotal {
-                                player:
-                                    PlayerScope::AllPlayers {
-                                        aggregate: AggregateFunction::Min,
-                                        exclude: None,
+                            QuantityRef::PlayerCount {
+                                filter:
+                                    PlayerFilter::PlayerAttribute {
+                                        relation: crate::types::ability::PlayerRelation::All,
+                                        attr,
+                                        comparator: Comparator::LE,
+                                        value,
                                     },
                             },
                     },
-                comparator: Comparator::LE,
-                rhs:
-                    QuantityExpr::DivideRounded {
-                        inner,
-                        divisor: 2,
-                        rounding: RoundingMode::Down,
-                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
             } => {
                 assert!(matches!(
-                    inner.as_ref(),
-                    QuantityExpr::Ref {
-                        qty: QuantityRef::StartingLifeTotal
+                    attr.as_ref(),
+                    QuantityRef::LifeTotal {
+                        player: PlayerScope::ScopedPlayer,
                     }
+                ));
+                assert!(matches!(
+                    value.as_ref(),
+                    QuantityExpr::DivideRounded {
+                        divisor: 2,
+                        rounding: RoundingMode::Down,
+                        inner,
+                    } if matches!(
+                        inner.as_ref(),
+                        QuantityExpr::Ref {
+                            qty: QuantityRef::StartingLifeTotal {
+                                player: PlayerScope::ScopedPlayer,
+                            }
+                        }
+                    )
                 ));
             }
             other => {
-                panic!(
-                    "expected AllPlayers(Min) LE DivideRounded(StartingLifeTotal), got {other:?}"
-                )
+                panic!("expected candidate-relative existential life threshold, got {other:?}")
             }
         }
     }
@@ -17354,30 +17403,43 @@ mod tests {
                 lhs:
                     QuantityExpr::Ref {
                         qty:
-                            QuantityRef::LifeTotal {
-                                player:
-                                    PlayerScope::Opponent {
-                                        aggregate: AggregateFunction::Min,
+                            QuantityRef::PlayerCount {
+                                filter:
+                                    PlayerFilter::PlayerAttribute {
+                                        relation: crate::types::ability::PlayerRelation::Opponent,
+                                        attr,
+                                        comparator: Comparator::LT,
+                                        value,
                                     },
                             },
                     },
-                comparator: Comparator::LT,
-                rhs:
-                    QuantityExpr::DivideRounded {
-                        inner,
-                        divisor: 2,
-                        rounding: RoundingMode::Down,
-                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
             } => {
                 assert!(matches!(
-                    inner.as_ref(),
-                    QuantityExpr::Ref {
-                        qty: QuantityRef::StartingLifeTotal
+                    attr.as_ref(),
+                    QuantityRef::LifeTotal {
+                        player: PlayerScope::ScopedPlayer,
                     }
+                ));
+                assert!(matches!(
+                    value.as_ref(),
+                    QuantityExpr::DivideRounded {
+                        divisor: 2,
+                        rounding: RoundingMode::Down,
+                        inner,
+                    } if matches!(
+                        inner.as_ref(),
+                        QuantityExpr::Ref {
+                            qty: QuantityRef::StartingLifeTotal {
+                                player: PlayerScope::ScopedPlayer,
+                            }
+                        }
+                    )
                 ));
             }
             other => {
-                panic!("expected Opponent(Min) LT DivideRounded(StartingLifeTotal), got {other:?}")
+                panic!("expected candidate-relative opponent life threshold, got {other:?}")
             }
         }
     }
@@ -17435,14 +17497,18 @@ mod tests {
                 "your life total is greater than your starting life total",
                 Comparator::GT,
                 QuantityExpr::Ref {
-                    qty: QuantityRef::StartingLifeTotal,
+                    qty: QuantityRef::StartingLifeTotal {
+                        player: PlayerScope::Controller,
+                    },
                 },
             ),
             (
                 "your life total is greater than or equal to your starting life total",
                 Comparator::GE,
                 QuantityExpr::Ref {
-                    qty: QuantityRef::StartingLifeTotal,
+                    qty: QuantityRef::StartingLifeTotal {
+                        player: PlayerScope::Controller,
+                    },
                 },
             ),
         ] {
