@@ -1390,6 +1390,7 @@ mod a_killer_among_us;
 mod a_sigil_of_myrkul;
 mod aang_journey_partial_fail_to_find_2722;
 mod aclazotz_attack_discard_multi_opponent;
+mod activation_cost_reduction_election;
 mod agency_coroner_suspected_cost_paid;
 mod alania_divergent_storm;
 mod angelic_field_marshal_lieutenant_2885;
