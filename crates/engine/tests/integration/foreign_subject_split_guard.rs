@@ -118,11 +118,7 @@ fn effective_pt(runner: &mut engine::game::scenario::GameRunner, id: ObjectId) -
 /// Drives The Swarmweaver's Delirium anthem through `GameScenario` and
 /// `evaluate_layers` for an Insect and a Spider on P0's battlefield, at both
 /// graveyard-type-count states, with an opponent-controlled Insect as a scope
-/// control. This is the discriminating pair the parse-shape assertions above
-/// cannot reach on their own: a dropped gate (the anthem always on) and a
-/// dropped half of the compound subject (only Insects or only Spiders
-/// benefiting) both leave the parsed AST shape from
-/// `the_swarmweaver_compound_subject_anthem_is_not_split` untouched.
+/// control.
 #[test]
 fn the_swarmweaver_delirium_gates_insects_and_spiders_by_graveyard_types() {
     for at_threshold in [false, true] {
