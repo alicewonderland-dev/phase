@@ -1,5 +1,5 @@
 import "fake-indexeddb/auto";
-import { createStore, get } from "idb-keyval";
+import { createStore, get, set } from "idb-keyval";
 
 import { setSavedDeckTxnLockWaitForTests, type SavedDeckTxn } from "../../services/savedDeckTransaction";
 
@@ -155,4 +155,11 @@ export async function resetSavedDeckLibraryForTests(): Promise<void> {
 
 export function readIdbGenerationForTests(): Promise<number | undefined> {
   return get<number>("generation", createStore(GENERATION_DB, GENERATION_STORE));
+}
+
+/** Test-only seam to make the IDB and localStorage generations diverge without running a
+ *  transaction. Production code never calls this. */
+export async function seedGenerationForTests(idb: number, local: number): Promise<void> {
+  await set("generation", idb, createStore(GENERATION_DB, GENERATION_STORE));
+  localStorage.setItem("phase-saved-deck-library-generation", String(local));
 }

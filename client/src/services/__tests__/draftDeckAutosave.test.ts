@@ -1,7 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { CUSTOM_CUBE_SET_CODE, DRAFT_KINDS } from "../../adapter/draftKinds";
-import { draftAutosaveSlot, draftSubmissionToParsedDeck } from "../draftDeckAutosave";
+import { listSavedDeckNames } from "../../constants/storage";
+import {
+  installFifoWebLocks,
+  refusingWebLocks,
+  resetSavedDeckLibraryForTests,
+  uninstallWebLocks,
+} from "../../test/helpers/webLocks";
+import { autosaveDraftDeck, draftAutosaveSlot, draftSubmissionToParsedDeck } from "../draftDeckAutosave";
 
 describe("draftAutosaveSlot", () => {
   it("distinguishes a solo cube draft (kind Quick, custom-cube set code) from a solo Quick draft", () => {
@@ -43,5 +50,38 @@ describe("draftSubmissionToParsedDeck", () => {
     const deck = draftSubmissionToParsedDeck({ mainDeck: ["Bolt"], sideboard: [] }, []);
     expect(deck.commander).toBeUndefined();
     expect(deck.sideboard).toEqual([]);
+  });
+});
+
+describe("autosaveDraftDeck", () => {
+  afterEach(() => {
+    uninstallWebLocks();
+    localStorage.clear();
+  });
+
+  const submission = {
+    view: { kind: "Sealed" as const, commanders_required: 0 },
+    setCode: null,
+    partition: { mainDeck: ["Bolt"], sideboard: [] },
+    commanders: [],
+  };
+
+  it("resolves and warns without writing, when the lock is refused", async () => {
+    Object.defineProperty(globalThis.navigator, "locks", {
+      configurable: true,
+      value: refusingWebLocks(new DOMException("nope", "InvalidStateError")),
+    });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await expect(autosaveDraftDeck(submission)).resolves.toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledWith("[draftDeckAutosave] autosave skipped:", "lock-refused");
+    expect(listSavedDeckNames()).toEqual([]);
+    warnSpy.mockRestore();
+  });
+
+  it("paired positive: with the lock available, the same submission writes the deck", async () => {
+    installFifoWebLocks();
+    await resetSavedDeckLibraryForTests();
+    await expect(autosaveDraftDeck(submission)).resolves.toBeUndefined();
+    expect(listSavedDeckNames().length).toBeGreaterThan(0);
   });
 });

@@ -41,6 +41,12 @@ vi.mock("../connectivityStore", () => ({
 
 import { adoptCloudSyncHmrState, disposeCloudSyncModuleForTest, useCloudSyncStore } from "../cloudSyncStore";
 import { SyncConflictError } from "../../services/cloudSync";
+import { withSavedDeckLibrary } from "../../services/savedDeckTransaction";
+import {
+  installFifoWebLocks,
+  resetSavedDeckLibraryForTests,
+  uninstallWebLocks,
+} from "../../test/helpers/webLocks";
 
 const identity = { userId: "user-1", label: "Tester" };
 
@@ -1342,5 +1348,134 @@ describe("cloud sync serialization", () => {
     await Promise.resolve();
     expect(disposer).toHaveBeenCalledTimes(2);
     expect(provider.subscribe).toHaveBeenCalledTimes(1);
+  });
+
+  describe("saved-deck lock", () => {
+    beforeEach(async () => {
+      installFifoWebLocks();
+      await resetSavedDeckLibraryForTests();
+    });
+    afterEach(() => {
+      uninstallWebLocks();
+    });
+
+    it("re-checks staleness inside the lock: a same-tab write that arrives while applyRemote waits for the lock blocks the apply", async () => {
+      await readySignedIn();
+      useCloudSyncStore.setState({ dirty: false, lastSyncedRevision: 1 });
+      provider.pullMeta.mockResolvedValue(meta(2));
+      provider.pull.mockResolvedValue(remote(2));
+
+      let releaseHolder!: () => void;
+      const held = new Promise<void>((resolve) => {
+        releaseHolder = resolve;
+      });
+      const holder = withSavedDeckLibrary(() => held);
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).held).toHaveLength(1);
+      });
+
+      const sync = useCloudSyncStore.getState().syncNow();
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).pending).toHaveLength(1);
+      });
+      watched?.();
+      releaseHolder();
+      await holder;
+      await sync;
+
+      expect(mocks.applyBackup).not.toHaveBeenCalled();
+      expect(useCloudSyncStore.getState().dirty).toBe(true);
+    });
+
+    it("paired positive: without a same-tab write while waiting, applyRemote applies the snapshot", async () => {
+      await readySignedIn();
+      useCloudSyncStore.setState({ dirty: false, lastSyncedRevision: 1 });
+      provider.pullMeta.mockResolvedValue(meta(2));
+      provider.pull.mockResolvedValue(remote(2));
+
+      let releaseHolder!: () => void;
+      const held = new Promise<void>((resolve) => {
+        releaseHolder = resolve;
+      });
+      const holder = withSavedDeckLibrary(() => held);
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).held).toHaveLength(1);
+      });
+
+      const sync = useCloudSyncStore.getState().syncNow();
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).pending).toHaveLength(1);
+      });
+      releaseHolder();
+      await holder;
+      await sync;
+
+      expect(mocks.applyBackup).toHaveBeenCalledWith(expect.anything(), remote(2).backup, "overwrite");
+      expect(useCloudSyncStore.getState()).toMatchObject({ status: "synced", dirty: false });
+    });
+
+    it("re-checks staleness inside the lock: a same-tab write that arrives while applyMerged waits for the lock blocks the apply", async () => {
+      const merged = backup({ decks: { Merged: "{}" } });
+      await readySignedIn();
+      useCloudSyncStore.setState({ conflict: remote(3), status: "conflict" });
+      provider.pullMeta.mockResolvedValue(meta(3));
+      provider.push.mockResolvedValue(meta(4));
+      mocks.mergeDeckCollections.mockReturnValue(merged);
+
+      let releaseHolder!: () => void;
+      const held = new Promise<void>((resolve) => {
+        releaseHolder = resolve;
+      });
+      const holder = withSavedDeckLibrary(() => held);
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).held).toHaveLength(1);
+      });
+
+      const merge = useCloudSyncStore.getState().resolveConflict("merge");
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).pending).toHaveLength(1);
+      });
+      watched?.();
+      releaseHolder();
+      await holder;
+      await merge;
+
+      expect(mocks.applyBackup).not.toHaveBeenCalled();
+      expect(useCloudSyncStore.getState()).toMatchObject({
+        status: "conflict",
+        dirty: true,
+        lastSyncedRevision: 4,
+        conflict: { backup: merged, meta: meta(4) },
+      });
+    });
+
+    it("paired positive: without a same-tab write while waiting, applyMerged applies the merge", async () => {
+      const merged = backup({ decks: { Merged: "{}" } });
+      await readySignedIn();
+      useCloudSyncStore.setState({ conflict: remote(3), status: "conflict" });
+      provider.pullMeta.mockResolvedValue(meta(3));
+      provider.push.mockResolvedValue(meta(4));
+      mocks.mergeDeckCollections.mockReturnValue(merged);
+
+      let releaseHolder!: () => void;
+      const held = new Promise<void>((resolve) => {
+        releaseHolder = resolve;
+      });
+      const holder = withSavedDeckLibrary(() => held);
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).held).toHaveLength(1);
+      });
+
+      const merge = useCloudSyncStore.getState().resolveConflict("merge");
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).pending).toHaveLength(1);
+      });
+      releaseHolder();
+      await holder;
+      await merge;
+
+      expect(mocks.applyBackup).toHaveBeenCalledWith(expect.anything(), merged, "overwrite");
+      expect(useCloudSyncStore.getState()).toMatchObject({ status: "synced", lastSyncedRevision: 4 });
+    });
   });
 });

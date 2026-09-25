@@ -17,7 +17,7 @@ import {
   writeDraftAutosaveDeck,
 } from "../../../constants/storage";
 import { useAppNotificationStore } from "../../../stores/appToastStore";
-import { withSavedDeckLibrary } from "../../../services/savedDeckTransaction";
+import { setSavedDeckTxnGateForTests, withSavedDeckLibrary } from "../../../services/savedDeckTransaction";
 import {
   installFifoWebLocks,
   resetSavedDeckLibraryForTests,
@@ -597,6 +597,274 @@ describe("DeckBuilder", () => {
       ]),
     );
     expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck A")).not.toBeNull();
+  });
+
+  it("an edit made while a save waits for the lock keeps the deck dirty after that save completes", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "Dirty Deck",
+      JSON.stringify({ main: [{ name: "Forest", count: 10 }], sideboard: [], format: "Standard" }),
+    );
+
+    render(
+      <DeckBuilder
+        format="Standard"
+        onFormatChange={vi.fn()}
+        initialDeckName="Dirty Deck"
+        searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+        onSearchFiltersChange={vi.fn()}
+        onResetSearch={vi.fn()}
+      />,
+    );
+    const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+    await waitFor(() => expect(nameInput).toHaveValue("Dirty Deck"));
+
+    await user.click(screen.getByRole("button", { name: "remove-Forest" })); // payload will hold 9
+
+    let releaseHolder!: () => void;
+    const held = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+    const holder = withSavedDeckLibrary(() => held);
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).pending).toHaveLength(1);
+    });
+
+    await user.click(await screen.findByRole("button", { name: "remove-Forest" })); // editor now holds 8
+
+    releaseHolder();
+    await holder;
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(0);
+      expect((await navigator.locks.query()).pending).toHaveLength(0);
+    });
+
+    // The save completed with the payload from the first click.
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Dirty Deck") ?? "{}");
+    expect(saved.main).toEqual([{ name: "Forest", count: 9 }]);
+
+    // The second edit landed after the save's payload was captured, so the deck is still dirty.
+    await user.click(screen.getByRole("button", { name: /Menu/ }));
+    expect(await screen.findByRole("button", { name: "Discard" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+
+    // Paired positive: saving again with no contention clears dirty.
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Dirty Deck") ?? "{}").main).toEqual([
+        { name: "Forest", count: 8 },
+      ]),
+    );
+    await user.click(screen.getByRole("button", { name: /Menu/ }));
+    expect(screen.queryByRole("button", { name: "Discard" })).not.toBeInTheDocument();
+  });
+
+  describe("cross-tab saved-deck transactions", () => {
+    const AUTOSAVE_V2 = JSON.stringify({
+      main: [{ name: "Mountain", count: 2 }],
+      sideboard: [],
+      format: "Limited",
+    });
+
+    afterEach(() => {
+      setSavedDeckTxnGateForTests(null);
+    });
+
+    async function seedAutosave() {
+      await writeDraftAutosaveDeck(
+        "Sealed",
+        "[Autosave] Sealed",
+        JSON.stringify({
+          main: [{ name: "Lightning Bolt", count: 1 }],
+          sideboard: [],
+          format: "Limited",
+        }),
+      );
+    }
+
+    // The maintainer's test: pause the autosave (tab A) right after it selects the deck it
+    // owns, manually save the same deck in tab B, then resume the autosave and confirm the
+    // manual data stays intact and unmarked.
+    it("the autosave, paused after owner selection, does not clobber a manual save of the same deck", async () => {
+      const user = userEvent.setup();
+      await seedAutosave();
+
+      render(
+        <DeckBuilder
+          format="Limited"
+          onFormatChange={vi.fn()}
+          initialDeckName="[Autosave] Sealed"
+          searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+          onSearchFiltersChange={vi.fn()}
+          onResetSearch={vi.fn()}
+        />,
+      );
+      const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+      await waitFor(() => expect(nameInput).toHaveValue("[Autosave] Sealed"));
+
+      let reachedResolve!: () => void;
+      const reached = new Promise<void>((resolve) => {
+        reachedResolve = resolve;
+      });
+      let releaseGate!: () => void;
+      const gateHeld = new Promise<void>((resolve) => {
+        releaseGate = resolve;
+      });
+      setSavedDeckTxnGateForTests((phase) => {
+        if (phase === "draft-autosave-after-owner-selection") {
+          reachedResolve();
+          return gateHeld;
+        }
+      });
+
+      const autosave = writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", AUTOSAVE_V2);
+      await reached;
+
+      await user.click(await screen.findByRole("button", { name: "remove-Lightning Bolt" }));
+      await user.click(screen.getByRole("button", { name: "Save" }));
+
+      await vi.waitFor(async () => {
+        const pending = ((await navigator.locks.query()).pending ?? []).length === 1;
+        const stored = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed") ?? "{}");
+        expect(pending || (stored.main ?? null)?.length === 0).toBe(true);
+      });
+
+      releaseGate();
+      await autosave;
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).held).toHaveLength(0);
+        expect((await navigator.locks.query()).pending).toHaveLength(0);
+      });
+
+      const persisted = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed") ?? "{}");
+      expect(persisted.main).toEqual([]);
+      expect(getDeckMeta("[Autosave] Sealed")?.autosaveSlot).toBeUndefined();
+      await expect(autosave).resolves.toEqual({ status: "committed", value: "[Autosave] Sealed" });
+    });
+
+    // The mirror: pause the manual save (tab B) right after its data write, let the autosave
+    // (tab A) run to completion, then resume the manual save.
+    it("a manual save, paused after its data write, does not lose to a concurrent autosave", async () => {
+      const user = userEvent.setup();
+      await seedAutosave();
+
+      render(
+        <DeckBuilder
+          format="Limited"
+          onFormatChange={vi.fn()}
+          initialDeckName="[Autosave] Sealed"
+          searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+          onSearchFiltersChange={vi.fn()}
+          onResetSearch={vi.fn()}
+        />,
+      );
+      const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+      await waitFor(() => expect(nameInput).toHaveValue("[Autosave] Sealed"));
+      await user.click(await screen.findByRole("button", { name: "remove-Lightning Bolt" }));
+
+      let reachedResolve!: () => void;
+      const reached = new Promise<void>((resolve) => {
+        reachedResolve = resolve;
+      });
+      let releaseGate!: () => void;
+      const gateHeld = new Promise<void>((resolve) => {
+        releaseGate = resolve;
+      });
+      setSavedDeckTxnGateForTests((phase) => {
+        if (phase === "builder-save-after-data-write") {
+          reachedResolve();
+          return gateHeld;
+        }
+      });
+
+      await user.click(screen.getByRole("button", { name: "Save" }));
+      await reached;
+
+      const autosave = writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", AUTOSAVE_V2);
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).pending).toHaveLength(1);
+      });
+
+      releaseGate();
+      await autosave;
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).held).toHaveLength(0);
+        expect((await navigator.locks.query()).pending).toHaveLength(0);
+      });
+
+      const manual = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed") ?? "{}");
+      expect(manual.main).toEqual([]);
+      expect(getDeckMeta("[Autosave] Sealed")?.autosaveSlot).toBeUndefined();
+      await expect(autosave).resolves.toEqual({ status: "committed", value: "[Autosave] Sealed (2)" });
+      expect(getDeckMeta("[Autosave] Sealed (2)")?.autosaveSlot).toBe("Sealed");
+    });
+
+    // Rename: the manual rename is paused after the move and data write, and the autosave
+    // arrives while it waits.
+    it("a manual rename, paused after its data write, is not overtaken by a concurrent autosave", async () => {
+      const user = userEvent.setup();
+      await seedAutosave();
+
+      render(
+        <DeckBuilder
+          format="Limited"
+          onFormatChange={vi.fn()}
+          initialDeckName="[Autosave] Sealed"
+          searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+          onSearchFiltersChange={vi.fn()}
+          onResetSearch={vi.fn()}
+        />,
+      );
+      const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+      await waitFor(() => expect(nameInput).toHaveValue("[Autosave] Sealed"));
+      await user.clear(nameInput);
+      await user.type(nameInput, "My Sealed");
+
+      let reachedResolve!: () => void;
+      const reached = new Promise<void>((resolve) => {
+        reachedResolve = resolve;
+      });
+      let releaseGate!: () => void;
+      const gateHeld = new Promise<void>((resolve) => {
+        releaseGate = resolve;
+      });
+      setSavedDeckTxnGateForTests((phase) => {
+        if (phase === "builder-save-after-data-write") {
+          reachedResolve();
+          return gateHeld;
+        }
+      });
+
+      await user.click(screen.getByRole("button", { name: "Save" }));
+      await reached;
+
+      const autosave = writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", AUTOSAVE_V2);
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).pending).toHaveLength(1);
+      });
+
+      releaseGate();
+      await autosave;
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).held).toHaveLength(0);
+        expect((await navigator.locks.query()).pending).toHaveLength(0);
+      });
+
+      const renamed = localStorage.getItem(STORAGE_KEY_PREFIX + "My Sealed");
+      expect(renamed).not.toBeNull();
+      expect(JSON.parse(renamed ?? "{}").main).toEqual([{ name: "Lightning Bolt", count: 1 }]);
+      expect(getDeckMeta("My Sealed")?.autosaveSlot).toBeUndefined();
+
+      const autosaved = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed") ?? "{}");
+      expect(autosaved.main).toEqual([{ name: "Mountain", count: 2 }]);
+      expect(getDeckMeta("[Autosave] Sealed")?.autosaveSlot).toBe("Sealed");
+      await expect(autosave).resolves.toEqual({ status: "committed", value: "[Autosave] Sealed" });
+    });
   });
 
   it("toggles between Deck and Info surfaces via the tab bar", async () => {
