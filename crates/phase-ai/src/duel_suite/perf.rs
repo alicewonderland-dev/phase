@@ -7,7 +7,7 @@
 //! that gap by running a fixed, seeded, action-capped prefix of the selected
 //! scenarios ([`default_scenarios`] unless overridden), field-wise summing the
 //! engine's [`PerfCounterSnapshot`] across them, and comparing the integer
-//! counter payload against a committed baseline.
+//! counter payload against a baseline.
 //!
 //! **Guarantee.** The gate compares the **per-counter median over K independent
 //! cold-process trajectories** for a fixed `(binary, card-data, seed, action_cap,

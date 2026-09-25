@@ -2,7 +2,7 @@
 //!
 //! Runs the `default_scenarios` matchups, or the `--scenario` selection, through
 //! a fixed seeded action-cap prefix, field-wise sums the engine perf counters,
-//! and compares the integer payload against a committed baseline. Catches
+//! and compares the integer payload against a baseline. Catches
 //! cost-per-decision regressions (clone storms, quadratic combat scans, display
 //! sweeps in search) that the win-rate `cargo ai-gate` is structurally blind to.
 //!
@@ -79,8 +79,8 @@ fn main() {
     };
 
     // Branch 1 — child: load the DB, emit ONE single-trajectory sample, exit.
-    if args.emit_sample.is_some() {
-        run_child(&args);
+    if let Some(sample_path) = &args.emit_sample {
+        run_child(sample_path, &args.data_root, &args.scenarios);
         return;
     }
 
@@ -101,15 +101,11 @@ fn main() {
 /// (see `PERF_THREAD_STACK_SIZE`) since the AI search recurses past the
 /// platform default; an unhandled panic there would otherwise unwind only
 /// the spawned thread and exit 0 silently, so a join failure is mapped to
-/// exit 101 (mirrors `ai_commander.rs`'s identical convention). Split out of
-/// `main` so `main` names no scenario list anywhere.
-fn run_child(args: &Args) {
-    let data_root = args.data_root.clone();
-    let sample_path = args
-        .emit_sample
-        .clone()
-        .expect("run_child requires emit_sample to be set");
-    let scenarios = args.scenarios.clone();
+/// exit 101 (mirrors `ai_commander.rs`'s identical convention).
+fn run_child(sample_path: &Path, data_root: &Path, scenarios: &[&'static str]) {
+    let data_root = data_root.to_path_buf();
+    let sample_path = sample_path.to_path_buf();
+    let scenarios = scenarios.to_vec();
     let handle = std::thread::Builder::new()
         .name("ai-perf-gate-sample".to_string())
         .stack_size(PERF_THREAD_STACK_SIZE)
@@ -359,7 +355,7 @@ fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Args, String> {
     if requested.is_some() && repro_report {
         return Err("--scenario has no effect with --repro-report, which runs no suite".into());
     }
-    if requested.is_some() && emit_sample.is_none() && !repro_report && baseline.is_none() {
+    if requested.is_some() && emit_sample.is_none() && baseline.is_none() {
         return Err("--scenario requires an explicit --baseline PATH: a non-default scenario set cannot be compared against, or refreshed into, the committed baseline".into());
     }
     let scenarios = match &requested {
@@ -528,7 +524,7 @@ fn print_usage() {
     );
     eprintln!();
     eprintln!("The gate runs PERF_SAMPLE_COUNT independent sample processes and compares the");
-    eprintln!("per-counter median against the committed baseline (issue #4878).");
+    eprintln!("per-counter median against the baseline (issue #4878).");
     eprintln!();
     eprintln!("Internal flags (spawned/orchestrated automatically, not for manual use):");
     eprintln!("  --emit-sample PATH   emit one single-trajectory sample to PATH and exit");
@@ -669,7 +665,7 @@ mod tests {
 
     #[test]
     fn a_selected_scenario_reaches_run_perf_suite_in_place_of_the_defaults() {
-        let dir = scratch("b8");
+        let dir = scratch("child-selection");
         let data_root = empty_card_db(&dir);
         let sample_path = dir.join("sample.json");
         let args = parse_args(args(&[
@@ -682,14 +678,16 @@ mod tests {
         ]))
         .expect("parse");
 
-        run_child(&args);
+        run_child(
+            args.emit_sample.as_deref().unwrap(),
+            &args.data_root,
+            &args.scenarios,
+        );
 
         let report = load_report(&sample_path).expect("child must write a readable report");
         assert_eq!(report.scenarios, vec!["azorius-vs-prowess".to_string()]);
         // Reach guard: proves the suite actually ran rather than writing an empty
-        // report. `azorius-vs-prowess` was not yet probed on a `{}` card DB
-        // before this test; the assertion below establishes it produces
-        // non-zero counters, the same shape as the default scenarios on `{}`.
+        // report.
         assert!(
             report.counters.0.values().any(|v| *v > 0),
             "expected at least one non-zero perf counter, got {:?}",
@@ -725,7 +723,7 @@ mod tests {
             .expect("affinity-mirror must name a card red-mirror does not")
             .clone();
 
-        let dir = scratch("b9");
+        let dir = scratch("provenance-scope");
         let data_root = dir.join("cards");
         std::fs::create_dir_all(&data_root).expect("create data root");
         let mut db = serde_json::Map::new();
