@@ -41,10 +41,11 @@ pub struct NodeReach<'a> {
 /// Each node is answered on the copy of the board `resolution_board` builds,
 /// as the entry stands before its first instruction runs. A node below an
 /// instruction that may change what the node's answer reads answers nothing
-/// (`reads_what_was_written`), and so does a node below an instruction whose
-/// changes this authority cannot bound (`instruction_writes`), a node that
-/// repeats, resolves once per chosen player, or waits on a condition only its
-/// resolution decides; every node below such a node answers nothing too.
+/// (`reads_what_was_written`). A node below an instruction whose changes this
+/// authority cannot bound (`instruction_writes`) answers nothing, and so does a
+/// node that repeats, resolves once per chosen player, or waits on a condition
+/// only its resolution decides; every node below such a node answers nothing
+/// too.
 ///
 /// CR 405.5: a stack object above `entry` resolves first, so it is never in the
 /// answer.
