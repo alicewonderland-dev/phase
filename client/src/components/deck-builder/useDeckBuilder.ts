@@ -8,12 +8,11 @@ import type { ParsedDeck, DeckEntry } from "../../services/deckParser";
 import { deduplicateEntries, expandParsedDeck, resolveCommander } from "../../services/deckParser";
 import { evaluateDeckCompatibility, type DeckCompatibilityResult } from "../../services/deckCompatibility";
 import {
-  ACTIVE_DECK_KEY,
   STORAGE_KEY_PREFIX,
   getDeckMeta,
   loadSavedDeck,
   loadSavedDeckBracket,
-  migrateDeckMeta,
+  moveSavedDeck,
   setDeckFolder,
   stampDeckMeta,
 } from "../../constants/storage";
@@ -29,7 +28,7 @@ import type { CommanderBracket } from "../../types/bracket";
 import { getPreconBracket } from "../../data/preconBrackets";
 import { getSharedAdapter } from "../../adapter/wasm-adapter";
 import { useBracketEstimate } from "../../hooks/useBracketEstimate";
-import { projectSignatureSpellForFormat } from "../../services/savedDeckProjection";
+import { projectSignatureSpellForFormat, serializeSavedDeck } from "../../services/savedDeckProjection";
 import {
   commanderPartnerCandidates,
   companionCandidates,
@@ -500,29 +499,18 @@ export function useDeckBuilder({
       // matches what we're about to persist.
       applyDeckToEditor(resolved);
     }
-    const payload: Record<string, unknown> = {
-      ...projectSignatureSpellForFormat(resolved, format),
-      format,
-    };
-    if (bracket !== null) payload.bracket = bracket;
-    const data = JSON.stringify(payload);
+    const data = serializeSavedDeck(resolved, format, bracket);
     const nextName = deckName.trim();
     if (
       savedDeckName
       && savedDeckName !== nextName
       && localStorage.getItem(STORAGE_KEY_PREFIX + savedDeckName) !== null
     ) {
-      localStorage.removeItem(STORAGE_KEY_PREFIX + savedDeckName);
-      // Carry folder/star membership + timestamps to the new name; the
-      // trailing stampDeckMeta(nextName) then no-ops since the entry exists.
       // If nextName already names another deck, the setItem below overwrites
-      // its data (pre-existing Save behavior) and this migration likewise
-      // replaces its metadata — both correctly reflect the surviving deck's
-      // identity now living under nextName.
-      migrateDeckMeta(savedDeckName, nextName);
-      if (localStorage.getItem(ACTIVE_DECK_KEY) === savedDeckName) {
-        localStorage.setItem(ACTIVE_DECK_KEY, nextName);
-      }
+      // its data (pre-existing Save behavior) and moveSavedDeck's metadata
+      // carry likewise replaces its metadata — both correctly reflect the
+      // surviving deck's identity now living under nextName.
+      moveSavedDeck(savedDeckName, nextName);
     }
     localStorage.setItem(STORAGE_KEY_PREFIX + nextName, data);
     stampDeckMeta(nextName);
@@ -556,12 +544,7 @@ export function useDeckBuilder({
     while (localStorage.getItem(STORAGE_KEY_PREFIX + cloneName) !== null) {
       cloneName = `${base} copy ${suffix++}`;
     }
-    const payload: Record<string, unknown> = {
-      ...projectSignatureSpellForFormat(currentDeck, format),
-      format,
-    };
-    if (bracket !== null) payload.bracket = bracket;
-    localStorage.setItem(STORAGE_KEY_PREFIX + cloneName, JSON.stringify(payload));
+    localStorage.setItem(STORAGE_KEY_PREFIX + cloneName, serializeSavedDeck(currentDeck, format, bracket));
     stampDeckMeta(cloneName);
     // A clone lands beside its source: inherit the folder, but start unstarred
     // (the star is a deliberate per-deck pin, not a copyable property).

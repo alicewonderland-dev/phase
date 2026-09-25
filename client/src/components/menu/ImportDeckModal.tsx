@@ -4,7 +4,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { useTranslation } from "react-i18next";
 
 import { menuButtonClass } from "./buttonStyles";
-import { STORAGE_KEY_PREFIX, listSavedDeckNames, stampDeckMeta } from "../../constants/storage";
+import { STORAGE_KEY_PREFIX, listSavedDeckNames, stampDeckMeta, uniqueDeckName } from "../../constants/storage";
 import {
   assignOathbreakerSlots,
   deriveImportedDeckName,
@@ -45,16 +45,6 @@ interface PendingOathbreakerImport {
 }
 
 const GENERIC_IMPORTED_NAMES = new Set(["Imported Deck", "Untitled Deck"]);
-
-function uniqueDeckName(baseName: string, existingNames: string[]): string {
-  const existing = new Set(existingNames);
-  if (!existing.has(baseName)) return baseName;
-
-  for (let i = 2; ; i++) {
-    const candidate = `${baseName} ${i}`;
-    if (!existing.has(candidate)) return candidate;
-  }
-}
 
 function resolveImportDeckName(
   manualName: string,

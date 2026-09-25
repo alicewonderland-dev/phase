@@ -1,7 +1,15 @@
+import { DRAFT_KINDS } from "../adapter/draftKinds";
 import { isCommanderBracket, type CommanderBracket } from "../types/bracket";
 import type { FeedSubscription } from "../types/feed";
 import { repairParsedDeck, type ParsedDeck } from "../services/deckParser";
 import { projectSavedDeckSpecialSlots } from "../services/savedDeckProjection";
+
+/** Every draft-autosave slot: one per draft kind, plus solo cube drafts (which run as kind `Quick`). */
+export const DRAFT_AUTOSAVE_SLOTS = [...DRAFT_KINDS, "Cube"] as const;
+export type DraftAutosaveSlot = (typeof DRAFT_AUTOSAVE_SLOTS)[number];
+export function isDraftAutosaveSlot(value: unknown): value is DraftAutosaveSlot {
+  return DRAFT_AUTOSAVE_SLOTS.some((slot) => slot === value);
+}
 
 /** Prefix for saved deck data in localStorage. Full key: `${STORAGE_KEY_PREFIX}${deckName}` */
 export const STORAGE_KEY_PREFIX = "phase-deck:";
@@ -113,6 +121,9 @@ export interface DeckMeta {
   folderId?: string;
   /** Whether the deck is starred (pinned above folders in the library). */
   starred?: boolean;
+  /** The draft-autosave slot that owns this deck. Only `writeDraftAutosaveDeck` overwrites or renames a
+   *  deck, and only one carrying its slot; `clearDeckAutosaveMarker` removes it. */
+  autosaveSlot?: DraftAutosaveSlot;
 }
 
 /** A user-created folder for organizing saved decks. Folders are flat
@@ -151,13 +162,22 @@ function saveMetadataStore(store: Record<string, DeckMeta>): void {
   localStorage.setItem(DECK_METADATA_KEY, JSON.stringify(store));
 }
 
-/** Stamp metadata for a deck. Call whenever a deck is saved or seeded. */
+/** Remove draft-autosave ownership: the autosave will no longer overwrite or rename this deck. */
+export function clearDeckAutosaveMarker(deckName: string): void {
+  const store = loadMetadataStore();
+  if (store[deckName]?.autosaveSlot === undefined) return;
+  delete store[deckName].autosaveSlot;
+  saveMetadataStore(store);
+}
+
+/** Stamp metadata for a deck saved or seeded by anything other than the draft autosave, and clear any autosave ownership. */
 export function stampDeckMeta(deckName: string, addedAt?: number): void {
   const store = loadMetadataStore();
   if (!store[deckName]) {
     store[deckName] = { addedAt: addedAt ?? Date.now() };
     saveMetadataStore(store);
   }
+  clearDeckAutosaveMarker(deckName);
 }
 
 /** Update the lastPlayedAt timestamp for a deck. Call when starting a game. */
@@ -190,6 +210,31 @@ export function migrateDeckMeta(oldName: string, newName: string): void {
   delete store[oldName];
   saveMetadataStore(store);
   notifyDecksChanged();
+}
+
+/** The first of `baseName`, `candidate(2)`, `candidate(3)`, … not in `takenNames`. */
+export function uniqueDeckName(
+  baseName: string,
+  takenNames: Iterable<string>,
+  candidate: (index: number) => string = (index) => `${baseName} ${index}`,
+): string {
+  const taken = new Set(takenNames);
+  if (!taken.has(baseName)) return baseName;
+  for (let i = 2; ; i++) {
+    const next = candidate(i);
+    if (!taken.has(next)) return next;
+  }
+}
+
+/** Move a saved deck from `oldName` to `newName`: removes `oldName`'s data, carries its metadata
+ *  (`migrateDeckMeta`), and repoints the active deck. The caller writes `newName`'s data. */
+export function moveSavedDeck(oldName: string, newName: string): void {
+  if (oldName === newName) return;
+  localStorage.removeItem(STORAGE_KEY_PREFIX + oldName);
+  migrateDeckMeta(oldName, newName);
+  if (localStorage.getItem(ACTIVE_DECK_KEY) === oldName) {
+    localStorage.setItem(ACTIVE_DECK_KEY, newName);
+  }
 }
 
 /** Assign a deck to a folder, or pass `null` to move it to Unfiled. */
@@ -247,6 +292,43 @@ export function listSavedDeckNames(): string[] {
     }
   }
   return names.sort();
+}
+
+/** Write a draft autosave into `slot` and return the deck name used. Overwrites only the deck carrying
+ *  `slot`, moving it to the first free name among `label`, `label (2)`, …; never overwrites another deck. */
+export function writeDraftAutosaveDeck(slot: DraftAutosaveSlot, label: string, data: string): string {
+  const store = loadMetadataStore();
+  const owners = Object.entries(store)
+    .filter(([name, meta]) => meta.autosaveSlot === slot && localStorage.getItem(STORAGE_KEY_PREFIX + name) !== null)
+    .map(([name]) => name)
+    .sort();
+  const current = owners.includes(label) ? label : owners[0];
+  const name = uniqueDeckName(
+    label,
+    listSavedDeckNames().filter((n) => n !== current),
+    (i) => `${label} (${i})`,
+  );
+
+  // Write the data first: if this throws (e.g. quota), nothing else has changed.
+  localStorage.setItem(STORAGE_KEY_PREFIX + name, data);
+
+  if (current !== undefined && current !== name) {
+    moveSavedDeck(current, name);
+  }
+
+  const nextStore = loadMetadataStore();
+  // An orphaned marker at `name` (no deck key, so not an owner) must not carry its stale metadata forward
+  // when there is no owner to move: this write starts a fresh entry, not a continuation of that orphan.
+  nextStore[name] = current === undefined
+    ? { addedAt: Date.now(), autosaveSlot: slot }
+    : { ...nextStore[name], addedAt: nextStore[name]?.addedAt ?? Date.now(), autosaveSlot: slot };
+  for (const other of owners) {
+    if (other === current) continue;
+    delete nextStore[other]?.autosaveSlot;
+  }
+  saveMetadataStore(nextStore);
+
+  return name;
 }
 
 // --- Folder registry helpers ---

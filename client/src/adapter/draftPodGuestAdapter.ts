@@ -49,6 +49,7 @@ export type DraftPodGuestEvent =
   | { type: "viewUpdated"; view: DraftPlayerView }
   | { type: "pickAcknowledged"; view: DraftPlayerView }
   | { type: "deckSubmissionAcknowledged"; submissionId: string; view: DraftPlayerView }
+  | { type: "recoveredDeckSubmissionAccepted"; mainDeck: string[]; commanders: string[]; view: DraftPlayerView }
   | { type: "lobbyUpdate"; seats: SeatPublicView[]; joined: number; total: number }
   | { type: "draftPaused"; reason: DraftPauseReason }
   | { type: "draftResumed" }
@@ -286,6 +287,17 @@ export class DraftPodGuestAdapter {
         this.emit({
           type: "deckSubmissionAcknowledged",
           submissionId: event.submissionId,
+          view: event.view,
+        });
+        break;
+      // A pure re-emit, deliberately unlike the arms above: no caller of this
+      // adapter is awaiting the submission that produced it, so there is no
+      // view to install as current.
+      case "recoveredDeckSubmissionAccepted":
+        this.emit({
+          type: "recoveredDeckSubmissionAccepted",
+          mainDeck: event.mainDeck,
+          commanders: event.commanders,
           view: event.view,
         });
         break;

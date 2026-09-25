@@ -1,12 +1,14 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import {
+  ACTIVE_DECK_KEY,
   createFolder,
   deleteFolder,
   DRAFT_WORKSPACE_PREFERENCES_KEY,
   getDeckMeta,
   isUserOwnedStorageKey,
   listFolders,
+  listSavedDeckNames,
   loadSavedDeck,
   loadSavedDeckBracket,
   loadSavedDeckFormat,
@@ -17,6 +19,8 @@ import {
   stampDeckMeta,
   toggleDeckStar,
   touchDeckPlayed,
+  uniqueDeckName,
+  writeDraftAutosaveDeck,
   STORAGE_KEY_PREFIX,
 } from "../storage";
 import { expandParsedDeck } from "../../services/deckParser";
@@ -324,5 +328,137 @@ describe("touchDeckPlayed preserves organization", () => {
     expect(meta.folderId).toBe(folder.id);
     expect(meta.starred).toBe(true);
     expect(typeof meta.lastPlayedAt).toBe("number");
+  });
+});
+
+describe("uniqueDeckName", () => {
+  it("keeps the import suffix and accepts a custom candidate", () => {
+    expect(uniqueDeckName("X", ["X"])).toBe("X 2");
+    expect(uniqueDeckName("X", ["X"], (i) => `X (${i})`)).toBe("X (2)");
+    expect(uniqueDeckName("Fresh", [])).toBe("Fresh");
+  });
+});
+
+describe("draft autosave ownership", () => {
+  it("creates the slot deck on the first autosave", () => {
+    const name = writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", "deck-data-1");
+    expect(name).toBe("[Autosave] Sealed");
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + name)).toBe("deck-data-1");
+    expect(getDeckMeta(name)?.autosaveSlot).toBe("Sealed");
+  });
+
+  it("never overwrites an unmarked deck occupying the label", () => {
+    localStorage.setItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed", "user-deck");
+    stampDeckMeta("[Autosave] Sealed");
+
+    const name = writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", "autosave-data");
+
+    expect(name).toBe("[Autosave] Sealed (2)");
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed")).toBe("user-deck");
+    expect(getDeckMeta("[Autosave] Sealed")?.autosaveSlot).toBeUndefined();
+    expect(getDeckMeta(name)?.autosaveSlot).toBe("Sealed");
+  });
+
+  it("skips every taken suffix", () => {
+    localStorage.setItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed", "user-deck");
+    stampDeckMeta("[Autosave] Sealed");
+    localStorage.setItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed (2)", "user-deck-2");
+    stampDeckMeta("[Autosave] Sealed (2)");
+
+    const name = writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", "autosave-data");
+
+    expect(name).toBe("[Autosave] Sealed (3)");
+  });
+
+  it("overwrites the marked deck in place on a repeat autosave", () => {
+    const first = writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", "data-1");
+    const second = writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", "data-2");
+
+    expect(second).toBe(first);
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + first)).toBe("data-2");
+    expect(getDeckMeta(first)?.autosaveSlot).toBe("Sealed");
+    expect(listSavedDeckNames()).toEqual([first]);
+  });
+
+  it("moves a marked deck to the freed label, carrying folder, star, and the active pointer", () => {
+    localStorage.setItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed (2)", "data-1");
+    const folder = createFolder("Drafts")!;
+    const store = JSON.parse(localStorage.getItem("phase-deck-metadata") ?? "{}");
+    store["[Autosave] Sealed (2)"] = { addedAt: 1, autosaveSlot: "Sealed", folderId: folder.id, starred: true };
+    localStorage.setItem("phase-deck-metadata", JSON.stringify(store));
+    localStorage.setItem(ACTIVE_DECK_KEY, "[Autosave] Sealed (2)");
+
+    const name = writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", "data-2");
+
+    expect(name).toBe("[Autosave] Sealed");
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed (2)")).toBeNull();
+    const meta = getDeckMeta(name)!;
+    expect(meta.folderId).toBe(folder.id);
+    expect(meta.starred).toBe(true);
+    expect(meta.autosaveSlot).toBe("Sealed");
+    expect(localStorage.getItem(ACTIVE_DECK_KEY)).toBe(name);
+  });
+
+  it("keeps a single owner per slot, clearing the marker on the other", () => {
+    localStorage.setItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed", "data-a");
+    stampDeckMeta("[Autosave] Sealed");
+    localStorage.setItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed", "");
+    // Mark two decks with the same slot directly, bypassing the writer.
+    const store = JSON.parse(localStorage.getItem("phase-deck-metadata") ?? "{}");
+    store["[Autosave] Sealed"] = { addedAt: 1, autosaveSlot: "Sealed" };
+    store["Other Sealed Deck"] = { addedAt: 2, autosaveSlot: "Sealed" };
+    localStorage.setItem("phase-deck-metadata", JSON.stringify(store));
+    localStorage.setItem(STORAGE_KEY_PREFIX + "Other Sealed Deck", "data-b");
+
+    const name = writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", "data-new");
+
+    expect(name).toBe("[Autosave] Sealed");
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Other Sealed Deck")).toBe("data-b");
+    expect(getDeckMeta("Other Sealed Deck")?.autosaveSlot).toBeUndefined();
+    expect(getDeckMeta(name)?.autosaveSlot).toBe("Sealed");
+  });
+
+  it("does not treat an orphaned marker (no deck key) as an owner", () => {
+    const store = JSON.parse(localStorage.getItem("phase-deck-metadata") ?? "{}");
+    store["[Autosave] Sealed"] = { addedAt: 1, autosaveSlot: "Sealed", folderId: "stale-folder" };
+    localStorage.setItem("phase-deck-metadata", JSON.stringify(store));
+
+    const name = writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", "fresh-data");
+
+    expect(name).toBe("[Autosave] Sealed");
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + name)).toBe("fresh-data");
+    expect(getDeckMeta(name)?.folderId).toBeUndefined();
+    expect(getDeckMeta(name)?.autosaveSlot).toBe("Sealed");
+  });
+
+  it("stamping a marked deck clears only the marker", () => {
+    writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", "data-1");
+    const folder = createFolder("Kept")!;
+    setDeckFolder("[Autosave] Sealed", folder.id);
+
+    stampDeckMeta("[Autosave] Sealed");
+
+    const meta = getDeckMeta("[Autosave] Sealed")!;
+    expect(meta.autosaveSlot).toBeUndefined();
+    expect(meta.folderId).toBe(folder.id);
+  });
+
+  it("play, folder, and star mutations keep the marker", () => {
+    writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", "data-1");
+    const folder = createFolder("Kept")!;
+
+    touchDeckPlayed("[Autosave] Sealed");
+    setDeckFolder("[Autosave] Sealed", folder.id);
+    toggleDeckStar("[Autosave] Sealed");
+
+    expect(getDeckMeta("[Autosave] Sealed")?.autosaveSlot).toBe("Sealed");
+  });
+
+  it("does not cross autosave slots", () => {
+    writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", "sealed-data");
+    writeDraftAutosaveDeck("Quick", "[Autosave] Quick Draft", "quick-data");
+
+    expect(getDeckMeta("[Autosave] Sealed")?.autosaveSlot).toBe("Sealed");
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed")).toBe("sealed-data");
   });
 });

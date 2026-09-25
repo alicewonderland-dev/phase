@@ -1,4 +1,4 @@
-import { STORAGE_KEY_PREFIX } from "../constants/storage";
+import { clearDeckAutosaveMarker, STORAGE_KEY_PREFIX } from "../constants/storage";
 import type { DeckEntry } from "../hooks/useDecks";
 import type { ParsedDeck } from "./deckParser";
 
@@ -25,4 +25,5 @@ export function preconExists(savedName: string): boolean {
 export function savePreconDeck(savedName: string, deck: DeckEntry): void {
   const parsed = preconDeckEntryToParsedDeck(deck);
   localStorage.setItem(STORAGE_KEY_PREFIX + savedName, JSON.stringify(parsed));
+  clearDeckAutosaveMarker(savedName);
 }

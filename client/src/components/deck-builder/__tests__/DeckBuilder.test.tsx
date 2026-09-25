@@ -14,6 +14,7 @@ import {
   getDeckMeta,
   setDeckFolder,
   toggleDeckStar,
+  writeDraftAutosaveDeck,
 } from "../../../constants/storage";
 import { useAppNotificationStore } from "../../../stores/appToastStore";
 
@@ -369,6 +370,111 @@ describe("DeckBuilder", () => {
     expect(meta?.folderId).toBe(folder.id);
     expect(meta?.starred).toBe(true);
     expect(getDeckMeta("Old Deck")).toBeNull();
+  });
+
+  it("makes an edited autosave a user deck, freeing its slot for the next autosave", async () => {
+    const user = userEvent.setup();
+    writeDraftAutosaveDeck(
+      "Sealed",
+      "[Autosave] Sealed",
+      JSON.stringify({
+        main: [{ name: "Lightning Bolt", count: 1 }],
+        sideboard: [],
+        format: "Limited",
+      }),
+    );
+
+    render(
+      <DeckBuilder
+        format="Limited"
+        onFormatChange={vi.fn()}
+        initialDeckName="[Autosave] Sealed"
+        searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+        onSearchFiltersChange={vi.fn()}
+        onResetSearch={vi.fn()}
+      />,
+    );
+
+    const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+    await waitFor(() => expect(nameInput).toHaveValue("[Autosave] Sealed"));
+    await user.click(await screen.findByRole("button", { name: "remove-Lightning Bolt" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(getDeckMeta("[Autosave] Sealed")?.autosaveSlot).toBeUndefined());
+    const persisted = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed") ?? "{}");
+    expect(persisted.main).toEqual([]);
+
+    const nextAutosaveName = writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", "fresh-autosave-data");
+    expect(nextAutosaveName).toBe("[Autosave] Sealed (2)");
+    // The user's edit at the original name is untouched by the new autosave.
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed") ?? "{}").main).toEqual([]);
+  });
+
+  it("makes a renamed autosave a user deck, carrying its folder", async () => {
+    const user = userEvent.setup();
+    writeDraftAutosaveDeck(
+      "Sealed",
+      "[Autosave] Sealed",
+      JSON.stringify({
+        main: [{ name: "Lightning Bolt", count: 4 }],
+        sideboard: [],
+        format: "Limited",
+      }),
+    );
+    const folder = createFolder("Drafts")!;
+    setDeckFolder("[Autosave] Sealed", folder.id);
+
+    render(
+      <DeckBuilder
+        format="Limited"
+        onFormatChange={vi.fn()}
+        initialDeckName="[Autosave] Sealed"
+        searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+        onSearchFiltersChange={vi.fn()}
+        onResetSearch={vi.fn()}
+      />,
+    );
+
+    const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+    await waitFor(() => expect(nameInput).toHaveValue("[Autosave] Sealed"));
+    await user.clear(nameInput);
+    await user.type(nameInput, "My Sealed");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(localStorage.getItem(STORAGE_KEY_PREFIX + "My Sealed")).not.toBeNull());
+    const meta = getDeckMeta("My Sealed");
+    expect(meta?.autosaveSlot).toBeUndefined();
+    expect(meta?.folderId).toBe(folder.id);
+  });
+
+  it("claims an autosave's name for a fresh deck saved under it", async () => {
+    const user = userEvent.setup();
+    writeDraftAutosaveDeck(
+      "Sealed",
+      "[Autosave] Sealed",
+      JSON.stringify({
+        main: [{ name: "Lightning Bolt", count: 4 }],
+        sideboard: [],
+        format: "Limited",
+      }),
+    );
+
+    render(
+      <DeckBuilder
+        format="Standard"
+        onFormatChange={vi.fn()}
+        searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+        onSearchFiltersChange={vi.fn()}
+        onResetSearch={vi.fn()}
+      />,
+    );
+
+    const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+    // user-event's `type` treats `[`/`]` as special-key syntax; `{[}`/`{]}` type the literal characters.
+    await user.type(nameInput, "{[}Autosave{]} Sealed");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(getDeckMeta("[Autosave] Sealed")?.autosaveSlot).toBeUndefined());
   });
 
   it("warns about unsaved changes when leaving after an edit", async () => {

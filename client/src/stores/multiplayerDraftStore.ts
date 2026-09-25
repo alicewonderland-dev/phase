@@ -27,6 +27,7 @@ import type { DraftCommanderLaunch, DraftMatchDeckPayload, DraftMatchLaunch, Dra
 import { MAX_MATERIALIZED_VIRTUAL_BASICS } from "../components/draft/workspace/types";
 import type { DraftCardPlacement, DraftWorkspaceState } from "../components/draft/workspace/types";
 import { BASIC_LAND_NAMES } from "../constants/game";
+import { autosaveDraftDeck } from "../services/draftDeckAutosave";
 import {
   appendWorkspaceInstanceToResolvedDestination,
   createDraftWorkspaceState,
@@ -2011,6 +2012,7 @@ export const useMultiplayerDraftStore = create<
           submittedPartition: partition,
         },
       });
+      autosaveDraftDeck({ view, setCode: null, mainDeck: partition.mainDeck, commanders });
     } else if (role === "guest" && activeGuestAdapter) {
       await activeGuestAdapter.submitDeck(partition.mainDeck, commanders);
       set({
@@ -2018,6 +2020,7 @@ export const useMultiplayerDraftStore = create<
         submittedWorkspaceState: cloneWorkspace(workspace),
         submittedPartition: partition,
       });
+      autosaveDraftDeck({ view, setCode: null, mainDeck: partition.mainDeck, commanders });
     }
   },
 
@@ -3447,6 +3450,9 @@ function handleGuestEvent(event: DraftPodGuestEvent, set: SetFn): void {
       break;
     case "bo3ScoreUpdate":
       // Informational — standings update comes via viewUpdated
+      break;
+    case "recoveredDeckSubmissionAccepted":
+      autosaveDraftDeck({ view: event.view, setCode: null, mainDeck: event.mainDeck, commanders: event.commanders });
       break;
   }
 }
