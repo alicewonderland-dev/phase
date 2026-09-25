@@ -68,9 +68,7 @@ path = "src/bin/ai_gate.rs"
 
 [[bin]]
 name = "ai-perf-gate"
-# No `test = false`: that key suppresses a bin's unittest target entirely, so it belongs only on a
-# bin with no `#[cfg(test)]` code. This one carries unit tests over the argument parser, child-sample
-# forwarding and provenance scoping.
+# No `test = false`: this bin carries unit tests.
 path = "src/bin/ai_perf_gate.rs"
 
 [[bin]]
