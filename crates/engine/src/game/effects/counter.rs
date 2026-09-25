@@ -306,9 +306,6 @@ pub fn resolve(
     Ok(())
 }
 
-/// CR 701.6a: the spells or abilities a `Counter` node counters. Shared by
-/// `resolve` and `stack_reach`, so a pending node is read with the resolver's
-/// own binding.
 /// The stack entry `resolve` removes for a countered `obj_id`: the most recently
 /// pushed entry whose id (a spell) or source (an ability) is `obj_id`.
 pub(super) fn countered_stack_index(state: &GameState, obj_id: ObjectId) -> Option<usize> {
@@ -318,6 +315,9 @@ pub(super) fn countered_stack_index(state: &GameState, obj_id: ObjectId) -> Opti
         .rposition(|e| e.id == obj_id || e.source_id == obj_id)
 }
 
+/// CR 701.6a: the spells or abilities a `Counter` node counters. Shared by
+/// `resolve` and `stack_reach`, so a pending node is read with the resolver's
+/// own binding.
 pub(super) fn countered_targets(state: &GameState, ability: &ResolvedAbility) -> Vec<TargetRef> {
     match &ability.effect {
         Effect::Counter { target, .. } if matches!(target, TargetFilter::ParentTarget) => {

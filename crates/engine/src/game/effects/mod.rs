@@ -13713,7 +13713,7 @@ fn reset_top_level_resolution_state(state: &mut GameState) {
     // coalesce into a single tracked set, while unrelated resolutions
     // stay isolated.
     state.chain_tracked_set_id = None;
-    // CR 700.2: the edge latch for the mode boundary below. It is cleared
+    // CR 700.2: the edge latch for the mode boundary in `resolve_ability_chain`. It is cleared
     // HERE, in the same line group as `chain_tracked_set_id`, and that
     // ADJACENCY IS LOAD-BEARING: the latch means "the chain set has already
     // been cleared for this mode", so a prelude that cleared one without the
@@ -17672,7 +17672,7 @@ fn resolved_unless_cost(
         // permanent (Pendrell Flux, Disruption Aura). An absent source or a
         // costless source (land, token, other permanent with no mana cost)
         // resolves to `ManaCost::NoCost`, which CR 118.6 / CR 202.1b define
-        // as an UNPAYABLE cost; the dedicated unpayable branch below handles
+        // as an UNPAYABLE cost; the dedicated unpayable branch in `resolve_chain_body` handles
         // it (kept distinct from the `{0}` "always payable" short-circuit).
         AbilityCost::Mana {
             cost: ManaCost::SelfManaCost,
