@@ -4,9 +4,9 @@
 //! regressions: a change that doubles the number of `GameState` clones, static
 //! sweeps, or mana display sweeps per AI decision produces the identical game
 //! outcome and therefore passes the paired-seed comparison. This module closes
-//! that gap by running a fixed, seeded, action-capped prefix of the three
-//! quick-gate mirror matchups, field-wise summing the engine's
-//! [`PerfCounterSnapshot`] across the three scenarios, and comparing the integer
+//! that gap by running a fixed, seeded, action-capped prefix of the selected
+//! scenarios ([`default_scenarios`] unless overridden), field-wise summing the
+//! engine's [`PerfCounterSnapshot`] across them, and comparing the integer
 //! counter payload against a committed baseline.
 //!
 //! **Guarantee.** The gate compares the **per-counter median over K independent
@@ -52,7 +52,7 @@
 //! (`--refresh-baseline`), which prints the baseline-vs-current diff before
 //! overwriting — never a blind widen.
 //!
-//! That stamp covers **only the card-data entries [`default_scenarios`]'s decks
+//! That stamp covers **only the card-data entries the run's scenario decks
 //! actually name**, not the whole file (`ai_perf_gate::gate_card_data_hash`).
 //! `card-data.json` is derived from both MTGJSON and the Oracle parser, so a
 //! whole-file hash moved on every set release and every parser change while this
@@ -112,8 +112,7 @@ pub const PERF_REPRO_VALIDATION_RUNS: usize = 25;
 pub const PERF_REPRO_MARGIN_FRACTION: f64 = 0.5;
 
 /// Fixed base seed for every perf scenario. A compile-time constant (not a CLI
-/// flag) so the gate can never be run with a workload that mismatches the
-/// baseline; the [`compare`] workload guard rejects a baseline generated under a
+/// flag); the [`compare`] workload guard rejects a baseline generated under a
 /// different seed.
 pub const PERF_BASE_SEED: u64 = 0x9E37_79B9;
 
@@ -137,6 +136,51 @@ const PERF_ABSOLUTE_FLOOR: u64 = 64;
 /// and each id is verified to resolve via [`find_matchup`] at suite run time.
 pub fn default_scenarios() -> Vec<&'static str> {
     vec!["red-mirror", "affinity-mirror", "enchantress-mirror"]
+}
+
+/// A requested perf scenario selection could not be resolved into a runnable
+/// workload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScenarioSelectionError {
+    /// The selection names no scenario, so the run would measure nothing.
+    Empty,
+    /// The id is not a matchup id.
+    Unknown(String),
+}
+
+impl std::fmt::Display for ScenarioSelectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScenarioSelectionError::Empty => write!(
+                f,
+                "the scenario selection is empty — a run over no scenarios measures nothing"
+            ),
+            ScenarioSelectionError::Unknown(id) => write!(
+                f,
+                "unknown perf scenario id '{id}' — not a matchup id (`ai-duel --list-matchups` lists them)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ScenarioSelectionError {}
+
+/// Resolve requested scenario ids through [`find_matchup`], preserving request order.
+/// Every id must resolve and the list must be non-empty: an id that failed to resolve and
+/// was dropped anyway would shrink the run, and the smaller run could pass.
+pub fn resolve_scenarios<S: AsRef<str>>(
+    ids: &[S],
+) -> Result<Vec<&'static str>, ScenarioSelectionError> {
+    if ids.is_empty() {
+        return Err(ScenarioSelectionError::Empty);
+    }
+    ids.iter()
+        .map(|id| {
+            find_matchup(id.as_ref())
+                .map(|spec| spec.id)
+                .ok_or_else(|| ScenarioSelectionError::Unknown(id.as_ref().to_string()))
+        })
+        .collect()
 }
 
 /// Field-wise integer counter payload, keyed by counter name. A `BTreeMap` for
@@ -423,7 +467,7 @@ pub fn run_perf_suite(
             .unwrap_or_else(|err| panic!("perf scenario '{id}' failed to resolve decks: {err}"));
         // Progress goes to STDERR only: the parent gate runs its children with
         // `Stdio::null()` on stdout precisely so its own markdown table stays clean
-        // (`bin/ai_perf_gate.rs:185`), and stderr is inherited so these lines reach
+        // (`ai_perf_gate::run_parent_gate`), and stderr is inherited so these lines reach
         // the CI log. Without them a killed sample leaves no evidence at all — the
         // report is written once, after every scenario has finished.
         let scenario_start = Instant::now();
@@ -466,10 +510,8 @@ pub fn run_perf_suite(
 /// cannot move the aggregate. The result's counters need not equal any single
 /// real trajectory — this gate compares aggregate COST LEVELS, not a replayed game.
 ///
-/// Panics (internal invariant, not a runtime input path) if `samples` is empty or
-/// the samples disagree on any workload field — every sample is produced by the
-/// same binary at the same const workload, so disagreement is a bug. Provenance
-/// (git_sha, card_data_hash) is left None for the caller to stamp.
+/// Panics if `samples` is empty or the samples disagree on any workload field.
+/// Provenance (git_sha, card_data_hash) is left None for the caller to stamp.
 pub fn median_report(samples: &[PerfReport]) -> PerfReport {
     assert!(
         !samples.is_empty(),
@@ -483,8 +525,7 @@ pub fn median_report(samples: &[PerfReport]) -> PerfReport {
         );
         assert_eq!(s.base_seed, first.base_seed, "sample seed mismatch");
         assert_eq!(s.action_cap, first.action_cap, "sample action_cap mismatch");
-        // Order-sensitive: samples come from the same const `default_scenarios()`, so this is
-        // an internal invariant rather than a runtime input path.
+        // Order-sensitive.
         assert_eq!(s.scenarios, first.scenarios, "sample scenario mismatch");
     }
     // All samples share an identical key set (from_snapshot is a total destructure).
@@ -1279,6 +1320,29 @@ mod tests {
                 "perf scenario id '{id}' no longer resolves via find_matchup"
             );
         }
+    }
+
+    #[test]
+    fn an_unknown_scenario_id_is_refused_not_dropped() {
+        assert_eq!(
+            resolve_scenarios(&["azorius-vs-prowess", "no-such-matchup"]),
+            Err(ScenarioSelectionError::Unknown(
+                "no-such-matchup".to_string()
+            ))
+        );
+        // paired positive: a fully-resolving list round-trips in request order.
+        assert_eq!(
+            resolve_scenarios(&["azorius-vs-prowess", "red-mirror"]),
+            Ok(vec!["azorius-vs-prowess", "red-mirror"])
+        );
+    }
+
+    #[test]
+    fn an_empty_scenario_selection_is_refused() {
+        assert_eq!(
+            resolve_scenarios::<&str>(&[]),
+            Err(ScenarioSelectionError::Empty)
+        );
     }
 
     // Matrix 9 (reframed — addendum r1 Decision 1): a NON-asserting in-process

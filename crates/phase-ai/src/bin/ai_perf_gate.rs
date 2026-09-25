@@ -1,14 +1,13 @@
 //! Deterministic decision-cost regression gate.
 //!
-//! Runs the three quick-gate mirror matchups through a fixed seeded action-cap
-//! prefix, field-wise sums the engine perf counters, and compares the integer
-//! payload against a committed baseline. Catches cost-per-decision regressions
-//! (clone storms, quadratic combat scans, display sweeps in search) that the
-//! win-rate `cargo ai-gate` is structurally blind to.
+//! Runs the `default_scenarios` matchups, or the `--scenario` selection, through
+//! a fixed seeded action-cap prefix, field-wise sums the engine perf counters,
+//! and compares the integer payload against a committed baseline. Catches
+//! cost-per-decision regressions (clone storms, quadratic combat scans, display
+//! sweeps in search) that the win-rate `cargo ai-gate` is structurally blind to.
 //!
 //! Workload (seed, action_cap) is fixed by compile-time consts in
-//! `duel_suite::perf`, never flags, so the gate can never run against a workload
-//! that mismatches the baseline.
+//! `duel_suite::perf`, never flags.
 //!
 //! Individual trajectories are NOT cross-process deterministic — engine
 //! HashSet/HashMap iteration order leaks per-process RandomState into AI
@@ -26,6 +25,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -34,8 +34,8 @@ use std::process::{Command, Stdio};
 use engine::database::CardDatabase;
 use phase_ai::duel_suite::perf::{
     compare, default_scenarios, load_report, median_report, print_markdown, print_repro_margin,
-    render_error_markdown, repro_margin_report, run_perf_suite, PerfReport, PERF_ACTION_CAP,
-    PERF_BASE_SEED, PERF_SAMPLE_COUNT,
+    render_error_markdown, repro_margin_report, resolve_scenarios, run_perf_suite, PerfReport,
+    PERF_ACTION_CAP, PERF_BASE_SEED, PERF_SAMPLE_COUNT,
 };
 use phase_ai::duel_suite::{find_matchup, resolve_deck_ref};
 
@@ -49,6 +49,7 @@ const DEFAULT_CURRENT: &str = "target/ai-perf-gate-current.json";
 /// identical spawn — this binary just never got the fix applied.
 const PERF_THREAD_STACK_SIZE: usize = 32 << 20;
 
+#[derive(Debug)]
 struct Args {
     data_root: PathBuf,
     baseline: PathBuf,
@@ -61,10 +62,12 @@ struct Args {
     repro_report: bool,
     /// Internal: the validation-run reports the margin gate aggregates (repeatable).
     repro_inputs: Vec<PathBuf>,
+    /// The scenario list passed to `run_perf_suite`; defaults to `default_scenarios()`.
+    scenarios: Vec<&'static str>,
 }
 
 fn main() {
-    let args = match parse_args() {
+    let args = match parse_args(std::env::args().skip(1)) {
         Ok(args) => args,
         Err(message) => {
             if !message.is_empty() {
@@ -75,24 +78,9 @@ fn main() {
         }
     };
 
-    // Branch 1 — child: load the DB, emit ONE single-trajectory sample to the
-    // file, exit. Emits NOTHING on stdout (GAP 4) so the parent's stdout stays a
-    // clean table; diagnostics go to stderr only. Runs on a large-stack thread
-    // (see `PERF_THREAD_STACK_SIZE`) since the AI search recurses past the
-    // platform default; an unhandled panic there would otherwise unwind only
-    // the spawned thread and exit 0 silently, so a join failure is mapped to
-    // exit 101 (mirrors `ai_commander.rs`'s identical convention).
-    if let Some(sample_path) = &args.emit_sample {
-        let data_root = args.data_root.clone();
-        let sample_path = sample_path.clone();
-        let handle = std::thread::Builder::new()
-            .name("ai-perf-gate-sample".to_string())
-            .stack_size(PERF_THREAD_STACK_SIZE)
-            .spawn(move || run_child_sample(&data_root, &sample_path))
-            .expect("failed to spawn perf-sample thread");
-        if handle.join().is_err() {
-            std::process::exit(101);
-        }
+    // Branch 1 — child: load the DB, emit ONE single-trajectory sample, exit.
+    if args.emit_sample.is_some() {
+        run_child(&args);
         return;
     }
 
@@ -107,9 +95,34 @@ fn main() {
     run_parent_gate(&args);
 }
 
+/// Branch 1 dispatch: load the DB, emit ONE single-trajectory sample to the
+/// file, exit. Emits NOTHING on stdout (GAP 4) so the parent's stdout stays a
+/// clean table; diagnostics go to stderr only. Runs on a large-stack thread
+/// (see `PERF_THREAD_STACK_SIZE`) since the AI search recurses past the
+/// platform default; an unhandled panic there would otherwise unwind only
+/// the spawned thread and exit 0 silently, so a join failure is mapped to
+/// exit 101 (mirrors `ai_commander.rs`'s identical convention). Split out of
+/// `main` so `main` names no scenario list anywhere.
+fn run_child(args: &Args) {
+    let data_root = args.data_root.clone();
+    let sample_path = args
+        .emit_sample
+        .clone()
+        .expect("run_child requires emit_sample to be set");
+    let scenarios = args.scenarios.clone();
+    let handle = std::thread::Builder::new()
+        .name("ai-perf-gate-sample".to_string())
+        .stack_size(PERF_THREAD_STACK_SIZE)
+        .spawn(move || run_child_sample(&data_root, &sample_path, &scenarios))
+        .expect("failed to spawn perf-sample thread");
+    if handle.join().is_err() {
+        std::process::exit(101);
+    }
+}
+
 /// Branch 1: emit a single-trajectory sample report to `sample_path`. Loads the
 /// card DB (the only branch that does). Never writes stdout.
-fn run_child_sample(data_root: &Path, sample_path: &Path) {
+fn run_child_sample(data_root: &Path, sample_path: &Path, scenarios: &[&str]) {
     let db_path = data_root.join("card-data.json");
     let db = match CardDatabase::from_export(&db_path) {
         Ok(db) => db,
@@ -121,7 +134,7 @@ fn run_child_sample(data_root: &Path, sample_path: &Path) {
             std::process::exit(2);
         }
     };
-    let report = run_perf_suite(&db, PERF_BASE_SEED, PERF_ACTION_CAP, &default_scenarios());
+    let report = run_perf_suite(&db, PERF_BASE_SEED, PERF_ACTION_CAP, scenarios);
     if let Err(err) = write_report(&report, sample_path) {
         eprintln!(
             "failed to write sample report {}: {err}",
@@ -180,10 +193,7 @@ fn run_parent_gate(args: &Args) {
         // Registered BEFORE the spawn so every failure path below cleans it up.
         temp_paths.push(tmp_i.clone());
         let status = Command::new(&exe)
-            .arg("--emit-sample")
-            .arg(&tmp_i)
-            .arg("--data-root")
-            .arg(&args.data_root)
+            .args(child_sample_args(&tmp_i, &args.data_root, &args.scenarios))
             .stdout(Stdio::null()) // GAP 4: parent's stdout stays a clean table
             .stderr(Stdio::inherit()) // child diagnostics still visible in CI logs
             .status();
@@ -216,7 +226,7 @@ fn run_parent_gate(args: &Args) {
     let mut current = median_report(&samples);
     // Stamp provenance the parent can compute without loading the DB.
     current.git_sha = command_output("git", &["rev-parse", "--short=12", "HEAD"]);
-    current.card_data_hash = gate_card_data_hash(&args.data_root);
+    current.card_data_hash = gate_card_data_hash(&args.data_root, &args.scenarios);
 
     eprintln!(
         "perf suite: seed={} action_cap={} sample_count={} scenarios={:?} wall_clock={}ms",
@@ -287,6 +297,24 @@ fn run_parent_gate(args: &Args) {
     }
 }
 
+/// Build the argv the parent passes to an `--emit-sample` child: the sample and
+/// data-root paths, followed by one `--scenario ID` per requested scenario. The
+/// ids are ALWAYS forwarded, the defaults included, so the default CI run
+/// exercises the same argv-forwarding path as an override.
+fn child_sample_args(sample_path: &Path, data_root: &Path, scenarios: &[&str]) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        "--emit-sample".into(),
+        sample_path.into(),
+        "--data-root".into(),
+        data_root.into(),
+    ];
+    for id in scenarios {
+        args.push("--scenario".into());
+        args.push((*id).into());
+    }
+    args
+}
+
 /// Best-effort removal of the per-run temp sample files (ignore errors).
 fn cleanup_temps(paths: &[PathBuf]) {
     for path in paths {
@@ -294,40 +322,60 @@ fn cleanup_temps(paths: &[PathBuf]) {
     }
 }
 
-fn parse_args() -> Result<Args, String> {
+fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut data_root = std::env::var("PHASE_CARDS_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("data"));
-    let mut baseline = PathBuf::from(DEFAULT_BASELINE);
+    let mut baseline: Option<PathBuf> = None;
     let mut current_output = PathBuf::from(DEFAULT_CURRENT);
     let mut refresh_baseline = false;
     let mut emit_sample = None;
     let mut repro_report = false;
     let mut repro_inputs = Vec::new();
+    let mut requested: Option<Vec<String>> = None;
 
-    let mut iter = std::env::args().skip(1);
+    let mut iter = argv.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--data-root" => data_root = next_path(&mut iter, "--data-root")?,
-            "--baseline" => baseline = next_path(&mut iter, "--baseline")?,
+            "--baseline" => baseline = Some(next_path(&mut iter, "--baseline")?),
             "--current-output" => current_output = next_path(&mut iter, "--current-output")?,
             "--refresh-baseline" => refresh_baseline = true,
             "--emit-sample" => emit_sample = Some(next_path(&mut iter, "--emit-sample")?),
             "--repro-report" => repro_report = true,
             "--repro-input" => repro_inputs.push(next_path(&mut iter, "--repro-input")?),
+            "--scenario" => requested.get_or_insert_with(Vec::new).extend(
+                next_value(&mut iter, "--scenario")?
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string),
+            ),
             "--help" | "-h" => return Err(String::new()),
             _ => return Err(format!("unknown option: {arg}")),
         }
     }
 
+    if requested.is_some() && repro_report {
+        return Err("--scenario has no effect with --repro-report, which runs no suite".into());
+    }
+    if requested.is_some() && emit_sample.is_none() && !repro_report && baseline.is_none() {
+        return Err("--scenario requires an explicit --baseline PATH: a non-default scenario set cannot be compared against, or refreshed into, the committed baseline".into());
+    }
+    let scenarios = match &requested {
+        None => default_scenarios(),
+        Some(ids) => resolve_scenarios(ids).map_err(|e| format!("--scenario: {e}"))?,
+    };
+
     Ok(Args {
         data_root,
-        baseline,
+        baseline: baseline.unwrap_or_else(|| PathBuf::from(DEFAULT_BASELINE)),
         current_output,
         refresh_baseline,
         emit_sample,
         repro_report,
         repro_inputs,
+        scenarios,
     })
 }
 
@@ -378,12 +426,12 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
 /// `card_data_changed()` then reports false rather than inventing a delta. Every
 /// failure path announces itself on stderr — an unstamped run must not read as a
 /// clean one.
-fn gate_card_data_hash(data_root: &Path) -> Option<String> {
+fn gate_card_data_hash(data_root: &Path, scenarios: &[&str]) -> Option<String> {
     // DB-free by construction: `resolve_deck_ref` expands inline builders and
     // pinned snapshots without a `CardDatabase`, preserving this branch's
     // documented never-loads-the-DB property.
     let mut names = BTreeSet::new();
-    for id in default_scenarios() {
+    for id in scenarios {
         let Some(matchup) = find_matchup(id) else {
             eprintln!("provenance: scenario {id:?} does not resolve — card-data hash unstamped");
             return None;
@@ -456,7 +504,7 @@ fn gate_card_data_hash(data_root: &Path) -> Option<String> {
             "provenance: card-data hash covers {} of {} deck-named cards from scenarios {:?}",
             subset.len(),
             names.len(),
-            default_scenarios()
+            scenarios
         );
     }
     hash
@@ -475,6 +523,9 @@ fn print_usage() {
     eprintln!(
         "                          [--data-root DIR] [--baseline PATH] [--current-output PATH]"
     );
+    eprintln!(
+        "                          [--scenario ID[,ID...] (repeatable; requires --baseline)]"
+    );
     eprintln!();
     eprintln!("The gate runs PERF_SAMPLE_COUNT independent sample processes and compares the");
     eprintln!("per-counter median against the committed baseline (issue #4878).");
@@ -485,4 +536,217 @@ fn print_usage() {
         "  --repro-report       run the reproducibility MARGIN gate over --repro-input reports"
     );
     eprintln!("  --repro-input PATH   a validation-run report for --repro-report (repeatable)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A scratch dir per `tag`, pre-cleaned so a pid-reused leftover from a prior
+    /// failed run does not collide (mirrors `refresh_baseline_cli.rs::scratch`).
+    fn scratch(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ai-perf-gate-bin-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    /// A valid, empty card database (`{}` deserialises as a card-name→entry map with
+    /// no entries). Returns the data-root path.
+    fn empty_card_db(dir: &Path) -> PathBuf {
+        let root = dir.join("cards");
+        std::fs::create_dir_all(&root).expect("create data root");
+        std::fs::write(root.join("card-data.json"), "{}").expect("write card data");
+        root
+    }
+
+    #[test]
+    fn no_scenario_flag_selects_the_default_scenarios() {
+        let parsed = parse_args(args(&[])).expect("parse");
+        assert_eq!(parsed.scenarios, default_scenarios());
+        assert_eq!(parsed.baseline, PathBuf::from(DEFAULT_BASELINE));
+    }
+
+    #[test]
+    fn an_unknown_scenario_is_a_parse_error() {
+        let err = parse_args(args(&[
+            "--scenario",
+            "no-such-matchup",
+            "--baseline",
+            "b.json",
+        ]))
+        .expect_err("unknown scenario id must be a parse error");
+        assert!(
+            err.contains("no-such-matchup"),
+            "error should name the bad id, got: {err}"
+        );
+    }
+
+    #[test]
+    fn scenario_flags_accumulate_across_repeats_and_commas() {
+        let parsed = parse_args(args(&[
+            "--scenario",
+            "azorius-vs-prowess",
+            "--scenario",
+            "red-mirror, affinity-mirror",
+            "--baseline",
+            "b.json",
+        ]))
+        .expect("parse");
+        assert_eq!(
+            parsed.scenarios,
+            vec!["azorius-vs-prowess", "red-mirror", "affinity-mirror"]
+        );
+    }
+
+    #[test]
+    fn a_scenario_flag_naming_nothing_is_a_parse_error() {
+        parse_args(args(&["--scenario", "", "--baseline", "b.json"]))
+            .expect_err("an empty --scenario value must be a parse error");
+        parse_args(args(&["--scenario", " , ", "--baseline", "b.json"]))
+            .expect_err("a --scenario value with only blanks must be a parse error");
+    }
+
+    #[test]
+    fn a_scenario_selection_requires_an_explicit_baseline() {
+        let err = parse_args(args(&["--scenario", "red-mirror"]))
+            .expect_err("--scenario with no --baseline must be a parse error");
+        assert!(
+            err.contains("--baseline"),
+            "error should mention --baseline, got: {err}"
+        );
+        let err = parse_args(args(&["--scenario", "red-mirror", "--refresh-baseline"]))
+            .expect_err("--scenario with --refresh-baseline and no --baseline must be refused");
+        assert!(
+            err.contains("--baseline"),
+            "error should mention --baseline, got: {err}"
+        );
+        // paired positive: the same selection WITH --baseline parses fine.
+        parse_args(args(&["--scenario", "red-mirror", "--baseline", "b.json"])).expect("parse");
+    }
+
+    #[test]
+    fn a_scenario_selection_is_refused_with_repro_report() {
+        parse_args(args(&[
+            "--repro-report",
+            "--scenario",
+            "red-mirror",
+            "--baseline",
+            "b.json",
+        ]))
+        .expect_err("--scenario with --repro-report must be a parse error");
+        // paired positive: --repro-report alone (no --scenario) still parses.
+        parse_args(args(&["--repro-report", "--baseline", "b.json"])).expect("parse");
+    }
+
+    #[test]
+    fn child_sample_args_round_trip_the_scenario_list() {
+        let sample_path = PathBuf::from("/tmp/sample.json");
+        let data_root = PathBuf::from("/tmp/cards");
+        let raw = child_sample_args(&sample_path, &data_root, &["azorius-vs-prowess"]);
+        let strings: Vec<String> = raw
+            .into_iter()
+            .map(|s| s.into_string().expect("argv is UTF-8"))
+            .collect();
+        let parsed = parse_args(strings).expect("child argv must parse without --baseline");
+        assert_eq!(parsed.emit_sample, Some(sample_path.clone()));
+        assert_eq!(parsed.scenarios, vec!["azorius-vs-prowess"]);
+
+        // the same holds for the default scenario list.
+        let raw = child_sample_args(&sample_path, &data_root, &default_scenarios());
+        let strings: Vec<String> = raw
+            .into_iter()
+            .map(|s| s.into_string().expect("argv is UTF-8"))
+            .collect();
+        let parsed = parse_args(strings).expect("child argv must parse without --baseline");
+        assert_eq!(parsed.scenarios, default_scenarios());
+    }
+
+    #[test]
+    fn a_selected_scenario_reaches_run_perf_suite_in_place_of_the_defaults() {
+        let dir = scratch("b8");
+        let data_root = empty_card_db(&dir);
+        let sample_path = dir.join("sample.json");
+        let args = parse_args(args(&[
+            "--emit-sample",
+            sample_path.to_str().unwrap(),
+            "--data-root",
+            data_root.to_str().unwrap(),
+            "--scenario",
+            "azorius-vs-prowess",
+        ]))
+        .expect("parse");
+
+        run_child(&args);
+
+        let report = load_report(&sample_path).expect("child must write a readable report");
+        assert_eq!(report.scenarios, vec!["azorius-vs-prowess".to_string()]);
+        // Reach guard: proves the suite actually ran rather than writing an empty
+        // report. `azorius-vs-prowess` was not yet probed on a `{}` card DB
+        // before this test; the assertion below establishes it produces
+        // non-zero counters, the same shape as the default scenarios on `{}`.
+        assert!(
+            report.counters.0.values().any(|v| *v > 0),
+            "expected at least one non-zero perf counter, got {:?}",
+            report.counters
+        );
+    }
+
+    #[test]
+    fn the_provenance_hash_covers_only_the_selected_scenarios() {
+        // Pick one card name that appears only in red-mirror's decks and one that
+        // appears only in affinity-mirror's decks, so the two scenario selections
+        // stamp genuinely different card-data subsets.
+        let red = find_matchup("red-mirror").expect("red-mirror must resolve");
+        let affinity = find_matchup("affinity-mirror").expect("affinity-mirror must resolve");
+        let red_names: BTreeSet<String> = [&red.p0, &red.p1]
+            .into_iter()
+            .flat_map(|d| resolve_deck_ref(d).expect("resolve red-mirror deck"))
+            .map(|c| c.to_lowercase())
+            .collect();
+        let affinity_names: BTreeSet<String> = [&affinity.p0, &affinity.p1]
+            .into_iter()
+            .flat_map(|d| resolve_deck_ref(d).expect("resolve affinity-mirror deck"))
+            .map(|c| c.to_lowercase())
+            .collect();
+        let red_only = red_names
+            .difference(&affinity_names)
+            .next()
+            .expect("red-mirror must name a card affinity-mirror does not")
+            .clone();
+        let affinity_only = affinity_names
+            .difference(&red_names)
+            .next()
+            .expect("affinity-mirror must name a card red-mirror does not")
+            .clone();
+
+        let dir = scratch("b9");
+        let data_root = dir.join("cards");
+        std::fs::create_dir_all(&data_root).expect("create data root");
+        let mut db = serde_json::Map::new();
+        db.insert(red_only, serde_json::json!({}));
+        db.insert(affinity_only, serde_json::json!({}));
+        std::fs::write(
+            data_root.join("card-data.json"),
+            serde_json::to_string(&db).unwrap(),
+        )
+        .expect("write card data");
+
+        let red_hash = gate_card_data_hash(&data_root, &["red-mirror"]);
+        let affinity_hash = gate_card_data_hash(&data_root, &["affinity-mirror"]);
+        assert!(red_hash.is_some(), "red-mirror hash must be stamped");
+        assert!(
+            affinity_hash.is_some(),
+            "affinity-mirror hash must be stamped"
+        );
+        assert_ne!(
+            red_hash, affinity_hash,
+            "provenance hash must scope to the selected scenarios only"
+        );
+    }
 }
