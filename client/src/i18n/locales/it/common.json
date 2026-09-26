@@ -440,8 +440,5 @@
   },
   "savedDeckLibraryStorageFailure": {
     "description": "Phase non è riuscito ad accedere all'archiviazione del browser. Riprova in un momento."
-  },
-  "savedDeckAutosaveUnavailable": {
-    "description": "Il salvataggio automatico non è disponibile in questo contesto del browser."
   }
 }

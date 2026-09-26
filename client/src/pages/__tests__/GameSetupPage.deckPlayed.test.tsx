@@ -114,8 +114,7 @@ describe("GameSetupPage — deck-played tracking under a busy saved-deck library
     expect(await screen.findByTestId("nav-state")).toBeInTheDocument();
 
     // Let the deck-played write's own lock-wait timeout (20ms, set above) fire while
-    // this test is still running: if that write ever rejects, nothing catches it
-    // (it is `void`d), so an unhandled rejection here would fail this test.
+    // this test is still running, so an unhandled rejection would surface here.
     await new Promise((resolve) => setTimeout(resolve, 60));
 
     releaseHolder();

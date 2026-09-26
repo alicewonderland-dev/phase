@@ -25,8 +25,7 @@ export type ExistingDeckPolicy = "replace" | "keep";
  * Persist a preconstructed deck under the user's saved-decks namespace so it
  * participates in the normal deck-compatibility / active-deck / tile-render
  * flows without any precon-specific branching downstream. When `onExisting`
- * is `"keep"`, a deck already saved under `savedName` (created by another
- * writer while this one waited for the lock) is left untouched.
+ * is `"keep"`, a deck already saved under `savedName` is left untouched.
  */
 export function savePreconDeck(
   savedName: string,

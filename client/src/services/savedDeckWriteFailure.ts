@@ -32,8 +32,6 @@ const titleByAction: Record<SavedDeckWriteAction, () => string> = {
   applyCloud: () => i18n.t("savedDeckLibraryBusy.title.applyCloud"),
 };
 
-// D1: a lock refusal/timeout or a stale local view can self-heal by retrying; an IDB read or
-// write failure will not, so it gets its own description rather than the "close other tabs" text.
 const STORAGE_FAILURE_REASONS: ReadonlySet<SavedDeckTxnFailure> = new Set([
   "generation-unreadable",
   "generation-unpublished",
@@ -47,7 +45,9 @@ export function savedDeckLibraryStorageFailureDescription(): string {
   return i18n.t("savedDeckLibraryStorageFailure.description");
 }
 
-function busyOrStorageDescription(reason: SavedDeckTxnFailure): string {
+/** Single authority for choosing the busy vs. storage-failure description from a txn failure
+ *  reason — shared by the toast helpers here and by `cloudSyncStore`'s inline error text. */
+export function busyOrStorageDescription(reason: SavedDeckTxnFailure): string {
   return STORAGE_FAILURE_REASONS.has(reason)
     ? savedDeckLibraryStorageFailureDescription()
     : savedDeckLibraryBusyDescription();
@@ -59,16 +59,13 @@ export function notifySavedDeckLibraryBusy(action: SavedDeckWriteAction, reason?
 }
 
 /** A background draft autosave (never rejects; `reason` comes from its skipped result) was not
- *  written. Unlike a user write, "no lock manager at all" gets its own description: nothing the
- *  user can do (close other tabs) will fix it. */
+ *  written. `"lock-unavailable"` (no Web Locks API — non-secure origins only) is silent: every
+ *  submission on such an origin would otherwise toast, since there is no lock to ever acquire. */
 export function notifyDraftAutosaveSkipped(reason: SavedDeckTxnSkipReason): void {
-  const description =
-    reason === "lock-unavailable"
-      ? i18n.t("savedDeckAutosaveUnavailable.description")
-      : busyOrStorageDescription(reason);
+  if (reason === "lock-unavailable") return;
   useAppNotificationStore.getState().showNotification({
     title: i18n.t("savedDeckLibraryBusy.title.autosaveDraft"),
-    description,
+    description: busyOrStorageDescription(reason),
   });
 }
 

@@ -1566,5 +1566,25 @@ describe("cloud sync serialization", () => {
       releaseHolder();
       await holder;
     });
+
+    it("choosing the cloud copy while IDB is unreadable tells the user it's a storage failure, not a busy tab", async () => {
+      await readySignedIn();
+      useCloudSyncStore.setState({ conflict: remote(2), status: "conflict" });
+      provider.pullMeta.mockResolvedValue(meta(2));
+      provider.pull.mockResolvedValue(remote(2));
+      const transactionSpy = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(() => {
+        throw new Error("IDB unavailable");
+      });
+
+      await useCloudSyncStore.getState().resolveConflict("cloud");
+
+      expect(mocks.applyBackup).not.toHaveBeenCalled();
+      expect(useCloudSyncStore.getState().conflict).not.toBeNull();
+      expect(useAppNotificationStore.getState().notification?.description).toBe(
+        "Phase couldn't reach browser storage. Try again in a moment.",
+      );
+
+      transactionSpy.mockRestore();
+    });
   });
 });

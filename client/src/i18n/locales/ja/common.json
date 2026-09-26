@@ -440,8 +440,5 @@
   },
   "savedDeckLibraryStorageFailure": {
     "description": "Phaseはブラウザのストレージにアクセスできませんでした。しばらくしてから再試行してください。"
-  },
-  "savedDeckAutosaveUnavailable": {
-    "description": "このブラウザコンテキストでは自動保存を利用できません。"
   }
 }

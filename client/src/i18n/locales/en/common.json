@@ -440,8 +440,5 @@
   },
   "savedDeckLibraryStorageFailure": {
     "description": "Phase couldn't reach browser storage. Try again in a moment."
-  },
-  "savedDeckAutosaveUnavailable": {
-    "description": "Autosave isn't available in this browser context."
   }
 }

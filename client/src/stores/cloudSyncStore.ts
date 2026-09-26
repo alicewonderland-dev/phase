@@ -20,8 +20,8 @@ import {
 } from "../services/cloudSync";
 import { computeBackupDigest, summarizeBackupDiff, type ConflictDiffSummary } from "../services/cloudSync/backupDiff";
 import { watchUserStorage, withStorageWatchSuppressed } from "../services/cloudSync/storageWatcher";
-import { withSavedDeckLibraryOrSkip } from "../services/savedDeckTransaction";
-import { notifySavedDeckLibraryBusy, savedDeckLibraryBusyDescription } from "../services/savedDeckWriteFailure";
+import { withSavedDeckLibraryOrSkip, type SavedDeckTxnFailure } from "../services/savedDeckTransaction";
+import { busyOrStorageDescription, notifySavedDeckLibraryBusy } from "../services/savedDeckWriteFailure";
 import { getEffectiveOffline } from "./connectivityStore";
 import { usePreferencesStore } from "./preferencesStore";
 
@@ -255,7 +255,10 @@ async function pullCloudSnapshot(provider: CloudSyncProvider): Promise<RemoteSna
   return remote === null ? null : { ...remote, backup: projectCloudBackup(remote.backup) };
 }
 
-type ApplyOutcome = "applied" | "stale" | "busy";
+type ApplyOutcome =
+  | { status: "applied" }
+  | { status: "stale" }
+  | { status: "busy"; reason: SavedDeckTxnFailure };
 
 async function applyRemote(
   generation: Generation,
@@ -271,11 +274,13 @@ async function applyRemote(
     useCloudSyncStore.setState({ status: "synced", error: null, dirty: false, conflict: null, conflictDiff: null, lastSyncedRevision: remote.meta.revision, lastSyncedDigest: digest, lastSyncedAt: new Date().toISOString() });
     return true;
   }, "run-unguarded");
-  if (result.status === "skipped") return "busy";
-  if (!result.value) return "stale";
+  // "run-unguarded" never yields "lock-unavailable" — that variant is only for the "skip"
+  // policy — so the remaining reason is always a SavedDeckTxnFailure.
+  if (result.status === "skipped") return { status: "busy", reason: result.reason as SavedDeckTxnFailure };
+  if (!result.value) return { status: "stale" };
   void usePreferencesStore.persist.rehydrate();
   window.dispatchEvent(new CustomEvent(PROFILE_REPLACED_EVENT));
-  return "applied";
+  return { status: "applied" };
 }
 
 async function applyMerged(generation: Generation, auth: number, write: number, backup: PhaseBackup): Promise<ApplyOutcome> {
@@ -284,11 +289,11 @@ async function applyMerged(generation: Generation, auth: number, write: number, 
     withStorageWatchSuppressed(() => applyBackup(txn, backup, "overwrite"));
     return true;
   }, "run-unguarded");
-  if (result.status === "skipped") return "busy";
-  if (!result.value) return "stale";
+  if (result.status === "skipped") return { status: "busy", reason: result.reason as SavedDeckTxnFailure };
+  if (!result.value) return { status: "stale" };
   void usePreferencesStore.persist.rehydrate();
   window.dispatchEvent(new CustomEvent(PROFILE_REPLACED_EVENT));
-  return "applied";
+  return { status: "applied" };
 }
 
 function acknowledgePush(
@@ -396,8 +401,9 @@ async function reconcile(generation: Generation, preserveError = false): Promise
       } else if (localChanged) {
         publishConflict(generation, auth, write, local, remote);
       } else {
-        if ((await applyRemote(generation, auth, write, remote, remoteDigest)) === "busy") {
-          if (current(generation, auth)) useCloudSyncStore.setState({ status: "error", error: savedDeckLibraryBusyDescription() });
+        const outcome = await applyRemote(generation, auth, write, remote, remoteDigest);
+        if (outcome.status === "busy") {
+          if (current(generation, auth)) useCloudSyncStore.setState({ status: "error", error: busyOrStorageDescription(outcome.reason) });
           return;
         }
         restorePreservedAuthError(generation, auth, write, preserveError, oldError);
@@ -737,8 +743,9 @@ export const useCloudSyncStore = create<CloudSyncState>()(persist((set, get) => 
           }
           const remoteDigest = await computeBackupDigest(remote.backup);
           if (!current(generation, auth) || localWriteVersion !== write) return;
-          if ((await applyRemote(generation, auth, write, remote, remoteDigest)) === "busy") {
-            notifySavedDeckLibraryBusy("applyCloud");
+          const outcome = await applyRemote(generation, auth, write, remote, remoteDigest);
+          if (outcome.status === "busy") {
+            notifySavedDeckLibraryBusy("applyCloud", outcome.reason);
           }
           return;
         }
@@ -751,9 +758,9 @@ export const useCloudSyncStore = create<CloudSyncState>()(persist((set, get) => 
         const pushed = await generation.provider.push(next, conflict.meta.revision);
         if (!current(generation, auth)) return;
         const mergeOutcome = choice === "merge" ? await applyMerged(generation, auth, write, next) : null;
-        const staleMerge = mergeOutcome !== null && mergeOutcome !== "applied" ? { backup: next, meta: pushed } : null;
+        const staleMerge = mergeOutcome !== null && mergeOutcome.status !== "applied" ? { backup: next, meta: pushed } : null;
         acknowledgePush(generation, auth, write, pushed, nextDigest, staleMerge);
-        if (mergeOutcome === "busy") notifySavedDeckLibraryBusy("applyCloud");
+        if (mergeOutcome?.status === "busy") notifySavedDeckLibraryBusy("applyCloud", mergeOutcome.reason);
       } catch (error) {
         if (!current(generation, auth)) return;
         if (error instanceof SyncConflictError) {

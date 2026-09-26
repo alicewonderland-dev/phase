@@ -440,8 +440,5 @@
   },
   "savedDeckLibraryStorageFailure": {
     "description": "Phase konnte nicht auf den Browser-Speicher zugreifen. Versuche es gleich noch einmal."
-  },
-  "savedDeckAutosaveUnavailable": {
-    "description": "Automatisches Speichern ist in diesem Browserkontext nicht verfügbar."
   }
 }

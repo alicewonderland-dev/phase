@@ -440,8 +440,5 @@
   },
   "savedDeckLibraryStorageFailure": {
     "description": "Phase no pudo acceder al almacenamiento del navegador. Inténtalo de nuevo en un momento."
-  },
-  "savedDeckAutosaveUnavailable": {
-    "description": "El autoguardado no está disponible en este contexto del navegador."
   }
 }

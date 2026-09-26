@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useEffect } from "react";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { DeckBuilder } from "../DeckBuilder";
@@ -1244,6 +1244,61 @@ describe("DeckBuilder", () => {
     expect(JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck B") ?? "{}").main).toEqual([
       { name: "Gamma", count: 1 },
     ]);
+  });
+
+  it("an older Load that resolves after a newer Load does not overwrite the editor", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "Deck A",
+      JSON.stringify({ main: [{ name: "Alpha", count: 1 }], sideboard: [], format: "Standard" }),
+    );
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "Deck B",
+      JSON.stringify({ main: [{ name: "Beta", count: 1 }], sideboard: [], format: "Standard" }),
+    );
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "Deck C",
+      JSON.stringify({ main: [{ name: "Gamma", count: 1 }], sideboard: [], format: "Standard" }),
+    );
+
+    render(
+      <DeckBuilder
+        format="Standard"
+        onFormatChange={vi.fn()}
+        initialDeckName="Deck A"
+        searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+        onSearchFiltersChange={vi.fn()}
+        onResetSearch={vi.fn()}
+      />,
+    );
+    const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+    await waitFor(() => expect(nameInput).toHaveValue("Deck A"));
+
+    // The initial Load already called resolveCommander once; hold only the call Load B makes.
+    let resolveB!: (deck: unknown) => void;
+    const held = new Promise((resolve) => {
+      resolveB = resolve;
+    });
+    vi.mocked(resolveCommander).mockImplementationOnce(() => held as never);
+
+    await user.click(screen.getByRole("button", { name: "Load deck..." }));
+    await user.click(screen.getByRole("option", { name: "Deck B" }));
+    await vi.waitFor(() => expect(vi.mocked(resolveCommander)).toHaveBeenCalledTimes(2));
+
+    await user.click(screen.getByRole("button", { name: "Load deck..." }));
+    await user.click(screen.getByRole("option", { name: "Deck C" }));
+    await waitFor(() => expect(nameInput).toHaveValue("Deck C"));
+
+    // Let Load B's now-resolved promise, and any state updates it triggers, settle
+    // before asserting nothing changed.
+    await act(async () => {
+      resolveB({ main: [{ name: "Beta", count: 1 }], sideboard: [] });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(nameInput).toHaveValue("Deck C");
+    expect(screen.getByText("1 Gamma")).toBeInTheDocument();
+    expect(screen.queryByText("1 Beta")).not.toBeInTheDocument();
   });
 
   it("an edit made while save-time commander inference is pending does not apply the inferred deck", async () => {

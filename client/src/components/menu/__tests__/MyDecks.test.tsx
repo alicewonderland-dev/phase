@@ -678,6 +678,137 @@ describe("MyDecks", () => {
     uninstallWebLocks();
   });
 
+  it("adopting a feed deck refused by a busy library shows the busy toast and saves nothing", async () => {
+    installFifoWebLocks();
+    await resetSavedDeckLibraryForTests(); // clears localStorage; seed the feed deck after
+    const feedDeck = {
+      name: "Feed Deck",
+      colors: ["U"],
+      main: [{ name: "Island", count: 60 }],
+      sideboard: [],
+    };
+    saveDeck("Feed Deck", { main: feedDeck.main, sideboard: [] });
+    saveDeckOrigins({ "Feed Deck": "some-feed" });
+    await setCachedFeed("some-feed", {
+      id: "some-feed",
+      name: "Some Feed",
+      version: 1,
+      updated: "2026-01-01T00:00:00Z",
+      decks: [feedDeck],
+    });
+    saveFeedSubscriptions([{
+      sourceId: "some-feed",
+      url: "https://example.com/some-feed.json",
+      type: "remote",
+      subscribedAt: 1,
+      lastRefreshedAt: 1,
+      lastVersion: 1,
+    }]);
+    vi.mocked(evaluateDeckCompatibilityBatch).mockResolvedValue({});
+    useAppNotificationStore.setState({ notification: null, expiresAt: 0 });
+    vi.stubGlobal("prompt", vi.fn(() => "Feed Deck Copy"));
+
+    render(
+      <MyDecks
+        mode="manage"
+        activeDeckName={null}
+        onCreateDeck={vi.fn()}
+        onEditDeck={vi.fn()}
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Subscriptions" }));
+    expect(await screen.findByText("Feed Deck")).toBeInTheDocument();
+
+    let releaseHolder!: () => void;
+    const held = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+    const holder = withSavedDeckLibrary(() => held);
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+
+    setSavedDeckTxnLockWaitForTests(20);
+    await userEvent.click(screen.getByRole("button", { name: "Copy to My Decks" }));
+
+    await vi.waitFor(() => {
+      expect(useAppNotificationStore.getState().notification?.title).toBe("Couldn't save deck");
+    });
+    expect(localStorage.getItem(`${STORAGE_KEY_PREFIX}Feed Deck Copy`)).toBeNull();
+
+    setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+    releaseHolder();
+    await holder;
+    uninstallWebLocks();
+  });
+
+  it("refreshing all feeds refused by a busy library shows the busy toast without an unhandled rejection", async () => {
+    installFifoWebLocks();
+    await resetSavedDeckLibraryForTests(); // clears localStorage; seed the subscription after
+    await setCachedFeed("some-feed", {
+      id: "some-feed",
+      name: "Some Feed",
+      version: 1,
+      updated: "2026-01-01T00:00:00Z",
+      decks: [{ name: "Some Feed Deck", colors: [], main: [{ name: "Island", count: 60 }], sideboard: [] }],
+    });
+    saveFeedSubscriptions([{
+      sourceId: "some-feed",
+      url: "https://example.com/some-feed.json",
+      type: "remote",
+      subscribedAt: 1,
+      lastRefreshedAt: 1,
+      lastVersion: 1,
+    }]);
+    vi.mocked(evaluateDeckCompatibilityBatch).mockResolvedValue({});
+    useAppNotificationStore.setState({ notification: null, expiresAt: 0 });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: () => Promise.resolve({
+        id: "some-feed",
+        name: "Some Feed",
+        version: 2,
+        updated: "2026-01-02T00:00:00Z",
+        decks: [{ name: "Fresh Feed Deck", colors: [], main: [{ name: "Island", count: 60 }], sideboard: [] }],
+      }),
+    }));
+
+    render(
+      <MyDecks
+        mode="manage"
+        activeDeckName={null}
+        onCreateDeck={vi.fn()}
+        onEditDeck={vi.fn()}
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Subscriptions" }));
+    expect(await screen.findByText("Some Feed")).toBeInTheDocument();
+
+    let releaseHolder!: () => void;
+    const held = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+    const holder = withSavedDeckLibrary(() => held);
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+
+    setSavedDeckTxnLockWaitForTests(20);
+    await userEvent.click(screen.getByRole("button", { name: "Refresh All" }));
+
+    await vi.waitFor(() => {
+      expect(useAppNotificationStore.getState().notification?.title).toBe("Couldn't update deck feeds");
+    });
+    expect(localStorage.getItem(`${STORAGE_KEY_PREFIX}Fresh Feed Deck`)).toBeNull();
+
+    setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+    releaseHolder();
+    await holder;
+    uninstallWebLocks();
+  });
+
   it("does not fall through to saved-deck art for a basic-only precon override", async () => {
     let resolvePrecons: (
       value: Awaited<ReturnType<typeof loadPreconDeckMap>>,
