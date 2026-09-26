@@ -434,10 +434,14 @@
       "organize": "No se pudo actualizar la organización del mazo",
       "updateFeeds": "No se pudieron actualizar los feeds de mazos",
       "restore": "No se pudo restaurar la copia de seguridad",
-      "applyCloud": "No se pudieron aplicar los mazos de la nube"
+      "applyCloud": "No se pudieron aplicar los mazos de la nube",
+      "autosaveDraft": "No se pudo autoguardar el mazo del draft"
     }
   },
   "savedDeckLibraryStorageFailure": {
     "description": "Phase no pudo acceder al almacenamiento del navegador. Inténtalo de nuevo en un momento."
+  },
+  "savedDeckAutosaveUnavailable": {
+    "description": "El autoguardado no está disponible en este contexto del navegador."
   }
 }

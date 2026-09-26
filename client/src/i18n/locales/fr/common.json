@@ -434,10 +434,14 @@
       "organize": "Impossible de mettre à jour l'organisation des decks",
       "updateFeeds": "Impossible de mettre à jour les flux de decks",
       "restore": "Impossible de restaurer la sauvegarde",
-      "applyCloud": "Impossible d'appliquer les decks du cloud"
+      "applyCloud": "Impossible d'appliquer les decks du cloud",
+      "autosaveDraft": "Impossible de sauvegarder automatiquement le deck de draft"
     }
   },
   "savedDeckLibraryStorageFailure": {
     "description": "Phase n'a pas pu accéder au stockage du navigateur. Réessayez dans un instant."
+  },
+  "savedDeckAutosaveUnavailable": {
+    "description": "La sauvegarde automatique n'est pas disponible dans ce contexte du navigateur."
   }
 }

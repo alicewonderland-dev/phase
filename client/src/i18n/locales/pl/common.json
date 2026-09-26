@@ -434,10 +434,14 @@
       "organize": "Nie udało się zaktualizować organizacji talii",
       "updateFeeds": "Nie udało się zaktualizować kanałów talii",
       "restore": "Nie udało się przywrócić kopii zapasowej",
-      "applyCloud": "Nie udało się zastosować talii z chmury"
+      "applyCloud": "Nie udało się zastosować talii z chmury",
+      "autosaveDraft": "Nie udało się automatycznie zapisać talii z draftu"
     }
   },
   "savedDeckLibraryStorageFailure": {
     "description": "Phase nie mógł uzyskać dostępu do pamięci przeglądarki. Spróbuj ponownie za chwilę."
+  },
+  "savedDeckAutosaveUnavailable": {
+    "description": "Automatyczny zapis nie jest dostępny w tym kontekście przeglądarki."
   }
 }

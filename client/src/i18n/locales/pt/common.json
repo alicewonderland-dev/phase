@@ -434,10 +434,14 @@
       "organize": "Não foi possível atualizar a organização dos baralhos",
       "updateFeeds": "Não foi possível atualizar os feeds de baralhos",
       "restore": "Não foi possível restaurar o backup",
-      "applyCloud": "Não foi possível aplicar os baralhos da nuvem"
+      "applyCloud": "Não foi possível aplicar os baralhos da nuvem",
+      "autosaveDraft": "Não foi possível salvar automaticamente o baralho do draft"
     }
   },
   "savedDeckLibraryStorageFailure": {
     "description": "O Phase não conseguiu acessar o armazenamento do navegador. Tenta novamente em um instante."
+  },
+  "savedDeckAutosaveUnavailable": {
+    "description": "O salvamento automático não está disponível neste contexto do navegador."
   }
 }

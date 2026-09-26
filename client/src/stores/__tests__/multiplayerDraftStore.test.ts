@@ -23,7 +23,7 @@ import {
   resetSavedDeckLibraryForTests,
   uninstallWebLocks,
 } from "../../test/helpers/webLocks";
-import { withSavedDeckLibrary } from "../../services/savedDeckTransaction";
+import { setSavedDeckTxnLockWaitForTests, withSavedDeckLibrary } from "../../services/savedDeckTransaction";
 import { DraftPodHostAdapter } from "../../adapter/draftPodHostAdapter";
 import { DraftPodGuestAdapter } from "../../adapter/draftPodGuestAdapter";
 import type { DraftPlayerView } from "../../adapter/draft-adapter";
@@ -1650,6 +1650,7 @@ describe("multiplayerDraftStore", () => {
       beforeEach(async () => {
         installFifoWebLocks();
         await resetSavedDeckLibraryForTests();
+        useAppNotificationStore.setState({ notification: null, expiresAt: 0 });
       });
       afterEach(() => {
         uninstallWebLocks();
@@ -2040,6 +2041,79 @@ describe("multiplayerDraftStore", () => {
         await holder;
         await awaitSavedDeckLibraryIdle();
         expect(loadSavedDeck("[Autosave] Premier Draft")).not.toBeNull();
+      });
+
+      it("shows a busy toast when the host's autosave is skipped by a lock-wait timeout, and the submission still resolves", async () => {
+        await useMultiplayerDraftStore.getState().hostDraft({
+          poolInput: { type: "Set", data: { set_pool_json: "{}" } },
+          kind: "Premier",
+          podSize: 8,
+          hostDisplayName: "Host",
+          tournamentFormat: "Swiss",
+          podPolicy: "Competitive",
+        });
+        const deckbuildingView = { ...mockView("Deckbuilding"), kind: "Premier" as const, pool: [card("spell", "Spell")] };
+        capturedHostEventHandler!({
+          type: "workspaceRestored",
+          workspaceState: {
+            schemaVersion: 1,
+            placements: { spell: { zone: "deck", row: 0, column: 0, order: 0 } },
+            virtualBasics: [],
+          },
+        });
+        capturedHostEventHandler!({ type: "viewUpdated", view: deckbuildingView });
+        mockHostAdapter.submitDeck.mockResolvedValueOnce(deckbuildingView);
+
+        let releaseHolder!: () => void;
+        const held = new Promise<void>((resolve) => {
+          releaseHolder = resolve;
+        });
+        const holder = withSavedDeckLibrary(() => held);
+        await vi.waitFor(async () => {
+          expect((await navigator.locks.query()).held).toHaveLength(1);
+        });
+        setSavedDeckTxnLockWaitForTests(50);
+
+        await expect(useMultiplayerDraftStore.getState().submitDeck()).resolves.toBeUndefined();
+
+        await vi.waitFor(() => {
+          expect(useAppNotificationStore.getState().notification).toEqual({
+            title: "Couldn't autosave your draft deck",
+            description: "Another Phase tab is busy. Close other Phase tabs and try again.",
+          });
+        });
+
+        setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+        releaseHolder();
+        await holder;
+      });
+
+      it("shows no toast when the host's autosave commits", async () => {
+        await useMultiplayerDraftStore.getState().hostDraft({
+          poolInput: { type: "Set", data: { set_pool_json: "{}" } },
+          kind: "Premier",
+          podSize: 8,
+          hostDisplayName: "Host",
+          tournamentFormat: "Swiss",
+          podPolicy: "Competitive",
+        });
+        const deckbuildingView = { ...mockView("Deckbuilding"), kind: "Premier" as const, pool: [card("spell", "Spell")] };
+        capturedHostEventHandler!({
+          type: "workspaceRestored",
+          workspaceState: {
+            schemaVersion: 1,
+            placements: { spell: { zone: "deck", row: 0, column: 0, order: 0 } },
+            virtualBasics: [],
+          },
+        });
+        capturedHostEventHandler!({ type: "viewUpdated", view: deckbuildingView });
+        mockHostAdapter.submitDeck.mockResolvedValueOnce(deckbuildingView);
+
+        await useMultiplayerDraftStore.getState().submitDeck();
+        await awaitSavedDeckLibraryIdle();
+
+        expect(loadSavedDeck("[Autosave] Premier Draft")).not.toBeNull();
+        expect(useAppNotificationStore.getState().notification).toBeNull();
       });
     });
 

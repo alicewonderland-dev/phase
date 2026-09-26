@@ -11,6 +11,7 @@ import { countProjectedNames, type DraftWorkspacePartition } from "../components
 import { writeDraftAutosaveDeck, type DraftAutosaveSlot } from "../constants/storage";
 import type { ParsedDeck } from "./deckParser";
 import { serializeSavedDeck } from "./savedDeckProjection";
+import { notifyDraftAutosaveSkipped } from "./savedDeckWriteFailure";
 
 /** A solo cube draft runs as kind `Quick`; only its set code tells it apart. */
 export function draftAutosaveSlot(kind: DraftKind, setCode: string | null): DraftAutosaveSlot {
@@ -77,6 +78,7 @@ export async function autosaveDraftDeck(submission: DraftDeckAutosave): Promise<
     const result = await writeDraftAutosaveDeck(slot, label, serializeSavedDeck(deck, format, null));
     if (result.status === "skipped") {
       console.warn("[draftDeckAutosave] autosave skipped:", result.reason);
+      notifyDraftAutosaveSkipped(result.reason);
     }
   } catch (error) {
     console.warn("[draftDeckAutosave] autosave failed:", error);

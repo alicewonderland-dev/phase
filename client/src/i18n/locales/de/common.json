@@ -434,10 +434,14 @@
       "organize": "Deck-Organisation konnte nicht aktualisiert werden",
       "updateFeeds": "Deck-Feeds konnten nicht aktualisiert werden",
       "restore": "Sicherung konnte nicht wiederhergestellt werden",
-      "applyCloud": "Cloud-Decks konnten nicht übernommen werden"
+      "applyCloud": "Cloud-Decks konnten nicht übernommen werden",
+      "autosaveDraft": "Draft-Deck konnte nicht automatisch gespeichert werden"
     }
   },
   "savedDeckLibraryStorageFailure": {
     "description": "Phase konnte nicht auf den Browser-Speicher zugreifen. Versuche es gleich noch einmal."
+  },
+  "savedDeckAutosaveUnavailable": {
+    "description": "Automatisches Speichern ist in diesem Browserkontext nicht verfügbar."
   }
 }

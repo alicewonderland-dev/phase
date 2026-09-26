@@ -101,7 +101,8 @@ import {
   resetSavedDeckLibraryForTests,
   uninstallWebLocks,
 } from "../../test/helpers/webLocks";
-import { withSavedDeckLibrary } from "../../services/savedDeckTransaction";
+import { setSavedDeckTxnLockWaitForTests, withSavedDeckLibrary } from "../../services/savedDeckTransaction";
+import { useAppNotificationStore } from "../appToastStore";
 
 function card(instanceId: string, name = instanceId): DraftCardInstance {
   return {
@@ -1759,6 +1760,7 @@ describe("draft store workspace authority", () => {
       vi.useRealTimers();
       installFifoWebLocks();
       await resetSavedDeckLibraryForTests();
+      useAppNotificationStore.setState({ notification: null, expiresAt: 0 });
     });
     afterEach(() => {
       uninstallWebLocks();
@@ -1906,6 +1908,47 @@ describe("draft store workspace authority", () => {
       await holder;
       await awaitSavedDeckLibraryIdle();
       expect(loadSavedDeck("[Autosave] Quick Draft")).not.toBeNull();
+    });
+
+    it("shows a busy toast when the autosave is skipped by a lock-wait timeout, and the submission still resolves", async () => {
+      await start([card("bolt", "Bolt")]);
+      useDraftStore.getState().setWorkspacePlacement("bolt", { zone: "deck", row: 0, column: 0, order: 0 });
+      wasm.submit_deck.mockReturnValue({ ...view([card("bolt", "Bolt")]), status: "Pairing" });
+
+      let releaseHolder!: () => void;
+      const held = new Promise<void>((resolve) => {
+        releaseHolder = resolve;
+      });
+      const holder = withSavedDeckLibrary(() => held);
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).held).toHaveLength(1);
+      });
+      setSavedDeckTxnLockWaitForTests(50);
+
+      await expect(useDraftStore.getState().submitDeck()).resolves.toBeUndefined();
+
+      await vi.waitFor(() => {
+        expect(useAppNotificationStore.getState().notification).toEqual({
+          title: "Couldn't autosave your draft deck",
+          description: "Another Phase tab is busy. Close other Phase tabs and try again.",
+        });
+      });
+
+      setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+      releaseHolder();
+      await holder;
+    });
+
+    it("shows no toast when the autosave commits", async () => {
+      await start([card("bolt", "Bolt")]);
+      useDraftStore.getState().setWorkspacePlacement("bolt", { zone: "deck", row: 0, column: 0, order: 0 });
+      wasm.submit_deck.mockReturnValue({ ...view([card("bolt", "Bolt")]), status: "Pairing" });
+
+      await useDraftStore.getState().submitDeck();
+      await awaitSavedDeckLibraryIdle();
+
+      expect(loadSavedDeck("[Autosave] Quick Draft")).not.toBeNull();
+      expect(useAppNotificationStore.getState().notification).toBeNull();
     });
   });
 });

@@ -434,10 +434,14 @@
       "organize": "デッキの整理を更新できませんでした",
       "updateFeeds": "デッキフィードを更新できませんでした",
       "restore": "バックアップを復元できませんでした",
-      "applyCloud": "クラウドデッキを適用できませんでした"
+      "applyCloud": "クラウドデッキを適用できませんでした",
+      "autosaveDraft": "ドラフトデッキを自動保存できませんでした"
     }
   },
   "savedDeckLibraryStorageFailure": {
     "description": "Phaseはブラウザのストレージにアクセスできませんでした。しばらくしてから再試行してください。"
+  },
+  "savedDeckAutosaveUnavailable": {
+    "description": "このブラウザコンテキストでは自動保存を利用できません。"
   }
 }

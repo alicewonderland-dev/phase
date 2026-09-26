@@ -4,7 +4,11 @@
  * per-case label map: `draftDeckAutosave.ts::autosaveSlotLabels`.
  */
 import i18n from "i18next";
-import { SavedDeckLibraryBusyError, type SavedDeckTxnFailure } from "./savedDeckTransaction";
+import {
+  SavedDeckLibraryBusyError,
+  type SavedDeckTxnFailure,
+  type SavedDeckTxnSkipReason,
+} from "./savedDeckTransaction";
 import { useAppNotificationStore } from "../stores/appToastStore";
 
 export type SavedDeckWriteAction =
@@ -43,12 +47,29 @@ export function savedDeckLibraryStorageFailureDescription(): string {
   return i18n.t("savedDeckLibraryStorageFailure.description");
 }
 
+function busyOrStorageDescription(reason: SavedDeckTxnFailure): string {
+  return STORAGE_FAILURE_REASONS.has(reason)
+    ? savedDeckLibraryStorageFailureDescription()
+    : savedDeckLibraryBusyDescription();
+}
+
 export function notifySavedDeckLibraryBusy(action: SavedDeckWriteAction, reason?: SavedDeckTxnFailure): void {
-  const description =
-    reason !== undefined && STORAGE_FAILURE_REASONS.has(reason)
-      ? savedDeckLibraryStorageFailureDescription()
-      : savedDeckLibraryBusyDescription();
+  const description = reason !== undefined ? busyOrStorageDescription(reason) : savedDeckLibraryBusyDescription();
   useAppNotificationStore.getState().showNotification({ title: titleByAction[action](), description });
+}
+
+/** A background draft autosave (never rejects; `reason` comes from its skipped result) was not
+ *  written. Unlike a user write, "no lock manager at all" gets its own description: nothing the
+ *  user can do (close other tabs) will fix it. */
+export function notifyDraftAutosaveSkipped(reason: SavedDeckTxnSkipReason): void {
+  const description =
+    reason === "lock-unavailable"
+      ? i18n.t("savedDeckAutosaveUnavailable.description")
+      : busyOrStorageDescription(reason);
+  useAppNotificationStore.getState().showNotification({
+    title: i18n.t("savedDeckLibraryBusy.title.autosaveDraft"),
+    description,
+  });
 }
 
 /** Run a user-initiated deck-library write; if it is refused, tell the user and resolve `{ ok: false }`. Other errors propagate. */

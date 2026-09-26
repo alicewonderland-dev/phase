@@ -178,6 +178,43 @@ describe("withSavedDeckLibrary / withSavedDeckLibraryOrSkip", () => {
     setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
   });
 
+  it("under the production lock wait, a queued request is not rejected just before LOCK_WAIT_TIMEOUT_MS and rejects with lock-timeout at it", async () => {
+    let releaseHolder!: () => void;
+    const held = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+    const holder = withSavedDeckLibrary(() => held);
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+
+    expect(LOCK_WAIT_TIMEOUT_MS).toBe(6000);
+    setSavedDeckTxnLockWaitForTests(null); // use the real LOCK_WAIT_TIMEOUT_MS, not a test knob
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    let rejected = false;
+    const waiter = withSavedDeckLibrary(() => "value");
+    waiter.catch(() => {
+      rejected = true;
+    });
+    // Synchronous: `locks.request` queues this request before its first await, so the
+    // FIFO double's `pending` list already reflects it without waiting for a tick.
+    expect((await navigator.locks.query()).pending).toHaveLength(1);
+
+    // Hardcoded, not `LOCK_WAIT_TIMEOUT_MS - 1`/`LOCK_WAIT_TIMEOUT_MS`: importing the constant on
+    // both sides would make this pass no matter what the constant is set to.
+    await vi.advanceTimersByTimeAsync(5999);
+    expect(rejected).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(rejected).toBe(true);
+    await expect(waiter).rejects.toMatchObject({ reason: "lock-timeout" });
+
+    vi.useRealTimers();
+    releaseHolder();
+    await holder;
+    setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+  });
+
   it("on a view-catch-up timeout, both policies fail and record the committed generation locally", async () => {
     await seedGenerationForTests(3, 2);
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });

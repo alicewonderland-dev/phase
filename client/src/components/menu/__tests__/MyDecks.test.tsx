@@ -636,6 +636,48 @@ describe("MyDecks", () => {
     uninstallWebLocks();
   });
 
+  it("deleting a deck refused by a busy library keeps the deck and shows the busy toast", async () => {
+    installFifoWebLocks();
+    await resetSavedDeckLibraryForTests(); // clears localStorage; seed the deck after
+    saveDeck("Deck Alpha", { main: [{ name: "Island", count: 60 }], sideboard: [] });
+    vi.mocked(evaluateDeckCompatibilityBatch).mockResolvedValue({});
+    useAppNotificationStore.setState({ notification: null, expiresAt: 0 });
+
+    render(
+      <MyDecks
+        mode="manage"
+        activeDeckName={null}
+        onCreateDeck={vi.fn()}
+        onEditDeck={vi.fn()}
+      />,
+    );
+    expect(await screen.findByText("Deck Alpha")).toBeInTheDocument();
+
+    let releaseHolder!: () => void;
+    const held = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+    const holder = withSavedDeckLibrary(() => held);
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+
+    setSavedDeckTxnLockWaitForTests(20);
+    await userEvent.click(screen.getByTitle("Delete deck"));
+    await userEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+    await vi.waitFor(() => {
+      expect(useAppNotificationStore.getState().notification?.title).toBe("Couldn't delete deck");
+    });
+    expect(screen.getByText("Deck Alpha")).toBeInTheDocument();
+    expect(localStorage.getItem(`${STORAGE_KEY_PREFIX}Deck Alpha`)).toBeTruthy();
+
+    setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+    releaseHolder();
+    await holder;
+    uninstallWebLocks();
+  });
+
   it("does not fall through to saved-deck art for a basic-only precon override", async () => {
     let resolvePrecons: (
       value: Awaited<ReturnType<typeof loadPreconDeckMap>>,

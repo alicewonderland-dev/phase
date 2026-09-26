@@ -434,10 +434,14 @@
       "organize": "Couldn't update deck organization",
       "updateFeeds": "Couldn't update deck feeds",
       "restore": "Couldn't restore backup",
-      "applyCloud": "Couldn't apply cloud decks"
+      "applyCloud": "Couldn't apply cloud decks",
+      "autosaveDraft": "Couldn't autosave your draft deck"
     }
   },
   "savedDeckLibraryStorageFailure": {
     "description": "Phase couldn't reach browser storage. Try again in a moment."
+  },
+  "savedDeckAutosaveUnavailable": {
+    "description": "Autosave isn't available in this browser context."
   }
 }
