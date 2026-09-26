@@ -489,6 +489,26 @@ export function useDeckBuilder({
     [markDirty],
   );
 
+  // User edits to the name, format and bracket advance editRevision like card edits, so a save that completes
+  // after one reports "saved-then-changed". Re-selecting the current format or bracket is not an edit.
+  // handleLoad calls the raw setters instead, so loading a deck is not an edit.
+  const handleDeckNameChange = useCallback((name: string) => {
+    markDirty();
+    setDeckName(name);
+  }, [markDirty]);
+
+  const handleFormatChange = useCallback((next: GameFormat) => {
+    if (next === format) return;
+    markDirty();
+    onFormatChange(next);
+  }, [format, markDirty, onFormatChange]);
+
+  const handleBracketChange = useCallback((next: CommanderBracket | null) => {
+    if (next === bracket) return;
+    markDirty();
+    setBracket(next);
+  }, [bracket, markDirty]);
+
   const applyDeckToEditor = useCallback((next: ParsedDeck, targetFormat: GameFormat = format) => {
     const projected = projectSignatureSpellForFormat(next, targetFormat);
     const targetUsesCommander = formatMetadata(targetFormat)?.default_config.uses_commander ?? false;
@@ -847,9 +867,7 @@ export function useDeckBuilder({
     deck,
     searchResults,
     deckName,
-    setDeckName,
     bracket,
-    setBracket,
     savedDecks,
     justSaved,
     setJustSaved,
@@ -893,6 +911,9 @@ export function useDeckBuilder({
     canIncrement,
     handleMoveCard,
     handleImport,
+    handleDeckNameChange,
+    handleFormatChange,
+    handleBracketChange,
     handleSave,
     handleClone,
     handleLoad,

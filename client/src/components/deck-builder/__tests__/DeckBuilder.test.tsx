@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { DeckBuilder } from "../DeckBuilder";
+import type { GameFormat } from "../../../adapter/types";
 import { loadPreconDeckMap } from "../../../hooks/useDecks";
 import { resolveCommander } from "../../../services/deckParser";
 import { useIsMobile } from "../../../hooks/useIsMobile";
@@ -815,6 +816,231 @@ describe("DeckBuilder", () => {
       expect(screen.queryByText("1 Delta")).not.toBeInTheDocument();
       const savedA = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck A") ?? "{}");
       expect(savedA.main).toEqual([{ name: "Alpha", count: 1 }, { name: "Delta", count: 1 }]);
+    });
+  });
+
+  describe("persisted metadata edits", () => {
+    // Holds the format the way DeckBuilderPage's URL does, so choosing a format re-renders the builder.
+    function StatefulFormatBuilder({ initialFormat }: { initialFormat: GameFormat }) {
+      const [format, setFormat] = useState<GameFormat>(initialFormat);
+      return (
+        <DeckBuilder
+          format={format}
+          onFormatChange={setFormat}
+          initialDeckName="Deck A"
+          searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+          onSearchFiltersChange={vi.fn()}
+          onResetSearch={vi.fn()}
+        />
+      );
+    }
+
+    function seed(format: GameFormat, extraA: Record<string, unknown> = {}) {
+      localStorage.setItem(
+        STORAGE_KEY_PREFIX + "Deck A",
+        JSON.stringify({
+          main: [{ name: "Alpha", count: 1 }, { name: "Beta", count: 1 }],
+          sideboard: [],
+          format,
+          ...extraA,
+        }),
+      );
+      localStorage.setItem(
+        STORAGE_KEY_PREFIX + "Deck B",
+        JSON.stringify({ main: [{ name: "Gamma", count: 1 }], sideboard: [], format }),
+      );
+    }
+
+    async function mount(format: GameFormat) {
+      seed(format);
+      render(<StatefulFormatBuilder initialFormat={format} />);
+      const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+      await waitFor(() => expect(nameInput).toHaveValue("Deck A"));
+      return nameInput as HTMLInputElement;
+    }
+
+    async function holdLibrary() {
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const holder = withSavedDeckLibrary(() => held);
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).held).toHaveLength(1);
+      });
+      return async () => {
+        release();
+        await holder;
+        await vi.waitFor(async () => {
+          const q = await navigator.locks.query();
+          expect(q.held).toHaveLength(0);
+          expect(q.pending).toHaveLength(0);
+        });
+      };
+    }
+
+    function storedA() {
+      return JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck A") ?? "{}");
+    }
+
+    async function saveAndContinueToDeckB(user: ReturnType<typeof userEvent.setup>) {
+      await user.click(screen.getByRole("button", { name: "remove-Beta" }));
+      const release = await holdLibrary();
+      await user.click(screen.getByRole("button", { name: "Load deck..." }));
+      await user.click(screen.getByRole("option", { name: "Deck B" }));
+      await user.click(screen.getByRole("button", { name: "Save & continue" }));
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).pending).toHaveLength(1);
+      });
+      return release;
+    }
+
+    async function expectLeavePrompts(user: ReturnType<typeof userEvent.setup>, prompts: boolean) {
+      await user.click(screen.getByRole("button", { name: /Menu/ }));
+      if (prompts) {
+        expect(await screen.findByRole("button", { name: "Discard" })).toBeInTheDocument();
+        expect(navigateMock).not.toHaveBeenCalled();
+        await user.click(screen.getByRole("button", { name: "Cancel" }));
+      } else {
+        expect(screen.queryByRole("button", { name: "Discard" })).not.toBeInTheDocument();
+        expect(navigateMock).toHaveBeenCalled();
+      }
+    }
+
+    it("a rename typed behind the Save & continue dialog while its save waits keeps the renamed deck open", async () => {
+      const user = userEvent.setup();
+      const nameInput = await mount("Standard");
+      const release = await saveAndContinueToDeckB(user);
+
+      // The dialog does not trap focus, so a keyboard user can still edit the deck behind it.
+      nameInput.focus();
+      nameInput.setSelectionRange(0, nameInput.value.length);
+      await user.keyboard("Deck Renamed");
+
+      await release();
+      expect(screen.getByRole("dialog", { name: "Unsaved changes" })).toBeInTheDocument();
+      expect(nameInput).toHaveValue("Deck Renamed");
+      expect(screen.queryByText("1 Gamma")).not.toBeInTheDocument();
+      expect(storedA().main).toEqual([{ name: "Alpha", count: 1 }]);
+    });
+
+    it("a format chosen behind the Save & continue dialog while its save waits keeps the deck open in that format", async () => {
+      const user = userEvent.setup();
+      const nameInput = await mount("Standard");
+      const release = await saveAndContinueToDeckB(user);
+
+      screen.getByRole("button", { name: "Format" }).focus();
+      await user.keyboard("{Enter}");
+      const modernOption = await screen.findByRole("option", { name: "Modern" });
+      modernOption.focus();
+      await user.keyboard("{Enter}");
+
+      await release();
+      expect(screen.getByRole("dialog", { name: "Unsaved changes" })).toBeInTheDocument();
+      expect(nameInput).toHaveValue("Deck A");
+      expect(screen.getByRole("button", { name: "Format" })).toHaveTextContent("Modern");
+      const stored = storedA();
+      expect(stored.main).toEqual([{ name: "Alpha", count: 1 }]);
+      expect(stored.format).toBe("Standard");
+    });
+
+    it("a bracket chosen behind the Save & continue dialog while its save waits keeps the deck open with that bracket", async () => {
+      const user = userEvent.setup();
+      const nameInput = await mount("Commander");
+      const release = await saveAndContinueToDeckB(user);
+
+      const upgradedButton = await screen.findByRole("button", { name: /Upgraded/ });
+      upgradedButton.focus();
+      await user.keyboard("{Enter}");
+
+      await release();
+      expect(screen.getByRole("dialog", { name: "Unsaved changes" })).toBeInTheDocument();
+      expect(nameInput).toHaveValue("Deck A");
+      expect(await screen.findByRole("button", { name: /Upgraded/ })).toHaveAttribute("aria-pressed", "true");
+      const stored = storedA();
+      expect(stored.main).toEqual([{ name: "Alpha", count: 1 }]);
+      expect(stored.bracket).toBeUndefined();
+    });
+
+    it("Save & continue with no metadata change loads the requested deck once its save completes", async () => {
+      const user = userEvent.setup();
+      const nameInput = await mount("Standard");
+      const release = await saveAndContinueToDeckB(user);
+
+      await release();
+      await waitFor(() => expect(nameInput).toHaveValue("Deck B"));
+      expect(screen.getByText("1 Gamma")).toBeInTheDocument();
+      expect(storedA().main).toEqual([{ name: "Alpha", count: 1 }]);
+    });
+
+    it("an ordinary Save that completes after a rename leaves the renamed deck unsaved", async () => {
+      const user = userEvent.setup();
+      const nameInput = await mount("Standard");
+      await user.click(screen.getByRole("button", { name: "remove-Beta" }));
+      const release = await holdLibrary();
+      await user.click(screen.getByRole("button", { name: "Save" }));
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).pending).toHaveLength(1);
+      });
+
+      nameInput.focus();
+      nameInput.setSelectionRange(0, nameInput.value.length);
+      await user.keyboard("Deck Renamed");
+
+      await release();
+      await waitFor(() => expect(storedA().main).toEqual([{ name: "Alpha", count: 1 }]));
+      expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument();
+      await expectLeavePrompts(user, true);
+    });
+
+    it("renaming the deck marks it unsaved", async () => {
+      const user = userEvent.setup();
+      await mount("Standard");
+      const nameInput = screen.getByRole("textbox", { name: "Deck name" });
+      await user.clear(nameInput);
+      await user.type(nameInput, "Deck Renamed");
+      await expectLeavePrompts(user, true);
+    });
+
+    it("choosing another format marks the deck unsaved", async () => {
+      const user = userEvent.setup();
+      await mount("Standard");
+      await user.click(screen.getByRole("button", { name: "Format" }));
+      await user.click(await screen.findByRole("option", { name: "Modern" }));
+      await expectLeavePrompts(user, true);
+    });
+
+    it("choosing another bracket marks the deck unsaved", async () => {
+      const user = userEvent.setup();
+      await mount("Commander");
+      await user.click(await screen.findByRole("button", { name: /Upgraded/ }));
+      await expectLeavePrompts(user, true);
+    });
+
+    it("choosing the format already selected leaves the deck saved", async () => {
+      const user = userEvent.setup();
+      await mount("Standard");
+      await user.click(screen.getByRole("button", { name: "Format" }));
+      await user.click(await screen.findByRole("option", { name: "Standard" }));
+      await expectLeavePrompts(user, false);
+    });
+
+    it("choosing the bracket already selected leaves the deck saved", async () => {
+      const user = userEvent.setup();
+      await mount("Commander");
+      const unratedButton = await screen.findByRole("button", { name: "Unrated" });
+      expect(unratedButton).toHaveAttribute("aria-pressed", "true");
+      await user.click(unratedButton);
+      await expectLeavePrompts(user, false);
+    });
+
+    it("loading a saved deck whose format and bracket differ from the editor's leaves it saved", async () => {
+      const user = userEvent.setup();
+      seed("Commander", { bracket: 3 });
+      render(<StatefulFormatBuilder initialFormat="Standard" />);
+      await waitFor(() => expect(screen.getByRole("button", { name: "Format" })).toHaveTextContent("Commander"));
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: /Upgraded/ })).toHaveAttribute("aria-pressed", "true"),
+      );
+      await expectLeavePrompts(user, false);
     });
   });
 

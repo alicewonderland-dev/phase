@@ -46,9 +46,7 @@ export function DeckBuilder({
     deck,
     searchResults,
     deckName,
-    setDeckName,
     bracket,
-    setBracket,
     savedDecks,
     justSaved,
     setJustSaved,
@@ -90,6 +88,9 @@ export function DeckBuilder({
     canIncrement,
     handleMoveCard,
     handleImport,
+    handleDeckNameChange,
+    handleFormatChange,
+    handleBracketChange,
     handleSave,
     handleClone,
     handleLoad,
@@ -301,7 +302,7 @@ export function DeckBuilder({
       <DeckBuilderToolbar
         onBack={requestBack}
         deckName={deckName}
-        onDeckNameChange={setDeckName}
+        onDeckNameChange={handleDeckNameChange}
         justSaved={justSaved && !dirty}
         onClearJustSaved={() => setJustSaved(false)}
         onSave={handleSave}
@@ -310,7 +311,7 @@ export function DeckBuilder({
         savedDecks={savedDecks}
         onLoad={requestLoad}
         format={format}
-        onFormatChange={onFormatChange}
+        onFormatChange={handleFormatChange}
       />
 
       <DeckBuilderTabBar
@@ -533,7 +534,7 @@ export function DeckBuilder({
               isCommander={isCommander}
               estimate={estimate}
               manualBracket={bracket}
-              onBracketChange={setBracket}
+              onBracketChange={handleBracketChange}
               auditEmptyReason={auditEmptyReason}
               onCardClick={handleScrollToCard}
             />
