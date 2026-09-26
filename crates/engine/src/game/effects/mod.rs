@@ -18983,8 +18983,7 @@ fn scoped_player_matches_filter(
         }
         // Set-valued / event-context / aggregate variants: not used by
         // decline-tail today. Fail closed (mirrors the
-        // `TriggerCondition::DuringPlayersTurn` fallthrough pattern at
-        // game/triggers.rs:3703-3723).
+        // `TriggerCondition::DuringPlayersTurn` fallthrough pattern).
         PlayerFilter::DefendingPlayer
         | PlayerFilter::HasLostTheGame
         | PlayerFilter::OpponentDealtDamage { .. }
@@ -20885,8 +20884,8 @@ mod tests {
         let target = reflexive_test_creature(&mut state, PlayerId(0), "Only target");
         let mut reflexive = reflexive_counter_ability(ObjectId(100));
         // CR 601.2c + CR 603.3d: `Opponent` is the ONLY non-`ScopedPlayer` chooser
-        // the parser ever stamps (`oracle_target.rs:3540`, "of an opponent's
-        // choice"), and it is the shape `resolve_effect_player_ref` resolves
+        // the parser ever stamps ("of an opponent's choice"), and it is the
+        // shape `resolve_effect_player_ref` resolves
         // through the shared authority. A synthetic `SpecificPlayer` chooser is
         // unreachable from any card and falls into that resolver's event-context
         // catch-all, which returns `None` with no trigger event — the prompt would

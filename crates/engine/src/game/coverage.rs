@@ -10131,7 +10131,7 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         StaticCondition::SourceIsHarnessed => ("SourceIsHarnessed", Handled),
         // SourceAttachedToCreature resolved by `layers::evaluate_condition`
         StaticCondition::SourceAttachedToCreature => ("SourceAttachedToCreature", Handled),
-        // SourceMatchesFilter resolved by layers::evaluate_condition (layers.rs:1104)
+        // SourceMatchesFilter resolved by layers::evaluate_condition.
         StaticCondition::SourceMatchesFilter { .. } => ("SourceMatchesFilter", Handled),
         // CR 401.1 + CR 401.5: top-of-library gate, resolved by
         // layers::evaluate_condition_with_context against the controller's library top.
