@@ -18,15 +18,28 @@ export function preconExists(savedName: string): boolean {
   return localStorage.getItem(STORAGE_KEY_PREFIX + savedName) !== null;
 }
 
+/** Whether a name that already exists in the library should be replaced or left as-is. */
+export type ExistingDeckPolicy = "replace" | "keep";
+
 /**
  * Persist a preconstructed deck under the user's saved-decks namespace so it
  * participates in the normal deck-compatibility / active-deck / tile-render
- * flows without any precon-specific branching downstream.
+ * flows without any precon-specific branching downstream. When `onExisting`
+ * is `"keep"`, a deck already saved under `savedName` (created by another
+ * writer while this one waited for the lock) is left untouched.
  */
-export function savePreconDeck(savedName: string, deck: DeckEntry): Promise<void> {
+export function savePreconDeck(
+  savedName: string,
+  deck: DeckEntry,
+  onExisting: ExistingDeckPolicy,
+): Promise<"saved" | "kept-existing"> {
   const parsed = preconDeckEntryToParsedDeck(deck);
   return withSavedDeckLibrary((txn) => {
+    if (onExisting === "keep" && localStorage.getItem(STORAGE_KEY_PREFIX + savedName) !== null) {
+      return "kept-existing";
+    }
     writeSavedDeckData(txn, savedName, JSON.stringify(parsed));
     clearDeckAutosaveMarker(txn, savedName);
+    return "saved";
   });
 }

@@ -4,8 +4,9 @@ import { motion, AnimatePresence } from "framer-motion";
 import { useTranslation } from "react-i18next";
 
 import { menuButtonClass } from "./buttonStyles";
-import { listSavedDeckNames, stampDeckMeta, uniqueDeckName, writeSavedDeckData } from "../../constants/storage";
+import { freeDeckName, listSavedDeckNames, stampDeckMeta, writeSavedDeckData } from "../../constants/storage";
 import { withSavedDeckLibrary } from "../../services/savedDeckTransaction";
+import { attemptSavedDeckWrite } from "../../services/savedDeckWriteFailure";
 import {
   assignOathbreakerSlots,
   deriveImportedDeckName,
@@ -54,14 +55,10 @@ function resolveImportDeckName(
   fallbackName?: string,
 ): string {
   const trimmedManual = manualName.trim();
-  if (trimmedManual) return uniqueDeckName(trimmedManual, listSavedDeckNames());
+  if (trimmedManual) return trimmedManual;
 
   const derivedName = deriveImportedDeckName(content, deck);
-  const baseName =
-    fallbackName && GENERIC_IMPORTED_NAMES.has(derivedName)
-      ? fallbackName
-      : derivedName;
-  return uniqueDeckName(baseName, listSavedDeckNames());
+  return fallbackName && GENERIC_IMPORTED_NAMES.has(derivedName) ? fallbackName : derivedName;
 }
 
 function initialSignatureSpell(deck: ParsedDeck, candidates: string[]): string {
@@ -100,12 +97,16 @@ export function ImportDeckModal({ open, onClose, onImported }: ImportDeckModalPr
     });
   };
 
-  const persistImport = async (name: string, deck: ParsedDeck, format?: "Oathbreaker") => {
-    await withSavedDeckLibrary((txn) => {
-      writeSavedDeckData(txn, name, JSON.stringify(format ? { ...deck, format } : deck));
-      stampDeckMeta(txn, name);
-    });
-    finishImport(name);
+  const persistImport = async (baseName: string, deck: ParsedDeck, format?: "Oathbreaker") => {
+    const saved = await attemptSavedDeckWrite("import", () =>
+      withSavedDeckLibrary((txn) => {
+        const name = freeDeckName(txn, baseName);
+        writeSavedDeckData(txn, name, JSON.stringify(format ? { ...deck, format } : deck));
+        stampDeckMeta(txn, name);
+        return name;
+      }),
+    );
+    if (saved.ok) finishImport(saved.value);
   };
 
   const signatureCandidatesFor = async (deck: ParsedDeck, oathbreaker: string): Promise<string[]> => {

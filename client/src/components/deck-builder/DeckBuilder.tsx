@@ -234,7 +234,7 @@ export function DeckBuilder({
 
   const confirmSaveThen = useCallback(async () => {
     const action = pendingAction;
-    await handleSave();
+    if (!(await handleSave())) return;
     setPendingAction(null);
     if (action) performAction(action);
   }, [pendingAction, handleSave, performAction]);

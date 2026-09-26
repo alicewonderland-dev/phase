@@ -9,6 +9,7 @@ import { deduplicateEntries, expandParsedDeck, resolveCommander } from "../../se
 import { evaluateDeckCompatibility, type DeckCompatibilityResult } from "../../services/deckCompatibility";
 import {
   STORAGE_KEY_PREFIX,
+  freeDeckName,
   getDeckMeta,
   loadSavedDeck,
   loadSavedDeckBracket,
@@ -18,6 +19,7 @@ import {
   writeSavedDeckData,
 } from "../../constants/storage";
 import { withSavedDeckLibrary } from "../../services/savedDeckTransaction";
+import { attemptSavedDeckWrite } from "../../services/savedDeckWriteFailure";
 import { loadPreconDeckMap } from "../../hooks/useDecks";
 import { preconDeckEntryToParsedDeck } from "../../services/preconDecks";
 import { useDeckCardData } from "../../hooks/useDeckCardData";
@@ -87,17 +89,30 @@ export function useDeckBuilder({
   // Unsaved-changes flag: set on any deck mutation.
   // Drives the leave/load confirmation and the beforeunload guard.
   const [dirty, setDirty] = useState(false);
-  // Bumped by every edit; handleSave captures it before its first await and only clears `dirty`
-  // if nothing edited the deck while the save was pending (on resolveCommander or the lock).
+  // Bumped by every edit (markDirty).
   const editRevision = useRef(0);
   const markDirty = useCallback(() => {
     editRevision.current += 1;
     setDirty(true);
   }, []);
-  // Bumped by handleLoad and handleClone: a Load or Clone that lands while a save is pending
-  // means the save's nextName no longer names the deck now open, so handleSave must not apply
-  // savedDeckName/justSaved/toast for it.
+  // Bumped whenever the editor switches to another deck: a Load, or a Clone that opens its copy.
   const deckIdentityRevision = useRef(0);
+  interface EditorCapture {
+    identity: number;
+    edit: number;
+  }
+  // Captured before an await, so the work after it can tell whether a Load, Clone or edit happened meanwhile.
+  const captureEditor = useCallback(
+    (): EditorCapture => ({ identity: deckIdentityRevision.current, edit: editRevision.current }),
+    [],
+  );
+  const editorChangedSince = useCallback(
+    (captured: EditorCapture) => ({
+      reloaded: captured.identity !== deckIdentityRevision.current,
+      edited: captured.edit !== editRevision.current,
+    }),
+    [],
+  );
   const { cardDataCache, cacheCards } = useDeckCardData([
     ...deck.main.map((entry) => entry.name),
     ...deck.sideboard.map((entry) => entry.name),
@@ -496,13 +511,9 @@ export function useDeckBuilder({
     markDirty();
   }, [applyDeckToEditor, markDirty]);
 
-  const handleSave = useCallback(async () => {
-    if (!deckName.trim()) return;
-    // Capture both revisions before the first await. `revisionAtSave` detects an edit made while
-    // this save waits (on resolveCommander or the lock); `identityAtSave` detects a Load or Clone
-    // that switched the open deck out from under this save.
-    const revisionAtSave = editRevision.current;
-    const identityAtSave = deckIdentityRevision.current;
+  const handleSave = useCallback(async (): Promise<boolean> => {
+    if (!deckName.trim()) return false;
+    const captured = captureEditor();
     // Save-time commander inference: when a Commander-format deck is shaped
     // like a 100-singleton list with no explicit commander, ask the engine
     // (via resolveCommander → WASM isCardCommanderEligible) to pick one. This
@@ -512,26 +523,32 @@ export function useDeckBuilder({
     const resolved = isCommander ? await resolveCommander(currentDeck) : currentDeck;
     const inferred =
       (resolved.commander?.length ?? 0) > (currentDeck.commander?.length ?? 0);
-    if (inferred) {
+    const changed = editorChangedSince(captured);
+    if (inferred && !changed.reloaded && !changed.edited) {
       // Reflect the engine's choice in the editor so the displayed state
       // matches what we're about to persist.
       applyDeckToEditor(resolved);
     }
     const data = serializeSavedDeck(resolved, format, bracket);
     const nextName = deckName.trim();
-    await saveBuilderDeck(savedDeckName, nextName, data);
-    if (deckIdentityRevision.current === identityAtSave) {
+    const saved = await attemptSavedDeckWrite("save", () => saveBuilderDeck(savedDeckName, nextName, data));
+    if (!saved.ok) return false;
+    const after = editorChangedSince(captured);
+    if (!after.reloaded) {
       setSavedDeckName(nextName);
       setJustSaved(true);
-      if (editRevision.current === revisionAtSave) setDirty(false);
+      if (!after.edited) setDirty(false);
       showNotification({
         title: t("toolbar.savedToastTitle"),
         description: t("toolbar.savedToastDescription", { name: nextName }),
       });
     }
     setSavedDecks(listSavedDecks());
+    return true;
   }, [
     deckName,
+    captureEditor,
+    editorChangedSince,
     isCommander,
     currentDeck,
     applyDeckToEditor,
@@ -543,38 +560,40 @@ export function useDeckBuilder({
   ]);
 
   // Clone = explicit duplicate. Unlike Save (which renames the current deck in
-  // place), this always writes a NEW key and leaves the original untouched, then
-  // switches the editor to the copy so further edits/Saves target the clone.
+  // place), this always writes a NEW key and leaves the original untouched.
   const handleClone = useCallback(async () => {
+    const captured = captureEditor();
     const base = deckName.trim() || "Untitled Deck";
     const data = serializeSavedDeck(currentDeck, format, bracket);
-    const cloneName = await withSavedDeckLibrary((txn) => {
-      let name = `${base} copy`;
-      let suffix = 2;
-      while (localStorage.getItem(STORAGE_KEY_PREFIX + name) !== null) {
-        name = `${base} copy ${suffix++}`;
-      }
-      writeSavedDeckData(txn, name, data);
-      stampDeckMeta(txn, name);
-      // A clone lands beside its source: inherit the folder, but start unstarred
-      // (the star is a deliberate per-deck pin, not a copyable property).
-      const sourceFolderId = savedDeckName
-        ? getDeckMeta(savedDeckName)?.folderId ?? null
-        : null;
-      if (sourceFolderId) setDeckFolder(txn, name, sourceFolderId);
-      return name;
-    });
-    deckIdentityRevision.current += 1;
-    setDeckName(cloneName);
-    setSavedDeckName(cloneName);
+    const cloned = await attemptSavedDeckWrite("clone", () =>
+      withSavedDeckLibrary((txn) => {
+        const name = freeDeckName(txn, `${base} copy`, (i) => `${base} copy ${i}`);
+        writeSavedDeckData(txn, name, data);
+        stampDeckMeta(txn, name);
+        // A clone lands beside its source: inherit the folder, but start unstarred
+        // (the star is a deliberate per-deck pin, not a copyable property).
+        const sourceFolderId = savedDeckName
+          ? getDeckMeta(savedDeckName)?.folderId ?? null
+          : null;
+        if (sourceFolderId) setDeckFolder(txn, name, sourceFolderId);
+        return name;
+      }),
+    );
+    if (!cloned.ok) return;
+    const cloneName = cloned.value;
     setSavedDecks(listSavedDecks());
-    setJustSaved(true);
-    setDirty(false);
     showNotification({
       title: t("toolbar.clonedToastTitle"),
       description: t("toolbar.clonedToastDescription", { name: cloneName }),
     });
-  }, [deckName, currentDeck, format, bracket, savedDeckName, showNotification, t]);
+    const changed = editorChangedSince(captured);
+    if (changed.reloaded || changed.edited) return;
+    deckIdentityRevision.current += 1;
+    setDeckName(cloneName);
+    setSavedDeckName(cloneName);
+    setJustSaved(true);
+    setDirty(false);
+  }, [deckName, captureEditor, editorChangedSince, currentDeck, format, bracket, savedDeckName, showNotification, t]);
 
   useEffect(() => {
     if (!justSaved) return;

@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 
 import { isCommanderPreconDeck, useDecks, type DeckEntry } from "../../hooks/useDecks";
 import { preconExists, savePreconDeck } from "../../services/preconDecks";
+import { attemptSavedDeckWrite } from "../../services/savedDeckWriteFailure";
 import { menuButtonClass } from "./buttonStyles";
 import { MenuSelect } from "../ui/MenuSelect";
 
@@ -121,8 +122,16 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
     const suggested = `${deck.name} (${deck.code})`;
     const chosen = prompt(t("precon.savePrompt"), suggested);
     if (!chosen) return;
-    if (preconExists(chosen) && !confirm(t("precon.overwriteConfirm", { name: chosen }))) return;
-    await savePreconDeck(chosen, deck);
+    const existed = preconExists(chosen);
+    if (existed && !confirm(t("precon.overwriteConfirm", { name: chosen }))) return;
+    let saved = await attemptSavedDeckWrite("save", () =>
+      savePreconDeck(chosen, deck, existed ? "replace" : "keep"),
+    );
+    if (saved.ok && saved.value === "kept-existing") {
+      if (!confirm(t("precon.overwriteConfirm", { name: chosen }))) return;
+      saved = await attemptSavedDeckWrite("save", () => savePreconDeck(chosen, deck, "replace"));
+    }
+    if (!saved.ok) return;
     onImported(chosen);
     onClose();
   };
@@ -154,29 +163,37 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
     if (picks.length === 0) return;
 
     const conflicts = picks.filter((p) => preconExists(p.savedName));
-    let overwrite = true;
-    if (conflicts.length > 0) {
-      const msg =
+    const conflictNames = new Set(conflicts.map((p) => p.savedName));
+    const overwrite =
+      conflicts.length > 0 &&
+      confirm(
         conflicts.length === picks.length
           ? t("precon.overwriteAllConfirm", { count: picks.length })
-          : t("precon.overwriteSomeConfirm", { conflicts: conflicts.length, total: picks.length });
-      overwrite = confirm(msg);
-    }
+          : t("precon.overwriteSomeConfirm", { conflicts: conflicts.length, total: picks.length }),
+      );
 
     let lastImported: string | null = null;
     let imported = 0;
     let skipped = 0;
+    let refused = false;
     for (const { savedName, deck } of picks) {
-      if (preconExists(savedName) && !overwrite) {
+      const saved = await attemptSavedDeckWrite("save", () =>
+        savePreconDeck(savedName, deck, overwrite && conflictNames.has(savedName) ? "replace" : "keep"),
+      );
+      if (!saved.ok) {
+        refused = true;
+        break;
+      }
+      if (saved.value === "kept-existing") {
         skipped++;
         continue;
       }
-      await savePreconDeck(savedName, deck);
       lastImported = savedName;
       imported++;
     }
 
     if (lastImported) onImported(lastImported);
+    if (refused) return;
     clearSelection();
     onClose();
     if (skipped > 0) {

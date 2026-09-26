@@ -233,6 +233,16 @@ export function uniqueDeckName(
   }
 }
 
+/** `uniqueDeckName` against the library as the transaction that will write the name sees it. */
+export function freeDeckName(
+  txn: SavedDeckTxn,
+  baseName: string,
+  candidate?: (index: number) => string,
+): string {
+  void txn;
+  return uniqueDeckName(baseName, listSavedDeckNames(), candidate);
+}
+
 /** Write a saved deck's data. */
 export function writeSavedDeckData(txn: SavedDeckTxn, deckName: string, raw: string): void {
   void txn;
@@ -356,7 +366,7 @@ export function writeDraftAutosaveDeck(
     saveMetadataStore(txn, nextStore);
 
     return name;
-  });
+  }, "skip");
 }
 
 /** Save the deck builder's deck as `nextName`, moving it from `previousName` when renamed. */
@@ -387,7 +397,8 @@ function loadFolderStore(): DeckFolder[] {
   }
 }
 
-function saveFolderStore(folders: DeckFolder[]): void {
+function saveFolderStore(txn: SavedDeckTxn, folders: DeckFolder[]): void {
+  void txn;
   localStorage.setItem(DECK_FOLDERS_KEY, JSON.stringify(folders));
   notifyDecksChanged();
 }
@@ -404,26 +415,26 @@ export function listFolders(): DeckFolder[] {
  * folder, or `null` when the name is blank. Duplicate names are permitted —
  * folders are identified by `id`, not name.
  */
-export function createFolder(name: string): DeckFolder | null {
+export function createFolder(txn: SavedDeckTxn, name: string): DeckFolder | null {
   const trimmed = name.trim().slice(0, MAX_FOLDER_NAME_LENGTH);
   if (!trimmed) return null;
   const folders = loadFolderStore();
   const order = folders.reduce((max, f) => Math.max(max, f.order), -1) + 1;
   const folder: DeckFolder = { id: crypto.randomUUID(), name: trimmed, order };
   folders.push(folder);
-  saveFolderStore(folders);
+  saveFolderStore(txn, folders);
   return folder;
 }
 
 /** Rename a folder in place. No-op when the id is unknown or name is blank. */
-export function renameFolder(id: string, name: string): void {
+export function renameFolder(txn: SavedDeckTxn, id: string, name: string): void {
   const trimmed = name.trim().slice(0, MAX_FOLDER_NAME_LENGTH);
   if (!trimmed) return;
   const folders = loadFolderStore();
   const folder = folders.find((f) => f.id === id);
   if (!folder) return;
   folder.name = trimmed;
-  saveFolderStore(folders);
+  saveFolderStore(txn, folders);
 }
 
 /**
@@ -442,7 +453,7 @@ export function deleteFolder(txn: SavedDeckTxn, id: string): void {
     }
   }
   if (changed) saveMetadataStore(txn, store);
-  saveFolderStore(folders.filter((f) => f.id !== id));
+  saveFolderStore(txn, folders.filter((f) => f.id !== id));
 }
 
 /**

@@ -14,7 +14,12 @@ import {
   stampDeckMeta,
   writeSavedDeckData,
 } from "../constants/storage";
-import { withSavedDeckLibrary, type SavedDeckTxn } from "./savedDeckTransaction";
+import {
+  SavedDeckLibraryBusyError,
+  withSavedDeckLibrary,
+  withSavedDeckLibraryOrSkip,
+  type SavedDeckTxn,
+} from "./savedDeckTransaction";
 import {
   getCachedFeed,
   hydrateFeedCache,
@@ -207,7 +212,7 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
   if (!allowRefresh) {
     for (const sub of subs) {
       const cached = getCachedFeed(sub.sourceId);
-      if (cached) await withSavedDeckLibrary((txn) => syncFeedDecksToStorage(txn, cached));
+      if (cached) await withSavedDeckLibraryOrSkip((txn) => syncFeedDecksToStorage(txn, cached), "run-unguarded");
     }
     return;
   }
@@ -228,7 +233,7 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
       const feedId = source.id;
       const normalizedFeed = { ...feed, id: feedId, format: source.format ?? feed.format };
       const cachePersistence = setCachedFeed(feedId, normalizedFeed);
-      await withSavedDeckLibrary((txn) => syncFeedDecksToStorage(txn, normalizedFeed));
+      await withSavedDeckLibraryOrSkip((txn) => syncFeedDecksToStorage(txn, normalizedFeed), "run-unguarded");
 
       subs.push({
         sourceId: feedId,
@@ -259,7 +264,7 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
     const isStale = now - sub.lastRefreshedAt >= FEED_STALE_AFTER_MS;
     const bundled = sub.type === "bundled";
     if (!bundled && !isStale && cached) {
-      await withSavedDeckLibrary((txn) => syncFeedDecksToStorage(txn, cached));
+      await withSavedDeckLibraryOrSkip((txn) => syncFeedDecksToStorage(txn, cached), "run-unguarded");
       continue;
     }
 
@@ -269,7 +274,7 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
       const registrySource = FEED_REGISTRY.find((r) => r.id === sub.sourceId);
       const normalizedFeed = { ...feed, id: sub.sourceId, format: registrySource?.format ?? feed.format };
       const cachePersistence = setCachedFeed(sub.sourceId, normalizedFeed);
-      await withSavedDeckLibrary((txn) => syncFeedDecksToStorage(txn, normalizedFeed));
+      await withSavedDeckLibraryOrSkip((txn) => syncFeedDecksToStorage(txn, normalizedFeed), "run-unguarded");
       const feedChanged = cached?.updated !== normalizedFeed.updated;
       const metadataChanged = sub.lastVersion !== feed.version || sub.error !== undefined;
       sub.lastVersion = feed.version;
@@ -282,7 +287,7 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
       // Fall back to cached data
       const cached = getCachedFeed(sub.sourceId);
       if (cached) {
-        await withSavedDeckLibrary((txn) => syncFeedDecksToStorage(txn, cached));
+        await withSavedDeckLibraryOrSkip((txn) => syncFeedDecksToStorage(txn, cached), "run-unguarded");
       }
     }
   }
@@ -379,8 +384,10 @@ export async function refreshFeed(feedId: string): Promise<Feed> {
     saveFeedSubscriptions(subs);
     return feed;
   } catch (err) {
-    sub.error = err instanceof Error ? err.message : String(err);
-    saveFeedSubscriptions(subs);
+    if (!(err instanceof SavedDeckLibraryBusyError)) {
+      sub.error = err instanceof Error ? err.message : String(err);
+      saveFeedSubscriptions(subs);
+    }
     throw err;
   }
 }
@@ -394,6 +401,7 @@ export async function refreshAllFeeds(): Promise<Map<string, Feed | Error>> {
       const feed = await refreshFeed(sub.sourceId);
       results.set(sub.sourceId, feed);
     } catch (err) {
+      if (err instanceof SavedDeckLibraryBusyError) throw err;
       results.set(sub.sourceId, err instanceof Error ? err : new Error(String(err)));
     }
   }

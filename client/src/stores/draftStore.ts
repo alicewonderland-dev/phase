@@ -1328,7 +1328,7 @@ export const useDraftStore = create<DraftStoreState & DraftStoreActions>()((set,
         },
         persistence: "schedule",
       });
-      await autosaveDraftDeck({ view: state.view, setCode: state.selectedSet, partition, commanders: [] });
+      void autosaveDraftDeck({ view: state.view, setCode: state.selectedSet, partition, commanders: [] });
     } catch (error) {
       retireExclusive(token);
       throw error;

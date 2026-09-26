@@ -2026,7 +2026,7 @@ export const useMultiplayerDraftStore = create<
           submittedPartition: partition,
         },
       });
-      await autosaveDraftDeck({ view, setCode: null, partition, commanders });
+      void autosaveDraftDeck({ view, setCode: null, partition, commanders });
     } else if (role === "guest" && activeGuestAdapter) {
       await activeGuestAdapter.submitDeck(partition.mainDeck, commanders);
       set({
@@ -2034,7 +2034,7 @@ export const useMultiplayerDraftStore = create<
         submittedWorkspaceState: cloneWorkspace(workspace),
         submittedPartition: partition,
       });
-      await autosaveDraftDeck({ view, setCode: null, partition, commanders });
+      void autosaveDraftDeck({ view, setCode: null, partition, commanders });
     }
   },
 

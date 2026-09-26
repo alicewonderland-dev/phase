@@ -12,6 +12,7 @@ import {
   type DeckFolder,
   type DeckMeta,
 } from "../constants/storage";
+import { attemptSavedDeckWrite } from "../services/savedDeckWriteFailure";
 import { withSavedDeckLibrary } from "../services/savedDeckTransaction";
 import { PROFILE_REPLACED_EVENT } from "../stores/cloudSyncStore";
 
@@ -75,26 +76,44 @@ export function groupSavedDecks(
 }
 
 /** Module-level so the hook returns the same identity on every render (it closes over nothing). */
-function deleteFolder(id: string): Promise<void> {
-  return withSavedDeckLibrary((txn) => deleteFolderStore(txn, id));
+function createFolder(name: string): Promise<DeckFolder | null> {
+  return attemptSavedDeckWrite("organize", () => withSavedDeckLibrary((txn) => createFolderStore(txn, name))).then(
+    (r) => (r.ok ? r.value : null),
+  );
 }
 /** Module-level so the hook returns the same identity on every render (it closes over nothing). */
-function assignDeck(deckName: string, folderId: string | null): Promise<void> {
-  return withSavedDeckLibrary((txn) => setDeckFolder(txn, deckName, folderId));
+function renameFolder(id: string, name: string): Promise<boolean> {
+  return attemptSavedDeckWrite("organize", () => withSavedDeckLibrary((txn) => renameFolderStore(txn, id, name))).then(
+    (r) => r.ok,
+  );
+}
+/** Module-level so the hook returns the same identity on every render (it closes over nothing). */
+function deleteFolder(id: string): Promise<boolean> {
+  return attemptSavedDeckWrite("organize", () => withSavedDeckLibrary((txn) => deleteFolderStore(txn, id))).then(
+    (r) => r.ok,
+  );
+}
+/** Module-level so the hook returns the same identity on every render (it closes over nothing). */
+function assignDeck(deckName: string, folderId: string | null): Promise<boolean> {
+  return attemptSavedDeckWrite("organize", () =>
+    withSavedDeckLibrary((txn) => setDeckFolder(txn, deckName, folderId)),
+  ).then((r) => r.ok);
 }
 /** Module-level so the hook returns the same identity on every render (it closes over nothing). */
 function toggleStar(deckName: string): Promise<boolean> {
-  return withSavedDeckLibrary((txn) => toggleDeckStar(txn, deckName));
+  return attemptSavedDeckWrite("organize", () => withSavedDeckLibrary((txn) => toggleDeckStar(txn, deckName))).then(
+    (r) => r.ok,
+  );
 }
 
 export interface UseDeckFoldersResult {
   folders: DeckFolder[];
   /** Group a (pre-sorted) list of saved deck names into Starred/folders/Unfiled. */
   group: (deckNames: string[]) => GroupedDecks;
-  createFolder: (name: string) => DeckFolder | null;
-  renameFolder: (id: string, name: string) => void;
-  deleteFolder: (id: string) => Promise<void>;
-  assignDeck: (deckName: string, folderId: string | null) => Promise<void>;
+  createFolder: (name: string) => Promise<DeckFolder | null>;
+  renameFolder: (id: string, name: string) => Promise<boolean>;
+  deleteFolder: (id: string) => Promise<boolean>;
+  assignDeck: (deckName: string, folderId: string | null) => Promise<boolean>;
   toggleStar: (deckName: string) => Promise<boolean>;
 }
 
@@ -129,8 +148,8 @@ export function useDeckFolders(): UseDeckFoldersResult {
   return {
     folders,
     group,
-    createFolder: createFolderStore,
-    renameFolder: renameFolderStore,
+    createFolder,
+    renameFolder,
     deleteFolder,
     assignDeck,
     toggleStar,

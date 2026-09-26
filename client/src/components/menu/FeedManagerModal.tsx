@@ -14,6 +14,7 @@ import {
   refreshAllFeeds,
 } from "../../services/feedService";
 import type { FeedSubscription } from "../../types/feed";
+import { attemptSavedDeckWrite } from "../../services/savedDeckWriteFailure";
 import { useEffectiveOffline } from "../../stores/connectivityStore";
 
 interface FeedManagerModalProps {
@@ -36,7 +37,8 @@ export function FeedManagerModal({ open, onClose }: FeedManagerModalProps) {
     setLoading(sourceId);
     setError(null);
     try {
-      await subscribe(sourceId);
+      const r = await attemptSavedDeckWrite("updateFeeds", () => subscribe(sourceId));
+      if (!r.ok) return;
       setSubs(listSubscriptions());
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -47,7 +49,8 @@ export function FeedManagerModal({ open, onClose }: FeedManagerModalProps) {
   };
 
   const handleUnsubscribe = async (feedId: string) => {
-    await unsubscribe(feedId);
+    const r = await attemptSavedDeckWrite("updateFeeds", () => unsubscribe(feedId));
+    if (!r.ok) return;
     setSubs(listSubscriptions());
   };
 
@@ -56,7 +59,8 @@ export function FeedManagerModal({ open, onClose }: FeedManagerModalProps) {
     setLoading(feedId);
     setError(null);
     try {
-      await refreshFeed(feedId);
+      const r = await attemptSavedDeckWrite("updateFeeds", () => refreshFeed(feedId));
+      if (!r.ok) return;
       setSubs(listSubscriptions());
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -71,7 +75,8 @@ export function FeedManagerModal({ open, onClose }: FeedManagerModalProps) {
     setLoading("all");
     setError(null);
     try {
-      await refreshAllFeeds();
+      const r = await attemptSavedDeckWrite("updateFeeds", refreshAllFeeds);
+      if (!r.ok) return;
       setSubs(listSubscriptions());
     } finally {
       setLoading(null);
@@ -85,7 +90,8 @@ export function FeedManagerModal({ open, onClose }: FeedManagerModalProps) {
     setLoading("custom");
     setError(null);
     try {
-      await subscribe(url);
+      const r = await attemptSavedDeckWrite("updateFeeds", () => subscribe(url));
+      if (!r.ok) return;
       setSubs(listSubscriptions());
       setCustomUrl("");
     } catch (err) {

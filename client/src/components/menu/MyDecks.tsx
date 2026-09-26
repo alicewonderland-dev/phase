@@ -14,6 +14,7 @@ import {
   type DeckFolder,
 } from "../../constants/storage";
 import { withSavedDeckLibrary } from "../../services/savedDeckTransaction";
+import { attemptSavedDeckWrite } from "../../services/savedDeckWriteFailure";
 import { PROFILE_REPLACED_EVENT } from "../../stores/cloudSyncStore";
 import { usePreferencesStore } from "../../stores/preferencesStore";
 import { useEffectiveOffline } from "../../stores/connectivityStore";
@@ -744,21 +745,24 @@ export function MyDecks({
   const handleFolderPromptConfirm = useCallback(
     (folderName: string) => {
       if (!folderPrompt) return;
-      switch (folderPrompt.kind) {
-        case "create": {
-          createFolder(folderName);
-          break;
+      const prompt = folderPrompt;
+      void (async () => {
+        switch (prompt.kind) {
+          case "create": {
+            await createFolder(folderName);
+            break;
+          }
+          case "create-and-assign": {
+            const folder = await createFolder(folderName);
+            if (folder) await assignDeck(prompt.deckName, folder.id);
+            break;
+          }
+          case "rename": {
+            await renameFolder(prompt.folderId, folderName);
+            break;
+          }
         }
-        case "create-and-assign": {
-          const folder = createFolder(folderName);
-          if (folder) assignDeck(folderPrompt.deckName, folder.id);
-          break;
-        }
-        case "rename": {
-          renameFolder(folderPrompt.folderId, folderName);
-          break;
-        }
-      }
+      })();
       setFolderPrompt(null);
     },
     [folderPrompt, createFolder, assignDeck, renameFolder],
@@ -1294,10 +1298,14 @@ export function MyDecks({
   const showEvaluationStatus = mode === "manage"
     && (isScanningUserDecks || isScanningCoverage || (isEvaluating && !requiresCompatibilityFilter));
 
+  /** Resolves false only when saving the precon was refused; the deck must not be selected then. */
   const materializePreconDeck = useCallback(async (deckName: string): Promise<boolean> => {
     const candidate = legalPreconByName.get(deckName);
-    if (!candidate || candidate.source.type !== "precon") return false;
-    await savePreconDeck(deckName, preconCandidateToDeckEntry(candidate));
+    if (!candidate || candidate.source.type !== "precon") return true;
+    const saved = await attemptSavedDeckWrite("save", () =>
+      savePreconDeck(deckName, preconCandidateToDeckEntry(candidate), "replace"),
+    );
+    if (!saved.ok) return false;
     setDeckNames(listSavedDeckNames());
     return true;
   }, [legalPreconByName]);
@@ -1307,7 +1315,7 @@ export function MyDecks({
       onEditDeck?.(deckName);
       return;
     }
-    await materializePreconDeck(deckName);
+    if (!(await materializePreconDeck(deckName))) return;
     onSelectDeck?.(deckName);
   }, [materializePreconDeck, mode, onEditDeck, onSelectDeck]);
 
@@ -1382,8 +1390,8 @@ export function MyDecks({
     if (effectiveOffline) return;
     setIsRefreshing(true);
     try {
-      await refreshAllFeeds();
-      setDeckNames(listSavedDeckNames());
+      const refreshed = await attemptSavedDeckWrite("updateFeeds", refreshAllFeeds);
+      if (refreshed.ok) setDeckNames(listSavedDeckNames());
     } finally {
       setIsRefreshing(false);
     }
@@ -1392,13 +1400,13 @@ export function MyDecks({
   const handleAdoptDeck = useCallback(async (deckName: string) => {
     const newName = prompt(t("myDecks.saveAsPrompt"), deckName);
     if (!newName) return;
-    await adoptFeedDeck(deckName, newName);
-    setDeckNames(listSavedDeckNames());
+    const adopted = await attemptSavedDeckWrite("save", () => adoptFeedDeck(deckName, newName));
+    if (adopted.ok) setDeckNames(listSavedDeckNames());
   }, [t]);
 
   const handleDeleteDeck = useCallback(async (deckName: string) => {
-    await withSavedDeckLibrary((txn) => deleteDeck(txn, deckName));
-    setDeckNames(listSavedDeckNames());
+    const deleted = await attemptSavedDeckWrite("delete", () => withSavedDeckLibrary((txn) => deleteDeck(txn, deckName)));
+    if (deleted.ok) setDeckNames(listSavedDeckNames());
   }, []);
 
   const handleFeedManagerClose = () => {
