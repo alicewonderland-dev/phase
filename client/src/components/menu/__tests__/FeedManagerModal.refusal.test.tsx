@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -73,5 +73,71 @@ describe("FeedManagerModal — refused by a busy saved-deck library", () => {
     setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
     releaseHolder();
     await holder;
+  });
+});
+
+describe("FeedManagerModal — custom feed URL field", () => {
+  beforeEach(async () => {
+    installFifoWebLocks();
+    await resetSavedDeckLibraryForTests();
+    useAppNotificationStore.setState({ notification: null, expiresAt: 0 });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: () => Promise.resolve({ ...FEED_JSON, id: "custom-feed" }),
+    }));
+  });
+
+  afterEach(() => {
+    uninstallWebLocks();
+    vi.unstubAllGlobals();
+    cleanup();
+  });
+
+  it("a URL typed while another is being added is kept", async () => {
+    const user = userEvent.setup();
+    render(<FeedManagerModal open onClose={vi.fn()} />);
+    const urlInput = screen.getByPlaceholderText("https://example.com/feed.json");
+
+    let releaseHolder!: () => void;
+    const held = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+    const holder = withSavedDeckLibrary(() => held);
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+
+    await user.type(urlInput, "https://a.example.com/feed.json");
+    await user.click(screen.getByRole("button", { name: "Add" }));
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).pending).toHaveLength(1);
+    });
+
+    await user.clear(urlInput);
+    await user.type(urlInput, "https://b.example.com/feed.json");
+
+    releaseHolder();
+    await holder;
+    await vi.waitFor(async () => {
+      const q = await navigator.locks.query();
+      expect(q.held).toHaveLength(0);
+      expect(q.pending).toHaveLength(0);
+    });
+
+    expect(urlInput).toHaveValue("https://b.example.com/feed.json");
+    expect(vi.mocked(fetch)).toHaveBeenCalledWith("https://a.example.com/feed.json", expect.anything());
+  });
+
+  it("adding a custom feed clears its URL (paired positive)", async () => {
+    const user = userEvent.setup();
+    render(<FeedManagerModal open onClose={vi.fn()} />);
+    const urlInput = screen.getByPlaceholderText("https://example.com/feed.json");
+
+    await user.type(urlInput, "https://a.example.com/feed.json");
+    await user.click(screen.getByRole("button", { name: "Add" }));
+
+    await waitFor(() => expect(urlInput).toHaveValue(""));
   });
 });

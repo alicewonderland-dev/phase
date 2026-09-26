@@ -93,7 +93,8 @@ export function FeedManagerModal({ open, onClose }: FeedManagerModalProps) {
       const r = await attemptSavedDeckWrite("updateFeeds", () => subscribe(url));
       if (!r.ok) return;
       setSubs(listSubscriptions());
-      setCustomUrl("");
+      // Clear only the URL just added, not one typed while it was being added.
+      setCustomUrl((current) => (current.trim() === url ? "" : current));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setError(message === FEED_ERROR_KEYS.offline ? t(message) : message);
