@@ -4,7 +4,7 @@ const SAVED_DECK_LIBRARY_LOCK = "phase-saved-deck-library";
 /** localStorage key holding the last-published saved-deck library generation. */
 const SAVED_DECK_GENERATION_KEY = "phase-saved-deck-library-generation";
 
-export const LOCK_WAIT_TIMEOUT_MS = 2000;
+export const LOCK_WAIT_TIMEOUT_MS = 6000;
 export const GENERATION_IO_TIMEOUT_MS = 1000;
 export const LIBRARY_VIEW_TIMEOUT_MS = 2000;
 
@@ -13,16 +13,30 @@ declare const savedDeckTxnBrand: unique symbol;
 export type SavedDeckTxn = { readonly [savedDeckTxnBrand]: true };
 const TXN = {} as SavedDeckTxn; // module-private; the brand exists only at compile time
 
-export type SavedDeckTxnSkipReason =
-  | "lock-unavailable"
+export type SavedDeckTxnFailure =
   | "lock-refused"
   | "lock-timeout"
-  | "library-view-unconfirmed"
+  | "generation-unreadable"
+  | "library-view-stale"
   | "generation-unpublished";
 
-export type SavedDeckTxnResult<T> =
+export type SavedDeckTxnSkipReason = "lock-unavailable" | SavedDeckTxnFailure;
+
+export type SavedDeckTxnResult<T, R extends SavedDeckTxnSkipReason = SavedDeckTxnSkipReason> =
   | { status: "committed"; value: T }
-  | { status: "skipped"; reason: SavedDeckTxnSkipReason };
+  | { status: "skipped"; reason: R };
+
+export type NoLockManagerPolicy = "run-unguarded" | "skip";
+
+/** A user-initiated saved-deck library write was refused before its body ran. */
+export class SavedDeckLibraryBusyError extends Error {
+  readonly reason: SavedDeckTxnFailure;
+  constructor(reason: SavedDeckTxnFailure) {
+    super(`Saved-deck library unavailable: ${reason}`);
+    this.name = "SavedDeckLibraryBusyError";
+    this.reason = reason;
+  }
+}
 
 let _generationStore: ReturnType<typeof createStore> | null = null;
 function generationStore(): ReturnType<typeof createStore> {
@@ -111,33 +125,29 @@ function awaitLibraryView(committed: number): Promise<boolean> {
 }
 
 type BarrierOutcome =
-  // skip policy only: nothing was published, nothing is armed.
-  | { armed: false; reason: SavedDeckTxnSkipReason }
-  // `next` must be published in a `finally` regardless of what happens next.
-  | { armed: true; next: number; proceed: boolean; reason?: SavedDeckTxnSkipReason };
+  | { proceed: true; publish: number }
+  | { proceed: false; reason: SavedDeckTxnFailure; publish: number | null };
 
-/** `policy: "skip"` may return `armed: false`, giving up before publishing; `policy: "proceed"` always arms. */
-async function runLibraryBarrier(policy: "proceed" | "skip"): Promise<BarrierOutcome> {
+async function runLibraryBarrier(): Promise<BarrierOutcome> {
   const read = await within(() => get<number>("generation", generationStore()), GENERATION_IO_TIMEOUT_MS);
+  if (!read.settled) {
+    return { proceed: false, reason: "generation-unreadable", publish: null };
+  }
   // Treating an empty store as unconfirmed would make every autosave skip on a fresh library, so
-  // only a read that fails to settle (I/O failure or timeout) is genuinely unconfirmed.
-  const committed = !read.settled ? null : typeof read.value === "number" ? read.value : 0;
-  if (committed === null && policy === "skip") {
-    return { armed: false, reason: "library-view-unconfirmed" };
+  // only a read that fails to settle (I/O failure or timeout) is genuinely unreadable.
+  const committed = typeof read.value === "number" ? read.value : 0;
+  const caughtUp = await awaitLibraryView(committed);
+  if (!caughtUp) {
+    // Without this, a generation whose local publish never arrives would fail every later
+    // transaction here too.
+    return { proceed: false, reason: "library-view-stale", publish: committed };
   }
-  const target = committed ?? 0;
-  if (committed !== null) {
-    const caughtUp = await awaitLibraryView(committed);
-    if (!caughtUp && policy === "skip") {
-      return { armed: false, reason: "library-view-unconfirmed" };
-    }
-  }
-  const next = Math.max(Number(localStorage.getItem(SAVED_DECK_GENERATION_KEY) ?? 0), target) + 1;
+  const next = Math.max(Number(localStorage.getItem(SAVED_DECK_GENERATION_KEY) ?? 0), committed) + 1;
   const published = await within(() => set("generation", next, generationStore()), GENERATION_IO_TIMEOUT_MS);
   if (!published.settled) {
-    return { armed: true, next, proceed: policy === "proceed", reason: "generation-unpublished" };
+    return { proceed: false, reason: "generation-unpublished", publish: next };
   }
-  return { armed: true, next, proceed: true };
+  return { proceed: true, publish: next };
 }
 
 function publishLocalGeneration(next: number): void {
@@ -148,17 +158,10 @@ function publishLocalGeneration(next: number): void {
   }
 }
 
-/**
- * Run `body` under the saved-deck library lock and the write-ahead generation barrier, skipping
- * instead of running `body` when the lock or the barrier could not be confirmed. The autosave
- * uses this policy: a skip never overwrites a deck it could not safely observe or announce.
- */
-export async function withSavedDeckLibraryOrSkip<T>(
+async function runLocked<T>(
+  locks: LockManager,
   body: (txn: SavedDeckTxn) => T | Promise<T>,
-): Promise<SavedDeckTxnResult<T>> {
-  const locks = globalThis.navigator?.locks ?? null;
-  if (!locks) return { status: "skipped", reason: "lock-unavailable" };
-
+): Promise<SavedDeckTxnResult<T, SavedDeckTxnFailure>> {
   const controller = new AbortController();
   let granted = false;
   let timedOut = false;
@@ -174,18 +177,15 @@ export async function withSavedDeckLibraryOrSkip<T>(
     return await locks.request(SAVED_DECK_LIBRARY_LOCK, { mode: "exclusive", signal: controller.signal }, async () => {
       granted = true;
       if (timer) clearTimeout(timer);
-      const outcome = await runLibraryBarrier("skip");
-      if (!outcome.armed) {
-        return { status: "skipped", reason: outcome.reason } as SavedDeckTxnResult<T>;
-      }
+      const outcome = await runLibraryBarrier();
       try {
         if (!outcome.proceed) {
-          return { status: "skipped", reason: outcome.reason! } as SavedDeckTxnResult<T>;
+          return { status: "skipped", reason: outcome.reason } as SavedDeckTxnResult<T, SavedDeckTxnFailure>;
         }
         const value = await body(TXN);
-        return { status: "committed", value } as SavedDeckTxnResult<T>;
+        return { status: "committed", value } as SavedDeckTxnResult<T, SavedDeckTxnFailure>;
       } finally {
-        publishLocalGeneration(outcome.next);
+        if (outcome.publish !== null) publishLocalGeneration(outcome.publish);
       }
     });
   } catch (error) {
@@ -196,38 +196,32 @@ export async function withSavedDeckLibraryOrSkip<T>(
 }
 
 /**
- * Run `body` under the saved-deck library lock and the write-ahead generation barrier, always
- * running the body — unguarded, if the lock could not be acquired or the barrier could not
- * confirm this tab's view. Manual/user-initiated writers use this policy: they must never block
- * indefinitely behind another tab.
+ * Run a background write under the saved-deck library lock and the write-ahead generation
+ * barrier, or skip it without running `body` if either cannot be confirmed within its bound. With
+ * no lock manager, `noLockManager` decides whether `body` runs unguarded or is skipped.
+ */
+export async function withSavedDeckLibraryOrSkip<T>(
+  body: (txn: SavedDeckTxn) => T | Promise<T>,
+  noLockManager: NoLockManagerPolicy,
+): Promise<SavedDeckTxnResult<T>> {
+  const locks = globalThis.navigator?.locks ?? null;
+  if (!locks) {
+    if (noLockManager === "skip") return { status: "skipped", reason: "lock-unavailable" };
+    return { status: "committed", value: await body(TXN) };
+  }
+  return runLocked(locks, body);
+}
+
+/**
+ * Run a user-initiated write under the saved-deck library lock and the write-ahead generation
+ * barrier. If either cannot be confirmed within its bound, reject with SavedDeckLibraryBusyError
+ * without running `body`. With no lock manager, run `body` unguarded.
  */
 export async function withSavedDeckLibrary<T>(body: (txn: SavedDeckTxn) => T | Promise<T>): Promise<T> {
   const locks = globalThis.navigator?.locks ?? null;
   if (!locks) return body(TXN);
 
-  const controller = new AbortController();
-  let granted = false;
-  const waitMs = lockWaitMs();
-  const timer = Number.isFinite(waitMs)
-    ? setTimeout(() => {
-        controller.abort();
-      }, waitMs)
-    : null;
-
-  try {
-    return await locks.request(SAVED_DECK_LIBRARY_LOCK, { mode: "exclusive", signal: controller.signal }, async () => {
-      granted = true;
-      if (timer) clearTimeout(timer);
-      const outcome = await runLibraryBarrier("proceed");
-      try {
-        return await body(TXN);
-      } finally {
-        if (outcome.armed) publishLocalGeneration(outcome.next);
-      }
-    });
-  } catch (error) {
-    if (timer) clearTimeout(timer);
-    if (granted) throw error;
-    return body(TXN);
-  }
+  const result = await runLocked(locks, body);
+  if (result.status === "skipped") throw new SavedDeckLibraryBusyError(result.reason);
+  return result.value;
 }

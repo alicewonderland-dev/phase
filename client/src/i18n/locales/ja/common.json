@@ -423,5 +423,21 @@
       "no-turn": "TURNリレーが提供されませんでした",
       "aborted": "要求をキャンセルしました"
     }
+  },
+  "savedDeckLibraryBusy": {
+    "description": "別のPhaseタブが使用中です。他のPhaseタブを閉じてから再試行してください。",
+    "title": {
+      "save": "デッキを保存できませんでした",
+      "clone": "デッキを複製できませんでした",
+      "import": "デッキをインポートできませんでした",
+      "delete": "デッキを削除できませんでした",
+      "organize": "デッキの整理を更新できませんでした",
+      "updateFeeds": "デッキフィードを更新できませんでした",
+      "restore": "バックアップを復元できませんでした",
+      "applyCloud": "クラウドデッキを適用できませんでした"
+    }
+  },
+  "savedDeckLibraryStorageFailure": {
+    "description": "Phaseはブラウザのストレージにアクセスできませんでした。しばらくしてから再試行してください。"
   }
 }

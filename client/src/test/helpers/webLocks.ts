@@ -1,5 +1,6 @@
 import "fake-indexeddb/auto";
 import { createStore, get, set } from "idb-keyval";
+import { vi } from "vitest";
 
 import { setSavedDeckTxnLockWaitForTests, type SavedDeckTxn } from "../../services/savedDeckTransaction";
 
@@ -162,4 +163,14 @@ export function readIdbGenerationForTests(): Promise<number | undefined> {
 export async function seedGenerationForTests(idb: number, local: number): Promise<void> {
   await set("generation", idb, createStore(GENERATION_DB, GENERATION_STORE));
   localStorage.setItem("phase-saved-deck-library-generation", String(local));
+}
+
+/** Wait until the saved-deck library lock has no held and no pending request. */
+export async function awaitSavedDeckLibraryIdle(): Promise<void> {
+  const locks = globalThis.navigator?.locks;
+  if (!locks) return;
+  await vi.waitFor(async () => {
+    const { held, pending } = await locks.query();
+    if ((held?.length ?? 0) > 0 || (pending?.length ?? 0) > 0) throw new Error("saved-deck library lock still busy");
+  });
 }
