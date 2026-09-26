@@ -727,6 +727,70 @@ describe("refreshFeed", () => {
     const subs = listSubscriptions();
     expect(subs[0].error).toBeTruthy();
   });
+
+  it("keeps a subscription added while refreshFeed's fetch is still pending", async () => {
+    mockFetch(VALID_FEED);
+    await subscribe("https://example.com/feed.json");
+
+    let resolveFetch!: (v: unknown) => void;
+    global.fetch = vi.fn().mockImplementation((url: string) => {
+      if (url.includes("feed.json") && !url.includes("other")) {
+        return new Promise((resolve) => {
+          resolveFetch = resolve;
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: () => Promise.resolve(makeMtgGoldfishFeed("other-feed", "Modern")),
+      });
+    });
+
+    const refreshing = refreshFeed("test-feed");
+    await vi.waitFor(() => expect(resolveFetch).toBeDefined());
+
+    await subscribe("https://example.com/other-feed.json");
+    expect(listSubscriptions().map((s) => s.sourceId)).toContain("other-feed");
+
+    resolveFetch({ ok: true, status: 200, statusText: "OK", json: () => Promise.resolve(VALID_FEED) });
+    await refreshing;
+
+    // Neither subscription was dropped by refreshFeed writing back a snapshot of the
+    // subscription list taken before subscribe() committed its own entry.
+    expect(listSubscriptions().map((s) => s.sourceId)).toEqual(
+      expect.arrayContaining(["test-feed", "other-feed"]),
+    );
+  });
+
+  it("does not resurrect a subscription unsubscribed while its fetch was pending, and does not publish its decks", async () => {
+    mockFetch(VALID_FEED);
+    await subscribe("https://example.com/feed.json");
+
+    let resolveFetch!: (v: unknown) => void;
+    global.fetch = vi.fn().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveFetch = resolve;
+        }),
+    );
+
+    const refreshing = refreshFeed("test-feed");
+    await vi.waitFor(() => expect(resolveFetch).toBeDefined());
+
+    await unsubscribe("test-feed");
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Test Deck")).toBeNull();
+
+    const updatedFeed = {
+      ...VALID_FEED,
+      decks: [{ name: "Resurrected Deck", colors: ["R"], main: [{ count: 4, name: "Shock" }], sideboard: [] }],
+    };
+    resolveFetch({ ok: true, status: 200, statusText: "OK", json: () => Promise.resolve(updatedFeed) });
+    await refreshing;
+
+    expect(listSubscriptions().map((s) => s.sourceId)).not.toContain("test-feed");
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Resurrected Deck")).toBeNull();
+  });
 });
 
 describe("cross-tab saved-deck transactions", () => {
@@ -1073,7 +1137,7 @@ describe("cross-tab saved-deck transactions", () => {
     vi.mocked(idbSet).mockClear();
     const persisting = deferred<void>();
     // Defer only the feed-cache write; the barrier's own "generation" write must keep the real
-    // implementation, or the second transaction below could never confirm the lock is free.
+    // implementation.
     vi.mocked(idbSet).mockImplementation((key: unknown, value: unknown) => {
       if (key === "starter-decks") return persisting.promise;
       getIdbDb().set(key as string, value);

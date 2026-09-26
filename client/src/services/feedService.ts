@@ -260,15 +260,21 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
       const published = await publishUnlessSuperseded(signal, replacement, (txn) => {
         const cachePersistence = setCachedFeed(feedId, normalizedFeed);
         syncFeedDecksToStorage(txn, normalizedFeed);
-        subs.push({
-          sourceId: feedId,
-          url: source.url,
-          type: "bundled",
-          subscribedAt: Date.now(),
-          lastRefreshedAt: Date.now(),
-          lastVersion: feed.version,
-        });
-        saveFeedSubscriptions(subs);
+        // subscribe()/unsubscribe() run unlocked against localStorage while this fetch was in
+        // flight, so re-read the current list under the lock rather than writing back the
+        // `subs` snapshot loaded before the loop started.
+        const currentSubs = loadFeedSubscriptions();
+        if (!currentSubs.some((s) => s.sourceId === feedId)) {
+          currentSubs.push({
+            sourceId: feedId,
+            url: source.url,
+            type: "bundled",
+            subscribedAt: Date.now(),
+            lastRefreshedAt: Date.now(),
+            lastVersion: feed.version,
+          });
+          saveFeedSubscriptions(currentSubs);
+        }
         return { cachePersistence };
       });
       if (published.status === "committed") await published.value.cachePersistence;
@@ -303,12 +309,20 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
       const published = await publishUnlessSuperseded(signal, replacement, (txn) => {
         const cachePersistence = setCachedFeed(sub.sourceId, normalizedFeed);
         syncFeedDecksToStorage(txn, normalizedFeed);
-        const feedChanged = cached?.updated !== normalizedFeed.updated;
-        const metadataChanged = sub.lastVersion !== feed.version || sub.error !== undefined;
-        sub.lastVersion = feed.version;
-        if (isStale || feedChanged) sub.lastRefreshedAt = Date.now();
-        if (sub.error !== undefined) sub.error = undefined;
-        if (isStale || feedChanged || metadataChanged) saveFeedSubscriptions(subs);
+        // Same reasoning as the auto-subscribe loop above: re-read under the lock and update
+        // only this feed's entry, so a concurrent subscribe()/unsubscribe() isn't clobbered by
+        // writing back the pre-fetch `subs` snapshot. If this feed was unsubscribed while the
+        // fetch was in flight, there's no entry left to update.
+        const currentSubs = loadFeedSubscriptions();
+        const currentSub = currentSubs.find((s) => s.sourceId === sub.sourceId);
+        if (currentSub) {
+          const feedChanged = cached?.updated !== normalizedFeed.updated;
+          const metadataChanged = currentSub.lastVersion !== feed.version || currentSub.error !== undefined;
+          currentSub.lastVersion = feed.version;
+          if (isStale || feedChanged) currentSub.lastRefreshedAt = Date.now();
+          if (currentSub.error !== undefined) currentSub.error = undefined;
+          if (isStale || feedChanged || metadataChanged) saveFeedSubscriptions(currentSubs);
+        }
         return { cachePersistence };
       });
       if (published.status === "committed") await published.value.cachePersistence;
@@ -410,13 +424,24 @@ export async function refreshFeed(feedId: string): Promise<Feed> {
   try {
     const feed = await fetchFeed(sub.url);
     const { cachePersistence } = await withSavedDeckLibrary((txn) => {
+      // The fetch above ran unlocked, so a concurrent subscribe()/unsubscribe() may have
+      // committed while it was in flight. Re-read the subscription list under the lock and
+      // update only this feed's entry — writing back the pre-fetch `subs` snapshot loaded
+      // above would silently discard that concurrent change.
+      const currentSubs = loadFeedSubscriptions();
+      const currentSub = currentSubs.find((s) => s.sourceId === feedId);
+      if (!currentSub) {
+        // Unsubscribed while the fetch was in flight — nothing left to refresh or publish.
+        return { cachePersistence: Promise.resolve() };
+      }
+
       const cachePersistence = setCachedFeed(feed.id, feed);
       syncFeedDecksToStorage(txn, feed);
 
-      sub.lastRefreshedAt = Date.now();
-      sub.lastVersion = feed.version;
-      sub.error = undefined;
-      saveFeedSubscriptions(subs);
+      currentSub.lastRefreshedAt = Date.now();
+      currentSub.lastVersion = feed.version;
+      currentSub.error = undefined;
+      saveFeedSubscriptions(currentSubs);
 
       return { cachePersistence };
     });
@@ -424,8 +449,12 @@ export async function refreshFeed(feedId: string): Promise<Feed> {
     return feed;
   } catch (err) {
     if (!(err instanceof SavedDeckLibraryBusyError)) {
-      sub.error = err instanceof Error ? err.message : String(err);
-      saveFeedSubscriptions(subs);
+      const currentSubs = loadFeedSubscriptions();
+      const currentSub = currentSubs.find((s) => s.sourceId === feedId);
+      if (currentSub) {
+        currentSub.error = err instanceof Error ? err.message : String(err);
+        saveFeedSubscriptions(currentSubs);
+      }
     }
     throw err;
   }
