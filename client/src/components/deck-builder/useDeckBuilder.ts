@@ -44,6 +44,9 @@ import {
 
 const PRECON_PREFIX = "[Pre-built] ";
 
+/** "saved-then-changed": the write committed, but the editor changed while it was pending, so it no longer holds what was written. */
+export type SaveOutcome = "refused" | "saved" | "saved-then-changed";
+
 function listSavedDecks(): string[] {
   const keys: string[] = [];
   for (let i = 0; i < localStorage.length; i++) {
@@ -511,8 +514,8 @@ export function useDeckBuilder({
     markDirty();
   }, [applyDeckToEditor, markDirty]);
 
-  const handleSave = useCallback(async (): Promise<boolean> => {
-    if (!deckName.trim()) return false;
+  const handleSave = useCallback(async (): Promise<SaveOutcome> => {
+    if (!deckName.trim()) return "refused";
     const captured = captureEditor();
     // Save-time commander inference: when a Commander-format deck is shaped
     // like a 100-singleton list with no explicit commander, ask the engine
@@ -532,7 +535,7 @@ export function useDeckBuilder({
     const data = serializeSavedDeck(resolved, format, bracket);
     const nextName = deckName.trim();
     const saved = await attemptSavedDeckWrite("save", () => saveBuilderDeck(savedDeckName, nextName, data));
-    if (!saved.ok) return false;
+    if (!saved.ok) return "refused";
     const after = editorChangedSince(captured);
     if (!after.reloaded) {
       setSavedDeckName(nextName);
@@ -544,7 +547,7 @@ export function useDeckBuilder({
       });
     }
     setSavedDecks(listSavedDecks());
-    return true;
+    return after.reloaded || after.edited ? "saved-then-changed" : "saved";
   }, [
     deckName,
     captureEditor,

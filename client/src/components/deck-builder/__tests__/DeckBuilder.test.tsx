@@ -31,8 +31,9 @@ import {
 
 const cacheCardsMock = vi.fn();
 
+const { navigateMock } = vi.hoisted(() => ({ navigateMock: vi.fn() }));
 vi.mock("react-router", () => ({
-  useNavigate: () => vi.fn(),
+  useNavigate: () => navigateMock,
 }));
 
 // Default to desktop (matches jsdom's 1024px innerWidth); individual tests opt
@@ -121,6 +122,7 @@ describe("DeckBuilder", () => {
 
   afterEach(() => {
     cleanup();
+    navigateMock.mockReset();
     cacheCardsMock.mockClear();
     vi.mocked(loadPreconDeckMap).mockReset();
     vi.mocked(resolveCommander).mockReset();
@@ -666,6 +668,155 @@ describe("DeckBuilder", () => {
     );
     await user.click(screen.getByRole("button", { name: /Menu/ }));
     expect(screen.queryByRole("button", { name: "Discard" })).not.toBeInTheDocument();
+  });
+
+  describe("Save & continue while its save waits", () => {
+    function seedThreeDecks() {
+      localStorage.setItem(
+        STORAGE_KEY_PREFIX + "Deck A",
+        JSON.stringify({ main: [{ name: "Alpha", count: 1 }, { name: "Beta", count: 1 }, { name: "Delta", count: 1 }], sideboard: [], format: "Standard" }),
+      );
+      localStorage.setItem(
+        STORAGE_KEY_PREFIX + "Deck B",
+        JSON.stringify({ main: [{ name: "Gamma", count: 1 }], sideboard: [], format: "Standard" }),
+      );
+      localStorage.setItem(
+        STORAGE_KEY_PREFIX + "Deck C",
+        JSON.stringify({ main: [{ name: "Omega", count: 1 }], sideboard: [], format: "Standard" }),
+      );
+    }
+    async function mountBuilder() {
+      seedThreeDecks();
+      render(
+        <DeckBuilder
+          format="Standard"
+          onFormatChange={vi.fn()}
+          initialDeckName="Deck A"
+          searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+          onSearchFiltersChange={vi.fn()}
+          onResetSearch={vi.fn()}
+        />,
+      );
+      const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+      await waitFor(() => expect(nameInput).toHaveValue("Deck A"));
+      return nameInput as HTMLInputElement;
+    }
+    async function holdLibrary() {
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const holder = withSavedDeckLibrary(() => held);
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).held).toHaveLength(1);
+      });
+      return async () => {
+        release();
+        await holder;
+        await vi.waitFor(async () => {
+          const q = await navigator.locks.query();
+          expect(q.held).toHaveLength(0);
+          expect(q.pending).toHaveLength(0);
+        });
+      };
+    }
+    async function loadDeck(user: ReturnType<typeof userEvent.setup>, name: string) {
+      await user.click(screen.getByRole("button", { name: "Load deck..." }));
+      await user.click(screen.getByRole("option", { name }));
+    }
+
+    it("cancelling Save & continue while its save waits keeps the deck open and a later edit unsaved", async () => {
+      const user = userEvent.setup();
+      const nameInput = await mountBuilder();
+      await user.click(screen.getByRole("button", { name: "remove-Beta" }));
+
+      const release = await holdLibrary();
+      await loadDeck(user, "Deck B");
+      await user.click(screen.getByRole("button", { name: "Save & continue" }));
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).pending).toHaveLength(1);
+      });
+
+      await user.click(screen.getByRole("button", { name: "Cancel" }));
+      await user.click(await screen.findByRole("button", { name: "remove-Delta" }));
+
+      await release();
+      await waitFor(() => expect(nameInput).toHaveValue("Deck A"));
+      expect(screen.getByText("1 Alpha")).toBeInTheDocument();
+      expect(screen.queryByText("1 Delta")).not.toBeInTheDocument();
+      expect(screen.queryByText("1 Gamma")).not.toBeInTheDocument();
+      // The save committed its pre-cancel snapshot: reach guard that the save actually ran.
+      const savedA = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck A") ?? "{}");
+      expect(savedA.main).toEqual([{ name: "Alpha", count: 1 }, { name: "Delta", count: 1 }]);
+
+      await user.click(screen.getByRole("button", { name: /Menu/ }));
+      expect(await screen.findByRole("button", { name: "Discard" })).toBeInTheDocument();
+    });
+
+    it("Save & continue that is not cancelled loads the requested deck once its save completes (paired positive)", async () => {
+      const user = userEvent.setup();
+      const nameInput = await mountBuilder();
+      await user.click(screen.getByRole("button", { name: "remove-Beta" }));
+
+      const release = await holdLibrary();
+      await loadDeck(user, "Deck B");
+      await user.click(screen.getByRole("button", { name: "Save & continue" }));
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).pending).toHaveLength(1);
+      });
+
+      await release();
+      await waitFor(() => expect(nameInput).toHaveValue("Deck B"));
+      expect(screen.getByText("1 Gamma")).toBeInTheDocument();
+      const savedA = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck A") ?? "{}");
+      expect(savedA.main).toEqual([{ name: "Alpha", count: 1 }, { name: "Delta", count: 1 }]);
+    });
+
+    it("a newer request replaces one whose Save & continue is still waiting", async () => {
+      const user = userEvent.setup();
+      const nameInput = await mountBuilder();
+      await user.click(screen.getByRole("button", { name: "remove-Beta" }));
+
+      const release = await holdLibrary();
+      await loadDeck(user, "Deck B");
+      await user.click(screen.getByRole("button", { name: "Save & continue" }));
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).pending).toHaveLength(1);
+      });
+      await user.click(screen.getByRole("button", { name: "Cancel" }));
+      await loadDeck(user, "Deck C");
+
+      await release();
+      await waitFor(() => expect(nameInput).toHaveValue("Deck A"));
+      expect(await screen.findByRole("button", { name: "Save & continue" })).toBeInTheDocument();
+
+      await user.click(screen.getByRole("button", { name: "Save & continue" }));
+      await waitFor(() => expect(nameInput).toHaveValue("Deck C"));
+      expect(screen.getByText("1 Omega")).toBeInTheDocument();
+    });
+
+    it("an edit that reaches the deck while the Save & continue dialog stays open keeps the deck open", async () => {
+      const user = userEvent.setup();
+      const nameInput = await mountBuilder();
+      await user.click(screen.getByRole("button", { name: "remove-Beta" }));
+
+      const release = await holdLibrary();
+      await loadDeck(user, "Deck B");
+      await user.click(screen.getByRole("button", { name: "Save & continue" }));
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).pending).toHaveLength(1);
+      });
+
+      // The dialog does not trap focus, so a keyboard user can still edit the deck behind it.
+      screen.getByRole("button", { name: "remove-Delta" }).focus();
+      await user.keyboard("{Enter}");
+
+      await release();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(screen.getByRole("dialog", { name: "Unsaved changes" })).toBeInTheDocument();
+      expect(nameInput).toHaveValue("Deck A");
+      expect(screen.queryByText("1 Delta")).not.toBeInTheDocument();
+      const savedA = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck A") ?? "{}");
+      expect(savedA.main).toEqual([{ name: "Alpha", count: 1 }, { name: "Delta", count: 1 }]);
+    });
   });
 
   describe("cross-tab saved-deck transactions", () => {
