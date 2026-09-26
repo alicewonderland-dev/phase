@@ -958,6 +958,12 @@ describe("cross-tab saved-deck transactions", () => {
     return { release, holder };
   }
 
+  async function pendingLocks(count: number): Promise<void> {
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).pending).toHaveLength(count);
+    });
+  }
+
   it("refreshFeed refused by a busy library does not record a feed error", async () => {
     mockFetch(VALID_FEED);
     await subscribe("https://example.com/feed.json");
@@ -1381,6 +1387,102 @@ describe("cross-tab saved-deck transactions", () => {
 
     persisting.resolve();
     await refreshing;
+  });
+
+  it("does not publish a cached-only allowRefresh:false sync's decks for a feed unsubscribed while the sync is queued behind a busy library", async () => {
+    mockFetch(VALID_FEED);
+    await subscribe("https://example.com/feed.json");
+
+    const { release, holder } = await heldLock();
+    const unsubscribing = unsubscribe("test-feed");
+    await pendingLocks(1);
+
+    const initialization = initializeFeeds({ allowRefresh: false });
+    await pendingLocks(2);
+
+    release();
+    await holder;
+    await unsubscribing;
+    await initialization;
+
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Test Deck")).toBeNull();
+    expect(getDeckFeedOrigin("Test Deck")).toBeNull();
+    expect(listSubscriptions().map((s) => s.sourceId)).not.toContain("test-feed");
+  });
+
+  it("does not publish a fresh cached remote sync's decks for a feed unsubscribed while the sync is queued behind a busy library", async () => {
+    mockFetch(VALID_FEED);
+    await subscribe("https://example.com/feed.json");
+    const subs = JSON.parse(localStorage.getItem(FEED_SUBSCRIPTIONS_KEY)!) as FeedSubscription[];
+    localStorage.setItem(FEED_SUBSCRIPTIONS_KEY, JSON.stringify([...subs, ...bundledSubs()]));
+    // The bundled feeds are already-subscribed, so their own refetch below must not resolve to
+    // the "Test Deck" / "Another Deck" fixture — otherwise their unrelated publish would satisfy
+    // the assertions below even if the guard under test did not.
+    mockFetchByUrl({
+      ...ALL_BUNDLED_FEEDS,
+      "starter-decks": { ...STARTER_FEED, decks: [{ ...STARTER_FEED.decks[0], name: "Bundled Starter Deck" }] },
+    });
+
+    const { release, holder } = await heldLock();
+    const unsubscribing = unsubscribe("test-feed");
+    await pendingLocks(1);
+
+    const initialization = initializeFeeds();
+    await pendingLocks(2);
+
+    release();
+    await holder;
+    await unsubscribing;
+    await initialization;
+
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Test Deck")).toBeNull();
+    expect(getDeckFeedOrigin("Test Deck")).toBeNull();
+    expect(listSubscriptions().map((s) => s.sourceId)).not.toContain("test-feed");
+  });
+
+  it("does not publish a cached fallback's decks for a feed unsubscribed while its failed-refetch sync is queued behind a busy library", async () => {
+    mockFetch(VALID_FEED);
+    await subscribe("https://example.com/feed.json");
+    const subs = JSON.parse(localStorage.getItem(FEED_SUBSCRIPTIONS_KEY)!) as FeedSubscription[];
+    subs[0].lastRefreshedAt = 0;
+    localStorage.setItem(FEED_SUBSCRIPTIONS_KEY, JSON.stringify([...subs, ...bundledSubs()]));
+
+    // The bundled feeds are already-subscribed, so their own refetch below must not resolve to
+    // the "Test Deck" / "Another Deck" fixture — otherwise their unrelated publish would satisfy
+    // the assertions below even if the guard under test did not.
+    const bundledFeeds: Record<string, unknown> = {
+      ...ALL_BUNDLED_FEEDS,
+      "starter-decks": { ...STARTER_FEED, decks: [{ ...STARTER_FEED.decks[0], name: "Bundled Starter Deck" }] },
+    };
+    let rejectFetch!: (e: unknown) => void;
+    global.fetch = vi.fn().mockImplementation((url: string) => {
+      if (url.includes("feed.json")) {
+        return new Promise((_resolve, reject) => {
+          rejectFetch = reject;
+        });
+      }
+      const data = Object.entries(bundledFeeds).find(([pattern]) => url.includes(pattern))?.[1];
+      return Promise.resolve({ ok: !!data, status: data ? 200 : 404, statusText: data ? "OK" : "Not Found", json: () => Promise.resolve(data ?? {}) });
+    });
+
+    const initialization = initializeFeeds();
+    await vi.waitFor(() => expect(rejectFetch).toBeDefined());
+
+    const { release, holder } = await heldLock();
+    const unsubscribing = unsubscribe("test-feed");
+    await pendingLocks(1);
+
+    rejectFetch(new Error("network down"));
+    await pendingLocks(2);
+
+    release();
+    await holder;
+    await unsubscribing;
+    await initialization;
+
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Test Deck")).toBeNull();
+    expect(getDeckFeedOrigin("Test Deck")).toBeNull();
+    expect(listSubscriptions().map((s) => s.sourceId)).not.toContain("test-feed");
   });
 });
 
