@@ -602,9 +602,8 @@ export function useDeckBuilder({
   }, [justSaved]);
 
   const handleLoad = useCallback(async (name: string) => {
-    // Captured before the resolveCommander await below: whatever the user did most recently to
-    // the editor while this Load awaited — a newer Load/Clone (reloaded) or any edit, including an
-    // Import, which only bumps editRevision (edited) — must win over this Load.
+    // Captured before the resolveCommander await below: a newer Load/Clone (reloaded) or any edit
+    // that marks the deck dirty, including an Import (edited), must win over this Load.
     const captured = captureEditor();
     const parsed = loadSavedDeck(name);
     const data = localStorage.getItem(STORAGE_KEY_PREFIX + name);

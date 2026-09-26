@@ -1576,15 +1576,17 @@ describe("cloud sync serialization", () => {
         throw new Error("IDB unavailable");
       });
 
-      await useCloudSyncStore.getState().resolveConflict("cloud");
+      try {
+        await useCloudSyncStore.getState().resolveConflict("cloud");
 
-      expect(mocks.applyBackup).not.toHaveBeenCalled();
-      expect(useCloudSyncStore.getState().conflict).not.toBeNull();
-      expect(useAppNotificationStore.getState().notification?.description).toBe(
-        "Phase couldn't reach browser storage. Try again in a moment.",
-      );
-
-      transactionSpy.mockRestore();
+        expect(mocks.applyBackup).not.toHaveBeenCalled();
+        expect(useCloudSyncStore.getState().conflict).not.toBeNull();
+        expect(useAppNotificationStore.getState().notification?.description).toBe(
+          "Phase couldn't reach browser storage. Try again in a moment.",
+        );
+      } finally {
+        transactionSpy.mockRestore();
+      }
     });
 
     it("a background remote apply refused while IDB is unreadable reports the storage description, not the busy one", async () => {
@@ -1596,15 +1598,17 @@ describe("cloud sync serialization", () => {
         throw new Error("IDB unavailable");
       });
 
-      await useCloudSyncStore.getState().syncNow();
+      try {
+        await useCloudSyncStore.getState().syncNow();
 
-      expect(mocks.applyBackup).not.toHaveBeenCalled();
-      expect(useCloudSyncStore.getState().status).toBe("error");
-      expect(useCloudSyncStore.getState().error).toBe(
-        "Phase couldn't reach browser storage. Try again in a moment.",
-      );
-
-      transactionSpy.mockRestore();
+        expect(mocks.applyBackup).not.toHaveBeenCalled();
+        expect(useCloudSyncStore.getState().status).toBe("error");
+        expect(useCloudSyncStore.getState().error).toBe(
+          "Phase couldn't reach browser storage. Try again in a moment.",
+        );
+      } finally {
+        transactionSpy.mockRestore();
+      }
     });
 
     it("a merge refused while IDB is unreadable tells the user it's a storage failure, not a busy tab", async () => {
@@ -1618,14 +1622,16 @@ describe("cloud sync serialization", () => {
         throw new Error("IDB unavailable");
       });
 
-      await useCloudSyncStore.getState().resolveConflict("merge");
+      try {
+        await useCloudSyncStore.getState().resolveConflict("merge");
 
-      expect(mocks.applyBackup).not.toHaveBeenCalled();
-      expect(useAppNotificationStore.getState().notification?.description).toBe(
-        "Phase couldn't reach browser storage. Try again in a moment.",
-      );
-
-      transactionSpy.mockRestore();
+        expect(mocks.applyBackup).not.toHaveBeenCalled();
+        expect(useAppNotificationStore.getState().notification?.description).toBe(
+          "Phase couldn't reach browser storage. Try again in a moment.",
+        );
+      } finally {
+        transactionSpy.mockRestore();
+      }
     });
   });
 });

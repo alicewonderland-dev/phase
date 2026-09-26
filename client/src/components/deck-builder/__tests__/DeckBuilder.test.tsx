@@ -1378,6 +1378,76 @@ describe("DeckBuilder", () => {
     expect(screen.queryByText("99 Island")).not.toBeInTheDocument();
   });
 
+  it("a precon Load that resolves after the user edits the current deck does not overwrite that edit", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "Deck A",
+      JSON.stringify({ main: [{ name: "Alpha", count: 1 }, { name: "Beta", count: 1 }], sideboard: [], format: "Standard" }),
+    );
+    vi.mocked(loadPreconDeckMap).mockResolvedValue({
+      secrets: {
+        code: "SOS",
+        name: "Secrets of Strixhaven",
+        type: "Commander",
+        coveragePct: 100,
+        mainBoard: [{ name: "Island", count: 99 }],
+        sideBoard: [],
+        commander: [{ name: "Zimone, Mystery Unraveler", count: 1 }],
+      },
+    });
+
+    const { rerender } = render(
+      <DeckBuilder
+        format="Standard"
+        onFormatChange={vi.fn()}
+        initialDeckName="Deck A"
+        searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+        onSearchFiltersChange={vi.fn()}
+        onResetSearch={vi.fn()}
+      />,
+    );
+    const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+    await waitFor(() => expect(nameInput).toHaveValue("Deck A"));
+
+    // The initial Load already called resolveCommander once; hold only the call the precon Load makes.
+    let resolvePrecon!: (deck: unknown) => void;
+    const held = new Promise((resolve) => {
+      resolvePrecon = resolve;
+    });
+    vi.mocked(resolveCommander).mockImplementationOnce(() => held as never);
+
+    rerender(
+      <DeckBuilder
+        format="Standard"
+        onFormatChange={vi.fn()}
+        initialDeckName="[Pre-built] Secrets of Strixhaven (SOS)"
+        searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+        onSearchFiltersChange={vi.fn()}
+        onResetSearch={vi.fn()}
+      />,
+    );
+    await vi.waitFor(() => expect(vi.mocked(resolveCommander)).toHaveBeenCalledTimes(2));
+
+    // The user edits the still-displayed Deck A while the precon Load awaits.
+    await user.click(await screen.findByRole("button", { name: "remove-Beta" }));
+    expect(screen.queryByText("1 Beta")).not.toBeInTheDocument();
+
+    // Let the precon Load's now-resolved promise, and any state updates it triggers, settle
+    // before asserting the edit was not discarded.
+    await act(async () => {
+      resolvePrecon({ main: [{ name: "Island", count: 99 }], sideboard: [] });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(nameInput).toHaveValue("Deck A");
+    expect(screen.getByText("1 Alpha")).toBeInTheDocument();
+    expect(screen.queryByText("1 Beta")).not.toBeInTheDocument();
+    expect(screen.queryByText("99 Island")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /Menu/ }));
+    expect(await screen.findByRole("button", { name: "Discard" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+  });
+
   it("a Load that resolves after the user edits the current deck does not overwrite that edit", async () => {
     const user = userEvent.setup();
     localStorage.setItem(
