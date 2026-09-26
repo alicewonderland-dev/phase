@@ -38,6 +38,16 @@ export class SavedDeckLibraryBusyError extends Error {
   }
 }
 
+/** A user-initiated write was refused because the deck it targeted changed before it ran. */
+export class SavedDeckChangedError extends Error {
+  readonly deckName: string;
+  constructor(deckName: string) {
+    super(`Saved deck changed before the write ran: ${deckName}`);
+    this.name = "SavedDeckChangedError";
+    this.deckName = deckName;
+  }
+}
+
 let _generationStore: ReturnType<typeof createStore> | null = null;
 function generationStore(): ReturnType<typeof createStore> {
   if (!_generationStore) {

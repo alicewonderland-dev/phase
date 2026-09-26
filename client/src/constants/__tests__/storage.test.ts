@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ACTIVE_DECK_KEY,
   bumpProfileReplacementGeneration,
+  captureSavedDeck,
   createFolder,
   deleteFolder,
   DRAFT_WORKSPACE_PREFERENCES_KEY,
@@ -18,7 +19,9 @@ import {
   PROFILE_REPLACEMENT_KEY,
   profileReplacementGeneration,
   renameFolder,
+  requireSavedDeckUnchanged,
   saveBuilderDeck,
+  savedDeckUnchanged,
   saveSavedDeckBracket,
   setDeckFolder,
   stampDeckMeta,
@@ -26,6 +29,7 @@ import {
   touchDeckPlayed,
   uniqueDeckName,
   writeDraftAutosaveDeck,
+  writeSavedDeckData,
   STORAGE_KEY_PREFIX,
 } from "../storage";
 import { expandParsedDeck } from "../../services/deckParser";
@@ -37,6 +41,7 @@ import {
 } from "../../test/helpers/webLocks";
 import {
   LOCK_WAIT_TIMEOUT_MS,
+  SavedDeckChangedError,
   setSavedDeckTxnLockWaitForTests,
   withSavedDeckLibrary,
   type SavedDeckTxnResult,
@@ -383,6 +388,52 @@ describe("freeDeckName", () => {
   });
 });
 
+describe("captureSavedDeck / savedDeckUnchanged", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it("a name with no deck is never unchanged", () => {
+    const deck = captureSavedDeck("Ghost");
+    expect(deck.raw).toBeNull();
+    expect(savedDeckUnchanged(testSavedDeckTxn, deck)).toBe(false);
+    expect(() => requireSavedDeckUnchanged(testSavedDeckTxn, deck)).toThrow(SavedDeckChangedError);
+  });
+
+  it("metadata-only writes do not change a captured deck", () => {
+    localStorage.setItem(STORAGE_KEY_PREFIX + "Meta", "{}");
+    const deck = captureSavedDeck("Meta");
+    // No metadata entry yet, so each of these materializes one via `?? { addedAt }` — the
+    // identity check must still hold since none of them touch the stored deck bytes.
+    toggleDeckStar(testSavedDeckTxn, "Meta");
+    setDeckFolder(testSavedDeckTxn, "Meta", "folder-x");
+    touchDeckPlayed(testSavedDeckTxn, "Meta");
+    stampDeckMeta(testSavedDeckTxn, "Meta");
+    expect(savedDeckUnchanged(testSavedDeckTxn, deck)).toBe(true);
+  });
+
+  it("a rewrite with different data changes a captured deck", () => {
+    localStorage.setItem(STORAGE_KEY_PREFIX + "Rewrite", "A");
+    const deck = captureSavedDeck("Rewrite");
+    writeSavedDeckData(testSavedDeckTxn, "Rewrite", "B");
+    expect(savedDeckUnchanged(testSavedDeckTxn, deck)).toBe(false);
+  });
+
+  it("a delete changes a captured deck", () => {
+    localStorage.setItem(STORAGE_KEY_PREFIX + "Gone", "A");
+    const deck = captureSavedDeck("Gone");
+    localStorage.removeItem(STORAGE_KEY_PREFIX + "Gone");
+    expect(savedDeckUnchanged(testSavedDeckTxn, deck)).toBe(false);
+  });
+
+  it("a deck re-saved with identical data is unchanged", () => {
+    localStorage.setItem(STORAGE_KEY_PREFIX + "Same", "A");
+    const deck = captureSavedDeck("Same");
+    writeSavedDeckData(testSavedDeckTxn, "Same", "A");
+    expect(savedDeckUnchanged(testSavedDeckTxn, deck)).toBe(true);
+  });
+});
+
 describe("draft autosave ownership", () => {
   beforeEach(async () => {
     installFifoWebLocks();
@@ -419,7 +470,7 @@ describe("draft autosave ownership", () => {
       });
 
       let manualSettled = false;
-      const manual = saveBuilderDeck(null, "Mine", "manual-data").catch((error) => {
+      const manual = saveBuilderDeck(null, { current: null }, () => true, "Mine", "manual-data").catch((error) => {
         manualSettled = true;
         throw error;
       });

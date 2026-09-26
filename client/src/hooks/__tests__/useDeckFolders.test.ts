@@ -2,7 +2,7 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { groupSavedDecks, useDeckFolders } from "../useDeckFolders";
-import { DECK_FOLDERS_KEY, type DeckFolder, type DeckMeta } from "../../constants/storage";
+import { DECK_FOLDERS_KEY, STORAGE_KEY_PREFIX, type DeckFolder, type DeckMeta } from "../../constants/storage";
 import { setSavedDeckTxnLockWaitForTests, withSavedDeckLibrary } from "../../services/savedDeckTransaction";
 import { installFifoWebLocks, resetSavedDeckLibraryForTests, uninstallWebLocks } from "../../test/helpers/webLocks";
 import { PROFILE_REPLACED_EVENT } from "../../stores/cloudSyncStore";
@@ -109,6 +109,8 @@ describe("groupSavedDecks", () => {
 
 describe("useDeckFolders (reactive)", () => {
   it("regroups after membership + star mutations made through the hook", async () => {
+    // assignDeck/toggleStar now require the deck to exist (captured, unchanged) at the mutation.
+    localStorage.setItem(STORAGE_KEY_PREFIX + "Burn", JSON.stringify({ main: [], sideboard: [] }));
     const { result } = renderHook(() => useDeckFolders());
 
     let folderId = "";

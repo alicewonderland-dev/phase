@@ -88,6 +88,98 @@ describe("PreconDeckModal", () => {
     expect(persisted.main).toEqual([{ name: "Mountain", count: 40 }]);
   });
 
+  it("a confirmed overwrite queued behind a replacement of the same name is re-confirmed once, then overwrites (single pick)", async () => {
+    localStorage.setItem(STORAGE_KEY_PREFIX + "Aggro Deck (SET)", "ORIGINAL-DATA");
+    vi.stubGlobal("prompt", vi.fn(() => "Aggro Deck (SET)"));
+    const confirmSpy = vi.fn(() => true);
+    vi.stubGlobal("confirm", confirmSpy);
+    const onImported = vi.fn();
+
+    const holder = withSavedDeckLibrary(async (txn) => {
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).pending).toHaveLength(1);
+      });
+      writeSavedDeckData(txn, "Aggro Deck (SET)", "REPLACED-DATA");
+    });
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+
+    render(<PreconDeckModal open onClose={vi.fn()} onImported={onImported} />);
+    await userEvent.click(screen.getByRole("button", { name: /^Aggro Deck/ }));
+    await holder;
+
+    // The first confirm accepted overwriting ORIGINAL-DATA; the transaction found REPLACED-DATA
+    // instead and refused, so this pick re-confirms once more before overwriting that.
+    await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(onImported).toHaveBeenCalledWith("Aggro Deck (SET)", "open"));
+    const persisted = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Aggro Deck (SET)") ?? "{}");
+    expect(persisted.main).toEqual([{ name: "Mountain", count: 40 }]);
+  });
+
+  it("declining the re-confirm after a replacement leaves the replacement's data untouched", async () => {
+    localStorage.setItem(STORAGE_KEY_PREFIX + "Aggro Deck (SET)", "ORIGINAL-DATA");
+    vi.stubGlobal("prompt", vi.fn(() => "Aggro Deck (SET)"));
+    const confirmSpy = vi.fn().mockReturnValueOnce(true).mockReturnValueOnce(false);
+    vi.stubGlobal("confirm", confirmSpy);
+    const onImported = vi.fn();
+
+    const holder = withSavedDeckLibrary(async (txn) => {
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).pending).toHaveLength(1);
+      });
+      writeSavedDeckData(txn, "Aggro Deck (SET)", "REPLACED-DATA");
+    });
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+
+    render(<PreconDeckModal open onClose={vi.fn()} onImported={onImported} />);
+    await userEvent.click(screen.getByRole("button", { name: /^Aggro Deck/ }));
+    await holder;
+
+    await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(2));
+    expect(onImported).not.toHaveBeenCalled();
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Aggro Deck (SET)")).toBe("REPLACED-DATA");
+  });
+
+  it("batch import leaves a name that changed after the overwrite confirm untouched, and still overwrites unchanged conflicts", async () => {
+    localStorage.setItem(STORAGE_KEY_PREFIX + "Aggro Deck (SET)", "AGGRO-ORIGINAL");
+    localStorage.setItem(STORAGE_KEY_PREFIX + "Control Deck (SET)", "CONTROL-ORIGINAL");
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    vi.stubGlobal("alert", vi.fn());
+    const onImported = vi.fn();
+
+    let release!: () => void;
+    const held = new Promise<void>((r) => { release = r; });
+    const holder = withSavedDeckLibrary(async (txn) => {
+      await held;
+      // Replace only Aggro's content while this batch's saves wait behind this lock.
+      writeSavedDeckData(txn, "Aggro Deck (SET)", "AGGRO-REPLACED");
+    });
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+
+    render(<PreconDeckModal open onClose={vi.fn()} onImported={onImported} />);
+    await userEvent.click(screen.getByRole("checkbox", { name: /select aggro deck/i }));
+    await userEvent.click(screen.getByRole("checkbox", { name: /select control deck/i }));
+    await userEvent.click(screen.getByRole("button", { name: /Import \d+ selected/i }));
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).pending).toHaveLength(1);
+    });
+
+    release();
+    await holder;
+    await waitFor(() => expect(onImported).toHaveBeenCalledWith("Control Deck (SET)", "open"));
+
+    // Aggro changed after the confirm, so the batch left it as the holder wrote it.
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Aggro Deck (SET)")).toBe("AGGRO-REPLACED");
+    // Control was unchanged, so its conflict still overwrote.
+    const control = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Control Deck (SET)") ?? "{}");
+    expect(control.main).toEqual([{ name: "Island", count: 40 }]);
+  });
+
   it("declining the in-transaction re-confirm leaves the claimed deck untouched and does not import", async () => {
     vi.stubGlobal("prompt", vi.fn(() => "Aggro Deck (SET)"));
     vi.stubGlobal("confirm", vi.fn(() => false));

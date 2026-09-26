@@ -4,13 +4,19 @@ import userEvent from "@testing-library/user-event";
 
 import { MyDecks } from "../MyDecks";
 import {
+  ACTIVE_DECK_KEY,
   RANDOM_DECK_SELECTION,
   createFolder,
   getDeckMeta,
   listFolders,
+  removeDeckMeta,
+  removeSavedDeckData,
   saveFeedSubscriptions,
   saveDeckOrigins,
   setDeckFolder,
+  stampDeckMeta,
+  toggleDeckStar,
+  writeSavedDeckData,
   STORAGE_KEY_PREFIX,
 } from "../../../constants/storage";
 import type { ParsedDeck } from "../../../services/deckParser";
@@ -666,6 +672,104 @@ describe("MyDecks", () => {
     releaseHolder();
     await holder;
     uninstallWebLocks();
+  });
+
+  it("a delete queued behind a transaction that replaces the deck leaves the replacement's data, metadata and active pointer", async () => {
+    installFifoWebLocks();
+    await resetSavedDeckLibraryForTests(); // clears localStorage; seed the deck after
+    saveDeck("Deck Alpha", { main: [{ name: "Island", count: 60 }], sideboard: [] });
+    stampDeckMeta(testSavedDeckTxn, "Deck Alpha", 1000);
+    localStorage.setItem(ACTIVE_DECK_KEY, "Deck Alpha");
+    vi.mocked(evaluateDeckCompatibilityBatch).mockResolvedValue({});
+    useAppNotificationStore.setState({ notification: null, expiresAt: 0 });
+
+    render(<MyDecks mode="manage" activeDeckName={null} onCreateDeck={vi.fn()} onEditDeck={vi.fn()} />);
+    expect(await screen.findByText("Deck Alpha")).toBeInTheDocument();
+
+    let release!: () => void;
+    const held = new Promise<void>((r) => { release = r; });
+    const holder = withSavedDeckLibrary(async (txn) => {
+      await held;
+      removeSavedDeckData(txn, "Deck Alpha");
+      removeDeckMeta(txn, "Deck Alpha");
+      writeSavedDeckData(txn, "Deck Alpha", JSON.stringify({ main: [{ name: "Mountain", count: 60 }], sideboard: [] }));
+      stampDeckMeta(txn, "Deck Alpha", 2000);
+      toggleDeckStar(txn, "Deck Alpha");
+      localStorage.setItem(ACTIVE_DECK_KEY, "Deck Alpha");
+    });
+    await vi.waitFor(async () => { expect((await navigator.locks.query()).held).toHaveLength(1); });
+
+    await userEvent.click(screen.getByTitle("Delete deck"));
+    await userEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await vi.waitFor(async () => { expect((await navigator.locks.query()).pending).toHaveLength(1); });
+
+    release();
+    await holder;
+    await awaitSavedDeckLibraryIdle();
+
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck Alpha") ?? "{}").main).toEqual([
+      { name: "Mountain", count: 60 },
+    ]);
+    expect(getDeckMeta("Deck Alpha")).toEqual({ addedAt: 2000, starred: true });
+    expect(localStorage.getItem(ACTIVE_DECK_KEY)).toBe("Deck Alpha");
+    expect(useAppNotificationStore.getState().notification).toEqual({
+      title: "Couldn't delete deck",
+      description: "This deck changed before your action ran, so nothing was changed. Check the deck and try again.",
+    });
+    uninstallWebLocks();
+  });
+
+  it("a delete queued behind a transaction that leaves the deck unchanged still deletes it", async () => {
+    installFifoWebLocks();
+    await resetSavedDeckLibraryForTests();
+    saveDeck("Deck Alpha", { main: [{ name: "Island", count: 60 }], sideboard: [] });
+    stampDeckMeta(testSavedDeckTxn, "Deck Alpha", 1000);
+    localStorage.setItem(ACTIVE_DECK_KEY, "Deck Alpha");
+    vi.mocked(evaluateDeckCompatibilityBatch).mockResolvedValue({});
+    useAppNotificationStore.setState({ notification: null, expiresAt: 0 });
+
+    render(<MyDecks mode="manage" activeDeckName={null} onCreateDeck={vi.fn()} onEditDeck={vi.fn()} />);
+    expect(await screen.findByText("Deck Alpha")).toBeInTheDocument();
+
+    let release!: () => void;
+    const held = new Promise<void>((r) => { release = r; });
+    // The control: the same holder shape, minus the replacement — this queued action still
+    // finds "Deck Alpha" unchanged and deletes it.
+    const holder = withSavedDeckLibrary(async () => { await held; });
+    await vi.waitFor(async () => { expect((await navigator.locks.query()).held).toHaveLength(1); });
+
+    await userEvent.click(screen.getByTitle("Delete deck"));
+    await userEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await vi.waitFor(async () => { expect((await navigator.locks.query()).pending).toHaveLength(1); });
+
+    release();
+    await holder;
+    await awaitSavedDeckLibraryIdle();
+
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck Alpha")).toBeNull();
+    expect(getDeckMeta("Deck Alpha")).toBeNull();
+    expect(localStorage.getItem(ACTIVE_DECK_KEY)).toBeNull();
+    expect(useAppNotificationStore.getState().notification).toBeNull();
+    uninstallWebLocks();
+  });
+
+  it("deleting a precon tile that is not saved writes nothing and shows no toast", async () => {
+    vi.mocked(loadPreconDeckMap).mockResolvedValue(commanderPrecon());
+    vi.mocked(evaluateDeckCompatibilityBatch).mockResolvedValue({});
+    useAppNotificationStore.setState({ notification: null, expiresAt: 0 });
+
+    render(
+      <MyDecks mode="manage" selectedFormat="Commander" activeDeckName={null} onCreateDeck={vi.fn()} onEditDeck={vi.fn()} />,
+    );
+    // Positive: the precon tile renders, so the click below reaches handleDeleteDeck. Scoped to
+    // this tile — the bundled cEDH demo decks render "Delete deck" controls of their own.
+    const tileText = await screen.findByText("Secrets of Strixhaven (SOS)");
+    const tile = tileText.closest("[role=\"button\"]") as HTMLElement;
+    await userEvent.click(within(tile).getByTitle("Delete deck"));
+    await userEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+    expect(useAppNotificationStore.getState().notification).toBeNull();
+    expect(localStorage.getItem(`${STORAGE_KEY_PREFIX}[Pre-built] Secrets of Strixhaven (SOS)`)).toBeNull();
   });
 
   it("deleting a deck refused by a busy library keeps the deck and shows the busy toast", async () => {

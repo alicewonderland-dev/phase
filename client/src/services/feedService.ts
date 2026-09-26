@@ -5,11 +5,13 @@ import { FEED_REGISTRY } from "../data/feedRegistry";
 import {
   ACTIVE_DECK_KEY,
   STORAGE_KEY_PREFIX,
+  captureSavedDeck,
   loadDeckOrigins,
   loadFeedSubscriptions,
   profileReplacementGeneration,
   removeDeckMeta,
   removeSavedDeckData,
+  requireSavedDeckUnchanged,
   saveDeckOrigins,
   saveFeedSubscriptions,
   stampDeckMeta,
@@ -502,17 +504,16 @@ export async function refreshAllFeeds(): Promise<Map<string, Feed | Error>> {
 }
 
 export function adoptFeedDeck(deckName: string, newName?: string): Promise<string> {
+  const source = captureSavedDeck(deckName);
   return withSavedDeckLibrary((txn) => {
+    requireSavedDeckUnchanged(txn, source);
     const origins = loadDeckOrigins();
     const targetName = newName ?? deckName;
 
     if (newName && newName !== deckName) {
       // Copy deck data to new name
-      const raw = localStorage.getItem(STORAGE_KEY_PREFIX + deckName);
-      if (raw) {
-        writeSavedDeckData(txn, targetName, raw);
-        stampDeckMeta(txn, targetName);
-      }
+      writeSavedDeckData(txn, targetName, source.raw!);
+      stampDeckMeta(txn, targetName);
     }
 
     // Remove feed origin tracking (deck is now user-owned)

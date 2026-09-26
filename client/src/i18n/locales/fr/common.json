@@ -440,5 +440,8 @@
   },
   "savedDeckLibraryStorageFailure": {
     "description": "Phase n'a pas pu accéder au stockage du navigateur. Réessayez dans un instant."
+  },
+  "savedDeckChanged": {
+    "description": "Ce deck a changé avant l'exécution de votre action, donc rien n'a été modifié. Vérifiez le deck et réessayez."
   }
 }

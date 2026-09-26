@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { isCommanderPreconDeck, useDecks, type DeckEntry } from "../../hooks/useDecks";
 import { preconExists, savePreconDeck } from "../../services/preconDecks";
 import { attemptSavedDeckWrite } from "../../services/savedDeckWriteFailure";
+import { captureSavedDeck } from "../../constants/storage";
 import { menuButtonClass } from "./buttonStyles";
 import { MenuSelect } from "../ui/MenuSelect";
 import { useImportSession, type ImportSession } from "./importSession";
@@ -125,17 +126,22 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
     const suggested = `${deck.name} (${deck.code})`;
     const chosen = prompt(t("precon.savePrompt"), suggested);
     if (!chosen) return;
-    const existed = preconExists(chosen);
-    if (existed && !confirm(t("precon.overwriteConfirm", { name: chosen }))) return;
+    // Captured at this same confirm click (confirm() blocks synchronously, so nothing else can
+    // run between the read and the click): what "replace" below must still find to proceed.
+    const existing = captureSavedDeck(chosen);
+    if (existing.raw !== null && !confirm(t("precon.overwriteConfirm", { name: chosen }))) return;
     let saved = await attemptSavedDeckWrite("save", () =>
-      savePreconDeck(chosen, deck, existed ? "replace" : "keep"),
+      savePreconDeck(chosen, deck, existing.raw !== null ? { type: "replace", expected: existing } : { type: "keep" }),
     );
     if (saved.ok && saved.value === "kept-existing") {
-      // Another writer claimed the name while this save waited. Only ask
+      // The name was claimed, or its content changed, while this save waited. Only ask
       // again if the session that started this pick is still open.
       if (importSession.stateOf(started) !== "open") return;
       if (!confirm(t("precon.overwriteConfirm", { name: chosen }))) return;
-      saved = await attemptSavedDeckWrite("save", () => savePreconDeck(chosen, deck, "replace"));
+      const reconfirmed = captureSavedDeck(chosen);
+      saved = await attemptSavedDeckWrite("save", () =>
+        savePreconDeck(chosen, deck, reconfirmed.raw !== null ? { type: "replace", expected: reconfirmed } : { type: "keep" }),
+      );
     }
     if (!saved.ok) return;
     const session = importSession.stateOf(started);
@@ -171,7 +177,6 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
     if (picks.length === 0) return;
 
     const conflicts = picks.filter((p) => preconExists(p.savedName));
-    const conflictNames = new Set(conflicts.map((p) => p.savedName));
     const overwrite =
       conflicts.length > 0 &&
       confirm(
@@ -179,6 +184,11 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
           ? t("precon.overwriteAllConfirm", { count: picks.length })
           : t("precon.overwriteSomeConfirm", { conflicts: conflicts.length, total: picks.length }),
       );
+    // Captured at this same confirm click, per conflicting name, before any of this batch's
+    // saves waits for the lock: what "replace" below must still find to proceed for that name.
+    const expectedByName = new Map(
+      overwrite ? conflicts.map((p) => [p.savedName, captureSavedDeck(p.savedName)] as const) : [],
+    );
 
     let lastImported: string | null = null;
     let imported = 0;
@@ -186,8 +196,9 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
     let refused = false;
     const importedIds = new Set<string>();
     for (const { id, savedName, deck } of picks) {
+      const expected = expectedByName.get(savedName);
       const saved = await attemptSavedDeckWrite("save", () =>
-        savePreconDeck(savedName, deck, overwrite && conflictNames.has(savedName) ? "replace" : "keep"),
+        savePreconDeck(savedName, deck, expected ? { type: "replace", expected } : { type: "keep" }),
       );
       if (!saved.ok) {
         refused = true;

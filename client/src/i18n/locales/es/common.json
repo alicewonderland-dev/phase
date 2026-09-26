@@ -440,5 +440,8 @@
   },
   "savedDeckLibraryStorageFailure": {
     "description": "Phase no pudo acceder al almacenamiento del navegador. Inténtalo de nuevo en un momento."
+  },
+  "savedDeckChanged": {
+    "description": "Este mazo cambió antes de que se ejecutara tu acción, así que no se cambió nada. Revisa el mazo e inténtalo de nuevo."
   }
 }

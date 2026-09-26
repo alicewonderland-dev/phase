@@ -7,6 +7,7 @@ import {
   savedDeckTxnGate,
   withSavedDeckLibrary,
   withSavedDeckLibraryOrSkip,
+  SavedDeckChangedError,
   type SavedDeckTxn,
   type SavedDeckTxnResult,
 } from "../services/savedDeckTransaction";
@@ -273,10 +274,34 @@ export function freeDeckName(
   return uniqueDeckName(baseName, listSavedDeckNames(), candidate);
 }
 
-/** Write a saved deck's data. */
-export function writeSavedDeckData(txn: SavedDeckTxn, deckName: string, raw: string): void {
+/** A saved deck's stored data, read when the user chose an action on it. */
+export interface SavedDeckSnapshot {
+  readonly name: string;
+  /** `null` when no deck was saved under `name`. */
+  readonly raw: string | null;
+}
+
+/** Read the deck saved under `deckName` before waiting for the library lock; pass the result into the transaction. */
+export function captureSavedDeck(deckName: string): SavedDeckSnapshot {
+  return { name: deckName, raw: localStorage.getItem(STORAGE_KEY_PREFIX + deckName) };
+}
+
+/** Whether `deck.name` still holds the deck `deck` captured. Metadata is not compared, so organizing or playing a deck does not make it a different deck. */
+export function savedDeckUnchanged(txn: SavedDeckTxn, deck: SavedDeckSnapshot): boolean {
+  void txn;
+  return deck.raw !== null && localStorage.getItem(STORAGE_KEY_PREFIX + deck.name) === deck.raw;
+}
+
+/** Throw `SavedDeckChangedError`, before anything is written, unless `savedDeckUnchanged`. */
+export function requireSavedDeckUnchanged(txn: SavedDeckTxn, deck: SavedDeckSnapshot): void {
+  if (!savedDeckUnchanged(txn, deck)) throw new SavedDeckChangedError(deck.name);
+}
+
+/** Write a saved deck's data, returning the snapshot of what was written. */
+export function writeSavedDeckData(txn: SavedDeckTxn, deckName: string, raw: string): SavedDeckSnapshot {
   void txn;
   localStorage.setItem(STORAGE_KEY_PREFIX + deckName, raw);
+  return { name: deckName, raw };
 }
 
 /** Remove a saved deck's data. */
@@ -332,11 +357,13 @@ export function removeDeckMeta(txn: SavedDeckTxn, deckName: string): void {
   saveMetadataStore(txn, store);
 }
 
-/** Delete a saved deck from localStorage, clearing metadata and active-deck if needed. */
-export function deleteDeck(txn: SavedDeckTxn, deckName: string): void {
-  removeSavedDeckData(txn, deckName);
-  removeDeckMeta(txn, deckName);
-  if (localStorage.getItem(ACTIVE_DECK_KEY) === deckName) {
+/** Delete the saved deck `deck` captured, clearing its metadata and the active-deck pointer if it names it.
+ *  Throws SavedDeckChangedError, writing nothing, if the name no longer holds that deck. */
+export function deleteDeck(txn: SavedDeckTxn, deck: SavedDeckSnapshot): void {
+  requireSavedDeckUnchanged(txn, deck);
+  removeSavedDeckData(txn, deck.name);
+  removeDeckMeta(txn, deck.name);
+  if (localStorage.getItem(ACTIVE_DECK_KEY) === deck.name) {
     localStorage.removeItem(ACTIVE_DECK_KEY);
   }
 }
@@ -399,20 +426,40 @@ export function writeDraftAutosaveDeck(
   }, "skip");
 }
 
-/** Save the deck builder's deck as `nextName`, moving it from `previousName` when renamed. */
-export function saveBuilderDeck(previousName: string | null, nextName: string, data: string): Promise<void> {
+/**
+ * Save the deck builder's deck as `nextName`. When renamed, move it from `previous.name` only if
+ * that name still holds the deck `previous` captured; otherwise leave that name's deck alone. The
+ * check reads `savedDeckRef` under the lock, not just `previous`: when an earlier queued save or
+ * clone to that same name has already committed by the time this transaction runs, its write is
+ * what `previous` should be compared against, not the value captured back at this click.
+ *
+ * On success, `savedDeckRef` is updated to this write's snapshot only if `claimsEditor` (checked
+ * again after the write) still says so — a Load that switched the editor to a different deck
+ * while this save waited owns the ref, not this save's now-stale claim to it.
+ */
+export function saveBuilderDeck(
+  previous: SavedDeckSnapshot | null,
+  savedDeckRef: { current: SavedDeckSnapshot | null },
+  claimsEditor: () => boolean,
+  nextName: string,
+  data: string,
+): Promise<SavedDeckSnapshot> {
   return withSavedDeckLibrary(async (txn) => {
-    if (previousName && previousName !== nextName && localStorage.getItem(STORAGE_KEY_PREFIX + previousName) !== null) {
+    const live = savedDeckRef.current;
+    const effective = previous && live && live.name === previous.name ? live : previous;
+    if (effective && effective.name !== nextName && savedDeckUnchanged(txn, effective)) {
       // If nextName already names another deck, the writeSavedDeckData below overwrites
       // its data (pre-existing Save behavior) and moveSavedDeck's metadata
       // carry likewise replaces its metadata — both correctly reflect the
       // surviving deck's identity now living under nextName.
-      moveSavedDeck(txn, previousName, nextName);
+      moveSavedDeck(txn, effective.name, nextName);
     }
-    writeSavedDeckData(txn, nextName, data);
+    const saved = writeSavedDeckData(txn, nextName, data);
     const pause = savedDeckTxnGate("builder-save-after-data-write");
     if (pause) await pause;
     stampDeckMeta(txn, nextName);
+    if (claimsEditor()) savedDeckRef.current = saved;
+    return saved;
   });
 }
 

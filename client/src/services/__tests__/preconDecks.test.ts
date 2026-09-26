@@ -26,7 +26,7 @@ describe("savePreconDeck", () => {
       commander: undefined,
     };
 
-    await savePreconDeck(name, precon, "replace");
+    await savePreconDeck(name, precon, { type: "replace" });
 
     expect(getDeckMeta(name)?.autosaveSlot).toBeUndefined();
     const persisted = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + name) ?? "{}");

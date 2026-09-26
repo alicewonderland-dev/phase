@@ -440,5 +440,8 @@
   },
   "savedDeckLibraryStorageFailure": {
     "description": "Phase nie mógł uzyskać dostępu do pamięci przeglądarki. Spróbuj ponownie za chwilę."
+  },
+  "savedDeckChanged": {
+    "description": "Ta talia zmieniła się, zanim Twoja akcja została wykonana, więc nic nie zostało zmienione. Sprawdź talię i spróbuj ponownie."
   }
 }

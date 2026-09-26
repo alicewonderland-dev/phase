@@ -13,9 +13,13 @@ import {
   STORAGE_KEY_PREFIX,
   createFolder,
   getDeckMeta,
+  removeDeckMeta,
+  removeSavedDeckData,
   setDeckFolder,
+  stampDeckMeta,
   toggleDeckStar,
   writeDraftAutosaveDeck,
+  writeSavedDeckData,
 } from "../../../constants/storage";
 import { useAppNotificationStore } from "../../../stores/appToastStore";
 import {
@@ -240,6 +244,204 @@ describe("DeckBuilder", () => {
       title: "Deck saved",
       description: '"Renamed Deck" was saved to your decks.',
     });
+  });
+
+  it("a rename saved behind a transaction that replaces the old name leaves the replacement and saves the deck under the new name", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "P",
+      JSON.stringify({ main: [{ name: "Lightning Bolt", count: 4 }], sideboard: [], format: "Standard" }),
+    );
+    stampDeckMeta(testSavedDeckTxn, "P", 1000);
+    localStorage.setItem(ACTIVE_DECK_KEY, "P");
+
+    render(
+      <DeckBuilder
+        format="Standard"
+        onFormatChange={vi.fn()}
+        initialDeckName="P"
+        searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+        onSearchFiltersChange={vi.fn()}
+        onResetSearch={vi.fn()}
+      />,
+    );
+    const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+    await waitFor(() => expect(nameInput).toHaveValue("P"));
+
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const holder = withSavedDeckLibrary(async (txn) => {
+      await held;
+      removeSavedDeckData(txn, "P");
+      removeDeckMeta(txn, "P");
+      writeSavedDeckData(txn, "P", JSON.stringify({ main: [{ name: "Mountain", count: 60 }], sideboard: [] }));
+      stampDeckMeta(txn, "P", 2000);
+      toggleDeckStar(txn, "P");
+      localStorage.setItem(ACTIVE_DECK_KEY, "P");
+    });
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+
+    await user.clear(nameInput);
+    await user.type(nameInput, "N");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).pending).toHaveLength(1);
+    });
+
+    release();
+    await holder;
+    await waitFor(() => {
+      expect(localStorage.getItem(STORAGE_KEY_PREFIX + "N")).not.toBeNull();
+    });
+
+    const replacement = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "P") ?? "{}");
+    expect(replacement.main).toEqual([{ name: "Mountain", count: 60 }]);
+    expect(getDeckMeta("P")).toEqual({ addedAt: 2000, starred: true });
+    expect(localStorage.getItem(ACTIVE_DECK_KEY)).toBe("P");
+
+    const renamed = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "N") ?? "{}");
+    expect(renamed.main).toEqual([{ name: "Lightning Bolt", count: 4 }]);
+    const renamedMeta = getDeckMeta("N");
+    expect(renamedMeta?.starred).toBeFalsy();
+    expect(renamedMeta?.addedAt).not.toBe(2000);
+    expect(useAppNotificationStore.getState().notification).toEqual({
+      title: "Deck saved",
+      description: '"N" was saved to your decks.',
+    });
+  });
+
+  it("renaming after an in-place save moves the deck", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "P",
+      JSON.stringify({ main: [{ name: "Lightning Bolt", count: 4 }], sideboard: [], format: "Standard" }),
+    );
+
+    render(
+      <DeckBuilder
+        format="Standard"
+        onFormatChange={vi.fn()}
+        initialDeckName="P"
+        searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+        onSearchFiltersChange={vi.fn()}
+        onResetSearch={vi.fn()}
+      />,
+    );
+    const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+    await waitFor(() => expect(nameInput).toHaveValue("P"));
+
+    await user.click(await screen.findByRole("button", { name: "remove-Lightning Bolt" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "P") ?? "{}").main).toEqual([
+        { name: "Lightning Bolt", count: 3 },
+      ]);
+    });
+
+    // Discriminates the ref refresh after Save: without it, this rename's "previous" is stale
+    // (captured at Load, before the in-place save above wrote count 3) and refuses to move "P".
+    await user.clear(nameInput);
+    await user.type(nameInput, "N");
+    await user.click(screen.getByRole("button", { name: /^(Save|Saved ✓)$/ }));
+
+    await waitFor(() => {
+      expect(localStorage.getItem(STORAGE_KEY_PREFIX + "P")).toBeNull();
+    });
+    const persisted = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "N") ?? "{}");
+    expect(persisted.main).toEqual([{ name: "Lightning Bolt", count: 3 }]);
+  });
+
+  it("renaming a clone moves the clone", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "P",
+      JSON.stringify({ main: [{ name: "Lightning Bolt", count: 4 }], sideboard: [], format: "Standard" }),
+    );
+
+    render(
+      <DeckBuilder
+        format="Standard"
+        onFormatChange={vi.fn()}
+        initialDeckName="P"
+        searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+        onSearchFiltersChange={vi.fn()}
+        onResetSearch={vi.fn()}
+      />,
+    );
+    const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+    await waitFor(() => expect(nameInput).toHaveValue("P"));
+
+    await user.click(screen.getByRole("button", { name: "Clone" }));
+    await waitFor(() => expect(nameInput).toHaveValue("P copy"));
+
+    // Discriminates the snapshot Clone's own transaction writes into the ref: without it, this
+    // rename's "previous" is null (or still "P") and does not vacate "P copy".
+    await user.clear(nameInput);
+    await user.type(nameInput, "N");
+    await user.click(screen.getByRole("button", { name: /^(Save|Saved ✓)$/ }));
+
+    await waitFor(() => {
+      expect(localStorage.getItem(STORAGE_KEY_PREFIX + "P copy")).toBeNull();
+    });
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "N")).not.toBeNull();
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "P")).not.toBeNull();
+  });
+
+  it("an edit saved in place, then renamed, while both waited on the same held lock leaves one deck, not two", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "DeckA",
+      JSON.stringify({ main: [{ name: "Lightning Bolt", count: 4 }], sideboard: [], format: "Standard" }),
+    );
+
+    render(
+      <DeckBuilder
+        format="Standard"
+        onFormatChange={vi.fn()}
+        initialDeckName="DeckA"
+        searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+        onSearchFiltersChange={vi.fn()}
+        onResetSearch={vi.fn()}
+      />,
+    );
+    const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+    await waitFor(() => expect(nameInput).toHaveValue("DeckA"));
+    await user.click(await screen.findByRole("button", { name: "remove-Lightning Bolt" }));
+
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const holder = withSavedDeckLibrary(() => held);
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+
+    // S1: in-place save of the edited deck, queued behind the held lock.
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).pending).toHaveLength(1);
+    });
+
+    // S2: renamed (no further edit), queued behind S1.
+    await user.clear(nameInput);
+    await user.type(nameInput, "DeckN");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).pending).toHaveLength(2);
+    });
+
+    release();
+    await holder;
+    await waitFor(() => {
+      expect(localStorage.getItem(STORAGE_KEY_PREFIX + "DeckA")).toBeNull();
+    });
+    const persisted = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "DeckN") ?? "{}");
+    expect(persisted.main).toEqual([{ name: "Lightning Bolt", count: 3 }]);
   });
 
   it("preserves a saved planar deck through editor load and save", async () => {
@@ -595,7 +797,7 @@ describe("DeckBuilder", () => {
     expect(nameInput).toHaveValue("Deck B");
 
     // Editing and saving Deck B now must not take the rename branch against a stale
-    // "savedDeckName: Deck A" — that would move Deck A's data onto Deck B and delete it.
+    // "savedDeck: Deck A" — that would move Deck A's data onto Deck B and delete it.
     await user.click(await screen.findByRole("button", { name: "remove-Counterspell" }));
     await user.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() =>

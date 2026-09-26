@@ -440,5 +440,8 @@
   },
   "savedDeckLibraryStorageFailure": {
     "description": "Phase couldn't reach browser storage. Try again in a moment."
+  },
+  "savedDeckChanged": {
+    "description": "This deck changed before your action ran, so nothing was changed. Check the deck and try again."
   }
 }

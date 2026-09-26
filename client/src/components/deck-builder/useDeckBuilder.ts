@@ -9,6 +9,7 @@ import { deduplicateEntries, expandParsedDeck, resolveCommander } from "../../se
 import { evaluateDeckCompatibility, type DeckCompatibilityResult } from "../../services/deckCompatibility";
 import {
   STORAGE_KEY_PREFIX,
+  captureSavedDeck,
   freeDeckName,
   getDeckMeta,
   loadSavedDeck,
@@ -17,6 +18,7 @@ import {
   setDeckFolder,
   stampDeckMeta,
   writeSavedDeckData,
+  type SavedDeckSnapshot,
 } from "../../constants/storage";
 import { withSavedDeckLibrary } from "../../services/savedDeckTransaction";
 import { attemptSavedDeckWrite } from "../../services/savedDeckWriteFailure";
@@ -78,7 +80,11 @@ export function useDeckBuilder({
   const [deckName, setDeckName] = useState("");
   const [bracket, setBracket] = useState<CommanderBracket | null>(null);
   const [savedDecks, setSavedDecks] = useState(listSavedDecks);
-  const [savedDeckName, setSavedDeckName] = useState<string | null>(null);
+  // The deck currently loaded/saved in the editor, by name and stored bytes — not React state:
+  // `saveBuilderDeck` and Clone update it inside their own transaction body, with the bytes they
+  // just wrote, so a save queued behind an earlier one to the same name sees that write and not
+  // a value captured before it (see saveBuilderDeck's doc).
+  const savedDeckRef = useRef<SavedDeckSnapshot | null>(null);
   const [justSaved, setJustSaved] = useState(false);
   const [commanders, setCommanders] = useState<string[]>([]);
   // Which surface is foregrounded on phone (tablet/desktop show columns and
@@ -537,6 +543,9 @@ export function useDeckBuilder({
   const handleSave = useCallback(async (): Promise<SaveOutcome> => {
     if (!deckName.trim()) return "refused";
     const captured = captureEditor();
+    // Fixed now, before any await: the name this save should vacate if renamed, and the bytes
+    // it should still hold, so a Load of a different deck queued behind this save cannot retarget it.
+    const previous = savedDeckRef.current;
     // Save-time commander inference: when a Commander-format deck is shaped
     // like a 100-singleton list with no explicit commander, ask the engine
     // (via resolveCommander → WASM isCardCommanderEligible) to pick one. This
@@ -554,11 +563,13 @@ export function useDeckBuilder({
     }
     const data = serializeSavedDeck(resolved, format, bracket);
     const nextName = deckName.trim();
-    const saved = await attemptSavedDeckWrite("save", () => saveBuilderDeck(savedDeckName, nextName, data));
+    const claimsEditor = () => !editorChangedSince(captured).reloaded;
+    const saved = await attemptSavedDeckWrite("save", () =>
+      saveBuilderDeck(previous, savedDeckRef, claimsEditor, nextName, data),
+    );
     if (!saved.ok) return "refused";
     const after = editorChangedSince(captured);
     if (!after.reloaded) {
-      setSavedDeckName(nextName);
       setJustSaved(true);
       if (!after.edited) setDirty(false);
       showNotification({
@@ -577,7 +588,6 @@ export function useDeckBuilder({
     applyDeckToEditor,
     format,
     bracket,
-    savedDeckName,
     showNotification,
     t,
   ]);
@@ -591,19 +601,22 @@ export function useDeckBuilder({
     const cloned = await attemptSavedDeckWrite("clone", () =>
       withSavedDeckLibrary((txn) => {
         const name = freeDeckName(txn, `${base} copy`, (i) => `${base} copy ${i}`);
-        writeSavedDeckData(txn, name, data);
+        const copy = writeSavedDeckData(txn, name, data);
         stampDeckMeta(txn, name);
         // A clone lands beside its source: inherit the folder, but start unstarred
         // (the star is a deliberate per-deck pin, not a copyable property).
-        const sourceFolderId = savedDeckName
-          ? getDeckMeta(savedDeckName)?.folderId ?? null
+        const sourceFolderId = savedDeckRef.current
+          ? getDeckMeta(savedDeckRef.current.name)?.folderId ?? null
           : null;
         if (sourceFolderId) setDeckFolder(txn, name, sourceFolderId);
-        return name;
+        // A Load that switched the editor to a different deck while this clone waited owns the
+        // ref now; this clone's claim on it is stale (mirrors saveBuilderDeck's own guard).
+        if (!editorChangedSince(captured).reloaded) savedDeckRef.current = copy;
+        return copy;
       }),
     );
     if (!cloned.ok) return;
-    const cloneName = cloned.value;
+    const cloneName = cloned.value.name;
     setSavedDecks(listSavedDecks());
     showNotification({
       title: t("toolbar.clonedToastTitle"),
@@ -613,10 +626,9 @@ export function useDeckBuilder({
     if (changed.reloaded || changed.edited) return;
     deckIdentityRevision.current += 1;
     setDeckName(cloneName);
-    setSavedDeckName(cloneName);
     setJustSaved(true);
     setDirty(false);
-  }, [deckName, captureEditor, editorChangedSince, currentDeck, format, bracket, savedDeckName, showNotification, t]);
+  }, [deckName, captureEditor, editorChangedSince, currentDeck, format, bracket, showNotification, t]);
 
   useEffect(() => {
     if (!justSaved) return;
@@ -629,8 +641,8 @@ export function useDeckBuilder({
     // that marks the deck dirty, including an Import (edited), must win over this Load.
     const captured = captureEditor();
     const parsed = loadSavedDeck(name);
-    const data = localStorage.getItem(STORAGE_KEY_PREFIX + name);
-    if (!parsed || !data) {
+    const stored = captureSavedDeck(name);
+    if (!parsed || stored.raw === null) {
       if (!name.startsWith(PRECON_PREFIX)) return;
       const decks = await loadPreconDeckMap();
       const found = Object.entries(decks ?? {}).find(([, entry]) => PRECON_PREFIX + `${entry.name} (${entry.code})` === name);
@@ -644,11 +656,11 @@ export function useDeckBuilder({
       deckIdentityRevision.current += 1;
       setDirty(false);
       setDeckName(`${deckEntry.name} (${deckEntry.code})`);
-      setSavedDeckName(null);
+      savedDeckRef.current = null;
       setBracket(getPreconBracket(deckId) ?? null);
       return;
     }
-    const persisted = JSON.parse(data) as ParsedDeck & { format?: string };
+    const persisted = JSON.parse(stored.raw) as ParsedDeck & { format?: string };
     const resolved = await resolveCommander(parsed);
     const changedAfterLoad = editorChangedSince(captured);
     if (changedAfterLoad.reloaded || changedAfterLoad.edited) return;
@@ -667,7 +679,7 @@ export function useDeckBuilder({
       onFormatChange("Commander");
     }
     setDeckName(name);
-    setSavedDeckName(name);
+    savedDeckRef.current = stored;
     setBracket(loadSavedDeckBracket(name));
   }, [applyDeckToEditor, onFormatChange, captureEditor, editorChangedSince]);
 

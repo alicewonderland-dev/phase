@@ -9,6 +9,7 @@ import {
   RANDOM_DECK_SELECTION,
   listSavedDeckNames,
   getDeckMeta,
+  captureSavedDeck,
   deleteDeck,
   MAX_FOLDER_NAME_LENGTH,
   type DeckFolder,
@@ -1303,7 +1304,7 @@ export function MyDecks({
     const candidate = legalPreconByName.get(deckName);
     if (!candidate || candidate.source.type !== "precon") return true;
     const saved = await attemptSavedDeckWrite("save", () =>
-      savePreconDeck(deckName, preconCandidateToDeckEntry(candidate), "replace"),
+      savePreconDeck(deckName, preconCandidateToDeckEntry(candidate), { type: "replace" }),
     );
     if (!saved.ok) return false;
     setDeckNames(listSavedDeckNames());
@@ -1419,7 +1420,14 @@ export function MyDecks({
   }, [t]);
 
   const handleDeleteDeck = useCallback(async (deckName: string) => {
-    const deleted = await attemptSavedDeckWrite("delete", () => withSavedDeckLibrary((txn) => deleteDeck(txn, deckName)));
+    const deck = captureSavedDeck(deckName);
+    if (deck.raw === null) {
+      // The precon section wires its tiles to this same handler, and a precon that is not
+      // saved (the common case) names nothing here — deleteDeck would refuse it as "changed".
+      setDeckNames(listSavedDeckNames());
+      return;
+    }
+    const deleted = await attemptSavedDeckWrite("delete", () => withSavedDeckLibrary((txn) => deleteDeck(txn, deck)));
     if (deleted.ok) setDeckNames(listSavedDeckNames());
   }, []);
 

@@ -440,5 +440,8 @@
   },
   "savedDeckLibraryStorageFailure": {
     "description": "Phaseはブラウザのストレージにアクセスできませんでした。しばらくしてから再試行してください。"
+  },
+  "savedDeckChanged": {
+    "description": "操作の実行前にこのデッキが変更されたため、何も変更されませんでした。デッキを確認してもう一度お試しください。"
   }
 }

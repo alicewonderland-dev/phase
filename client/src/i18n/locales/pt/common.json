@@ -440,5 +440,8 @@
   },
   "savedDeckLibraryStorageFailure": {
     "description": "O Phase não conseguiu acessar o armazenamento do navegador. Tenta novamente em um instante."
+  },
+  "savedDeckChanged": {
+    "description": "Este baralho mudou antes de a tua ação ser executada, por isso nada foi alterado. Verifica o baralho e tenta novamente."
   }
 }

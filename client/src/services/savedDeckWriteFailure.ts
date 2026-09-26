@@ -5,6 +5,7 @@
  */
 import i18n from "i18next";
 import {
+  SavedDeckChangedError,
   SavedDeckLibraryBusyError,
   type SavedDeckTxnFailure,
   type SavedDeckTxnSkipReason,
@@ -58,6 +59,14 @@ export function notifySavedDeckLibraryBusy(action: SavedDeckWriteAction, reason?
   useAppNotificationStore.getState().showNotification({ title: titleByAction[action](), description });
 }
 
+/** The deck a user-initiated write targeted changed before the write ran (`SavedDeckChangedError`). */
+export function notifySavedDeckChanged(action: SavedDeckWriteAction): void {
+  useAppNotificationStore.getState().showNotification({
+    title: titleByAction[action](),
+    description: i18n.t("savedDeckChanged.description"),
+  });
+}
+
 /** A background draft autosave (never rejects; `reason` comes from its skipped result) was not
  *  written. `"lock-unavailable"` (no Web Locks API) is silent: every submission without the API
  *  would otherwise toast, since there is no lock to ever acquire. */
@@ -79,6 +88,10 @@ export async function attemptSavedDeckWrite<T>(
   } catch (error) {
     if (error instanceof SavedDeckLibraryBusyError) {
       notifySavedDeckLibraryBusy(action, error.reason);
+      return { ok: false };
+    }
+    if (error instanceof SavedDeckChangedError) {
+      notifySavedDeckChanged(action);
       return { ok: false };
     }
     throw error;

@@ -2,11 +2,13 @@ import { useCallback, useEffect, useState } from "react";
 
 import {
   DECKS_CHANGED_EVENT,
+  captureSavedDeck,
   createFolder as createFolderStore,
   deleteFolder as deleteFolderStore,
   getDeckMeta,
   listFolders,
   renameFolder as renameFolderStore,
+  requireSavedDeckUnchanged,
   setDeckFolder,
   toggleDeckStar,
   type DeckFolder,
@@ -77,11 +79,13 @@ export function groupSavedDecks(
 
 /** Module-level so the hook returns the same identity on every render (it closes over nothing). */
 function createFolder(name: string, deckName?: string): Promise<DeckFolder | null> {
+  const deck = deckName === undefined ? null : captureSavedDeck(deckName);
   return attemptSavedDeckWrite("organize", () =>
     withSavedDeckLibrary((txn) => {
+      if (deck) requireSavedDeckUnchanged(txn, deck);
       const folder = createFolderStore(txn, name);
       // One transaction, so a move of this deck queued while it waits runs after it instead of being overwritten.
-      if (folder && deckName !== undefined) setDeckFolder(txn, deckName, folder.id);
+      if (folder && deck) setDeckFolder(txn, deck.name, folder.id);
       return folder;
     }),
   ).then((r) => (r.ok ? r.value : null));
@@ -100,15 +104,23 @@ function deleteFolder(id: string): Promise<boolean> {
 }
 /** Module-level so the hook returns the same identity on every render (it closes over nothing). */
 function assignDeck(deckName: string, folderId: string | null): Promise<boolean> {
+  const deck = captureSavedDeck(deckName);
   return attemptSavedDeckWrite("organize", () =>
-    withSavedDeckLibrary((txn) => setDeckFolder(txn, deckName, folderId)),
+    withSavedDeckLibrary((txn) => {
+      requireSavedDeckUnchanged(txn, deck);
+      setDeckFolder(txn, deck.name, folderId);
+    }),
   ).then((r) => r.ok);
 }
 /** Module-level so the hook returns the same identity on every render (it closes over nothing). */
 function toggleStar(deckName: string): Promise<boolean> {
-  return attemptSavedDeckWrite("organize", () => withSavedDeckLibrary((txn) => toggleDeckStar(txn, deckName))).then(
-    (r) => r.ok,
-  );
+  const deck = captureSavedDeck(deckName);
+  return attemptSavedDeckWrite("organize", () =>
+    withSavedDeckLibrary((txn) => {
+      requireSavedDeckUnchanged(txn, deck);
+      return toggleDeckStar(txn, deck.name);
+    }),
+  ).then((r) => r.ok);
 }
 
 export interface UseDeckFoldersResult {

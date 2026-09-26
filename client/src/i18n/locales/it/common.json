@@ -440,5 +440,8 @@
   },
   "savedDeckLibraryStorageFailure": {
     "description": "Phase non è riuscito ad accedere all'archiviazione del browser. Riprova in un momento."
+  },
+  "savedDeckChanged": {
+    "description": "Questo mazzo è cambiato prima che la tua azione venisse eseguita, quindi non è stato modificato nulla. Controlla il mazzo e riprova."
   }
 }
