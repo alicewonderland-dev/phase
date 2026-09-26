@@ -237,7 +237,14 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
   if (!allowRefresh) {
     for (const sub of subs) {
       const cached = getCachedFeed(sub.sourceId);
-      if (cached) await publishUnlessSuperseded(signal, replacement, (txn) => syncFeedDecksToStorage(txn, cached));
+      if (!cached) continue;
+      await publishUnlessSuperseded(signal, replacement, (txn) => {
+        // `cached` was read before this call ever requested the library lock, so a concurrent
+        // unsubscribe() may have already dropped this subscription by the time the lock is
+        // granted. Re-check under the lock rather than publishing an unsubscribed feed's decks.
+        if (!loadFeedSubscriptions().some((s) => s.sourceId === sub.sourceId)) return;
+        syncFeedDecksToStorage(txn, cached);
+      });
     }
     return;
   }
@@ -260,9 +267,9 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
       const published = await publishUnlessSuperseded(signal, replacement, (txn) => {
         const cachePersistence = setCachedFeed(feedId, normalizedFeed);
         syncFeedDecksToStorage(txn, normalizedFeed);
-        // subscribe()/unsubscribe() run unlocked against localStorage while this fetch was in
-        // flight, so re-read the current list under the lock rather than writing back the
-        // `subs` snapshot loaded before the loop started.
+        // Re-read the current list under the lock rather than writing back the `subs` snapshot
+        // loaded before the loop started — a concurrent subscribe()/unsubscribe() may have
+        // committed while this fetch was in flight.
         const currentSubs = loadFeedSubscriptions();
         if (!currentSubs.some((s) => s.sourceId === feedId)) {
           currentSubs.push({
@@ -297,7 +304,13 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
     const isStale = now - sub.lastRefreshedAt >= FEED_STALE_AFTER_MS;
     const bundled = sub.type === "bundled";
     if (!bundled && !isStale && cached) {
-      await publishUnlessSuperseded(signal, replacement, (txn) => syncFeedDecksToStorage(txn, cached));
+      await publishUnlessSuperseded(signal, replacement, (txn) => {
+        // `cached` was read before this call ever requested the library lock, so a concurrent
+        // unsubscribe() may have already dropped this subscription by the time the lock is
+        // granted. Re-check under the lock rather than publishing an unsubscribed feed's decks.
+        if (!loadFeedSubscriptions().some((s) => s.sourceId === sub.sourceId)) return;
+        syncFeedDecksToStorage(txn, cached);
+      });
       continue;
     }
 
@@ -307,22 +320,24 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
       const registrySource = FEED_REGISTRY.find((r) => r.id === sub.sourceId);
       const normalizedFeed = { ...feed, id: sub.sourceId, format: registrySource?.format ?? feed.format };
       const published = await publishUnlessSuperseded(signal, replacement, (txn) => {
-        const cachePersistence = setCachedFeed(sub.sourceId, normalizedFeed);
-        syncFeedDecksToStorage(txn, normalizedFeed);
-        // Same reasoning as the auto-subscribe loop above: re-read under the lock and update
-        // only this feed's entry, so a concurrent subscribe()/unsubscribe() isn't clobbered by
-        // writing back the pre-fetch `subs` snapshot. If this feed was unsubscribed while the
-        // fetch was in flight, there's no entry left to update.
+        // Same reasoning as the auto-subscribe loop above: re-read under the lock and update only
+        // this feed's entry, so a concurrent subscribe()/unsubscribe() isn't clobbered by writing
+        // back the pre-fetch `subs` snapshot. Look this up BEFORE publishing anything — if this
+        // feed was unsubscribed while the fetch was in flight, there's no entry left to update,
+        // and the cache/decks a plain lookup-after-publish would have just written back must
+        // never become visible for a feed with no subscription.
         const currentSubs = loadFeedSubscriptions();
         const currentSub = currentSubs.find((s) => s.sourceId === sub.sourceId);
-        if (currentSub) {
-          const feedChanged = cached?.updated !== normalizedFeed.updated;
-          const metadataChanged = currentSub.lastVersion !== feed.version || currentSub.error !== undefined;
-          currentSub.lastVersion = feed.version;
-          if (isStale || feedChanged) currentSub.lastRefreshedAt = Date.now();
-          if (currentSub.error !== undefined) currentSub.error = undefined;
-          if (isStale || feedChanged || metadataChanged) saveFeedSubscriptions(currentSubs);
-        }
+        if (!currentSub) return { cachePersistence: Promise.resolve() };
+
+        const cachePersistence = setCachedFeed(sub.sourceId, normalizedFeed);
+        syncFeedDecksToStorage(txn, normalizedFeed);
+        const feedChanged = cached?.updated !== normalizedFeed.updated;
+        const metadataChanged = currentSub.lastVersion !== feed.version || currentSub.error !== undefined;
+        currentSub.lastVersion = feed.version;
+        if (isStale || feedChanged) currentSub.lastRefreshedAt = Date.now();
+        if (currentSub.error !== undefined) currentSub.error = undefined;
+        if (isStale || feedChanged || metadataChanged) saveFeedSubscriptions(currentSubs);
         return { cachePersistence };
       });
       if (published.status === "committed") await published.value.cachePersistence;
@@ -331,7 +346,14 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
       // Fall back to cached data
       const cached = getCachedFeed(sub.sourceId);
       if (cached) {
-        await publishUnlessSuperseded(signal, replacement, (txn) => syncFeedDecksToStorage(txn, cached));
+        await publishUnlessSuperseded(signal, replacement, (txn) => {
+          // Same re-check as the other cached-only publishes above: `cached` was read after the
+          // failed fetch but before this call requested the library lock, so a concurrent
+          // unsubscribe() may have already dropped this subscription by the time the lock is
+          // granted.
+          if (!loadFeedSubscriptions().some((s) => s.sourceId === sub.sourceId)) return;
+          syncFeedDecksToStorage(txn, cached);
+        });
       }
     }
   }
@@ -395,11 +417,13 @@ export async function unsubscribe(feedId: string): Promise<void> {
     }
 
     saveDeckOrigins(origins);
-  });
-  removeCachedFeed(feedId);
 
-  const subs = loadFeedSubscriptions().filter((s) => s.sourceId !== feedId);
-  saveFeedSubscriptions(subs);
+    // Remove the cache and subscription entry inside the same lock hold as the deck removal
+    // above, so another holder (e.g. a refresh queued behind this lock) can never observe the
+    // decks already gone but the subscription still present, or vice versa.
+    removeCachedFeed(feedId);
+    saveFeedSubscriptions(loadFeedSubscriptions().filter((s) => s.sourceId !== feedId));
+  });
 }
 
 export function listSubscriptions(): FeedSubscription[] {

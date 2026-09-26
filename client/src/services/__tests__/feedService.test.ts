@@ -527,6 +527,129 @@ describe("initializeFeeds", () => {
     expect(listSubscriptions()).toHaveLength(1);
     expect(getDeckFeedOrigin("Test Deck")).toBe("starter-decks");
   });
+
+  it("does not resurrect a subscription unsubscribed during the refresh loop's refetch, and does not publish its cache or decks", async () => {
+    await seedFreshBundledSubscriptions([{
+      sourceId: "stale-remote",
+      url: "https://example.com/stale.json",
+      type: "remote",
+      subscribedAt: 1,
+      lastRefreshedAt: 0,
+      lastVersion: 1,
+    }]);
+
+    let resolveFetch!: (v: unknown) => void;
+    global.fetch = vi.fn().mockImplementation((url: string) => {
+      if (url.includes("stale.json")) return new Promise((resolve) => { resolveFetch = resolve; });
+      return Promise.resolve({ ok: true, status: 200, statusText: "OK", json: () => Promise.resolve(STARTER_FEED) });
+    });
+
+    const initialization = initializeFeeds();
+    await vi.waitFor(() => expect(resolveFetch).toBeDefined());
+
+    await unsubscribe("stale-remote");
+
+    resolveFetch({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: () => Promise.resolve({ ...VALID_FEED, id: "stale-remote", decks: [{ name: "Stale Remote Deck", colors: ["R"], main: [{ count: 4, name: "Shock" }], sideboard: [] }] }),
+    });
+    await initialization;
+
+    expect(listSubscriptions().map((s) => s.sourceId)).not.toContain("stale-remote");
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Stale Remote Deck")).toBeNull();
+    expect(getDeckFeedOrigin("Stale Remote Deck")).toBeNull();
+    expect(getCachedFeed("stale-remote")).toBeNull();
+  });
+
+  it("keeps a subscription added during the refresh loop's refetch", async () => {
+    await seedFreshBundledSubscriptions([{
+      sourceId: "stale-remote",
+      url: "https://example.com/stale.json",
+      type: "remote",
+      subscribedAt: 1,
+      lastRefreshedAt: 0,
+      lastVersion: 1,
+    }]);
+
+    let resolveFetch!: (v: unknown) => void;
+    global.fetch = vi.fn().mockImplementation((url: string) => {
+      if (url.includes("stale.json")) return new Promise((resolve) => { resolveFetch = resolve; });
+      if (url.includes("other.json")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: () => Promise.resolve({ ...VALID_FEED, id: "other-remote", decks: [{ name: "Other Deck", colors: ["U"], main: [{ count: 4, name: "Counterspell" }], sideboard: [] }] }),
+        });
+      }
+      return Promise.resolve({ ok: true, status: 200, statusText: "OK", json: () => Promise.resolve(STARTER_FEED) });
+    });
+
+    const initialization = initializeFeeds();
+    await vi.waitFor(() => expect(resolveFetch).toBeDefined());
+
+    await subscribe("https://example.com/other.json");
+
+    resolveFetch({ ok: true, status: 200, statusText: "OK", json: () => Promise.resolve({ ...VALID_FEED, id: "stale-remote" }) });
+    await initialization;
+
+    expect(listSubscriptions().map((s) => s.sourceId)).toEqual(
+      expect.arrayContaining(["stale-remote", "other-remote"]),
+    );
+  });
+
+  it("leaves one subscription when the same bundled feed is subscribed concurrently with its own auto-subscribe fetch", async () => {
+    const starter = FEED_REGISTRY.find((source) => source.type === "bundled")!;
+
+    let resolveFetch!: (v: unknown) => void;
+    global.fetch = vi.fn().mockImplementation((url: string) => {
+      if (url === starter.url) return new Promise((resolve) => { resolveFetch = resolve; });
+      return Promise.resolve({ ok: true, status: 200, statusText: "OK", json: () => Promise.resolve(STARTER_FEED) });
+    });
+
+    const initialization = initializeFeeds();
+    await vi.waitFor(() => expect(resolveFetch).toBeDefined());
+
+    vi.mocked(fetch).mockImplementationOnce(() =>
+      Promise.resolve({ ok: true, status: 200, statusText: "OK", json: () => Promise.resolve({ ...STARTER_FEED, id: starter.id }) }) as never,
+    );
+    await subscribe(starter.id);
+
+    resolveFetch({ ok: true, status: 200, statusText: "OK", json: () => Promise.resolve({ ...STARTER_FEED, id: starter.id }) });
+    await initialization;
+
+    expect(listSubscriptions().filter((s) => s.sourceId === starter.id)).toHaveLength(1);
+  });
+
+  it("keeps a subscription added while a bundled feed's auto-subscribe fetch is still pending", async () => {
+    const starter = FEED_REGISTRY.find((source) => source.type === "bundled")!;
+
+    let resolveFetch!: (v: unknown) => void;
+    global.fetch = vi.fn().mockImplementation((url: string) => {
+      if (url === starter.url) return new Promise((resolve) => { resolveFetch = resolve; });
+      if (url.includes("other.json")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: () => Promise.resolve({ ...VALID_FEED, id: "other-remote", decks: [{ name: "Other Deck", colors: ["U"], main: [{ count: 4, name: "Counterspell" }], sideboard: [] }] }),
+        });
+      }
+      return Promise.resolve({ ok: true, status: 200, statusText: "OK", json: () => Promise.resolve(STARTER_FEED) });
+    });
+
+    const initialization = initializeFeeds();
+    await vi.waitFor(() => expect(resolveFetch).toBeDefined());
+
+    await subscribe("https://example.com/other.json");
+
+    resolveFetch({ ok: true, status: 200, statusText: "OK", json: () => Promise.resolve({ ...STARTER_FEED, id: starter.id }) });
+    await initialization;
+
+    expect(listSubscriptions().some((s) => s.sourceId === "other-remote")).toBe(true);
+  });
 });
 
 describe("subscribe", () => {
@@ -790,6 +913,28 @@ describe("refreshFeed", () => {
 
     expect(listSubscriptions().map((s) => s.sourceId)).not.toContain("test-feed");
     expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Resurrected Deck")).toBeNull();
+  });
+
+  it("does not resurrect a subscription unsubscribed while its fetch was pending, when the fetch then rejects", async () => {
+    mockFetch(VALID_FEED);
+    await subscribe("https://example.com/feed.json");
+
+    let rejectFetch!: (e: unknown) => void;
+    global.fetch = vi.fn().mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectFetch = reject;
+        }),
+    );
+
+    const refreshing = refreshFeed("test-feed").catch((err: unknown) => err);
+    await vi.waitFor(() => expect(rejectFetch).toBeDefined());
+
+    await unsubscribe("test-feed");
+    rejectFetch(new Error("network down"));
+    await refreshing;
+
+    expect(listSubscriptions().map((s) => s.sourceId)).not.toContain("test-feed");
   });
 });
 
