@@ -206,15 +206,11 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
     if (lastImported) onImported(lastImported, session);
     if (refused) return;
     if (session === "open") {
-      // The modal that started this batch is still the one on screen: closing
-      // it discards the whole selection, matching the pre-batch single-session
-      // behavior.
+      // The modal that started this batch is still the one on screen.
       clearSelection();
       onClose();
     } else {
       // The modal was dismissed (and possibly reopened) while this batch ran.
-      // Only this batch's own picks are stale; anything selected since
-      // reopening was never part of this batch and must survive.
       setSelectedIds((cur) => {
         const next = new Set(cur);
         for (const id of importedIds) next.delete(id);
