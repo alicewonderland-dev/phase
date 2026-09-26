@@ -1042,7 +1042,7 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             acc = acc.or(scan_target_filter(target, target_ctx, mode));
             acc
         }
-        Effect::HideawayConceal { target } => {
+        Effect::HideawayConceal { target, grantee: _ } => {
             let mut acc = Axes::NONE;
             acc = acc.or(scan_target_filter(target, target_ctx, mode));
             acc
@@ -2343,7 +2343,13 @@ fn scan_quantity_ref(x: &QuantityRef, mode: ScanMode) -> Axes {
             ));
             acc
         }
-        QuantityRef::TargetZoneCardCount { zone: _ } => Axes::NONE,
+        // `binding` selects which announced choice the count reads; it reads
+        // no game state itself, so the axis verdict is unchanged.
+        QuantityRef::TargetZoneCardCount {
+            zone: _,
+            scope: _,
+            binding: _,
+        } => Axes::NONE,
         QuantityRef::Devotion { .. } => Axes {
             event: false,
             sibling: true,
