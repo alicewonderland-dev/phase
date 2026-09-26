@@ -204,10 +204,10 @@ function syncFeedDecksToStorage(txn: SavedDeckTxn, feed: Feed): void {
  * profile-replacement generation `initializeFeeds` captured at its start once
  * the lock is granted. Both can change while this waits for the lock: an
  * abort signal from `useFeedInitialization`'s cleanup, or another
- * transaction (`cloudSyncStore.ts::applyRemote`/`applyMerged`) replacing the
- * whole profile — including `phase-feed-subscriptions` — under the same lock.
- * Either throws an AbortError so the write is skipped rather than committed
- * against a profile this generation no longer belongs to.
+ * transaction (`backup.ts::applyBackup`) replacing the profile — including
+ * `phase-feed-subscriptions` — under the same lock. Either throws an
+ * AbortError so the write is skipped rather than committed against a
+ * profile this generation no longer belongs to.
  */
 function syncFeedUnlessAborted(
   feed: Feed,

@@ -526,10 +526,9 @@ export function applyBackup(
   writeValidated(FEED_SUBSCRIPTIONS_KEY, backup.feedSubscriptions, true);
   writeValidated(FEED_DECK_ORIGINS_KEY, backup.feedDeckOrigins, true);
 
-  // This restore just rewrote FEED_SUBSCRIPTIONS_KEY (both modes, above) —
-  // bump so a feed sync already queued behind this transaction's lock
-  // (`feedService.ts::syncFeedUnlessAborted`) detects the replacement and
-  // skips instead of overwriting the restored subscriptions with stale data.
+  // A feed sync already queued behind this transaction's lock
+  // (`feedService.ts::syncFeedUnlessAborted`) must detect this replacement and
+  // skip instead of overwriting restored subscriptions with stale data.
   bumpProfileReplacementGeneration(txn);
 
   return { decksImported, decksSkippedMalformed, preferencesReplaced, malformedKeys };

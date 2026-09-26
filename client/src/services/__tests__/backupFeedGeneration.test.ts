@@ -5,12 +5,12 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 import { initializeFeeds } from "../feedService";
-import { importBackupFromFile } from "../backup";
+import { applyBackup, importBackupFromFile } from "../backup";
 import { _resetFeedCacheForTests } from "../feedPersistence";
 import { FEED_SUBSCRIPTIONS_KEY, STORAGE_KEY_PREFIX, profileReplacementGeneration } from "../../constants/storage";
 import { FEED_REGISTRY } from "../../data/feedRegistry";
 import { withSavedDeckLibraryOrSkip } from "../savedDeckTransaction";
-import { installFifoWebLocks, resetSavedDeckLibraryForTests, uninstallWebLocks } from "../../test/helpers/webLocks";
+import { installFifoWebLocks, resetSavedDeckLibraryForTests, testSavedDeckTxn, uninstallWebLocks } from "../../test/helpers/webLocks";
 
 const deck = (name: string) => ({ name, colors: ["R"], main: [{ count: 4, name: "Lightning Bolt" }], sideboard: [] });
 const bundledSubs = FEED_REGISTRY.filter((s) => s.type === "bundled").map((s) => ({
@@ -91,6 +91,12 @@ it("skips a feed sync queued behind a file restore that dropped its subscription
   expect(profileReplacementGeneration()).toBe(1);
   expect(subs).not.toContain("remote");
   expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Stale Remote Deck")).toBeNull();
+});
+
+it("a single applyBackup call bumps the profile-replacement generation by exactly one", () => {
+  const before = profileReplacementGeneration();
+  applyBackup(testSavedDeckTxn, backupWithOnlyBundledSubscriptions(), "overwrite");
+  expect(profileReplacementGeneration() - before).toBe(1);
 });
 
 it("control: without a queued restore, the feed sync commits its subscription changes", async () => {

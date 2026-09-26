@@ -100,9 +100,10 @@ export const DRAFT_WORKSPACE_PREFERENCES_KEY = "phase-draft-workspace-preference
 
 /**
  * localStorage key for a per-device counter bumped by `bumpProfileReplacementGeneration`,
- * called from `cloudSyncStore.ts::applyRemote`/`applyMerged` (cloud restore) and
- * `backup.ts::applyBackup` (manual backup-file import, and the legacy-storage
- * migration that reuses it). `feedService.ts` captures this before waiting on
+ * called only from `backup.ts::applyBackup` — reached via cloud sync's apply-remote
+ * and apply-merged paths (`cloudSyncStore.ts`), manual backup-file import
+ * (`backup.ts::importBackupFromFile`), and the legacy-storage migration
+ * (`legacyMigration.ts`). `feedService.ts` captures this before waiting on
  * the saved-deck library lock and compares after re-acquiring it, so a feed
  * sync queued behind one of these replacements can detect it and skip.
  *

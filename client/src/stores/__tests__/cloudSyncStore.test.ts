@@ -1396,7 +1396,6 @@ describe("cloud sync serialization", () => {
       useCloudSyncStore.setState({ dirty: false, lastSyncedRevision: 1 });
       provider.pullMeta.mockResolvedValue(meta(2));
       provider.pull.mockResolvedValue(remote(2));
-      const generationBefore = profileReplacementGeneration();
 
       let releaseHolder!: () => void;
       const held = new Promise<void>((resolve) => {
@@ -1416,8 +1415,8 @@ describe("cloud sync serialization", () => {
       await sync;
 
       expect(mocks.applyBackup).toHaveBeenCalledWith(expect.anything(), remote(2).backup, "overwrite");
+      expect(mocks.applyBackup).toHaveBeenCalledTimes(1);
       expect(useCloudSyncStore.getState()).toMatchObject({ status: "synced", dirty: false });
-      expect(profileReplacementGeneration()).toBe(generationBefore + 1);
     });
 
     it("re-checks staleness inside the lock: a same-tab write that arrives while applyMerged waits for the lock blocks the apply", async () => {
@@ -1464,7 +1463,6 @@ describe("cloud sync serialization", () => {
       provider.pullMeta.mockResolvedValue(meta(3));
       provider.push.mockResolvedValue(meta(4));
       mocks.mergeDeckCollections.mockReturnValue(merged);
-      const generationBefore = profileReplacementGeneration();
 
       let releaseHolder!: () => void;
       const held = new Promise<void>((resolve) => {
@@ -1484,8 +1482,8 @@ describe("cloud sync serialization", () => {
       await merge;
 
       expect(mocks.applyBackup).toHaveBeenCalledWith(expect.anything(), merged, "overwrite");
+      expect(mocks.applyBackup).toHaveBeenCalledTimes(1);
       expect(useCloudSyncStore.getState()).toMatchObject({ status: "synced", lastSyncedRevision: 4 });
-      expect(profileReplacementGeneration()).toBe(generationBefore + 1);
     });
 
     it("a background remote apply refused by a busy library reports an error and writes nothing", async () => {
