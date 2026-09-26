@@ -11686,6 +11686,7 @@ fn quantity_ref_binding_diverges(qty: &QuantityRef) -> bool {
         }
         QuantityRef::HandSize { player, .. }
         | QuantityRef::LifeTotal { player }
+        | QuantityRef::StartingLifeTotal { player }
         | QuantityRef::GraveyardSize { player, .. }
         | QuantityRef::LifeLostThisTurn { player }
         | QuantityRef::LifeGainedThisTurn { player }
@@ -11822,7 +11823,6 @@ fn quantity_ref_binding_diverges(qty: &QuantityRef) -> bool {
         // (`ctx.source`, the same object `ObjectScope::Source` is adjudicated
         // non-divergent for above).
         QuantityRef::LifeAboveStarting
-        | QuantityRef::StartingLifeTotal { .. }
         | QuantityRef::TriggeringDiscoverValue
         | QuantityRef::PlayerCount { .. }
         | QuantityRef::PlayerCounter { .. }
@@ -24473,6 +24473,31 @@ pub mod tests {
              creature card in the controller's graveyard), so a fire-time deletion would \
              have destroyed an ability that was supposed to resolve"
         );
+    }
+
+    #[test]
+    fn starting_life_fire_time_binding_tracks_player_scope() {
+        let state = GameState::new(crate::types::format::FormatConfig::archenemy(), 4, 0);
+        let starting = |player| QuantityRef::StartingLifeTotal { player };
+
+        let controller = starting(PlayerScope::Controller);
+        assert!(!quantity_ref_binding_diverges(&controller));
+        for (player, expected) in [(PlayerId(0), 40), (PlayerId(1), 20)] {
+            assert_eq!(
+                crate::game::quantity::resolve_quantity(
+                    &state,
+                    &QuantityExpr::Ref {
+                        qty: controller.clone(),
+                    },
+                    player,
+                    ObjectId(0),
+                ),
+                expected,
+            );
+        }
+        for scope in [PlayerScope::Target, PlayerScope::ScopedPlayer] {
+            assert!(quantity_ref_binding_diverges(&starting(scope)));
+        }
     }
 
     /// CR 608.2c + CR 603.4: a RESOLUTION-SCOPED quantity leaf carries no scope,

@@ -1490,8 +1490,8 @@ fn quantity_expr_is_source_context_previewable(
     match expr {
         QuantityExpr::Fixed { .. } => true,
         QuantityExpr::Ref {
-            qty: QuantityRef::StartingLifeTotal { .. },
-        } => true,
+            qty: QuantityRef::StartingLifeTotal { player },
+        } => player_scope_is_source_context_previewable(player),
         QuantityExpr::Ref {
             qty: QuantityRef::ObjectCount { filter },
         } => target_filter_is_source_context_free(filter),
@@ -1514,6 +1514,27 @@ fn quantity_expr_is_source_context_previewable(
             quantity_expr_is_source_context_previewable(state, max, controller, source_id)
                 && resolve_quantity(state, max, controller, source_id) == 0
         }
+    }
+}
+
+/// A source-only preview has its controller and source object, but no target,
+/// recipient, or per-player resolution iteration to bind a player reference.
+/// `SpecificPlayer` is duration-only and panics in the quantity resolver.
+fn player_scope_is_source_context_previewable(scope: &PlayerScope) -> bool {
+    match scope {
+        PlayerScope::Controller
+        | PlayerScope::Opponent { .. }
+        | PlayerScope::DefendingPlayer
+        | PlayerScope::SourceChosenPlayer => true,
+        PlayerScope::AllPlayers { exclude, .. } => exclude
+            .as_deref()
+            .is_none_or(player_scope_is_source_context_previewable),
+        PlayerScope::ScopedPlayer
+        | PlayerScope::Target
+        | PlayerScope::RecipientController
+        | PlayerScope::ParentObjectTargetController
+        | PlayerScope::SpecificPlayer { .. }
+        | PlayerScope::AnyTurn => false,
     }
 }
 
@@ -11873,6 +11894,73 @@ mod tests {
             10,
             "30 life is 10 above a hero's 20-life baseline"
         );
+    }
+
+    #[test]
+    fn starting_life_source_preview_requires_a_bound_player() {
+        use crate::types::format::FormatConfig;
+
+        let mut state = GameState::new(FormatConfig::archenemy(), 4, 0);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let starting = |player| QuantityExpr::Ref {
+            qty: QuantityRef::StartingLifeTotal { player },
+        };
+
+        assert_eq!(
+            try_resolve_quantity_in_source_context(
+                &state,
+                &starting(PlayerScope::Controller),
+                PlayerId(0),
+                source,
+            ),
+            Some(40),
+        );
+        assert_eq!(
+            try_resolve_quantity_in_source_context(
+                &state,
+                &starting(PlayerScope::Controller),
+                PlayerId(1),
+                source,
+            ),
+            Some(20),
+        );
+        for unbound in [
+            PlayerScope::Target,
+            PlayerScope::ScopedPlayer,
+            PlayerScope::RecipientController,
+            PlayerScope::ParentObjectTargetController,
+        ] {
+            assert_eq!(
+                try_resolve_quantity_in_source_context(
+                    &state,
+                    &starting(unbound),
+                    PlayerId(0),
+                    source,
+                ),
+                None,
+            );
+        }
+        for (id, baseline) in [(PlayerId(0), 40), (PlayerId(1), 20)] {
+            assert_eq!(
+                state.format_config.starting_life_total_for_player(id),
+                baseline
+            );
+            assert_eq!(
+                try_resolve_quantity_in_source_context(
+                    &state,
+                    &starting(PlayerScope::SpecificPlayer { id }),
+                    PlayerId(0),
+                    source,
+                ),
+                None,
+            );
+        }
     }
 
     /// CR 903.3d: CommanderManaValue resolves to the mana value of a commander
