@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 
 import { isCommanderPreconDeck, useDecks, type DeckEntry } from "../../hooks/useDecks";
 import { preconExists, savePreconDeck } from "../../services/preconDecks";
-import { attemptSavedDeckWrite } from "../../services/savedDeckWriteFailure";
+import { attemptSavedDeckWrite, notifySavedDeckChanged } from "../../services/savedDeckWriteFailure";
 import { captureSavedDeck } from "../../constants/storage";
 import { menuButtonClass } from "./buttonStyles";
 import { MenuSelect } from "../ui/MenuSelect";
@@ -126,8 +126,7 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
     const suggested = `${deck.name} (${deck.code})`;
     const chosen = prompt(t("precon.savePrompt"), suggested);
     if (!chosen) return;
-    // Captured at this same confirm click (confirm() blocks synchronously, so nothing else can
-    // run between the read and the click): what "replace" below must still find to proceed.
+    // Captured at this same confirm click: what "replace" below must still find to proceed.
     const existing = captureSavedDeck(chosen);
     if (existing.raw !== null && !confirm(t("precon.overwriteConfirm", { name: chosen }))) return;
     let saved = await attemptSavedDeckWrite("save", () =>
@@ -142,6 +141,12 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
       saved = await attemptSavedDeckWrite("save", () =>
         savePreconDeck(chosen, deck, reconfirmed.raw !== null ? { type: "replace", expected: reconfirmed } : { type: "keep" }),
       );
+      if (saved.ok && saved.value === "kept-existing") {
+        // The name changed again during the re-confirmed save — the user's second confirm no
+        // longer matches what's stored, so this import must not silently claim success.
+        notifySavedDeckChanged("save");
+        return;
+      }
     }
     if (!saved.ok) return;
     const session = importSession.stateOf(started);

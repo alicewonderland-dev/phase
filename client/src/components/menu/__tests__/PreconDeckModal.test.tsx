@@ -7,6 +7,7 @@ import { PreconDeckModal } from "../PreconDeckModal";
 import { STORAGE_KEY_PREFIX, writeSavedDeckData } from "../../../constants/storage";
 import type { DeckMap } from "../../../hooks/useDecks";
 import { withSavedDeckLibrary } from "../../../services/savedDeckTransaction";
+import { useAppNotificationStore } from "../../../stores/appToastStore";
 import {
   installFifoWebLocks,
   resetSavedDeckLibraryForTests,
@@ -48,6 +49,7 @@ beforeEach(async () => {
   localStorage.clear();
   installFifoWebLocks();
   await resetSavedDeckLibraryForTests();
+  useAppNotificationStore.setState({ notification: null, expiresAt: 0 });
 });
 
 afterEach(() => {
@@ -141,6 +143,56 @@ describe("PreconDeckModal", () => {
     await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(2));
     expect(onImported).not.toHaveBeenCalled();
     expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Aggro Deck (SET)")).toBe("REPLACED-DATA");
+  });
+
+  it("a name that changes again during the re-confirmed save is not imported, and the user is told", async () => {
+    const name = "Aggro Deck (SET)";
+    localStorage.setItem(STORAGE_KEY_PREFIX + name, "ORIGINAL-DATA");
+    vi.stubGlobal("prompt", vi.fn(() => name));
+    // The user's second confirm races a third writer that claims the name again before this
+    // pick's own re-confirmed save reaches the lock — so that save also finds a mismatch.
+    let second: Promise<void> | null = null;
+    const confirmSpy = vi.fn(() => {
+      if (confirmSpy.mock.calls.length === 2) {
+        second = withSavedDeckLibrary((txn) => {
+          writeSavedDeckData(txn, name, "SECOND-REPLACEMENT");
+        });
+      }
+      return true;
+    });
+    vi.stubGlobal("confirm", confirmSpy);
+    const onImported = vi.fn();
+    const onClose = vi.fn();
+
+    const holder = withSavedDeckLibrary(async (txn) => {
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).pending).toHaveLength(1);
+      });
+      writeSavedDeckData(txn, name, "REPLACED-DATA");
+    });
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+
+    render(<PreconDeckModal open onClose={onClose} onImported={onImported} />);
+    await userEvent.click(screen.getByRole("button", { name: /^Aggro Deck/ }));
+    await holder;
+
+    await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(2));
+    await vi.waitFor(async () => {
+      const q = await navigator.locks.query();
+      expect(q.held).toHaveLength(0);
+      expect(q.pending).toHaveLength(0);
+    });
+    await second;
+
+    // The third writer's data survives untouched: this pick's re-confirmed save also saw a
+    // mismatch and must not have overwritten it, imported it, or closed the modal — and the
+    // user must be told rather than the pick silently reporting success.
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + name)).toBe("SECOND-REPLACEMENT");
+    await waitFor(() => expect(useAppNotificationStore.getState().notification).not.toBeNull());
+    expect(onImported).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it("batch import leaves a name that changed after the overwrite confirm untouched, and still overwrites unchanged conflicts", async () => {

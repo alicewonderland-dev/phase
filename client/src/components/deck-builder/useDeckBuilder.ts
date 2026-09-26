@@ -596,6 +596,10 @@ export function useDeckBuilder({
   // place), this always writes a NEW key and leaves the original untouched.
   const handleClone = useCallback(async () => {
     const captured = captureEditor();
+    // Fixed before the write waits for the lock: which deck this clone is beside. A Load that
+    // swaps the live ref while this clone waits must not retarget the copy's folder onto the
+    // newly loaded deck.
+    const sourceAtClick = savedDeckRef.current;
     const base = deckName.trim() || "Untitled Deck";
     const data = serializeSavedDeck(currentDeck, format, bracket);
     const cloned = await attemptSavedDeckWrite("clone", () =>
@@ -605,13 +609,15 @@ export function useDeckBuilder({
         stampDeckMeta(txn, name);
         // A clone lands beside its source: inherit the folder, but start unstarred
         // (the star is a deliberate per-deck pin, not a copyable property).
-        const sourceFolderId = savedDeckRef.current
-          ? getDeckMeta(savedDeckRef.current.name)?.folderId ?? null
+        const sourceFolderId = sourceAtClick
+          ? getDeckMeta(sourceAtClick.name)?.folderId ?? null
           : null;
         if (sourceFolderId) setDeckFolder(txn, name, sourceFolderId);
-        // A Load that switched the editor to a different deck while this clone waited owns the
-        // ref now; this clone's claim on it is stale (mirrors saveBuilderDeck's own guard).
-        if (!editorChangedSince(captured).reloaded) savedDeckRef.current = copy;
+        // A Load or edit that changed the editor while this clone waited means the ref no longer
+        // belongs to this clone (mirrors saveBuilderDeck's own guard) — an edit alone must also
+        // block the claim, or the next Save moves this copy onto the still-open source.
+        const c = editorChangedSince(captured);
+        if (!c.reloaded && !c.edited) savedDeckRef.current = copy;
         return copy;
       }),
     );
