@@ -1867,7 +1867,7 @@ fn cost_mod_bare_color_category_and_historic_subject() {
     assert_eq!(
         props("Colorless spells you cast cost {1} less to cast."),
         vec![FilterProp::ColorCount {
-            comparator: Comparator::GE,
+            comparator: Comparator::EQ,
             count: 0,
         }],
     );
