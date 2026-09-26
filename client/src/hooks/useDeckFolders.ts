@@ -76,10 +76,15 @@ export function groupSavedDecks(
 }
 
 /** Module-level so the hook returns the same identity on every render (it closes over nothing). */
-function createFolder(name: string): Promise<DeckFolder | null> {
-  return attemptSavedDeckWrite("organize", () => withSavedDeckLibrary((txn) => createFolderStore(txn, name))).then(
-    (r) => (r.ok ? r.value : null),
-  );
+function createFolder(name: string, deckName?: string): Promise<DeckFolder | null> {
+  return attemptSavedDeckWrite("organize", () =>
+    withSavedDeckLibrary((txn) => {
+      const folder = createFolderStore(txn, name);
+      // One transaction, so a move of this deck queued while it waits runs after it instead of being overwritten.
+      if (folder && deckName !== undefined) setDeckFolder(txn, deckName, folder.id);
+      return folder;
+    }),
+  ).then((r) => (r.ok ? r.value : null));
 }
 /** Module-level so the hook returns the same identity on every render (it closes over nothing). */
 function renameFolder(id: string, name: string): Promise<boolean> {
@@ -110,7 +115,7 @@ export interface UseDeckFoldersResult {
   folders: DeckFolder[];
   /** Group a (pre-sorted) list of saved deck names into Starred/folders/Unfiled. */
   group: (deckNames: string[]) => GroupedDecks;
-  createFolder: (name: string) => Promise<DeckFolder | null>;
+  createFolder: (name: string, deckName?: string) => Promise<DeckFolder | null>;
   renameFolder: (id: string, name: string) => Promise<boolean>;
   deleteFolder: (id: string) => Promise<boolean>;
   assignDeck: (deckName: string, folderId: string | null) => Promise<boolean>;

@@ -53,6 +53,7 @@ import {
 } from "../../services/randomDeckSelection";
 import { ImportDeckModal } from "./ImportDeckModal";
 import { PreconDeckModal } from "./PreconDeckModal";
+import type { ImportSession } from "./importSession";
 import { savePreconDeck } from "../../services/preconDecks";
 import type { DeckEntry as PreconDeckEntry } from "../../hooks/useDecks";
 import { MenuPanel } from "./MenuShell";
@@ -753,8 +754,7 @@ export function MyDecks({
             break;
           }
           case "create-and-assign": {
-            const folder = await createFolder(folderName);
-            if (folder) await assignDeck(prompt.deckName, folder.id);
+            await createFolder(folderName, prompt.deckName);
             break;
           }
           case "rename": {
@@ -765,7 +765,7 @@ export function MyDecks({
       })();
       setFolderPrompt(null);
     },
-    [folderPrompt, createFolder, assignDeck, renameFolder],
+    [folderPrompt, createFolder, renameFolder],
   );
   const handleFolderPromptCancel = useCallback(() => {
     setFolderPrompt(null);
@@ -1310,17 +1310,30 @@ export function MyDecks({
     return true;
   }, [legalPreconByName]);
 
+  // Bumped by every select-mode choice, so a choice whose precon save or random pick finishes after a newer choice does not select.
+  const selectionRequest = useRef(0);
+  // A choice pending when this surface unmounts (e.g. the caller navigated
+  // away) must not select once it finishes either.
+  useEffect(() => {
+    return () => {
+      selectionRequest.current += 1;
+    };
+  }, []);
+
   const handleTileClick = useCallback(async (deckName: string) => {
     if (mode === "manage") {
       onEditDeck?.(deckName);
       return;
     }
+    const request = ++selectionRequest.current;
     if (!(await materializePreconDeck(deckName))) return;
+    if (request !== selectionRequest.current) return;
     onSelectDeck?.(deckName);
   }, [materializePreconDeck, mode, onEditDeck, onSelectDeck]);
 
   const handleRandomDeckClick = useCallback(async () => {
     if (mode !== "select" || randomSelectableCandidates.length === 0 || isPickingRandomDeck) return;
+    const request = ++selectionRequest.current;
     if (randomSelectionMode === "defer") {
       onSelectDeck?.(RANDOM_DECK_SELECTION);
       return;
@@ -1363,7 +1376,7 @@ export function MyDecks({
       })),
       { selectedFormat: selectedFormatForCompatibility },
     );
-    if (pick) handleTileClick(pick.deckName);
+    if (pick && request === selectionRequest.current) handleTileClick(pick.deckName);
   }, [
     compatibilities,
     deckCandidatesByName,
@@ -1379,9 +1392,10 @@ export function MyDecks({
     t,
   ]);
 
-  const handleImported = (name: string, names: string[]) => {
+  const handleImported = (name: string, names: string[], session: ImportSession) => {
     setDeckNames(names);
-    if (mode === "select") {
+    if (mode === "select" && session === "open") {
+      selectionRequest.current += 1;
       onSelectDeck?.(name);
     }
   };
@@ -2029,7 +2043,7 @@ export function MyDecks({
       <PreconDeckModal
         open={showPrecon}
         onClose={() => setShowPrecon(false)}
-        onImported={(name) => handleImported(name, listSavedDeckNames())}
+        onImported={(name, session) => handleImported(name, listSavedDeckNames(), session)}
       />
       <FeedManagerModal
         open={showFeedManager}

@@ -6,11 +6,12 @@ import { preconExists, savePreconDeck } from "../../services/preconDecks";
 import { attemptSavedDeckWrite } from "../../services/savedDeckWriteFailure";
 import { menuButtonClass } from "./buttonStyles";
 import { MenuSelect } from "../ui/MenuSelect";
+import { useImportSession, type ImportSession } from "./importSession";
 
 interface PreconDeckModalProps {
   open: boolean;
   onClose: () => void;
-  onImported: (name: string) => void;
+  onImported: (name: string, session: ImportSession) => void;
 }
 
 /** Cap on rendered rows. Prevents 1000+ node lists becoming a perf cliff;
@@ -49,6 +50,7 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
   // filtered list reordering as the user types — a deck stays selected even
   // when the search query temporarily hides it.
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const importSession = useImportSession(open);
 
   // Esc-to-close, bound only while the modal is open.
   useEffect(() => {
@@ -119,6 +121,7 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
   if (!open) return null;
 
   const handlePick = async (deck: DeckEntry) => {
+    const started = importSession.begin();
     const suggested = `${deck.name} (${deck.code})`;
     const chosen = prompt(t("precon.savePrompt"), suggested);
     if (!chosen) return;
@@ -128,12 +131,16 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
       savePreconDeck(chosen, deck, existed ? "replace" : "keep"),
     );
     if (saved.ok && saved.value === "kept-existing") {
+      // Another writer claimed the name while this save waited. Only ask
+      // again if the session that started this pick is still open.
+      if (importSession.stateOf(started) !== "open") return;
       if (!confirm(t("precon.overwriteConfirm", { name: chosen }))) return;
       saved = await attemptSavedDeckWrite("save", () => savePreconDeck(chosen, deck, "replace"));
     }
     if (!saved.ok) return;
-    onImported(chosen);
-    onClose();
+    const session = importSession.stateOf(started);
+    onImported(chosen, session);
+    if (session === "open") onClose();
   };
 
   const toggleSelected = (id: string) => {
@@ -154,6 +161,7 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
   // run as a single transition rather than per-deck.
   const handleImportSelected = async () => {
     if (!decks || selectedIds.size === 0) return;
+    const started = importSession.begin();
     const picks: Array<{ savedName: string; deck: DeckEntry }> = [];
     for (const id of selectedIds) {
       const deck = decks[id];
@@ -192,14 +200,16 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
       imported++;
     }
 
-    if (lastImported) onImported(lastImported);
+    const session = importSession.stateOf(started);
+    if (lastImported) onImported(lastImported, session);
     if (refused) return;
-    clearSelection();
-    onClose();
+    if (session === "open") {
+      clearSelection();
+      onClose();
+    }
     if (skipped > 0) {
       // No toast system in this surface — a single alert keeps the user
-      // informed without ambiguity. Fires AFTER onClose so the dialog tears
-      // down first and the alert lands in the deck-list view.
+      // informed without ambiguity.
       alert(t("precon.importedSkipped", { count: imported, skipped }));
     }
   };

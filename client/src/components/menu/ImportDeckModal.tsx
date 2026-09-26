@@ -23,6 +23,7 @@ import {
 } from "../../services/engineRuntime";
 import { useAppNotificationStore } from "../../stores/appToastStore";
 import { useEffectiveOffline } from "../../stores/connectivityStore";
+import { useImportSession, type ImportSession } from "./importSession";
 
 // Frontend-authored error messages from deckUrlImport.ts arrive as translation
 // keys prefixed `importDeck.`. Worker-authored messages flow through as-is
@@ -34,7 +35,7 @@ type ImportTab = "paste" | "url" | "file";
 interface ImportDeckModalProps {
   open: boolean;
   onClose: () => void;
-  onImported: (name: string, deckNames: string[]) => void;
+  onImported: (name: string, deckNames: string[], session: ImportSession) => void;
 }
 
 interface PendingOathbreakerImport {
@@ -87,17 +88,19 @@ export function ImportDeckModal({ open, onClose, onImported }: ImportDeckModalPr
   const [oathbreakerSetupLoading, setOathbreakerSetupLoading] = useState(false);
   const [oathbreakerSetupError, setOathbreakerSetupError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const importSession = useImportSession(open);
 
-  const finishImport = (name: string) => {
-    onImported(name, listSavedDeckNames());
-    resetAndClose();
+  const finishImport = (name: string, started: number) => {
+    const session = importSession.stateOf(started);
+    onImported(name, listSavedDeckNames(), session);
+    if (session === "open") resetAndClose();
     showNotification({
       title: t("importDeck.importedSuccessTitle"),
       description: t("importDeck.importedSuccessDescription", { name }),
     });
   };
 
-  const persistImport = async (baseName: string, deck: ParsedDeck, format?: "Oathbreaker") => {
+  const persistImport = async (started: number, baseName: string, deck: ParsedDeck, format?: "Oathbreaker") => {
     const saved = await attemptSavedDeckWrite("import", () =>
       withSavedDeckLibrary((txn) => {
         const name = freeDeckName(txn, baseName);
@@ -106,7 +109,7 @@ export function ImportDeckModal({ open, onClose, onImported }: ImportDeckModalPr
         return name;
       }),
     );
-    if (saved.ok) finishImport(saved.value);
+    if (saved.ok) finishImport(saved.value, started);
   };
 
   const signatureCandidatesFor = async (deck: ParsedDeck, oathbreaker: string): Promise<string[]> => {
@@ -123,7 +126,7 @@ export function ImportDeckModal({ open, onClose, onImported }: ImportDeckModalPr
     return policy.type === "Required" ? policy.data.candidates : [];
   };
 
-  const stageOathbreakerImport = async (deck: ParsedDeck, name: string) => {
+  const stageOathbreakerImport = async (started: number, deck: ParsedDeck, name: string) => {
     const candidateNames = Array.from(new Set([
       ...deck.main.map((entry) => entry.name),
       ...(deck.commander ?? []),
@@ -134,6 +137,9 @@ export function ImportDeckModal({ open, onClose, onImported }: ImportDeckModalPr
         eligible: await isCardCommanderEligibleForFormat(candidate, "Oathbreaker"),
       })),
     );
+    // The modal that started this eligibility check may have been dismissed
+    // (and possibly reopened) while it waited: don't open its setup step then.
+    if (importSession.stateOf(started) !== "open") return;
     const oathbreakerCandidates = eligibility
       .filter(({ eligible }) => eligible)
       .map(({ candidate }) => candidate);
@@ -160,17 +166,17 @@ export function ImportDeckModal({ open, onClose, onImported }: ImportDeckModalPr
     });
   };
 
-  const stageImport = async (content: string, fallbackName?: string): Promise<boolean> => {
+  const stageImport = async (started: number, content: string, fallbackName?: string): Promise<boolean> => {
     const deck = await resolveCommander(detectAndParseDeck(content));
     if (!parsedDeckHasCards(deck)) return false;
 
     const name = resolveImportDeckName(deckName, content, deck, fallbackName);
     if (!importAsOathbreaker) {
-      await persistImport(name, deck);
+      await persistImport(started, name, deck);
       return true;
     }
 
-    await stageOathbreakerImport(deck, name);
+    await stageOathbreakerImport(started, deck, name);
     return true;
   };
 
@@ -201,6 +207,7 @@ export function ImportDeckModal({ open, onClose, onImported }: ImportDeckModalPr
     const pending = pendingOathbreakerImport;
     if (!pending?.oathbreaker || !pending.signatureSpell) return;
     await persistImport(
+      importSession.begin(),
       pending.name,
       assignOathbreakerSlots(pending.deck, pending.oathbreaker, pending.signatureSpell),
       "Oathbreaker",
@@ -212,7 +219,7 @@ export function ImportDeckModal({ open, onClose, onImported }: ImportDeckModalPr
     setPasteError(null);
     setPasteLoading(true);
     try {
-      if (!(await stageImport(pasteText))) {
+      if (!(await stageImport(importSession.begin(), pasteText))) {
         setPasteError(t("importDeck.errorNoCards"));
       }
     } catch {
@@ -227,9 +234,10 @@ export function ImportDeckModal({ open, onClose, onImported }: ImportDeckModalPr
     if (!trimmed || urlLoading) return;
     setUrlError(null);
     setUrlLoading(true);
+    const started = importSession.begin();
     try {
       const content = await fetchDeckFromUrl(trimmed);
-      if (!(await stageImport(content))) {
+      if (!(await stageImport(started, content))) {
         setUrlError(t("importDeck.errorNoCards"));
       }
     } catch (err) {
@@ -243,13 +251,14 @@ export function ImportDeckModal({ open, onClose, onImported }: ImportDeckModalPr
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    const started = importSession.begin();
     const reader = new FileReader();
     reader.onload = async () => {
       setFileError(null);
       const content = reader.result as string;
       const fallbackName = file.name.replace(/\.(dck|dec|txt)$/i, "");
       try {
-        if (!(await stageImport(content, fallbackName))) {
+        if (!(await stageImport(started, content, fallbackName))) {
           setFileError(t("importDeck.errorNoCards"));
         }
       } catch {

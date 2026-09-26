@@ -6,6 +6,8 @@ import { MyDecks } from "../MyDecks";
 import {
   RANDOM_DECK_SELECTION,
   createFolder,
+  getDeckMeta,
+  listFolders,
   saveFeedSubscriptions,
   saveDeckOrigins,
   setDeckFolder,
@@ -22,7 +24,8 @@ import { setSavedDeckTxnLockWaitForTests, withSavedDeckLibrary } from "../../../
 import { useAppNotificationStore } from "../../../stores/appToastStore";
 import { evaluateDeckCompatibilityBatch } from "../../../services/deckCompatibility";
 import { setCachedFeed } from "../../../services/feedPersistence";
-import { loadPreconDeckMap } from "../../../hooks/useDecks";
+import { loadPreconDeckMap, useDecks } from "../../../hooks/useDecks";
+import type { DeckMap } from "../../../hooks/useDecks";
 import { useConnectivityStore } from "../../../stores/connectivityStore";
 import * as feedService from "../../../services/feedService";
 
@@ -58,6 +61,34 @@ vi.mock("../../../hooks/useDecks", () => ({
 
 function saveDeck(name: string, deck: ParsedDeck): void {
   localStorage.setItem(STORAGE_KEY_PREFIX + name, JSON.stringify(deck));
+}
+
+function commanderPrecon() {
+  return {
+    secrets: {
+      code: "SOS",
+      name: "Secrets of Strixhaven",
+      type: "Commander Deck",
+      releaseDate: "2026-02-01",
+      coveragePct: 100,
+      mainBoard: [{ name: "Island", count: 99 }],
+      sideBoard: [],
+      commander: [{ name: "Zimone, Mystery Unraveler", count: 1 }],
+    },
+  };
+}
+
+function compatibleBatch(decks: Array<{ name: string }>) {
+  return Object.fromEntries(decks.map(({ name }) => [name, {
+    standard: { compatible: false, reasons: [] },
+    commander: { compatible: true, reasons: [] },
+    bo3_ready: false,
+    unknown_cards: [],
+    selected_format_compatible: true,
+    selected_format_reasons: [],
+    color_identity: ["U"],
+    color_distribution: [],
+  }]));
 }
 
 describe("MyDecks", () => {
@@ -1027,5 +1058,277 @@ describe("MyDecks", () => {
     expect(image).not.toBeNull();
     fireEvent.error(image!);
     expect(advanceFailedSource).toHaveBeenCalledWith("visual-pack://installed/deck-art");
+  });
+
+  describe("a newer choice supersedes one still saving or checking compatibility", () => {
+    beforeEach(async () => {
+      installFifoWebLocks();
+      await resetSavedDeckLibraryForTests();
+    });
+    afterEach(() => uninstallWebLocks());
+
+    it("a precon whose save finishes after the user picks another deck does not replace that pick", async () => {
+      saveDeck("Mine", { main: [{ name: "Island", count: 99 }], sideboard: [], format: "Commander", commander: ["Zimone, Mystery Unraveler"] } as ParsedDeck);
+      vi.mocked(loadPreconDeckMap).mockResolvedValue(commanderPrecon());
+      vi.mocked(evaluateDeckCompatibilityBatch).mockImplementation(async (decks) => compatibleBatch(decks));
+      const onSelectDeck = vi.fn();
+
+      render(<MyDecks mode="select" selectedFormat="Commander" activeDeckName={null} onSelectDeck={onSelectDeck} />);
+      await screen.findByText("Secrets of Strixhaven (SOS)");
+      await screen.findByText("Mine");
+
+      let release!: () => void;
+      const held = new Promise<void>((r) => { release = r; });
+      const holder = withSavedDeckLibrary(() => held);
+      await vi.waitFor(async () => { expect((await navigator.locks.query()).held).toHaveLength(1); });
+
+      await userEvent.click(screen.getByText("Secrets of Strixhaven (SOS)"));
+      await vi.waitFor(async () => { expect((await navigator.locks.query()).pending).toHaveLength(1); });
+      await userEvent.click(screen.getByText("Mine"));
+
+      release();
+      await holder;
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(onSelectDeck.mock.calls).toEqual([["Mine"]]);
+    });
+
+    it("a random pick whose compatibility check finishes after the user picks a deck does not replace that pick", async () => {
+      saveDeck("Mine", { main: [{ name: "Island", count: 60 }], sideboard: [] });
+      saveDeck("Other", { main: [{ name: "Mountain", count: 60 }], sideboard: [] });
+      let release!: (v: Record<string, ReturnType<typeof compatibleBatch>[string]>) => void;
+      vi.mocked(evaluateDeckCompatibilityBatch).mockImplementation(
+        () => new Promise((r) => { release = r; }),
+      );
+      const onSelectDeck = vi.fn();
+
+      render(<MyDecks mode="select" selectedFormat="Standard" activeDeckName={null} onSelectDeck={onSelectDeck} />);
+      await screen.findByText("Mine");
+
+      await userEvent.click(screen.getByRole("button", { name: "Random Deck" }));
+      await vi.waitFor(() => expect(vi.mocked(evaluateDeckCompatibilityBatch)).toHaveBeenCalled());
+      await userEvent.click(screen.getByText("Mine"));
+
+      release({});
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(onSelectDeck.mock.calls).toEqual([["Mine"]]);
+    });
+  });
+
+  describe("an import selected through the Preconstructed catalog modal", () => {
+    const catalogDecks: DeckMap = {
+      aggro: {
+        code: "SET",
+        name: "Aggro Deck",
+        type: "Commander Deck",
+        releaseDate: "2026-01-01",
+        coveragePct: 100,
+        mainBoard: [{ name: "Mountain", count: 40 }],
+        sideBoard: [],
+        commander: [{ name: "Krenko", count: 1 }],
+      },
+    };
+
+    beforeEach(async () => {
+      installFifoWebLocks();
+      await resetSavedDeckLibraryForTests();
+      vi.mocked(useDecks).mockReturnValue({ decks: catalogDecks, status: "success" as const });
+      // A different deck from a different catalog: it keeps MyDecks' own legal-precon
+      // listing (and hence the "Preconstructed" CTA) non-empty without also
+      // rendering "Aggro Deck" outside the modal under test.
+      vi.mocked(loadPreconDeckMap).mockResolvedValue(commanderPrecon());
+      vi.mocked(evaluateDeckCompatibilityBatch).mockImplementation(async (decks) => compatibleBatch(decks));
+    });
+    afterEach(() => {
+      uninstallWebLocks();
+      vi.mocked(useDecks).mockReturnValue({ decks: null, status: "loading" as const });
+    });
+
+    it("a precon imported after its modal was dismissed is listed but not selected", async () => {
+      vi.stubGlobal("prompt", vi.fn(() => "Aggro Deck (SET)"));
+      const onSelectDeck = vi.fn();
+
+      render(<MyDecks mode="select" selectedFormat="Commander" activeDeckName={null} onSelectDeck={onSelectDeck} />);
+      await screen.findByText("Secrets of Strixhaven (SOS)");
+      await userEvent.click(screen.getByRole("button", { name: "Preconstructed" }));
+
+      let release!: () => void;
+      const held = new Promise<void>((r) => { release = r; });
+      const holder = withSavedDeckLibrary(() => held);
+      await vi.waitFor(async () => { expect((await navigator.locks.query()).held).toHaveLength(1); });
+
+      await userEvent.click(screen.getByRole("button", { name: /^Aggro Deck/ }));
+      await vi.waitFor(async () => { expect((await navigator.locks.query()).pending).toHaveLength(1); });
+
+      await userEvent.keyboard("{Escape}");
+      release();
+      await holder;
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(onSelectDeck).not.toHaveBeenCalled();
+      expect(await screen.findByText("Aggro Deck (SET)")).toBeInTheDocument();
+    });
+
+    it("a precon imported while its modal stays open is selected (paired positive)", async () => {
+      vi.stubGlobal("prompt", vi.fn(() => "Aggro Deck (SET)"));
+      const onSelectDeck = vi.fn();
+
+      render(<MyDecks mode="select" selectedFormat="Commander" activeDeckName={null} onSelectDeck={onSelectDeck} />);
+      await screen.findByText("Secrets of Strixhaven (SOS)");
+      await userEvent.click(screen.getByRole("button", { name: "Preconstructed" }));
+
+      let release!: () => void;
+      const held = new Promise<void>((r) => { release = r; });
+      const holder = withSavedDeckLibrary(() => held);
+      await vi.waitFor(async () => { expect((await navigator.locks.query()).held).toHaveLength(1); });
+
+      await userEvent.click(screen.getByRole("button", { name: /^Aggro Deck/ }));
+      await vi.waitFor(async () => { expect((await navigator.locks.query()).pending).toHaveLength(1); });
+
+      release();
+      await holder;
+
+      await vi.waitFor(() => expect(onSelectDeck).toHaveBeenCalledWith("Aggro Deck (SET)"));
+    });
+
+    it("an import selected while a random pick is pending is not replaced by that pick", async () => {
+      // No `format`, matching "random selection prefers exact-format feed decks…" above:
+      // an explicit format would resolve `knownFormat` synchronously and skip the batch call.
+      saveDeck("Mine", { main: [{ name: "Island", count: 99 }], sideboard: [] });
+      saveDeck("Other", { main: [{ name: "Mountain", count: 99 }], sideboard: [] });
+      vi.stubGlobal("prompt", vi.fn(() => "Aggro Deck (SET)"));
+      let releaseRandom!: (v: Record<string, ReturnType<typeof compatibleBatch>[string]>) => void;
+      vi.mocked(evaluateDeckCompatibilityBatch).mockImplementation((decks, opts) => {
+        // The background coverage scan also passes `summaryOnly: true` but drives
+        // its result through `onResult`/`onStatus`; the random pick's own call
+        // awaits the returned promise directly with neither — that is the one to hold.
+        if (opts?.summaryOnly && !opts.onResult && !opts.onStatus) {
+          return new Promise((r) => { releaseRandom = r; });
+        }
+        return Promise.resolve(compatibleBatch(decks));
+      });
+      const onSelectDeck = vi.fn();
+
+      render(<MyDecks mode="select" selectedFormat="Commander" activeDeckName={null} onSelectDeck={onSelectDeck} />);
+      await screen.findByText("Mine");
+
+      await userEvent.click(screen.getByRole("button", { name: "Random Deck" }));
+      await vi.waitFor(() => expect(releaseRandom).toBeDefined());
+
+      await userEvent.click(screen.getByRole("button", { name: "Preconstructed" }));
+      await userEvent.click(screen.getByRole("button", { name: /^Aggro Deck/ }));
+      await vi.waitFor(() => expect(onSelectDeck).toHaveBeenCalledWith("Aggro Deck (SET)"));
+
+      releaseRandom({});
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(onSelectDeck.mock.calls).toEqual([["Aggro Deck (SET)"]]);
+    });
+  });
+
+  describe("MyDecks unmounts while a select-mode choice waits", () => {
+    beforeEach(async () => {
+      installFifoWebLocks();
+      await resetSavedDeckLibraryForTests();
+    });
+    afterEach(() => uninstallWebLocks());
+
+    it("a precon pick whose save finishes after MyDecks unmounts does not select", async () => {
+      vi.mocked(loadPreconDeckMap).mockResolvedValue({
+        secrets: {
+          code: "SOS",
+          name: "Secrets of Strixhaven",
+          type: "Commander Deck",
+          releaseDate: "2026-02-01",
+          coveragePct: 100,
+          mainBoard: [{ name: "Island", count: 99 }],
+          sideBoard: [],
+          commander: [{ name: "Zimone, Mystery Unraveler", count: 1 }],
+        },
+      });
+      vi.mocked(evaluateDeckCompatibilityBatch).mockImplementation(async (decks) => compatibleBatch(decks));
+      const onSelectDeck = vi.fn();
+
+      const r = render(<MyDecks mode="select" selectedFormat="Commander" activeDeckName={null} onSelectDeck={onSelectDeck} />);
+      await screen.findByText("Secrets of Strixhaven (SOS)");
+
+      let release!: () => void;
+      const held = new Promise<void>((res) => { release = res; });
+      const holder = withSavedDeckLibrary(() => held);
+      await vi.waitFor(async () => { expect((await navigator.locks.query()).held).toHaveLength(1); });
+
+      await userEvent.click(screen.getByText("Secrets of Strixhaven (SOS)"));
+      await vi.waitFor(async () => { expect((await navigator.locks.query()).pending).toHaveLength(1); });
+
+      r.unmount();
+      release();
+      await holder;
+      await new Promise((res) => setTimeout(res, 20));
+
+      expect(onSelectDeck).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("a folder created for a deck does not undo a move made while it waits", () => {
+    beforeEach(async () => {
+      installFifoWebLocks();
+      await resetSavedDeckLibraryForTests();
+    });
+    afterEach(() => uninstallWebLocks());
+
+    it("New folder… on a deck that is then moved to another folder before the create completes keeps both", async () => {
+      saveDeck("Mine", { main: [{ name: "Island", count: 60 }], sideboard: [] });
+      const folderG = createFolder(testSavedDeckTxn, "G");
+      expect(folderG).not.toBeNull();
+
+      render(<MyDecks mode="manage" activeDeckName={null} />);
+      await screen.findByText("Mine");
+
+      let release!: () => void;
+      const held = new Promise<void>((r) => { release = r; });
+      const holder = withSavedDeckLibrary(() => held);
+      await vi.waitFor(async () => { expect((await navigator.locks.query()).held).toHaveLength(1); });
+
+      await userEvent.click(screen.getByRole("button", { name: "Deck options" }));
+      await userEvent.click(await screen.findByRole("menuitem", { name: "New folder…" }));
+      await userEvent.type(await screen.findByLabelText("Folder name:"), "F");
+      await userEvent.click(screen.getByRole("button", { name: "Create" }));
+
+      await userEvent.click(screen.getByRole("button", { name: "Deck options" }));
+      await userEvent.click(await screen.findByRole("menuitemradio", { name: /^G/ }));
+
+      await vi.waitFor(async () => { expect((await navigator.locks.query()).pending).toHaveLength(2); });
+      release();
+      await holder;
+      await vi.waitFor(async () => {
+        const q = await navigator.locks.query();
+        expect(q.held).toHaveLength(0);
+        expect(q.pending).toHaveLength(0);
+      });
+
+      await vi.waitFor(() => {
+        expect(listFolders().map((f) => f.name)).toContain("F");
+        expect(getDeckMeta("Mine")?.folderId).toBe(folderG!.id);
+      });
+    });
+
+    it("New folder… moves the deck into the new folder", async () => {
+      saveDeck("Mine", { main: [{ name: "Island", count: 60 }], sideboard: [] });
+
+      render(<MyDecks mode="manage" activeDeckName={null} />);
+      await screen.findByText("Mine");
+
+      await userEvent.click(screen.getByRole("button", { name: "Deck options" }));
+      await userEvent.click(await screen.findByRole("menuitem", { name: "New folder…" }));
+      await userEvent.type(await screen.findByLabelText("Folder name:"), "F");
+      await userEvent.click(screen.getByRole("button", { name: "Create" }));
+
+      await waitFor(() => {
+        const folder = listFolders().find((f) => f.name === "F");
+        expect(folder).toBeDefined();
+        expect(getDeckMeta("Mine")?.folderId).toBe(folder!.id);
+      });
+    });
   });
 });
