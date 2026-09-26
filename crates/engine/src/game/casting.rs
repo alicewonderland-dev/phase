@@ -23418,7 +23418,7 @@ fn quantity_ref_is_board_state_relative(qty: &QuantityRef) -> bool {
         | QuantityRef::PartySize { player }
         | QuantityRef::Speed { player } => player_is_concrete(player),
         QuantityRef::StartingLifeTotal { player } => {
-            quantity_player_scope_is_board_state_relative(player)
+            super::quantity::player_scope_is_source_context_previewable(player)
         }
         QuantityRef::LifeAboveStarting => true,
         QuantityRef::ObjectCount { filter }
@@ -23456,27 +23456,6 @@ fn quantity_ref_is_board_state_relative(qty: &QuantityRef) -> bool {
         // cast/trigger-event context, etc.) makes the condition non-evaluable
         // before activation, so the helper returns `None`.
         _ => false,
-    }
-}
-
-/// A pre-activation starting-life read has the controller and source object,
-/// but no chosen target, recipient, or per-player resolution iteration.
-/// `SpecificPlayer` is duration-only and panics in the quantity resolver.
-fn quantity_player_scope_is_board_state_relative(scope: &PlayerScope) -> bool {
-    match scope {
-        PlayerScope::Controller
-        | PlayerScope::Opponent { .. }
-        | PlayerScope::DefendingPlayer
-        | PlayerScope::SourceChosenPlayer => true,
-        PlayerScope::AllPlayers { exclude, .. } => exclude
-            .as_deref()
-            .is_none_or(quantity_player_scope_is_board_state_relative),
-        PlayerScope::ScopedPlayer
-        | PlayerScope::Target
-        | PlayerScope::RecipientController
-        | PlayerScope::ParentObjectTargetController
-        | PlayerScope::SpecificPlayer { .. }
-        | PlayerScope::AnyTurn => false,
     }
 }
 

@@ -5819,15 +5819,13 @@ fn parse_life_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
     // same runtime quantity. Keep this exact suffix ahead of the generic
     // comparator and numeric fallbacks below.
     if matches!(scope, LifeTotalScope::Controller) {
-        if let Ok((after_n, n)) =
-            preceded(tag::<_, _, OracleError<'_>>("at least "), parse_number).parse(rest)
+        if let Ok((rest, n)) = preceded(
+            tag::<_, _, OracleError<'_>>("at least "),
+            terminated(parse_number, tag(" greater than your starting life total")),
+        )
+        .parse(rest)
         {
-            if let Ok((rest, _)) =
-                tag::<_, _, OracleError<'_>>(" greater than your starting life total")
-                    .parse(after_n)
-            {
-                return Ok((rest, make_quantity_ge(QuantityRef::LifeAboveStarting, n)));
-            }
+            return Ok((rest, make_quantity_ge(QuantityRef::LifeAboveStarting, n)));
         }
     }
 
@@ -17584,6 +17582,45 @@ mod tests {
 
     #[test]
     fn a_players_life_total_at_least_greater_than_your_starting_life_is_unsupported() {
+        let (rest, supported) = parse_inner_condition(
+            "a player's life total is less than or equal to half their starting life total",
+        )
+        .expect("the all-player, candidate-relative life route must parse");
+        assert_eq!(rest, "");
+        match supported {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::PlayerCount {
+                                filter:
+                                    PlayerFilter::PlayerAttribute {
+                                        relation: PlayerRelation::All,
+                                        attr,
+                                        comparator: Comparator::LE,
+                                        value,
+                                    },
+                            },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
+            } => {
+                assert!(matches!(
+                    attr.as_ref(),
+                    QuantityRef::LifeTotal {
+                        player: PlayerScope::ScopedPlayer,
+                    }
+                ));
+                assert!(value.any_ref(&mut |qty| matches!(
+                    qty,
+                    QuantityRef::StartingLifeTotal {
+                        player: PlayerScope::ScopedPlayer,
+                    }
+                )));
+            }
+            other => panic!("expected candidate-relative all-player comparison, got {other:?}"),
+        }
+
         assert!(
             parse_inner_condition(
                 "a player's life total is at least 10 greater than your starting life total"

@@ -1520,7 +1520,7 @@ fn quantity_expr_is_source_context_previewable(
 /// A source-only preview has its controller and source object, but no target,
 /// recipient, or per-player resolution iteration to bind a player reference.
 /// `SpecificPlayer` is duration-only and panics in the quantity resolver.
-fn player_scope_is_source_context_previewable(scope: &PlayerScope) -> bool {
+pub(crate) fn player_scope_is_source_context_previewable(scope: &PlayerScope) -> bool {
     match scope {
         PlayerScope::Controller
         | PlayerScope::Opponent { .. }
