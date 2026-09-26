@@ -12,6 +12,7 @@ import {
   captureSavedDeck,
   freeDeckName,
   getDeckMeta,
+  listFolders,
   loadSavedDeck,
   loadSavedDeckBracket,
   saveBuilderDeck,
@@ -597,6 +598,9 @@ export function useDeckBuilder({
   const handleClone = useCallback(async () => {
     const captured = captureEditor();
     const sourceAtClick = savedDeckRef.current;
+    // The clone's folder is decided at the click, like every other decision in this flow:
+    // capture it now, before any await lets a Load or rename-Save race this transaction.
+    const folderAtClick = sourceAtClick ? getDeckMeta(sourceAtClick.name)?.folderId ?? null : null;
     const base = deckName.trim() || "Untitled Deck";
     const data = serializeSavedDeck(currentDeck, format, bracket);
     const cloned = await attemptSavedDeckWrite("clone", () =>
@@ -604,17 +608,14 @@ export function useDeckBuilder({
         const name = freeDeckName(txn, `${base} copy`, (i) => `${base} copy ${i}`);
         const copy = writeSavedDeckData(txn, name, data);
         stampDeckMeta(txn, name);
-        // A clone lands beside its source: inherit the folder, but start unstarred
-        // (the star is a deliberate per-deck pin, not a copyable property). Use the
-        // click-time source only when a Load has retargeted the ref since the click —
-        // this clone must not follow that Load to the newly opened deck. Otherwise read
-        // the live ref: a queued rename-Save ahead of this clone already moved the
-        // click-time name's metadata to its new name, so looking it up by that name
-        // would miss the folder.
+        // A clone lands beside its source: inherit the click-time folder, but start
+        // unstarred (the star is a deliberate per-deck pin, not a copyable property).
+        // The folder may have been deleted while this transaction waited, so only
+        // assign it if it still exists — otherwise the copy would carry a dangling id.
+        if (folderAtClick && listFolders().some((f) => f.id === folderAtClick)) {
+          setDeckFolder(txn, name, folderAtClick);
+        }
         const c = editorChangedSince(captured);
-        const source = c.reloaded ? sourceAtClick : savedDeckRef.current;
-        const sourceFolderId = source ? getDeckMeta(source.name)?.folderId ?? null : null;
-        if (sourceFolderId) setDeckFolder(txn, name, sourceFolderId);
         // An edit alone must also block the claim, or the next Save moves this copy onto
         // the still-open source.
         if (!c.reloaded && !c.edited) savedDeckRef.current = copy;

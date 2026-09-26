@@ -12,7 +12,9 @@ import {
   ACTIVE_DECK_KEY,
   STORAGE_KEY_PREFIX,
   createFolder,
+  deleteFolder,
   getDeckMeta,
+  listFolders,
   removeDeckMeta,
   removeSavedDeckData,
   setDeckFolder,
@@ -2407,6 +2409,190 @@ describe("DeckBuilder", () => {
     // ran; the clone must land in that folder, not with no folder at all.
     expect(getDeckMeta("Deck A2 copy")?.folderId).toBe(folderA.id);
     expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck A copy")).toBeNull();
+  });
+
+  it("a rename-Save queued ahead of a Clone, then a Load while both wait, still lands the clone in the click-time folder", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "Deck A",
+      JSON.stringify({ main: [{ name: "Alpha", count: 1 }], sideboard: [], format: "Standard" }),
+    );
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "Deck B",
+      JSON.stringify({ main: [{ name: "Gamma", count: 1 }], sideboard: [], format: "Standard" }),
+    );
+    const folderA = createFolder(testSavedDeckTxn, "FA")!;
+    setDeckFolder(testSavedDeckTxn, "Deck A", folderA.id);
+
+    render(
+      <DeckBuilder
+        format="Standard"
+        onFormatChange={vi.fn()}
+        initialDeckName="Deck A"
+        searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+        onSearchFiltersChange={vi.fn()}
+        onResetSearch={vi.fn()}
+      />,
+    );
+    const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+    await waitFor(() => expect(nameInput).toHaveValue("Deck A"));
+
+    let releaseHolder!: () => void;
+    const held = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+    const holder = withSavedDeckLibrary(() => held);
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+
+    // S1: rename-Save of Deck A -> Deck A2, queued behind the held lock.
+    await user.clear(nameInput);
+    await user.type(nameInput, "Deck A2");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).pending).toHaveLength(1);
+    });
+
+    // C1: Clone, queued behind S1.
+    await user.click(screen.getByRole("button", { name: "Clone" }));
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).pending).toHaveLength(2);
+    });
+
+    // A Load of Deck B lands while S1 and C1 both still wait on the held lock. The queued
+    // rename left the editor dirty, so the Load is behind the unsaved-changes confirm — discard
+    // to load directly rather than queuing yet another Save.
+    await user.click(screen.getByRole("button", { name: "Load deck..." }));
+    await user.click(screen.getByRole("option", { name: "Deck B" }));
+    await user.click(await screen.findByRole("button", { name: "Discard" }));
+    await waitFor(() => expect(nameInput).toHaveValue("Deck B"));
+
+    releaseHolder();
+    await holder;
+
+    await waitFor(() =>
+      expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck A2 copy")).not.toBeNull(),
+    );
+    // The clone's folder was decided at the Clone click, before the Load — it must land in
+    // FA regardless of the Load that raced it to the lock.
+    expect(getDeckMeta("Deck A2 copy")?.folderId).toBe(folderA.id);
+  });
+
+  it("clicking Clone twice while a rename-Save is queued ahead of both leaves both copies in the click-time folder", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "Deck A",
+      JSON.stringify({ main: [{ name: "Alpha", count: 1 }], sideboard: [], format: "Standard" }),
+    );
+    const folderA = createFolder(testSavedDeckTxn, "FA")!;
+    setDeckFolder(testSavedDeckTxn, "Deck A", folderA.id);
+
+    render(
+      <DeckBuilder
+        format="Standard"
+        onFormatChange={vi.fn()}
+        initialDeckName="Deck A"
+        searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+        onSearchFiltersChange={vi.fn()}
+        onResetSearch={vi.fn()}
+      />,
+    );
+    const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+    await waitFor(() => expect(nameInput).toHaveValue("Deck A"));
+
+    let releaseHolder!: () => void;
+    const held = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+    const holder = withSavedDeckLibrary(() => held);
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+
+    // S1: rename-Save of Deck A -> Deck A2, queued behind the held lock.
+    await user.clear(nameInput);
+    await user.type(nameInput, "Deck A2");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).pending).toHaveLength(1);
+    });
+
+    // C1, C2: Clone clicked twice, both queued behind S1.
+    await user.click(screen.getByRole("button", { name: "Clone" }));
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).pending).toHaveLength(2);
+    });
+    await user.click(screen.getByRole("button", { name: "Clone" }));
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).pending).toHaveLength(3);
+    });
+
+    releaseHolder();
+    await holder;
+
+    await waitFor(() =>
+      expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck A2 copy 2")).not.toBeNull(),
+    );
+    expect(getDeckMeta("Deck A2 copy")?.folderId).toBe(folderA.id);
+    expect(getDeckMeta("Deck A2 copy 2")?.folderId).toBe(folderA.id);
+  });
+
+  it("a folder deleted between the Clone click and its transaction leaves the copy with no folder", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "Deck A",
+      JSON.stringify({ main: [{ name: "Alpha", count: 1 }], sideboard: [], format: "Standard" }),
+    );
+    const folderA = createFolder(testSavedDeckTxn, "FA")!;
+    setDeckFolder(testSavedDeckTxn, "Deck A", folderA.id);
+
+    render(
+      <DeckBuilder
+        format="Standard"
+        onFormatChange={vi.fn()}
+        initialDeckName="Deck A"
+        searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+        onSearchFiltersChange={vi.fn()}
+        onResetSearch={vi.fn()}
+      />,
+    );
+    const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+    await waitFor(() => expect(nameInput).toHaveValue("Deck A"));
+
+    let releaseHolder!: () => void;
+    const held = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+    const holder = withSavedDeckLibrary(() => held);
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+
+    // D1: delete folder FA through the real transaction path, queued behind the held lock —
+    // this must run before the Clone click below so its transaction sees FA already gone.
+    const deletion = withSavedDeckLibrary((txn) => deleteFolder(txn, folderA.id));
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).pending).toHaveLength(1);
+    });
+
+    // C1: Clone, clicked (and its folder captured) while FA still exists, queued behind D1.
+    await user.click(screen.getByRole("button", { name: "Clone" }));
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).pending).toHaveLength(2);
+    });
+
+    releaseHolder();
+    await holder;
+    await deletion;
+
+    await waitFor(() =>
+      expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck A copy")).not.toBeNull(),
+    );
+    expect(listFolders().some((f) => f.id === folderA.id)).toBe(false);
+    // The folder existed when Clone was clicked but was gone by the time its transaction ran —
+    // the copy must not carry the now-dangling id.
+    expect(getDeckMeta("Deck A copy")?.folderId).toBeUndefined();
   });
 
   it("clones into the source's folder but starts the copy unstarred", async () => {
