@@ -2218,8 +2218,7 @@ describe("DeckBuilder", () => {
     expect(useAppNotificationStore.getState().notification?.title).toBe("Deck cloned");
 
     // Editing and saving the now-loaded Deck B must not touch the clone the pending Clone left
-    // under its own name — the claimsEditor guard in handleClone already gave up the ref to this
-    // Load, so this Save has nothing stale to move onto Deck B.
+    // under its own name.
     await user.click(await screen.findByRole("button", { name: "remove-Gamma" }));
     await user.click(screen.getByRole("button", { name: /^(Save|Saved ✓)$/ }));
     await waitFor(() =>
@@ -2351,6 +2350,63 @@ describe("DeckBuilder", () => {
     // The copy belongs beside its source (Deck A, in folder A) — a Load of Deck B that lands
     // mid-wait must not retarget the copy's folder onto Deck B's folder.
     expect(getDeckMeta("Deck A copy")?.folderId).toBe(folderA.id);
+  });
+
+  it("a rename-Save queued ahead of a Clone still leaves the clone beside the renamed deck's folder", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "Deck A",
+      JSON.stringify({ main: [{ name: "Alpha", count: 1 }], sideboard: [], format: "Standard" }),
+    );
+    const folderA = createFolder(testSavedDeckTxn, "FA")!;
+    setDeckFolder(testSavedDeckTxn, "Deck A", folderA.id);
+
+    render(
+      <DeckBuilder
+        format="Standard"
+        onFormatChange={vi.fn()}
+        initialDeckName="Deck A"
+        searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+        onSearchFiltersChange={vi.fn()}
+        onResetSearch={vi.fn()}
+      />,
+    );
+    const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+    await waitFor(() => expect(nameInput).toHaveValue("Deck A"));
+
+    let releaseHolder!: () => void;
+    const held = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+    const holder = withSavedDeckLibrary(() => held);
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+
+    // S1: rename-Save of Deck A -> Deck A2, queued behind the held lock.
+    await user.clear(nameInput);
+    await user.type(nameInput, "Deck A2");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).pending).toHaveLength(1);
+    });
+
+    // C1: Clone, queued behind S1.
+    await user.click(screen.getByRole("button", { name: "Clone" }));
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).pending).toHaveLength(2);
+    });
+
+    releaseHolder();
+    await holder;
+
+    await waitFor(() =>
+      expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck A2 copy")).not.toBeNull(),
+    );
+    // S1 moved Deck A's metadata (including its folder) onto Deck A2 before C1's transaction
+    // ran; the clone must land in that folder, not with no folder at all.
+    expect(getDeckMeta("Deck A2 copy")?.folderId).toBe(folderA.id);
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck A copy")).toBeNull();
   });
 
   it("clones into the source's folder but starts the copy unstarred", async () => {
