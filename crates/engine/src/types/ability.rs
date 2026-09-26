@@ -10796,16 +10796,14 @@ pub enum PlayerFilter {
     /// CR 402.1 (hand) / CR 119.1 (life) / CR 122.1f (poison) / CR 404.1
     /// (graveyard): Each player satisfying `relation` whose scalar player
     /// attribute `attr`, read PER CANDIDATE PLAYER, satisfies `comparator`
-    /// against `value`. `attr` is the per-player-scalar `QuantityRef` subset
-    /// (`HandSize` / `LifeTotal` / `GraveyardSize` / `PlayerCounter`) — read
-    /// directly off the candidate `Player` at runtime, never via the
-    /// controller-scoped quantity resolver, so its embedded `PlayerScope` /
-    /// `CountScope` carries no game-state meaning here.
+    /// against `value`. `attr` uses the per-player scalar reader (which can
+    /// consult game state for team life or ledger-backed values), so its
+    /// embedded `PlayerScope` / `CountScope` does not choose another player.
     ///
     /// Covers "opponents who have N or more poison counters" (Glissa's
     /// Retriever) and "your opponents with N or more cards in hand"
-    /// (Wolfcaller's Howl). `value` is the controller-relative threshold,
-    /// resolved once per evaluation (candidate-independent).
+    /// (Wolfcaller's Howl). `value` keeps the ability controller and source,
+    /// while `ScopedPlayer` binds to each candidate during evaluation.
     ///
     /// `attr` and `value` are boxed to break the `QuantityExpr →
     /// QuantityRef::PlayerCount → PlayerFilter::PlayerAttribute →

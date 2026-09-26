@@ -575,8 +575,8 @@ pub(crate) fn matches_player_scope(
                     // whose [scalar attr] [comparator] [value]" — the candidate
                     // satisfies both `relation` and the per-candidate scalar
                     // comparison. `value` keeps the ability controller and binds
-                    // `scoped_player` to this candidate; `attr` is read directly
-                    // off the candidate.
+                    // `scoped_player` to this candidate; `attr` is read for
+                    // that candidate.
                     PlayerFilter::PlayerAttribute {
                         relation,
                         attr,

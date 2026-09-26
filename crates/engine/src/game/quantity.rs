@@ -4545,7 +4545,8 @@ fn resolve_ref(
                 - state.format_config.starting_life_total_for_player(p.id)
         }),
         // CR 103.4 + CR 904.5: the rules starting total for the referenced
-        // ability controller, including the archenemy's 40-life baseline.
+        // player or players selected by `scope`, including the archenemy's
+        // 40-life baseline.
         QuantityRef::StartingLifeTotal { player: scope } => {
             resolve_per_player_scalar(state, scope, controller, ctx, targets, ability, |p| {
                 state.format_config.starting_life_total_for_player(p.id)
