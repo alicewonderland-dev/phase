@@ -15,6 +15,7 @@ import {
 } from "../../../constants/storage";
 import type { ParsedDeck } from "../../../services/deckParser";
 import {
+  awaitSavedDeckLibraryIdle,
   installFifoWebLocks,
   resetSavedDeckLibraryForTests,
   testSavedDeckTxn,
@@ -1088,11 +1089,7 @@ describe("MyDecks", () => {
 
       release();
       await holder;
-      await vi.waitFor(async () => {
-        const q = await navigator.locks.query();
-        expect(q.held).toHaveLength(0);
-        expect(q.pending).toHaveLength(0);
-      });
+      await awaitSavedDeckLibraryIdle();
 
       expect(onSelectDeck.mock.calls).toEqual([["Mine"]]);
     });
@@ -1168,11 +1165,7 @@ describe("MyDecks", () => {
       await userEvent.keyboard("{Escape}");
       release();
       await holder;
-      await vi.waitFor(async () => {
-        const q = await navigator.locks.query();
-        expect(q.held).toHaveLength(0);
-        expect(q.pending).toHaveLength(0);
-      });
+      await awaitSavedDeckLibraryIdle();
 
       expect(onSelectDeck).not.toHaveBeenCalled();
       expect(await screen.findByText("Aggro Deck (SET)")).toBeInTheDocument();
@@ -1230,6 +1223,10 @@ describe("MyDecks", () => {
 
       releaseRandom({});
       await waitFor(() => expect(screen.getByRole("button", { name: "Random Deck" })).toBeEnabled());
+      // The button re-enables (`finally` clears `isPickingRandomDeck`) before
+      // `handleTileClick`'s own precon save settles the library lock; wait for
+      // that too, or a stale `selectionRequest` bump race goes undetected.
+      await awaitSavedDeckLibraryIdle();
 
       expect(onSelectDeck.mock.calls).toEqual([["Aggro Deck (SET)"]]);
     });
@@ -1272,11 +1269,7 @@ describe("MyDecks", () => {
       r.unmount();
       release();
       await holder;
-      await vi.waitFor(async () => {
-        const q = await navigator.locks.query();
-        expect(q.held).toHaveLength(0);
-        expect(q.pending).toHaveLength(0);
-      });
+      await awaitSavedDeckLibraryIdle();
 
       expect(onSelectDeck).not.toHaveBeenCalled();
     });
@@ -1313,11 +1306,7 @@ describe("MyDecks", () => {
       await vi.waitFor(async () => { expect((await navigator.locks.query()).pending).toHaveLength(2); });
       release();
       await holder;
-      await vi.waitFor(async () => {
-        const q = await navigator.locks.query();
-        expect(q.held).toHaveLength(0);
-        expect(q.pending).toHaveLength(0);
-      });
+      await awaitSavedDeckLibraryIdle();
 
       await vi.waitFor(() => {
         expect(listFolders().map((f) => f.name)).toContain("F");

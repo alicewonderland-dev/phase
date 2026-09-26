@@ -131,6 +131,27 @@ describe("PreconDeckModal", () => {
     expect(control.main).toEqual([{ name: "Island", count: 40 }]);
   });
 
+  it("a batch import that finishes while its modal is still open clears the whole selection and closes", async () => {
+    localStorage.setItem(STORAGE_KEY_PREFIX + "Aggro Deck (SET)", "EXISTING-AGGRO");
+    vi.stubGlobal("confirm", vi.fn(() => false));
+    vi.stubGlobal("alert", vi.fn());
+    const onImported = vi.fn();
+    const onClose = vi.fn();
+
+    render(<PreconDeckModal open onClose={onClose} onImported={onImported} />);
+    await userEvent.click(screen.getByRole("checkbox", { name: /select aggro deck/i }));
+    await userEvent.click(screen.getByRole("checkbox", { name: /select control deck/i }));
+    await userEvent.click(screen.getByRole("button", { name: /Import \d+ selected/i }));
+
+    // Aggro's overwrite was declined (kept-existing, so it never joined
+    // `importedIds`); Control saved cleanly.
+    await waitFor(() => expect(onImported).toHaveBeenCalledWith("Control Deck (SET)", "open"));
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("checkbox", { name: /select aggro deck/i })).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: /select control deck/i })).not.toBeChecked();
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Aggro Deck (SET)")).toBe("EXISTING-AGGRO");
+  });
+
   describe("closing and reopening while a save waits", () => {
     function Harness({
       onImported,
@@ -175,7 +196,7 @@ describe("PreconDeckModal", () => {
       expect(screen.getByRole("button", { name: /^Aggro Deck/ })).toBeInTheDocument();
     });
 
-    it("a batch import that finishes after the modal was closed and reopened leaves the reopened modal and its selection alone", async () => {
+    it("a batch import that finishes after the modal was closed and reopened leaves the reopened modal", async () => {
       const onImported = vi.fn();
       const onClose = vi.fn();
       let releaseHolder!: () => void;

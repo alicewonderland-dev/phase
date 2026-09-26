@@ -205,16 +205,21 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
     const session = importSession.stateOf(started);
     if (lastImported) onImported(lastImported, session);
     if (refused) return;
-    // Drop only this batch's own picks, whether or not the modal that started it
-    // is still open — a reopened modal must not show the prior batch's picks as
-    // still checked, but must keep anything the user selected since reopening.
-    setSelectedIds((cur) => {
-      const next = new Set(cur);
-      for (const id of importedIds) next.delete(id);
-      return next;
-    });
     if (session === "open") {
+      // The modal that started this batch is still the one on screen: closing
+      // it discards the whole selection, matching the pre-batch single-session
+      // behavior.
+      clearSelection();
       onClose();
+    } else {
+      // The modal was dismissed (and possibly reopened) while this batch ran.
+      // Only this batch's own picks are stale; anything selected since
+      // reopening was never part of this batch and must survive.
+      setSelectedIds((cur) => {
+        const next = new Set(cur);
+        for (const id of importedIds) next.delete(id);
+        return next;
+      });
     }
     if (skipped > 0) {
       // No toast system in this surface — a single alert keeps the user
