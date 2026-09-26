@@ -94,7 +94,7 @@ describe("PreferencesModal — import refused by a busy saved-deck library", () 
     });
     // The refusal must resolve through attemptSavedDeckWrite's `{ ok: false }`
     // path, not fall through to onImport's own catch and its inline error text.
-    expect(screen.queryByText(/File is not/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/unavailable/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/^Imported \d/i)).not.toBeInTheDocument();
 
     setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);

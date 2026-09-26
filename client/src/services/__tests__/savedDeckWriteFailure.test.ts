@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { SavedDeckLibraryBusyError } from "../savedDeckTransaction";
-import { attemptSavedDeckWrite } from "../savedDeckWriteFailure";
+import { attemptSavedDeckWrite, notifyDraftAutosaveSkipped } from "../savedDeckWriteFailure";
 import { useAppNotificationStore } from "../../stores/appToastStore";
 
 const BUSY_DESCRIPTION = "Another Phase tab is busy. Close other Phase tabs and try again.";
@@ -59,5 +59,20 @@ describe("attemptSavedDeckWrite", () => {
     const result = await attemptSavedDeckWrite("save", () => Promise.resolve("value"));
     expect(result).toEqual({ ok: true, value: "value" });
     expect(useAppNotificationStore.getState().notification).toBeNull();
+  });
+});
+
+describe("notifyDraftAutosaveSkipped", () => {
+  it("lock-unavailable stays silent", () => {
+    notifyDraftAutosaveSkipped("lock-unavailable");
+    expect(useAppNotificationStore.getState().notification).toBeNull();
+  });
+
+  it("lock-refused shows the busy toast", () => {
+    notifyDraftAutosaveSkipped("lock-refused");
+    expect(useAppNotificationStore.getState().notification).toEqual({
+      title: "Couldn't autosave your draft deck",
+      description: BUSY_DESCRIPTION,
+    });
   });
 });

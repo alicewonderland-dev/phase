@@ -1586,5 +1586,46 @@ describe("cloud sync serialization", () => {
 
       transactionSpy.mockRestore();
     });
+
+    it("a background remote apply refused while IDB is unreadable reports the storage description, not the busy one", async () => {
+      await readySignedIn();
+      useCloudSyncStore.setState({ dirty: false, lastSyncedRevision: 1 });
+      provider.pullMeta.mockResolvedValue(meta(2));
+      provider.pull.mockResolvedValue(remote(2));
+      const transactionSpy = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(() => {
+        throw new Error("IDB unavailable");
+      });
+
+      await useCloudSyncStore.getState().syncNow();
+
+      expect(mocks.applyBackup).not.toHaveBeenCalled();
+      expect(useCloudSyncStore.getState().status).toBe("error");
+      expect(useCloudSyncStore.getState().error).toBe(
+        "Phase couldn't reach browser storage. Try again in a moment.",
+      );
+
+      transactionSpy.mockRestore();
+    });
+
+    it("a merge refused while IDB is unreadable tells the user it's a storage failure, not a busy tab", async () => {
+      const merged = backup({ decks: { Merged: "{}" } });
+      await readySignedIn();
+      useCloudSyncStore.setState({ conflict: remote(3), status: "conflict" });
+      provider.pullMeta.mockResolvedValue(meta(3));
+      provider.push.mockResolvedValue(meta(4));
+      mocks.mergeDeckCollections.mockReturnValue(merged);
+      const transactionSpy = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(() => {
+        throw new Error("IDB unavailable");
+      });
+
+      await useCloudSyncStore.getState().resolveConflict("merge");
+
+      expect(mocks.applyBackup).not.toHaveBeenCalled();
+      expect(useAppNotificationStore.getState().notification?.description).toBe(
+        "Phase couldn't reach browser storage. Try again in a moment.",
+      );
+
+      transactionSpy.mockRestore();
+    });
   });
 });

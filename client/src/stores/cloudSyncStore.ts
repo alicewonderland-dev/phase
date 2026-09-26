@@ -274,9 +274,7 @@ async function applyRemote(
     useCloudSyncStore.setState({ status: "synced", error: null, dirty: false, conflict: null, conflictDiff: null, lastSyncedRevision: remote.meta.revision, lastSyncedDigest: digest, lastSyncedAt: new Date().toISOString() });
     return true;
   }, "run-unguarded");
-  // "run-unguarded" never yields "lock-unavailable" — that variant is only for the "skip"
-  // policy — so the remaining reason is always a SavedDeckTxnFailure.
-  if (result.status === "skipped") return { status: "busy", reason: result.reason as SavedDeckTxnFailure };
+  if (result.status === "skipped") return { status: "busy", reason: result.reason };
   if (!result.value) return { status: "stale" };
   void usePreferencesStore.persist.rehydrate();
   window.dispatchEvent(new CustomEvent(PROFILE_REPLACED_EVENT));
@@ -289,7 +287,7 @@ async function applyMerged(generation: Generation, auth: number, write: number, 
     withStorageWatchSuppressed(() => applyBackup(txn, backup, "overwrite"));
     return true;
   }, "run-unguarded");
-  if (result.status === "skipped") return { status: "busy", reason: result.reason as SavedDeckTxnFailure };
+  if (result.status === "skipped") return { status: "busy", reason: result.reason };
   if (!result.value) return { status: "stale" };
   void usePreferencesStore.persist.rehydrate();
   window.dispatchEvent(new CustomEvent(PROFILE_REPLACED_EVENT));

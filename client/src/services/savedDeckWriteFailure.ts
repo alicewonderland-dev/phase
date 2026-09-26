@@ -37,11 +37,11 @@ const STORAGE_FAILURE_REASONS: ReadonlySet<SavedDeckTxnFailure> = new Set([
   "generation-unpublished",
 ]);
 
-export function savedDeckLibraryBusyDescription(): string {
+function savedDeckLibraryBusyDescription(): string {
   return i18n.t("savedDeckLibraryBusy.description");
 }
 
-export function savedDeckLibraryStorageFailureDescription(): string {
+function savedDeckLibraryStorageFailureDescription(): string {
   return i18n.t("savedDeckLibraryStorageFailure.description");
 }
 
@@ -59,8 +59,8 @@ export function notifySavedDeckLibraryBusy(action: SavedDeckWriteAction, reason?
 }
 
 /** A background draft autosave (never rejects; `reason` comes from its skipped result) was not
- *  written. `"lock-unavailable"` (no Web Locks API — non-secure origins only) is silent: every
- *  submission on such an origin would otherwise toast, since there is no lock to ever acquire. */
+ *  written. `"lock-unavailable"` (no Web Locks API) is silent: every submission without the API
+ *  would otherwise toast, since there is no lock to ever acquire. */
 export function notifyDraftAutosaveSkipped(reason: SavedDeckTxnSkipReason): void {
   if (reason === "lock-unavailable") return;
   useAppNotificationStore.getState().showNotification({

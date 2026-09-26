@@ -602,8 +602,9 @@ export function useDeckBuilder({
   }, [justSaved]);
 
   const handleLoad = useCallback(async (name: string) => {
-    // Captured before the resolveCommander await below: a Load started after this one (another
-    // Load, or a Clone that switches the editor's identity) must win, not whichever finishes last.
+    // Captured before the resolveCommander await below: whatever the user did most recently to
+    // the editor while this Load awaited — a newer Load/Clone (reloaded) or any edit, including an
+    // Import, which only bumps editRevision (edited) — must win over this Load.
     const captured = captureEditor();
     const parsed = loadSavedDeck(name);
     const data = localStorage.getItem(STORAGE_KEY_PREFIX + name);
@@ -614,7 +615,8 @@ export function useDeckBuilder({
       if (!found) return;
       const [deckId, deckEntry] = found;
       const resolved = await resolveCommander(preconDeckEntryToParsedDeck(deckEntry));
-      if (editorChangedSince(captured).reloaded) return;
+      const changedAfterPrecon = editorChangedSince(captured);
+      if (changedAfterPrecon.reloaded || changedAfterPrecon.edited) return;
       applyDeckToEditor(resolved);
       setActiveSurface("deck");
       deckIdentityRevision.current += 1;
@@ -626,7 +628,8 @@ export function useDeckBuilder({
     }
     const persisted = JSON.parse(data) as ParsedDeck & { format?: string };
     const resolved = await resolveCommander(parsed);
-    if (editorChangedSince(captured).reloaded) return;
+    const changedAfterLoad = editorChangedSince(captured);
+    if (changedAfterLoad.reloaded || changedAfterLoad.edited) return;
     const savedFormat = persisted.format
       ? DECK_CONSTRUCTION_FORMATS.find(
           (metadata) => metadata.format.toLowerCase() === persisted.format!.toLowerCase(),

@@ -198,8 +198,18 @@ async function runLocked<T>(
 /**
  * Run a background write under the saved-deck library lock and the write-ahead generation
  * barrier, or skip it without running `body` if either cannot be confirmed within its bound. With
- * no lock manager, `noLockManager` decides whether `body` runs unguarded or is skipped.
+ * no lock manager, `noLockManager` decides whether `body` runs unguarded or is skipped:
+ * "run-unguarded" never yields "lock-unavailable" (that reason only arises from "skip"), so its
+ * overload narrows the skip reason to `SavedDeckTxnFailure`.
  */
+export async function withSavedDeckLibraryOrSkip<T>(
+  body: (txn: SavedDeckTxn) => T | Promise<T>,
+  noLockManager: "run-unguarded",
+): Promise<SavedDeckTxnResult<T, SavedDeckTxnFailure>>;
+export async function withSavedDeckLibraryOrSkip<T>(
+  body: (txn: SavedDeckTxn) => T | Promise<T>,
+  noLockManager: "skip",
+): Promise<SavedDeckTxnResult<T>>;
 export async function withSavedDeckLibraryOrSkip<T>(
   body: (txn: SavedDeckTxn) => T | Promise<T>,
   noLockManager: NoLockManagerPolicy,
