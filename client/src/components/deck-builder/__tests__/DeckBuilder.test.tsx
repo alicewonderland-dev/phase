@@ -17,7 +17,11 @@ import {
   writeDraftAutosaveDeck,
 } from "../../../constants/storage";
 import { useAppNotificationStore } from "../../../stores/appToastStore";
-import { setSavedDeckTxnGateForTests, withSavedDeckLibrary } from "../../../services/savedDeckTransaction";
+import {
+  setSavedDeckTxnGateForTests,
+  setSavedDeckTxnLockWaitForTests,
+  withSavedDeckLibrary,
+} from "../../../services/savedDeckTransaction";
 import {
   installFifoWebLocks,
   resetSavedDeckLibraryForTests,
@@ -351,7 +355,7 @@ describe("DeckBuilder", () => {
       }),
     );
     localStorage.setItem(ACTIVE_DECK_KEY, "Old Deck");
-    const folder = createFolder("Aggro")!;
+    const folder = createFolder(testSavedDeckTxn, "Aggro")!;
     setDeckFolder(testSavedDeckTxn, "Old Deck", folder.id);
     toggleDeckStar(testSavedDeckTxn, "Old Deck");
 
@@ -431,7 +435,7 @@ describe("DeckBuilder", () => {
         format: "Limited",
       }),
     );
-    const folder = createFolder("Drafts")!;
+    const folder = createFolder(testSavedDeckTxn, "Drafts")!;
     setDeckFolder(testSavedDeckTxn, "[Autosave] Sealed", folder.id);
 
     render(
@@ -673,6 +677,174 @@ describe("DeckBuilder", () => {
 
     afterEach(() => {
       setSavedDeckTxnGateForTests(null);
+      setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+    });
+
+    it("a manual save refused while the autosave holds the ownership transition writes nothing, stays dirty, and succeeds on retry", async () => {
+      const user = userEvent.setup();
+      await seedAutosave();
+
+      render(
+        <DeckBuilder
+          format="Limited"
+          onFormatChange={vi.fn()}
+          initialDeckName="[Autosave] Sealed"
+          searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+          onSearchFiltersChange={vi.fn()}
+          onResetSearch={vi.fn()}
+        />,
+      );
+      const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+      await waitFor(() => expect(nameInput).toHaveValue("[Autosave] Sealed"));
+
+      let reachedResolve!: () => void;
+      const reached = new Promise<void>((resolve) => {
+        reachedResolve = resolve;
+      });
+      let releaseGate!: () => void;
+      const gateHeld = new Promise<void>((resolve) => {
+        releaseGate = resolve;
+      });
+      setSavedDeckTxnGateForTests((phase) => {
+        if (phase === "draft-autosave-after-owner-selection") {
+          reachedResolve();
+          return gateHeld;
+        }
+      });
+
+      const autosave = writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", AUTOSAVE_V2);
+      await reached;
+
+      await user.click(await screen.findByRole("button", { name: "remove-Lightning Bolt" }));
+      setSavedDeckTxnLockWaitForTests(50);
+      await user.click(screen.getByRole("button", { name: "Save" }));
+
+      await vi.waitFor(() => {
+        expect(useAppNotificationStore.getState().notification).toEqual({
+          title: "Couldn't save deck",
+          description: "Another Phase tab is busy. Close other Phase tabs and try again.",
+        });
+      });
+
+      const stillHeld = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed") ?? "{}");
+      expect(stillHeld.main).toEqual([{ name: "Lightning Bolt", count: 1 }]);
+      expect(getDeckMeta("[Autosave] Sealed")?.autosaveSlot).toBe("Sealed");
+
+      await user.click(screen.getByRole("button", { name: /Menu/ }));
+      expect(await screen.findByRole("button", { name: "Discard" })).toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: "Cancel" }));
+
+      setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+      releaseGate();
+      await expect(autosave).resolves.toEqual({ status: "committed", value: "[Autosave] Sealed" });
+      const autosaved = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed") ?? "{}");
+      expect(autosaved.main).toEqual([{ name: "Mountain", count: 2 }]);
+      expect(getDeckMeta("[Autosave] Sealed")?.autosaveSlot).toBe("Sealed");
+
+      await user.click(screen.getByRole("button", { name: "Save" }));
+      await waitFor(() => {
+        const stored = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed") ?? "{}");
+        expect(stored.main).toEqual([]);
+      });
+      expect(getDeckMeta("[Autosave] Sealed")?.autosaveSlot).toBeUndefined();
+      await vi.waitFor(() => {
+        expect(useAppNotificationStore.getState().notification?.title).toBe("Deck saved");
+      });
+    });
+
+    it("Save & continue refused by a busy library keeps the dialog open and the edits in place", async () => {
+      const user = userEvent.setup();
+      localStorage.setItem(
+        STORAGE_KEY_PREFIX + "Deck A",
+        JSON.stringify({ main: [{ name: "Lightning Bolt", count: 4 }], sideboard: [], format: "Standard" }),
+      );
+      localStorage.setItem(
+        STORAGE_KEY_PREFIX + "Deck B",
+        JSON.stringify({ main: [{ name: "Counterspell", count: 4 }], sideboard: [], format: "Standard" }),
+      );
+
+      render(
+        <DeckBuilder
+          format="Standard"
+          onFormatChange={vi.fn()}
+          initialDeckName="Deck A"
+          searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+          onSearchFiltersChange={vi.fn()}
+          onResetSearch={vi.fn()}
+        />,
+      );
+      const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+      await waitFor(() => expect(nameInput).toHaveValue("Deck A"));
+      await user.click(screen.getByRole("button", { name: "remove-Lightning Bolt" }));
+
+      let releaseHolder!: () => void;
+      const held = new Promise<void>((resolve) => {
+        releaseHolder = resolve;
+      });
+      const holder = withSavedDeckLibrary(() => held);
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).held).toHaveLength(1);
+      });
+
+      setSavedDeckTxnLockWaitForTests(50);
+      await user.click(screen.getByRole("button", { name: "Load deck..." }));
+      await user.click(screen.getByRole("option", { name: "Deck B" }));
+      await user.click(screen.getByRole("button", { name: "Save & continue" }));
+
+      await vi.waitFor(() => {
+        expect(useAppNotificationStore.getState().notification?.title).toBe("Couldn't save deck");
+      });
+      expect(nameInput).toHaveValue("Deck A");
+      expect(await screen.findByRole("button", { name: "Discard" })).toBeInTheDocument();
+      const savedA = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck A") ?? "{}");
+      expect(savedA.main).toEqual([{ name: "Lightning Bolt", count: 4 }]);
+
+      setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+      releaseHolder();
+      await holder;
+    });
+
+    it("Clone refused by a busy library writes no copy and leaves the editor alone", async () => {
+      const user = userEvent.setup();
+      localStorage.setItem(
+        STORAGE_KEY_PREFIX + "Deck A",
+        JSON.stringify({ main: [{ name: "Lightning Bolt", count: 4 }], sideboard: [], format: "Standard" }),
+      );
+
+      render(
+        <DeckBuilder
+          format="Standard"
+          onFormatChange={vi.fn()}
+          initialDeckName="Deck A"
+          searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+          onSearchFiltersChange={vi.fn()}
+          onResetSearch={vi.fn()}
+        />,
+      );
+      const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+      await waitFor(() => expect(nameInput).toHaveValue("Deck A"));
+
+      let releaseHolder!: () => void;
+      const held = new Promise<void>((resolve) => {
+        releaseHolder = resolve;
+      });
+      const holder = withSavedDeckLibrary(() => held);
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).held).toHaveLength(1);
+      });
+
+      setSavedDeckTxnLockWaitForTests(50);
+      await user.click(screen.getByRole("button", { name: "Clone" }));
+
+      await vi.waitFor(() => {
+        expect(useAppNotificationStore.getState().notification?.title).toBe("Couldn't clone deck");
+      });
+      expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck A copy")).toBeNull();
+      expect(nameInput).toHaveValue("Deck A");
+
+      setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+      releaseHolder();
+      await holder;
     });
 
     async function seedAutosave() {
@@ -1019,6 +1191,251 @@ describe("DeckBuilder", () => {
     });
   });
 
+  it("a Load that lands while save-time commander inference is pending does not apply the inferred deck", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "Deck A",
+      JSON.stringify({ main: [{ name: "Alpha", count: 1 }, { name: "Beta", count: 1 }], sideboard: [], format: "Commander" }),
+    );
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "Deck B",
+      JSON.stringify({ main: [{ name: "Gamma", count: 1 }], sideboard: [], format: "Commander" }),
+    );
+
+    render(
+      <DeckBuilder
+        format="Commander"
+        onFormatChange={vi.fn()}
+        initialDeckName="Deck A"
+        searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+        onSearchFiltersChange={vi.fn()}
+        onResetSearch={vi.fn()}
+      />,
+    );
+    const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+    await waitFor(() => expect(nameInput).toHaveValue("Deck A"));
+
+    // The initial Load already called resolveCommander once; mock only the call the pending Save makes.
+    let resolveInference!: (deck: unknown) => void;
+    const deferred = new Promise((resolve) => {
+      resolveInference = resolve;
+    });
+    vi.mocked(resolveCommander).mockImplementationOnce(() => deferred as never);
+
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await vi.waitFor(() => expect(vi.mocked(resolveCommander)).toHaveBeenCalledTimes(2));
+
+    await user.click(screen.getByRole("button", { name: "Load deck..." }));
+    await user.click(screen.getByRole("option", { name: "Deck B" }));
+    await waitFor(() => expect(nameInput).toHaveValue("Deck B"));
+
+    resolveInference({
+      main: [{ name: "Beta", count: 1 }],
+      sideboard: [],
+      commander: ["Alpha"],
+    });
+
+    await waitFor(() => {
+      expect(JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck A") ?? "{}").commander).toEqual(["Alpha"]);
+    });
+    expect(screen.getByText("1 Gamma")).toBeInTheDocument();
+    expect(screen.queryByText("1 Beta")).not.toBeInTheDocument();
+    expect(nameInput).toHaveValue("Deck B");
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck B") ?? "{}").main).toEqual([
+      { name: "Gamma", count: 1 },
+    ]);
+  });
+
+  it("an edit made while save-time commander inference is pending does not apply the inferred deck", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "Deck A",
+      JSON.stringify({ main: [{ name: "Alpha", count: 1 }, { name: "Beta", count: 1 }], sideboard: [], format: "Commander" }),
+    );
+
+    render(
+      <DeckBuilder
+        format="Commander"
+        onFormatChange={vi.fn()}
+        initialDeckName="Deck A"
+        searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+        onSearchFiltersChange={vi.fn()}
+        onResetSearch={vi.fn()}
+      />,
+    );
+    const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+    await waitFor(() => expect(nameInput).toHaveValue("Deck A"));
+
+    // The initial Load already called resolveCommander once; mock only the call the pending Save makes.
+    let resolveInference!: (deck: unknown) => void;
+    const deferred = new Promise((resolve) => {
+      resolveInference = resolve;
+    });
+    vi.mocked(resolveCommander).mockImplementationOnce(() => deferred as never);
+
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await vi.waitFor(() => expect(vi.mocked(resolveCommander)).toHaveBeenCalledTimes(2));
+
+    await user.click(await screen.findByRole("button", { name: "remove-Beta" }));
+
+    resolveInference({
+      main: [{ name: "Beta", count: 1 }],
+      sideboard: [],
+      commander: ["Alpha"],
+    });
+
+    await waitFor(() => {
+      expect(JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck A") ?? "{}").commander).toEqual(["Alpha"]);
+    });
+    expect(screen.getByText("1 Alpha")).toBeInTheDocument();
+    expect(screen.queryByText("1 Beta")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /Menu/ }));
+    expect(await screen.findByRole("button", { name: "Discard" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+  });
+
+  it("with neither a Load nor an edit pending, the inferred deck is applied to the editor", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "Deck A",
+      JSON.stringify({ main: [{ name: "Alpha", count: 1 }, { name: "Beta", count: 1 }], sideboard: [], format: "Commander" }),
+    );
+    render(
+      <DeckBuilder
+        format="Commander"
+        onFormatChange={vi.fn()}
+        initialDeckName="Deck A"
+        searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+        onSearchFiltersChange={vi.fn()}
+        onResetSearch={vi.fn()}
+      />,
+    );
+    const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+    await waitFor(() => expect(nameInput).toHaveValue("Deck A"));
+
+    // The initial Load already called resolveCommander once; mock only the call the Save makes.
+    vi.mocked(resolveCommander).mockImplementationOnce(async () => ({
+      main: [{ name: "Beta", count: 1 }],
+      sideboard: [],
+      commander: ["Alpha"],
+    }));
+
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("1 Beta")).toBeInTheDocument();
+      expect(screen.queryByText("1 Alpha")).not.toBeInTheDocument();
+    });
+  });
+
+  it("a Load during a pending Clone leaves the clone under its own name and the editor on the loaded deck", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "Deck A",
+      JSON.stringify({ main: [{ name: "Alpha", count: 1 }, { name: "Beta", count: 1 }], sideboard: [], format: "Standard" }),
+    );
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "Deck B",
+      JSON.stringify({ main: [{ name: "Gamma", count: 1 }], sideboard: [], format: "Standard" }),
+    );
+
+    render(
+      <DeckBuilder
+        format="Standard"
+        onFormatChange={vi.fn()}
+        initialDeckName="Deck A"
+        searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+        onSearchFiltersChange={vi.fn()}
+        onResetSearch={vi.fn()}
+      />,
+    );
+    const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+    await waitFor(() => expect(nameInput).toHaveValue("Deck A"));
+
+    let releaseHolder!: () => void;
+    const held = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+    const holder = withSavedDeckLibrary(() => held);
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+
+    await user.click(screen.getByRole("button", { name: "Clone" }));
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).pending).toHaveLength(1);
+    });
+
+    await user.click(screen.getByRole("button", { name: "Load deck..." }));
+    await user.click(screen.getByRole("option", { name: "Deck B" }));
+    await waitFor(() => expect(nameInput).toHaveValue("Deck B"));
+
+    releaseHolder();
+    await holder;
+
+    await waitFor(() => {
+      expect(JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck A copy") ?? "{}").main).toEqual([
+        { name: "Alpha", count: 1 },
+        { name: "Beta", count: 1 },
+      ]);
+    });
+    expect(nameInput).toHaveValue("Deck B");
+    expect(screen.getByText("1 Gamma")).toBeInTheDocument();
+    expect(useAppNotificationStore.getState().notification?.title).toBe("Deck cloned");
+  });
+
+  it("an edit during a pending Clone keeps the deck dirty and leaves the clone under its own name", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "Deck A",
+      JSON.stringify({ main: [{ name: "Alpha", count: 1 }, { name: "Beta", count: 1 }], sideboard: [], format: "Standard" }),
+    );
+
+    render(
+      <DeckBuilder
+        format="Standard"
+        onFormatChange={vi.fn()}
+        initialDeckName="Deck A"
+        searchFilters={{ text: "", colors: [], type: "", sets: [], browseFormat: "all" }}
+        onSearchFiltersChange={vi.fn()}
+        onResetSearch={vi.fn()}
+      />,
+    );
+    const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
+    await waitFor(() => expect(nameInput).toHaveValue("Deck A"));
+
+    let releaseHolder!: () => void;
+    const held = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+    const holder = withSavedDeckLibrary(() => held);
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+
+    await user.click(screen.getByRole("button", { name: "Clone" }));
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).pending).toHaveLength(1);
+    });
+
+    await user.click(await screen.findByRole("button", { name: "remove-Beta" }));
+
+    releaseHolder();
+    await holder;
+
+    await waitFor(() => {
+      expect(JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Deck A copy") ?? "{}").main).toEqual([
+        { name: "Alpha", count: 1 },
+        { name: "Beta", count: 1 },
+      ]);
+    });
+    expect(nameInput).toHaveValue("Deck A");
+    await user.click(screen.getByRole("button", { name: /Menu/ }));
+    expect(await screen.findByRole("button", { name: "Discard" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(useAppNotificationStore.getState().notification?.title).toBe("Deck cloned");
+  });
+
   it("clones into the source's folder but starts the copy unstarred", async () => {
     const user = userEvent.setup();
     localStorage.setItem(
@@ -1029,7 +1446,7 @@ describe("DeckBuilder", () => {
         format: "Standard",
       }),
     );
-    const folder = createFolder("Commander")!;
+    const folder = createFolder(testSavedDeckTxn, "Commander")!;
     setDeckFolder(testSavedDeckTxn, "My Deck", folder.id);
     toggleDeckStar(testSavedDeckTxn, "My Deck");
 

@@ -5,6 +5,7 @@ import {
   createFolder,
   deleteFolder,
   DRAFT_WORKSPACE_PREFERENCES_KEY,
+  freeDeckName,
   getDeckMeta,
   isUserOwnedStorageKey,
   listFolders,
@@ -216,8 +217,8 @@ describe("saved-deck bracket sidecar", () => {
 
 describe("folder registry", () => {
   it("createFolder appends with an incrementing order and returns the folder", () => {
-    const a = createFolder("Control");
-    const b = createFolder("Aggro");
+    const a = createFolder(testSavedDeckTxn, "Control");
+    const b = createFolder(testSavedDeckTxn, "Aggro");
     expect(a).not.toBeNull();
     expect(a?.name).toBe("Control");
     expect(a?.order).toBe(0);
@@ -227,14 +228,14 @@ describe("folder registry", () => {
   });
 
   it("createFolder trims, caps length, and rejects blank names", () => {
-    expect(createFolder("   ")).toBeNull();
-    const folder = createFolder(`  ${"x".repeat(60)}  `);
+    expect(createFolder(testSavedDeckTxn, "   ")).toBeNull();
+    const folder = createFolder(testSavedDeckTxn, `  ${"x".repeat(60)}  `);
     expect(folder?.name).toHaveLength(40);
   });
 
   it("listFolders sorts by order then name", () => {
-    createFolder("Zed"); // order 0
-    createFolder("Alpha"); // order 1
+    createFolder(testSavedDeckTxn, "Zed"); // order 0
+    createFolder(testSavedDeckTxn, "Alpha"); // order 1
     // Same order value sorts by name as a tiebreak.
     localStorage.setItem(
       "phase-deck-folders",
@@ -247,17 +248,17 @@ describe("folder registry", () => {
   });
 
   it("renameFolder updates the name and ignores unknown ids / blanks", () => {
-    const folder = createFolder("Old")!;
-    renameFolder(folder.id, "New");
+    const folder = createFolder(testSavedDeckTxn, "Old")!;
+    renameFolder(testSavedDeckTxn, folder.id, "New");
     expect(listFolders()[0].name).toBe("New");
-    renameFolder(folder.id, "  ");
+    renameFolder(testSavedDeckTxn, folder.id, "  ");
     expect(listFolders()[0].name).toBe("New");
-    renameFolder("nonexistent", "Ghost");
+    renameFolder(testSavedDeckTxn, "nonexistent", "Ghost");
     expect(listFolders()).toHaveLength(1);
   });
 
   it("deleteFolder removes the folder and reassigns its decks to Unfiled", () => {
-    const folder = createFolder("Brews")!;
+    const folder = createFolder(testSavedDeckTxn, "Brews")!;
     stampDeckMeta(testSavedDeckTxn, "Deck A");
     setDeckFolder(testSavedDeckTxn, "Deck A", folder.id);
     expect(getDeckMeta("Deck A")?.folderId).toBe(folder.id);
@@ -272,7 +273,7 @@ describe("folder registry", () => {
 
 describe("deck membership + stars", () => {
   it("setDeckFolder assigns and clears membership", () => {
-    const folder = createFolder("Commander")!;
+    const folder = createFolder(testSavedDeckTxn, "Commander")!;
     stampDeckMeta(testSavedDeckTxn, "Atraxa");
     setDeckFolder(testSavedDeckTxn, "Atraxa", folder.id);
     expect(getDeckMeta("Atraxa")?.folderId).toBe(folder.id);
@@ -281,7 +282,7 @@ describe("deck membership + stars", () => {
   });
 
   it("setDeckFolder seeds metadata for a deck that was never stamped", () => {
-    const folder = createFolder("Imported")!;
+    const folder = createFolder(testSavedDeckTxn, "Imported")!;
     setDeckFolder(testSavedDeckTxn, "Fresh Import", folder.id);
     const meta = getDeckMeta("Fresh Import");
     expect(meta?.folderId).toBe(folder.id);
@@ -299,7 +300,7 @@ describe("deck membership + stars", () => {
 
 describe("metadata migration on rename", () => {
   it("migrateDeckMeta carries folder, star, and timestamps to the new name", () => {
-    const folder = createFolder("Modern")!;
+    const folder = createFolder(testSavedDeckTxn, "Modern")!;
     stampDeckMeta(testSavedDeckTxn, "Old Name", 1000);
     setDeckFolder(testSavedDeckTxn, "Old Name", folder.id);
     toggleDeckStar(testSavedDeckTxn, "Old Name");
@@ -330,7 +331,7 @@ describe("metadata migration on rename", () => {
 
 describe("touchDeckPlayed preserves organization", () => {
   it("keeps folderId and starred when stamping lastPlayedAt", () => {
-    const folder = createFolder("Pauper")!;
+    const folder = createFolder(testSavedDeckTxn, "Pauper")!;
     stampDeckMeta(testSavedDeckTxn, "Affinity");
     setDeckFolder(testSavedDeckTxn, "Affinity", folder.id);
     toggleDeckStar(testSavedDeckTxn, "Affinity");
@@ -349,6 +350,19 @@ describe("uniqueDeckName", () => {
     expect(uniqueDeckName("X", ["X"])).toBe("X 2");
     expect(uniqueDeckName("X", ["X"], (i) => `X (${i})`)).toBe("X (2)");
     expect(uniqueDeckName("Fresh", [])).toBe("Fresh");
+  });
+});
+
+describe("freeDeckName", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it("skips names already in the library", () => {
+    localStorage.setItem(STORAGE_KEY_PREFIX + "X", "{}");
+    localStorage.setItem(STORAGE_KEY_PREFIX + "X 2", "{}");
+    expect(freeDeckName(testSavedDeckTxn, "X")).toBe("X 3");
+    expect(freeDeckName(testSavedDeckTxn, "X", (i) => `X (${i})`)).toBe("X (2)");
   });
 });
 
@@ -374,7 +388,7 @@ describe("draft autosave ownership", () => {
     expect(localStorage.getItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed")).toBeNull();
   });
 
-  it("on a lock-wait timeout, a manual save proceeds unguarded and an autosave skips", async () => {
+  it("on a lock-wait timeout, a manual save rejects and writes nothing, and an autosave skips", async () => {
     setSavedDeckTxnLockWaitForTests(null);
     vi.useFakeTimers();
     let releaseHolder!: () => void;
@@ -388,18 +402,19 @@ describe("draft autosave ownership", () => {
       });
 
       let manualSettled = false;
-      const manual = saveBuilderDeck(null, "Mine", "manual-data").then((v) => {
+      const manual = saveBuilderDeck(null, "Mine", "manual-data").catch((error) => {
         manualSettled = true;
-        return v;
+        throw error;
       });
+      manual.catch(() => {}); // avoid an unhandled-rejection window before the assertion below attaches
       await vi.waitFor(async () => {
         expect((await navigator.locks.query()).pending).toHaveLength(1);
       });
       await vi.advanceTimersByTimeAsync(LOCK_WAIT_TIMEOUT_MS);
-      await manual;
+      await expect(manual).rejects.toMatchObject({ reason: "lock-timeout" });
       await vi.waitFor(() => expect(manualSettled).toBe(true));
-      expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Mine")).toBe("manual-data");
-      expect(getDeckMeta("Mine")).toBeDefined();
+      expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Mine")).toBeNull();
+      expect(getDeckMeta("Mine")).toBeNull();
 
       let autosaveSettled: SavedDeckTxnResult<string> | undefined;
       const autosave = writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", "autosave-data").then((r) => {
@@ -466,7 +481,7 @@ describe("draft autosave ownership", () => {
 
   it("moves a marked deck to the freed label, carrying folder, star, and the active pointer", async () => {
     localStorage.setItem(STORAGE_KEY_PREFIX + "[Autosave] Sealed (2)", "data-1");
-    const folder = createFolder("Drafts")!;
+    const folder = createFolder(testSavedDeckTxn, "Drafts")!;
     const store = JSON.parse(localStorage.getItem("phase-deck-metadata") ?? "{}");
     store["[Autosave] Sealed (2)"] = { addedAt: 1, autosaveSlot: "Sealed", folderId: folder.id, starred: true };
     localStorage.setItem("phase-deck-metadata", JSON.stringify(store));
@@ -517,7 +532,7 @@ describe("draft autosave ownership", () => {
 
   it("stamping a marked deck clears only the marker", async () => {
     await writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", "data-1");
-    const folder = createFolder("Kept")!;
+    const folder = createFolder(testSavedDeckTxn, "Kept")!;
     setDeckFolder(testSavedDeckTxn, "[Autosave] Sealed", folder.id);
 
     stampDeckMeta(testSavedDeckTxn, "[Autosave] Sealed");
@@ -529,7 +544,7 @@ describe("draft autosave ownership", () => {
 
   it("play, folder, and star mutations keep the marker", async () => {
     await writeDraftAutosaveDeck("Sealed", "[Autosave] Sealed", "data-1");
-    const folder = createFolder("Kept")!;
+    const folder = createFolder(testSavedDeckTxn, "Kept")!;
 
     touchDeckPlayed(testSavedDeckTxn, "[Autosave] Sealed");
     setDeckFolder(testSavedDeckTxn, "[Autosave] Sealed", folder.id);

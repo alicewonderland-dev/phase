@@ -12,7 +12,14 @@ import {
   STORAGE_KEY_PREFIX,
 } from "../../../constants/storage";
 import type { ParsedDeck } from "../../../services/deckParser";
-import { testSavedDeckTxn } from "../../../test/helpers/webLocks";
+import {
+  installFifoWebLocks,
+  resetSavedDeckLibraryForTests,
+  testSavedDeckTxn,
+  uninstallWebLocks,
+} from "../../../test/helpers/webLocks";
+import { setSavedDeckTxnLockWaitForTests, withSavedDeckLibrary } from "../../../services/savedDeckTransaction";
+import { useAppNotificationStore } from "../../../stores/appToastStore";
 import { evaluateDeckCompatibilityBatch } from "../../../services/deckCompatibility";
 import { setCachedFeed } from "../../../services/feedPersistence";
 import { loadPreconDeckMap } from "../../../hooks/useDecks";
@@ -370,7 +377,7 @@ describe("MyDecks", () => {
       main: [{ name: "Island", count: 60 }],
       sideboard: [],
     });
-    const folder = createFolder("Archive");
+    const folder = createFolder(testSavedDeckTxn, "Archive");
     expect(folder).not.toBeNull();
     setDeckFolder(testSavedDeckTxn, "Filed Deck", folder!.id);
     vi.mocked(evaluateDeckCompatibilityBatch).mockResolvedValue({});
@@ -563,6 +570,70 @@ describe("MyDecks", () => {
     expect(onSelectDeck).toHaveBeenCalledWith("[Pre-built] Secrets of Strixhaven (SOS)");
     expect(localStorage.getItem(`${STORAGE_KEY_PREFIX}[Pre-built] Secrets of Strixhaven (SOS)`)).toBeTruthy();
     expect(loadPreconDeckMap).toHaveBeenCalled();
+  });
+
+  it("selecting a precon refused by a busy library shows the busy toast and does not select the deck", async () => {
+    vi.mocked(loadPreconDeckMap).mockResolvedValue({
+      secrets: {
+        code: "SOS",
+        name: "Secrets of Strixhaven",
+        type: "Commander Deck",
+        releaseDate: "2026-02-01",
+        coveragePct: 100,
+        mainBoard: [{ name: "Island", count: 99 }],
+        sideBoard: [],
+        commander: [{ name: "Zimone, Mystery Unraveler", count: 1 }],
+      },
+    });
+    vi.mocked(evaluateDeckCompatibilityBatch).mockImplementation(async (decks) => {
+      return Object.fromEntries(decks.map(({ name }) => [name, {
+        standard: { compatible: false, reasons: [] },
+        commander: { compatible: true, reasons: [] },
+        bo3_ready: false,
+        unknown_cards: [],
+        selected_format_compatible: true,
+        selected_format_reasons: [],
+        color_identity: ["U"],
+        color_distribution: [],
+      }]));
+    });
+    const onSelectDeck = vi.fn();
+
+    installFifoWebLocks();
+    await resetSavedDeckLibraryForTests();
+    useAppNotificationStore.setState({ notification: null, expiresAt: 0 });
+
+    render(
+      <MyDecks
+        mode="select"
+        selectedFormat="Commander"
+        activeDeckName={null}
+        onSelectDeck={onSelectDeck}
+      />,
+    );
+    expect(await screen.findByText("Secrets of Strixhaven (SOS)")).toBeInTheDocument();
+
+    let releaseHolder!: () => void;
+    const held = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+    const holder = withSavedDeckLibrary(() => held);
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+
+    setSavedDeckTxnLockWaitForTests(20);
+    await userEvent.click(screen.getByText("Secrets of Strixhaven (SOS)"));
+
+    await vi.waitFor(() => {
+      expect(useAppNotificationStore.getState().notification?.title).toBe("Couldn't save deck");
+    });
+    expect(onSelectDeck).not.toHaveBeenCalled();
+
+    setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+    releaseHolder();
+    await holder;
+    uninstallWebLocks();
   });
 
   it("does not fall through to saved-deck art for a basic-only precon override", async () => {

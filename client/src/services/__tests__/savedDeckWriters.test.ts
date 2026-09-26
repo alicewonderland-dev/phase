@@ -7,7 +7,8 @@ import { adoptFeedDeck, unsubscribe } from "../feedService";
 import { importBackupFromFile, type PhaseBackupV1 } from "../backup";
 import { saveBuilderDeck } from "../../constants/storage";
 import { useDeckFolders } from "../../hooks/useDeckFolders";
-import { withSavedDeckLibrary } from "../savedDeckTransaction";
+import { setSavedDeckTxnLockWaitForTests, withSavedDeckLibrary } from "../savedDeckTransaction";
+import { useAppNotificationStore } from "../../stores/appToastStore";
 import {
   installFifoWebLocks,
   resetSavedDeckLibraryForTests,
@@ -67,7 +68,7 @@ describe("savedDeckWriters: each takes the saved-deck library lock", () => {
       sideBoard: [],
       commander: undefined,
     };
-    const call = savePreconDeck("Precon Deck", precon);
+    const call = savePreconDeck("Precon Deck", precon, "replace");
     expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Precon Deck")).toBeNull();
     await waitPendingThenRelease(release, holder);
     await call;
@@ -151,5 +152,140 @@ describe("savedDeckWriters: each takes the saved-deck library lock", () => {
       await call;
     });
     expect(JSON.parse(localStorage.getItem(DECK_METADATA_KEY) ?? "{}")["Starrable Deck"]?.starred).toBe(true);
+  });
+});
+
+describe("refused on a lock-wait timeout", () => {
+  beforeEach(() => {
+    setSavedDeckTxnLockWaitForTests(20);
+  });
+  afterEach(() => {
+    setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+  });
+
+  it("savePreconDeck rejects with lock-timeout and writes nothing", async () => {
+    const { release, holder } = await heldLock();
+    const precon: DeckEntry = {
+      name: "Precon", code: "SET", type: "Commander Deck", coveragePct: 100,
+      mainBoard: [{ name: "Forest", count: 40 }], sideBoard: [], commander: undefined,
+    };
+    const before = localStorage.getItem(STORAGE_KEY_PREFIX + "Precon Deck");
+    const call = savePreconDeck("Precon Deck", precon, "replace");
+    await expect(call).rejects.toMatchObject({ reason: "lock-timeout" });
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Precon Deck")).toBe(before);
+    release();
+    await holder;
+  });
+
+  it("adoptFeedDeck rejects with lock-timeout and writes nothing", async () => {
+    localStorage.setItem(
+      STORAGE_KEY_PREFIX + "Feed Deck",
+      JSON.stringify({ main: [{ name: "Bear", count: 1 }], sideboard: [] }),
+    );
+    const { release, holder } = await heldLock();
+    const before = localStorage.getItem(STORAGE_KEY_PREFIX + "Adopted Deck");
+    const call = adoptFeedDeck("Feed Deck", "Adopted Deck");
+    await expect(call).rejects.toMatchObject({ reason: "lock-timeout" });
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Adopted Deck")).toBe(before);
+    release();
+    await holder;
+  });
+
+  it("unsubscribe rejects with lock-timeout and writes nothing", async () => {
+    localStorage.setItem(FEED_DECK_ORIGINS_KEY, JSON.stringify({ "Feed Deck": "feed-1" }));
+    localStorage.setItem(STORAGE_KEY_PREFIX + "Feed Deck", JSON.stringify({ main: [], sideboard: [] }));
+    const { release, holder } = await heldLock();
+    const before = localStorage.getItem(STORAGE_KEY_PREFIX + "Feed Deck");
+    const call = unsubscribe("feed-1");
+    await expect(call).rejects.toMatchObject({ reason: "lock-timeout" });
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Feed Deck")).toBe(before);
+    release();
+    await holder;
+  });
+
+  it("importBackupFromFile rejects with lock-timeout and writes nothing", async () => {
+    const backup: PhaseBackupV1 = {
+      version: 1,
+      exportedAt: new Date(0).toISOString(),
+      preferences: null,
+      decks: { "Imported Deck": JSON.stringify({ main: [], sideboard: [] }) },
+      deckMetadata: null,
+      activeDeck: null,
+      feedSubscriptions: null,
+      feedDeckOrigins: null,
+    };
+    const file = new File([JSON.stringify(backup)], "phase-backup.json", { type: "application/json" });
+    const { release, holder } = await heldLock();
+    const before = localStorage.getItem(STORAGE_KEY_PREFIX + "Imported Deck");
+    const call = importBackupFromFile(file, "merge");
+    await expect(call).rejects.toMatchObject({ reason: "lock-timeout" });
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Imported Deck")).toBe(before);
+    release();
+    await holder;
+  });
+
+  it("saveBuilderDeck rejects with lock-timeout and writes nothing", async () => {
+    const { release, holder } = await heldLock();
+    const before = localStorage.getItem(STORAGE_KEY_PREFIX + "Built Deck");
+    const call = saveBuilderDeck(null, "Built Deck", JSON.stringify({ main: [], sideboard: [] }));
+    await expect(call).rejects.toMatchObject({ reason: "lock-timeout" });
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Built Deck")).toBe(before);
+    release();
+    await holder;
+  });
+
+  it("useDeckFolders().toggleStar resolves false, leaves the star unchanged, and shows the busy toast", async () => {
+    localStorage.setItem(STORAGE_KEY_PREFIX + "Starrable Deck", JSON.stringify({ main: [], sideboard: [] }));
+    useAppNotificationStore.setState({ notification: null, expiresAt: 0 });
+    const { result } = renderHook(() => useDeckFolders());
+    const { release, holder } = await heldLock();
+    let call!: Promise<boolean>;
+    act(() => {
+      call = result.current.toggleStar("Starrable Deck");
+    });
+    await act(async () => {
+      expect(await call).toBe(false);
+    });
+    expect(JSON.parse(localStorage.getItem(DECK_METADATA_KEY) ?? "{}")["Starrable Deck"]?.starred).toBeFalsy();
+    expect(useAppNotificationStore.getState().notification?.title).toBe("Couldn't update deck organization");
+    release();
+    await holder;
+  });
+});
+
+describe("precon overwrite consent inside the transaction", () => {
+  const precon: DeckEntry = {
+    name: "Precon", code: "SET", type: "Commander Deck", coveragePct: 100,
+    mainBoard: [{ name: "Forest", count: 40 }], sideBoard: [], commander: undefined,
+  };
+
+  it("\"keep\" leaves a deck written by the lock's holder untouched", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const holder = withSavedDeckLibrary((txn) => {
+      void txn;
+      localStorage.setItem(STORAGE_KEY_PREFIX + "P", "HOLDER-DATA");
+      return held;
+    });
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+    const savedCall = savePreconDeck("P", precon, "keep");
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).pending).toHaveLength(1);
+    });
+    release();
+    await holder;
+    await expect(savedCall).resolves.toBe("kept-existing");
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "P")).toBe("HOLDER-DATA");
+  });
+
+  it("\"replace\" overwrites the existing deck (paired positive)", async () => {
+    localStorage.setItem(STORAGE_KEY_PREFIX + "P", "HOLDER-DATA");
+    await expect(savePreconDeck("P", precon, "replace")).resolves.toBe("saved");
+    const persisted = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "P") ?? "{}");
+    expect(persisted.main).toEqual([{ name: "Forest", count: 40 }]);
   });
 });

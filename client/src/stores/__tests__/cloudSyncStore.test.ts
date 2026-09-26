@@ -41,7 +41,8 @@ vi.mock("../connectivityStore", () => ({
 
 import { adoptCloudSyncHmrState, disposeCloudSyncModuleForTest, useCloudSyncStore } from "../cloudSyncStore";
 import { SyncConflictError } from "../../services/cloudSync";
-import { withSavedDeckLibrary } from "../../services/savedDeckTransaction";
+import { setSavedDeckTxnLockWaitForTests, withSavedDeckLibrary } from "../../services/savedDeckTransaction";
+import { useAppNotificationStore } from "../appToastStore";
 import {
   installFifoWebLocks,
   resetSavedDeckLibraryForTests,
@@ -1476,6 +1477,94 @@ describe("cloud sync serialization", () => {
 
       expect(mocks.applyBackup).toHaveBeenCalledWith(expect.anything(), merged, "overwrite");
       expect(useCloudSyncStore.getState()).toMatchObject({ status: "synced", lastSyncedRevision: 4 });
+    });
+
+    it("a background remote apply refused by a busy library reports an error and writes nothing", async () => {
+      await readySignedIn();
+      useCloudSyncStore.setState({ dirty: false, lastSyncedRevision: 1 });
+      provider.pullMeta.mockResolvedValue(meta(2));
+      provider.pull.mockResolvedValue(remote(2));
+
+      setSavedDeckTxnLockWaitForTests(20);
+      let releaseHolder!: () => void;
+      const held = new Promise<void>((resolve) => {
+        releaseHolder = resolve;
+      });
+      const holder = withSavedDeckLibrary(() => held);
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).held).toHaveLength(1);
+      });
+
+      await useCloudSyncStore.getState().syncNow();
+
+      expect(mocks.applyBackup).not.toHaveBeenCalled();
+      expect(useCloudSyncStore.getState().status).toBe("error");
+      expect(useCloudSyncStore.getState().error).toBe(
+        "Another Phase tab is busy. Close other Phase tabs and try again.",
+      );
+
+      setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+      releaseHolder();
+      await holder;
+    });
+
+    it("choosing the cloud copy while the library is busy keeps the conflict and tells the user", async () => {
+      await readySignedIn();
+      useCloudSyncStore.setState({ conflict: remote(2), status: "conflict" });
+      provider.pullMeta.mockResolvedValue(meta(2));
+      provider.pull.mockResolvedValue(remote(2));
+
+      setSavedDeckTxnLockWaitForTests(20);
+      let releaseHolder!: () => void;
+      const held = new Promise<void>((resolve) => {
+        releaseHolder = resolve;
+      });
+      const holder = withSavedDeckLibrary(() => held);
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).held).toHaveLength(1);
+      });
+
+      await useCloudSyncStore.getState().resolveConflict("cloud");
+
+      expect(mocks.applyBackup).not.toHaveBeenCalled();
+      expect(useCloudSyncStore.getState().conflict).not.toBeNull();
+      expect(useAppNotificationStore.getState().notification?.title).toBe("Couldn't apply cloud decks");
+
+      setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+      releaseHolder();
+      await holder;
+    });
+
+    it("a merge refused by a busy library re-publishes the merged conflict", async () => {
+      const merged = backup({ decks: { Merged: "{}" } });
+      await readySignedIn();
+      useCloudSyncStore.setState({ conflict: remote(3), status: "conflict" });
+      provider.pullMeta.mockResolvedValue(meta(3));
+      provider.push.mockResolvedValue(meta(4));
+      mocks.mergeDeckCollections.mockReturnValue(merged);
+
+      setSavedDeckTxnLockWaitForTests(20);
+      let releaseHolder!: () => void;
+      const held = new Promise<void>((resolve) => {
+        releaseHolder = resolve;
+      });
+      const holder = withSavedDeckLibrary(() => held);
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).held).toHaveLength(1);
+      });
+
+      await useCloudSyncStore.getState().resolveConflict("merge");
+
+      expect(mocks.applyBackup).not.toHaveBeenCalled();
+      expect(useCloudSyncStore.getState()).toMatchObject({
+        status: "conflict",
+        conflict: { backup: merged, meta: meta(4) },
+      });
+      expect(useAppNotificationStore.getState().notification?.title).toBe("Couldn't apply cloud decks");
+
+      setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+      releaseHolder();
+      await holder;
     });
   });
 });

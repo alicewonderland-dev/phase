@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("idb-keyval", () => {
   const db = new Map<string, unknown>();
@@ -46,6 +46,12 @@ import { set as idbSet, entries as idbEntries } from "idb-keyval";
 import { useConnectivityStore } from "../../stores/connectivityStore";
 import { FEED_REGISTRY } from "../../data/feedRegistry";
 import type { FeedSubscription } from "../../types/feed";
+import {
+  SavedDeckLibraryBusyError,
+  setSavedDeckTxnLockWaitForTests,
+  withSavedDeckLibrary,
+} from "../savedDeckTransaction";
+import { installFifoWebLocks, uninstallWebLocks } from "../../test/helpers/webLocks";
 
 const STARTER_FEED = {
   id: "starter-decks",
@@ -718,6 +724,76 @@ describe("refreshFeed", () => {
 
     const subs = listSubscriptions();
     expect(subs[0].error).toBeTruthy();
+  });
+});
+
+describe("cross-tab saved-deck transactions", () => {
+  beforeEach(() => {
+    installFifoWebLocks();
+  });
+  afterEach(() => {
+    uninstallWebLocks();
+  });
+
+  async function heldLock(): Promise<{ release: () => void; holder: Promise<void> }> {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const holder = withSavedDeckLibrary(() => held);
+    await vi.waitFor(async () => {
+      expect((await navigator.locks.query()).held).toHaveLength(1);
+    });
+    return { release, holder };
+  }
+
+  it("refreshFeed refused by a busy library does not record a feed error", async () => {
+    mockFetch(VALID_FEED);
+    await subscribe("https://example.com/feed.json");
+
+    setSavedDeckTxnLockWaitForTests(20);
+    const { release, holder } = await heldLock();
+    await expect(refreshFeed("test-feed")).rejects.toBeInstanceOf(SavedDeckLibraryBusyError);
+    expect(listSubscriptions()[0].error).toBeUndefined();
+    setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+    release();
+    await holder;
+  });
+
+  it("refreshAllFeeds stops at a busy library", async () => {
+    mockFetch(VALID_FEED);
+    await subscribe("https://example.com/feed.json");
+    mockFetch(makeMtgGoldfishFeed("second-feed", "Modern"));
+    await subscribe("https://example.com/second-feed.json");
+
+    const fetchSpy = vi.spyOn(global, "fetch");
+    fetchSpy.mockClear();
+    setSavedDeckTxnLockWaitForTests(20);
+    const { release, holder } = await heldLock();
+    await expect(refreshAllFeeds()).rejects.toBeInstanceOf(SavedDeckLibraryBusyError);
+    // Only the first subscription's fetch (from refreshFeed, before the busy rejection) ran.
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+    release();
+    await holder;
+  });
+
+  it("initializeFeeds skips a busy library and syncs on its next run", async () => {
+    mockFetch(VALID_FEED);
+    await subscribe("https://example.com/feed.json");
+    localStorage.removeItem(STORAGE_KEY_PREFIX + "Test Deck");
+    localStorage.removeItem(STORAGE_KEY_PREFIX + "Another Deck");
+
+    setSavedDeckTxnLockWaitForTests(20);
+    const { release, holder } = await heldLock();
+    await initializeFeeds({ allowRefresh: false });
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Test Deck")).toBeNull();
+    setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+    release();
+    await holder;
+
+    await initializeFeeds({ allowRefresh: false });
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Test Deck")).not.toBeNull();
   });
 });
 

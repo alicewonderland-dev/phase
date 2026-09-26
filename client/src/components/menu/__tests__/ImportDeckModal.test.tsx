@@ -1,15 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
-import { STORAGE_KEY_PREFIX } from "../../../constants/storage";
+import { STORAGE_KEY_PREFIX, listSavedDeckNames, writeSavedDeckData } from "../../../constants/storage";
 import {
   isCardCommanderEligible,
   isCardCommanderEligibleForFormat,
   signatureSpellSelectionPolicy,
 } from "../../../services/engineRuntime";
+import { setSavedDeckTxnLockWaitForTests, withSavedDeckLibrary } from "../../../services/savedDeckTransaction";
 import { useAppNotificationStore } from "../../../stores/appToastStore";
 import { useConnectivityStore } from "../../../stores/connectivityStore";
+import {
+  installFifoWebLocks,
+  resetSavedDeckLibraryForTests,
+  uninstallWebLocks,
+} from "../../../test/helpers/webLocks";
 import { ImportDeckModal } from "../ImportDeckModal";
 
 const mocks = vi.hoisted(() => ({
@@ -211,6 +217,82 @@ Deck
       commander: ["Daretti, Ingenious Iconoclast"],
       signature_spell: ["Scheming Symmetry"],
       format: "Oathbreaker",
+    });
+  });
+
+  describe("cross-tab saved-deck transactions", () => {
+    beforeEach(async () => {
+      installFifoWebLocks();
+      await resetSavedDeckLibraryForTests();
+    });
+
+    afterEach(() => {
+      uninstallWebLocks();
+      setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+    });
+
+    it("a deck another writer creates under the chosen name while the import waits is not overwritten", async () => {
+      const user = userEvent.setup();
+      const onImported = vi.fn();
+      let releaseHeld!: () => void;
+      const held = new Promise<void>((resolve) => {
+        releaseHeld = resolve;
+      });
+      const holder = withSavedDeckLibrary(async (txn) => {
+        await held;
+        writeSavedDeckData(txn, "Probe Deck", "OTHER-TAB");
+      });
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).held).toHaveLength(1);
+      });
+
+      render(<ImportDeckModal open onClose={vi.fn()} onImported={onImported} />);
+      await user.type(
+        screen.getByPlaceholderText(/Paste deck list here/i),
+        "About\nName Probe Deck\n\nDeck\n1x Abrade (VOW) 139",
+      );
+      await user.click(screen.getByRole("button", { name: "Import" }));
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).pending).toHaveLength(1);
+      });
+      releaseHeld();
+      await holder;
+
+      await waitFor(() => expect(onImported).toHaveBeenCalledWith("Probe Deck 2", ["Probe Deck", "Probe Deck 2"]));
+      expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Probe Deck")).toBe("OTHER-TAB");
+      expect(JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Probe Deck 2") ?? "{}").main).toEqual(
+        expect.arrayContaining([expect.objectContaining({ name: "Abrade" })]),
+      );
+    });
+
+    it("an import refused by a busy library keeps the modal open and writes nothing", async () => {
+      const user = userEvent.setup();
+      const onImported = vi.fn();
+      let releaseHolder!: () => void;
+      const held = new Promise<void>((resolve) => {
+        releaseHolder = resolve;
+      });
+      const holder = withSavedDeckLibrary(() => held);
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).held).toHaveLength(1);
+      });
+
+      render(<ImportDeckModal open onClose={vi.fn()} onImported={onImported} />);
+      const pasteText = "Name: Paste Deck\n[Main]\n1 Sol Ring";
+      fireEvent.change(screen.getByPlaceholderText(/Paste deck list here/i), { target: { value: pasteText } });
+      setSavedDeckTxnLockWaitForTests(50);
+      await user.click(screen.getByRole("button", { name: "Import" }));
+
+      await vi.waitFor(() => {
+        expect(useAppNotificationStore.getState().notification?.title).toBe("Couldn't import deck");
+      });
+      expect(onImported).not.toHaveBeenCalled();
+      expect(screen.getByPlaceholderText(/Paste deck list here/i)).toHaveValue(pasteText);
+      expect(listSavedDeckNames()).toEqual([]);
+
+      setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
+      releaseHolder();
+      await holder;
     });
   });
 });

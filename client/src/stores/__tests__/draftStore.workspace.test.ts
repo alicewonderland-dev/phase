@@ -96,10 +96,12 @@ import {
   type DraftPickOutcome,
 } from "../draftStore";
 import {
+  awaitSavedDeckLibraryIdle,
   installFifoWebLocks,
   resetSavedDeckLibraryForTests,
   uninstallWebLocks,
 } from "../../test/helpers/webLocks";
+import { withSavedDeckLibrary } from "../../services/savedDeckTransaction";
 
 function card(instanceId: string, name = instanceId): DraftCardInstance {
   return {
@@ -1769,6 +1771,7 @@ describe("draft store workspace authority", () => {
       wasm.submit_deck.mockReturnValue({ ...view([card("bolt", "Bolt")]), status: "Pairing" });
 
       await useDraftStore.getState().submitDeck();
+      await awaitSavedDeckLibraryIdle();
 
       expect(loadSavedDeck("[Autosave] Quick Draft")?.main).toEqual([{ name: "Bolt", count: 1 }]);
       expect(loadSavedDeckFormat("[Autosave] Quick Draft")).toBe("Limited");
@@ -1786,6 +1789,7 @@ describe("draft store workspace authority", () => {
       });
 
       await useDraftStore.getState().submitDeck();
+      await awaitSavedDeckLibraryIdle();
 
       expect(wasm.submit_deck).toHaveBeenLastCalledWith(JSON.stringify(["Bolt", "Plains"]), JSON.stringify([]));
       const saved = loadSavedDeck("[Autosave] Quick Draft");
@@ -1804,6 +1808,7 @@ describe("draft store workspace authority", () => {
       wasm.submit_deck.mockReturnValue({ ...sealedView, status: "Pairing" });
 
       await useDraftStore.getState().submitDeck();
+      await awaitSavedDeckLibraryIdle();
 
       expect(getDeckMeta("[Autosave] Sealed")?.autosaveSlot).toBe("Sealed");
     });
@@ -1820,6 +1825,7 @@ describe("draft store workspace authority", () => {
       wasm.submit_deck.mockReturnValue({ ...cubeView, status: "Pairing" });
 
       await useDraftStore.getState().submitDeck();
+      await awaitSavedDeckLibraryIdle();
 
       expect(getDeckMeta("[Autosave] Cube Draft")?.autosaveSlot).toBe("Cube");
       expect(localStorage.getItem(STORAGE_KEY_PREFIX + "[Autosave] Quick Draft")).toBeNull();
@@ -1852,7 +1858,13 @@ describe("draft store workspace authority", () => {
         clear: () => { backing.clear(); },
       });
 
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
       await expect(useDraftStore.getState().submitDeck()).resolves.toBeUndefined();
+      await awaitSavedDeckLibraryIdle();
+      await vi.waitFor(() =>
+        expect(warnSpy).toHaveBeenCalledWith("[draftDeckAutosave] autosave failed:", expect.anything()),
+      );
 
       expect(useDraftStore.getState().phase).toBe("launching");
       expect(listSavedDeckNames()).toEqual([]);
@@ -1867,6 +1879,33 @@ describe("draft store workspace authority", () => {
       await expect(useDraftStore.getState().submitDeck()).rejects.toThrow("engine rejected submission");
 
       expect(listSavedDeckNames()).toEqual([]);
+    });
+
+    it("the submission resolves while the autosave waits for the library", async () => {
+      await start([card("bolt", "Bolt")]);
+      useDraftStore.getState().setWorkspacePlacement("bolt", { zone: "deck", row: 0, column: 0, order: 0 });
+      wasm.submit_deck.mockReturnValue({ ...view([card("bolt", "Bolt")]), status: "Pairing" });
+
+      let releaseHolder!: () => void;
+      const held = new Promise<void>((resolve) => {
+        releaseHolder = resolve;
+      });
+      const holder = withSavedDeckLibrary(() => held);
+      await vi.waitFor(async () => {
+        expect((await navigator.locks.query()).held).toHaveLength(1);
+      });
+
+      let settled = false;
+      void useDraftStore.getState().submitDeck().then(() => {
+        settled = true;
+      });
+      await vi.waitFor(() => expect(settled).toBe(true));
+      expect((await navigator.locks.query()).pending).toHaveLength(1);
+
+      releaseHolder();
+      await holder;
+      await awaitSavedDeckLibraryIdle();
+      expect(loadSavedDeck("[Autosave] Quick Draft")).not.toBeNull();
     });
   });
 });
