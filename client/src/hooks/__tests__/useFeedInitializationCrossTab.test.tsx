@@ -1,6 +1,6 @@
 // Drives the REAL hook against the REAL feedService (unlike
 // useFeedInitialization.test.tsx, which mocks feedService entirely) so a
-// cross-tab profile replacement actually reaches syncFeedUnlessAborted's
+// cross-tab profile replacement actually reaches publishUnlessSuperseded's
 // generation check and produces a real AbortError, not a mocked one.
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";

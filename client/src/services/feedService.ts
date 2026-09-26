@@ -200,26 +200,23 @@ function syncFeedDecksToStorage(txn: SavedDeckTxn, feed: Feed): void {
 }
 
 /**
- * Writes `feed` under the saved-deck library lock, re-checking abort and the
- * profile-replacement generation `initializeFeeds` captured at its start once
- * the lock is granted. Both can change while this waits for the lock: an
- * abort signal from `useFeedInitialization`'s cleanup, or another
- * transaction (`backup.ts::applyBackup`) replacing the profile — including
- * `phase-feed-subscriptions` — under the same lock. Either throws an
- * AbortError so the write is skipped rather than committed against a
- * profile this generation no longer belongs to.
+ * Runs `publish` inside `withSavedDeckLibraryOrSkip` unless, by the time the body runs, this initialization has
+ * been aborted or a profile replacement (`backup.ts::applyBackup` bumps the generation) has superseded it.
+ * Everything a sync makes visible — the cached feed, its decks, its subscription record — goes in `publish`, so a
+ * superseded or skipped sync shows none of it. The transaction awaits `publish`'s result while holding the
+ * library lock, so return a pending cache write wrapped, not bare.
  */
-function syncFeedUnlessAborted(
-  feed: Feed,
+function publishUnlessSuperseded<T>(
   signal: AbortSignal | undefined,
   replacement: number,
-): Promise<SavedDeckTxnResult<void, SavedDeckTxnFailure>> {
+  publish: (txn: SavedDeckTxn) => T,
+): Promise<SavedDeckTxnResult<T, SavedDeckTxnFailure>> {
   return withSavedDeckLibraryOrSkip((txn) => {
     throwIfAborted(signal);
     if (profileReplacementGeneration() !== replacement) {
       throw new DOMException("Feed initialization superseded by a profile replacement", "AbortError");
     }
-    syncFeedDecksToStorage(txn, feed);
+    return publish(txn);
   }, "run-unguarded");
 }
 
@@ -240,7 +237,7 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
   if (!allowRefresh) {
     for (const sub of subs) {
       const cached = getCachedFeed(sub.sourceId);
-      if (cached) await syncFeedUnlessAborted(cached, signal, replacement);
+      if (cached) await publishUnlessSuperseded(signal, replacement, (txn) => syncFeedDecksToStorage(txn, cached));
     }
     return;
   }
@@ -260,19 +257,21 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
       // fetched feed.id differs from the registry.
       const feedId = source.id;
       const normalizedFeed = { ...feed, id: feedId, format: source.format ?? feed.format };
-      const cachePersistence = setCachedFeed(feedId, normalizedFeed);
-      await syncFeedUnlessAborted(normalizedFeed, signal, replacement);
-
-      subs.push({
-        sourceId: feedId,
-        url: source.url,
-        type: "bundled",
-        subscribedAt: Date.now(),
-        lastRefreshedAt: Date.now(),
-        lastVersion: feed.version,
+      const published = await publishUnlessSuperseded(signal, replacement, (txn) => {
+        const cachePersistence = setCachedFeed(feedId, normalizedFeed);
+        syncFeedDecksToStorage(txn, normalizedFeed);
+        subs.push({
+          sourceId: feedId,
+          url: source.url,
+          type: "bundled",
+          subscribedAt: Date.now(),
+          lastRefreshedAt: Date.now(),
+          lastVersion: feed.version,
+        });
+        saveFeedSubscriptions(subs);
+        return { cachePersistence };
       });
-      saveFeedSubscriptions(subs);
-      await cachePersistence;
+      if (published.status === "committed") await published.value.cachePersistence;
     } catch (err) {
       if (signal?.aborted || (err instanceof DOMException && err.name === "AbortError")) throw err;
       console.error(`Failed to initialize feed "${source.id}":`, err);
@@ -292,7 +291,7 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
     const isStale = now - sub.lastRefreshedAt >= FEED_STALE_AFTER_MS;
     const bundled = sub.type === "bundled";
     if (!bundled && !isStale && cached) {
-      await syncFeedUnlessAborted(cached, signal, replacement);
+      await publishUnlessSuperseded(signal, replacement, (txn) => syncFeedDecksToStorage(txn, cached));
       continue;
     }
 
@@ -301,21 +300,24 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
       throwIfAborted(signal);
       const registrySource = FEED_REGISTRY.find((r) => r.id === sub.sourceId);
       const normalizedFeed = { ...feed, id: sub.sourceId, format: registrySource?.format ?? feed.format };
-      const cachePersistence = setCachedFeed(sub.sourceId, normalizedFeed);
-      await syncFeedUnlessAborted(normalizedFeed, signal, replacement);
-      const feedChanged = cached?.updated !== normalizedFeed.updated;
-      const metadataChanged = sub.lastVersion !== feed.version || sub.error !== undefined;
-      sub.lastVersion = feed.version;
-      if (isStale || feedChanged) sub.lastRefreshedAt = Date.now();
-      if (sub.error !== undefined) sub.error = undefined;
-      if (isStale || feedChanged || metadataChanged) saveFeedSubscriptions(subs);
-      await cachePersistence;
+      const published = await publishUnlessSuperseded(signal, replacement, (txn) => {
+        const cachePersistence = setCachedFeed(sub.sourceId, normalizedFeed);
+        syncFeedDecksToStorage(txn, normalizedFeed);
+        const feedChanged = cached?.updated !== normalizedFeed.updated;
+        const metadataChanged = sub.lastVersion !== feed.version || sub.error !== undefined;
+        sub.lastVersion = feed.version;
+        if (isStale || feedChanged) sub.lastRefreshedAt = Date.now();
+        if (sub.error !== undefined) sub.error = undefined;
+        if (isStale || feedChanged || metadataChanged) saveFeedSubscriptions(subs);
+        return { cachePersistence };
+      });
+      if (published.status === "committed") await published.value.cachePersistence;
     } catch (err) {
       if (signal?.aborted || (err instanceof DOMException && err.name === "AbortError")) throw err;
       // Fall back to cached data
       const cached = getCachedFeed(sub.sourceId);
       if (cached) {
-        await syncFeedUnlessAborted(cached, signal, replacement);
+        await publishUnlessSuperseded(signal, replacement, (txn) => syncFeedDecksToStorage(txn, cached));
       }
     }
   }
@@ -333,27 +335,31 @@ export async function subscribe(sourceOrUrl: string): Promise<Feed> {
 
   const feed = await fetchFeed(url);
 
-  await setCachedFeed(feed.id, feed);
-  await withSavedDeckLibrary((txn) => syncFeedDecksToStorage(txn, feed));
+  const { cachePersistence } = await withSavedDeckLibrary((txn) => {
+    const cachePersistence = setCachedFeed(feed.id, feed);
+    syncFeedDecksToStorage(txn, feed);
 
-  const subs = loadFeedSubscriptions();
-  const existing = subs.find((s) => s.sourceId === feed.id);
-  if (existing) {
-    existing.lastRefreshedAt = Date.now();
-    existing.lastVersion = feed.version;
-    existing.error = undefined;
-  } else {
-    subs.push({
-      sourceId: feed.id,
-      url,
-      type,
-      subscribedAt: Date.now(),
-      lastRefreshedAt: Date.now(),
-      lastVersion: feed.version,
-    });
-  }
+    const subs = loadFeedSubscriptions();
+    const existing = subs.find((s) => s.sourceId === feed.id);
+    if (existing) {
+      existing.lastRefreshedAt = Date.now();
+      existing.lastVersion = feed.version;
+      existing.error = undefined;
+    } else {
+      subs.push({
+        sourceId: feed.id,
+        url,
+        type,
+        subscribedAt: Date.now(),
+        lastRefreshedAt: Date.now(),
+        lastVersion: feed.version,
+      });
+    }
+    saveFeedSubscriptions(subs);
 
-  saveFeedSubscriptions(subs);
+    return { cachePersistence };
+  });
+  await cachePersistence;
   return feed;
 }
 
@@ -403,13 +409,18 @@ export async function refreshFeed(feedId: string): Promise<Feed> {
 
   try {
     const feed = await fetchFeed(sub.url);
-    await setCachedFeed(feed.id, feed);
-    await withSavedDeckLibrary((txn) => syncFeedDecksToStorage(txn, feed));
+    const { cachePersistence } = await withSavedDeckLibrary((txn) => {
+      const cachePersistence = setCachedFeed(feed.id, feed);
+      syncFeedDecksToStorage(txn, feed);
 
-    sub.lastRefreshedAt = Date.now();
-    sub.lastVersion = feed.version;
-    sub.error = undefined;
-    saveFeedSubscriptions(subs);
+      sub.lastRefreshedAt = Date.now();
+      sub.lastVersion = feed.version;
+      sub.error = undefined;
+      saveFeedSubscriptions(subs);
+
+      return { cachePersistence };
+    });
+    await cachePersistence;
     return feed;
   } catch (err) {
     if (!(err instanceof SavedDeckLibraryBusyError)) {

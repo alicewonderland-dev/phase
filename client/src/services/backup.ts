@@ -527,7 +527,7 @@ export function applyBackup(
   writeValidated(FEED_DECK_ORIGINS_KEY, backup.feedDeckOrigins, true);
 
   // A feed sync already queued behind this transaction's lock
-  // (`feedService.ts::syncFeedUnlessAborted`) must detect this replacement and
+  // (`feedService.ts::publishUnlessSuperseded`) must detect this replacement and
   // skip instead of overwriting restored subscriptions with stale data.
   bumpProfileReplacementGeneration(txn);
 
