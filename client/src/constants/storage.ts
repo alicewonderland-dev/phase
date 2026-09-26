@@ -99,11 +99,12 @@ export const LLM_ENDPOINTS_KEY = "phase-llm-endpoints";
 export const DRAFT_WORKSPACE_PREFERENCES_KEY = "phase-draft-workspace-preferences";
 
 /**
- * localStorage key for a per-device counter bumped whenever a saved-deck
- * transaction body replaces the whole profile (`cloudSyncStore.ts::applyRemote`/
- * `applyMerged`). `feedService.ts` captures this before waiting on the saved-deck
- * library lock and compares after re-acquiring it, so a feed sync queued behind
- * a profile replacement can detect it and skip.
+ * localStorage key for a per-device counter bumped by `bumpProfileReplacementGeneration`,
+ * called from `cloudSyncStore.ts::applyRemote`/`applyMerged` (cloud restore) and
+ * `backup.ts::applyBackup` (manual backup-file import, and the legacy-storage
+ * migration that reuses it). `feedService.ts` captures this before waiting on
+ * the saved-deck library lock and compares after re-acquiring it, so a feed
+ * sync queued behind one of these replacements can detect it and skip.
  *
  * Deliberately NOT part of {@link isUserOwnedStorageKey}: syncing this counter
  * would let a remote profile apply overwrite the very value used to detect a

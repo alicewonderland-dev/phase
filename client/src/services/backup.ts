@@ -13,6 +13,7 @@
  */
 import {
   ACTIVE_DECK_KEY,
+  bumpProfileReplacementGeneration,
   DECK_FOLDERS_KEY,
   DECK_METADATA_KEY,
   DRAFT_WORKSPACE_PREFERENCES_KEY,
@@ -449,7 +450,6 @@ export function applyBackup(
   backup: PhaseBackupV1,
   mode: ImportMode,
 ): ImportResult {
-  void txn;
   if (mode === "overwrite") {
     const toRemove: string[] = [];
     for (let i = 0; i < localStorage.length; i++) {
@@ -525,6 +525,12 @@ export function applyBackup(
   writeValidated(ACTIVE_DECK_KEY, backup.activeDeck, false);
   writeValidated(FEED_SUBSCRIPTIONS_KEY, backup.feedSubscriptions, true);
   writeValidated(FEED_DECK_ORIGINS_KEY, backup.feedDeckOrigins, true);
+
+  // This restore just rewrote FEED_SUBSCRIPTIONS_KEY (both modes, above) —
+  // bump so a feed sync already queued behind this transaction's lock
+  // (`feedService.ts::syncFeedUnlessAborted`) detects the replacement and
+  // skips instead of overwriting the restored subscriptions with stale data.
+  bumpProfileReplacementGeneration(txn);
 
   return { decksImported, decksSkippedMalformed, preferencesReplaced, malformedKeys };
 }
