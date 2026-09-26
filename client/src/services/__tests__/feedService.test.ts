@@ -1416,8 +1416,7 @@ describe("cross-tab saved-deck transactions", () => {
     const subs = JSON.parse(localStorage.getItem(FEED_SUBSCRIPTIONS_KEY)!) as FeedSubscription[];
     localStorage.setItem(FEED_SUBSCRIPTIONS_KEY, JSON.stringify([...subs, ...bundledSubs()]));
     // The bundled feeds are already-subscribed, so their own refetch below must not resolve to
-    // the "Test Deck" / "Another Deck" fixture — otherwise their unrelated publish would satisfy
-    // the assertions below even if the guard under test did not.
+    // the "Test Deck" / "Another Deck" fixture.
     mockFetchByUrl({
       ...ALL_BUNDLED_FEEDS,
       "starter-decks": { ...STARTER_FEED, decks: [{ ...STARTER_FEED.decks[0], name: "Bundled Starter Deck" }] },
@@ -1448,8 +1447,7 @@ describe("cross-tab saved-deck transactions", () => {
     localStorage.setItem(FEED_SUBSCRIPTIONS_KEY, JSON.stringify([...subs, ...bundledSubs()]));
 
     // The bundled feeds are already-subscribed, so their own refetch below must not resolve to
-    // the "Test Deck" / "Another Deck" fixture — otherwise their unrelated publish would satisfy
-    // the assertions below even if the guard under test did not.
+    // the "Test Deck" / "Another Deck" fixture.
     const bundledFeeds: Record<string, unknown> = {
       ...ALL_BUNDLED_FEEDS,
       "starter-decks": { ...STARTER_FEED, decks: [{ ...STARTER_FEED.decks[0], name: "Bundled Starter Deck" }] },
