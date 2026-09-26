@@ -41,6 +41,7 @@ import {
   STORAGE_KEY_PREFIX,
   ACTIVE_DECK_KEY,
   FEED_SUBSCRIPTIONS_KEY,
+  bumpProfileReplacementGeneration,
 } from "../../constants/storage";
 import { set as idbSet, entries as idbEntries } from "idb-keyval";
 import { useConnectivityStore } from "../../stores/connectivityStore";
@@ -50,6 +51,7 @@ import {
   SavedDeckLibraryBusyError,
   setSavedDeckTxnLockWaitForTests,
   withSavedDeckLibrary,
+  withSavedDeckLibraryOrSkip,
 } from "../savedDeckTransaction";
 import { installFifoWebLocks, uninstallWebLocks } from "../../test/helpers/webLocks";
 
@@ -794,6 +796,154 @@ describe("cross-tab saved-deck transactions", () => {
 
     await initializeFeeds({ allowRefresh: false });
     expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Test Deck")).not.toBeNull();
+  });
+
+  function bundledSubs(): FeedSubscription[] {
+    return FEED_REGISTRY.filter((source) => source.type === "bundled").map((source) => ({
+      sourceId: source.id,
+      url: source.url,
+      type: source.type,
+      subscribedAt: 1,
+      lastRefreshedAt: Date.now(),
+      lastVersion: 1,
+    }));
+  }
+
+  it("aborts a cached-only sync without writing the deck when the abort lands while it waits for the saved-deck lock", async () => {
+    await setCachedFeed("cached", { ...VALID_FEED, id: "cached" });
+    localStorage.setItem(FEED_SUBSCRIPTIONS_KEY, JSON.stringify([{
+      sourceId: "cached", url: "https://example.com/cached.json", type: "remote",
+      subscribedAt: 1, lastRefreshedAt: Date.now(), lastVersion: 1,
+    }]));
+    const { release, holder } = await heldLock();
+    const controller = new AbortController();
+    const initialization = initializeFeeds({ allowRefresh: false, signal: controller.signal });
+    await vi.waitFor(async () => expect((await navigator.locks.query()).pending).toHaveLength(1));
+
+    controller.abort();
+    release();
+    await holder;
+
+    await expect(initialization).rejects.toMatchObject({ name: "AbortError" });
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Test Deck")).toBeNull();
+  });
+
+  it("aborts a first-run bundled feed fetch without writing the deck or its subscription when the abort lands while it waits for the saved-deck lock", async () => {
+    mockFetchByUrl(ALL_BUNDLED_FEEDS);
+    const { release, holder } = await heldLock();
+    const controller = new AbortController();
+    const initialization = initializeFeeds({ signal: controller.signal });
+    await vi.waitFor(async () => expect((await navigator.locks.query()).pending).toHaveLength(1));
+
+    controller.abort();
+    release();
+    await holder;
+
+    await expect(initialization).rejects.toMatchObject({ name: "AbortError" });
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Test Deck")).toBeNull();
+    expect(listSubscriptions()).toEqual([]);
+  });
+
+  it("aborts a fresh cached subscription sync without writing the deck when the abort lands while it waits for the saved-deck lock", async () => {
+    const cached = { ...VALID_FEED, id: "fresh-remote" };
+    await setCachedFeed("fresh-remote", cached);
+    localStorage.setItem(FEED_SUBSCRIPTIONS_KEY, JSON.stringify([
+      { sourceId: "fresh-remote", url: "https://example.com/fresh.json", type: "remote",
+        subscribedAt: 1, lastRefreshedAt: Date.now(), lastVersion: 1 },
+      ...bundledSubs(),
+    ]));
+    const { release, holder } = await heldLock();
+    const controller = new AbortController();
+    const initialization = initializeFeeds({ signal: controller.signal });
+    await vi.waitFor(async () => expect((await navigator.locks.query()).pending).toHaveLength(1));
+
+    controller.abort();
+    release();
+    await holder;
+
+    await expect(initialization).rejects.toMatchObject({ name: "AbortError" });
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Test Deck")).toBeNull();
+  });
+
+  it("aborts a refetched subscription sync without writing the deck when the abort lands while it waits for the saved-deck lock", async () => {
+    localStorage.setItem(FEED_SUBSCRIPTIONS_KEY, JSON.stringify([
+      { sourceId: "stale-remote", url: "https://example.com/stale.json", type: "remote",
+        subscribedAt: 1, lastRefreshedAt: 0, lastVersion: 1 },
+      ...bundledSubs(),
+    ]));
+    mockFetchByUrl({ "stale.json": VALID_FEED });
+    const { release, holder } = await heldLock();
+    const controller = new AbortController();
+    const initialization = initializeFeeds({ signal: controller.signal });
+    await vi.waitFor(async () => expect((await navigator.locks.query()).pending).toHaveLength(1));
+
+    controller.abort();
+    release();
+    await holder;
+
+    await expect(initialization).rejects.toMatchObject({ name: "AbortError" });
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Test Deck")).toBeNull();
+  });
+
+  it("aborts a cached fallback sync after a failed refetch without writing the deck when the abort lands while it waits for the saved-deck lock", async () => {
+    const cached = { ...VALID_FEED, id: "cached-remote" };
+    await setCachedFeed("cached-remote", cached);
+    localStorage.setItem(FEED_SUBSCRIPTIONS_KEY, JSON.stringify([
+      { sourceId: "cached-remote", url: "https://example.com/cached-remote.json", type: "remote",
+        subscribedAt: 1, lastRefreshedAt: 0, lastVersion: 1 },
+      ...bundledSubs(),
+    ]));
+    mockFetch({}, false);
+    const { release, holder } = await heldLock();
+    const controller = new AbortController();
+    const initialization = initializeFeeds({ signal: controller.signal });
+    await vi.waitFor(async () => expect((await navigator.locks.query()).pending).toHaveLength(1));
+
+    controller.abort();
+    release();
+    await holder;
+
+    await expect(initialization).rejects.toMatchObject({ name: "AbortError" });
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Test Deck")).toBeNull();
+  });
+
+  it("skips a feed sync superseded by a profile replacement that lands while it waits for the saved-deck lock", async () => {
+    localStorage.setItem(FEED_SUBSCRIPTIONS_KEY, JSON.stringify([
+      { sourceId: "stale-remote", url: "https://example.com/stale.json", type: "remote",
+        subscribedAt: 1, lastRefreshedAt: 0, lastVersion: 0 },
+      ...bundledSubs(),
+    ]));
+    mockFetchByUrl({
+      "stale.json": {
+        ...VALID_FEED,
+        id: "stale-remote",
+        decks: [{ ...VALID_FEED.decks[0], name: "Stale Remote Deck" }],
+      },
+    });
+
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const restoredSubs = bundledSubs();
+    // Shaped like cloudSyncStore.ts::applyRemote: holds the lock, then overwrites the
+    // subscription list and bumps the profile-replacement generation from inside its body.
+    const applyHolder = withSavedDeckLibraryOrSkip((txn) => {
+      return held.then(() => {
+        localStorage.setItem(FEED_SUBSCRIPTIONS_KEY, JSON.stringify(restoredSubs));
+        bumpProfileReplacementGeneration(txn);
+      });
+    }, "run-unguarded");
+    await vi.waitFor(async () => expect((await navigator.locks.query()).held).toHaveLength(1));
+
+    const initialization = initializeFeeds();
+    await vi.waitFor(async () => expect((await navigator.locks.query()).pending).toHaveLength(1));
+
+    release();
+    await applyHolder;
+
+    await expect(initialization).rejects.toMatchObject({ name: "AbortError" });
+    expect(localStorage.getItem(STORAGE_KEY_PREFIX + "Stale Remote Deck")).toBeNull();
+    const subs = JSON.parse(localStorage.getItem(FEED_SUBSCRIPTIONS_KEY)!) as FeedSubscription[];
+    expect(subs.map((s) => s.sourceId)).not.toContain("stale-remote");
   });
 });
 

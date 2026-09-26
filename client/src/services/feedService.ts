@@ -7,6 +7,7 @@ import {
   STORAGE_KEY_PREFIX,
   loadDeckOrigins,
   loadFeedSubscriptions,
+  profileReplacementGeneration,
   removeDeckMeta,
   removeSavedDeckData,
   saveDeckOrigins,
@@ -19,6 +20,8 @@ import {
   withSavedDeckLibrary,
   withSavedDeckLibraryOrSkip,
   type SavedDeckTxn,
+  type SavedDeckTxnFailure,
+  type SavedDeckTxnResult,
 } from "./savedDeckTransaction";
 import {
   getCachedFeed,
@@ -196,6 +199,30 @@ function syncFeedDecksToStorage(txn: SavedDeckTxn, feed: Feed): void {
   saveDeckOrigins(origins);
 }
 
+/**
+ * Writes `feed` under the saved-deck library lock, re-checking abort and the
+ * profile-replacement generation `initializeFeeds` captured at its start once
+ * the lock is granted. Both can change while this waits for the lock: an
+ * abort signal from `useFeedInitialization`'s cleanup, or another
+ * transaction (`cloudSyncStore.ts::applyRemote`/`applyMerged`) replacing the
+ * whole profile — including `phase-feed-subscriptions` — under the same lock.
+ * Either throws an AbortError so the write is skipped rather than committed
+ * against a profile this generation no longer belongs to.
+ */
+function syncFeedUnlessAborted(
+  feed: Feed,
+  signal: AbortSignal | undefined,
+  replacement: number,
+): Promise<SavedDeckTxnResult<void, SavedDeckTxnFailure>> {
+  return withSavedDeckLibraryOrSkip((txn) => {
+    throwIfAborted(signal);
+    if (profileReplacementGeneration() !== replacement) {
+      throw new DOMException("Feed initialization superseded by a profile replacement", "AbortError");
+    }
+    syncFeedDecksToStorage(txn, feed);
+  }, "run-unguarded");
+}
+
 // --- Public API ---
 
 export interface InitializeFeedsOptions {
@@ -208,11 +235,12 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
   throwIfAborted(signal);
 
   const subs = loadFeedSubscriptions();
+  const replacement = profileReplacementGeneration();
 
   if (!allowRefresh) {
     for (const sub of subs) {
       const cached = getCachedFeed(sub.sourceId);
-      if (cached) await withSavedDeckLibraryOrSkip((txn) => syncFeedDecksToStorage(txn, cached), "run-unguarded");
+      if (cached) await syncFeedUnlessAborted(cached, signal, replacement);
     }
     return;
   }
@@ -233,7 +261,7 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
       const feedId = source.id;
       const normalizedFeed = { ...feed, id: feedId, format: source.format ?? feed.format };
       const cachePersistence = setCachedFeed(feedId, normalizedFeed);
-      await withSavedDeckLibraryOrSkip((txn) => syncFeedDecksToStorage(txn, normalizedFeed), "run-unguarded");
+      await syncFeedUnlessAborted(normalizedFeed, signal, replacement);
 
       subs.push({
         sourceId: feedId,
@@ -264,7 +292,7 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
     const isStale = now - sub.lastRefreshedAt >= FEED_STALE_AFTER_MS;
     const bundled = sub.type === "bundled";
     if (!bundled && !isStale && cached) {
-      await withSavedDeckLibraryOrSkip((txn) => syncFeedDecksToStorage(txn, cached), "run-unguarded");
+      await syncFeedUnlessAborted(cached, signal, replacement);
       continue;
     }
 
@@ -274,7 +302,7 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
       const registrySource = FEED_REGISTRY.find((r) => r.id === sub.sourceId);
       const normalizedFeed = { ...feed, id: sub.sourceId, format: registrySource?.format ?? feed.format };
       const cachePersistence = setCachedFeed(sub.sourceId, normalizedFeed);
-      await withSavedDeckLibraryOrSkip((txn) => syncFeedDecksToStorage(txn, normalizedFeed), "run-unguarded");
+      await syncFeedUnlessAborted(normalizedFeed, signal, replacement);
       const feedChanged = cached?.updated !== normalizedFeed.updated;
       const metadataChanged = sub.lastVersion !== feed.version || sub.error !== undefined;
       sub.lastVersion = feed.version;
@@ -287,7 +315,7 @@ export async function initializeFeeds({ allowRefresh = true, signal }: Initializ
       // Fall back to cached data
       const cached = getCachedFeed(sub.sourceId);
       if (cached) {
-        await withSavedDeckLibraryOrSkip((txn) => syncFeedDecksToStorage(txn, cached), "run-unguarded");
+        await syncFeedUnlessAborted(cached, signal, replacement);
       }
     }
   }

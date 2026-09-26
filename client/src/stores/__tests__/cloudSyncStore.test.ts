@@ -41,6 +41,7 @@ vi.mock("../connectivityStore", () => ({
 
 import { adoptCloudSyncHmrState, disposeCloudSyncModuleForTest, useCloudSyncStore } from "../cloudSyncStore";
 import { SyncConflictError } from "../../services/cloudSync";
+import { profileReplacementGeneration } from "../../constants/storage";
 import { setSavedDeckTxnLockWaitForTests, withSavedDeckLibrary } from "../../services/savedDeckTransaction";
 import { useAppNotificationStore } from "../appToastStore";
 import {
@@ -1365,6 +1366,7 @@ describe("cloud sync serialization", () => {
       useCloudSyncStore.setState({ dirty: false, lastSyncedRevision: 1 });
       provider.pullMeta.mockResolvedValue(meta(2));
       provider.pull.mockResolvedValue(remote(2));
+      const generationBefore = profileReplacementGeneration();
 
       let releaseHolder!: () => void;
       const held = new Promise<void>((resolve) => {
@@ -1386,6 +1388,7 @@ describe("cloud sync serialization", () => {
 
       expect(mocks.applyBackup).not.toHaveBeenCalled();
       expect(useCloudSyncStore.getState().dirty).toBe(true);
+      expect(profileReplacementGeneration()).toBe(generationBefore);
     });
 
     it("paired positive: without a same-tab write while waiting, applyRemote applies the snapshot", async () => {
@@ -1393,6 +1396,7 @@ describe("cloud sync serialization", () => {
       useCloudSyncStore.setState({ dirty: false, lastSyncedRevision: 1 });
       provider.pullMeta.mockResolvedValue(meta(2));
       provider.pull.mockResolvedValue(remote(2));
+      const generationBefore = profileReplacementGeneration();
 
       let releaseHolder!: () => void;
       const held = new Promise<void>((resolve) => {
@@ -1413,6 +1417,7 @@ describe("cloud sync serialization", () => {
 
       expect(mocks.applyBackup).toHaveBeenCalledWith(expect.anything(), remote(2).backup, "overwrite");
       expect(useCloudSyncStore.getState()).toMatchObject({ status: "synced", dirty: false });
+      expect(profileReplacementGeneration()).toBe(generationBefore + 1);
     });
 
     it("re-checks staleness inside the lock: a same-tab write that arrives while applyMerged waits for the lock blocks the apply", async () => {
@@ -1422,6 +1427,7 @@ describe("cloud sync serialization", () => {
       provider.pullMeta.mockResolvedValue(meta(3));
       provider.push.mockResolvedValue(meta(4));
       mocks.mergeDeckCollections.mockReturnValue(merged);
+      const generationBefore = profileReplacementGeneration();
 
       let releaseHolder!: () => void;
       const held = new Promise<void>((resolve) => {
@@ -1448,6 +1454,7 @@ describe("cloud sync serialization", () => {
         lastSyncedRevision: 4,
         conflict: { backup: merged, meta: meta(4) },
       });
+      expect(profileReplacementGeneration()).toBe(generationBefore);
     });
 
     it("paired positive: without a same-tab write while waiting, applyMerged applies the merge", async () => {
@@ -1457,6 +1464,7 @@ describe("cloud sync serialization", () => {
       provider.pullMeta.mockResolvedValue(meta(3));
       provider.push.mockResolvedValue(meta(4));
       mocks.mergeDeckCollections.mockReturnValue(merged);
+      const generationBefore = profileReplacementGeneration();
 
       let releaseHolder!: () => void;
       const held = new Promise<void>((resolve) => {
@@ -1477,6 +1485,7 @@ describe("cloud sync serialization", () => {
 
       expect(mocks.applyBackup).toHaveBeenCalledWith(expect.anything(), merged, "overwrite");
       expect(useCloudSyncStore.getState()).toMatchObject({ status: "synced", lastSyncedRevision: 4 });
+      expect(profileReplacementGeneration()).toBe(generationBefore + 1);
     });
 
     it("a background remote apply refused by a busy library reports an error and writes nothing", async () => {
@@ -1484,6 +1493,7 @@ describe("cloud sync serialization", () => {
       useCloudSyncStore.setState({ dirty: false, lastSyncedRevision: 1 });
       provider.pullMeta.mockResolvedValue(meta(2));
       provider.pull.mockResolvedValue(remote(2));
+      const generationBefore = profileReplacementGeneration();
 
       setSavedDeckTxnLockWaitForTests(20);
       let releaseHolder!: () => void;
@@ -1502,6 +1512,7 @@ describe("cloud sync serialization", () => {
       expect(useCloudSyncStore.getState().error).toBe(
         "Another Phase tab is busy. Close other Phase tabs and try again.",
       );
+      expect(profileReplacementGeneration()).toBe(generationBefore);
 
       setSavedDeckTxnLockWaitForTests(Number.POSITIVE_INFINITY);
       releaseHolder();

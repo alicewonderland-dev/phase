@@ -20,6 +20,7 @@ import {
 } from "../services/cloudSync";
 import { computeBackupDigest, summarizeBackupDiff, type ConflictDiffSummary } from "../services/cloudSync/backupDiff";
 import { watchUserStorage, withStorageWatchSuppressed } from "../services/cloudSync/storageWatcher";
+import { bumpProfileReplacementGeneration } from "../constants/storage";
 import { withSavedDeckLibraryOrSkip, type SavedDeckTxnFailure } from "../services/savedDeckTransaction";
 import { busyOrStorageDescription, notifySavedDeckLibraryBusy } from "../services/savedDeckWriteFailure";
 import { getEffectiveOffline } from "./connectivityStore";
@@ -270,6 +271,7 @@ async function applyRemote(
   const result = await withSavedDeckLibraryOrSkip((txn) => {
     if (!current(generation, auth) || localWriteVersion !== write) return false;
     withStorageWatchSuppressed(() => applyBackup(txn, remote.backup, "overwrite"));
+    bumpProfileReplacementGeneration(txn);
     conflictWriteVersion = null;
     useCloudSyncStore.setState({ status: "synced", error: null, dirty: false, conflict: null, conflictDiff: null, lastSyncedRevision: remote.meta.revision, lastSyncedDigest: digest, lastSyncedAt: new Date().toISOString() });
     return true;
@@ -285,6 +287,7 @@ async function applyMerged(generation: Generation, auth: number, write: number, 
   const result = await withSavedDeckLibraryOrSkip((txn) => {
     if (!current(generation, auth) || localWriteVersion !== write) return false;
     withStorageWatchSuppressed(() => applyBackup(txn, backup, "overwrite"));
+    bumpProfileReplacementGeneration(txn);
     return true;
   }, "run-unguarded");
   if (result.status === "skipped") return { status: "busy", reason: result.reason };

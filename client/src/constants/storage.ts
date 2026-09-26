@@ -99,6 +99,34 @@ export const LLM_ENDPOINTS_KEY = "phase-llm-endpoints";
 export const DRAFT_WORKSPACE_PREFERENCES_KEY = "phase-draft-workspace-preferences";
 
 /**
+ * localStorage key for a per-device counter bumped whenever a saved-deck
+ * transaction body replaces the whole profile (`cloudSyncStore.ts::applyRemote`/
+ * `applyMerged`). `feedService.ts` captures this before waiting on the saved-deck
+ * library lock and compares after re-acquiring it, so a feed sync queued behind
+ * a profile replacement can detect it and skip.
+ *
+ * Deliberately NOT part of {@link isUserOwnedStorageKey}: syncing this counter
+ * would let a remote profile apply overwrite the very value used to detect a
+ * profile replacement, defeating the guard it exists to provide.
+ */
+export const PROFILE_REPLACEMENT_KEY = "phase-profile-replacement";
+
+/** Current profile-replacement generation (see {@link PROFILE_REPLACEMENT_KEY}). */
+export function profileReplacementGeneration(): number {
+  return Number(localStorage.getItem(PROFILE_REPLACEMENT_KEY) ?? 0);
+}
+
+/**
+ * Bump the profile-replacement generation. Requires a {@link SavedDeckTxn} so it
+ * can only run inside a saved-deck library transaction body, alongside the
+ * profile replacement it accompanies.
+ */
+export function bumpProfileReplacementGeneration(txn: SavedDeckTxn): void {
+  void txn;
+  localStorage.setItem(PROFILE_REPLACEMENT_KEY, String(profileReplacementGeneration() + 1));
+}
+
+/**
  * Single authority for "is this localStorage key part of the user's portable
  * profile?" — the decks, preferences, metadata, active-deck pointer, and feed
  * state that `buildBackup`/`applyBackup` round-trip and that cloud sync mirrors.

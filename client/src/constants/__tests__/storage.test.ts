@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ACTIVE_DECK_KEY,
+  bumpProfileReplacementGeneration,
   createFolder,
   deleteFolder,
   DRAFT_WORKSPACE_PREFERENCES_KEY,
@@ -14,6 +15,8 @@ import {
   loadSavedDeckBracket,
   loadSavedDeckFormat,
   migrateDeckMeta,
+  PROFILE_REPLACEMENT_KEY,
+  profileReplacementGeneration,
   renameFolder,
   saveBuilderDeck,
   saveSavedDeckBracket,
@@ -50,6 +53,20 @@ describe("user-owned storage keys", () => {
     expect(isUserOwnedStorageKey(`${DRAFT_WORKSPACE_PREFERENCES_KEY}-copy`)).toBe(false);
     expect(isUserOwnedStorageKey(`copy-${DRAFT_WORKSPACE_PREFERENCES_KEY}`)).toBe(false);
     expect(isUserOwnedStorageKey(DRAFT_WORKSPACE_PREFERENCES_KEY.toUpperCase())).toBe(false);
+  });
+
+  it("excludes the profile-replacement counter — it must not be cloud-synced or backed up", () => {
+    expect(isUserOwnedStorageKey(PROFILE_REPLACEMENT_KEY)).toBe(false);
+  });
+});
+
+describe("profile-replacement generation", () => {
+  it("starts at zero and only advances through a saved-deck transaction", () => {
+    expect(profileReplacementGeneration()).toBe(0);
+    bumpProfileReplacementGeneration(testSavedDeckTxn);
+    expect(profileReplacementGeneration()).toBe(1);
+    bumpProfileReplacementGeneration(testSavedDeckTxn);
+    expect(profileReplacementGeneration()).toBe(2);
   });
 });
 
