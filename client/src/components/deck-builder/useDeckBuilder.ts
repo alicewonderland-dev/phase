@@ -598,7 +598,7 @@ export function useDeckBuilder({
   const handleClone = useCallback(async () => {
     const captured = captureEditor();
     const sourceAtClick = savedDeckRef.current;
-    // The clone's folder is decided at the click, like every other decision in this flow:
+    // The clone's folder is decided at the click:
     // capture it now, before any await lets a Load or rename-Save race this transaction.
     const folderAtClick = sourceAtClick ? getDeckMeta(sourceAtClick.name)?.folderId ?? null : null;
     const base = deckName.trim() || "Untitled Deck";
