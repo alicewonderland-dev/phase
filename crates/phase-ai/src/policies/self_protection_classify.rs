@@ -2079,7 +2079,7 @@ mod tests {
         ));
     }
 
-    /// P1 casts `text` at P0's creature (`power`/`toughness`, `keywords`).
+    /// P1 casts `text` at P0's creature (`toughness`, `keywords`).
     fn opponent_spell_at_ai_creature(
         name: &str,
         text: &str,
