@@ -5,7 +5,7 @@ use engine::types::ability::{
     DamageTargetFilter, DamageTargetPlayerScope, Effect, FilterProp, PlayerScope, QuantityExpr,
     QuantityRef, SourceExclusion, StaticCondition, TargetFilter, TypeFilter,
 };
-use engine::types::keywords::Keyword;
+use engine::types::keywords::{HexproofFilter, Keyword};
 use engine::types::statics::StaticMode;
 use engine::types::zones::Zone;
 
@@ -1374,9 +1374,12 @@ fn havi_the_all_father_full_card_parser_snapshot() {
 #[test]
 fn elenda_saint_of_dusk_full_card_parser() {
     let parsed = parse(
-        "As long as your life total is greater than your starting life total, Elenda gets +1/+1 and has menace. Elenda gets an additional +5/+5 as long as your life total is at least 10 greater than your starting life total.",
+        "Lifelink, hexproof from instants\nAs long as your life total is greater than your starting life total, Elenda gets +1/+1 and has menace. Elenda gets an additional +5/+5 as long as your life total is at least 10 greater than your starting life total.",
         "Elenda, Saint of Dusk",
-        &[],
+        &[
+            Keyword::Lifelink,
+            Keyword::HexproofFrom(HexproofFilter::CardType("instants".to_string())),
+        ],
         &["Legendary", "Creature"],
         &["Vampire", "Knight"],
     );

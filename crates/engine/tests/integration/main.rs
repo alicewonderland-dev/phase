@@ -288,6 +288,7 @@ mod duskmantle_seer_each_player_reveal;
 mod dyadrine_counter_selection;
 mod electrostatic_bolt;
 mod elemental_spectacle_regression;
+mod elenda_torgaar_starting_life_runtime;
 mod elspeth_resplendent_conjoined_counter_choice;
 mod elusive_otter_repro;
 mod embiggen_typeline_pump;
