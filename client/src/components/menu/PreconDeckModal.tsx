@@ -162,11 +162,11 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
   const handleImportSelected = async () => {
     if (!decks || selectedIds.size === 0) return;
     const started = importSession.begin();
-    const picks: Array<{ savedName: string; deck: DeckEntry }> = [];
+    const picks: Array<{ id: string; savedName: string; deck: DeckEntry }> = [];
     for (const id of selectedIds) {
       const deck = decks[id];
       if (!deck) continue;
-      picks.push({ savedName: `${deck.name} (${deck.code})`, deck });
+      picks.push({ id, savedName: `${deck.name} (${deck.code})`, deck });
     }
     if (picks.length === 0) return;
 
@@ -184,7 +184,8 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
     let imported = 0;
     let skipped = 0;
     let refused = false;
-    for (const { savedName, deck } of picks) {
+    const importedIds = new Set<string>();
+    for (const { id, savedName, deck } of picks) {
       const saved = await attemptSavedDeckWrite("save", () =>
         savePreconDeck(savedName, deck, overwrite && conflictNames.has(savedName) ? "replace" : "keep"),
       );
@@ -196,6 +197,7 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
         skipped++;
         continue;
       }
+      importedIds.add(id);
       lastImported = savedName;
       imported++;
     }
@@ -203,8 +205,15 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
     const session = importSession.stateOf(started);
     if (lastImported) onImported(lastImported, session);
     if (refused) return;
+    // Drop only this batch's own picks, whether or not the modal that started it
+    // is still open — a reopened modal must not show the prior batch's picks as
+    // still checked, but must keep anything the user selected since reopening.
+    setSelectedIds((cur) => {
+      const next = new Set(cur);
+      for (const id of importedIds) next.delete(id);
+      return next;
+    });
     if (session === "open") {
-      clearSelection();
       onClose();
     }
     if (skipped > 0) {

@@ -356,6 +356,7 @@ Deck
     it("an import that finishes after the modal was closed and reopened leaves the reopened modal open", async () => {
       const user = userEvent.setup();
       const onImported = vi.fn();
+      const onClose = vi.fn();
       let releaseHolder!: () => void;
       const held = new Promise<void>((resolve) => {
         releaseHolder = resolve;
@@ -365,7 +366,7 @@ Deck
         expect((await navigator.locks.query()).held).toHaveLength(1);
       });
 
-      render(<Harness onImported={onImported} />);
+      render(<Harness onImported={onImported} onClose={onClose} />);
       await user.type(
         screen.getByPlaceholderText(/Paste deck list here/i),
         "Name: Paste Deck\n[Main]\n1 Sol Ring",
@@ -382,18 +383,20 @@ Deck
       releaseHolder();
       await holder;
       await waitFor(() => expect(onImported).toHaveBeenCalledWith("Paste Deck", ["Paste Deck"], "dismissed"));
+      expect(onClose).toHaveBeenCalledTimes(1);
       expect(screen.getByPlaceholderText(/Paste deck list here/i)).toHaveValue("second session");
     });
 
     it("a URL import dismissed while its fetch is pending leaves the reopened modal open", async () => {
       const user = userEvent.setup();
       const onImported = vi.fn();
+      const onClose = vi.fn();
       let releaseFetch!: (content: string) => void;
       mocks.fetchDeckFromUrl.mockImplementation(
         () => new Promise<string>((resolve) => { releaseFetch = resolve; }),
       );
 
-      render(<Harness onImported={onImported} />);
+      render(<Harness onImported={onImported} onClose={onClose} />);
       await user.click(screen.getByRole("button", { name: "From URL" }));
       await user.type(screen.getByPlaceholderText(/moxfield\.com\/decks/i), "https://moxfield.com/decks/abc");
       await user.click(screen.getByRole("button", { name: "Import" }));
@@ -406,6 +409,7 @@ Deck
       await waitFor(() =>
         expect(onImported).toHaveBeenCalledWith("URL Deck", ["URL Deck"], "dismissed"),
       );
+      expect(onClose).toHaveBeenCalledTimes(1);
       expect(screen.queryByPlaceholderText(/Paste deck list here/i)).not.toBeNull();
     });
 
@@ -462,11 +466,13 @@ Deck
 
       await user.click(screen.getByRole("button", { name: /cancel/i }));
       await user.click(screen.getByRole("button", { name: "reopen" }));
-      resolvers.forEach((r) => r(true));
-      await new Promise((r) => setTimeout(r, 20));
+      await act(async () => {
+        resolvers.forEach((r) => r(true));
+      });
 
       expect(screen.queryByLabelText("Oathbreaker")).not.toBeInTheDocument();
       expect(screen.getByPlaceholderText(/Paste deck list here/i)).toBeInTheDocument();
+      expect(signatureSpellSelectionPolicy).not.toHaveBeenCalled();
     });
   });
 });

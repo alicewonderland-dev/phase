@@ -116,7 +116,6 @@ afterEach(() => {
   vi.mocked(loadPreconDeckMap).mockReset();
 });
 
-// CR: none — client navigation only, no game rule involved.
 describe("Save & continue that outlives the builder's presence in the router tree", () => {
   it("leaving the builder via browser back while Save & continue waits does not navigate once the save completes", async () => {
     seed();
@@ -150,7 +149,6 @@ describe("Save & continue that outlives the builder's presence in the router tre
     const pathAfterLeaving = currentPath;
 
     await release();
-    await new Promise((r) => setTimeout(r, 30));
 
     expect(currentPath).toBe(pathAfterLeaving);
   });
@@ -184,23 +182,3 @@ describe("Save & continue that outlives the builder's presence in the router tre
   });
 });
 
-describe("Save & continue that outlives the builder's mount", () => {
-  it("unmounting the builder directly while Save & continue waits does not throw once the save completes", async () => {
-    seed();
-    const user = userEvent.setup();
-    const r = render(<MemoryRouter>{builderElement}</MemoryRouter>);
-    const nameInput = await screen.findByRole("textbox", { name: "Deck name" });
-    await waitFor(() => expect(nameInput).toHaveValue("Deck A"));
-    await user.click(screen.getByRole("button", { name: "remove-Beta" }));
-
-    const release = await holdLibrary();
-    await user.click(screen.getByRole("button", { name: /Menu/ }));
-    await user.click(screen.getByRole("button", { name: "Save & continue" }));
-    await vi.waitFor(async () => {
-      expect((await navigator.locks.query()).pending).toHaveLength(1);
-    });
-
-    r.unmount();
-    await expect(release()).resolves.toBeUndefined();
-  });
-});

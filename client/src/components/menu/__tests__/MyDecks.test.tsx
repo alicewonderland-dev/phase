@@ -1088,7 +1088,11 @@ describe("MyDecks", () => {
 
       release();
       await holder;
-      await new Promise((r) => setTimeout(r, 20));
+      await vi.waitFor(async () => {
+        const q = await navigator.locks.query();
+        expect(q.held).toHaveLength(0);
+        expect(q.pending).toHaveLength(0);
+      });
 
       expect(onSelectDeck.mock.calls).toEqual([["Mine"]]);
     });
@@ -1110,7 +1114,7 @@ describe("MyDecks", () => {
       await userEvent.click(screen.getByText("Mine"));
 
       release({});
-      await new Promise((r) => setTimeout(r, 20));
+      await waitFor(() => expect(screen.getByRole("button", { name: "Random Deck" })).toBeEnabled());
 
       expect(onSelectDeck.mock.calls).toEqual([["Mine"]]);
     });
@@ -1164,7 +1168,11 @@ describe("MyDecks", () => {
       await userEvent.keyboard("{Escape}");
       release();
       await holder;
-      await new Promise((r) => setTimeout(r, 20));
+      await vi.waitFor(async () => {
+        const q = await navigator.locks.query();
+        expect(q.held).toHaveLength(0);
+        expect(q.pending).toHaveLength(0);
+      });
 
       expect(onSelectDeck).not.toHaveBeenCalled();
       expect(await screen.findByText("Aggro Deck (SET)")).toBeInTheDocument();
@@ -1221,7 +1229,7 @@ describe("MyDecks", () => {
       await vi.waitFor(() => expect(onSelectDeck).toHaveBeenCalledWith("Aggro Deck (SET)"));
 
       releaseRandom({});
-      await new Promise((r) => setTimeout(r, 20));
+      await waitFor(() => expect(screen.getByRole("button", { name: "Random Deck" })).toBeEnabled());
 
       expect(onSelectDeck.mock.calls).toEqual([["Aggro Deck (SET)"]]);
     });
@@ -1264,7 +1272,11 @@ describe("MyDecks", () => {
       r.unmount();
       release();
       await holder;
-      await new Promise((res) => setTimeout(res, 20));
+      await vi.waitFor(async () => {
+        const q = await navigator.locks.query();
+        expect(q.held).toHaveLength(0);
+        expect(q.pending).toHaveLength(0);
+      });
 
       expect(onSelectDeck).not.toHaveBeenCalled();
     });

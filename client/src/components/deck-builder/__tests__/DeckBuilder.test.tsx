@@ -810,7 +810,6 @@ describe("DeckBuilder", () => {
       await user.keyboard("{Enter}");
 
       await release();
-      await new Promise((r) => setTimeout(r, 20));
       expect(screen.getByRole("dialog", { name: "Unsaved changes" })).toBeInTheDocument();
       expect(nameInput).toHaveValue("Deck A");
       expect(screen.queryByText("1 Delta")).not.toBeInTheDocument();

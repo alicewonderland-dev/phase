@@ -83,7 +83,7 @@ describe("PreconDeckModal", () => {
     await holder;
 
     await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(1));
-    expect(onImported).toHaveBeenCalledWith("Aggro Deck (SET)", "open");
+    await waitFor(() => expect(onImported).toHaveBeenCalledWith("Aggro Deck (SET)", "open"));
     const persisted = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "Aggro Deck (SET)") ?? "{}");
     expect(persisted.main).toEqual([{ name: "Mountain", count: 40 }]);
   });
@@ -186,8 +186,9 @@ describe("PreconDeckModal", () => {
       });
 
       render(<Harness onImported={onImported} onClose={onClose} />);
+      // Only Aggro is part of this batch — Control is left free so it can be
+      // picked after reopening without overlapping the batch's own ids.
       await userEvent.click(screen.getByRole("checkbox", { name: /select aggro deck/i }));
-      await userEvent.click(screen.getByRole("checkbox", { name: /select control deck/i }));
       await userEvent.click(screen.getByRole("button", { name: /Import \d+ selected/i }));
       await vi.waitFor(async () => {
         expect((await navigator.locks.query()).pending).toHaveLength(1);
@@ -195,13 +196,15 @@ describe("PreconDeckModal", () => {
 
       await userEvent.keyboard("{Escape}");
       await userEvent.click(screen.getByRole("button", { name: "reopen" }));
+      // A pick made after reopening, while the dismissed batch is still queued.
+      await userEvent.click(screen.getByRole("checkbox", { name: /select control deck/i }));
       releaseHolder();
       await holder;
 
       await waitFor(() => expect(onImported).toHaveBeenCalledTimes(1));
-      expect(onImported).toHaveBeenCalledWith("Control Deck (SET)", "dismissed");
+      expect(onImported).toHaveBeenCalledWith("Aggro Deck (SET)", "dismissed");
       expect(onClose).toHaveBeenCalledTimes(1);
-      expect(screen.getByRole("checkbox", { name: /select aggro deck/i })).toBeChecked();
+      expect(screen.getByRole("checkbox", { name: /select aggro deck/i })).not.toBeChecked();
       expect(screen.getByRole("checkbox", { name: /select control deck/i })).toBeChecked();
     });
 
@@ -212,10 +215,17 @@ describe("PreconDeckModal", () => {
       const onImported = vi.fn();
       const onClose = vi.fn();
 
+      let resolveDismissed!: () => void;
+      const dismissedP = new Promise<void>((resolve) => { resolveDismissed = resolve; });
       const holder = withSavedDeckLibrary(async (txn) => {
         await vi.waitFor(async () => {
           expect((await navigator.locks.query()).pending).toHaveLength(1);
         });
+        // Don't write until the test has dismissed the modal — otherwise this
+        // holder can settle the write and release the lock before the
+        // {Escape} keypress below has been dispatched, racing the assertion
+        // that a dismissed session skips the re-confirm.
+        await dismissedP;
         writeSavedDeckData(txn, "Aggro Deck (SET)", "HOLDER-DATA");
       });
       await vi.waitFor(async () => {
@@ -225,6 +235,7 @@ describe("PreconDeckModal", () => {
       render(<Harness onImported={onImported} onClose={onClose} />);
       await userEvent.click(screen.getByRole("button", { name: /^Aggro Deck/ }));
       await userEvent.keyboard("{Escape}");
+      resolveDismissed();
       await holder;
 
       // The save observed "kept-existing" (another writer claimed the name), but the
@@ -260,7 +271,7 @@ describe("PreconDeckModal", () => {
       await holder;
 
       await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(1));
-      expect(onImported).toHaveBeenCalledWith("Aggro Deck (SET)", "open");
+      await waitFor(() => expect(onImported).toHaveBeenCalledWith("Aggro Deck (SET)", "open"));
     });
   });
 });
