@@ -533,15 +533,7 @@ pub fn resolve_all(
                 let occurrence = state.active_return_result_occurrence.ok_or_else(|| {
                     EffectError::MissingParam("return result occurrence".to_string())
                 })?;
-                let frame = state
-                    .return_result_frames
-                    .get_mut(&occurrence)
-                    .ok_or_else(|| EffectError::MissingParam("return result frame".to_string()))?;
-                if frame.insert(result_id, Vec::new()).is_some() {
-                    return Err(EffectError::InvalidParam(
-                        "duplicate return result".to_string(),
-                    ));
-                }
+                super::publish_return_result(state, occurrence, result_id, Vec::new())?;
             }
             events.push(GameEvent::EffectResolved {
                 kind: EffectKind::from(&ability.effect),

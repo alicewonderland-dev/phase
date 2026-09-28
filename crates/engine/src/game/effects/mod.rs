@@ -32,8 +32,8 @@ use crate::types::game_state::{
     PendingContinuation, PendingCostMoveResume, PendingDiscardBatchCompletion,
     PendingPlayerScopeLinkedExile, PendingPlayerScopeSacrificeChoice,
     PendingPlayerScopeSacrificeCompletion, PendingPlayerScopeSacrificeFollowUp,
-    RepeatUntilStopWitness, ResolutionOptionalPaymentOption, WaitingFor, ZoneChangeRecord,
-    ZoneOpponentChooserPurpose,
+    RepeatUntilStopWitness, ResolutionOptionalPaymentOption, ReturnResultOccurrenceId, WaitingFor,
+    ZoneChangeRecord, ZoneOpponentChooserPurpose,
 };
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef, TrackedSetId};
 use crate::types::mana::ManaCost;
@@ -996,6 +996,76 @@ pub(crate) fn clear_return_result_frames_if_idle(state: &mut GameState) {
     {
         state.return_result_frames.clear();
     }
+}
+
+/// CR 608.2c: One instruction publishes its final zone-change result once in
+/// the occurrence that is resolving it. The empty result is present even when
+/// the instruction has no matching objects or its condition skips its action.
+pub(crate) fn publish_return_result(
+    state: &mut GameState,
+    occurrence_id: ReturnResultOccurrenceId,
+    result_id: crate::types::ability::ReturnResultId,
+    records: Vec<ZoneChangeRecord>,
+) -> Result<(), EffectError> {
+    let frame = state
+        .return_result_frames
+        .get_mut(&occurrence_id)
+        .ok_or_else(|| EffectError::MissingParam("return result frame".to_string()))?;
+    if frame.contains_key(&result_id) {
+        return Err(EffectError::InvalidParam(
+            "duplicate return result".to_string(),
+        ));
+    }
+    frame.insert(result_id, records);
+    Ok(())
+}
+
+fn publish_empty_return_result_for_active(
+    state: &mut GameState,
+    result_id: crate::types::ability::ReturnResultId,
+) -> Result<(), EffectError> {
+    let occurrence_id = state
+        .active_return_result_occurrence
+        .ok_or_else(|| EffectError::MissingParam("return result occurrence".to_string()))?;
+    publish_return_result(state, occurrence_id, result_id, Vec::new())
+}
+
+fn branch_declares_return_result(
+    ability: &ResolvedAbility,
+    result_id: crate::types::ability::ReturnResultId,
+) -> bool {
+    fn definition_declares_return_result(
+        definition: &AbilityDefinition,
+        result_id: crate::types::ability::ReturnResultId,
+    ) -> bool {
+        definition.declares_return_result == Some(result_id)
+            || definition
+                .sub_ability
+                .as_deref()
+                .is_some_and(|sub| definition_declares_return_result(sub, result_id))
+            || definition
+                .else_ability
+                .as_deref()
+                .is_some_and(|other| definition_declares_return_result(other, result_id))
+            || definition
+                .mode_abilities
+                .iter()
+                .any(|mode| definition_declares_return_result(mode, result_id))
+    }
+
+    ability.declares_return_result == Some(result_id)
+        || ability
+            .sub_ability
+            .as_deref()
+            .is_some_and(|sub| branch_declares_return_result(sub, result_id))
+        || ability
+            .else_ability
+            .as_deref()
+            .is_some_and(|other| branch_declares_return_result(other, result_id))
+        || ability
+            .mode_abilities
+            .iter()
+            .any(|mode| definition_declares_return_result(mode, result_id))
 }
 
 /// Clears replacement-scoped token facts only after the authoritative stack drains.
@@ -14846,6 +14916,20 @@ fn resolve_chain_body(
     // conditions relative to the scoped player.
     if let Some(ref condition) = ability.condition {
         if !evaluate_condition(condition, state, ability) {
+            // CR 608.2c: A skipped return instruction has a settled empty
+            // result. Publish before an independent following instruction can
+            // read it. An alternative branch declaring this SAME instruction
+            // result owns publication when it executes; publishing here too
+            // would falsely duplicate the one result of the printed action.
+            if let Some(result_id) = ability.declares_return_result {
+                if ability
+                    .else_ability
+                    .as_deref()
+                    .is_none_or(|other| !branch_declares_return_result(other, result_id))
+                {
+                    publish_empty_return_result_for_active(state, result_id)?;
+                }
+            }
             if let Some(ref else_branch) = ability.else_ability {
                 let mut else_resolved = else_branch.as_ref().clone();
                 if should_propagate_parent_targets(ability, &else_resolved) {
@@ -16962,6 +17046,20 @@ fn resolve_chain_body(
                     &events[events_before..],
                 );
             if !condition_met {
+                // CR 608.2c: This parent-side gate skips dispatching the sub
+                // entirely, so its own false-condition path cannot publish the
+                // empty result. Settle it before a later independent sibling
+                // reads it. An alternative that declares the same result owns
+                // the mutually exclusive publication instead.
+                if let Some(result_id) = sub.declares_return_result {
+                    if sub
+                        .else_ability
+                        .as_deref()
+                        .is_none_or(|other| !branch_declares_return_result(other, result_id))
+                    {
+                        publish_empty_return_result_for_active(state, result_id)?;
+                    }
+                }
                 // CR 608.2c: Execute else branch if present ("Otherwise, [effect]")
                 if let Some(ref else_branch) = sub.else_ability {
                     let mut else_resolved = else_branch.as_ref().clone();
@@ -17040,6 +17138,9 @@ fn resolve_chain_body(
                                         && sibling_resolved.else_ability.is_none()
                                 })
                             {
+                                if let Some(result_id) = sibling_resolved.declares_return_result {
+                                    publish_empty_return_result_for_active(state, result_id)?;
+                                }
                                 current = sibling.sub_ability.as_ref();
                                 continue;
                             }

@@ -1,10 +1,13 @@
 //! Instruction-local return results frozen into a next-upkeep delayed trigger.
 
+use std::sync::Arc;
+
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{
-    AbilityDefinition, AbilityKind, ChoiceType, DelayedTriggerCondition, Effect, PtValue,
-    QuantityExpr, ReplacementDefinition, TargetFilter, TargetRef, TargetSelectionMode,
+    AbilityCondition, AbilityDefinition, AbilityKind, ChoiceType, DelayedTriggerCondition, Effect,
+    PtValue, QuantityExpr, ReplacementDefinition, SubAbilityLink, TargetFilter, TargetRef,
+    TargetSelectionMode,
 };
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
@@ -23,6 +26,7 @@ const TWINCAST: &str =
     "Copy target instant or sorcery spell. You may choose new targets for the copy.";
 const INTERLEAVED_RETURNS: &str = "Choose target creature you own. Return each chosen creature to your hand. Choose target artifact you own. Return each chosen artifact to your hand. At the beginning of the next upkeep, create a 4/4 white Bird Soldier creature token with flying for each creature returned to your hand this way.";
 const DISTINCT_RETURN_READERS: &str = "Choose target creature you own. Return each chosen creature to your hand. Return target land you control to your hand. Choose target artifact you own. Return each chosen artifact to your hand. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each creature returned to your hand this way. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each artifact returned to your hand this way.";
+const CONDITIONAL_RETURN_WITNESS: &str = "Choose target creature you own. Return each chosen creature to your hand. At the beginning of the next upkeep, create a 4/4 white Bird Soldier creature token with flying for each creature returned to your hand this way.";
 
 fn bird_count(runner: &engine::game::scenario::GameRunner) -> usize {
     runner
@@ -114,6 +118,32 @@ fn delayed_return_reader_rejects_wrong_noun_destination_and_missing_producer() {
         assert!(matches!(&*cursor.effect, Effect::Unimplemented { .. }), "{oracle}: {cursor:#?}");
         assert!(cursor.reads_return_result.is_none());
     }
+}
+
+#[test]
+fn leading_conditional_chosen_return_remains_strict_unsupported() {
+    let oracle = CONDITIONAL_RETURN_WITNESS.replacen(
+        "Return each chosen creature to your hand.",
+        "If you control a Bird, return each chosen creature to your hand.",
+        1,
+    );
+    let parsed = parse_oracle_text(
+        &oracle,
+        "Leading Conditional Return Witness",
+        &[],
+        &["Instant".into()],
+        &[],
+    );
+    let mut node = &parsed.abilities[0];
+    let mut strict = false;
+    loop {
+        strict |= matches!(&*node.effect, Effect::Unimplemented { .. });
+        match node.sub_ability.as_deref() {
+            Some(next) => node = next,
+            None => break,
+        }
+    }
+    assert!(strict, "conditional return must not silently claim support");
 }
 
 #[test]
@@ -239,6 +269,100 @@ fn kicked_zero_and_two_returns_freeze_independent_token_counts() {
         runner.advance_until_stack_empty();
         assert_eq!(bird_count(&runner), chosen_count as usize);
         assert!(runner.state().delayed_triggers.is_empty());
+    }
+}
+
+#[test]
+fn skipped_return_publishes_empty_before_independent_delayed_reader() {
+    // The parser does not claim a leading conditional-return grammar here.
+    // Add a typed condition to its successfully parsed return instruction so
+    // the cast pipeline exercises a skipped producer followed by an independent
+    // delayed reader. The alternative case guards one-result publication when
+    // an else branch executes the same producer instead.
+    for (cast_zone, alternative_returns, expected_count) in [
+        (Zone::Hand, false, 1),
+        (Zone::Exile, false, 0),
+        (Zone::Exile, true, 1),
+    ] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::End);
+        scenario.with_library_top(P0, &["P0 Draw A", "P0 Draw B"]);
+        scenario.with_library_top(P1, &["P1 Draw A", "P1 Draw B"]);
+        let selected = scenario.add_creature(P0, "Selected Bear", 2, 2).id();
+        let spell = scenario
+            .add_spell_to_hand_from_oracle(
+                P0,
+                "Conditional Return Witness",
+                true,
+                CONDITIONAL_RETURN_WITNESS,
+            )
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let mut runner = scenario.build();
+        let object = runner.state_mut().objects.get_mut(&spell).unwrap();
+        let definitions = Arc::make_mut(&mut object.abilities);
+        let mut producer = definitions
+            .iter_mut()
+            .find(|definition| matches!(definition.kind, AbilityKind::Spell))
+            .expect("printed spell ability");
+        while producer.declares_return_result.is_none() {
+            producer = producer
+                .sub_ability
+                .as_deref_mut()
+                .expect("parsed chain must contain a return producer");
+        }
+        assert!(matches!(&*producer.effect, Effect::BounceAll { .. }));
+        assert!(
+            producer.else_ability.is_none(),
+            "return producer already has an alternative: {:?}",
+            producer.else_ability
+        );
+        assert_eq!(
+            producer.sub_ability.as_ref().map(|sub| sub.sub_link),
+            Some(SubAbilityLink::SequentialSibling),
+            "the delayed reader must remain independent of the return gate"
+        );
+        assert!(
+            producer.sub_ability.as_ref().unwrap().condition.is_none(),
+            "delayed reader unexpectedly has a gate: {:?}",
+            producer.sub_ability.as_ref().unwrap().condition
+        );
+        if alternative_returns {
+            producer.else_ability = Some(Box::new(producer.clone()));
+        }
+        producer.condition = Some(AbilityCondition::WasCast {
+            zone: Some(cast_zone),
+        });
+        object.base_abilities = object.abilities.clone();
+        let outcome = runner.cast(spell).target_object(selected).resolve();
+        outcome.assert_zone(
+            &[selected],
+            if expected_count == 0 {
+                Zone::Battlefield
+            } else {
+                Zone::Hand
+            },
+        );
+        assert_eq!(
+            outcome.state().delayed_triggers.len(),
+            1,
+            "cast zone {cast_zone:?}, alternative {alternative_returns}"
+        );
+        assert!(matches!(
+            &outcome.state().delayed_triggers[0].ability.effect,
+            Effect::Token {
+                count: QuantityExpr::Fixed { value },
+                ..
+            } if *value == expected_count
+        ));
+        runner.advance_to_phase(Phase::Upkeep);
+        runner.advance_until_stack_empty();
+        assert_eq!(bird_count(&runner), expected_count as usize);
+        assert!(runner.state().delayed_triggers.is_empty());
+        runner.advance_to_phase(Phase::Draw);
+        runner.advance_to_phase(Phase::Upkeep);
+        runner.advance_until_stack_empty();
+        assert_eq!(bird_count(&runner), expected_count as usize);
     }
 }
 

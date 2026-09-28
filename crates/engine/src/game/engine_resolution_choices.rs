@@ -8917,14 +8917,8 @@ pub(crate) fn run_batch_completion(
             settled_records,
         } => {
             let records = settled_records.expect("zone result completion must be settled");
-            let frame = state
-                .return_result_frames
-                .get_mut(&occurrence_id)
-                .expect("zone result completion names a live resolution occurrence");
-            assert!(
-                frame.insert(result_id, records).is_none(),
-                "one return instruction publishes exactly once per occurrence"
-            );
+            effects::publish_return_result(state, occurrence_id, result_id, records)
+                .expect("zone result completion publishes once into a live occurrence");
             crate::game::zone_pipeline::BatchMoveResult::Done
         }
         BatchCompletion::MilledDeliveryComplete { player_id, cards } => {
