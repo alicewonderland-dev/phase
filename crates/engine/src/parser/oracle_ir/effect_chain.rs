@@ -1585,8 +1585,8 @@ mod tests {
     use crate::types::ability::{Duration, Effect};
 
     #[test]
-    fn chosen_return_ir_links_the_named_producer_and_exact_last_return() {
-        let text = "Choose target creature you own. Choose target creature of an opponent's choice. Return each creature you chose to its owner's hand. Return each creature that opponent chose to its owner's hand. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each creature returned to its owner's hand this way.";
+    fn chosen_return_ir_links_the_matching_producer_past_an_unrelated_return() {
+        let text = "Choose target creature you own. Return each chosen creature to your hand. Choose target artifact you own. Return each chosen artifact to your hand. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each creature returned to your hand this way.";
         let ir = crate::parser::oracle_effect::parse_effect_chain_ir(
             text,
             AbilityKind::Spell,
@@ -1594,14 +1594,39 @@ mod tests {
         );
         let clauses = &ir.clauses;
         assert_eq!(clauses.len(), 5, "{clauses:#?}");
-        let first = clauses[0].declares_chosen_clause.expect("first producer");
-        let second = clauses[1].declares_chosen_clause.expect("second producer");
+        let first = clauses[0]
+            .declares_chosen_clause
+            .expect("creature producer");
+        let second = clauses[2]
+            .declares_chosen_clause
+            .expect("artifact producer");
         assert_ne!(first, second);
-        assert_eq!(clauses[2].reads_chosen_clause, Some(first));
+        assert_eq!(clauses[1].reads_chosen_clause, Some(first));
         assert_eq!(clauses[3].reads_chosen_clause, Some(second));
-        assert_eq!(clauses[4].reads_return_result, Some(clauses[3].id));
+        assert_eq!(clauses[4].reads_return_result, Some(clauses[1].id));
         assert!(matches!(
             clauses[4].parsed.effect,
+            Effect::CreateDelayedTrigger { .. }
+        ));
+    }
+
+    #[test]
+    fn returned_to_owners_hand_reader_stays_strict_without_recipient_support() {
+        let text = "Choose target creature you own. Return each chosen creature to its owner's hand. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each creature returned to its owner's hand this way.";
+        let ir = crate::parser::oracle_effect::parse_effect_chain_ir(
+            text,
+            AbilityKind::Spell,
+            &mut crate::parser::oracle_effect::ParseContext::default(),
+        );
+        let clauses = &ir.clauses;
+        assert_eq!(clauses.len(), 3, "{clauses:#?}");
+        assert_eq!(
+            clauses[1].reads_chosen_clause,
+            clauses[0].declares_chosen_clause
+        );
+        assert!(clauses[2].reads_return_result.is_none());
+        assert!(matches!(
+            clauses[2].parsed.effect,
             Effect::Unimplemented { .. }
         ));
     }
@@ -1627,7 +1652,7 @@ mod tests {
     }
 
     #[test]
-    fn eagles_ir_keeps_exact_return_link_and_one_delayed_strict_marker() {
+    fn eagles_ir_keeps_exact_return_link_and_supported_delayed_token() {
         let text = "Choose target creature you own. If this spell was kicked, instead choose any number of target creatures you own. Return each chosen creature to your hand. At the beginning of the next upkeep, create a 4/4 white Bird Soldier creature token with flying for each creature returned to your hand this way.";
         let ir = crate::parser::oracle_effect::parse_effect_chain_ir(
             text,
@@ -1640,14 +1665,22 @@ mod tests {
         assert_eq!(clauses[1].declares_chosen_clause, Some(producer));
         assert_eq!(clauses[2].reads_chosen_clause, Some(producer));
         assert_eq!(clauses[3].reads_return_result, Some(clauses[2].id));
-        assert_eq!(
-            clauses
-                .iter()
-                .filter(|clause| matches!(clause.parsed.effect, Effect::Unimplemented { .. }))
-                .count(),
-            1,
-            "the delayed result consumer is the sole strict boundary"
-        );
+        assert!(clauses
+            .iter()
+            .all(|clause| !matches!(clause.parsed.effect, Effect::Unimplemented { .. })));
+        let Effect::CreateDelayedTrigger {
+            condition, effect, ..
+        } = &clauses[3].parsed.effect
+        else {
+            panic!("expected supported delayed trigger: {:#?}", clauses[3]);
+        };
+        assert!(matches!(
+            condition,
+            DelayedTriggerCondition::AtNextPhase {
+                phase: crate::types::phase::Phase::Upkeep
+            }
+        ));
+        assert!(matches!(&*effect.effect, Effect::Token { .. }));
     }
 
     /// CR 608.2c + CR 611.2a: `ClauseDraft::push` stamps the sentence's leading
