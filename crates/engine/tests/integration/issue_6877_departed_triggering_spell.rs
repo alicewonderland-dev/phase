@@ -10,7 +10,9 @@ use engine::game::scenario_db::GameScenarioDbExt;
 use engine::types::ability::TargetRef;
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
-use engine::types::game_state::{CastPaymentMode, GameState, WaitingFor};
+use engine::types::game_state::{
+    CastPaymentMode, GameState, StackEntryKind, SyntheticTriggerProvenance, WaitingFor,
+};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaColor, ManaType, ManaUnit};
 use engine::types::phase::Phase;
@@ -63,6 +65,15 @@ fn spells_cast_count(state: &GameState, player: PlayerId) -> usize {
         .spells_cast_this_turn_by_player
         .get(&player)
         .map_or(0, |records| records.len())
+}
+
+fn spells_cast_count_named(state: &GameState, player: PlayerId, name: &str) -> usize {
+    state
+        .spells_cast_this_turn_by_player
+        .get(&player)
+        .map_or(0, |records| {
+            records.iter().filter(|r| r.name == name).count()
+        })
 }
 
 /// Drive `act()` through cast setup (targeting, mana payment, modal face
@@ -597,6 +608,163 @@ fn older_trigger_copies_its_own_cast_not_a_later_recast() {
         }
         other => panic!("expected CopyRetarget for the old trigger's win, got {other:?}"),
     }
+}
+
+/// CR 702.40a + CR 113.7a + CR 400.7: the same card cast twice in one step
+/// while its own first Storm trigger still waits — the OLDER Storm trigger's
+/// copy must carry the OLDER cast's target, never the newer recast's, even
+/// though both casts share the same storage object id.
+#[test]
+fn older_storm_trigger_copies_its_own_cast_not_a_later_recast() {
+    let mut scenario = GameScenario::new_n_player(2, 0);
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_creature_from_oracle(P0, "Krark 0", 2, 2, KRARK);
+    for i in 0..8 {
+        scenario.add_spell_to_library_top(P0, &format!("Library P0 {i}"), true);
+    }
+    for i in 0..8 {
+        scenario.add_spell_to_library_top(P1, &format!("Library P1 {i}"), true);
+    }
+    // A creature spell, not instant/sorcery, so Krark's own trigger does not
+    // fire on it — only its cast counts toward Storm's copy count.
+    let filler_spell = scenario
+        .add_creature_to_hand(P0, "Filler Creature", 1, 1)
+        .id();
+    let brain_freeze = scenario
+        .add_spell_to_hand(P0, "Brain Freeze", true)
+        .from_oracle_text_with_keywords(&["Storm"], BRAIN_FREEZE)
+        .id();
+    scenario.with_mana_pool(P0, floating_mana(10, ManaType::Colorless));
+    let mut runner = scenario.build();
+    let krark = krark_id(&runner, "Krark 0");
+
+    commit_cast(&mut runner, filler_spell, None);
+    let _ = drive(&mut runner, &Drive::new());
+
+    // First cast: Brain Freeze -> P1. Krark preferred to resolve first, so its
+    // own (first) Storm trigger is left waiting below it.
+    commit_cast(&mut runner, brain_freeze, Some(TargetRef::Player(P1)));
+    order_triggers(&mut runner, Some(krark));
+    assert_eq!(
+        runner.state().stack.len(),
+        3,
+        "spell plus Krark's trigger plus its own (first) Storm trigger: {:?}",
+        runner.state().stack
+    );
+
+    reseed(&mut runner, 1);
+    let lose_events = drive(&mut runner, &Drive::new().prefer(krark));
+    assert!(saw_coin(&lose_events, false), "{lose_events:?}");
+    assert_eq!(
+        runner.state().objects[&brain_freeze].zone,
+        Zone::Hand,
+        "Krark's lose must bounce the first Brain Freeze cast to hand"
+    );
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "only the first ('old') Storm trigger should remain: {:?}",
+        runner.state().stack
+    );
+
+    // Recast the same Brain Freeze object -> P0, while the older Storm
+    // trigger still waits.
+    commit_cast(&mut runner, brain_freeze, Some(TargetRef::Player(P0)));
+    order_triggers(&mut runner, Some(krark));
+    assert_eq!(
+        runner.state().stack.len(),
+        4,
+        "recast plus Krark's new trigger plus a new Storm trigger, above the \
+         older waiting Storm trigger: {:?}",
+        runner.state().stack
+    );
+    assert_eq!(
+        spells_cast_count_named(runner.state(), P0, "Brain Freeze"),
+        2,
+        "reach guard: two SpellCast events for the one object id"
+    );
+
+    reseed(&mut runner, 1);
+    let new_lose_events = drive(&mut runner, &Drive::new().prefer(krark));
+    assert!(saw_coin(&new_lose_events, false), "{new_lose_events:?}");
+    assert_eq!(
+        runner.state().objects[&brain_freeze].zone,
+        Zone::Hand,
+        "Krark's lose must bounce the second Brain Freeze cast to hand"
+    );
+    assert_eq!(
+        runner.state().stack.len(),
+        2,
+        "the new Storm trigger and the older Storm trigger remain: {:?}",
+        runner.state().stack
+    );
+
+    // Reach guard: both remaining entries are Storm-provenance triggers
+    // sharing the one Brain Freeze object id, not e.g. leftover Krark
+    // triggers or a TriggeringSource shape.
+    let storm_entries = runner
+        .state()
+        .stack
+        .iter()
+        .filter(|entry| {
+            entry.source_id == brain_freeze
+                && matches!(
+                    &entry.kind,
+                    StackEntryKind::TriggeredAbility {
+                        provenance: Some(SyntheticTriggerProvenance::Storm { .. }),
+                        ..
+                    }
+                )
+        })
+        .count();
+    assert_eq!(
+        storm_entries,
+        2,
+        "reach guard: two Storm-provenance triggers must be waiting: {:?}",
+        runner.state().stack
+    );
+
+    // The newer Storm trigger is on top and resolves first; keep its target.
+    let new_storm_events = drive(&mut runner, &Drive::new().keep_retargets());
+    assert!(
+        saw_spell_copied(&new_storm_events),
+        "the newer Storm trigger must copy its own (newer) cast: {new_storm_events:?}"
+    );
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "only the OLDER Storm trigger should remain: {:?}",
+        runner.state().stack
+    );
+
+    // Finally the OLDER Storm trigger resolves. It must copy the FIRST
+    // cast's record (target P1) — never the highest (most recent) departed
+    // record, which would be the second cast's (target P0).
+    let lib_before_p1 = library_len(runner.state(), P1);
+    let _ = drive(&mut runner, &Drive::new());
+    match &runner.state().waiting_for {
+        WaitingFor::CopyRetarget { target_slots, .. } => {
+            assert_eq!(
+                target_slots[0].current,
+                Some(TargetRef::Player(P1)),
+                "the OLDER Storm trigger's pin must read the OLDER cast's \
+                 departed record, not the highest (most recent) one"
+            );
+        }
+        other => {
+            panic!("expected CopyRetarget for the older Storm trigger's resolution, got {other:?}")
+        }
+    }
+    runner
+        .act(GameAction::KeepAllCopyTargets)
+        .expect("KeepAllCopyTargets must succeed for the older Storm trigger's copy");
+    let _ = drive(&mut runner, &Drive::new());
+    assert_eq!(
+        library_len(runner.state(), P1),
+        lib_before_p1.saturating_sub(3),
+        "the OLDER Storm copy must have resolved against the older cast's \
+         target (P1), milling 3 as Brain Freeze's own effect does"
+    );
 }
 
 // ---------------------------------------------------------------------------
