@@ -115,6 +115,13 @@ export const DRAFT_OFFLINE_ERROR = "offline.startUnavailable";
 export type GuestDraftResumeOutcome = "resumed" | "absent" | "invalid" | "failed" | "offline" | "superseded";
 
 /**
+ * How a `hostDraft` / `joinDraft` attempt settled. `"superseded"`: the attempt
+ * no longer owned the pod session when it settled, so the store's state is not
+ * its result and the caller must not act on it.
+ */
+export type DraftSessionOpenOutcome = "opened" | "failed" | "superseded";
+
+/**
  * The pod SESSION's phase.
  *
  * Every member is the projection of an engine or adapter session status — the
@@ -341,10 +348,10 @@ interface MultiplayerDraftActions {
   /** Dismiss the current phase-scoped error banner. */
   clearError: () => void;
   /** Host: create a new draft pod and start accepting guests. */
-  /** `true` only after the current adapter initialized and remains owned. */
-  hostDraft: (config: DraftPodHostConfig) => Promise<boolean>;
+  /** `"opened"` only after the current adapter initialized and remains owned. */
+  hostDraft: (config: DraftPodHostConfig) => Promise<DraftSessionOpenOutcome>;
   /** Guest: join an existing draft pod by room code. */
-  joinDraft: (config: DraftPodGuestConfig) => Promise<boolean>;
+  joinDraft: (config: DraftPodGuestConfig) => Promise<DraftSessionOpenOutcome>;
   /** Reconnect exclusively through the persisted capability, never `draft_join`. */
   resumeDraft: (options?: { routeToken?: number; signal?: AbortSignal }) => Promise<GuestDraftResumeOutcome>;
   /** Host: start the draft once the pod is ready. */
@@ -1593,7 +1600,7 @@ export const useMultiplayerDraftStore = create<
   hostDraft: async (config) => {
     if (getEffectiveOffline()) {
       set({ error: DRAFT_OFFLINE_ERROR });
-      return false;
+      return "failed";
     }
     const epoch = ++draftAdapterEpoch;
     const previous = detachDraftAdapters();
@@ -1601,13 +1608,13 @@ export const useMultiplayerDraftStore = create<
     retainDraftSessionTeardown(previous.hostPersistenceId, previousTeardown);
     if (previous.host || previous.guest) await previousTeardown;
     if (config.persistenceId) await claimDraftSessionOwner(config.persistenceId);
-    if (epoch !== draftAdapterEpoch || config.signal?.aborted) return false;
+    if (epoch !== draftAdapterEpoch || config.signal?.aborted) return "superseded";
     if (getEffectiveOffline()) {
       // Replacement teardown was authorized before connectivity changed. This
       // epoch now owns the detached lifecycle, so it must not leave the prior
       // role/phase live after declining to construct its successor.
       set({ ...initialState, error: DRAFT_OFFLINE_ERROR });
-      return false;
+      return "failed";
     }
 
     const generation = beginDraftLifecycle();
@@ -1648,7 +1655,7 @@ export const useMultiplayerDraftStore = create<
     try {
       await adapter.initialize({ ...config, signal: lifecycleSignal(controller) });
       initialized = true;
-      if (activeHostAdapter !== adapter || epoch !== draftAdapterEpoch) return false;
+      if (activeHostAdapter !== adapter || epoch !== draftAdapterEpoch) return "superseded";
       if (config.persistenceId) {
         const view = get().view;
         const phase = view ? activePhaseForDraftViewStatus(view.status) ?? "lobby" : "lobby";
@@ -1665,7 +1672,7 @@ export const useMultiplayerDraftStore = create<
           updatedAt: Date.now(),
         });
       }
-      return true;
+      return "opened";
     } catch {
       // The adapter reports the error while it is current. A late failure is
       // deliberately silent: its event gate was detached by the new owner.
@@ -1687,26 +1694,26 @@ export const useMultiplayerDraftStore = create<
         }
       }
     }
-    return false;
+    return epoch === draftAdapterEpoch && generation === lifecycleGeneration ? "failed" : "superseded";
   },
 
   joinDraft: async (config) => {
     if (getEffectiveOffline()) {
       set({ error: DRAFT_OFFLINE_ERROR });
-      return false;
+      return "failed";
     }
     const epoch = ++draftAdapterEpoch;
     const previous = detachDraftAdapters();
     const previousTeardown = disposeDetachedDraftAdapters(previous, true);
     retainDraftSessionTeardown(previous.hostPersistenceId, previousTeardown);
     if (previous.host || previous.guest) await previousTeardown;
-    if (epoch !== draftAdapterEpoch || config.signal?.aborted) return false;
+    if (epoch !== draftAdapterEpoch || config.signal?.aborted) return "superseded";
     if (getEffectiveOffline()) {
       // See hostDraft: this current replacement owns the already-detached
       // lifecycle and must publish an idle offline state rather than a phantom
       // connecting/lobby owner with no adapter.
       set({ ...initialState, error: DRAFT_OFFLINE_ERROR });
-      return false;
+      return "failed";
     }
 
     const generation = beginDraftLifecycle();
@@ -1745,7 +1752,7 @@ export const useMultiplayerDraftStore = create<
     try {
       await adapter.initialize({ ...config, signal: lifecycleSignal(controller) });
       initialized = true;
-      if (activeGuestAdapter === adapter && epoch === draftAdapterEpoch) return true;
+      if (activeGuestAdapter === adapter && epoch === draftAdapterEpoch) return "opened";
     } catch {
       // See hostDraft: only the current owner is allowed to project errors.
     } finally {
@@ -1765,7 +1772,7 @@ export const useMultiplayerDraftStore = create<
         }
       }
     }
-    return false;
+    return epoch === draftAdapterEpoch && generation === lifecycleGeneration ? "failed" : "superseded";
   },
 
   resumeDraft: async (options = {}) => {
@@ -1790,6 +1797,10 @@ export const useMultiplayerDraftStore = create<
     const isCurrent = () => resumeGuestDraftAttempt === attempt && !options.signal?.aborted;
     attempt.promise = (async (): Promise<GuestDraftResumeOutcome> => {
       if (options.signal?.aborted) return "superseded";
+      // A guest session this tab already holds is never replaced: `joinDraft`
+      // disposes it to reconnect. `error` stays recoverable through this path.
+      const { role, phase } = get();
+      if (role === "guest" && phase !== "idle" && phase !== "error") return "resumed";
       const active = inspectActiveDraftGuest();
       if (active.type === "absent") return "absent";
       if (active.type === "invalid") {
@@ -1841,8 +1852,8 @@ export const useMultiplayerDraftStore = create<
         draftToken: session.draftToken,
         signal: options.signal,
       });
-      if (!isCurrent()) return "superseded";
-      if (joined) return "resumed";
+      if (!isCurrent() || joined === "superseded") return "superseded";
+      if (joined === "opened") return "resumed";
       if (getEffectiveOffline()) {
         set({ error: DRAFT_OFFLINE_ERROR });
         return "offline";

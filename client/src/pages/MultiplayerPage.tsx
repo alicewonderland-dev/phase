@@ -53,10 +53,12 @@ import {
 } from "../stores/multiplayerStore";
 import { DEFAULT_MULTIPLAYER_SERVER_URL, OFFICIAL_MULTIPLAYER_SERVER_URL } from "../config/multiplayerServer";
 import {
+  DRAFT_OFFLINE_ERROR,
   isMultiplayerDraftPodLive,
   useMultiplayerDraftStore,
-  type MultiplayerDraftPhase,
+  type DraftSessionOpenOutcome,
 } from "../stores/multiplayerDraftStore";
+import { assertNever } from "../utils/assertNever";
 import { useGameStore, saveActiveGame } from "../stores/gameStore";
 import { useCardDataStore } from "../stores/cardDataStore";
 import { useEffectiveOffline } from "../stores/connectivityStore";
@@ -71,7 +73,7 @@ type BuildUpdateDialog =
   | { status: "manual"; link: ActionableBotLink; arrival: number };
 
 function parseViewParam(value: string | null): MultiplayerView {
-  if (value === "host-setup" || value === "deck-select" || value === "draft-lobby") return value;
+  if (value === "host-setup" || value === "deck-select") return value;
   return "lobby";
 }
 
@@ -119,7 +121,7 @@ export function MultiplayerPage() {
   ));
 
   useEffect(() => {
-    if (!effectiveOffline || view === "draft-lobby" || view === "lobby") return;
+    if (!effectiveOffline || view === "lobby") return;
     setView("lobby");
   }, [effectiveOffline, view]);
 
@@ -162,8 +164,6 @@ function MultiplayerPageContent({
   const startP2PHostingSession = useMultiplayerStore((s) => s.startP2PHostingSession);
   const showToast = useMultiplayerStore((s) => s.showToast);
 
-  const draftPhase = useMultiplayerDraftStore((s) => s.phase);
-  const draftRoomCode = useMultiplayerDraftStore((s) => s.roomCode);
   const joinDraft = useMultiplayerDraftStore((s) => s.joinDraft);
   const leaveDraft = useMultiplayerDraftStore((s) => s.leave);
 
@@ -413,8 +413,7 @@ function MultiplayerPageContent({
   const resolveGuestFromStore = useMultiplayerStore((s) => s.resolveGuest);
   const lookupJoinTargetFromStore = useMultiplayerStore((s) => s.lookupJoinTarget);
 
-  // The single user-driven reload site; never reloads a live game (a draft-pod
-  // lobby renders on this page).
+  // The single user-driven reload site; never reloads a live game.
   const reloadOrToast = useCallback(() => {
     if (!reloadIfNoLiveGame()) showToast(t("page.refreshAfterGame"));
   }, [showToast, t]);
@@ -740,15 +739,39 @@ function MultiplayerPageContent({
       }
       const roomCode = await resolveP2PDialTarget(code, origin, password);
       if (roomCode === null) return;
+      // A pod session started during the broker round trip is newer than
+      // this click, and `joinDraft` would replace it.
+      if (isMultiplayerDraftPodLive(useMultiplayerDraftStore.getState())) return;
       const playerName = useMultiplayerStore.getState().displayName ?? "Player";
+      let outcome: DraftSessionOpenOutcome;
       try {
-        await joinDraft({ kind: "new", roomCode, displayName: playerName });
-        setView("draft-lobby");
+        outcome = await joinDraft({ kind: "new", roomCode, displayName: playerName });
       } catch {
         showToast(t("page.failedToJoinDraft"));
+        return;
+      }
+      switch (outcome) {
+        case "opened":
+          // `entry=guest`: a reload of `/draft-pod` then recovers this guest
+          // seat, never a saved hosted pod.
+          navigate("/draft-pod?entry=guest");
+          return;
+        case "superseded":
+          return;
+        case "failed": {
+          const { error } = useMultiplayerDraftStore.getState();
+          // `true`: a failed join must not erase this browser's saved hosted pod.
+          void leaveDraft(true);
+          showToast(
+            error !== null && error !== DRAFT_OFFLINE_ERROR ? error : t("page.failedToJoinDraft"),
+          );
+          return;
+        }
+        default:
+          assertNever(outcome);
       }
     },
-    [joinDraft, resolveP2PDialTarget, showToast, t],
+    [joinDraft, leaveDraft, navigate, resolveP2PDialTarget, showToast, t],
   );
 
   const handleSpectate = useCallback(
@@ -1041,11 +1064,6 @@ function MultiplayerPageContent({
       setView("lobby");
       return;
     }
-    if (view === "draft-lobby") {
-      void leaveDraft();
-      setView("lobby");
-      return;
-    }
     navigate("/");
   };
 
@@ -1067,20 +1085,16 @@ function MultiplayerPageContent({
       ? t("page.titleLobby")
       : view === "host-setup"
         ? t("page.titleHostSetup")
-        : view === "draft-lobby"
-          ? t("page.titleDraftLobby")
-          : t("page.titleDeckSelect");
+        : t("page.titleDeckSelect");
 
   const description =
     view === "lobby"
       ? t("page.descriptionLobby")
       : view === "host-setup"
         ? t("page.descriptionHostSetup")
-        : view === "draft-lobby"
-          ? t("page.descriptionDraftLobby")
-          : selectedFormat
-            ? t("page.descriptionDeckSelectFormat", { format: selectedFormat })
-            : t("page.descriptionDeckSelect");
+        : selectedFormat
+          ? t("page.descriptionDeckSelectFormat", { format: selectedFormat })
+          : t("page.descriptionDeckSelect");
 
   return (
     <div className="menu-scene relative flex min-h-screen flex-col overflow-hidden">
@@ -1210,17 +1224,6 @@ function MultiplayerPageContent({
                   ? t("deckLegalityChip.checkingLegality")
                   : undefined
             }
-          />
-        )}
-
-        {view === "draft-lobby" && (
-          <DraftLobbyPanel
-            phase={draftPhase}
-            roomCode={draftRoomCode}
-            onLeave={() => {
-              void leaveDraft();
-              setView("lobby");
-            }}
           />
         )}
 
@@ -1360,89 +1363,6 @@ function MultiplayerOfflineUnavailable({ onHome }: { onHome: () => void }) {
         </MenuPanel>
       </MenuShell>
     </div>
-  );
-}
-
-// ── Draft Lobby Panel ─────────────────────────────────────────────────
-//
-// Minimal inline panel shown when the user has joined (as guest) a
-// multiplayer draft pod. Displays connection status, room code, and a
-// leave button. The full draft UI lives on the DraftPage; this panel is
-// a holding area while waiting in the pod lobby.
-
-function DraftLobbyPanel({
-  phase,
-  roomCode,
-  onLeave,
-}: {
-  phase: MultiplayerDraftPhase;
-  roomCode: string | null;
-  onLeave: () => void;
-}) {
-  const { t } = useTranslation("multiplayer");
-  const seats = useMultiplayerDraftStore((s) => s.seats);
-  const joined = useMultiplayerDraftStore((s) => s.joined);
-  const total = useMultiplayerDraftStore((s) => s.total);
-  const error = useMultiplayerDraftStore((s) => s.error);
-
-  return (
-    <MenuPanel className="relative z-10 flex w-full max-w-3xl flex-col gap-5 px-5 py-6">
-      <div className="flex items-center justify-between">
-        <div className="text-[0.68rem] uppercase tracking-[0.22em] text-slate-500">
-          {t("draftLobbyPanel.draftPod")}
-        </div>
-        {roomCode && (
-          <span className="rounded-[6px] border border-white/10 bg-black/25 px-2.5 py-0.5 font-mono text-xs tracking-wider text-purple-300">
-            {roomCode}
-          </span>
-        )}
-      </div>
-
-      {phase === "connecting" && (
-        <div className="text-sm text-slate-400">{t("draftLobbyPanel.connecting")}</div>
-      )}
-
-      {phase === "error" && (
-        <div className="rounded-[10px] border border-rose-400/20 bg-rose-500/[0.07] px-4 py-3 text-sm text-rose-200 shadow-[0_8px_22px_rgba(0,0,0,0.18)] backdrop-blur-sm">
-          {error ?? t("draftLobbyPanel.connectionFailed")}
-        </div>
-      )}
-
-      {(phase === "lobby" || phase === "connecting") && total > 0 && (
-        <div className="flex flex-col gap-3">
-          <div className="text-sm text-slate-300">
-            {t("draftLobbyPanel.playersJoined", { joined, total })}
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {seats.map((seat, i) => (
-              <div
-                key={i}
-                className={`rounded-lg border px-3 py-1.5 text-xs ${
-                  seat.display_name
-                    ? "border-purple-400/20 bg-purple-500/[0.07] text-purple-200"
-                    : "border-white/8 bg-black/16 text-slate-500"
-                }`}
-              >
-                {seat.display_name || t("draftLobbyPanel.seat", { number: i + 1 })}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {phase === "drafting" && (
-        <div className="text-sm text-emerald-300">
-          {t("draftLobbyPanel.draftInProgress")}
-        </div>
-      )}
-
-      <button
-        onClick={onLeave}
-        className={menuButtonClass({ tone: "neutral", size: "sm" })}
-      >
-        {t("draftLobbyPanel.leaveDraft")}
-      </button>
-    </MenuPanel>
   );
 }
 
