@@ -480,7 +480,7 @@ function seatDecksFor(view: DraftPlayerView, localSeat = 0): CommanderSeatDecks 
  * does — by driving the real `hostDraft` against the mocked host adapter —
  * then publishes a completed Commander pod over it.
  */
-async function installCompletedPod(view: DraftPlayerView, localSeat = 0) {
+async function installCompletedPod(view: DraftPlayerView, localSeat = 0, signal?: AbortSignal) {
   await useMultiplayerDraftStore.getState().hostDraft({
     poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
     kind: "CommanderDraft",
@@ -488,6 +488,7 @@ async function installCompletedPod(view: DraftPlayerView, localSeat = 0) {
     hostDisplayName: "Host",
     tournamentFormat: "Swiss",
     podPolicy: "Competitive",
+    signal,
   });
   useMultiplayerDraftStore.setState({
     phase: "complete",
@@ -1440,12 +1441,10 @@ describe("multiplayerDraftStore Commander launch", () => {
 
   /**
    * The next fence down: no launch is in flight here, so `leave` parks on its
-   * own pod adapter's `dispose` instead of on `abandonCommanderBringUp`.
-   * `preserveSession` is what tells the two dispose calls a stale adapter can
-   * receive apart — `leave`'s own (`false`, gated below) and `hostDraft`'s
-   * defensive teardown of a still-live previous adapter (`true`, on B's own
-   * open) — so B's own open can run to completion before the gate is
-   * released instead of parking on the same call it is gating.
+   * own pod adapter's `dispose` instead of on `abandonCommanderBringUp`. The
+   * route the leaving pod was opened on is aborted during that wait, which
+   * detaches it, so B has no previous adapter to wait on and opens before the
+   * gate is released.
    */
   it("does not strand a session opened while the leaving session's own pod adapter is disposing", async () => {
     let releaseXDispose!: () => void;
@@ -1457,8 +1456,9 @@ describe("multiplayerDraftStore Commander launch", () => {
     });
     const bAdapter = freshHostAdapter();
     mockHostAdapterQueue.push(xAdapter, bAdapter);
+    const route = new AbortController();
 
-    await installCompletedPod(commanderView(4));
+    await installCompletedPod(commanderView(4), 0, route.signal);
     const leaving = useMultiplayerDraftStore.getState().leave(false);
     let snapshot: Pick<ReturnType<typeof useMultiplayerDraftStore.getState>, "role" | "phase" | "view">;
     try {
@@ -1468,6 +1468,7 @@ describe("multiplayerDraftStore Commander launch", () => {
 
       // B, a wholly separate pod, opens and fully settles while the leaving
       // session's own `leave` is still parked disposing its own adapter.
+      route.abort();
       await installCompletedPod(commanderView(3));
       snapshot = {
         role: useMultiplayerDraftStore.getState().role,
@@ -1481,6 +1482,7 @@ describe("multiplayerDraftStore Commander launch", () => {
     }
     await leaving;
 
+    expect(xAdapter.dispose).toHaveBeenCalledOnce();
     expect(bAdapter.dispose).not.toHaveBeenCalled();
     expect({
       role: useMultiplayerDraftStore.getState().role,
@@ -1494,9 +1496,9 @@ describe("multiplayerDraftStore Commander launch", () => {
    * LIVE MATCH running (`launchCommanderGame` completed): a `matchAdapter`
    * and an `activeMatchController`. On `leave`'s ordinary path
    * `disposeMatchAdapter` releases both, but that function is unreachable
-   * past `leave`'s own early return — the newer session's own opening
-   * `set({...initialState, ...})` clears the store's `matchAdapter` field
-   * without ever calling `.dispose()` on the object it held. Both must still
+   * past `leave`'s own early return — the route abort's `set(initialState)`
+   * clears the store's `matchAdapter` field without ever calling `.dispose()`
+   * on the object it held. Both must still
    * be freed by identity, and neither dispose call may reach the newer
    * session's own (separate) pod adapter.
    */
@@ -1510,8 +1512,9 @@ describe("multiplayerDraftStore Commander launch", () => {
     });
     const bAdapter = freshHostAdapter();
     mockHostAdapterQueue.push(xAdapter, bAdapter);
+    const route = new AbortController();
 
-    await installCompletedPod(commanderView(4));
+    await installCompletedPod(commanderView(4), 0, route.signal);
     await useMultiplayerDraftStore.getState().launchCommanderGame(navigate);
     // Reach-guards: the match runtime this row is about is really live before
     // the race starts.
@@ -1526,8 +1529,9 @@ describe("multiplayerDraftStore Commander launch", () => {
       await vi.waitFor(() => expect(xAdapter.dispose).toHaveBeenCalledWith({ preserveSession: false }));
 
       // A wholly separate pod opens and fully settles while `leave` is still
-      // parked disposing its own pod adapter. Its own opening code nulls the
-      // store's `matchAdapter` field right here, before `leave` resumes.
+      // parked disposing its own pod adapter. The route abort nulls the
+      // store's `matchAdapter` field here, before `leave` resumes.
+      route.abort();
       await installCompletedPod(commanderView(3));
       snapshot = {
         role: useMultiplayerDraftStore.getState().role,
@@ -1549,6 +1553,7 @@ describe("multiplayerDraftStore Commander launch", () => {
 
     // Neither dispose reached the newer session: its own pod adapter is
     // untouched and its visible state survives unchanged.
+    expect(xAdapter.dispose).toHaveBeenCalledOnce();
     expect(bAdapter.dispose).not.toHaveBeenCalled();
     expect({
       role: useMultiplayerDraftStore.getState().role,

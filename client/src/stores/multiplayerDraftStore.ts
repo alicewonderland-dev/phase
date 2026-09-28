@@ -71,7 +71,7 @@ import {
 } from "../adapter/draftPodGuestAdapter";
 import type { DraftGuestRecoveryFailure } from "../adapter/p2p-draft-guest";
 import {
-  clearActiveDraftPod,
+  clearActiveDraftPodFor,
   clearActiveDraftGuest,
   clearActiveDraftGuestIfCurrent,
   clearDraftSettlementOutbox,
@@ -583,7 +583,15 @@ let resumeGuestDraftAttempt: {
   signal: AbortSignal | undefined;
   promise: Promise<GuestDraftResumeOutcome>;
 } | null = null;
-const disposedHostAdapters = new WeakSet<DraftPodHostAdapter>();
+const hostAdapterTeardowns = new WeakMap<DraftPodHostAdapter, Promise<void>>();
+/**
+ * Hosts the player has left with `leave(false)`, keyed to the persistence id
+ * each owned when the leave began. `disposeHostAdapter` reads this map at the
+ * moment it creates a host's (memoized, once-per-adapter) teardown, so
+ * marking a host here before that teardown exists is what makes
+ * `tearDownHostAdapter` end it.
+ */
+const leftHostAdapters = new WeakMap<DraftPodHostAdapter, string | null>();
 const disposedGuestAdapters = new WeakSet<DraftPodGuestAdapter>();
 const retainedDraftSessionTeardowns = new Map<string, Promise<void>>();
 let activeMatchController: GameLoopController | null = null;
@@ -1089,10 +1097,44 @@ function detachDraftAdapters(): DetachedDraftAdapters {
   return detached;
 }
 
-async function disposeHostAdapter(adapter: DraftPodHostAdapter, preserveSession: boolean): Promise<void> {
-  if (disposedHostAdapters.has(adapter)) return;
-  disposedHostAdapters.add(adapter);
-  await adapter.dispose({ preserveSession });
+/**
+ * Disposes a host adapter once: memoized per adapter, so a later caller for
+ * the same adapter gets the SAME teardown back instead of starting a second
+ * one — whichever caller's `preserveSession` reaches here FIRST for a given
+ * adapter is the one `tearDownHostAdapter` runs with.
+ *
+ * A host `leave(false)` marked in `leftHostAdapters` before this call creates
+ * its teardown is retained here under its captured persistence id
+ * (`retainDraftSessionTeardown`), so a `hostDraft` reusing that id
+ * (`claimDraftSessionOwner`) waits for `tearDownHostAdapter`'s
+ * `clearActiveDraftPodFor` before it opens and saves its own locator —
+ * whichever of this file's dispose call sites is the first to reach this
+ * function for that adapter.
+ */
+function disposeHostAdapter(adapter: DraftPodHostAdapter, preserveSession: boolean): Promise<void> {
+  const inFlight = hostAdapterTeardowns.get(adapter);
+  if (inFlight) return inFlight;
+  const teardown = tearDownHostAdapter(adapter, preserveSession);
+  hostAdapterTeardowns.set(adapter, teardown);
+  const leftPersistenceId = leftHostAdapters.get(adapter);
+  if (leftPersistenceId) retainDraftSessionTeardown(leftPersistenceId, teardown);
+  return teardown;
+}
+
+/**
+ * Ends a host marked in `leftHostAdapters`: overrides the caller's
+ * `preserveSession` to `false`, then clears the active-pod locator for the
+ * persistence id captured when `leave` marked it (`clearActiveDraftPodFor`),
+ * so a locator this player's own left pod saved does not outlive it.
+ */
+async function tearDownHostAdapter(adapter: DraftPodHostAdapter, preserveSession: boolean): Promise<void> {
+  if (!leftHostAdapters.has(adapter)) {
+    await adapter.dispose({ preserveSession });
+    return;
+  }
+  await adapter.dispose({ preserveSession: false });
+  const persistenceId = leftHostAdapters.get(adapter);
+  if (persistenceId) clearActiveDraftPodFor(persistenceId);
 }
 
 async function disposeGuestAdapter(adapter: DraftPodGuestAdapter, preserveRecovery = true): Promise<void> {
@@ -3122,6 +3164,11 @@ export const useMultiplayerDraftStore = create<
     // `LEAVE_ACK_TIMEOUT_MS`) for a replacement session to already be live by
     // the time it returns, and a stale `leave` must not tear that one down.
     const epoch = draftAdapterEpoch;
+    // Taken before any await, so a newer session or a route abort that
+    // detaches this host while `leave` waits still ends it
+    // (`tearDownHostAdapter`).
+    const host = activeHostAdapter;
+    if (host && !preserveRecovery) leftHostAdapters.set(host, activeHostPersistenceId);
     // Captured before any await, for `disposeCapturedMatchRuntime` on the
     // early-return arms below: exactly the match runtime THIS call's own
     // session owns right now, before a newer `hostDraft`/`joinDraft` can have
@@ -3143,14 +3190,13 @@ export const useMultiplayerDraftStore = create<
       return;
     }
 
-    const host = activeHostAdapter;
     const guest = activeGuestAdapter;
 
     // An explicit guest leave is host-acknowledged. Until that completes, the
     // live adapter remains the recovery owner; tearing down the lifecycle here
     // would discard the session that must reconnect after a dropped ACK.
     if (host) {
-      await host.dispose({ preserveSession: preserveRecovery });
+      await disposeHostAdapter(host, preserveRecovery);
       if (epoch !== draftAdapterEpoch) {
         disposeCapturedMatchRuntime(ownedMatchAdapter, ownedMatchController);
         return;
@@ -3170,9 +3216,6 @@ export const useMultiplayerDraftStore = create<
 
     if (activeHostAdapter === host) {
       activeHostAdapter = null;
-      if (!preserveRecovery) {
-        clearActiveDraftPod();
-      }
     }
     if (activeGuestAdapter === guest) {
       activeGuestAdapter = null;
