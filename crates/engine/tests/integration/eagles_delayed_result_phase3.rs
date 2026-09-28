@@ -367,6 +367,179 @@ fn skipped_return_publishes_empty_before_independent_delayed_reader() {
 }
 
 #[test]
+fn declined_optional_return_publishes_empty_before_independent_delayed_reader() {
+    // The parsed chain supplies the result binding and independent reader;
+    // marking only its return producer optional exercises the runtime choice
+    // without claiming support for an additional Oracle grammar.
+    for (accept_return, alternative_returns, expected_count) in
+        [(false, false, 0), (true, false, 1), (false, true, 1)]
+    {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::End);
+        scenario.with_library_top(P0, &["P0 Draw A", "P0 Draw B"]);
+        scenario.with_library_top(P1, &["P1 Draw A", "P1 Draw B"]);
+        let selected = scenario.add_creature(P0, "Selected Bear", 2, 2).id();
+        let spell = scenario
+            .add_spell_to_hand_from_oracle(
+                P0,
+                "Optional Return Witness",
+                true,
+                CONDITIONAL_RETURN_WITNESS,
+            )
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let mut runner = scenario.build();
+        let object = runner.state_mut().objects.get_mut(&spell).unwrap();
+        let definitions = Arc::make_mut(&mut object.abilities);
+        let mut producer = definitions
+            .iter_mut()
+            .find(|definition| matches!(definition.kind, AbilityKind::Spell))
+            .expect("printed spell ability");
+        while producer.declares_return_result.is_none() {
+            producer = producer
+                .sub_ability
+                .as_deref_mut()
+                .expect("parsed chain must contain a return producer");
+        }
+        assert!(matches!(&*producer.effect, Effect::BounceAll { .. }));
+        assert_eq!(
+            producer.sub_ability.as_ref().map(|sub| sub.sub_link),
+            Some(SubAbilityLink::SequentialSibling),
+            "the delayed reader must remain independent of the optional return"
+        );
+        if alternative_returns {
+            let mut alternative = producer.clone();
+            alternative.optional = false;
+            alternative.else_ability = None;
+            producer.else_ability = Some(Box::new(alternative));
+        }
+        producer.optional = true;
+        object.base_abilities = object.abilities.clone();
+
+        let cast = runner.cast(spell).target_object(selected);
+        let outcome = if accept_return {
+            cast.accept_optional().resolve()
+        } else {
+            cast.decline_optional().resolve()
+        };
+        outcome.assert_zone(
+            &[selected],
+            if expected_count == 0 {
+                Zone::Battlefield
+            } else {
+                Zone::Hand
+            },
+        );
+        assert_eq!(
+            outcome.state().delayed_triggers.len(),
+            1,
+            "accept return {accept_return}, alternative {alternative_returns}"
+        );
+        assert!(matches!(
+            &outcome.state().delayed_triggers[0].ability.effect,
+            Effect::Token {
+                count: QuantityExpr::Fixed { value },
+                ..
+            } if *value == expected_count
+        ));
+        runner.advance_to_phase(Phase::Upkeep);
+        runner.advance_until_stack_empty();
+        assert_eq!(bird_count(&runner), expected_count as usize);
+        assert!(runner.state().delayed_triggers.is_empty());
+    }
+}
+
+#[test]
+fn optional_return_prompt_restores_exact_result_occurrence() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::End);
+    let selected = scenario.add_creature(P0, "Selected Bear", 2, 2).id();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(
+            P0,
+            "Optional Return Save Witness",
+            true,
+            CONDITIONAL_RETURN_WITNESS,
+        )
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    let object = runner.state_mut().objects.get_mut(&spell).unwrap();
+    let definitions = Arc::make_mut(&mut object.abilities);
+    let mut producer = definitions
+        .iter_mut()
+        .find(|definition| matches!(definition.kind, AbilityKind::Spell))
+        .expect("printed spell ability");
+    while producer.declares_return_result.is_none() {
+        producer = producer
+            .sub_ability
+            .as_deref_mut()
+            .expect("parsed chain must contain a return producer");
+    }
+    producer.optional = true;
+    object.base_abilities = object.abilities.clone();
+
+    runner.cast(spell).target_object(selected).commit();
+    runner.resolve_top();
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::OptionalEffectChoice { .. }
+    ));
+    let saved = serde_json::to_value(ResolutionStateWire::from_game_state(runner.state().clone()))
+        .expect("parked optional return serializes");
+    let occurrence = saved["resolution_frames"]["frames"]
+        .as_array()
+        .expect("typed frames")
+        .iter()
+        .find(|frame| frame["type"] == "OptionalEffect")
+        .and_then(|frame| frame["data"]["return_result_occurrence"].as_u64())
+        .expect("optional frame captures its named-result occurrence");
+    assert!(saved["return_result_frames"][occurrence.to_string()].is_object());
+
+    for (index, (mut corrupt, expected)) in [
+        (saved.clone(), "optional effect has no occurrence stamp"),
+        (saved.clone(), "optional effect names missing occurrence"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let frame = corrupt["resolution_frames"]["frames"]
+            .as_array_mut()
+            .expect("typed frames")
+            .iter_mut()
+            .find(|frame| frame["type"] == "OptionalEffect")
+            .expect("parked optional frame");
+        if index == 0 {
+            frame["data"]
+                .as_object_mut()
+                .expect("optional frame data")
+                .remove("return_result_occurrence");
+        } else {
+            frame["data"]["return_result_occurrence"] = serde_json::json!(999_u64);
+        }
+        let error = serde_json::from_value::<PersistedGameState>(corrupt)
+            .expect_err("malformed optional occurrence must fail at restore");
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    let restored: ResolutionStateWire =
+        serde_json::from_value(saved).expect("valid parked optional return restores");
+    *runner.state_mut() = restored.into_game_state();
+    runner
+        .act(GameAction::DecideOptionalEffect { accept: false })
+        .expect("declining after reload resumes the original result frame");
+    runner.advance_until_stack_empty();
+    assert_eq!(runner.state().objects[&selected].zone, Zone::Battlefield);
+    assert!(matches!(
+        &runner.state().delayed_triggers[0].ability.effect,
+        Effect::Token {
+            count: QuantityExpr::Fixed { value: 0 },
+            ..
+        }
+    ));
+}
+
+#[test]
 fn token_creature_counts_from_its_prior_object_record_after_leaving() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::End);

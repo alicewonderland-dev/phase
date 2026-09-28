@@ -3986,7 +3986,21 @@ pub(super) fn resolve_optional_effect_decision(
             }
         }
         AutoMayChoice::Decline => {
-            if let Some(branch) = optional_decline_branch(&ability) {
+            let decline_branch = optional_decline_branch(&ability);
+            // CR 608.2c: Declining the optional return skips its action, but
+            // an independent following instruction can still read its named
+            // result. Settle that result as empty before the surviving branch
+            // runs. If that branch executes an alternative return with the
+            // same result ID, it publishes the result itself.
+            if let Some(result_id) = ability.declares_return_result {
+                if decline_branch
+                    .as_deref()
+                    .is_none_or(|branch| !branch_declares_return_result(branch, result_id))
+                {
+                    publish_empty_return_result_for_active(state, result_id)?;
+                }
+            }
+            if let Some(branch) = decline_branch {
                 let mut resolved = branch.into_owned();
                 // CR 608.2c: inherit the parent's resolved object targets ONLY
                 // when the decline clause's effect actually anaphors the parent
@@ -15180,6 +15194,7 @@ fn resolve_chain_body(
                             trigger_event: state.current_trigger_event.clone(),
                             trigger_events: state.current_trigger_events.clone(),
                             trigger_match_count: state.current_trigger_match_count,
+                            return_result_occurrence: state.active_return_result_occurrence,
                         }),
                         WaitingFor::OpponentMayChoice {
                             player: first,
@@ -15270,6 +15285,7 @@ fn resolve_chain_body(
                         trigger_event: state.current_trigger_event.clone(),
                         trigger_events: state.current_trigger_events.clone(),
                         trigger_match_count: state.current_trigger_match_count,
+                        return_result_occurrence: state.active_return_result_occurrence,
                     }),
                     WaitingFor::ResolutionOptionalPaymentChoice {
                         player: payer,
@@ -15324,6 +15340,7 @@ fn resolve_chain_body(
                     // permanent-from-hand sub-effect) resumes with the same
                     // `EventContextAmount` the pre-pause resolution observed.
                     trigger_match_count: state.current_trigger_match_count,
+                    return_result_occurrence: state.active_return_result_occurrence,
                 }),
                 WaitingFor::OptionalEffectChoice {
                     player: prompt_player,
@@ -23711,6 +23728,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         });
         state.waiting_for = WaitingFor::OptionalEffectChoice {
             player: PlayerId(0),
@@ -23756,6 +23774,7 @@ mod tests {
                 trigger_event: None,
                 trigger_events: Vec::new(),
                 trigger_match_count: None,
+                return_result_occurrence: None,
             });
             state.waiting_for = WaitingFor::OptionalEffectChoice {
                 player: PlayerId(0),

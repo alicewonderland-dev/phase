@@ -98,6 +98,10 @@ pub struct OptionalEffectFrame {
     pub trigger_events: Vec<GameEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_match_count: Option<u32>,
+    /// CR 608.2c: the resolving instruction-result frame survives a choice
+    /// prompt, including save/reload before its named result is published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_result_occurrence: Option<crate::types::game_state::ReturnResultOccurrenceId>,
 }
 
 /// CR 705.1 + CR 614.1a: Discriminates which multi-flip resolver paused for a
@@ -4840,6 +4844,7 @@ impl LegacyOptionalEffectWire {
             // (no in-flight reproduction on a legacy-serialized optional frame).
             trigger_events: Vec::new(),
             trigger_match_count: self.pending_optional_trigger_match_count,
+            return_result_occurrence: None,
         }))
     }
 }
@@ -6218,6 +6223,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         }));
         optional_effect
             .validate(&WaitingFor::OpponentMayChoice {
@@ -6305,6 +6311,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         }));
         let optional_payload = v2_fixture_with_frames(optional_state, optional_frames);
         let restored: ResolutionStateWire = serde_json::from_value(optional_payload)
@@ -6390,6 +6397,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         })
     }
 
@@ -6824,6 +6832,7 @@ mod tests {
                 trigger_event: None,
                 trigger_events: Vec::new(),
                 trigger_match_count: None,
+                return_result_occurrence: None,
             })
         };
         let opponent_may = WaitingFor::OpponentMayChoice {
@@ -6954,6 +6963,7 @@ mod tests {
                 trigger_event: None,
                 trigger_events: Vec::new(),
                 trigger_match_count: None,
+                return_result_occurrence: None,
             },
         );
         apply_as_current(
@@ -8347,6 +8357,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         }));
         buried_optional_frames.push_inner(continuation_frame(151));
         assert!(

@@ -10968,9 +10968,22 @@ pub(crate) fn validate_return_result_occurrence_coherence(state: &GameState) -> 
                 .is_some_and(has_result_metadata)
     }
 
+    let validate_optional_frame = |frame: &OptionalEffectFrame| match frame.return_result_occurrence
+    {
+        Some(id) if !frame_exists(id) => Err(format!(
+            "return-result optional effect names missing occurrence {:?}",
+            id
+        )),
+        None if has_result_metadata(&frame.ability) => {
+            Err("return-result optional effect has no occurrence stamp".to_string())
+        }
+        _ => Ok(()),
+    };
+
     let mut parked_publishers = HashSet::new();
     for frame in state.resolution_stack.iter() {
         match frame {
+            ResolutionFrame::OptionalEffect(optional) => validate_optional_frame(optional)?,
             ResolutionFrame::AbilityContinuation(frame) => {
                 let pending = &frame.pending;
                 match pending.return_result_occurrence {
@@ -11020,6 +11033,13 @@ pub(crate) fn validate_return_result_occurrence_coherence(state: &GameState) -> 
             }
             _ => {}
         }
+    }
+    if let Some(PendingCostMoveResume::SacrificeForCost {
+        completion: PendingSacrificeCostCompletion::ResolutionOptionalPayment { frame, .. },
+        ..
+    }) = &state.pending_cost_move_resume
+    {
+        validate_optional_frame(frame)?;
     }
     Ok(())
 }
