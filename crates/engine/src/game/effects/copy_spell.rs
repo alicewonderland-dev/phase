@@ -632,8 +632,7 @@ impl CopySource {
 
 /// CR 608.2h + CR 400.7: Adapt `targeting::triggering_spell`'s answer to a
 /// [`CopySource`]. `Gone` (a spell-cast event names a spell with neither a
-/// live entry nor a departed record) is `None` here too — the same "nothing
-/// to copy" a caller with no spell-cast event in scope falls through to.
+/// live entry nor a departed record) is `None`.
 fn copy_source_from_triggering_spell(source: TriggeringSpell<'_>) -> Option<CopySource> {
     match source {
         TriggeringSpell::OnStack(entry) => Some(CopySource::on_stack(entry.clone())),
@@ -1296,6 +1295,81 @@ mod tests {
                 "{target:?}: no SpellCopied event may be emitted"
             );
         }
+    }
+
+    /// CR 702.40a + CR 113.7a: the `SelfRef` arm's own-spell check
+    /// (`*object_id == ability.source_id`) must gate the shared
+    /// on-stack/departed/gone authority to the trigger's own spell — a
+    /// different spell that happens to be the CURRENT trigger event must not
+    /// be copied instead.
+    #[test]
+    fn self_ref_copy_trigger_copies_its_own_spell_not_the_current_trigger_event_spell() {
+        let mut state = GameState::new_two_player(42);
+        let self_spell_id = ObjectId(30);
+        let other_spell_id = ObjectId(31);
+
+        // S — the copy trigger's own spell, targeting P0.
+        push_spell(
+            &mut state,
+            self_spell_id,
+            CardId(1),
+            PlayerId(0),
+            "Self Spell",
+            ResolvedAbility {
+                targets: vec![TargetRef::Player(PlayerId(0))],
+                ..ResolvedAbility::new(Effect::NoOp, vec![], self_spell_id, PlayerId(0))
+            },
+            CastingVariant::Normal,
+        );
+        // T — a different spell also on the stack, targeting P1.
+        push_spell(
+            &mut state,
+            other_spell_id,
+            CardId(2),
+            PlayerId(0),
+            "Other Spell",
+            ResolvedAbility {
+                targets: vec![TargetRef::Player(PlayerId(1))],
+                ..ResolvedAbility::new(Effect::NoOp, vec![], other_spell_id, PlayerId(0))
+            },
+            CastingVariant::Normal,
+        );
+        // The game's current triggering event names T, not S.
+        state.current_trigger_event = Some(GameEvent::SpellCast {
+            controller: PlayerId(0),
+            object_id: other_spell_id,
+            card_id: CardId(2),
+            cast_mana_value: None,
+        });
+
+        let ability = ResolvedAbility::new(
+            Effect::CopySpell {
+                target: TargetFilter::SelfRef,
+                retarget: CopyRetargetPermission::MayChooseNewTargets,
+                copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
+            },
+            vec![],
+            self_spell_id,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events)
+            .expect("self-cast copy trigger must still copy its own spell");
+        let copy_targets = state
+            .stack
+            .back()
+            .unwrap()
+            .ability()
+            .unwrap()
+            .targets
+            .clone();
+        assert_eq!(
+            copy_targets,
+            vec![TargetRef::Player(PlayerId(0))],
+            "the copy must be of S (this ability's own spell), not T"
+        );
     }
 
     /// Companion (positive control) for the row above: with the spell still
