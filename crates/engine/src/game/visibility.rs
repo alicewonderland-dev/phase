@@ -52,6 +52,11 @@ pub(crate) fn project_paid_cast_cleanup_authority(state: &GameState) -> GameStat
             redact_casting_permission_cleanup_authority(object);
         }
     }
+    for (_, incarnations) in projected.departed_stack_spells.iter_mut() {
+        for (_, departed) in incarnations.iter_mut() {
+            redact_casting_permission_cleanup_authority(&mut departed.object);
+        }
+    }
     projected
 }
 

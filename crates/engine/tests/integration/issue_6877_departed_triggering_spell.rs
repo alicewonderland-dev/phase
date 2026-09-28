@@ -5,22 +5,27 @@
 //!
 //! https://github.com/phase-rs/phase/issues/6877
 
+use engine::game::derived_views::ClientGameStateRef;
+use engine::game::game_object::GameObject;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::scenario_db::GameScenarioDbExt;
-use engine::types::ability::TargetRef;
-use engine::types::actions::GameAction;
+use engine::game::visibility::filter_state_for_viewer;
+use engine::types::ability::{CastingPermission, ResolutionCastCleanup, TargetRef};
+use engine::types::actions::{CastChoice, GameAction};
 use engine::types::events::GameEvent;
 use engine::types::game_state::{
     CastPaymentMode, GameState, StackEntryKind, SyntheticTriggerProvenance, WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
-use engine::types::mana::{ManaType, ManaUnit};
+use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
+use super::cast_this_way_gate_8721::{offered_card, settle_attack_trigger, to_declare_attackers};
+use super::rules::AttackTarget;
 use crate::support::shared_card_db;
 
 // Krark's Partner line is omitted; it plays no part in a two-player game.
@@ -42,6 +47,11 @@ const SAGE_OF_THE_SKIES: &str = "When you cast this spell, if you've cast anothe
 const UNSUBSTANTIATE: &str = "Return target spell or creature to its owner's hand.";
 const CHAIN_OF_SMOG: &str = "Target player discards two cards. That player may copy this spell \
     and may choose a new target for that copy.";
+const OGRE_BATTLECASTER: &str = "First strike\n\
+    Whenever this creature attacks, you may cast target instant or sorcery card from your \
+    graveyard by paying {R}{R} in addition to its other costs. If that spell would be put into \
+    a graveyard, exile it instead. When you cast that spell, this creature gets +X/+0 until end \
+    of turn, where X is that spell's mana value.";
 
 fn floating_mana(n: usize, color: ManaType) -> Vec<ManaUnit> {
     (0..n)
@@ -1132,5 +1142,188 @@ fn resolving_spell_copies_the_live_cast_not_an_earlier_departed_record() {
             );
         }
         other => panic!("expected CopyRetarget for the recast's copy, got {other:?}"),
+    }
+}
+
+/// The temporary `ExileWithAltCost` permission's cleanup, if the object
+/// carries one.
+fn resolution_cleanup(object: &GameObject) -> Option<&ResolutionCastCleanup> {
+    object
+        .casting_permissions
+        .iter()
+        .find_map(|permission| match permission {
+            CastingPermission::ExileWithAltCost {
+                resolution_cleanup: Some(cleanup),
+                ..
+            } => Some(cleanup),
+            _ => None,
+        })
+}
+
+fn assert_no_cleanup_authority(cleanup: &ResolutionCastCleanup, where_: &str) {
+    assert_eq!(
+        cleanup.offer_id, None,
+        "{where_} must not carry offer_id: {cleanup:?}"
+    );
+    assert!(
+        cleanup.delayed_trigger_receipts.is_empty(),
+        "{where_} must not carry delayed_trigger_receipts: {cleanup:?}"
+    );
+}
+
+/// CR 608.2g (paid graveyard cast) + CR 601.2i (countering): Ogre Battlecaster
+/// casts Lightning Bolt from the graveyard and Hesitation counters it before
+/// it resolves — no viewer's projection of the resulting `departed_stack_spells`
+/// record carries the cast offer's server-only cleanup authority (`offer_id`,
+/// `delayed_trigger_receipts`), on either the viewer filter or the direct
+/// client serializer. Control: while the spell is still on the stack, its own
+/// live projection already carries neither.
+#[test]
+fn departed_paid_cast_record_redacts_cleanup_authority_for_every_viewer() {
+    let mut scenario = GameScenario::new_n_player(2, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let ogre = scenario
+        .add_creature_from_oracle(P0, "Ogre Battlecaster", 3, 3, OGRE_BATTLECASTER)
+        .id();
+    scenario.add_enchantment_from_oracle(P1, "Hesitation", HESITATION);
+    for _ in 0..6 {
+        scenario.add_basic_land(P0, ManaColor::Red);
+    }
+    let bolt = scenario
+        .add_spell_to_graveyard(P0, "Lightning Bolt", true)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Red],
+            generic: 0,
+        })
+        .id();
+    let mut runner = scenario.build();
+
+    to_declare_attackers(&mut runner, P0);
+    runner
+        .declare_attackers(&[(ogre, AttackTarget::Player(P1))])
+        .expect("Ogre must be a legal attacker");
+    settle_attack_trigger(&mut runner, true);
+    assert_eq!(
+        offered_card(&runner),
+        Some(bolt),
+        "reach guard: the resolving trigger offers Bolt for casting now"
+    );
+
+    runner
+        .act(GameAction::GraveyardPaidCastChoice {
+            choice: CastChoice::Cast,
+        })
+        .expect("accept the during-resolution cast offer");
+    for _ in 0..16 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::ManaPayment { .. } => {
+                runner
+                    .act(GameAction::PassPriority)
+                    .expect("pay the offered cast's cost from lands");
+            }
+            WaitingFor::OrderTriggers { .. } | WaitingFor::Priority { .. } => break,
+            other => panic!("unexpected waiting_for while paying the offered cast: {other:?}"),
+        }
+    }
+    assert!(
+        runner.state().stack.iter().any(|entry| entry.id == bolt),
+        "reach guard: the accepted Bolt is on the stack"
+    );
+
+    // CONTROL: while the spell is still live on the stack, its own
+    // projection already carries neither cleanup authority — for either
+    // player.
+    let live_cleanup = resolution_cleanup(&runner.state().objects[&bolt])
+        .expect("reach guard: the live cast's object carries the temporary permission");
+    assert!(
+        live_cleanup.offer_id.is_some(),
+        "reach guard: the authoritative live permission carries an offer id"
+    );
+    for viewer in [P0, P1] {
+        let projected = filter_state_for_viewer(runner.state(), viewer);
+        let projected_cleanup = resolution_cleanup(&projected.objects[&bolt])
+            .expect("live viewer projection must retain the temporary permission itself");
+        assert_no_cleanup_authority(
+            projected_cleanup,
+            &format!("control: {viewer:?}'s live-spell projection"),
+        );
+    }
+
+    // `drive` stops as soon as ANY stack entry leaves the stack — Ogre's own
+    // delayed "when you cast that spell" pump trigger resolves first here,
+    // so Hesitation's counter trigger needs a further `drive` call.
+    order_triggers(&mut runner, None);
+    let mut counter_events = drive(&mut runner, &Drive::new());
+    for _ in 0..8 {
+        if saw_spell_countered(&counter_events) {
+            break;
+        }
+        let more = drive(&mut runner, &Drive::new());
+        if more.is_empty() {
+            break;
+        }
+        counter_events.extend(more);
+    }
+    assert!(
+        saw_spell_countered(&counter_events),
+        "Hesitation must counter the offered Bolt: {counter_events:?}"
+    );
+    assert_eq!(
+        runner.state().objects[&bolt].zone,
+        Zone::Exile,
+        "reach guard: Ogre's own rider exiles a countered offered spell instead of the graveyard"
+    );
+
+    // Positive reach guard: the UNPROJECTED authoritative record does carry
+    // the cast offer's cleanup authority, so the negative assertions below
+    // are not vacuous.
+    let departed = runner
+        .state()
+        .departed_stack_spells
+        .get(&bolt)
+        .and_then(|incarnations| incarnations.values().next())
+        .expect("reach guard: a departed record for the countered Bolt must exist");
+    let authoritative_cleanup = resolution_cleanup(&departed.object)
+        .expect("reach guard: the departed record's object retains the temporary permission");
+    assert!(
+        authoritative_cleanup.offer_id.is_some(),
+        "reach guard: the unprojected departed record must carry offer_id"
+    );
+    assert!(
+        !authoritative_cleanup.delayed_trigger_receipts.is_empty(),
+        "reach guard: the unprojected departed record must carry delayed_trigger_receipts"
+    );
+
+    for viewer in [P0, P1] {
+        let projected = filter_state_for_viewer(runner.state(), viewer);
+        let projected_departed = projected
+            .departed_stack_spells
+            .get(&bolt)
+            .and_then(|incarnations| incarnations.values().next())
+            .expect("viewer projection must retain the departed record itself");
+        let projected_cleanup = resolution_cleanup(&projected_departed.object)
+            .expect("viewer projection must retain the temporary permission");
+        assert_no_cleanup_authority(
+            projected_cleanup,
+            &format!("{viewer:?}'s filter_state_for_viewer departed record"),
+        );
+
+        // Direct client serializer: same boundary, through the wire shape,
+        // decoded back into typed fields.
+        let wire = serde_json::to_value(ClientGameStateRef::wrap(runner.state(), Some(viewer)))
+            .expect("direct client wire serializes");
+        let wire_state: GameState = serde_json::from_value(wire["state"].clone())
+            .expect("direct client wire state must deserialize");
+        let wire_departed = wire_state
+            .departed_stack_spells
+            .get(&bolt)
+            .and_then(|incarnations| incarnations.values().next())
+            .expect("direct client wire must retain the departed record itself");
+        let wire_cleanup = resolution_cleanup(&wire_departed.object)
+            .expect("direct client wire must retain the temporary permission");
+        assert_no_cleanup_authority(
+            wire_cleanup,
+            &format!("{viewer:?}'s direct client wire departed record"),
+        );
     }
 }
