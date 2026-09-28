@@ -10,9 +10,10 @@ use crate::types::events::GameEvent;
 #[cfg(test)]
 use crate::types::game_state::MayTriggerOrigin;
 use crate::types::game_state::{
-    AutoMayChoice, CastOfferKind, CastingVariant, ExileLink, ExileLinkKind, GameState,
-    MayTriggerAutoChoiceKey, PendingCounterPostAction, PendingSpellResolution, StackEntry,
-    StackEntryKind, StackPaidSnapshot, StackResolutionPolicy, TriggerSourceContext, WaitingFor,
+    AutoMayChoice, CastOfferKind, CastingVariant, DepartedStackSpell, ExileLink, ExileLinkKind,
+    GameState, MayTriggerAutoChoiceKey, PendingCounterPostAction, PendingSpellResolution,
+    StackEntry, StackEntryKind, StackPaidSnapshot, StackResolutionPolicy, TriggerSourceContext,
+    WaitingFor,
 };
 use crate::types::identifiers::{ObjectId, TriggerFiring};
 use crate::types::player::PlayerId;
@@ -541,6 +542,39 @@ fn remove_stack_entry_at_unobserved(
     })
 }
 
+/// CR 608.2h + CR 707.2: Record a spell's stack entry and object as it last
+/// existed on the stack, before a non-resolving departure. Only for a spell
+/// entry (`StackEntryKind::Spell`) whose cast finished
+/// (`obj.cast_occurrence` is `Some` —
+/// `casting_costs.rs::stamp_cast_occurrence_on_stack_spell`); a spell copy or
+/// a rolled-back cast was never finalized and has no CR 707.2 choices to
+/// remember. Called from the two exclusive non-resolving-removal seams: the
+/// zone-exit path (`zones.rs::apply_zone_exit_cleanup`, before the
+/// `cast_occurrence` clear that would make this guard vacuous) and
+/// `remove_nonresolving_stack_entry_at` below — a resolution pop
+/// (`pop_top_stack_entry`) calls neither.
+pub(crate) fn record_departed_stack_spell(state: &mut GameState, entry: &StackEntry) {
+    let StackEntryKind::Spell { .. } = &entry.kind else {
+        return;
+    };
+    let Some(obj) = state.objects.get(&entry.id) else {
+        return;
+    };
+    if obj.cast_occurrence.is_none() {
+        return;
+    }
+    let incarnation = obj.incarnation;
+    let record = DepartedStackSpell {
+        entry: entry.clone(),
+        object: Box::new(obj.clone()),
+    };
+    state
+        .departed_stack_spells
+        .entry(entry.id)
+        .or_default()
+        .insert(incarnation, record);
+}
+
 /// Removes a stack entry for a non-resolution reason and observes the exact
 /// firing only after the entry and side tables have been settled.
 pub(super) fn remove_nonresolving_stack_entry_at(
@@ -549,6 +583,7 @@ pub(super) fn remove_nonresolving_stack_entry_at(
     disposition: super::lifecycle::DelayedTerminalDisposition,
 ) -> Option<PoppedStackEntry> {
     let popped = remove_stack_entry_at_unobserved(state, index)?;
+    record_departed_stack_spell(state, &popped.entry);
     if let Some(firing) = popped.trigger_firing {
         super::lifecycle::record_delayed_terminal(firing, disposition);
     }
