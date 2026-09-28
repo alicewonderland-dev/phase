@@ -1767,10 +1767,17 @@ pub(crate) fn parse_chosen_return_spec(text: &str, lower: &str) -> Option<Chosen
     let (_, rest) = nom_on_lower(text, lower, |input| {
         value((), tag("return each ")).parse(input)
     })?;
-    let (phrase, destination, _) = super::strip_return_destination_ext_with_remainder(rest);
-    if destination?.zone != Zone::Hand {
+    let (phrase, destination, remainder) = super::strip_return_destination_ext_with_remainder(rest);
+    let destination = destination?;
+    if destination.zone != Zone::Hand {
         return None;
     }
+    let consumed_end = rest.len().checked_sub(remainder.len())?;
+    let printed_destination = rest.get(phrase.len()..consumed_end)?.to_ascii_lowercase();
+    let recipient = all_consuming(tag::<_, _, OracleError<'_>>(" to your hand"))
+        .parse(printed_destination.as_str())
+        .ok()
+        .map(|_| ControllerRef::You);
     let phrase_lower = phrase.trim().trim_end_matches('.').to_ascii_lowercase();
     let (noun, chooser) = if let Ok((_, noun)) = all_consuming(preceded(
         tag::<_, _, OracleError<'_>>("chosen "),
@@ -1800,7 +1807,12 @@ pub(crate) fn parse_chosen_return_spec(text: &str, lower: &str) -> Option<Chosen
     if !remainder.trim().is_empty() || matches!(noun, TargetFilter::None | TargetFilter::Any) {
         return None;
     }
-    Some(ChosenReturnSpec { noun, chooser })
+    Some(ChosenReturnSpec {
+        noun,
+        chooser,
+        destination: destination.zone,
+        recipient,
+    })
 }
 
 /// Parse the typed prior-object count carried by a later delayed clause.

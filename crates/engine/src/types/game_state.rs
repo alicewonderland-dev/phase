@@ -11040,6 +11040,53 @@ pub(crate) fn normalize_resolution_cast_offer_allocator(
 /// still name live resolving roots across replacement choices.
 /// A parked batch is necessarily unsettled; its completion is published only
 /// after the whole replacement-aware zone-change group has finished.
+pub(crate) fn has_return_result_metadata(ability: &ResolvedAbility) -> bool {
+    ability.declares_return_result.is_some()
+        || ability.reads_return_result.is_some()
+        || ability
+            .sub_ability
+            .as_deref()
+            .is_some_and(has_return_result_metadata)
+        || ability
+            .else_ability
+            .as_deref()
+            .is_some_and(has_return_result_metadata)
+}
+
+pub(crate) fn live_return_result_occurrences(
+    state: &GameState,
+) -> HashSet<ReturnResultOccurrenceId> {
+    let mut live = HashSet::new();
+    live.extend(state.active_return_result_occurrence);
+    for frame in state.resolution_stack.iter() {
+        match frame {
+            ResolutionFrame::OptionalEffect(optional) => {
+                live.extend(optional.return_result_occurrence);
+            }
+            ResolutionFrame::AbilityContinuation(frame) => {
+                live.extend(frame.pending.return_result_occurrence);
+            }
+            ResolutionFrame::BatchDelivery(batch) => {
+                if let Some(BatchCompletion::RecordInstructionZoneResult {
+                    occurrence_id, ..
+                }) = &batch.completion
+                {
+                    live.insert(*occurrence_id);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(PendingCostMoveResume::SacrificeForCost {
+        completion: PendingSacrificeCostCompletion::ResolutionOptionalPayment { frame, .. },
+        ..
+    }) = &state.pending_cost_move_resume
+    {
+        live.extend(frame.return_result_occurrence);
+    }
+    live
+}
+
 pub(crate) fn validate_return_result_occurrence_coherence(state: &GameState) -> Result<(), String> {
     if state.next_return_result_occurrence_id == 0 {
         return Err("return-result occurrence allocator is zero".to_string());
@@ -11065,26 +11112,13 @@ pub(crate) fn validate_return_result_occurrence_coherence(state: &GameState) -> 
         return Err("active return-result occurrence has no live frame".to_string());
     }
 
-    fn has_result_metadata(ability: &ResolvedAbility) -> bool {
-        ability.declares_return_result.is_some()
-            || ability.reads_return_result.is_some()
-            || ability
-                .sub_ability
-                .as_deref()
-                .is_some_and(has_result_metadata)
-            || ability
-                .else_ability
-                .as_deref()
-                .is_some_and(has_result_metadata)
-    }
-
     let validate_optional_frame = |frame: &OptionalEffectFrame| match frame.return_result_occurrence
     {
         Some(id) if !frame_exists(id) => Err(format!(
             "return-result optional effect names missing occurrence {:?}",
             id
         )),
-        None if has_result_metadata(&frame.ability) => {
+        None if has_return_result_metadata(&frame.ability) => {
             Err("return-result optional effect has no occurrence stamp".to_string())
         }
         _ => Ok(()),
@@ -11103,7 +11137,7 @@ pub(crate) fn validate_return_result_occurrence_coherence(state: &GameState) -> 
                             id
                         ));
                     }
-                    None if has_result_metadata(&pending.chain) => {
+                    None if has_return_result_metadata(&pending.chain) => {
                         return Err(
                             "return-result continuation has no occurrence stamp".to_string()
                         );
@@ -11150,6 +11184,14 @@ pub(crate) fn validate_return_result_occurrence_coherence(state: &GameState) -> 
     }) = &state.pending_cost_move_resume
     {
         validate_optional_frame(frame)?;
+    }
+    for id in live_return_result_occurrences(state) {
+        if !frame_exists(id) {
+            return Err(format!(
+                "return-result owner names missing occurrence {:?}",
+                id
+            ));
+        }
     }
     Ok(())
 }

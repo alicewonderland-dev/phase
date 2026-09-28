@@ -6,8 +6,8 @@ use engine::game::scenario::{GameScenario, P0, P1};
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{
     AbilityCondition, AbilityDefinition, AbilityKind, ChoiceType, DelayedTriggerCondition, Effect,
-    PtValue, QuantityExpr, ReplacementDefinition, SubAbilityLink, TargetFilter, TargetRef,
-    TargetSelectionMode,
+    PtValue, QuantityExpr, RepeatContinuation, ReplacementDefinition, SubAbilityLink, TargetFilter,
+    TargetRef, TargetSelectionMode,
 };
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
@@ -36,6 +36,108 @@ fn bird_count(runner: &engine::game::scenario::GameRunner) -> usize {
         .filter_map(|id| runner.state().objects.get(id))
         .filter(|object| object.is_token && object.name.contains("Bird Soldier"))
         .count()
+}
+
+#[test]
+fn repeated_eagles_process_keeps_each_return_result_separate() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::End);
+    let selected = scenario.add_creature(P0, "Repeated Bear", 2, 2).id();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "The Eagles Are Coming!", true, EAGLES)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    let object = runner.state_mut().objects.get_mut(&spell).unwrap();
+    for abilities in [&mut object.abilities, &mut object.base_abilities] {
+        let root = &mut Arc::make_mut(abilities)[0];
+        root.repeat_for = Some(QuantityExpr::Fixed { value: 2 });
+        root.sub_ability
+            .as_mut()
+            .expect("selected return is part of the parsed process")
+            .sub_link = SubAbilityLink::ContinuationStep;
+    }
+    let outcome = runner.cast(spell).target_object(selected).resolve();
+    outcome.assert_zone(&[selected], Zone::Hand);
+    let counts: Vec<_> = outcome
+        .state()
+        .delayed_triggers
+        .iter()
+        .map(|trigger| match &trigger.ability.effect {
+            Effect::Token {
+                count: QuantityExpr::Fixed { value },
+                ..
+            } => *value,
+            effect => panic!("expected frozen delayed tokens, got {effect:?}"),
+        })
+        .collect();
+    assert_eq!(
+        counts,
+        [1, 0],
+        "each iteration must read its own settled return; waiting={:?}, stack={:?}",
+        outcome.state().waiting_for,
+        outcome.state().resolution_stack
+    );
+    assert!(outcome.state().return_result_frames.is_empty());
+    runner.advance_to_phase(Phase::Upkeep);
+    runner.advance_until_stack_empty();
+    assert_eq!(bird_count(&runner), 1);
+}
+
+#[test]
+fn repeated_eagles_controller_choice_and_while_condition_use_new_results() {
+    for repeat in [
+        RepeatContinuation::ControllerChoice,
+        RepeatContinuation::WhileCondition {
+            condition: Box::new(AbilityCondition::IsYourTurn),
+            max_iterations: Some(1),
+        },
+    ] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::End);
+        let selected = scenario.add_creature(P0, "Repeated Bear", 2, 2).id();
+        let spell = scenario
+            .add_spell_to_hand_from_oracle(P0, "The Eagles Are Coming!", true, EAGLES)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let mut runner = scenario.build();
+        let object = runner.state_mut().objects.get_mut(&spell).unwrap();
+        for abilities in [&mut object.abilities, &mut object.base_abilities] {
+            Arc::make_mut(abilities)[0].repeat_until = Some(repeat.clone());
+        }
+        let outcome = runner.cast(spell).target_object(selected).resolve();
+        outcome.assert_zone(&[selected], Zone::Hand);
+        if matches!(repeat, RepeatContinuation::ControllerChoice) {
+            assert!(matches!(
+                runner.state().waiting_for,
+                WaitingFor::RepeatDecision { .. }
+            ));
+            runner
+                .act(GameAction::DecideOptionalEffect { accept: true })
+                .expect("accept second process iteration");
+            assert!(runner.state().return_result_frames.len() <= 1);
+            runner
+                .act(GameAction::DecideOptionalEffect { accept: false })
+                .expect("stop repeated process");
+        }
+        let counts: Vec<_> = runner
+            .state()
+            .delayed_triggers
+            .iter()
+            .map(|trigger| match &trigger.ability.effect {
+                Effect::Token {
+                    count: QuantityExpr::Fixed { value },
+                    ..
+                } => *value,
+                effect => panic!("expected frozen delayed tokens, got {effect:?}"),
+            })
+            .collect();
+        assert_eq!(counts, [1, 0], "repeat mode {repeat:?}");
+        assert!(runner.state().return_result_frames.is_empty());
+        runner.advance_to_phase(Phase::Upkeep);
+        runner.advance_until_stack_empty();
+        assert_eq!(bird_count(&runner), 1);
+    }
 }
 
 #[test]
@@ -567,6 +669,10 @@ fn token_creature_counts_from_its_prior_object_record_after_leaving() {
         GameEvent::ZoneChanged { object_id, to: Zone::Hand, .. } if *object_id == token
     )));
     outcome.assert_zone(&[card], Zone::Hand);
+    assert!(
+        !outcome.state().objects.contains_key(&token),
+        "the returned token must cease to exist after its zone change"
+    );
     assert!(matches!(
         &outcome.state().delayed_triggers[0].ability.effect,
         Effect::Token {
@@ -1020,6 +1126,11 @@ fn nested_post_effect_repause_and_reload_preserve_outer_result() {
     ));
     assert!(initial.state().delayed_triggers.is_empty());
     assert!(!initial.state().return_result_frames.is_empty());
+    initial
+        .state()
+        .resolution_stack
+        .validate(&initial.state().waiting_for)
+        .expect("nested child and parent continuations preserve stack order");
     for (index, choice) in ["first", "second"].into_iter().enumerate() {
         let saved =
             serde_json::to_value(ResolutionStateWire::from_game_state(runner.state().clone()))
@@ -1032,6 +1143,11 @@ fn nested_post_effect_repause_and_reload_preserve_outer_result() {
                 choice: choice.to_string(),
             })
             .expect("answer nested post-effect choice");
+        runner
+            .state()
+            .resolution_stack
+            .validate(&runner.state().waiting_for)
+            .expect("nested continuation stack stays valid after each choice");
         if index == 0 {
             assert!(
                 matches!(runner.state().waiting_for, WaitingFor::NamedChoice { .. }),

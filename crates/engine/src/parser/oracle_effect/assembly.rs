@@ -2715,17 +2715,18 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
             .declares_chosen_clause
             .map(|id| ChosenGroupId(id.0));
         def.reads_chosen_group = clause_ir.reads_chosen_clause.map(|id| ChosenGroupId(id.0));
-        if ir
-            .clauses
-            .iter()
-            .any(|reader| reader.reads_return_result == Some(clause_ir.id))
-        {
+        if ir.clauses.iter().any(|reader| {
+            reader
+                .reads_return_result
+                .as_ref()
+                .is_some_and(|(id, _)| *id == clause_ir.id)
+        }) {
             def.declares_return_result = Some(ReturnResultId(clause_ir.id.0));
         }
         def.reads_return_result = clause_ir
             .reads_return_result
-            .zip(clause_ir.return_result_read_spec.clone())
-            .map(|(id, spec)| (ReturnResultId(id.0), spec));
+            .as_ref()
+            .map(|(id, spec)| (ReturnResultId(id.0), spec.clone()));
         // CR 702.26a: Preserve clause provenance on parent-target tap riders so
         // host-bound phase-in rewrites can match the exact printed phrase without
         // falling back to whole-trigger text.

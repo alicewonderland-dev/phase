@@ -951,6 +951,7 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
             });
         }
         state.active_return_result_occurrence = prior_occurrence;
+        retire_unreferenced_return_result_frames(state);
         if !waits_for_resolution_choice(&state.waiting_for) {
             // CR 615.5: a resumed continuation completes its own paused
             // resident drain only after it has not raised another choice.
@@ -996,6 +997,41 @@ pub(crate) fn clear_return_result_frames_if_idle(state: &mut GameState) {
     {
         state.return_result_frames.clear();
     }
+}
+
+fn retire_unreferenced_return_result_frames(state: &mut GameState) {
+    let live = crate::types::game_state::live_return_result_occurrences(state);
+    state.return_result_frames.retain(|id, _| live.contains(id));
+}
+
+fn begin_return_result_occurrence(
+    state: &mut GameState,
+) -> Result<Option<ReturnResultOccurrenceId>, EffectError> {
+    let id = ReturnResultOccurrenceId(state.next_return_result_occurrence_id);
+    state.next_return_result_occurrence_id = state
+        .next_return_result_occurrence_id
+        .checked_add(1)
+        .ok_or_else(|| EffectError::InvalidParam("return occurrence id overflow".to_string()))?;
+    state.return_result_frames.insert(id, Default::default());
+    Ok(state.active_return_result_occurrence.replace(id))
+}
+
+/// CR 608.2c: A repeated instruction executes afresh each iteration. Its
+/// settled zone-change result belongs to that iteration, including across a
+/// player-choice pause, while an enclosing instruction keeps its own result.
+fn with_iteration_return_result_occurrence<T>(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    run: impl FnOnce(&mut GameState) -> Result<T, EffectError>,
+) -> Result<T, EffectError> {
+    if !crate::types::game_state::has_return_result_metadata(ability) {
+        return run(state);
+    }
+    let previous = begin_return_result_occurrence(state)?;
+    let result = run(state);
+    state.active_return_result_occurrence = previous;
+    retire_unreferenced_return_result_frames(state);
+    result
 }
 
 /// CR 608.2c: One instruction publishes its final zone-change result once in
@@ -2085,7 +2121,9 @@ fn drain_active_repeat_for(state: &mut GameState, events: &mut Vec<GameEvent>) {
             // that the depth==0 prelude in `resolve_ability_chain` would
             // otherwise reset. The resumed iteration is logically continuing the
             // outer chain, not starting a fresh top-level resolution.
-            let _ = resolve_ability_chain(state, iter_effective, events, 1);
+            let _ = with_iteration_return_result_occurrence(state, iter_effective, |state| {
+                resolve_ability_chain(state, iter_effective, events, 1)
+            });
             // CR 608.2c: Iteration may transition to a player-choice state OR
             // synchronously install a `pending_continuation` (e.g. when the
             // sub_ability chain wires itself for later drain). Either signals
@@ -10974,7 +11012,9 @@ fn drive_repeat_for_outermost(
         let mut iter_ability = effective.clone();
         iter_ability.repeat_for = None;
         let stack_depth_before_iteration = state.resolution_stack.capture_child_boundary();
-        resolve_chain_body(state, &iter_ability, events, depth)?;
+        with_iteration_return_result_occurrence(state, &iter_ability, |state| {
+            resolve_chain_body(state, &iter_ability, events, depth)
+        })?;
         if state.waiting_for != initial_waiting_for
             || (!initial_continuation_present && state.active_ability_continuation().is_some())
         {
@@ -13732,21 +13772,12 @@ pub fn resolve_ability_chain(
     // CR 608.2c: Each top-level execution owns a separate result frame. A
     // replacement post-effect can enter another depth-0 chain synchronously;
     // restore the parent's selector after that nested root returns.
-    let previous_return_occurrence = if depth == 0 {
-        let id = crate::types::game_state::ReturnResultOccurrenceId(
-            state.next_return_result_occurrence_id,
-        );
-        state.next_return_result_occurrence_id = state
-            .next_return_result_occurrence_id
-            .checked_add(1)
-            .ok_or_else(|| {
-                EffectError::InvalidParam("return occurrence id overflow".to_string())
-            })?;
-        state.return_result_frames.insert(id, Default::default());
-        Some(state.active_return_result_occurrence.replace(id))
-    } else {
-        None
-    };
+    let previous_return_occurrence =
+        if depth == 0 && crate::types::game_state::has_return_result_metadata(ability) {
+            Some(begin_return_result_occurrence(state)?)
+        } else {
+            None
+        };
     let result = (|| {
         // CR 608.2c: Bump the per-ability per-turn resolution counter at the start of
         // top-level resolution so that the ordinary resolution-time
@@ -13779,7 +13810,9 @@ pub fn resolve_ability_chain(
             Some(RepeatContinuation::ControllerChoice) => {
                 let initial_waiting_for = state.waiting_for.clone();
                 let stack_depth_before_iteration = state.resolution_stack.capture_child_boundary();
-                resolve_chain_body(state, ability, events, depth)?;
+                with_iteration_return_result_occurrence(state, ability, |state| {
+                    resolve_chain_body(state, ability, events, depth)
+                })?;
                 if state.waiting_for != initial_waiting_for {
                     // Inner pause: stash so the drain re-sets the repeat prompt
                     // after the iteration's player choice resolves.
@@ -13817,7 +13850,9 @@ pub fn resolve_ability_chain(
                 let iteration_events_start = events.len();
                 let initial_waiting_for = state.waiting_for.clone();
                 let stack_depth_before_iteration = state.resolution_stack.capture_child_boundary();
-                resolve_chain_body(state, ability, events, depth)?;
+                with_iteration_return_result_occurrence(state, ability, |state| {
+                    resolve_chain_body(state, ability, events, depth)
+                })?;
                 if state.waiting_for != initial_waiting_for {
                     park_repeat_until_after_inner_pause(
                         state,
@@ -13877,7 +13912,9 @@ pub fn resolve_ability_chain(
                     let initial_waiting_for = state.waiting_for.clone();
                     let stack_depth_before_iteration =
                         state.resolution_stack.capture_child_boundary();
-                    resolve_chain_body(state, ability, events, depth)?;
+                    with_iteration_return_result_occurrence(state, ability, |state| {
+                        resolve_chain_body(state, ability, events, depth)
+                    })?;
                     if state.waiting_for != initial_waiting_for {
                         // Inner pause: stash the loop ability with its remaining cap
                         // so the drain re-evaluates the condition after the choice.
@@ -13906,7 +13943,7 @@ pub fn resolve_ability_chain(
     })();
     if let Some(previous) = previous_return_occurrence {
         state.active_return_result_occurrence = previous;
-        clear_return_result_frames_if_idle(state);
+        retire_unreferenced_return_result_frames(state);
     }
     result
 }
@@ -15902,15 +15939,33 @@ fn resolve_chain_body(
                     full_chain_iteration.repeat_for = None;
                     full_chain_iteration.copy_count_status =
                         crate::types::ability::CopyCountStatus::Finalized;
-                    resolve_ability_chain(state, &full_chain_iteration, events, depth.max(1))?;
+                    with_iteration_return_result_occurrence(
+                        state,
+                        &full_chain_iteration,
+                        |state| {
+                            resolve_ability_chain(
+                                state,
+                                &full_chain_iteration,
+                                events,
+                                depth.max(1),
+                            )
+                        },
+                    )?;
                 } else if (kind_driven || member_driven) && iter_effective.optional {
                     // CR 608.2c: pass a non-zero depth so the depth==0 prelude
                     // (chain-local state clearing, resolution counter) does not
                     // re-run mid-loop — this iteration continues the current
                     // resolution, mirroring the drain-path resume at depth 1.
-                    let _ = resolve_ability_chain(state, iter_effective, events, depth.max(1));
+                    let _ =
+                        with_iteration_return_result_occurrence(state, iter_effective, |state| {
+                            resolve_ability_chain(state, iter_effective, events, depth.max(1))
+                        });
                 } else {
-                    if let Ok(result) = resolve_effect(state, iter_effective, events) {
+                    if let Ok(result) =
+                        with_iteration_return_result_occurrence(state, iter_effective, |state| {
+                            resolve_effect(state, iter_effective, events)
+                        })
+                    {
                         if iterations == 1 {
                             immediate_effect_result = result;
                         }

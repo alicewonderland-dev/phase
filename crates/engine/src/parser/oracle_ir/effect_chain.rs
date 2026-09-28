@@ -585,6 +585,9 @@ pub(crate) struct ChosenReturnSpec {
     pub(crate) noun: TargetFilter,
     /// `None` requires one unambiguous antecedent of the named class.
     pub(crate) chooser: Option<TargetFilter>,
+    pub(crate) destination: Zone,
+    /// Only a printed recipient represented by the delayed-reader grammar can bind.
+    pub(crate) recipient: Option<ControllerRef>,
 }
 
 fn chosen_noun_compatible(producer: &TargetFilter, noun: &TargetFilter) -> bool {
@@ -877,9 +880,7 @@ pub(crate) struct ClauseIr {
     pub(crate) reads_chosen_clause: Option<ClauseId>,
     /// The prior return instruction whose actual results a delayed clause names.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) reads_return_result: Option<ClauseId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) return_result_read_spec: Option<ReturnResultReadSpec>,
+    pub(crate) reads_return_result: Option<(ClauseId, ReturnResultReadSpec)>,
     /// Honest chain-relative source (`SpanPrecision::ChainRelative`): exact byte
     /// range within this chain + verbatim fragment. Replaces the former
     /// unaddressed `source_text` string (Plan 01 §5, line 341). Upgrades to a
@@ -1459,7 +1460,6 @@ impl ClauseDraft<'_> {
         if chosen_return.is_some() && reads_chosen_clause.is_none() {
             self.parsed.effect = Effect::unimplemented("return", &self.source_text);
         }
-        let mut return_result_read_spec = None;
         let mut reads_return_result = None;
         let delayed_result_reader = self.delayed_condition.is_some()
             || self.prefix_delayed_condition.is_some()
@@ -1495,11 +1495,11 @@ impl ClauseDraft<'_> {
                 _ => false,
             };
             let antecedent = parsed_reader.as_ref().and_then(|reader| {
-                self.builder
+                let mut candidates = self
+                    .builder
                     .clauses
                     .iter()
-                    .rev()
-                    .find(|clause| {
+                    .filter(|clause| {
                         clause.reads_chosen_clause.is_some()
                             && matches!(
                                 &clause.parsed.effect,
@@ -1517,15 +1517,23 @@ impl ClauseDraft<'_> {
                                     .to_ascii_lowercase(),
                             )
                             .is_some_and(|producer| {
-                                chosen_noun_compatible(&producer.noun, &reader.noun)
+                                producer.destination == reader.destination
+                                    && producer.recipient.as_ref() == Some(&reader.recipient)
+                                    && chosen_noun_compatible(&producer.noun, &reader.noun)
                             })
                     })
                     .map(|clause| clause.id)
+                    .collect::<Vec<_>>();
+                candidates.sort_unstable();
+                candidates.dedup();
+                match candidates.as_slice() {
+                    [id] => Some(*id),
+                    _ => None,
+                }
             });
             if body_valid {
                 if let (Some(spec), Some(id)) = (parsed_reader, antecedent) {
-                    return_result_read_spec = Some(spec);
-                    reads_return_result = Some(id);
+                    reads_return_result = Some((id, spec));
                 } else {
                     self.parsed.effect = Effect::unimplemented("create", &self.source_text);
                 }
@@ -1549,7 +1557,6 @@ impl ClauseDraft<'_> {
             declares_chosen_clause,
             reads_chosen_clause,
             reads_return_result,
-            return_result_read_spec,
             source,
             disposition: self.disposition,
             parsed: self.parsed,
@@ -1603,11 +1610,51 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(clauses[1].reads_chosen_clause, Some(first));
         assert_eq!(clauses[3].reads_chosen_clause, Some(second));
-        assert_eq!(clauses[4].reads_return_result, Some(clauses[1].id));
+        assert_eq!(
+            clauses[4].reads_return_result.as_ref().map(|(id, _)| *id),
+            Some(clauses[1].id)
+        );
         assert!(matches!(
             clauses[4].parsed.effect,
             Effect::CreateDelayedTrigger { .. }
         ));
+    }
+
+    #[test]
+    fn delayed_return_reader_requires_one_matching_recipient_and_producer() {
+        for (text, expected_producers) in [
+            ("Choose target creature you own. Choose target creature of an opponent's choice. Return each creature you chose to your hand. Return each creature that opponent chose to your hand. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each creature returned to your hand this way.", 2),
+            ("Choose target creature you own. Return each chosen creature to its owner's hand. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each creature returned to your hand this way.", 1),
+        ] {
+            let ir = crate::parser::oracle_effect::parse_effect_chain_ir(
+                text,
+                AbilityKind::Spell,
+                &mut crate::parser::oracle_effect::ParseContext::default(),
+            );
+            let reader = ir.clauses.last().expect("delayed clause");
+            assert_eq!(ir.clauses.iter().filter(|clause| clause.reads_chosen_clause.is_some()).count(), expected_producers, "producer grammar must be reached: {ir:#?}");
+            assert!(reader.reads_return_result.is_none(), "ambiguous or mismatched recipient: {ir:#?}");
+            assert!(matches!(reader.parsed.effect, Effect::Unimplemented { .. }), "reader must remain an honest gap: {ir:#?}");
+        }
+    }
+
+    #[test]
+    fn delayed_return_reader_after_a_repeat_is_not_a_single_iteration_result() {
+        let text = "Choose target creature you own. Return each chosen creature to your hand. Repeat this process once. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each creature returned to your hand this way.";
+        let ir = crate::parser::oracle_effect::parse_effect_chain_ir(
+            text,
+            AbilityKind::Spell,
+            &mut crate::parser::oracle_effect::ParseContext::default(),
+        );
+        let reader = ir.clauses.last().expect("delayed reader clause");
+        assert!(
+            matches!(reader.parsed.effect, Effect::Unimplemented { .. }),
+            "after-loop aggregate must remain unsupported unless explicitly accumulated: {ir:#?}"
+        );
+        assert!(
+            reader.reads_return_result.is_none(),
+            "after-loop reader must not bind one repeated body's result: {ir:#?}"
+        );
     }
 
     #[test]
@@ -1664,7 +1711,10 @@ mod tests {
         let producer = clauses[0].declares_chosen_clause.expect("unpaid producer");
         assert_eq!(clauses[1].declares_chosen_clause, Some(producer));
         assert_eq!(clauses[2].reads_chosen_clause, Some(producer));
-        assert_eq!(clauses[3].reads_return_result, Some(clauses[2].id));
+        assert_eq!(
+            clauses[3].reads_return_result.as_ref().map(|(id, _)| *id),
+            Some(clauses[2].id)
+        );
         assert!(clauses
             .iter()
             .all(|clause| !matches!(clause.parsed.effect, Effect::Unimplemented { .. })));
