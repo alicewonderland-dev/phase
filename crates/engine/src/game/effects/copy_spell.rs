@@ -1372,7 +1372,7 @@ mod tests {
         );
     }
 
-    /// Companion (positive control) for the row above: with the spell still
+    /// Companion (positive control) for `departed_spell_without_record_copies_no_stack_object`: with the spell still
     /// on the stack, the same spell-cast-event authority answers `OnStack`
     /// and the copy is created — the live path is unaffected.
     #[test]

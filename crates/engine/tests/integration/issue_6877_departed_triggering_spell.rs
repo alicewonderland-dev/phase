@@ -1171,7 +1171,7 @@ fn assert_no_cleanup_authority(cleanup: &ResolutionCastCleanup, where_: &str) {
     );
 }
 
-/// CR 608.2g (paid graveyard cast) + CR 601.2i (countering): Ogre Battlecaster
+/// CR 608.2g (paid graveyard cast): Ogre Battlecaster
 /// casts Lightning Bolt from the graveyard and Hesitation counters it before
 /// it resolves — no viewer's projection of the resulting `departed_stack_spells`
 /// record carries the cast offer's server-only cleanup authority (`offer_id`,
