@@ -1956,8 +1956,6 @@ pub fn assign_selected_slots_in_chain(
     Ok(())
 }
 
-/// CR 601.2c: record `chosen` as the targets chosen for `ability` and capture
-/// the incarnations of the chain's object targets.
 fn finish_target_assignment(
     state: &GameState,
     ability: &mut ResolvedAbility,
