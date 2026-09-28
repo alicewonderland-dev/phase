@@ -2,7 +2,8 @@
 
 use std::sync::Arc;
 
-use engine::game::scenario::{GameScenario, P0, P1};
+use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+use engine::game::visibility::{filter_state_for_unseated_viewer, filter_state_for_viewer};
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{
     AbilityCondition, AbilityDefinition, AbilityKind, ChoiceType, DelayedTriggerCondition, Effect,
@@ -1696,6 +1697,55 @@ fn paused_return_result_restore_rejects_corrupt_authority_before_resume() {
     ));
     assert!(!outcome.state().return_result_frames.is_empty());
 
+    let canonical = serde_json::to_value(runner.state()).expect("canonical pause serializes");
+    assert!(!runner.state().resolution_stack.is_empty());
+    assert!(runner.state().next_return_result_occurrence_id > 1);
+    // The production pause has a live result frame before its batch publishes a
+    // record. Seed that exact private carrier in a clone to make wire leakage
+    // observable even when the pending frame's inner map is still empty.
+    let mut leak_probe = runner.state().clone();
+    let occurrence_id = *leak_probe
+        .return_result_frames
+        .keys()
+        .next()
+        .expect("paused return owns a result frame");
+    let secret_name = "PRIVATE_RETURN_RESULT_PROJECTION_CANARY";
+    let mut secret_record = leak_probe.objects[&redirected].snapshot_for_zone_change(
+        redirected,
+        Some(Zone::Battlefield),
+        Zone::Hand,
+    );
+    secret_record.name = secret_name.to_string();
+    leak_probe
+        .return_result_frames
+        .get_mut(&occurrence_id)
+        .unwrap()
+        .insert(ReturnResultId(u32::MAX), vec![secret_record]);
+    leak_probe.active_return_result_occurrence = Some(occurrence_id);
+    assert!(serde_json::to_string(&leak_probe)
+        .expect("private result carrier serializes")
+        .contains(secret_name));
+    for projected in [
+        filter_state_for_viewer(&leak_probe, P0),
+        filter_state_for_viewer(&leak_probe, P1),
+        filter_state_for_unseated_viewer(&leak_probe),
+    ] {
+        assert!(projected.resolution_stack.is_empty());
+        assert!(projected.return_result_frames.is_empty());
+        assert!(projected.active_return_result_occurrence.is_none());
+        assert_eq!(projected.next_return_result_occurrence_id, 1);
+        let wire = serde_json::to_value(projected).expect("viewer pause serializes");
+        assert!(wire.get("return_result_frames").is_none());
+        assert!(wire.get("active_return_result_occurrence").is_none());
+        assert_eq!(wire["next_return_result_occurrence_id"], 1);
+        assert!(!wire.to_string().contains(secret_name));
+    }
+    assert_eq!(
+        serde_json::to_value(runner.state()).expect("canonical pause still serializes"),
+        canonical,
+        "viewer projection must not mutate the authoritative pause"
+    );
+
     let saved = serde_json::to_value(ResolutionStateWire::from_game_state(runner.state().clone()))
         .expect("parked production batch serializes");
     let batch_completion = |wire: &serde_json::Value| {
@@ -1773,6 +1823,17 @@ fn paused_return_result_restore_rejects_corrupt_authority_before_resume() {
     let mut collided_allocator = saved.clone();
     collided_allocator["next_return_result_occurrence_id"] = serde_json::json!(occurrence);
     corruptions.push((collided_allocator, "outside the allocator"));
+
+    let mut orphan = saved.clone();
+    let orphan_id = orphan["next_return_result_occurrence_id"]
+        .as_u64()
+        .expect("next free occurrence id");
+    orphan["next_return_result_occurrence_id"] = serde_json::json!(orphan_id + 1);
+    orphan["return_result_frames"]
+        .as_object_mut()
+        .expect("occurrence arena")
+        .insert(orphan_id.to_string(), serde_json::json!({}));
+    corruptions.push((orphan, "has no live owner"));
 
     let mut missing_active = saved.clone();
     missing_active["active_return_result_occurrence"] = serde_json::json!(999_u64);
@@ -2178,14 +2239,69 @@ fn owner_not_controller_governs_target_and_return_result() {
         .add_creature(P1, "Borrowed by Caster", 2, 2)
         .controlled_by(P0)
         .id();
+    let another_owned_creature = scenario.add_creature(P0, "Another Owned Bear", 2, 2).id();
     let spell = scenario
         .add_spell_to_hand_from_oracle(P0, "The Eagles Are Coming!", true, EAGLES)
         .with_mana_cost(ManaCost::zero())
         .id();
     let mut runner = scenario.build();
-    let outcome = runner.cast(spell).target_object(owned_by_caster).resolve();
+    let mut positive_runner = GameRunner::from_state(runner.state().clone());
+    let card_id = runner.state().objects[&spell].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: spell,
+            card_id,
+            targets: vec![],
+            payment_mode: Default::default(),
+        })
+        .expect("cast reaches target selection");
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::OptionalCostChoice { .. }
+    ) {
+        runner
+            .act(GameAction::DecideOptionalCost { pay: false })
+            .expect("declining kicker reaches target announcement");
+    }
+    let WaitingFor::TargetSelection {
+        target_slots,
+        selection,
+        ..
+    } = &runner.state().waiting_for
+    else {
+        panic!(
+            "Eagles must ask for an owned creature target, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    let legal = &target_slots[selection.current_slot].legal_targets;
+    // CR 601.2c: "you own" checks owner at target announcement, even when
+    // another player controls that creature.
+    assert!(legal.contains(&TargetRef::Object(owned_by_caster)));
+    assert!(legal.contains(&TargetRef::Object(another_owned_creature)));
+    assert!(!legal.contains(&TargetRef::Object(controlled_by_caster)));
+    let before_illegal = serde_json::to_value(runner.state()).expect("target prompt serializes");
+    runner
+        .act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(controlled_by_caster)),
+        })
+        .expect_err("a controlled but unowned creature is illegal");
+    assert_eq!(
+        serde_json::to_value(runner.state()).expect("rejected target state serializes"),
+        before_illegal,
+        "illegal target selection cannot change the pending cast"
+    );
+
+    let outcome = positive_runner
+        .cast(spell)
+        .target_object(owned_by_caster)
+        .resolve();
+    // CR 608.2c: the instruction returns the chosen creature to its owner's hand.
     outcome.assert_zone(&[owned_by_caster], Zone::Hand);
-    outcome.assert_zone(&[controlled_by_caster], Zone::Battlefield);
+    outcome.assert_zone(
+        &[controlled_by_caster, another_owned_creature],
+        Zone::Battlefield,
+    );
     assert!(matches!(
         &outcome.state().delayed_triggers[0].ability.effect,
         Effect::Token {
