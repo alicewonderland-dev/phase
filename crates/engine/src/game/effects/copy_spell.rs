@@ -163,6 +163,10 @@ pub fn resolve(
                 // CR 707.10: a copy of a spell isn't cast, so it must never
                 // consume a once-per-turn CastWithAlternativeCost grant's slot.
                 a.context.alt_cost_grant_source = None;
+                // CR 707.10: a graveyard cast permission authorizes the original
+                // cast only; the copy cannot consume it or inherit its ETB rider.
+                a.context.graveyard_permission_authority = None;
+                a.context.graveyard_permission_latch = None;
             }
             StackEntryKind::Spell { ability: None, .. } => {}
             StackEntryKind::ActivatedAbility { ability, .. } => {
