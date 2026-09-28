@@ -242,6 +242,11 @@ pub fn resolve(
                 .map(ObjectIncarnationRef::from_object);
             if let Some(copy_ability) = state.stack.back_mut().and_then(|e| e.ability_mut()) {
                 rewrite_copy_spell_object_targets(copy_ability, member, member_pin);
+                for declared in &mut copy_ability.declared_targets {
+                    if matches!(declared, TargetRef::Object(_)) {
+                        *declared = TargetRef::Object(member);
+                    }
+                }
             }
         }
     }

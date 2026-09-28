@@ -2033,6 +2033,8 @@ pub fn flatten_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
     targets
 }
 
+/// CR 115.1 + CR 115.10a: the objects and players chosen as targets for the
+/// chain `ability` heads: its `ResolvedAbility::declared_targets`.
 pub fn flatten_declared_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
     ability.declared_targets.clone()
 }

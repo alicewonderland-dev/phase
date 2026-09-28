@@ -4,11 +4,14 @@
 use engine::game::ability_utils::{flatten_declared_targets_in_chain, flatten_targets_in_chain};
 use engine::game::combat::AttackTarget;
 use engine::game::effects::attach::attach_to;
+use engine::game::game_object::AttachTarget;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{Effect, TargetFilter, TargetRef};
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
-use engine::types::game_state::{GameState, StackEntryKind, WaitingFor};
+use engine::types::game_state::{
+    GameState, RetargetScope, ShardChoice, StackEntryKind, WaitingFor,
+};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
 use engine::types::mana::{ManaColor, ManaCost};
@@ -27,6 +30,10 @@ const MURDER: &str = "Destroy target creature.";
 const TAIL_SWIPE: &str = "Choose target creature you control and target creature you don't control. If you cast this spell during your main phase, the creature you control gets +1/+1 until end of turn. Then those creatures fight each other. (Each deals damage equal to its power to the other.)";
 const PSIONIC_ENTITY: &str =
     "{T}: This creature deals 2 damage to any target and 3 damage to itself.";
+const VAMPIRE_SOVEREIGN: &str =
+    "Flying\nWhen this creature enters, target opponent loses 3 life and you gain 3 life.";
+const SWOOPING_PTERANODON: &str = "Flying, haste\nWhenever this creature or another Dinosaur you control with flying enters, gain control of target creature an opponent controls until end of turn. Untap that creature. It gains flying and haste until end of turn. At the beginning of the next end step, target land deals 3 damage to that creature.";
+const FATAL_FISSURE: &str = "Choose target creature. When that creature dies this turn, you earthbend 4. (Target land you control becomes a 0/0 creature with haste that's still a land. Put four +1/+1 counters on it. When it dies or is exiled, return it to the battlefield tapped.)";
 const AEGIS_ANGEL: &str = "Flying (This creature can't be blocked except by creatures with flying or reach.)\nWhen this creature enters, another target permanent gains indestructible for as long as you control this creature. (Effects that say \"destroy\" don't destroy it. A creature with indestructible can't be destroyed by damage.)";
 
 /// `(flatten_targets_in_chain, flatten_declared_targets_in_chain)` of the
@@ -462,9 +469,280 @@ fn a_per_opponent_trigger_targets_only_the_permanents_it_is_aimed_at() {
     );
 }
 
+fn crimes(state: &GameState, player: PlayerId) -> u32 {
+    state
+        .players
+        .iter()
+        .find(|p| p.id == player)
+        .expect("player")
+        .crimes_committed_this_turn
+}
+
+#[test]
+fn a_batched_attack_trigger_commits_no_crime() {
+    let (mut runner, attacker, strategist) = sabotage_board();
+    let entry = trigger_of(&mut runner, strategist);
+    let (held, _) = both(runner.state(), entry);
+    assert_eq!(
+        held,
+        vec![TargetRef::Object(attacker)],
+        "reach guard: the trigger holds the attacker"
+    );
+    assert_eq!(
+        runner.state().objects[&attacker].controller,
+        P0,
+        "reach guard: the attacker is P1's opponent's"
+    );
+    assert_eq!(crimes(runner.state(), P1), 0, "CR 700.13");
+}
+
+#[test]
+fn an_enters_trigger_that_targets_an_opponent_commits_a_crime() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let sovereign = scenario
+        .add_creature_to_hand_from_oracle(P0, "Vampire Sovereign", 3, 4, VAMPIRE_SOVEREIGN)
+        .from_oracle_text_with_keywords(&["Flying"], VAMPIRE_SOVEREIGN)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(sovereign).commit();
+    let entry = trigger_of(&mut runner, sovereign);
+    let (_, declared) = both(runner.state(), entry);
+    assert_eq!(
+        declared,
+        vec![TargetRef::Player(P1)],
+        "reach guard: the trigger targets the opponent"
+    );
+    assert_eq!(crimes(runner.state(), P0), 1, "CR 700.13");
+}
+
+/// P0's Swooping Pteranodon has taken P1's 2/2, and P0 controls `lands`
+/// Mountains. Passes to the end step until the Pteranodon's delayed trigger is
+/// on the stack, choosing the first Mountain if asked. Returns the Mountains,
+/// the trigger, whether a target prompt opened, and the target of every
+/// `GameEvent::BecomesTarget` emitted from the end of the enters trigger on.
+fn pteranodon_end_step(
+    lands: usize,
+) -> (GameRunner, Vec<ObjectId>, ObjectId, bool, Vec<TargetRef>) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PostCombatMain);
+    let bear = scenario.add_creature(P1, "Bear", 2, 2).id();
+    let pteranodon = scenario
+        .add_creature_to_hand_from_oracle(P0, "Swooping Pteranodon", 3, 3, SWOOPING_PTERANODON)
+        .from_oracle_text_with_keywords(&["Flying", "Haste"], SWOOPING_PTERANODON)
+        .with_subtypes(vec!["Dinosaur"])
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mountains: Vec<ObjectId> = (0..lands)
+        .map(|_| scenario.add_basic_land(P0, ManaColor::Red))
+        .collect();
+    let mut runner = scenario.build();
+    runner.cast(pteranodon).commit();
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        runner.state().objects[&bear].controller,
+        P0,
+        "reach guard: the enters trigger resolved"
+    );
+    let mut prompted = false;
+    let mut targeted = Vec::new();
+    for _ in 0..40 {
+        let state = runner.state();
+        if state.phase == Phase::End
+            && matches!(state.waiting_for, WaitingFor::Priority { .. })
+            && !state.stack.is_empty()
+        {
+            break;
+        }
+        let action = if matches!(state.waiting_for, WaitingFor::TriggerTargetSelection { .. }) {
+            prompted = true;
+            GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(mountains[0])),
+            }
+        } else {
+            GameAction::PassPriority
+        };
+        let result = runner.act(action).expect("advance to the end step");
+        targeted.extend(result.events.into_iter().filter_map(|event| match event {
+            GameEvent::BecomesTarget { target, .. } => Some(target),
+            _ => None,
+        }));
+    }
+    let entry = trigger_of(&mut runner, pteranodon);
+    (runner, mountains, entry, prompted, targeted)
+}
+
+#[test]
+fn an_end_step_trigger_makes_only_its_one_legal_target_a_target() {
+    let (runner, mountains, entry, prompted, targeted) = pteranodon_end_step(1);
+    assert!(
+        !prompted,
+        "reach guard: the only land was chosen without a prompt"
+    );
+    let (held, _) = both(runner.state(), entry);
+    assert!(
+        held.iter().any(|t| *t != TargetRef::Object(mountains[0])),
+        "reach guard: the trigger also holds an object it does not target"
+    );
+    assert_eq!(
+        targeted,
+        vec![TargetRef::Object(mountains[0])],
+        "CR 115.10a"
+    );
+}
+
+#[test]
+fn an_end_step_trigger_makes_only_its_chosen_target_a_target() {
+    let (runner, mountains, entry, prompted, targeted) = pteranodon_end_step(2);
+    assert!(prompted, "reach guard: the land was chosen at a prompt");
+    let (held, _) = both(runner.state(), entry);
+    assert!(
+        held.iter().any(|t| *t != TargetRef::Object(mountains[0])),
+        "reach guard: the trigger also holds an object it does not target"
+    );
+    assert_eq!(
+        targeted,
+        vec![TargetRef::Object(mountains[0])],
+        "CR 115.10a"
+    );
+}
+
+/// A Fatal Fissure board once its delayed trigger is on the stack.
+struct FissureTrigger {
+    runner: GameRunner,
+    bear: ObjectId,
+    swamps: Vec<ObjectId>,
+    entry: ObjectId,
+    /// The query's answer for the trigger's entry at its target prompt, if
+    /// one opened.
+    at_prompt: Option<Vec<TargetRef>>,
+    /// `GameEvent::BecomesTarget` targets and `GameEvent::CrimeCommitted`
+    /// players emitted by the actions after Murder is cast.
+    targeted: Vec<TargetRef>,
+    criminals: Vec<PlayerId>,
+}
+
+/// P0, who controls `lands` Swamps, casts Fatal Fissure at P1's 2/2 and it
+/// resolves. P0 then casts Murder at the 2/2 and passes until the delayed
+/// trigger is on the stack, choosing the first Swamp if asked.
+fn fissure_trigger(lands: usize) -> FissureTrigger {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let bear = scenario.add_creature(P1, "Bear", 2, 2).id();
+    let fissure = scenario
+        .add_spell_to_hand_from_oracle(P0, "Fatal Fissure", true, FATAL_FISSURE)
+        .from_oracle_text_with_keywords(&["Earthbend"], FATAL_FISSURE)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let murder = scenario
+        .add_spell_to_hand_from_oracle(P0, "Murder", true, MURDER)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let swamps: Vec<ObjectId> = (0..lands)
+        .map(|_| scenario.add_basic_land(P0, ManaColor::Black))
+        .collect();
+    let mut runner = scenario.build();
+    runner.cast(fissure).target_objects(&[bear]).commit();
+    runner.advance_until_stack_empty();
+    runner.cast(murder).target_objects(&[bear]).commit();
+    let mut at_prompt = None;
+    let mut targeted = Vec::new();
+    let mut criminals = Vec::new();
+    for _ in 0..40 {
+        let state = runner.state();
+        let pending = state.stack.iter().rev().find(|e| {
+            e.source_id == fissure && matches!(e.kind, StackEntryKind::TriggeredAbility { .. })
+        });
+        let action = match (&state.waiting_for, pending) {
+            (WaitingFor::Priority { .. }, Some(_)) => break,
+            (WaitingFor::TriggerTargetSelection { .. }, Some(entry)) => {
+                at_prompt = Some(both(state, entry.id).1);
+                GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(swamps[0])),
+                }
+            }
+            _ => GameAction::PassPriority,
+        };
+        let result = runner.act(action).expect("advance to the delayed trigger");
+        for event in result.events {
+            match event {
+                GameEvent::BecomesTarget { target, .. } => targeted.push(target),
+                GameEvent::CrimeCommitted { player_id } => criminals.push(player_id),
+                _ => {}
+            }
+        }
+    }
+    let entry = trigger_of(&mut runner, fissure);
+    assert_eq!(
+        runner.state().objects[&bear].zone,
+        Zone::Graveyard,
+        "reach guard: the creature the delayed trigger waited on died"
+    );
+    FissureTrigger {
+        runner,
+        bear,
+        swamps,
+        entry,
+        at_prompt,
+        targeted,
+        criminals,
+    }
+}
+
+#[test]
+fn a_delayed_trigger_with_one_legal_land_targets_only_the_land() {
+    let fissure = fissure_trigger(1);
+    let swamp = TargetRef::Object(fissure.swamps[0]);
+    assert_eq!(
+        fissure.at_prompt, None,
+        "reach guard: the only land was chosen without a prompt"
+    );
+    let (held, declared) = both(fissure.runner.state(), fissure.entry);
+    assert!(
+        held.contains(&TargetRef::Object(fissure.bear)),
+        "reach guard: the trigger also holds the creature it waited on"
+    );
+    assert_eq!(declared, vec![swamp.clone()]);
+    assert_eq!(fissure.targeted, vec![swamp], "CR 115.10a");
+    assert_eq!(fissure.criminals, Vec::new(), "CR 700.13");
+}
+
+#[test]
+fn a_delayed_trigger_with_a_chosen_land_targets_only_the_land() {
+    let fissure = fissure_trigger(2);
+    assert!(
+        fissure.at_prompt.is_some(),
+        "reach guard: the land was chosen at a prompt"
+    );
+    assert!(
+        both(fissure.runner.state(), fissure.entry)
+            .0
+            .contains(&TargetRef::Object(fissure.bear)),
+        "reach guard: the trigger also holds the creature it waited on"
+    );
+    assert_eq!(fissure.at_prompt, Some(Vec::new()));
+    assert_eq!(
+        both(fissure.runner.state(), fissure.entry).1,
+        vec![TargetRef::Object(fissure.swamps[0])]
+    );
+    assert_eq!(
+        fissure.targeted,
+        vec![TargetRef::Object(fissure.swamps[0])],
+        "CR 115.10a"
+    );
+    assert_eq!(fissure.criminals, Vec::new(), "CR 700.13");
+}
+
+const GIFT_OF_IMMORTALITY: &str = "Enchant creature\nWhen enchanted creature dies, return that card to the battlefield under its owner's control. Return this card to the battlefield attached to that creature at the beginning of the next end step.";
+const BASALT_GOLEM: &str = "This creature can't be blocked by artifact creatures.\nWhenever this creature becomes blocked by a creature, that creature's controller sacrifices it at end of combat. If the player does, they create a 0/2 colorless Wall artifact creature token with defender.";
 const KIKI_JIKI: &str = "Haste\n{T}: Create a token that's a copy of target nonlegendary creature you control, except it has haste. Sacrifice it at the beginning of the next end step.";
+const REDIRECT: &str = "You may choose new targets for target spell.";
+const SPELLSKITE: &str = "{U/P}: Change a target of target spell or ability to this creature. ({U/P} can be paid with either {U} or 2 life.)";
 const TWINCAST: &str =
     "Copy target instant or sorcery spell. You may choose new targets for the copy.";
+const ZADA: &str = "Whenever you cast an instant or sorcery spell that targets only Zada, copy that spell for each other creature you control that the spell could target. Each copy targets a different one of those creatures.";
+const GIANT_GROWTH: &str = "Target creature gets +3/+3 until end of turn.";
 
 /// Passes priority, ordering triggers as listed, until `done` holds. Returns
 /// every event those actions emitted.
@@ -503,6 +781,103 @@ fn pending_trigger_of(state: &GameState, source: ObjectId) -> Option<ObjectId> {
             e.source_id == source && matches!(e.kind, StackEntryKind::TriggeredAbility { .. })
         })
         .map(|e| e.id)
+}
+
+fn criminals(events: &[GameEvent]) -> Vec<PlayerId> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            GameEvent::CrimeCommitted { player_id } => Some(*player_id),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_delayed_return_targets_none_of_the_creature_it_holds() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let bear = scenario.add_creature(P1, "Bear", 2, 2).id();
+    let gift = scenario
+        .add_enchantment_from_oracle(P0, "Gift of Immortality", GIFT_OF_IMMORTALITY)
+        .with_subtypes(vec!["Aura"])
+        .from_oracle_text_with_keywords(&["Enchant"], GIFT_OF_IMMORTALITY)
+        .id();
+    let murder = scenario
+        .add_spell_to_hand_from_oracle(P1, "Murder", true, MURDER)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = p1_priority(scenario);
+    attach_to(runner.state_mut(), gift, bear);
+    runner.cast(murder).target_objects(&[bear]).commit();
+    let mut events = pass_until(&mut runner, |state| {
+        state.phase == Phase::End && pending_trigger_of(state, gift).is_some()
+    });
+    let entry = pending_trigger_of(runner.state(), gift).expect("the delayed return");
+    let (held, declared) = both(runner.state(), entry);
+    assert!(
+        held.contains(&TargetRef::Object(bear)),
+        "reach guard: the delayed return holds the creature"
+    );
+    assert_eq!(
+        runner.state().objects[&bear].controller,
+        P1,
+        "reach guard: the creature is P0's opponent's"
+    );
+    assert_eq!(declared, Vec::new());
+    events.extend(pass_until(&mut runner, |state| state.stack.is_empty()));
+    assert_eq!(
+        runner.state().objects[&gift].attached_to,
+        Some(AttachTarget::Object(bear)),
+        "reach guard: the return resolved"
+    );
+    assert_eq!(criminals(&events), Vec::new(), "CR 700.13");
+}
+
+#[test]
+fn a_delayed_sacrifice_targets_none_of_the_blocker_it_holds() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let golem = scenario
+        .add_creature_from_oracle(P0, "Basalt Golem", 2, 4, BASALT_GOLEM)
+        .id();
+    let blocker = scenario.add_creature(P1, "Blocker", 0, 5).id();
+    let mut runner = scenario.build();
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&golem)
+        .expect("golem")
+        .summoning_sick = false;
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[(golem, AttackTarget::Player(P1))])
+        .expect("declare attackers");
+    let mut events = pass_until(&mut runner, |state| {
+        matches!(state.waiting_for, WaitingFor::DeclareBlockers { .. })
+    });
+    events.extend(
+        runner
+            .declare_blockers(&[(blocker, golem)])
+            .expect("declare blockers")
+            .events,
+    );
+    events.extend(pass_until(&mut runner, |state| {
+        state.phase == Phase::EndCombat && pending_trigger_of(state, golem).is_some()
+    }));
+    let entry = pending_trigger_of(runner.state(), golem).expect("the delayed sacrifice");
+    let (held, declared) = both(runner.state(), entry);
+    assert!(
+        held.contains(&TargetRef::Object(blocker)),
+        "reach guard: the delayed sacrifice holds the blocker"
+    );
+    assert_eq!(
+        runner.state().objects[&blocker].controller,
+        P1,
+        "reach guard: the blocker is P0's opponent's"
+    );
+    assert_eq!(declared, Vec::new());
+    assert_eq!(criminals(&events), Vec::new(), "CR 700.13");
 }
 
 #[test]
@@ -568,6 +943,133 @@ fn declared_of(state: &GameState, id: ObjectId) -> Vec<TargetRef> {
     both(state, id).1
 }
 
+#[test]
+fn a_spell_given_new_targets_targets_the_new_ones() {
+    let mut scenario = GameScenario::new();
+    let (first, other, shock) = shock_on_the_stack(&mut scenario);
+    let redirect = scenario
+        .add_spell_to_hand_from_oracle(P1, "Redirect", true, REDIRECT)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(shock).target_objects(&[first]).commit();
+    assert_eq!(
+        declared_of(runner.state(), shock),
+        vec![TargetRef::Object(first)],
+        "reach guard: Shock was cast at the first creature"
+    );
+    runner.act(GameAction::PassPriority).expect("pass to P1");
+    runner.cast(redirect).target_objects(&[shock]).commit();
+    pass_until(&mut runner, |state| {
+        matches!(
+            state.waiting_for,
+            WaitingFor::OptionalEffectChoice { .. } | WaitingFor::RetargetChoice { .. }
+        )
+    });
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::OptionalEffectChoice { .. }
+    ) {
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: true })
+            .expect("choose new targets");
+    }
+    runner
+        .act(GameAction::RetargetSpell {
+            new_targets: vec![TargetRef::Object(other)],
+        })
+        .expect("retarget");
+    let (held, declared) = both(runner.state(), shock);
+    assert_eq!(
+        held,
+        vec![TargetRef::Object(other)],
+        "reach guard: the new target was written"
+    );
+    assert_eq!(declared, vec![TargetRef::Object(other)], "CR 115.7d");
+}
+
+#[test]
+fn a_spell_given_new_targets_at_a_prompt_without_slot_addresses_targets_the_new_ones() {
+    let mut scenario = GameScenario::new();
+    let (first, other, shock) = shock_on_the_stack(&mut scenario);
+    let mut runner = scenario.build();
+    runner.cast(shock).target_objects(&[first]).commit();
+    let index = runner
+        .state()
+        .stack
+        .iter()
+        .position(|e| e.id == shock)
+        .expect("Shock is on the stack");
+    // A retarget prompt saved before prompts carried slot addresses.
+    runner.state_mut().waiting_for = WaitingFor::RetargetChoice {
+        player: P1,
+        stack_entry_index: index,
+        scope: RetargetScope::All,
+        current_targets: vec![TargetRef::Object(first)],
+        slots: Vec::new(),
+        slot_pools: Vec::new(),
+        legal_new_targets: vec![TargetRef::Object(first), TargetRef::Object(other)],
+    };
+    runner
+        .act(GameAction::RetargetSpell {
+            new_targets: vec![TargetRef::Object(other)],
+        })
+        .expect("retarget");
+    let (held, declared) = both(runner.state(), shock);
+    assert_eq!(
+        held,
+        vec![TargetRef::Object(other)],
+        "reach guard: the new target was written"
+    );
+    assert_eq!(declared, vec![TargetRef::Object(other)], "CR 115.7d");
+}
+
+#[test]
+fn a_spell_whose_target_is_changed_to_a_creature_targets_that_creature() {
+    let mut scenario = GameScenario::new();
+    let (first, _, shock) = shock_on_the_stack(&mut scenario);
+    let spellskite = scenario
+        .add_creature_from_oracle(P1, "Spellskite", 0, 4, SPELLSKITE)
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(shock).target_objects(&[first]).commit();
+    runner.act(GameAction::PassPriority).expect("pass to P1");
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: spellskite,
+            ability_index: 0,
+        })
+        .expect("activate");
+    for _ in 0..8 {
+        match &runner.state().waiting_for {
+            WaitingFor::TargetSelection { .. } => {
+                runner
+                    .act(GameAction::ChooseTarget {
+                        target: Some(TargetRef::Object(shock)),
+                    })
+                    .expect("target Shock");
+            }
+            WaitingFor::PhyrexianPayment { .. } => {
+                runner
+                    .act(GameAction::SubmitPhyrexianChoices {
+                        choices: vec![ShardChoice::PayLife],
+                    })
+                    .expect("pay 2 life");
+            }
+            WaitingFor::Priority { .. } => break,
+            other => panic!("unexpected prompt {other:?}"),
+        }
+    }
+    pass_until(&mut runner, |state| state.stack.len() == 1);
+    let (held, declared) = both(runner.state(), shock);
+    assert_eq!(
+        held,
+        vec![TargetRef::Object(spellskite)],
+        "reach guard: the new target was written"
+    );
+    assert_eq!(declared, vec![TargetRef::Object(spellskite)], "CR 115.7b");
+}
+
 /// P0 casts Shock at P1's first creature, then Twincast at the Shock, and
 /// passes until the copy's retarget prompt opens.
 fn twincast_board() -> (GameRunner, ObjectId, ObjectId, ObjectId) {
@@ -601,6 +1103,27 @@ fn twincast_board() -> (GameRunner, ObjectId, ObjectId, ObjectId) {
 }
 
 #[test]
+fn a_copy_given_a_new_target_targets_it() {
+    let (mut runner, first, shock, copy) = twincast_board();
+    runner
+        .act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Player(P1)),
+        })
+        .expect("choose the copy's new target");
+    let (held, declared) = both(runner.state(), copy);
+    assert_eq!(
+        held,
+        vec![TargetRef::Player(P1)],
+        "reach guard: the new target was written"
+    );
+    assert_eq!(declared, vec![TargetRef::Player(P1)], "CR 707.10c");
+    assert_eq!(
+        declared_of(runner.state(), shock),
+        vec![TargetRef::Object(first)]
+    );
+}
+
+#[test]
 fn a_copy_that_keeps_its_targets_targets_what_the_original_does() {
     let (mut runner, first, _, copy) = twincast_board();
     runner
@@ -610,5 +1133,42 @@ fn a_copy_that_keeps_its_targets_targets_what_the_original_does() {
         declared_of(runner.state(), copy),
         vec![TargetRef::Object(first)],
         "CR 707.10"
+    );
+}
+
+#[test]
+fn each_copy_made_for_another_creature_targets_that_creature() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let zada = scenario
+        .add_creature_from_oracle(P0, "Zada, Hedron Grinder", 3, 3, ZADA)
+        .as_legendary()
+        .id();
+    let bear = scenario.add_creature(P0, "Bear", 2, 2).id();
+    let growth = scenario
+        .add_spell_to_hand_from_oracle(P0, "Giant Growth", true, GIANT_GROWTH)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(growth).target_objects(&[zada]).commit();
+    pass_until(&mut runner, |state| {
+        state.stack.len() == 2
+            && state
+                .stack
+                .iter()
+                .all(|e| matches!(e.kind, StackEntryKind::Spell { .. }))
+    });
+    let copy = runner.state().stack.back().expect("the copy").id;
+    assert_ne!(copy, growth, "reach guard: a copy was put on the stack");
+    let (held, declared) = both(runner.state(), copy);
+    assert_eq!(
+        held,
+        vec![TargetRef::Object(bear)],
+        "reach guard: the copy's target was rewritten"
+    );
+    assert_eq!(declared, vec![TargetRef::Object(bear)], "CR 707.10d");
+    assert_eq!(
+        declared_of(runner.state(), growth),
+        vec![TargetRef::Object(zada)]
     );
 }

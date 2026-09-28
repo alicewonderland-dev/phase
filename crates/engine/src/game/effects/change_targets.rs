@@ -379,6 +379,7 @@ fn write_retarget_position(
     let Some(mut mutated) = state.stack[stack_entry_index].ability().cloned() else {
         return;
     };
+    let mut changed = None;
     if let Some(node) = ability_utils::node_at_mut(&mut mutated, &address.path) {
         if let Some(old) = node.targets.get(address.slot).cloned() {
             let refresh = node.retarget_target_requires_pin_refresh(&old, new_target, state);
@@ -394,7 +395,11 @@ fn write_retarget_position(
                     node.update_selected_target_incarnation(pin);
                 }
             }
+            changed = Some(old);
         }
+    }
+    if let Some(old) = changed {
+        mutated.change_declared_target(&old, new_target);
     }
     ability_utils::restamp_derived_chain_targets(&mut mutated);
     if let Some(stack_ability_mut) = state.stack[stack_entry_index].ability_mut() {
