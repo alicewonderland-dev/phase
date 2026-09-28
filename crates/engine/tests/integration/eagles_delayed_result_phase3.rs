@@ -18,7 +18,7 @@ use engine::types::keywords::Keyword;
 use engine::types::mana::{ManaColor, ManaCost, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::replacements::ReplacementEvent;
-use engine::types::resolution::ResolutionStateWire;
+use engine::types::resolution::{ResolutionFrame, ResolutionStateWire};
 use engine::types::zones::{EtbTapState, Zone};
 
 const EAGLES: &str = "Kicker {2}{W}{W} (You may pay an additional {2}{W}{W} as you cast this spell.)\nChoose target creature you own. If this spell was kicked, instead choose any number of target creatures you own. Return each chosen creature to your hand. At the beginning of the next upkeep, create a 4/4 white Bird Soldier creature token with flying for each creature returned to your hand this way.";
@@ -131,6 +131,20 @@ fn repeated_return_after_zone_choice_and_reload_keeps_each_result() {
 
     let saved = serde_json::to_value(ResolutionStateWire::from_game_state(runner.state().clone()))
         .expect("paused repeated return serializes");
+    let selected_publisher = saved["resolution_frames"]["frames"]
+        .as_array()
+        .expect("typed resolution frames")
+        .iter()
+        .find(|frame| {
+            frame["type"] == "AbilityContinuation"
+                && frame["data"]["pending"]["pending_return_result_producer"].is_array()
+        })
+        .expect("selected return retains its exact producer key");
+    let occurrence = &selected_publisher["data"]["pending"]["return_result_occurrence"];
+    assert_eq!(
+        &selected_publisher["data"]["pending"]["pending_return_result_producer"][0],
+        occurrence
+    );
     let restored: ResolutionStateWire =
         serde_json::from_value(saved).expect("paused repeated return restores");
     *runner.state_mut() = restored.into_game_state();
@@ -162,6 +176,495 @@ fn repeated_return_after_zone_choice_and_reload_keeps_each_result() {
     runner.advance_to_phase(Phase::Upkeep);
     runner.advance_until_stack_empty();
     assert_eq!(bird_count(&runner), 2);
+}
+
+#[test]
+fn selected_return_result_survives_redirect_pause_and_rejects_corrupt_carriers() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::End);
+    let redirected = scenario
+        .add_creature(P0, "Redirected Selection Bear", 2, 2)
+        .with_replacement_definition(redirect_own_hand_move_to(Zone::Exile))
+        .with_replacement_definition(redirect_own_hand_move_to(Zone::Graveyard))
+        .id();
+    let returned = scenario
+        .add_creature(P0, "Returned Selection Bear", 2, 2)
+        .id();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "The Eagles Are Coming!", true, EAGLES)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    let object = runner.state_mut().objects.get_mut(&spell).unwrap();
+    let definitions = Arc::make_mut(&mut object.abilities);
+    let mut producer = definitions[0].clone();
+    while producer.declares_return_result.is_none() {
+        producer = *producer
+            .sub_ability
+            .expect("printed return producer is present");
+    }
+    producer.reads_chosen_group = None;
+    producer.repeat_for = Some(QuantityExpr::Fixed { value: 2 });
+    producer.effect = Box::new(Effect::BounceAll {
+        target: TargetFilter::Typed(TypedFilter::creature()),
+        destination: None,
+        count: Some(QuantityExpr::Fixed { value: 1 }),
+    });
+    producer
+        .sub_ability
+        .as_mut()
+        .expect("delayed reader")
+        .sub_link = SubAbilityLink::ContinuationStep;
+    definitions[0] = producer;
+    object.base_abilities = object.abilities.clone();
+
+    let first_prompt = runner.cast(spell).resolve();
+    assert!(matches!(
+        first_prompt.final_waiting_for(),
+        WaitingFor::EffectZoneChoice { cards, .. }
+            if cards.contains(&redirected) && cards.contains(&returned)
+    ));
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![redirected],
+        })
+        .expect("choose the redirecting creature");
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::ReplacementChoice { .. }
+    ));
+    assert!(runner.state().delayed_triggers.is_empty());
+
+    let saved = serde_json::to_value(ResolutionStateWire::from_game_state(runner.state().clone()))
+        .expect("selected return's replacement pause serializes");
+    let frames = saved["resolution_frames"]["frames"]
+        .as_array()
+        .expect("typed resolution frames");
+    let zone = frames
+        .iter()
+        .find(|frame| {
+            frame["type"] == "ChangeZone"
+                && frame["data"]["pending"]["pending_return_result_producer"].is_array()
+        })
+        .expect("zone iteration owns the transferred producer key");
+    let key = zone["data"]["pending"]["pending_return_result_producer"].clone();
+    let occurrence = key[0].as_u64().expect("occurrence id");
+    let result = key[1].as_u64().expect("result id");
+    let reader = frames
+        .iter()
+        .find(|frame| {
+            frame["type"] == "AbilityContinuation"
+                && frame["data"]["pending"]["return_result_occurrence"] == occurrence
+        })
+        .expect("reader is parked beneath the unsettled zone iteration");
+    assert!(reader["data"]["pending"]["pending_return_result_producer"].is_null());
+    assert!(reader["data"]["pending"]["chain"]
+        .to_string()
+        .contains("reads_return_result"));
+
+    let mut corruptions = Vec::new();
+    let mut duplicate = saved.clone();
+    for frame in duplicate["resolution_frames"]["frames"]
+        .as_array_mut()
+        .expect("typed frames")
+    {
+        if frame["type"] == "AbilityContinuation" {
+            frame["data"]["pending"]["pending_return_result_producer"] = key.clone();
+        }
+    }
+    corruptions.push((duplicate, "duplicate parked publishers"));
+
+    let mut prepublished = saved.clone();
+    prepublished["return_result_frames"][occurrence.to_string()]
+        .as_object_mut()
+        .expect("return-result frame")
+        .insert(result.to_string(), serde_json::json!([]));
+    corruptions.push((prepublished, "already published"));
+
+    let mut missing = saved.clone();
+    missing["return_result_frames"]
+        .as_object_mut()
+        .expect("return-result arena")
+        .remove(&occurrence.to_string());
+    corruptions.push((missing, "missing occurrence"));
+
+    let mut mismatched = saved.clone();
+    let other_occurrence = mismatched["next_return_result_occurrence_id"]
+        .as_u64()
+        .expect("next occurrence id");
+    mismatched["next_return_result_occurrence_id"] = serde_json::json!(other_occurrence + 1);
+    mismatched["return_result_frames"]
+        .as_object_mut()
+        .expect("return-result arena")
+        .insert(other_occurrence.to_string(), serde_json::json!({}));
+    for frame in mismatched["resolution_frames"]["frames"]
+        .as_array_mut()
+        .expect("typed frames")
+    {
+        if frame["type"] == "AbilityContinuation" {
+            frame["data"]["pending"]["return_result_occurrence"] =
+                serde_json::json!(other_occurrence);
+        }
+    }
+    corruptions.push((
+        mismatched,
+        "disagrees with its continuation occurrence or reader",
+    ));
+
+    let mut wrong_reader = saved.clone();
+    for frame in wrong_reader["resolution_frames"]["frames"]
+        .as_array_mut()
+        .expect("typed frames")
+    {
+        if frame["type"] == "ChangeZone"
+            && frame["data"]["pending"]["pending_return_result_producer"].is_array()
+        {
+            frame["data"]["pending"]["pending_return_result_producer"][1] =
+                serde_json::json!(result + 100);
+        }
+    }
+    corruptions.push((
+        wrong_reader,
+        "disagrees with its continuation occurrence or reader",
+    ));
+
+    for (corrupt, expected) in corruptions {
+        for envelope in [corrupt.clone(), serde_json::json!({ "state": corrupt })] {
+            let error = serde_json::from_value::<PersistedGameState>(envelope)
+                .expect_err("corrupt transferred publisher must fail at restore");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?}, got {error}"
+            );
+        }
+    }
+
+    let mut legacy = saved.clone();
+    for frame in legacy["resolution_frames"]["frames"]
+        .as_array_mut()
+        .expect("typed frames")
+    {
+        if matches!(
+            frame["type"].as_str(),
+            Some("AbilityContinuation" | "ChangeZone")
+        ) {
+            frame["data"]["pending"]
+                .as_object_mut()
+                .expect("pending owner")
+                .remove("pending_return_result_producer");
+        }
+    }
+    let _: ResolutionStateWire =
+        serde_json::from_value(legacy).expect("legacy save without producer keys decodes");
+    let restored: ResolutionStateWire =
+        serde_json::from_value(saved).expect("valid transferred key survives reload");
+    *runner.state_mut() = restored.into_game_state();
+    runner
+        .act(GameAction::ChooseReplacement { index: 0 })
+        .expect("redirect selected creature away from hand");
+    runner.advance_until_stack_empty();
+    assert!(matches!(
+        runner.state().objects[&redirected].zone,
+        Zone::Exile | Zone::Graveyard
+    ));
+    assert_eq!(runner.state().objects[&returned].zone, Zone::Hand);
+    let counts: Vec<_> = runner
+        .state()
+        .delayed_triggers
+        .iter()
+        .map(|trigger| match &trigger.ability.effect {
+            Effect::Token {
+                count: QuantityExpr::Fixed { value },
+                ..
+            } => *value,
+            effect => panic!("expected frozen delayed tokens, got {effect:?}"),
+        })
+        .collect();
+    assert_eq!(counts, [0, 1]);
+    assert!(runner.state().return_result_frames.is_empty());
+    runner.advance_to_phase(Phase::Upkeep);
+    runner.advance_until_stack_empty();
+    assert_eq!(bird_count(&runner), 1);
+}
+
+#[test]
+fn selected_return_result_keeps_one_key_across_two_zone_repauses() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::End);
+    let first = scenario
+        .add_creature(P0, "First Redirected Bear", 2, 2)
+        .with_replacement_definition(redirect_own_hand_move_to(Zone::Exile))
+        .with_replacement_definition(redirect_own_hand_move_to(Zone::Graveyard))
+        .id();
+    let second = scenario
+        .add_creature(P0, "Second Redirected Bear", 2, 2)
+        .with_replacement_definition(redirect_own_hand_move_to(Zone::Exile))
+        .with_replacement_definition(redirect_own_hand_move_to(Zone::Graveyard))
+        .id();
+    let untouched = scenario.add_creature(P0, "Unchosen Bear", 2, 2).id();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "The Eagles Are Coming!", true, EAGLES)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    let object = runner.state_mut().objects.get_mut(&spell).unwrap();
+    let definitions = Arc::make_mut(&mut object.abilities);
+    let mut producer = definitions[0].clone();
+    while producer.declares_return_result.is_none() {
+        producer = *producer.sub_ability.expect("return producer");
+    }
+    producer.reads_chosen_group = None;
+    producer.effect = Box::new(Effect::BounceAll {
+        target: TargetFilter::Typed(TypedFilter::creature()),
+        destination: None,
+        count: Some(QuantityExpr::Fixed { value: 2 }),
+    });
+    producer
+        .sub_ability
+        .as_mut()
+        .expect("delayed reader")
+        .sub_link = SubAbilityLink::ContinuationStep;
+    definitions[0] = producer;
+    object.base_abilities = object.abilities.clone();
+
+    let prompt = runner.cast(spell).resolve();
+    assert!(matches!(
+        prompt.final_waiting_for(),
+        WaitingFor::EffectZoneChoice { cards, count: 2, .. }
+            if cards.contains(&first) && cards.contains(&second) && cards.contains(&untouched)
+    ));
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![first, second],
+        })
+        .expect("choose two redirecting creatures");
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::ReplacementChoice { .. }
+    ));
+
+    let mut original_key = None;
+    for remaining in [1, 0] {
+        let saved =
+            serde_json::to_value(ResolutionStateWire::from_game_state(runner.state().clone()))
+                .expect("repaused selected return serializes");
+        let zone = saved["resolution_frames"]["frames"]
+            .as_array()
+            .expect("typed frames")
+            .iter()
+            .find(|frame| {
+                frame["type"] == "ChangeZone"
+                    && frame["data"]["pending"]["pending_return_result_producer"].is_array()
+            })
+            .expect("the zone iteration keeps producer authority");
+        let key = zone["data"]["pending"]["pending_return_result_producer"].clone();
+        assert_eq!(
+            zone["data"]["pending"]["remaining"]
+                .as_array()
+                .expect("remaining selected members")
+                .len(),
+            remaining
+        );
+        if let Some(original_key) = &original_key {
+            assert_eq!(&key, original_key, "a re-pause cannot rebind the producer");
+        } else {
+            original_key = Some(key);
+        }
+        let restored: ResolutionStateWire =
+            serde_json::from_value(saved).expect("the exact key survives each reload");
+        *runner.state_mut() = restored.into_game_state();
+        runner
+            .act(GameAction::ChooseReplacement { index: 0 })
+            .expect("settle the current selected member");
+    }
+    runner.advance_until_stack_empty();
+    assert!(matches!(
+        runner.state().objects[&first].zone,
+        Zone::Exile | Zone::Graveyard
+    ));
+    assert!(matches!(
+        runner.state().objects[&second].zone,
+        Zone::Exile | Zone::Graveyard
+    ));
+    assert_eq!(runner.state().objects[&untouched].zone, Zone::Battlefield);
+    assert_eq!(runner.state().delayed_triggers.len(), 1);
+    assert!(matches!(
+        &runner.state().delayed_triggers[0].ability.effect,
+        Effect::Token {
+            count: QuantityExpr::Fixed { value: 0 },
+            ..
+        }
+    ));
+    assert!(runner.state().return_result_frames.is_empty());
+}
+
+#[test]
+fn selected_return_result_publishes_present_empty_result_for_permitted_empty_pick() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::End);
+    let first = scenario.add_creature(P0, "First Optional Bear", 2, 2).id();
+    let second = scenario.add_creature(P0, "Second Optional Bear", 2, 2).id();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "The Eagles Are Coming!", true, EAGLES)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    let object = runner.state_mut().objects.get_mut(&spell).unwrap();
+    let definitions = Arc::make_mut(&mut object.abilities);
+    let mut producer = definitions[0].clone();
+    while producer.declares_return_result.is_none() {
+        producer = *producer.sub_ability.expect("return producer");
+    }
+    producer.reads_chosen_group = None;
+    producer.effect = Box::new(Effect::BounceAll {
+        target: TargetFilter::Typed(TypedFilter::creature()),
+        destination: None,
+        count: Some(QuantityExpr::Fixed { value: 1 }),
+    });
+    producer
+        .sub_ability
+        .as_mut()
+        .expect("delayed reader")
+        .sub_link = SubAbilityLink::ContinuationStep;
+    definitions[0] = producer;
+    object.base_abilities = object.abilities.clone();
+
+    let prompt = runner.cast(spell).resolve();
+    assert!(matches!(
+        prompt.final_waiting_for(),
+        WaitingFor::EffectZoneChoice { cards, .. }
+            if cards.contains(&first) && cards.contains(&second)
+    ));
+    assert!(runner.state().resolution_stack.iter().any(|frame| matches!(
+        frame,
+        ResolutionFrame::AbilityContinuation(continuation)
+            if continuation.pending.pending_return_result_producer.is_some()
+    )));
+    // The printed Eagles choice is mandatory. Make this already-produced
+    // BounceAll prompt optional to exercise the generic selected-result empty
+    // branch without claiming a new Oracle grammar for the card.
+    if let WaitingFor::EffectZoneChoice {
+        up_to, min_count, ..
+    } = &mut runner.state_mut().waiting_for
+    {
+        *up_to = true;
+        *min_count = 0;
+    }
+    runner
+        .act(GameAction::SelectCards { cards: vec![] })
+        .expect("permitted empty choice settles the named instruction");
+    runner.advance_until_stack_empty();
+    assert_eq!(runner.state().objects[&first].zone, Zone::Battlefield);
+    assert_eq!(runner.state().objects[&second].zone, Zone::Battlefield);
+    assert_eq!(runner.state().delayed_triggers.len(), 1);
+    assert!(matches!(
+        &runner.state().delayed_triggers[0].ability.effect,
+        Effect::Token {
+            count: QuantityExpr::Fixed { value: 0 },
+            ..
+        }
+    ));
+    assert!(runner.state().return_result_frames.is_empty());
+}
+
+#[test]
+fn selected_second_return_uses_its_own_result_key_after_an_earlier_producer() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::End);
+    let artifact = scenario
+        .add_artifact_from_oracle(P0, "First Return Relic", "")
+        .id();
+    let first_creature = scenario.add_creature(P0, "First Choice Bear", 2, 2).id();
+    let second_creature = scenario.add_creature(P0, "Second Choice Bear", 2, 2).id();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "The Eagles Are Coming!", true, EAGLES)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    let object = runner.state_mut().objects.get_mut(&spell).unwrap();
+    let definitions = Arc::make_mut(&mut object.abilities);
+    let mut first = definitions[0].clone();
+    while first.declares_return_result.is_none() {
+        first = *first.sub_ability.expect("return producer");
+    }
+    let mut second = first.clone();
+    let second_result = second.declares_return_result.expect("second result id");
+    second.reads_chosen_group = None;
+    second.sub_link = SubAbilityLink::SequentialSibling;
+    second.effect = Box::new(Effect::BounceAll {
+        target: TargetFilter::Typed(TypedFilter::creature()),
+        destination: None,
+        count: Some(QuantityExpr::Fixed { value: 1 }),
+    });
+    second
+        .sub_ability
+        .as_mut()
+        .expect("delayed reader")
+        .sub_link = SubAbilityLink::ContinuationStep;
+    first.reads_chosen_group = None;
+    first.declares_return_result = Some(ReturnResultId(100));
+    first.effect = Box::new(Effect::BounceAll {
+        target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact)),
+        destination: None,
+        count: None,
+    });
+    first.sub_ability = Some(Box::new(second));
+    definitions[0] = first;
+    object.base_abilities = object.abilities.clone();
+
+    let prompt = runner.cast(spell).resolve();
+    assert!(matches!(
+        prompt.final_waiting_for(),
+        WaitingFor::EffectZoneChoice { cards, .. }
+            if cards.contains(&first_creature) && cards.contains(&second_creature)
+    ));
+    assert_eq!(prompt.state().objects[&artifact].zone, Zone::Hand);
+    let saved = serde_json::to_value(ResolutionStateWire::from_game_state(runner.state().clone()))
+        .expect("second producer prompt serializes");
+    let key = saved["resolution_frames"]["frames"]
+        .as_array()
+        .expect("typed frames")
+        .iter()
+        .find_map(|frame| {
+            frame["data"]["pending"]["pending_return_result_producer"]
+                .as_array()
+                .cloned()
+        })
+        .expect("selected second producer key");
+    assert_eq!(key[1], serde_json::json!(second_result.0));
+    assert_ne!(key[1], serde_json::json!(100));
+    let occurrence = key[0].as_u64().expect("shared occurrence");
+    assert_eq!(
+        saved["return_result_frames"][occurrence.to_string()]["100"]
+            .as_array()
+            .expect("first producer already settled")
+            .len(),
+        1
+    );
+    assert!(saved["return_result_frames"][occurrence.to_string()]
+        .get(second_result.0.to_string())
+        .is_none());
+
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![first_creature],
+        })
+        .expect("select the second producer's creature");
+    runner.advance_until_stack_empty();
+    assert_eq!(runner.state().objects[&first_creature].zone, Zone::Hand);
+    assert_eq!(
+        runner.state().objects[&second_creature].zone,
+        Zone::Battlefield
+    );
+    assert_eq!(runner.state().delayed_triggers.len(), 1);
+    assert!(matches!(
+        &runner.state().delayed_triggers[0].ability.effect,
+        Effect::Token {
+            count: QuantityExpr::Fixed { value: 1 },
+            ..
+        }
+    ));
+    assert!(runner.state().return_result_frames.is_empty());
 }
 
 #[test]
@@ -1349,7 +1852,7 @@ fn paused_return_result_restore_rejects_corrupt_authority_before_resume() {
         .expect("parked named publisher")
         .clone();
     frames.insert(0, publisher);
-    corruptions.push((duplicate_batch, "duplicate parked batch publishers"));
+    corruptions.push((duplicate_batch, "duplicate parked publishers"));
 
     for (corrupt, expected) in corruptions {
         let mut v2 = corrupt.clone();

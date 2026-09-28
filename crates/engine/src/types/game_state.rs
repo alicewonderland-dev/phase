@@ -2590,6 +2590,10 @@ pub struct PendingContinuation {
     pub chain: Box<ResolvedAbility>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_result_occurrence: Option<ReturnResultOccurrenceId>,
+    /// The exact paused instruction whose settled zone-change result must be
+    /// published before this continuation can read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_return_result_producer: Option<(ReturnResultOccurrenceId, ReturnResultId)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_kind: Option<EffectKind>,
     /// CR 303.4f: Attach host captured before SearchChoice overwrites parent targets.
@@ -2657,6 +2661,7 @@ impl PendingContinuation {
         Self {
             chain,
             return_result_occurrence: state.active_return_result_occurrence,
+            pending_return_result_producer: None,
             parent_kind: None,
             search_attach_host: None,
             trigger_context: ResolvingTriggerContext::capture(state),
@@ -2680,6 +2685,7 @@ impl PendingContinuation {
         Self {
             chain,
             return_result_occurrence: state.active_return_result_occurrence,
+            pending_return_result_producer: None,
             parent_kind: Some(parent_kind),
             search_attach_host: None,
             trigger_context: ResolvingTriggerContext::capture(state),
@@ -4032,6 +4038,10 @@ impl PendingZoneChangeDelivery {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingChangeZoneIteration {
     pub logical_zone_change_group: LogicalZoneChangeGroup,
+    /// Ownership transferred from a paused instruction-result producer when
+    /// the selected zone move itself needs another player choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_return_result_producer: Option<(ReturnResultOccurrenceId, ReturnResultId)>,
     /// The chosen member that is currently completing outside the ordinary
     /// `remaining` loop. Required even when the tail is empty.
     pub paused_current: Option<PendingZoneChangeDelivery>,
@@ -6080,27 +6090,7 @@ pub(crate) fn settle_batch_delivery_outcome(
                 settled_records.is_none(),
                 "instruction result settled twice"
             );
-            *settled_records = Some(
-                group
-                    .terminal_outcomes
-                    .iter()
-                    .filter_map(|outcome| {
-                        let LogicalZoneChangeTerminalOutcome::Moved { occurrence_ordinal } =
-                            outcome
-                        else {
-                            return None;
-                        };
-                        let occurrence = group
-                            .all_origin_occurrences
-                            .get(*occurrence_ordinal)
-                            .expect("settled member names an existing occurrence");
-                        let GameEvent::ZoneChanged { record, .. } = &occurrence.event else {
-                            panic!("settled member names a zone-change event");
-                        };
-                        Some((**record).clone())
-                    })
-                    .collect(),
-            );
+            *settled_records = Some(settled_logical_zone_change_records(group));
         }
         BatchCompletion::RevealRestPile {
             delivery_stage: DigDeliveryStage::Kept,
@@ -6114,6 +6104,33 @@ pub(crate) fn settle_batch_delivery_outcome(
         } => rest_delivery.settle_from_logical_group(state, group),
         _ => {}
     }
+}
+
+/// CR 614.1 + CR 616.1: The final, exact event records of members that moved
+/// after replacement effects in a completed logical
+/// zone-change group. Both batch and interactive instruction results use this
+/// authority, so a redirect cannot be mistaken for an arrival in the printed
+/// destination.
+pub(crate) fn settled_logical_zone_change_records(
+    group: &LogicalZoneChangeGroup,
+) -> Vec<ZoneChangeRecord> {
+    group
+        .terminal_outcomes
+        .iter()
+        .filter_map(|outcome| {
+            let LogicalZoneChangeTerminalOutcome::Moved { occurrence_ordinal } = outcome else {
+                return None;
+            };
+            let occurrence = group
+                .all_origin_occurrences
+                .get(*occurrence_ordinal)
+                .expect("settled member names an existing occurrence");
+            let GameEvent::ZoneChanged { record, .. } = &occurrence.event else {
+                panic!("settled member names a zone-change event");
+            };
+            Some((**record).clone())
+        })
+        .collect()
 }
 
 impl BatchCompletion {
@@ -11053,6 +11070,21 @@ pub(crate) fn has_return_result_metadata(ability: &ResolvedAbility) -> bool {
             .is_some_and(has_return_result_metadata)
 }
 
+pub(crate) fn reads_return_result_id(ability: &ResolvedAbility, result_id: ReturnResultId) -> bool {
+    ability
+        .reads_return_result
+        .as_ref()
+        .is_some_and(|(id, _)| *id == result_id)
+        || ability
+            .sub_ability
+            .as_deref()
+            .is_some_and(|sub| reads_return_result_id(sub, result_id))
+        || ability
+            .else_ability
+            .as_deref()
+            .is_some_and(|branch| reads_return_result_id(branch, result_id))
+}
+
 pub(crate) fn live_return_result_occurrences(
     state: &GameState,
 ) -> HashSet<ReturnResultOccurrenceId> {
@@ -11065,6 +11097,19 @@ pub(crate) fn live_return_result_occurrences(
             }
             ResolutionFrame::AbilityContinuation(frame) => {
                 live.extend(frame.pending.return_result_occurrence);
+                live.extend(
+                    frame
+                        .pending
+                        .pending_return_result_producer
+                        .map(|(id, _)| id),
+                );
+            }
+            ResolutionFrame::ChangeZone(frame) => {
+                live.extend(
+                    frame.pending.as_ref().and_then(|pending| {
+                        pending.pending_return_result_producer.map(|(id, _)| id)
+                    }),
+                );
             }
             ResolutionFrame::BatchDelivery(batch) => {
                 if let Some(BatchCompletion::RecordInstructionZoneResult {
@@ -11125,6 +11170,29 @@ pub(crate) fn validate_return_result_occurrence_coherence(state: &GameState) -> 
     };
 
     let mut parked_publishers = HashSet::new();
+    let mut validate_parked_publisher =
+        |key: (ReturnResultOccurrenceId, ReturnResultId), owner: &str| -> Result<(), String> {
+            let (occurrence_id, result_id) = key;
+            if !frame_exists(occurrence_id) {
+                return Err(format!(
+                    "return-result {owner} names missing occurrence {:?}",
+                    occurrence_id
+                ));
+            }
+            if state.return_result_frames[&occurrence_id].contains_key(&result_id) {
+                return Err(format!(
+                    "return-result {:?} was already published before its parked {owner} settled",
+                    result_id
+                ));
+            }
+            if !parked_publishers.insert(key) {
+                return Err(format!(
+                    "return-result {:?} has duplicate parked publishers",
+                    result_id
+                ));
+            }
+            Ok(())
+        };
     for frame in state.resolution_stack.iter() {
         match frame {
             ResolutionFrame::OptionalEffect(optional) => validate_optional_frame(optional)?,
@@ -11144,6 +11212,43 @@ pub(crate) fn validate_return_result_occurrence_coherence(state: &GameState) -> 
                     }
                     _ => {}
                 }
+                if let Some(key) = pending.pending_return_result_producer {
+                    if pending.return_result_occurrence != Some(key.0) {
+                        return Err(format!(
+                            "return-result continuation publisher {:?} disagrees with its occurrence",
+                            key.1
+                        ));
+                    }
+                    if !reads_return_result_id(&pending.chain, key.1) {
+                        return Err(format!(
+                            "return-result continuation publisher {:?} has no matching reader",
+                            key.1
+                        ));
+                    }
+                    validate_parked_publisher(key, "continuation")?;
+                }
+            }
+            ResolutionFrame::ChangeZone(frame) => {
+                if let Some(key) = frame
+                    .pending
+                    .as_ref()
+                    .and_then(|pending| pending.pending_return_result_producer)
+                {
+                    if !state
+                        .resolution_stack
+                        .ability_continuations()
+                        .any(|pending| {
+                            pending.return_result_occurrence == Some(key.0)
+                                && reads_return_result_id(&pending.chain, key.1)
+                        })
+                    {
+                        return Err(format!(
+                            "return-result zone iteration publisher {:?} disagrees with its continuation occurrence or reader",
+                            key.1
+                        ));
+                    }
+                    validate_parked_publisher(key, "zone iteration")?;
+                }
             }
             ResolutionFrame::BatchDelivery(batch) => {
                 if let Some(BatchCompletion::RecordInstructionZoneResult {
@@ -11152,21 +11257,7 @@ pub(crate) fn validate_return_result_occurrence_coherence(state: &GameState) -> 
                     settled_records,
                 }) = &batch.completion
                 {
-                    if !frame_exists(*occurrence_id) {
-                        return Err(format!(
-                            "return-result batch names missing occurrence {:?}",
-                            occurrence_id
-                        ));
-                    }
-                    if state.return_result_frames[occurrence_id].contains_key(result_id) {
-                        return Err(format!("return-result {:?} was already published before its parked batch settled", result_id));
-                    }
-                    if !parked_publishers.insert((*occurrence_id, *result_id)) {
-                        return Err(format!(
-                            "return-result {:?} has duplicate parked batch publishers",
-                            result_id
-                        ));
-                    }
+                    validate_parked_publisher((*occurrence_id, *result_id), "batch")?;
                     if settled_records.is_some() {
                         return Err(format!(
                             "return-result {:?} is prematurely settled in a parked batch",
@@ -31877,6 +31968,7 @@ mod tests {
         paused.face_down_in_exile = crate::types::ability::ExileConcealment::FaceDown;
         let logical_zone_change_group = state.allocate_logical_zone_change_group(&[object]);
         state.push_change_zone_iteration(PendingChangeZoneIteration {
+            pending_return_result_producer: None,
             logical_zone_change_group,
             paused_current: Some(paused),
             remaining: Vec::new(),
@@ -39730,6 +39822,7 @@ mod tests {
             .latch_immediately_before(Vec::new(), Vec::new())
             .expect("empty immediately-before authority is still explicitly latched");
         let original = PendingChangeZoneIteration {
+            pending_return_result_producer: None,
             logical_zone_change_group,
             paused_current: None,
             remaining: vec![],

@@ -893,6 +893,7 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
         let PendingContinuation {
             chain,
             return_result_occurrence,
+            pending_return_result_producer,
             parent_kind,
             search_attach_host,
             trigger_context,
@@ -902,6 +903,10 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
             player_scope_linked_exile,
             player_scope_queue_end,
         } = cont;
+        debug_assert!(
+            pending_return_result_producer.is_none(),
+            "an instruction result must settle before its reader continuation drains"
+        );
         debug_assert!(
             attachment_choice.is_none(),
             "an attachment choice must be consumed by its EffectZoneChoice handler"
@@ -1719,6 +1724,7 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
         };
         let crate::types::game_state::PendingChangeZoneIteration {
             mut logical_zone_change_group,
+            pending_return_result_producer,
             paused_current,
             remaining,
             source_id,
@@ -1893,6 +1899,7 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
                     state.replace_active_change_zone_iteration(
                         crate::types::game_state::PendingChangeZoneIteration {
                             logical_zone_change_group,
+                            pending_return_result_producer,
                             paused_current: anticipated_pause.map(|mut boundary| {
                                 boundary.append_delivery_events(&events[delivery_start..]);
                                 boundary.mark_counted();
@@ -1957,6 +1964,7 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
                     state.replace_active_change_zone_iteration_after_child(
                         crate::types::game_state::PendingChangeZoneIteration {
                             logical_zone_change_group,
+                            pending_return_result_producer,
                             paused_current,
                             remaining: remaining[i + 1..].to_vec(),
                             source_id: ctx.source_id,
@@ -2001,6 +2009,17 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
             &mut events[events_before_drain..],
         )
         .expect("completed resumed ChangeZone owns every terminal member outcome");
+        if let Some((occurrence_id, result_id)) = pending_return_result_producer {
+            publish_return_result(
+                state,
+                occurrence_id,
+                result_id,
+                crate::types::game_state::settled_logical_zone_change_records(
+                    &logical_zone_change_group,
+                ),
+            )
+            .expect("settled selected return publishes its exact result once");
+        }
         // The resumed delivery preceded `events_before_drain`, so synchronize its
         // completed-owner departure stamp alongside the final drain segment.
         crate::game::triggers::sync_logical_zone_change_departure_stamps(
@@ -2312,24 +2331,38 @@ pub(crate) fn active_player_action_completion_requires(
     })
 }
 
-fn prepend_to_pending_continuation(state: &mut GameState, mut head: ResolvedAbility) {
+fn prepend_to_pending_continuation(state: &mut GameState, head: ResolvedAbility) {
+    prepend_to_pending_continuation_with_producer(state, head, None);
+}
+
+fn prepend_to_pending_continuation_with_producer(
+    state: &mut GameState,
+    mut head: ResolvedAbility,
+    pending_return_result_producer: Option<(
+        ReturnResultOccurrenceId,
+        crate::types::ability::ReturnResultId,
+    )>,
+) {
+    let make_pending = |state: &GameState, chain: Box<ResolvedAbility>| {
+        let mut pending = PendingContinuation::new(chain, state);
+        pending.pending_return_result_producer = pending_return_result_producer;
+        pending
+    };
     if state
         .resolution_stack
         .has_active_post_replacement_draw_pair()
     {
         state
-            .insert_ability_continuation_outside_active_post_replacement_draw(
-                PendingContinuation::new(Box::new(head), state),
-            )
+            .insert_ability_continuation_outside_active_post_replacement_draw(make_pending(
+                state,
+                Box::new(head),
+            ))
             .expect("paired post-replacement draw must retain its continuation outside the pair");
         return;
     }
     if active_frame_requires_ability_continuation_parent(state) {
         state
-            .insert_ability_continuation_parent_of_active(PendingContinuation::new(
-                Box::new(head),
-                state,
-            ))
+            .insert_ability_continuation_parent_of_active(make_pending(state, Box::new(head)))
             .expect("paused child operation must retain its continuation as an immediate parent");
         return;
     }
@@ -2343,6 +2376,7 @@ fn prepend_to_pending_continuation(state: &mut GameState, mut head: ResolvedAbil
         let PendingContinuation {
             chain,
             return_result_occurrence,
+            pending_return_result_producer: existing_return_result_producer,
             parent_kind,
             search_attach_host,
             trigger_context,
@@ -2352,11 +2386,17 @@ fn prepend_to_pending_continuation(state: &mut GameState, mut head: ResolvedAbil
             player_scope_linked_exile,
             player_scope_queue_end,
         } = existing;
+        assert!(
+            pending_return_result_producer.is_none() || existing_return_result_producer.is_none(),
+            "one continuation cannot own two unsettled return instructions"
+        );
         super::ability_utils::append_to_sub_chain(&mut head, *chain);
         state.push_ability_continuation(AbilityContinuationFrame {
             pending: PendingContinuation {
                 chain: Box::new(head),
                 return_result_occurrence,
+                pending_return_result_producer: pending_return_result_producer
+                    .or(existing_return_result_producer),
                 parent_kind,
                 search_attach_host,
                 // CR 608.2: carry over the existing stash's trigger context — an
@@ -2374,7 +2414,7 @@ fn prepend_to_pending_continuation(state: &mut GameState, mut head: ResolvedAbil
         return;
     }
 
-    state.park_ability_continuation(PendingContinuation::new(Box::new(head), state));
+    state.park_ability_continuation(make_pending(state, Box::new(head)));
 }
 
 fn park_player_scope_queue_end(state: &mut GameState, placeholder: ResolvedAbility) {
@@ -17437,6 +17477,35 @@ fn resolve_chain_body(
                 effect_context_object.as_ref(),
                 state,
             );
+            // CR 608.2c + CR 603.7: a selected BounceAll has not finished its
+            // zone-change instruction when it opens EffectZoneChoice. Bind its
+            // exact result key to the reader continuation before a later
+            // replacement choice can interpose another child frame.
+            let pending_return_result_producer = match (
+                ability.declares_return_result,
+                &ability.effect,
+                &state.waiting_for,
+            ) {
+                (
+                    Some(result_id),
+                    Effect::BounceAll { .. },
+                    WaitingFor::EffectZoneChoice {
+                        source_id,
+                        effect_kind: EffectKind::BounceAll,
+                        ..
+                    },
+                ) if *source_id == ability.source_id
+                    && crate::types::game_state::reads_return_result_id(&sub_clone, result_id) =>
+                {
+                    Some((
+                        state.active_return_result_occurrence.ok_or_else(|| {
+                            EffectError::MissingParam("return result occurrence".to_string())
+                        })?,
+                        result_id,
+                    ))
+                }
+                _ => None,
+            };
             if sub_clone.reads_return_result.is_some()
                 && state.resolution_stack.capture_child_boundary() > child_stack_start
             {
@@ -17445,14 +17514,20 @@ fn resolve_chain_body(
                 // beneath the producer's batch frame, so insert this reader
                 // outside the whole child stack, at the boundary captured
                 // before resolving the producer.
+                let mut pending = PendingContinuation::new(Box::new(sub_clone), state);
+                pending.pending_return_result_producer = pending_return_result_producer;
                 state
                     .insert_ability_continuation_parent_at_child_boundary(
-                        PendingContinuation::new(Box::new(sub_clone), state),
+                        pending,
                         child_stack_start,
                     )
                     .expect("named result reader must remain outside its producer's child stack");
             } else {
-                prepend_to_pending_continuation(state, sub_clone);
+                prepend_to_pending_continuation_with_producer(
+                    state,
+                    sub_clone,
+                    pending_return_result_producer,
+                );
             }
             // CR 701.57c + CR 608.2h: an unconditional Discover follow-up stashed
             // here still binds the hit card as its referent (no-op otherwise).
