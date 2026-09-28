@@ -81,6 +81,8 @@ mod tests {
 
     fn make_ability(amount: QuantityExpr, controller: PlayerId) -> ResolvedAbility {
         ResolvedAbility {
+            declares_chosen_group: None,
+            reads_chosen_group: None,
             detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: Effect::GrantExtraLoyaltyActivations {
                 amount,

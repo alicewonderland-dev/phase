@@ -237,6 +237,8 @@ fn resolved_ability_axes(a: &ResolvedAbility, mode: ScanMode) -> Axes {
         // ---- read-free: concrete ids / cast-time snapshots / flags / links,
         //      none of which express a resolution-time dynamic read ----
         targets: _,                // concrete announced target refs (already resolved)
+        declares_chosen_group: _,  // definition-local target identity, no live read
+        reads_chosen_group: _,     // bound targets above carry the concrete values
         source_id: _,              // object id
         cast_occurrence: _,        // finalized-cast provenance, no dynamic read
         source_incarnation: _,     // self-transform epoch latch, no dynamic read
@@ -5062,6 +5064,8 @@ fn ability_definition_axes(def: &AbilityDefinition, mode: ScanMode) -> Axes {
         cost: _,
         description: _,
         target_prompt: _,
+        declares_chosen_group: _, // definition-local target identity
+        reads_chosen_group: _,    // effect and target metadata are scanned above
         activation_restrictions: _,
         // Payment-time only; it cannot create a resolution-time dependency.
         activation_mana_payment_restriction: _,

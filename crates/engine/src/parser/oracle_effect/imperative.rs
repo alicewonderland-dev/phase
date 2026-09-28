@@ -26,6 +26,7 @@ use super::{
 };
 use crate::parser::oracle_ir::ast::*;
 use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
+use crate::parser::oracle_ir::effect_chain::ChosenReturnSpec;
 use crate::parser::oracle_nom::bridge::{nom_on_lower, nom_parse_lower, split_once_on_lower};
 use crate::parser::oracle_nom::condition as nom_condition;
 use crate::parser::oracle_nom::enters_under::{bind_control_clause, name_entry_control_antecedent};
@@ -1760,6 +1761,64 @@ pub(super) fn add_another_to_filter_recursive(filter: &mut TargetFilter) {
 /// NOTE: Shares verb prefixes with `try_parse_verb_and_target` in `mod.rs`.
 /// When adding a new targeted verb here, check if it also needs to be added there
 /// (for compound action splitting like "tap target creature and put a counter on it").
+/// Parse a return of the targets named by an earlier choose instruction.
+/// The destination and noun use the same helpers as ordinary return clauses.
+pub(crate) fn parse_chosen_return_spec(text: &str, lower: &str) -> Option<ChosenReturnSpec> {
+    let (_, rest) = nom_on_lower(text, lower, |input| {
+        value((), tag("return each ")).parse(input)
+    })?;
+    let (phrase, destination, _) = super::strip_return_destination_ext_with_remainder(rest);
+    if destination?.zone != Zone::Hand {
+        return None;
+    }
+    let phrase_lower = phrase.trim().trim_end_matches('.').to_ascii_lowercase();
+    let (noun, chooser) = if let Ok((_, noun)) = all_consuming(preceded(
+        tag::<_, _, OracleError<'_>>("chosen "),
+        nom::combinator::rest,
+    ))
+    .parse(phrase_lower.as_str())
+    {
+        (noun, None)
+    } else if let Ok((_, noun)) = all_consuming(terminated(
+        take_until::<_, _, OracleError<'_>>(" you chose"),
+        tag(" you chose"),
+    ))
+    .parse(phrase_lower.as_str())
+    {
+        (noun, Some(TargetFilter::Controller))
+    } else if let Ok((_, noun)) = all_consuming(terminated(
+        take_until::<_, _, OracleError<'_>>(" that opponent chose"),
+        tag(" that opponent chose"),
+    ))
+    .parse(phrase_lower.as_str())
+    {
+        (noun, Some(TargetFilter::Opponent))
+    } else {
+        return None;
+    };
+    let (noun, remainder) = parse_target(noun);
+    if !remainder.trim().is_empty() || matches!(noun, TargetFilter::None | TargetFilter::Any) {
+        return None;
+    }
+    Some(ChosenReturnSpec { noun, chooser })
+}
+
+/// A delayed per-object quantity that names a preceding return instruction.
+pub(crate) fn has_returned_this_way_quantity(lower: &str) -> bool {
+    preceded(
+        take_until::<_, _, OracleError<'_>>("for each "),
+        preceded(
+            tag("for each "),
+            pair(
+                take_until(" returned to "),
+                preceded(tag(" returned to "), take_until(" this way")),
+            ),
+        ),
+    )
+    .parse(lower)
+    .is_ok()
+}
+
 pub(super) fn parse_targeted_action_ast(
     text: &str,
     lower: &str,
@@ -2148,6 +2207,14 @@ pub(super) fn parse_targeted_action_ast(
             up_to,
             unless_filter,
             filter,
+        });
+    }
+    // CR 601.2c + CR 608.2c: A chosen group is a named target antecedent,
+    // not the battlefield population handled by the mass-return arm below.
+    if let Some(spec) = parse_chosen_return_spec(text, lower) {
+        return Some(TargetedImperativeAst::ReturnAll {
+            target: spec.noun,
+            count: None,
         });
     }
     // CR 400.7 + CR 611.2c: Unified `return [all|each]?` dispatcher. Consumes
@@ -4698,7 +4765,7 @@ pub(super) fn parse_choose_ast(
                     text: rest.to_string(),
                 });
             }
-            let (target, _) = parse_target(rest);
+            let (target, _) = parse_target_with_ctx(rest, ctx);
             return Some(ChooseImperativeAst::TargetOnly { target });
         }
     }

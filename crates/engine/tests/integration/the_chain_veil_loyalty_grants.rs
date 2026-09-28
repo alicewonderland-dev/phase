@@ -162,6 +162,8 @@ fn make_grant_ability(controller: PlayerId, source: ObjectId) -> ResolvedAbility
         selected_target_incarnations: Vec::new(),
         illegal_target_slots: Vec::new(),
         targets: vec![],
+        declares_chosen_group: None,
+        reads_chosen_group: None,
         kind: AbilityKind::Activated,
         sub_ability: None,
         else_ability: None,

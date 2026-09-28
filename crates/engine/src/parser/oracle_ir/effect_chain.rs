@@ -15,7 +15,7 @@ use crate::parser::oracle_nom::filter::ChosenColorGrantReference;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag,
     ActivationManaPaymentRestriction, ActivationRestriction, ChoiceType, ControllerRef,
-    CostReduction, DelayedTriggerCondition, Duration, ManaSpendPermission, MultiTargetSpec,
+    CostReduction, DelayedTriggerCondition, Duration, Effect, ManaSpendPermission, MultiTargetSpec,
     OpponentMayScope, PlayerFilter, QuantityExpr, RoundingMode, SubAbilityLink, TargetChoiceTiming,
     TargetFilter, TargetSelectionMode, UnlessPayModifier,
 };
@@ -579,6 +579,27 @@ pub(crate) enum DoesTheSameSubject {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub(crate) struct ClauseId(pub(crate) u32);
 
+/// The object class and chooser role named by a selected-return instruction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ChosenReturnSpec {
+    pub(crate) noun: TargetFilter,
+    /// `None` requires one unambiguous antecedent of the named class.
+    pub(crate) chooser: Option<TargetFilter>,
+}
+
+fn chosen_noun_compatible(producer: &TargetFilter, noun: &TargetFilter) -> bool {
+    match (producer, noun) {
+        (TargetFilter::Typed(producer), TargetFilter::Typed(noun)) => noun
+            .type_filters
+            .iter()
+            .all(|kind| producer.type_filters.contains(kind)),
+        (TargetFilter::And { filters }, noun) => filters
+            .iter()
+            .any(|filter| chosen_noun_compatible(filter, noun)),
+        _ => false,
+    }
+}
+
 /// The single explicit disposition of a clause: what it does relative to the
 /// rest of the chain. Replaces the former ad-hoc `absorbed_by_followup` boolean,
 /// `intrinsic_continuation`/`followup_continuation` options, `is_otherwise`
@@ -848,6 +869,15 @@ pub(crate) struct ClauseIr {
     /// The parsed effect clause (effect, duration, sub_ability from parse_effect_clause).
     /// Chain-local identity, assigned in source order by [`ClauseIrBuilder`].
     pub(crate) id: ClauseId,
+    /// One choose instruction and its mutually exclusive instead branch share this id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) declares_chosen_clause: Option<ClauseId>,
+    /// The exact choose instruction named by this selected-group consumer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reads_chosen_clause: Option<ClauseId>,
+    /// The prior return instruction whose actual results a delayed clause names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reads_return_result: Option<ClauseId>,
     /// Honest chain-relative source (`SpanPrecision::ChainRelative`): exact byte
     /// range within this chain + verbatim fragment. Replaces the former
     /// unaddressed `source_text` string (Plan 01 §5, line 341). Upgrades to a
@@ -1381,6 +1411,71 @@ impl ClauseDraft<'_> {
             }
         }
         let id = ClauseId(self.builder.next_clause_id);
+        let declares_chosen_clause = if matches!(&self.parsed.effect, Effect::TargetOnly { .. }) {
+            if matches!(
+                self.condition,
+                Some(AbilityCondition::AdditionalCostPaidInstead)
+            ) {
+                self.builder
+                    .clauses
+                    .last()
+                    .filter(|clause| matches!(clause.parsed.effect, Effect::TargetOnly { .. }))
+                    .and_then(|clause| clause.declares_chosen_clause)
+                    .or(Some(id))
+            } else {
+                Some(id)
+            }
+        } else {
+            None
+        };
+        let chosen_return = crate::parser::oracle_effect::imperative::parse_chosen_return_spec(
+            &self.source_text,
+            &self.source_text.to_ascii_lowercase(),
+        );
+        let reads_chosen_clause = chosen_return.as_ref().and_then(|spec| {
+            let mut candidates = self
+                .builder
+                .clauses
+                .iter()
+                .filter(|clause| {
+                    let Effect::TargetOnly { target } = &clause.parsed.effect else {
+                        return false;
+                    };
+                    let role_matches = match &spec.chooser {
+                        None => true,
+                        Some(TargetFilter::Controller) => clause.target_chooser.is_none(),
+                        Some(role) => clause.target_chooser.as_ref() == Some(role),
+                    };
+                    role_matches && chosen_noun_compatible(target, &spec.noun)
+                })
+                .filter_map(|clause| clause.declares_chosen_clause)
+                .collect::<Vec<_>>();
+            candidates.sort_unstable();
+            candidates.dedup();
+            (candidates.len() == 1).then(|| candidates[0])
+        });
+        if chosen_return.is_some() && reads_chosen_clause.is_none() {
+            self.parsed.effect = Effect::unimplemented("return", &self.source_text);
+        }
+        let delayed_result_reader = self.delayed_condition.is_some()
+            || self.prefix_delayed_condition.is_some()
+            || matches!(&self.parsed.effect, Effect::CreateDelayedTrigger { .. });
+        let reads_return_result = if delayed_result_reader
+            && crate::parser::oracle_effect::imperative::has_returned_this_way_quantity(
+                &self.source_text.to_ascii_lowercase(),
+            ) {
+            let antecedent = self
+                .builder
+                .clauses
+                .iter()
+                .rev()
+                .find(|clause| clause.reads_chosen_clause.is_some())
+                .map(|clause| clause.id);
+            self.parsed.effect = Effect::unimplemented("create", &self.source_text);
+            antecedent
+        } else {
+            None
+        };
         let span = self.builder.locate(&self.source_text);
         // `allocate_with_span` validates containment + fragment/precision. A
         // ChainRelative child of the chain item always satisfies both by
@@ -1394,6 +1489,9 @@ impl ClauseDraft<'_> {
         self.builder.next_clause_id += 1;
         self.builder.clauses.push(ClauseIr {
             id,
+            declares_chosen_clause,
+            reads_chosen_clause,
+            reads_return_result,
             source,
             disposition: self.disposition,
             parsed: self.parsed,
@@ -1427,6 +1525,72 @@ mod tests {
     use super::*;
     use crate::parser::oracle_ir::ast::parsed_clause;
     use crate::types::ability::{Duration, Effect};
+
+    #[test]
+    fn chosen_return_ir_links_the_named_producer_and_exact_last_return() {
+        let text = "Choose target creature you own. Choose target creature of an opponent's choice. Return each creature you chose to its owner's hand. Return each creature that opponent chose to its owner's hand. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each creature returned to its owner's hand this way.";
+        let ir = crate::parser::oracle_effect::parse_effect_chain_ir(
+            text,
+            AbilityKind::Spell,
+            &mut crate::parser::oracle_effect::ParseContext::default(),
+        );
+        let clauses = &ir.clauses;
+        assert_eq!(clauses.len(), 5, "{clauses:#?}");
+        let first = clauses[0].declares_chosen_clause.expect("first producer");
+        let second = clauses[1].declares_chosen_clause.expect("second producer");
+        assert_ne!(first, second);
+        assert_eq!(clauses[2].reads_chosen_clause, Some(first));
+        assert_eq!(clauses[3].reads_chosen_clause, Some(second));
+        assert_eq!(clauses[4].reads_return_result, Some(clauses[3].id));
+        assert!(matches!(
+            clauses[4].parsed.effect,
+            Effect::Unimplemented { .. }
+        ));
+    }
+
+    #[test]
+    fn role_named_ir_reader_is_stable_under_producer_order_reversal() {
+        for (text, expected_producer) in [
+            ("Choose target creature you own. Choose target creature of an opponent's choice. Return each creature you chose to its owner's hand.", 0),
+            ("Choose target creature of an opponent's choice. Choose target creature you own. Return each creature you chose to its owner's hand.", 1),
+            ("Choose target creature you own. Choose target creature of an opponent's choice. Return each creature that opponent chose to its owner's hand.", 1),
+        ] {
+            let ir = crate::parser::oracle_effect::parse_effect_chain_ir(
+                text,
+                AbilityKind::Spell,
+                &mut crate::parser::oracle_effect::ParseContext::default(),
+            );
+            let clauses = &ir.clauses;
+            assert_eq!(clauses.len(), 3, "{clauses:#?}");
+            assert_ne!(clauses[0].declares_chosen_clause, clauses[1].declares_chosen_clause);
+            assert_eq!(clauses[2].reads_chosen_clause, clauses[expected_producer].declares_chosen_clause);
+            assert!(matches!(clauses[2].parsed.effect, Effect::BounceAll { .. }));
+        }
+    }
+
+    #[test]
+    fn eagles_ir_keeps_exact_return_link_and_one_delayed_strict_marker() {
+        let text = "Choose target creature you own. If this spell was kicked, instead choose any number of target creatures you own. Return each chosen creature to your hand. At the beginning of the next upkeep, create a 4/4 white Bird Soldier creature token with flying for each creature returned to your hand this way.";
+        let ir = crate::parser::oracle_effect::parse_effect_chain_ir(
+            text,
+            AbilityKind::Spell,
+            &mut crate::parser::oracle_effect::ParseContext::default(),
+        );
+        let clauses = &ir.clauses;
+        assert_eq!(clauses.len(), 4, "{clauses:#?}");
+        let producer = clauses[0].declares_chosen_clause.expect("unpaid producer");
+        assert_eq!(clauses[1].declares_chosen_clause, Some(producer));
+        assert_eq!(clauses[2].reads_chosen_clause, Some(producer));
+        assert_eq!(clauses[3].reads_return_result, Some(clauses[2].id));
+        assert_eq!(
+            clauses
+                .iter()
+                .filter(|clause| matches!(clause.parsed.effect, Effect::Unimplemented { .. }))
+                .count(),
+            1,
+            "the delayed result consumer is the sole strict boundary"
+        );
+    }
 
     /// CR 608.2c + CR 611.2a: `ClauseDraft::push` stamps the sentence's leading
     /// duration onto a recovered conjunct, but a recovered conjunct is arbitrary

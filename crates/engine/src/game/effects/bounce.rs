@@ -492,14 +492,37 @@ pub fn resolve_all(
     // CR 107.3a + CR 601.2b: Filter evaluation runs in the ability's
     // resolution context (controller, target slots already filled).
     let ctx = crate::game::filter::FilterContext::from_ability(ability);
-    let matching: Vec<_> = state
-        .battlefield
-        .iter()
-        .filter(|id| {
-            crate::game::filter::matches_target_filter(state, **id, &effective_filter, &ctx)
-        })
-        .copied()
-        .collect();
+    let matching: Vec<_> = if ability.reads_chosen_group.is_some() {
+        ability
+            .targets
+            .iter()
+            .filter_map(|target| match target {
+                TargetRef::Object(id)
+                    if state.battlefield.contains(id)
+                        && ability.target_pin_is_current(*id, state)
+                        && ability.selected_target_pin_is_current(*id, state)
+                        && crate::game::filter::matches_target_filter(
+                            state,
+                            *id,
+                            &effective_filter,
+                            &ctx,
+                        ) =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect()
+    } else {
+        state
+            .battlefield
+            .iter()
+            .filter(|id| {
+                crate::game::filter::matches_target_filter(state, **id, &effective_filter, &ctx)
+            })
+            .copied()
+            .collect()
+    };
 
     if let Some(count_expr) = count_expr {
         let count = crate::game::quantity::resolve_quantity_with_targets(state, count_expr, ability)

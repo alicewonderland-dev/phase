@@ -3598,6 +3598,7 @@ pub(crate) fn should_propagate_parent_targets(
 /// continuation analysis can use the same authority as runtime propagation.
 pub(crate) fn can_inherit_parent_targets(sub: &ResolvedAbility) -> bool {
     sub.targets.is_empty()
+        && sub.reads_chosen_group.is_none()
         && (sub.target_choice_timing != TargetChoiceTiming::Resolution
             // CR 608.2c: a resolution-time instruction can still consume an
             // object selected by its parent. `ParentTarget` is not a fresh
@@ -4288,6 +4289,8 @@ fn instruction_outlives_declined_gate(
         // long it lasts, audited below.
         effect: _,
         duration,
+        declares_chosen_group,
+        reads_chosen_group,
         // Printed gates, branches, repetition, choosers and "you may": each reads
         // or asks about what happened earlier in the resolution, so each must be
         // absent. A surviving "you may" instruction is not audited (its pause
@@ -4363,6 +4366,8 @@ fn instruction_outlives_declined_gate(
         activation_record: _,
     } = node;
     let unbound = condition.is_none()
+        && declares_chosen_group.is_none()
+        && reads_chosen_group.is_none()
         && else_ability.is_none()
         && repeat_for.is_none()
         && repeat_until.is_none()

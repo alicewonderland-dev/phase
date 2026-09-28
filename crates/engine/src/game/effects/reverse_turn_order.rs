@@ -39,6 +39,8 @@ mod tests {
 
     fn make_ability() -> ResolvedAbility {
         ResolvedAbility {
+            declares_chosen_group: None,
+            reads_chosen_group: None,
             detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: Effect::ReverseTurnOrder,
             controller: PlayerId(0),

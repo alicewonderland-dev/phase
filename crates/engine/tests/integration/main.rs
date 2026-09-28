@@ -135,6 +135,7 @@ mod chosen_color_object_filter;
 mod chosen_color_rechoose_same_source;
 mod chosen_number_opponent_restriction;
 mod chosen_object_reader_hand_built;
+mod chosen_target_groups_phase2;
 mod claim_jumper_repeat;
 mod cleanup_discard_trigger_pipeline;
 mod cleave_text_changing_cost;
