@@ -659,8 +659,8 @@ pub(crate) enum TriggeringSpell<'a> {
     Gone,
 }
 
-/// CR 608.2h + CR 400.7 + CR 601.2i: Single authority for what a spell-cast
-/// trigger's "that spell" / self-cast "this spell" now names. `None` unless
+/// CR 608.2h + CR 400.7 + CR 601.2i: What a spell-cast trigger's "that spell"
+/// / self-cast "this spell" now names. `None` unless
 /// `state.current_trigger_event` is `GameEvent::SpellCast`; every consumer
 /// falls back to its own non-spell-cast path in that case. Layered like
 /// `triggering_spell_resolved_ability` beside it: live stack entry (at the

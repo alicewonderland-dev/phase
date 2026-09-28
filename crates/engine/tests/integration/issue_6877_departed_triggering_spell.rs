@@ -478,7 +478,7 @@ fn optional_copy_of_countered_spell_is_created_when_accepted() {
     );
 }
 
-/// Companion negative: declining the same optional copy creates none.
+/// Decline branch of `optional_copy_of_countered_spell_is_created_when_accepted`: declining creates no copy.
 #[test]
 fn optional_copy_of_countered_spell_is_not_created_when_declined() {
     let mut scenario = GameScenario::new_n_player(2, 0);
