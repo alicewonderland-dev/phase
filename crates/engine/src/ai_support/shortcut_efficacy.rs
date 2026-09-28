@@ -637,6 +637,10 @@ fn ability_window_reach(def: &AbilityDefinition) -> WindowReach {
         // Definition-local target identity; the walked effects carry the reads.
         declares_chosen_group: _,
         reads_chosen_group: _,
+        // The producer and reader are already walked through their effects;
+        // these IDs only bind an earlier instruction to the delayed body.
+        declares_return_result: _,
+        reads_return_result: _,
         // Activation gates: when, from which zone, with which mana, and under
         // which keyword this ability may be activated. NOT player-free, and the
         // earlier "no player reference" claim here was simply false: an

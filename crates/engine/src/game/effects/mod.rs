@@ -892,6 +892,7 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
         let cont = frame.pending;
         let PendingContinuation {
             chain,
+            return_result_occurrence,
             parent_kind,
             search_attach_host,
             trigger_context,
@@ -912,6 +913,10 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
             player_scope_linked_exile,
         );
         let source_id = chain.source_id;
+        let prior_occurrence = std::mem::replace(
+            &mut state.active_return_result_occurrence,
+            return_result_occurrence,
+        );
         // CR 608.2: replay the resolving ability's snapshotted trigger
         // context so TargetFilter::TriggeringPlayer (and its siblings)
         // resolve against the original trigger, not whatever is live now.
@@ -945,6 +950,7 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
                 subject: None,
             });
         }
+        state.active_return_result_occurrence = prior_occurrence;
         if !waits_for_resolution_choice(&state.waiting_for) {
             // CR 615.5: a resumed continuation completes its own paused
             // resident drain only after it has not raised another choice.
@@ -979,6 +985,17 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
         drain_active_repeat_until(state, events);
     }
     clear_post_replacement_token_choice_seed_if_resolution_drained(state);
+    clear_return_result_frames_if_idle(state);
+}
+
+pub(crate) fn clear_return_result_frames_if_idle(state: &mut GameState) {
+    if state.active_return_result_occurrence.is_none()
+        && state.resolving_stack_entry.is_none()
+        && state.resolution_stack.is_empty()
+        && matches!(state.waiting_for, WaitingFor::Priority { .. })
+    {
+        state.return_result_frames.clear();
+    }
 }
 
 /// Clears replacement-scoped token facts only after the authoritative stack drains.
@@ -1112,6 +1129,14 @@ pub(crate) fn resume_resolution_frames(state: &mut GameState, events: &mut Vec<G
         }
         ResolutionFrame::BatchDelivery(_) => {
             crate::game::zone_pipeline::drain_pending_batch_deliveries(state, events);
+            // CR 608.2c + CR 616.1: settlement can expose a replacement's
+            // parked post-effect continuation beneath this batch. Continue
+            // that child before the enclosing instruction's reader resumes.
+            if matches!(state.waiting_for, WaitingFor::Priority { .. })
+                && state.active_ability_continuation().is_some()
+            {
+                drain_pending_continuation(state, events);
+            }
         }
         ResolutionFrame::CounterMoves(_) => counters::drain_pending_counter_moves(state, events),
         ResolutionFrame::CounterRemovals(_) => {
@@ -2082,6 +2107,31 @@ pub(crate) fn append_to_pending_continuation(
         return;
     };
 
+    if let Some(active_occurrence) = state
+        .active_ability_continuation()
+        .map(|frame| frame.return_result_occurrence)
+    {
+        if active_occurrence != state.active_return_result_occurrence {
+            let current_occurrence = state.active_return_result_occurrence;
+            let pending = PendingContinuation::new(tail, state);
+            // CR 608.2c: A nested post-effect can park a child continuation
+            // before the outer return discovers its delayed reader. Occurrence
+            // IDs are minted in execution order: the older outer continuation
+            // belongs below the active child, while a newer child belongs above
+            // its parked parent. Keep both identities instead of splicing them.
+            if matches!((current_occurrence, active_occurrence),
+                (Some(outer), Some(inner)) if outer < inner
+            ) || matches!((current_occurrence, active_occurrence), (None, Some(_)))
+            {
+                state
+                    .insert_ability_continuation_parent_of_active(pending)
+                    .expect("active nested continuation accepts its outer parent");
+            } else {
+                state.park_ability_continuation(pending);
+            }
+            return;
+        }
+    }
     if let Some(frame) = state.active_ability_continuation_frame_mut() {
         let mut cursor = frame.pending.chain.as_mut();
         let tail = Some(tail);
@@ -2184,6 +2234,7 @@ fn prepend_to_pending_continuation(state: &mut GameState, mut head: ResolvedAbil
         let existing = frame.pending;
         let PendingContinuation {
             chain,
+            return_result_occurrence,
             parent_kind,
             search_attach_host,
             trigger_context,
@@ -2197,6 +2248,7 @@ fn prepend_to_pending_continuation(state: &mut GameState, mut head: ResolvedAbil
         state.push_ability_continuation(AbilityContinuationFrame {
             pending: PendingContinuation {
                 chain: Box::new(head),
+                return_result_occurrence,
                 parent_kind,
                 search_attach_host,
                 // CR 608.2: carry over the existing stash's trigger context — an
@@ -4291,6 +4343,8 @@ fn instruction_outlives_declined_gate(
         duration,
         declares_chosen_group,
         reads_chosen_group,
+        declares_return_result,
+        reads_return_result,
         // Printed gates, branches, repetition, choosers and "you may": each reads
         // or asks about what happened earlier in the resolution, so each must be
         // absent. A surviving "you may" instruction is not audited (its pause
@@ -4368,6 +4422,8 @@ fn instruction_outlives_declined_gate(
     let unbound = condition.is_none()
         && declares_chosen_group.is_none()
         && reads_chosen_group.is_none()
+        && declares_return_result.is_none()
+        && reads_return_result.is_none()
         && else_ability.is_none()
         && repeat_for.is_none()
         && repeat_until.is_none()
@@ -13581,160 +13637,186 @@ pub fn resolve_ability_chain(
         return Ok(());
     }
 
-    // CR 608.2c: Bump the per-ability per-turn resolution counter at the start of
-    // top-level resolution so that the ordinary resolution-time
-    // `AbilityCondition::AbilityUseCountThisTurn` condition can see the current
-    // resolution included in the count. This is not an intervening-if condition
-    // governed by CR 603.4. Sub-abilities (depth > 0) share the parent's count —
-    // they belong to the same printed ability instance. Only synthesized/
-    // runtime-only abilities (prowess, firebending) lack an `ability_index`
-    // stamp and skip this hook; activated abilities are stamped in
-    // `casting_costs::push_ability_entry` (and the loyalty path in
-    // `planeswalker`), so they DO bump this counter.
-    if depth == 0 {
-        count_top_level_resolution(state, ability);
-    }
-
-    // CR 608.2c + CR 107.1c: "Repeat this process" dispatch — the non-count
-    // companion to `repeat_for`. Instead of a fixed iteration count, a
-    // predicate decides per-iteration whether to re-follow the whole
-    // resolution chain. The dispatch is ITERATIVE (not recursive): `depth`
-    // never accumulates, the `depth > 20` guard is never approached, and the
-    // `depth == 0` prelude above ran exactly once — a repeated process is one
-    // resolution (CR 608.2c), so per-resolution accumulators and the
-    // resolution counter must not re-fire per iteration.
-    debug_assert!(
-        !(ability.repeat_for.is_some() && ability.repeat_until.is_some()),
-        "repeat_for (count) and repeat_until (predicate) are mutually exclusive"
-    );
-    match ability.repeat_until.clone() {
-        None => resolve_chain_body(state, ability, events, depth),
-        Some(RepeatContinuation::ControllerChoice) => {
-            let initial_waiting_for = state.waiting_for.clone();
-            let stack_depth_before_iteration = state.resolution_stack.capture_child_boundary();
-            resolve_chain_body(state, ability, events, depth)?;
-            if state.waiting_for != initial_waiting_for {
-                // Inner pause: stash so the drain re-sets the repeat prompt
-                // after the iteration's player choice resolves.
-                //
-                // No progress witness: this mode re-prompts the controller
-                // every iteration, so it cannot loop unattended.
-                park_repeat_until_after_inner_pause(
-                    state,
-                    Box::new(ability.clone()),
-                    None,
-                    stack_depth_before_iteration,
-                );
-            } else {
-                // CR 107.1c: after the iteration fully resolved, prompt the
-                // controller to repeat the process or stop.
-                state.waiting_for = WaitingFor::RepeatDecision {
-                    player: ability.controller,
-                    ability: Box::new(ability.clone()),
-                };
-            }
-            Ok(())
+    // CR 608.2c: Each top-level execution owns a separate result frame. A
+    // replacement post-effect can enter another depth-0 chain synchronously;
+    // restore the parent's selector after that nested root returns.
+    let previous_return_occurrence = if depth == 0 {
+        let id = crate::types::game_state::ReturnResultOccurrenceId(
+            state.next_return_result_occurrence_id,
+        );
+        state.next_return_result_occurrence_id = state
+            .next_return_result_occurrence_id
+            .checked_add(1)
+            .ok_or_else(|| {
+                EffectError::InvalidParam("return occurrence id overflow".to_string())
+            })?;
+        state.return_result_frames.insert(id, Default::default());
+        Some(state.active_return_result_occurrence.replace(id))
+    } else {
+        None
+    };
+    let result = (|| {
+        // CR 608.2c: Bump the per-ability per-turn resolution counter at the start of
+        // top-level resolution so that the ordinary resolution-time
+        // `AbilityCondition::AbilityUseCountThisTurn` condition can see the current
+        // resolution included in the count. This is not an intervening-if condition
+        // governed by CR 603.4. Sub-abilities (depth > 0) share the parent's count —
+        // they belong to the same printed ability instance. Only synthesized/
+        // runtime-only abilities (prowess, firebending) lack an `ability_index`
+        // stamp and skip this hook; activated abilities are stamped in
+        // `casting_costs::push_ability_entry` (and the loyalty path in
+        // `planeswalker`), so they DO bump this counter.
+        if depth == 0 {
+            count_top_level_resolution(state, ability);
         }
-        Some(RepeatContinuation::UntilStopConditions {
-            stop_on_put_to_hand,
-            stop_on_duplicate_exiled_names,
-        }) => loop {
-            // CR 104.4b: pre-iteration baseline. Captured INSIDE the loop so
-            // each iteration is measured against its own start, not the
-            // repeat's start — a repeat that makes progress and THEN stalls
-            // must still terminate.
-            let progress_baseline =
-                crate::game::exile_links::repeat_until_stop_witness(state, ability.source_id);
-            // Where this iteration's events begin, so the verdict can see
-            // whether it moved an object the witness does not count.
-            let iteration_events_start = events.len();
-            let initial_waiting_for = state.waiting_for.clone();
-            let stack_depth_before_iteration = state.resolution_stack.capture_child_boundary();
-            resolve_chain_body(state, ability, events, depth)?;
-            if state.waiting_for != initial_waiting_for {
-                park_repeat_until_after_inner_pause(
-                    state,
-                    Box::new(ability.clone()),
-                    Some(progress_baseline),
-                    stack_depth_before_iteration,
-                );
-                return Ok(());
-            }
-            match repeat_until_verdict(
-                state,
-                ability,
-                stop_on_put_to_hand,
-                stop_on_duplicate_exiled_names,
-                Some(&progress_baseline),
-                RepeatIterationChoice::for_unpaused_iteration(
-                    ability,
-                    &events[iteration_events_start..],
-                ),
-            ) {
-                RepeatUntilVerdict::Repeat => {}
-                RepeatUntilVerdict::Stop => return Ok(()),
-                RepeatUntilVerdict::MandatoryLoopDraw => {
-                    declare_mandatory_loop_draw(state, events);
-                    return Ok(());
-                }
-            }
-        },
-        // CR 608.2c: "[if <condition>,] repeat this process [once]" — re-follow
-        // the whole chain while `condition` holds against the just-resolved
-        // state, capped by `max_iterations` additional repeats. Iterates the
-        // same `resolve_chain_body` as `UntilStopConditions`, stashing on an
-        // inner pause so the repeat-until frame drain resumes the loop.
-        Some(RepeatContinuation::WhileCondition {
-            condition,
-            max_iterations,
-        }) => {
-            let mut remaining = max_iterations;
-            loop {
-                // CR 608.2c: each repeated process is a FRESH execution of the
-                // instructions, so its "that card"/"those cards" tracked set must
-                // not extend the prior iteration's. Reset the chain-local
-                // tracked-set identity before every iteration so a producer→copy
-                // chain (Sin: exile a card, then copy THAT card) binds only to the
-                // current iteration's object — otherwise the set accumulates and
-                // the copy multiplies (and the loop never terminates once the
-                // accumulated set keeps the predicate true).
-                state.chain_tracked_set_id = None;
-                // CR 705.2: intra-loop boundary — a `CoinFlipOutcome` gate must
-                // read only THIS iteration's flip. The authoritative
-                // resolution-lifetime clear at top-level entry (above) handles
-                // leaks ACROSS resolutions; this clear handles the boundary
-                // BETWEEN iterations of the same loop, so an iteration whose body
-                // doesn't reach the flip can't satisfy the gate on a prior
-                // iteration's stale result.
-                state.resolution_coin_flip = None;
+
+        // CR 608.2c + CR 107.1c: "Repeat this process" dispatch — the non-count
+        // companion to `repeat_for`. Instead of a fixed iteration count, a
+        // predicate decides per-iteration whether to re-follow the whole
+        // resolution chain. The dispatch is ITERATIVE (not recursive): `depth`
+        // never accumulates, the `depth > 20` guard is never approached, and the
+        // `depth == 0` prelude above ran exactly once — a repeated process is one
+        // resolution (CR 608.2c), so per-resolution accumulators and the
+        // resolution counter must not re-fire per iteration.
+        debug_assert!(
+            !(ability.repeat_for.is_some() && ability.repeat_until.is_some()),
+            "repeat_for (count) and repeat_until (predicate) are mutually exclusive"
+        );
+        match ability.repeat_until.clone() {
+            None => resolve_chain_body(state, ability, events, depth),
+            Some(RepeatContinuation::ControllerChoice) => {
                 let initial_waiting_for = state.waiting_for.clone();
                 let stack_depth_before_iteration = state.resolution_stack.capture_child_boundary();
                 resolve_chain_body(state, ability, events, depth)?;
                 if state.waiting_for != initial_waiting_for {
-                    // Inner pause: stash the loop ability with its remaining cap
-                    // so the drain re-evaluates the condition after the choice.
-                    let mut paused = ability.clone();
-                    paused.repeat_until = Some(RepeatContinuation::WhileCondition {
-                        condition: condition.clone(),
-                        max_iterations: remaining,
-                    });
-                    // No progress witness: this mode is bounded by its own
-                    // `max_iterations`, threaded above via
-                    // `should_repeat_while_condition`.
+                    // Inner pause: stash so the drain re-sets the repeat prompt
+                    // after the iteration's player choice resolves.
+                    //
+                    // No progress witness: this mode re-prompts the controller
+                    // every iteration, so it cannot loop unattended.
                     park_repeat_until_after_inner_pause(
                         state,
-                        Box::new(paused),
+                        Box::new(ability.clone()),
                         None,
+                        stack_depth_before_iteration,
+                    );
+                } else {
+                    // CR 107.1c: after the iteration fully resolved, prompt the
+                    // controller to repeat the process or stop.
+                    state.waiting_for = WaitingFor::RepeatDecision {
+                        player: ability.controller,
+                        ability: Box::new(ability.clone()),
+                    };
+                }
+                Ok(())
+            }
+            Some(RepeatContinuation::UntilStopConditions {
+                stop_on_put_to_hand,
+                stop_on_duplicate_exiled_names,
+            }) => loop {
+                // CR 104.4b: pre-iteration baseline. Captured INSIDE the loop so
+                // each iteration is measured against its own start, not the
+                // repeat's start — a repeat that makes progress and THEN stalls
+                // must still terminate.
+                let progress_baseline =
+                    crate::game::exile_links::repeat_until_stop_witness(state, ability.source_id);
+                // Where this iteration's events begin, so the verdict can see
+                // whether it moved an object the witness does not count.
+                let iteration_events_start = events.len();
+                let initial_waiting_for = state.waiting_for.clone();
+                let stack_depth_before_iteration = state.resolution_stack.capture_child_boundary();
+                resolve_chain_body(state, ability, events, depth)?;
+                if state.waiting_for != initial_waiting_for {
+                    park_repeat_until_after_inner_pause(
+                        state,
+                        Box::new(ability.clone()),
+                        Some(progress_baseline),
                         stack_depth_before_iteration,
                     );
                     return Ok(());
                 }
-                if !should_repeat_while_condition(state, ability, &condition, &mut remaining) {
-                    return Ok(());
+                match repeat_until_verdict(
+                    state,
+                    ability,
+                    stop_on_put_to_hand,
+                    stop_on_duplicate_exiled_names,
+                    Some(&progress_baseline),
+                    RepeatIterationChoice::for_unpaused_iteration(
+                        ability,
+                        &events[iteration_events_start..],
+                    ),
+                ) {
+                    RepeatUntilVerdict::Repeat => {}
+                    RepeatUntilVerdict::Stop => return Ok(()),
+                    RepeatUntilVerdict::MandatoryLoopDraw => {
+                        declare_mandatory_loop_draw(state, events);
+                        return Ok(());
+                    }
+                }
+            },
+            // CR 608.2c: "[if <condition>,] repeat this process [once]" — re-follow
+            // the whole chain while `condition` holds against the just-resolved
+            // state, capped by `max_iterations` additional repeats. Iterates the
+            // same `resolve_chain_body` as `UntilStopConditions`, stashing on an
+            // inner pause so the repeat-until frame drain resumes the loop.
+            Some(RepeatContinuation::WhileCondition {
+                condition,
+                max_iterations,
+            }) => {
+                let mut remaining = max_iterations;
+                loop {
+                    // CR 608.2c: each repeated process is a FRESH execution of the
+                    // instructions, so its "that card"/"those cards" tracked set must
+                    // not extend the prior iteration's. Reset the chain-local
+                    // tracked-set identity before every iteration so a producer→copy
+                    // chain (Sin: exile a card, then copy THAT card) binds only to the
+                    // current iteration's object — otherwise the set accumulates and
+                    // the copy multiplies (and the loop never terminates once the
+                    // accumulated set keeps the predicate true).
+                    state.chain_tracked_set_id = None;
+                    // CR 705.2: intra-loop boundary — a `CoinFlipOutcome` gate must
+                    // read only THIS iteration's flip. The authoritative
+                    // resolution-lifetime clear at top-level entry (above) handles
+                    // leaks ACROSS resolutions; this clear handles the boundary
+                    // BETWEEN iterations of the same loop, so an iteration whose body
+                    // doesn't reach the flip can't satisfy the gate on a prior
+                    // iteration's stale result.
+                    state.resolution_coin_flip = None;
+                    let initial_waiting_for = state.waiting_for.clone();
+                    let stack_depth_before_iteration =
+                        state.resolution_stack.capture_child_boundary();
+                    resolve_chain_body(state, ability, events, depth)?;
+                    if state.waiting_for != initial_waiting_for {
+                        // Inner pause: stash the loop ability with its remaining cap
+                        // so the drain re-evaluates the condition after the choice.
+                        let mut paused = ability.clone();
+                        paused.repeat_until = Some(RepeatContinuation::WhileCondition {
+                            condition: condition.clone(),
+                            max_iterations: remaining,
+                        });
+                        // No progress witness: this mode is bounded by its own
+                        // `max_iterations`, threaded above via
+                        // `should_repeat_while_condition`.
+                        park_repeat_until_after_inner_pause(
+                            state,
+                            Box::new(paused),
+                            None,
+                            stack_depth_before_iteration,
+                        );
+                        return Ok(());
+                    }
+                    if !should_repeat_while_condition(state, ability, &condition, &mut remaining) {
+                        return Ok(());
+                    }
                 }
             }
         }
+    })();
+    if let Some(previous) = previous_return_occurrence {
+        state.active_return_result_occurrence = previous;
+        clear_return_result_frames_if_idle(state);
     }
+    result
 }
 
 /// The per-resolution state `resolve_ability_chain` clears before a top-level
@@ -14075,6 +14157,7 @@ fn resolve_chain_body(
     // REPLACE, not an append) — both leave `is_some()` true. Comparing the full
     // value catches the replace case correctly (issue #491).
     let pending_continuation_before = state.active_ability_continuation().cloned();
+    let child_stack_start = state.resolution_stack.capture_child_boundary();
 
     // CR 608.2c + CR 701.20b + CR 603.3d: A multi-target reveal-all producer whose
     // per-target referent (the revealed card) is consumed by later co-instructions
@@ -17148,7 +17231,23 @@ fn resolve_chain_body(
                 effect_context_object.as_ref(),
                 state,
             );
-            prepend_to_pending_continuation(state, sub_clone);
+            if sub_clone.reads_return_result.is_some()
+                && state.resolution_stack.capture_child_boundary() > child_stack_start
+            {
+                // CR 608.2c: the reader follows the complete producer action.
+                // A replacement post-effect may have parked a continuation
+                // beneath the producer's batch frame, so insert this reader
+                // outside the whole child stack, at the boundary captured
+                // before resolving the producer.
+                state
+                    .insert_ability_continuation_parent_at_child_boundary(
+                        PendingContinuation::new(Box::new(sub_clone), state),
+                        child_stack_start,
+                    )
+                    .expect("named result reader must remain outside its producer's child stack");
+            } else {
+                prepend_to_pending_continuation(state, sub_clone);
+            }
             // CR 701.57c + CR 608.2h: an unconditional Discover follow-up stashed
             // here still binds the hit card as its referent (no-op otherwise).
             stamp_discovered_referent_onto_continuation(state);

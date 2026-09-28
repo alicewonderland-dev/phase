@@ -52,10 +52,10 @@ use crate::types::ability::{
     GrantedAbilityScope, LibraryPosition, MassLibraryShuffleMode, MultiTargetSpec,
     ObjectSelectionCardinality, ObjectSelectionEligibility, OutsideGameSourcePool, PerPlayerScope,
     PlayerFilter, PlayerRelation, PlayerScope, PossessionAxis, PreventionAmount, PreventionScope,
-    PtStat, PtValue, QuantityExpr, QuantityRef, ReassembleControlMode, SearchSelectionConstraint,
-    StaticDefinition, StickerTicketCostPayment, TapStateChange, TargetChoiceTiming, TargetFilter,
-    TargetSelectionMode, ThisWayCause, TypeFilter, TypedFilter, ZoneChoiceCandidateSource,
-    ZoneOwner,
+    PtStat, PtValue, QuantityExpr, QuantityRef, ReassembleControlMode, ReturnResultReadSpec,
+    SearchSelectionConstraint, StaticDefinition, StickerTicketCostPayment, TapStateChange,
+    TargetChoiceTiming, TargetFilter, TargetSelectionMode, ThisWayCause, TypeFilter, TypedFilter,
+    ZoneChoiceCandidateSource, ZoneOwner,
 };
 use crate::types::card_type::CoreType;
 use crate::types::phase::{Phase, PhaseGroup};
@@ -1803,20 +1803,43 @@ pub(crate) fn parse_chosen_return_spec(text: &str, lower: &str) -> Option<Chosen
     Some(ChosenReturnSpec { noun, chooser })
 }
 
-/// A delayed per-object quantity that names a preceding return instruction.
-pub(crate) fn has_returned_this_way_quantity(lower: &str) -> bool {
-    preceded(
+/// Parse the typed prior-object count carried by a later delayed clause.
+/// `None` means no such reader; `Some(None)` is a detected but unsupported one.
+pub(crate) fn parse_returned_this_way_quantity(
+    lower: &str,
+) -> Option<Option<ReturnResultReadSpec>> {
+    let (_, (noun, destination)) = preceded(
         take_until::<_, _, OracleError<'_>>("for each "),
         preceded(
             tag("for each "),
             pair(
                 take_until(" returned to "),
-                preceded(tag(" returned to "), take_until(" this way")),
+                preceded(
+                    tag(" returned to "),
+                    terminated(take_until(" this way"), tag(" this way")),
+                ),
             ),
         ),
     )
     .parse(lower)
-    .is_ok()
+    .ok()?;
+    let (noun_filter, noun_rest) = parse_target(noun);
+    let supported_noun = noun_rest.trim().is_empty()
+        && matches!(
+            &noun_filter,
+            TargetFilter::Typed(typed) if !typed.type_filters.is_empty()
+                && typed.controller.is_none() && typed.properties.is_empty()
+        );
+    let supported_destination = all_consuming(tag::<_, _, OracleError<'_>>("your hand"))
+        .parse(destination)
+        .is_ok();
+    Some(
+        (supported_noun && supported_destination).then_some(ReturnResultReadSpec {
+            noun: noun_filter,
+            destination: Zone::Hand,
+            recipient: ControllerRef::You,
+        }),
+    )
 }
 
 pub(super) fn parse_targeted_action_ast(

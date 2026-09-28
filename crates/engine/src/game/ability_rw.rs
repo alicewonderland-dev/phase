@@ -4156,6 +4156,8 @@ fn walk_ability(
         targets: _,
         declares_chosen_group: _, // target identity, no additional state read/write
         reads_chosen_group: _,    // selected objects are already in `targets`
+        declares_return_result: _, // producer effect accounts for publication
+        reads_return_result,      // instruction-local result is member-bound
         source_id: _,
         cast_occurrence: _,    // finalized-cast provenance, no read/write effect
         source_incarnation: _, // self-transform epoch latch, no read/write effect
@@ -4219,6 +4221,7 @@ fn walk_ability(
         .map_or(pscope_in, player_span_of_filter);
     let (eff, own_scope) = rw_effect(effect, chain_root, pscope, chain_move_owner);
     acc.merge(eff);
+    acc.reads_member_bound |= reads_return_result.is_some();
     let child_root = own_scope.or(chain_root);
     let child_move_owner = effect_move_owner(effect).or(chain_move_owner);
 
@@ -4315,8 +4318,10 @@ fn walk_definition(
         cost: _,
         description: _,
         target_prompt: _,
-        declares_chosen_group: _, // definition-local target identity
-        reads_chosen_group: _,    // effect and target metadata are walked above
+        declares_chosen_group: _,  // definition-local target identity
+        reads_chosen_group: _,     // effect and target metadata are walked above
+        declares_return_result: _, // producer effect accounts for publication
+        reads_return_result,       // instruction-local result is member-bound
         activation_restrictions: _,
         // Payment-time only; it cannot create a resolution-time dependency.
         activation_mana_payment_restriction: _,
@@ -4355,6 +4360,7 @@ fn walk_definition(
         .map_or(pscope_in, player_span_of_filter);
     let (eff, own_scope) = rw_effect(effect, chain_root, pscope, chain_move_owner);
     acc.merge(eff);
+    acc.reads_member_bound |= reads_return_result.is_some();
     let child_root = own_scope.or(chain_root);
     let child_move_owner = effect_move_owner(effect).or(chain_move_owner);
 

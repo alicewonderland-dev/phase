@@ -832,6 +832,8 @@ mod tests {
         let ability = ResolvedAbility {
             declares_chosen_group: None,
             reads_chosen_group: None,
+            declares_return_result: None,
+            reads_return_result: None,
             detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: Effect::Vote {
                 choices: vec!["evidence".to_string(), "bribery".to_string()],
@@ -954,6 +956,8 @@ mod tests {
         ResolvedAbility {
             declares_chosen_group: None,
             reads_chosen_group: None,
+            declares_return_result: None,
+            reads_return_result: None,
             detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: Effect::Vote {
                 choices,
@@ -1412,6 +1416,8 @@ mod tests {
         let ability = ResolvedAbility {
             declares_chosen_group: None,
             reads_chosen_group: None,
+            declares_return_result: None,
+            reads_return_result: None,
             detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: (*parsed_def.effect).clone(),
             targets: vec![],
@@ -1583,6 +1589,8 @@ mod tests {
         let ability = ResolvedAbility {
             declares_chosen_group: None,
             reads_chosen_group: None,
+            declares_return_result: None,
+            reads_return_result: None,
             detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: Effect::Vote {
                 choices: vec!["friend".to_string(), "foe".to_string()],

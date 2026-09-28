@@ -16,8 +16,8 @@ use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag,
     ActivationManaPaymentRestriction, ActivationRestriction, ChoiceType, ControllerRef,
     CostReduction, DelayedTriggerCondition, Duration, Effect, ManaSpendPermission, MultiTargetSpec,
-    OpponentMayScope, PlayerFilter, QuantityExpr, RoundingMode, SubAbilityLink, TargetChoiceTiming,
-    TargetFilter, TargetSelectionMode, UnlessPayModifier,
+    OpponentMayScope, PlayerFilter, QuantityExpr, QuantityRef, ReturnResultReadSpec, RoundingMode,
+    SubAbilityLink, TargetChoiceTiming, TargetFilter, TargetSelectionMode, UnlessPayModifier,
 };
 use crate::types::keywords::Keyword;
 use crate::types::mana::ManaExpiry;
@@ -878,6 +878,8 @@ pub(crate) struct ClauseIr {
     /// The prior return instruction whose actual results a delayed clause names.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reads_return_result: Option<ClauseId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) return_result_read_spec: Option<ReturnResultReadSpec>,
     /// Honest chain-relative source (`SpanPrecision::ChainRelative`): exact byte
     /// range within this chain + verbatim fragment. Replaces the former
     /// unaddressed `source_text` string (Plan 01 §5, line 341). Upgrades to a
@@ -1457,25 +1459,80 @@ impl ClauseDraft<'_> {
         if chosen_return.is_some() && reads_chosen_clause.is_none() {
             self.parsed.effect = Effect::unimplemented("return", &self.source_text);
         }
+        let mut return_result_read_spec = None;
+        let mut reads_return_result = None;
         let delayed_result_reader = self.delayed_condition.is_some()
             || self.prefix_delayed_condition.is_some()
             || matches!(&self.parsed.effect, Effect::CreateDelayedTrigger { .. });
-        let reads_return_result = if delayed_result_reader
-            && crate::parser::oracle_effect::imperative::has_returned_this_way_quantity(
-                &self.source_text.to_ascii_lowercase(),
-            ) {
-            let antecedent = self
-                .builder
-                .clauses
-                .iter()
-                .rev()
-                .find(|clause| clause.reads_chosen_clause.is_some())
-                .map(|clause| clause.id);
-            self.parsed.effect = Effect::unimplemented("create", &self.source_text);
-            antecedent
-        } else {
-            None
-        };
+        if let Some(parsed_reader) = delayed_result_reader
+            .then(|| {
+                crate::parser::oracle_effect::imperative::parse_returned_this_way_quantity(
+                    &self.source_text.to_ascii_lowercase(),
+                )
+            })
+            .flatten()
+        {
+            let body_valid = match &self.parsed.effect {
+                Effect::CreateDelayedTrigger {
+                    condition:
+                        DelayedTriggerCondition::AtNextPhase {
+                            phase: crate::types::phase::Phase::Upkeep,
+                        },
+                    effect,
+                    ..
+                } => {
+                    matches!(
+                        &*effect.effect,
+                        Effect::Token {
+                            count: QuantityExpr::Ref {
+                                qty: QuantityRef::TrackedSetSize
+                                    | QuantityRef::FilteredTrackedSetSize { .. }
+                            },
+                            ..
+                        }
+                    )
+                }
+                _ => false,
+            };
+            let antecedent = parsed_reader.as_ref().and_then(|reader| {
+                self.builder
+                    .clauses
+                    .iter()
+                    .rev()
+                    .find(|clause| {
+                        clause.reads_chosen_clause.is_some()
+                            && matches!(
+                                &clause.parsed.effect,
+                                Effect::BounceAll {
+                                    destination: None | Some(Zone::Hand),
+                                    ..
+                                }
+                            )
+                            && crate::parser::oracle_effect::imperative::parse_chosen_return_spec(
+                                clause.source.fragment().unwrap_or_default(),
+                                &clause
+                                    .source
+                                    .fragment()
+                                    .unwrap_or_default()
+                                    .to_ascii_lowercase(),
+                            )
+                            .is_some_and(|producer| {
+                                chosen_noun_compatible(&producer.noun, &reader.noun)
+                            })
+                    })
+                    .map(|clause| clause.id)
+            });
+            if body_valid {
+                if let (Some(spec), Some(id)) = (parsed_reader, antecedent) {
+                    return_result_read_spec = Some(spec);
+                    reads_return_result = Some(id);
+                } else {
+                    self.parsed.effect = Effect::unimplemented("create", &self.source_text);
+                }
+            } else {
+                self.parsed.effect = Effect::unimplemented("create", &self.source_text);
+            }
+        }
         let span = self.builder.locate(&self.source_text);
         // `allocate_with_span` validates containment + fragment/precision. A
         // ChainRelative child of the chain item always satisfies both by
@@ -1492,6 +1549,7 @@ impl ClauseDraft<'_> {
             declares_chosen_clause,
             reads_chosen_clause,
             reads_return_result,
+            return_result_read_spec,
             source,
             disposition: self.disposition,
             parsed: self.parsed,

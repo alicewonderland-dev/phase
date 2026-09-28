@@ -529,6 +529,20 @@ pub fn resolve_all(
             .max(0) as usize;
         if count == 0 {
             state.last_effect_count = Some(0);
+            if let Some(result_id) = ability.declares_return_result {
+                let occurrence = state.active_return_result_occurrence.ok_or_else(|| {
+                    EffectError::MissingParam("return result occurrence".to_string())
+                })?;
+                let frame = state
+                    .return_result_frames
+                    .get_mut(&occurrence)
+                    .ok_or_else(|| EffectError::MissingParam("return result frame".to_string()))?;
+                if frame.insert(result_id, Vec::new()).is_some() {
+                    return Err(EffectError::InvalidParam(
+                        "duplicate return result".to_string(),
+                    ));
+                }
+            }
             events.push(GameEvent::EffectResolved {
                 kind: EffectKind::from(&ability.effect),
                 source_id: ability.source_id,
@@ -596,8 +610,21 @@ pub fn resolve_all(
         .iter()
         .map(|&obj_id| ZoneMoveRequest::effect(obj_id, destination, ability.source_id))
         .collect();
+    let completion = if let Some(result_id) = ability.declares_return_result {
+        Some(
+            crate::types::game_state::BatchCompletion::RecordInstructionZoneResult {
+                occurrence_id: state.active_return_result_occurrence.ok_or_else(|| {
+                    EffectError::MissingParam("return result occurrence".to_string())
+                })?,
+                result_id,
+                settled_records: None,
+            },
+        )
+    } else {
+        None
+    };
     if let BatchMoveResult::NeedsChoice =
-        zone_pipeline::move_objects_simultaneously(state, reqs, events)
+        zone_pipeline::move_objects_simultaneously_then(state, reqs, completion, events)
     {
         // CR 616.1: a redirect ordering choice paused mid-batch; the prompt is
         // parked and the tail stashed. Bail before `EffectResolved` so it is not

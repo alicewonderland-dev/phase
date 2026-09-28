@@ -56,6 +56,10 @@ pub(super) fn finish_resolving_stack_entry(
 ) {
     let entry = state.resolving_stack_entry.take();
     let firing = state.resolving_trigger_firing.take();
+    // CR 608.2c: the resolving stack entry owns every nested instruction-result
+    // occurrence, including ones parked across replacement choices.
+    state.return_result_frames.clear();
+    state.active_return_result_occurrence = None;
     debug_assert!(
         firing.is_none()
             || entry
@@ -3734,6 +3738,8 @@ fn self_counter_ability_is_batch_candidate(ability: &ResolvedAbility) -> bool {
         targets,
         declares_chosen_group,
         reads_chosen_group,
+        declares_return_result,
+        reads_return_result,
         source_id: _,
         cast_occurrence,
         source_incarnation,
@@ -3809,6 +3815,8 @@ fn self_counter_ability_is_batch_candidate(ability: &ResolvedAbility) -> bool {
         && targets.is_empty()
         && declares_chosen_group.is_none()
         && reads_chosen_group.is_none()
+        && declares_return_result.is_none()
+        && reads_return_result.is_none()
         && cast_occurrence.is_none()
         && source_incarnation.is_none()
         && trigger_source.is_none()
@@ -3971,6 +3979,8 @@ fn fixed_controller_gain_life_ability_is_batch_candidate(ability: &ResolvedAbili
         targets,
         declares_chosen_group,
         reads_chosen_group,
+        declares_return_result,
+        reads_return_result,
         source_id: _,
         cast_occurrence,
         source_incarnation: _,
@@ -4045,6 +4055,8 @@ fn fixed_controller_gain_life_ability_is_batch_candidate(ability: &ResolvedAbili
         && targets.is_empty()
         && declares_chosen_group.is_none()
         && reads_chosen_group.is_none()
+        && declares_return_result.is_none()
+        && reads_return_result.is_none()
         && cast_occurrence.is_none()
         && scoped_player.is_none()
         && matches!(kind, AbilityKind::Spell | AbilityKind::Database)
@@ -4188,6 +4200,8 @@ fn fixed_opponent_effect_ability_is_batch_candidate(ability: &ResolvedAbility) -
         targets,
         declares_chosen_group,
         reads_chosen_group,
+        declares_return_result,
+        reads_return_result,
         source_id: _,
         cast_occurrence,
         source_incarnation: _,
@@ -4266,6 +4280,8 @@ fn fixed_opponent_effect_ability_is_batch_candidate(ability: &ResolvedAbility) -
         && targets.is_empty()
         && declares_chosen_group.is_none()
         && reads_chosen_group.is_none()
+        && declares_return_result.is_none()
+        && reads_return_result.is_none()
         && cast_occurrence.is_none()
         && scoped_player.is_none()
         && matches!(kind, AbilityKind::Spell | AbilityKind::Database)
@@ -4666,6 +4682,8 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         targets: a_targets,
         declares_chosen_group: a_declares_chosen_group,
         reads_chosen_group: a_reads_chosen_group,
+        declares_return_result: a_declares_return_result,
+        reads_return_result: a_reads_return_result,
         source_id: _,
         cast_occurrence: _,
         source_incarnation: _,
@@ -4744,6 +4762,8 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         targets: b_targets,
         declares_chosen_group: b_declares_chosen_group,
         reads_chosen_group: b_reads_chosen_group,
+        declares_return_result: b_declares_return_result,
+        reads_return_result: b_reads_return_result,
         source_id: _,
         cast_occurrence: _,
         source_incarnation: _,
@@ -4822,6 +4842,8 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         && a_targets == b_targets
         && a_declares_chosen_group == b_declares_chosen_group
         && a_reads_chosen_group == b_reads_chosen_group
+        && a_declares_return_result == b_declares_return_result
+        && a_reads_return_result == b_reads_return_result
         && a_force_block_attacker == b_force_block_attacker
         // CR 400.7 + CR 603.7c: two otherwise-identical abilities pinned to
         // DIFFERENT incarnations are not the same ability. Participating here

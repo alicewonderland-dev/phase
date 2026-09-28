@@ -153,6 +153,8 @@ pub fn build_resolved_from_def_with_targets(
         ResolvedAbility::new(*def.effect.clone(), targets, source_id, controller).kind(def.kind);
     resolved.declares_chosen_group = def.declares_chosen_group;
     resolved.reads_chosen_group = def.reads_chosen_group;
+    resolved.declares_return_result = def.declares_return_result;
+    resolved.reads_return_result = def.reads_return_result.clone();
     resolved.context.face_down_in_exile = def.face_down_in_exile;
     resolved.context.ability_tag = def.ability_tag;
     resolved.activation_cost_reduction = def.cost_reduction.clone();
@@ -281,6 +283,8 @@ pub(crate) fn apply_instead_swap(
     overridden.effect = sub.effect.clone();
     overridden.declares_chosen_group = sub.declares_chosen_group;
     overridden.reads_chosen_group = sub.reads_chosen_group;
+    overridden.declares_return_result = sub.declares_return_result;
+    overridden.reads_return_result = sub.reads_return_result.clone();
     overridden.duration = sub.duration.clone();
     // CR 608.2c: The override sub is consumed; its own sub_ability becomes the
     // new chain tail. The else_ability mirrors that chain.

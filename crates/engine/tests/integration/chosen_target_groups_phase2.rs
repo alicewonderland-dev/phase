@@ -222,7 +222,7 @@ fn role_named_return_moves_only_the_named_creature() {
 const EAGLES: &str = "Kicker {2}{W}{W} (You may pay an additional {2}{W}{W} as you cast this spell.)\nChoose target creature you own. If this spell was kicked, instead choose any number of target creatures you own. Return each chosen creature to your hand. At the beginning of the next upkeep, create a 4/4 white Bird Soldier creature token with flying for each creature returned to your hand this way.";
 
 #[test]
-fn eagles_phase_two_keeps_delayed_result_strictly_unsupported() {
+fn eagles_selected_return_binds_its_delayed_result() {
     let parsed = parse_oracle_text(
         EAGLES,
         "The Eagles Are Coming!",
@@ -248,11 +248,19 @@ fn eagles_phase_two_keeps_delayed_result_strictly_unsupported() {
         Some(AbilityCondition::AdditionalCostPaidInstead)
     ));
     assert!(matches!(&*selected_return.effect, Effect::BounceAll { .. }));
-    assert!(matches!(&*delayed.effect, Effect::Unimplemented { .. }));
+    assert!(matches!(
+        &*delayed.effect,
+        Effect::CreateDelayedTrigger { .. }
+    ));
+    assert_eq!(
+        selected_return.declares_return_result,
+        delayed.reads_return_result.as_ref().map(|(id, _)| *id)
+    );
+    assert!(selected_return.declares_return_result.is_some());
 }
 
 #[test]
-fn eagles_unpaid_return_reaches_hand_before_the_strict_delayed_boundary() {
+fn eagles_unpaid_return_reaches_hand_and_arms_the_delayed_trigger() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let selected = scenario.add_creature(P0, "Selected Bear", 2, 2).id();
@@ -269,12 +277,7 @@ fn eagles_unpaid_return_reaches_hand_before_the_strict_delayed_boundary() {
     )));
     outcome.assert_zone(&[selected], Zone::Hand);
     outcome.assert_zone(&[unselected], Zone::Battlefield);
-    assert!(!outcome
-        .state()
-        .battlefield
-        .iter()
-        .filter_map(|id| outcome.state().objects.get(id))
-        .any(|object| object.is_token && object.name.contains("Bird Soldier")));
+    assert_eq!(outcome.state().delayed_triggers.len(), 1);
 }
 
 #[test]
