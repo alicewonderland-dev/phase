@@ -3318,20 +3318,16 @@ mod tests {
         }
     }
 
-    /// `ReduceAbilityCost` statics now carry a target restriction and a
-    /// once-per-turn frequency, `GameState` journals each turn's activations,
-    /// and the activation cost carrier holds the target-settlement lock, all in
-    /// serialized full-game state; a v82 peer would drop them silently and
-    /// price an activation differently, so it must be refused before it
-    /// receives v83 state.
+    /// `WaitingFor::DeclareBlockers` gains `block_capacities`
+    /// (CR 509.1a + CR 101.1) — a capability bump like 60, not a parse bump.
     ///
     /// The name embeds the numeral deliberately: `assert_eq!(PROTOCOL_VERSION,
     /// <n>)` under a function named for `<n-1>` is green, so
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_83_for_target_gated_activation_costs() {
-        assert_eq!(PROTOCOL_VERSION, 83);
+    fn protocol_version_is_88_for_blocker_prompt_projections() {
+        assert_eq!(PROTOCOL_VERSION, 88);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3342,7 +3338,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_83_for_target_gated_activation_costs` stays
+    /// `protocol_version_is_88_for_blocker_prompt_projections` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
