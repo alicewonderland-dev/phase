@@ -1529,7 +1529,7 @@ mod tests {
         );
     }
 
-    /// Companion to the row above: pinned to the CURRENT incarnation (3) —
+    /// Pinned to the CURRENT incarnation (3) —
     /// the live entry answers, matching `spell_cast_event_with_spell_still_on_stack_copies_the_live_entry`.
     #[test]
     fn pinned_trigger_at_current_incarnation_copies_the_live_entry() {

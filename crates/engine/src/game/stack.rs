@@ -546,9 +546,9 @@ fn remove_stack_entry_at_unobserved(
 /// existed on the stack, before a non-resolving departure. Only for a spell
 /// entry (`StackEntryKind::Spell`) whose cast finished
 /// (`obj.cast_occurrence` is `Some` —
-/// `casting_costs.rs::stamp_cast_occurrence_on_stack_spell`); a spell copy or
-/// a rolled-back cast was never finalized and has no CR 707.2 choices to
-/// remember. Called from the zone-exit path
+/// `casting_costs.rs::stamp_cast_occurrence_on_stack_spell`); a rolled-back
+/// cast was never finalized and has no CR 707.2 choices to remember. Called
+/// from the zone-exit path
 /// (`zones.rs::apply_zone_exit_cleanup`, before the `cast_occurrence` clear
 /// that would make this guard vacuous) and `remove_nonresolving_stack_entry_at`
 /// below — a resolution pop (`pop_top_stack_entry`) calls neither.
