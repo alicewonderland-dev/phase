@@ -1916,14 +1916,9 @@ pub fn assign_targets_in_chain(
     ability: &mut ResolvedAbility,
     targets: &[TargetRef],
 ) -> Result<(), EngineError> {
-    if is_per_opponent_target_fanout(ability) {
+    if is_per_opponent_target_fanout(ability) || !chain_has_target_sink(ability) {
         ability.targets = targets.to_vec();
-        ability.capture_target_incarnations_recursive(state);
-        return Ok(());
-    }
-    if !chain_has_target_sink(ability) {
-        ability.targets = targets.to_vec();
-        ability.capture_target_incarnations_recursive(state);
+        finish_target_assignment(state, ability, targets.to_vec());
         return Ok(());
     }
     let mut next_target = 0usize;
@@ -1934,7 +1929,7 @@ pub fn assign_targets_in_chain(
         ));
     }
     stamp_other_batch_source_targets(ability);
-    ability.capture_target_incarnations_recursive(state);
+    finish_target_assignment(state, ability, targets.to_vec());
     Ok(())
 }
 
@@ -1943,14 +1938,10 @@ pub fn assign_selected_slots_in_chain(
     ability: &mut ResolvedAbility,
     selected_slots: &[Option<TargetRef>],
 ) -> Result<(), EngineError> {
-    if is_per_opponent_target_fanout(ability) {
-        ability.targets = selected_slots.iter().flatten().cloned().collect();
-        ability.capture_target_incarnations_recursive(state);
-        return Ok(());
-    }
-    if !chain_has_target_sink(ability) {
-        ability.targets = selected_slots.iter().flatten().cloned().collect();
-        ability.capture_target_incarnations_recursive(state);
+    let chosen: Vec<TargetRef> = selected_slots.iter().flatten().cloned().collect();
+    if is_per_opponent_target_fanout(ability) || !chain_has_target_sink(ability) {
+        ability.targets = chosen.clone();
+        finish_target_assignment(state, ability, chosen);
         return Ok(());
     }
     let mut next_slot = 0usize;
@@ -1961,8 +1952,24 @@ pub fn assign_selected_slots_in_chain(
         ));
     }
     stamp_other_batch_source_targets(ability);
-    ability.capture_target_incarnations_recursive(state);
+    finish_target_assignment(state, ability, chosen);
     Ok(())
+}
+
+/// CR 601.2c: record `chosen` as the targets chosen for `ability` and capture
+/// the incarnations of the chain's object targets.
+fn finish_target_assignment(
+    state: &GameState,
+    ability: &mut ResolvedAbility,
+    chosen: Vec<TargetRef>,
+) {
+    // CR 115.1: the opponents a per-opponent fanout iterates are not targets.
+    ability.declared_targets = if is_per_opponent_target_fanout(ability) {
+        object_targets_only(&chosen)
+    } else {
+        chosen
+    };
+    ability.capture_target_incarnations_recursive(state);
 }
 
 /// CR 608.2c + CR 120.1: a pairwise "each of those ... to the other" damage
@@ -2026,6 +2033,10 @@ pub fn flatten_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
         targets.extend(flatten_targets_in_chain(else_ability));
     }
     targets
+}
+
+pub fn flatten_declared_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
+    ability.declared_targets.clone()
 }
 
 /// CR 608.2b: The slots of `declared` — numbered exactly as

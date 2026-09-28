@@ -32468,6 +32468,8 @@ pub struct ResolvedAbility {
     /// whose keyed pins are reserved for delayed-trigger referents.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selected_target_incarnations: Vec<ObjectIncarnationRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_targets: Vec<TargetRef>,
     /// CR 602.2b + CR 601.2f: self-referential activation cost modification
     /// carried from the printed ability definition so target-dependent riders
     /// can be applied after targets are committed.
@@ -32860,6 +32862,7 @@ impl PartialEq for ResolvedAbility {
             force_block_attacker: a_force_block_attacker,
             target_incarnations: a_target_incarnations,
             selected_target_incarnations: a_selected_target_incarnations,
+            declared_targets: a_declared_targets,
             activation_cost_reduction: a_activation_cost_reduction,
             activation_record: a_activation_record,
             illegal_target_slots: a_illegal_target_slots,
@@ -32924,6 +32927,7 @@ impl PartialEq for ResolvedAbility {
             force_block_attacker: b_force_block_attacker,
             target_incarnations: b_target_incarnations,
             selected_target_incarnations: b_selected_target_incarnations,
+            declared_targets: b_declared_targets,
             activation_cost_reduction: b_activation_cost_reduction,
             activation_record: b_activation_record,
             illegal_target_slots: b_illegal_target_slots,
@@ -32988,6 +32992,7 @@ impl PartialEq for ResolvedAbility {
             && a_force_block_attacker == b_force_block_attacker
             && a_target_incarnations == b_target_incarnations
             && a_selected_target_incarnations == b_selected_target_incarnations
+            && a_declared_targets == b_declared_targets
             && a_activation_cost_reduction == b_activation_cost_reduction
             && a_activation_record == b_activation_record
             && a_illegal_target_slots == b_illegal_target_slots
@@ -33143,6 +33148,7 @@ impl ResolvedAbility {
             force_block_attacker: None,
             target_incarnations: Vec::new(),
             selected_target_incarnations: Vec::new(),
+            declared_targets: Vec::new(),
             activation_cost_reduction: None,
             activation_record: None,
             illegal_target_slots: Vec::new(),
