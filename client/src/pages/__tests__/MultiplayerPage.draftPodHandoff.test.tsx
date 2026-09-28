@@ -1,6 +1,6 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { useEffect } from "react";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { LobbyGame } from "../../adapter/types";
@@ -122,6 +122,7 @@ import { DraftPodPage } from "../DraftPodPage";
 import { adHocLobbySource, useMultiplayerStore, type LobbySource } from "../../stores/multiplayerStore";
 import { useMultiplayerDraftStore } from "../../stores/multiplayerDraftStore";
 import { useConnectivityStore } from "../../stores/connectivityStore";
+import { DraftPodGuestAdapter } from "../../adapter/draftPodGuestAdapter";
 
 const ORIGIN = adHocLobbySource("wss://play.example.com/ws") as LobbySource;
 const p2pDraftRow: LobbyGame = {
@@ -139,12 +140,27 @@ function LocationProbe() {
   return <div data-testid="loc">{location.pathname + location.search}</div>;
 }
 
+/** Captures the router's `navigate`, so a test can leave `/multiplayer` on its own. */
+let navigateTo: ((to: string) => void) | null = null;
+function NavigationProbe() {
+  const navigate = useNavigate();
+  useEffect(() => {
+    navigateTo = navigate;
+    return () => {
+      navigateTo = null;
+    };
+  }, [navigate]);
+  return null;
+}
+
 function renderApp(initialPath = "/multiplayer") {
   return render(
     <MemoryRouter initialEntries={[initialPath]}>
+      <NavigationProbe />
       <Routes>
         <Route path="/multiplayer" element={<MultiplayerPage />} />
         <Route path="/draft-pod" element={<DraftPodPage />} />
+        <Route path="/elsewhere" element={<div data-testid="elsewhere" />} />
       </Routes>
       <LocationProbe />
     </MemoryRouter>,
@@ -205,8 +221,8 @@ describe("MultiplayerPage draft pod handoff", () => {
     });
     pageJoins = [];
     useMultiplayerDraftStore.setState({
-      joinDraft: (config) => {
-        const joining = realJoinDraft(config);
+      joinDraft: (config, options) => {
+        const joining = realJoinDraft(config, options);
         pageJoins.push(joining);
         return joining;
       },
@@ -314,50 +330,102 @@ describe("MultiplayerPage draft pod handoff", () => {
     async (shape, phase, error) => {
       const stale = gateNextJoin();
       joinFromLobbyRow();
-      await waitFor(() => expect(pageJoins).toHaveLength(1));
+      try {
+        await waitFor(() => expect(pageJoins).toHaveLength(1));
 
-      if (shape === "failed") {
-        net.plan.push(async () => {
-          throw new Error("Failed to connect: Could not connect to peer NEWER");
+        if (shape === "failed") {
+          net.plan.push(async () => {
+            throw new Error("Failed to connect: Could not connect to peer NEWER");
+          });
+        }
+        await realJoinDraft({ kind: "new", roomCode: "NEWER", displayName: "Other" });
+        if (shape === "was kicked") guest.instances[0]!.emit({ type: "kicked", reason: "Kicked by host" });
+        expect(useMultiplayerDraftStore.getState()).toMatchObject({ role: "guest", phase, error });
+
+        stale.release();
+        await act(async () => {
+          await pageJoins[0];
         });
-      }
-      await realJoinDraft({ kind: "new", roomCode: "NEWER", displayName: "Other" });
-      if (shape === "was kicked") guest.instances[0]!.emit({ type: "kicked", reason: "Kicked by host" });
-      expect(useMultiplayerDraftStore.getState()).toMatchObject({ role: "guest", phase, error });
+        await settle();
 
-      stale.release();
+        expect(useMultiplayerDraftStore.getState()).toMatchObject({ role: "guest", phase, error });
+        for (const g of guest.instances) expect(g.dispose).not.toHaveBeenCalled();
+        expect(toastMessages()).toEqual([]);
+        expect(screen.getByTestId("loc").textContent).toBe("/multiplayer");
+      } finally {
+        stale.release();
+      }
+    },
+  );
+
+  it("stays silent and leaves a newer session alone when it starts while the failed lobby join is disposing its adapter", async () => {
+    const realDispose = DraftPodGuestAdapter.prototype.dispose;
+    let resumeDispose!: () => void;
+    const paused = new Promise<void>((resolve) => {
+      resumeDispose = resolve;
+    });
+    const disposeSpy = vi
+      .spyOn(DraftPodGuestAdapter.prototype, "dispose")
+      .mockImplementationOnce(async function (this: DraftPodGuestAdapter, options) {
+        await paused;
+        return realDispose.call(this, options);
+      });
+    net.plan.push(async () => {
+      throw new Error("test stub: no live PeerJS connection");
+    });
+    try {
+      joinFromLobbyRow();
+      await waitFor(() => expect(disposeSpy).toHaveBeenCalledTimes(1));
+
+      await realJoinDraft({ kind: "new", roomCode: "NEWER", displayName: "Other" });
+      expect(useMultiplayerDraftStore.getState()).toMatchObject({ role: "guest", phase: "lobby", error: null });
+
+      resumeDispose();
       await act(async () => {
         await pageJoins[0];
       });
       await settle();
 
-      expect(useMultiplayerDraftStore.getState()).toMatchObject({ role: "guest", phase, error });
-      for (const g of guest.instances) expect(g.dispose).not.toHaveBeenCalled();
+      expect(useMultiplayerDraftStore.getState()).toMatchObject({ role: "guest", phase: "lobby", error: null });
+      expect(guest.instances).toHaveLength(1);
+      expect(guest.instances[0]!.dispose).not.toHaveBeenCalled();
       expect(toastMessages()).toEqual([]);
       expect(screen.getByTestId("loc").textContent).toBe("/multiplayer");
-    },
-  );
-
-  it("does not report a lobby join the player left while it was pending", async () => {
-    const stale = gateNextJoin();
-    joinFromLobbyRow();
-    await waitFor(() => expect(pageJoins).toHaveLength(1));
-    await act(async () => {
-      await useMultiplayerDraftStore.getState().leave();
-    });
-
-    stale.release();
-    await act(async () => {
-      await pageJoins[0];
-    });
-    await settle();
-
-    expect(toastMessages()).toEqual([]);
-    expect(screen.getByTestId("loc").textContent).toBe("/multiplayer");
+    } finally {
+      resumeDispose();
+      disposeSpy.mockRestore();
+    }
   });
 
-  it("does not join over a pod session started while the broker was resolving the row", async () => {
-    let releaseBroker!: () => void;
+  it("leaves a session opened while the failed lobby join's toast is shown alone", async () => {
+    net.plan.push(async () => {
+      throw new Error("test stub: no live PeerJS connection");
+    });
+    let newer: ReturnType<typeof realJoinDraft> | null = null;
+    const unsubscribe = useMultiplayerStore.subscribe((state) => {
+      if (newer === null && state.toasts.size > 0) {
+        newer = realJoinDraft({ kind: "new", roomCode: "NEWER", displayName: "Other" });
+      }
+    });
+    try {
+      joinFromLobbyRow();
+      await waitFor(() => expect(newer).not.toBeNull());
+      await act(async () => {
+        await expect(newer).resolves.toEqual({ status: "opened" });
+      });
+      await settle();
+    } finally {
+      unsubscribe();
+    }
+
+    expect(toastMessages()).toEqual(["test stub: no live PeerJS connection"]);
+    expect(useMultiplayerDraftStore.getState()).toMatchObject({ role: "guest", phase: "lobby", error: null });
+    expect(guest.instances).toHaveLength(1);
+    expect(guest.instances[0]!.dispose).not.toHaveBeenCalled();
+  });
+
+  it("does not join a lobby row whose broker lookup settles after the player left the page", async () => {
+    let releaseBroker: () => void = () => {};
     useMultiplayerStore.setState({
       resolveGuest: vi.fn<ResolveGuest>(
         () =>
@@ -376,20 +444,110 @@ describe("MultiplayerPage draft pod handoff", () => {
           }),
       ),
     });
+    try {
+      joinFromLobbyRow();
+      await waitFor(() => expect(useMultiplayerStore.getState().resolveGuest).toHaveBeenCalledTimes(1));
+
+      act(() => navigateTo?.("/elsewhere"));
+      // Positive control: the page really did leave the lobby before the broker settles.
+      expect(screen.queryByTestId("lobby")).toBeNull();
+
+      releaseBroker();
+      await settle();
+
+      expect(pageJoins).toEqual([]);
+      expect(net.joinRoom).not.toHaveBeenCalled();
+      expect(screen.getByTestId("loc").textContent).toBe("/elsewhere");
+      expect(useMultiplayerDraftStore.getState()).toMatchObject({ role: null, phase: "idle" });
+      expect(toastMessages()).toEqual([]);
+    } finally {
+      releaseBroker();
+    }
+  });
+
+  it("withdraws a lobby join the player left while it was connecting", async () => {
+    const stale = gateNextJoin();
     joinFromLobbyRow();
-    await waitFor(() => expect(useMultiplayerStore.getState().resolveGuest).toHaveBeenCalledTimes(1));
+    try {
+      await waitFor(() => expect(pageJoins).toHaveLength(1));
+      expect(useMultiplayerDraftStore.getState()).toMatchObject({ role: "guest", phase: "connecting" });
 
-    await realJoinDraft({ kind: "new", roomCode: "NEWER", displayName: "Other" });
-    expect(useMultiplayerDraftStore.getState()).toMatchObject({ role: "guest", phase: "lobby" });
+      act(() => navigateTo?.("/elsewhere"));
 
-    releaseBroker();
-    await settle();
+      stale.release();
+      await act(async () => {
+        await expect(pageJoins[0]).resolves.toEqual({ status: "superseded" });
+      });
+      await settle();
 
-    expect(pageJoins).toEqual([]);
-    expect(net.joinRoom).toHaveBeenCalledTimes(1);
-    expect(guest.instances[0]!.dispose).not.toHaveBeenCalled();
-    expect(useMultiplayerDraftStore.getState()).toMatchObject({ role: "guest", phase: "lobby" });
-    expect(screen.getByTestId("loc").textContent).toBe("/multiplayer");
+      expect(screen.getByTestId("loc").textContent).toBe("/elsewhere");
+      expect(useMultiplayerDraftStore.getState()).toMatchObject({ role: null, phase: "idle" });
+      expect(toastMessages()).toEqual([]);
+    } finally {
+      stale.release();
+    }
+  });
+
+  it("does not report a lobby join the player left while it was pending", async () => {
+    const stale = gateNextJoin();
+    joinFromLobbyRow();
+    try {
+      await waitFor(() => expect(pageJoins).toHaveLength(1));
+      await act(async () => {
+        await useMultiplayerDraftStore.getState().leave();
+      });
+
+      stale.release();
+      await act(async () => {
+        await pageJoins[0];
+      });
+      await settle();
+
+      expect(toastMessages()).toEqual([]);
+      expect(screen.getByTestId("loc").textContent).toBe("/multiplayer");
+    } finally {
+      stale.release();
+    }
+  });
+
+  it("does not join over a pod session started while the broker was resolving the row", async () => {
+    let releaseBroker: () => void = () => {};
+    useMultiplayerStore.setState({
+      resolveGuest: vi.fn<ResolveGuest>(
+        () =>
+          new Promise((resolve) => {
+            releaseBroker = () =>
+              resolve({
+                ok: true as const,
+                peerInfo: {
+                  game_code: "ABC123",
+                  host_peer_id: "phase2-ABCDE",
+                  match_config: { match_type: "Bo1" as const },
+                  player_count: 8,
+                  filled_seats: 1,
+                },
+              });
+          }),
+      ),
+    });
+    try {
+      joinFromLobbyRow();
+      await waitFor(() => expect(useMultiplayerStore.getState().resolveGuest).toHaveBeenCalledTimes(1));
+
+      await realJoinDraft({ kind: "new", roomCode: "NEWER", displayName: "Other" });
+      expect(useMultiplayerDraftStore.getState()).toMatchObject({ role: "guest", phase: "lobby" });
+
+      releaseBroker();
+      await settle();
+
+      expect(pageJoins).toEqual([]);
+      expect(net.joinRoom).toHaveBeenCalledTimes(1);
+      expect(guest.instances[0]!.dispose).not.toHaveBeenCalled();
+      expect(useMultiplayerDraftStore.getState()).toMatchObject({ role: "guest", phase: "lobby" });
+      expect(screen.getByTestId("loc").textContent).toBe("/multiplayer");
+    } finally {
+      releaseBroker();
+    }
   });
 
   it("renders the lobby, not a leave-draft screen, for a stale ?view=draft-lobby link", async () => {

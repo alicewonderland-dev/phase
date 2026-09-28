@@ -409,7 +409,7 @@ describe("createPod lobby listing — production entry", () => {
     await vi.waitFor(() => expect(socketState.sockets.length).toBeGreaterThanOrEqual(1));
 
     await vi.waitFor(() => expect(initializeSpy).toHaveBeenCalledTimes(1));
-    expect(firstResolved).toBe("superseded");
+    expect(firstResolved).toEqual({ status: "superseded" });
 
     const firstSocket = socketState.sockets[0]!;
     expect(frames(firstSocket).some((f) => f.type === "CreateGameWithSettings")).toBe(false);

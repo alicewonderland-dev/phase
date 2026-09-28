@@ -501,7 +501,7 @@ function procedurePublication(
   };
 }
 
-type HostPodOutcome = DraftSessionOpenOutcome | "refused";
+type HostPodOutcome = DraftSessionOpenOutcome | { readonly status: "refused" };
 
 /**
  * Host `hostConfig`'s pod. From the moment an opened broker client is
@@ -523,7 +523,7 @@ async function hostPod(
   if (!listing.isPublic || !podListingEligible(hostConfig.podSize)) {
     if (getEffectiveOffline()) {
       set({ configError: DRAFT_OFFLINE_ERROR });
-      return "refused";
+      return { status: "refused" };
     }
     return useMultiplayerDraftStore.getState().hostDraft(hostConfig);
   }
@@ -532,16 +532,16 @@ async function hostPod(
   const refusal = podListingRefusal(request);
   if (refusal !== null) {
     set({ configError: refusal });
-    return "refused";
+    return { status: "refused" };
   }
 
   const { url, socket } = await useMultiplayerStore
     .getState()
     .resolveP2PBroker(useMultiplayerStore.getState().hostingServer);
-  if (stale()) return "refused";
+  if (stale()) return { status: "refused" };
   if (socket?.serverInfo.mode !== "LobbyOnly") {
     set({ configError: i18n.t("draft:podSetup.lobbyUnavailable") });
-    return "refused";
+    return { status: "refused" };
   }
 
   let broker: BrokerClient;
@@ -549,15 +549,15 @@ async function hostPod(
     broker = await openBrokerClient(url);
   } catch {
     if (!stale()) set({ configError: i18n.t("draft:podSetup.lobbyUnavailable") });
-    return "refused";
+    return { status: "refused" };
   }
 
-  let outcome: HostPodOutcome = "refused";
+  let outcome: HostPodOutcome = { status: "refused" };
   try {
-    if (stale()) return "refused";
+    if (stale()) return { status: "refused" };
     if (getEffectiveOffline()) {
       set({ configError: DRAFT_OFFLINE_ERROR });
-      return "refused";
+      return { status: "refused" };
     }
     outcome = await useMultiplayerDraftStore.getState().hostDraft({
       ...hostConfig,
@@ -565,7 +565,7 @@ async function hostPod(
     });
     return outcome;
   } finally {
-    if (outcome !== "opened") broker.close();
+    if (outcome.status !== "opened") broker.close();
   }
 }
 
@@ -876,12 +876,12 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
 
           const outcome = await hostPod(set, get, procedureRequest, config, listing, poolInput, hostConfig);
           if (!isCurrentPodOrchestration(procedureRequest) || get().config !== config) return;
-          if (outcome !== "failed") return;
+          if (outcome.status !== "failed") return;
           if (getEffectiveOffline()) {
             set({ configError: DRAFT_OFFLINE_ERROR });
             return;
           }
-          set({ configError: useMultiplayerDraftStore.getState().error ?? "Unable to host draft pod" });
+          set({ configError: outcome.error ?? "Unable to host draft pod" });
         } catch (err) {
           if (!isCurrentPodOrchestration(procedureRequest) || get().config !== config) return;
           if (getEffectiveOffline()) {
@@ -933,12 +933,12 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
 
         const outcome = await hostPod(set, get, procedureRequest, config, listing, poolInput, hostConfig);
         if (!isCurrentPodOrchestration(procedureRequest) || get().config !== config) return;
-        if (outcome !== "failed") return;
+        if (outcome.status !== "failed") return;
         if (getEffectiveOffline()) {
           set({ configError: DRAFT_OFFLINE_ERROR });
           return;
         }
-        set({ configError: useMultiplayerDraftStore.getState().error ?? "Unable to host draft pod" });
+        set({ configError: outcome.error ?? "Unable to host draft pod" });
       } catch (err) {
         if (!isCurrentPodOrchestration(procedureRequest) || get().config !== config) return;
         if (getEffectiveOffline()) {
@@ -1170,14 +1170,14 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
           ...hostConfig,
           signal: options.signal,
         });
-        if (!isCurrentAttempt() || !isCurrentPodOrchestration(procedureRequest) || hosted === "superseded") {
+        if (!isCurrentAttempt() || !isCurrentPodOrchestration(procedureRequest) || hosted.status === "superseded") {
           return "superseded";
         }
-        if (hosted === "failed" && getEffectiveOffline()) {
+        if (hosted.status === "failed" && getEffectiveOffline()) {
           set({ configError: DRAFT_OFFLINE_ERROR });
           return "offline";
         }
-        return hosted === "opened" ? "resumed" : "invalid";
+        return hosted.status === "opened" ? "resumed" : "invalid";
       })();
       resumeHostedPodAttempt = attempt;
 
@@ -1222,7 +1222,7 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
         }
         const joined = await useMultiplayerDraftStore.getState().joinDraft(guestConfig);
         if (!isCurrentPodOrchestration(request)) return;
-        if (joined === "failed" && getEffectiveOffline()) {
+        if (joined.status === "failed" && getEffectiveOffline()) {
           set({ configError: DRAFT_OFFLINE_ERROR });
         }
       } catch (err) {

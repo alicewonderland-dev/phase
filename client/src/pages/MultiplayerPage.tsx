@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type Dispatch,
+  type MutableRefObject,
+  type SetStateAction,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useLocation, useNavigate } from "react-router";
 
@@ -125,19 +133,39 @@ export function MultiplayerPage() {
     setView("lobby");
   }, [effectiveOffline, view]);
 
+  // Lobby joins this route has started but not yet settled. The
+  // `resolveP2PDialTarget` round trip and the `joinDraft` connection attempt
+  // it feeds outlive a navigation away from `/multiplayer`, and an abandoned
+  // one must not go on to seat this browser in a pod nobody is looking at.
+  // Owned here rather than by `MultiplayerPageContent`, which unmounts and
+  // remounts every time `effectiveOffline` flips — a join still in flight
+  // when the browser goes offline mid-connect is exactly the one whose own
+  // "failed" outcome should still surface, since `joinDraft` itself refuses
+  // offline.
+  const pendingLobbyJoins = useRef(new Set<AbortController>());
+  useEffect(() => {
+    const pending = pendingLobbyJoins.current;
+    return () => {
+      for (const join of pending) join.abort();
+      pending.clear();
+    };
+  }, []);
+
   if (effectiveOffline) {
     return <MultiplayerOfflineUnavailable onHome={() => navigate("/")} />;
   }
 
-  return <MultiplayerPageContent view={view} setView={setView} />;
+  return <MultiplayerPageContent view={view} setView={setView} pendingLobbyJoins={pendingLobbyJoins} />;
 }
 
 function MultiplayerPageContent({
   view,
   setView,
+  pendingLobbyJoins,
 }: {
   view: MultiplayerView;
   setView: Dispatch<SetStateAction<MultiplayerView>>;
+  pendingLobbyJoins: MutableRefObject<Set<AbortController>>;
 }) {
   const { t } = useTranslation("multiplayer");
   useAudioContext("lobby");
@@ -165,7 +193,6 @@ function MultiplayerPageContent({
   const showToast = useMultiplayerStore((s) => s.showToast);
 
   const joinDraft = useMultiplayerDraftStore((s) => s.joinDraft);
-  const leaveDraft = useMultiplayerDraftStore((s) => s.leave);
 
   const [activeDeckName, setActiveDeckName] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
@@ -737,20 +764,33 @@ function MultiplayerPageContent({
         showToast(t("page.joinNeedsServer"));
         return;
       }
-      const roomCode = await resolveP2PDialTarget(code, origin, password);
-      if (roomCode === null) return;
-      // A pod session started during the broker round trip is newer than
-      // this click, and `joinDraft` would replace it.
-      if (isMultiplayerDraftPodLive(useMultiplayerDraftStore.getState())) return;
-      const playerName = useMultiplayerStore.getState().displayName ?? "Player";
+      const join = new AbortController();
+      pendingLobbyJoins.current.add(join);
       let outcome: DraftSessionOpenOutcome;
       try {
-        outcome = await joinDraft({ kind: "new", roomCode, displayName: playerName });
+        const roomCode = await resolveP2PDialTarget(code, origin, password);
+        // A pod session started during the broker round trip is newer than
+        // this click, and `joinDraft` would replace it — the same is true of
+        // the player having left this page while the round trip was in flight.
+        if (roomCode === null || join.signal.aborted) return;
+        if (isMultiplayerDraftPodLive(useMultiplayerDraftStore.getState())) return;
+        const playerName = useMultiplayerStore.getState().displayName ?? "Player";
+        outcome = await joinDraft(
+          { kind: "new", roomCode, displayName: playerName, signal: join.signal },
+          { failureReport: "caller" },
+        );
       } catch {
         showToast(t("page.failedToJoinDraft"));
         return;
+      } finally {
+        // Before the switch below navigates: leaving `join` in the set past
+        // this point would let the unmount effect's cleanup abort it, and on
+        // an "opened" outcome that signal is now the session's own
+        // route-abort listener — tearing the session back down right after
+        // it opened.
+        pendingLobbyJoins.current.delete(join);
       }
-      switch (outcome) {
+      switch (outcome.status) {
         case "opened":
           // `entry=guest`: a reload of `/draft-pod` then recovers this guest
           // seat, never a saved hosted pod.
@@ -758,20 +798,18 @@ function MultiplayerPageContent({
           return;
         case "superseded":
           return;
-        case "failed": {
-          const { error } = useMultiplayerDraftStore.getState();
-          // `true`: a failed join must not erase this browser's saved hosted pod.
-          void leaveDraft(true);
+        case "failed":
           showToast(
-            error !== null && error !== DRAFT_OFFLINE_ERROR ? error : t("page.failedToJoinDraft"),
+            outcome.error !== null && outcome.error !== DRAFT_OFFLINE_ERROR
+              ? outcome.error
+              : t("page.failedToJoinDraft"),
           );
           return;
-        }
         default:
           assertNever(outcome);
       }
     },
-    [joinDraft, leaveDraft, navigate, resolveP2PDialTarget, showToast, t],
+    [joinDraft, navigate, resolveP2PDialTarget, showToast, t],
   );
 
   const handleSpectate = useCallback(

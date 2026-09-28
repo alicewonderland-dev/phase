@@ -16,8 +16,8 @@ const mocks = vi.hoisted(() => ({
     role: null as "host" | "guest" | null,
     phase: "idle",
     roomCode: null as string | null,
-    hostDraft: vi.fn<(config: unknown) => Promise<DraftSessionOpenOutcome>>(async () => "opened"),
-    joinDraft: vi.fn<(config: unknown) => Promise<DraftSessionOpenOutcome>>(async () => "opened"),
+    hostDraft: vi.fn<(config: unknown) => Promise<DraftSessionOpenOutcome>>(async () => ({ status: "opened" })),
+    joinDraft: vi.fn<(config: unknown) => Promise<DraftSessionOpenOutcome>>(async () => ({ status: "opened" })),
   },
   // Shaped like the real store's source model: `configuredBackupEndpoint`
   // reads `hostingServer`, so a mock still carrying `serverAddress` would
@@ -123,8 +123,8 @@ describe("draftPodStore", () => {
     mocks.multiplayerState.role = null;
     mocks.multiplayerState.phase = "idle";
     mocks.multiplayerState.roomCode = null;
-    mocks.multiplayerState.hostDraft = vi.fn<(config: unknown) => Promise<DraftSessionOpenOutcome>>(async () => "opened");
-    mocks.multiplayerState.joinDraft = vi.fn<(config: unknown) => Promise<DraftSessionOpenOutcome>>(async () => "opened");
+    mocks.multiplayerState.hostDraft = vi.fn<(config: unknown) => Promise<DraftSessionOpenOutcome>>(async () => ({ status: "opened" }));
+    mocks.multiplayerState.joinDraft = vi.fn<(config: unknown) => Promise<DraftSessionOpenOutcome>>(async () => ({ status: "opened" }));
     mocks.multiplayerConfig.hostingServer = "wss://phase.example/ws";
     mocks.multiplayerConfig.displayName = "";
     mocks.multiplayerConfig.lastPodListingPublic = null;
@@ -892,7 +892,7 @@ describe("draftPodStore", () => {
     it("does not report recovery as resumed when host initialization fails", async () => {
       mocks.inspectActiveDraftPod.mockReturnValue({ type: "present", meta: activeMeta, capture: { id: activeMeta.id, roomCode: activeMeta.roomCode, updatedAt: activeMeta.updatedAt } });
       mocks.loadDraftHostSession.mockResolvedValue(persistedSession);
-      mocks.multiplayerState.hostDraft = vi.fn<(config: unknown) => Promise<DraftSessionOpenOutcome>>(async () => "failed");
+      mocks.multiplayerState.hostDraft = vi.fn<(config: unknown) => Promise<DraftSessionOpenOutcome>>(async () => ({ status: "failed", error: null }));
 
       await expect(useDraftPodStore.getState().resumeHostedPod({ routeToken: 4 })).resolves.toBe("invalid");
       expect(mocks.clearActiveDraftPodIfCurrent).not.toHaveBeenCalled();
@@ -1212,7 +1212,7 @@ describe("draftPodStore", () => {
 
       it("reports a superseded hosting attempt as superseded", async () => {
         presentRecord();
-        mocks.multiplayerState.hostDraft.mockResolvedValueOnce("superseded");
+        mocks.multiplayerState.hostDraft.mockResolvedValueOnce({ status: "superseded" });
 
         const outcome = await useDraftPodStore.getState().resumeHostedPod({ entry: "auto", silent: true, routeToken: 27 });
 
@@ -1335,7 +1335,7 @@ describe("draftPodStore", () => {
     });
 
     it("surfaces a current failed host result for cube creation", async () => {
-      mocks.multiplayerState.hostDraft.mockResolvedValueOnce("failed");
+      mocks.multiplayerState.hostDraft.mockResolvedValueOnce({ status: "failed", error: null });
       useDraftPodStore.setState({
         poolMode: "cube",
         cubeForm: {
@@ -1356,6 +1356,28 @@ describe("draftPodStore", () => {
 
       expect(mocks.multiplayerState.hostDraft).toHaveBeenCalledOnce();
       expect(useDraftPodStore.getState().configError).toBe("Unable to host draft pod");
+    });
+    it("surfaces the failed host attempt's own error for cube creation", async () => {
+      mocks.multiplayerState.hostDraft.mockResolvedValueOnce({ status: "failed", error: "Host signaling failed" });
+      useDraftPodStore.setState({
+        poolMode: "cube",
+        cubeForm: {
+          cubeName: "Test Cube",
+          cubeListText: "1 Lightning Bolt\n",
+          settings: {
+            pod_size: 2,
+            pack_count: 1,
+            cards_per_pack: 2,
+            min_deck_size: 4,
+            addable_cards: { policy: "StandardBasics", custom: [] },
+          },
+        },
+        hostDisplayName: "Host",
+      });
+
+      await useDraftPodStore.getState().createPod();
+
+      expect(useDraftPodStore.getState().configError).toBe("Host signaling failed");
     });
   });
 
@@ -2154,7 +2176,7 @@ describe("draftPodStore", () => {
       [
         "hosting fails",
         () => {
-          mocks.multiplayerState.hostDraft = vi.fn<(config: unknown) => Promise<DraftSessionOpenOutcome>>(async () => "failed");
+          mocks.multiplayerState.hostDraft = vi.fn<(config: unknown) => Promise<DraftSessionOpenOutcome>>(async () => ({ status: "failed", error: null }));
         },
         "Unable to host draft pod",
       ],
@@ -2168,9 +2190,16 @@ describe("draftPodStore", () => {
         "boom",
       ],
       [
+        "hosting fails with its own error",
+        () => {
+          mocks.multiplayerState.hostDraft = vi.fn<(config: unknown) => Promise<DraftSessionOpenOutcome>>(async () => ({ status: "failed", error: "Host signaling failed" }));
+        },
+        "Host signaling failed",
+      ],
+      [
         "hosting is superseded",
         () => {
-          mocks.multiplayerState.hostDraft = vi.fn<(config: unknown) => Promise<DraftSessionOpenOutcome>>(async () => "superseded");
+          mocks.multiplayerState.hostDraft = vi.fn<(config: unknown) => Promise<DraftSessionOpenOutcome>>(async () => ({ status: "superseded" }));
         },
         null,
       ],
@@ -2430,7 +2459,7 @@ describe("draftPodStore", () => {
       const creating = useDraftPodStore.getState().createPod();
       await vi.waitFor(() => expect(mocks.multiplayerState.hostDraft).toHaveBeenCalledOnce());
       useConnectivityStore.setState({ forcedOffline: true });
-      resolveHost("failed");
+      resolveHost({ status: "failed", error: null });
 
       await creating;
       expect(useDraftPodStore.getState().configError).toBe("offline.startUnavailable");
@@ -2446,7 +2475,7 @@ describe("draftPodStore", () => {
       const joining = useDraftPodStore.getState().joinPod();
       await vi.waitFor(() => expect(mocks.multiplayerState.joinDraft).toHaveBeenCalledOnce());
       useConnectivityStore.setState({ browserOnline: false });
-      resolveJoin("failed");
+      resolveJoin({ status: "failed", error: null });
 
       await joining;
       expect(useDraftPodStore.getState().configError).toBe("offline.startUnavailable");
@@ -2462,7 +2491,7 @@ describe("draftPodStore", () => {
       const joining = useDraftPodStore.getState().joinPod();
       await vi.waitFor(() => expect(mocks.multiplayerState.joinDraft).toHaveBeenCalledOnce());
       useConnectivityStore.setState({ browserOnline: false });
-      resolveJoin("superseded");
+      resolveJoin({ status: "superseded" });
 
       await joining;
       expect(useDraftPodStore.getState().configError).toBeNull();
@@ -2471,7 +2500,7 @@ describe("draftPodStore", () => {
     it("does not report a superseded host as a hosting failure", async () => {
       vi.stubGlobal("__DRAFT_POOLS_URL__", "/draft-pools.json");
       vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ tst: { code: "TST" } }) })));
-      mocks.multiplayerState.hostDraft.mockResolvedValueOnce("superseded");
+      mocks.multiplayerState.hostDraft.mockResolvedValueOnce({ status: "superseded" });
       configureSetPod();
 
       await useDraftPodStore.getState().createPod();
@@ -2568,7 +2597,7 @@ describe("draftPodStore", () => {
       await vi.waitFor(() => expect(mocks.multiplayerState.joinDraft).toHaveBeenCalledOnce());
 
       useConnectivityStore.setState({ forcedOffline: true });
-      resolveJoin("failed");
+      resolveJoin({ status: "failed", error: null });
       await joining;
       const newerOffline = useDraftPodStore.getState();
       expect(newerOffline).toMatchObject({

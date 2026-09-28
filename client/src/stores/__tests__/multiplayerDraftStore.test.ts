@@ -303,7 +303,7 @@ describe("multiplayerDraftStore", () => {
       await expect(useMultiplayerDraftStore.getState().hostDraft({
         poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
         kind: "Premier", podSize: 8, hostDisplayName: "Other", tournamentFormat: "Swiss", podPolicy: "Competitive",
-      })).resolves.toBe("failed");
+      })).resolves.toMatchObject({ status: "failed" });
 
       expect(vi.mocked(DraftPodHostAdapter)).toHaveBeenCalledTimes(1);
       expect(mockHostAdapter.dispose).not.toHaveBeenCalled();
@@ -337,7 +337,7 @@ describe("multiplayerDraftStore", () => {
         podPolicy: "Competitive" as const,
         persistenceId: "shared-recovery",
       };
-      await expect(useMultiplayerDraftStore.getState().hostDraft(config)).resolves.toBe("opened");
+      await expect(useMultiplayerDraftStore.getState().hostDraft(config)).resolves.toEqual({ status: "opened" });
 
       let releaseCleanup!: () => void;
       mockHostAdapter.dispose.mockImplementationOnce(() => new Promise<void>((resolve) => {
@@ -349,7 +349,7 @@ describe("multiplayerDraftStore", () => {
       expect(vi.mocked(DraftPodHostAdapter)).toHaveBeenCalledTimes(1);
       releaseCleanup();
 
-      await expect(replacement).resolves.toBe("opened");
+      await expect(replacement).resolves.toEqual({ status: "opened" });
       expect(vi.mocked(DraftPodHostAdapter)).toHaveBeenCalledTimes(2);
     });
 
@@ -364,7 +364,7 @@ describe("multiplayerDraftStore", () => {
         persistenceId: "shared-recovery",
       };
       const route = new AbortController();
-      await expect(useMultiplayerDraftStore.getState().hostDraft({ ...config, signal: route.signal })).resolves.toBe("opened");
+      await expect(useMultiplayerDraftStore.getState().hostDraft({ ...config, signal: route.signal })).resolves.toEqual({ status: "opened" });
 
       let releaseCleanup!: () => void;
       mockHostAdapter.dispose.mockImplementationOnce(() => new Promise<void>((resolve) => {
@@ -380,7 +380,7 @@ describe("multiplayerDraftStore", () => {
       useConnectivityStore.setState({ forcedOffline: true });
       releaseCleanup();
 
-      await expect(replacement).resolves.toBe("failed");
+      await expect(replacement).resolves.toMatchObject({ status: "failed" });
       expect(vi.mocked(DraftPodHostAdapter)).toHaveBeenCalledTimes(1);
       expect(useMultiplayerDraftStore.getState()).toMatchObject({
         role: null,
@@ -398,7 +398,7 @@ describe("multiplayerDraftStore", () => {
         tournamentFormat: "Swiss" as const,
         podPolicy: "Competitive" as const,
       };
-      await expect(useMultiplayerDraftStore.getState().hostDraft(config)).resolves.toBe("opened");
+      await expect(useMultiplayerDraftStore.getState().hostDraft(config)).resolves.toEqual({ status: "opened" });
 
       let releaseTeardown!: () => void;
       mockHostAdapter.dispose.mockImplementationOnce(() => new Promise<void>((resolve) => {
@@ -409,7 +409,7 @@ describe("multiplayerDraftStore", () => {
       useConnectivityStore.setState({ forcedOffline: true });
       releaseTeardown();
 
-      await expect(replacement).resolves.toBe("failed");
+      await expect(replacement).resolves.toMatchObject({ status: "failed" });
       expect(vi.mocked(DraftPodHostAdapter)).toHaveBeenCalledTimes(1);
       expect(useMultiplayerDraftStore.getState()).toMatchObject({
         role: null,
@@ -454,7 +454,7 @@ describe("multiplayerDraftStore", () => {
       useConnectivityStore.setState({ browserOnline: false });
       resolveHost();
 
-      await expect(hosting).resolves.toBe("opened");
+      await expect(hosting).resolves.toEqual({ status: "opened" });
       expect(mockHostAdapter.dispose).not.toHaveBeenCalled();
       expect(useMultiplayerDraftStore.getState()).toMatchObject({ role: "host", phase: "connecting" });
     });
@@ -479,7 +479,7 @@ describe("multiplayerDraftStore", () => {
       controller.abort();
       resolveHost();
 
-      await expect(hosting).resolves.toBe("superseded");
+      await expect(hosting).resolves.toEqual({ status: "superseded" });
       expect(mockHostAdapter.dispose).toHaveBeenCalledWith({ preserveSession: true });
       expect(useMultiplayerDraftStore.getState().role).not.toBe("host");
     });
@@ -493,7 +493,7 @@ describe("multiplayerDraftStore", () => {
       await expect(useMultiplayerDraftStore.getState().hostDraft({
         poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
         kind: "Premier", podSize: 8, hostDisplayName: "Host", tournamentFormat: "Swiss", podPolicy: "Competitive",
-      })).resolves.toBe("failed");
+      })).resolves.toMatchObject({ status: "failed" });
 
       expect(mockHostAdapter.dispose).toHaveBeenCalledWith({ preserveSession: true });
       expect(useMultiplayerDraftStore.getState()).toMatchObject({
@@ -513,7 +513,7 @@ describe("multiplayerDraftStore", () => {
         tournamentFormat: "Swiss",
         podPolicy: "Competitive",
         signal: controller.signal,
-      })).resolves.toBe("opened");
+      })).resolves.toEqual({ status: "opened" });
 
       controller.abort();
       await Promise.resolve();
@@ -825,7 +825,7 @@ describe("multiplayerDraftStore", () => {
 
       await expect(useMultiplayerDraftStore.getState().joinDraft({
         kind: "new", roomCode: "ABCDE", displayName: "Alice",
-      })).resolves.toBe("failed");
+      })).resolves.toMatchObject({ status: "failed" });
 
       expect(capturedGuestEventHandler).toBeNull();
       expect(useMultiplayerDraftStore.getState()).toMatchObject({
@@ -852,7 +852,7 @@ describe("multiplayerDraftStore", () => {
       useConnectivityStore.setState({ browserOnline: false });
       releaseTeardown();
 
-      await expect(joining).resolves.toBe("failed");
+      await expect(joining).resolves.toMatchObject({ status: "failed" });
       expect(vi.mocked(DraftPodGuestAdapter)).not.toHaveBeenCalled();
       expect(useMultiplayerDraftStore.getState()).toMatchObject({
         role: null,
@@ -909,7 +909,7 @@ describe("multiplayerDraftStore", () => {
       useConnectivityStore.setState({ forcedOffline: true });
       resolveGuest();
 
-      await expect(joining).resolves.toBe("opened");
+      await expect(joining).resolves.toEqual({ status: "opened" });
       expect(mockGuestAdapter.dispose).not.toHaveBeenCalled();
       expect(useMultiplayerDraftStore.getState()).toMatchObject({ role: "guest", phase: "connecting" });
     });
@@ -922,7 +922,7 @@ describe("multiplayerDraftStore", () => {
 
       await expect(useMultiplayerDraftStore.getState().joinDraft({
         kind: "new", roomCode: "ABCDE", displayName: "Alice",
-      })).resolves.toBe("failed");
+      })).resolves.toMatchObject({ status: "failed" });
 
       expect(mockGuestAdapter.dispose).toHaveBeenCalledWith({ preserveRecovery: true });
       expect(useMultiplayerDraftStore.getState()).toMatchObject({
@@ -1212,12 +1212,12 @@ describe("multiplayerDraftStore", () => {
 
       await expect(useMultiplayerDraftStore.getState().joinDraft({
         kind: "new", roomCode: "NEWER", displayName: "Alice",
-      })).resolves.toBe("opened");
+      })).resolves.toEqual({ status: "opened" });
       useConnectivityStore.setState({ forcedOffline: true });
       await expect(useMultiplayerDraftStore.getState().hostDraft({
         poolInput: { type: "Set", data: { pools: [{ code: "TST" }], sequence: ["TST"] } },
         kind: "Premier", podSize: 8, hostDisplayName: "Host", tournamentFormat: "Swiss", podPolicy: "Competitive",
-      })).resolves.toBe("failed");
+      })).resolves.toMatchObject({ status: "failed" });
 
       if (settlement === "fulfillment") resolveSession({ draftToken: "old-token" });
       else rejectSession(new Error("old session failed"));
