@@ -1049,6 +1049,10 @@ pub(crate) struct ClauseIrBuilder {
     cursor: usize,
     /// Next `ClauseId` to assign (source order within this chain).
     next_clause_id: u32,
+    /// First clause after the most recent printed back-reference repeat.
+    /// A later reader cannot treat a return before this boundary as one
+    /// instruction-local result: that return executed once per iteration.
+    repeated_process_end: Option<ClauseId>,
     /// Accumulated clauses in source order.
     clauses: Vec<ClauseIr>,
     /// CR 611.2a + CR 608.2c: the printed leading duration of the chunk currently
@@ -1079,6 +1083,7 @@ impl ClauseIrBuilder {
             chain_text: chain_text.to_string(),
             cursor: 0,
             next_clause_id: 0,
+            repeated_process_end: None,
             clauses: Vec::new(),
             pending_leading_duration: None,
         }
@@ -1159,6 +1164,13 @@ impl ClauseIrBuilder {
     /// Whether any clause has been pushed yet.
     pub(crate) fn is_empty(&self) -> bool {
         self.clauses.is_empty()
+    }
+
+    /// CR 608.2c: a recognized "repeat this process" directive executes the
+    /// preceding process again. A following clause needs an aggregate result,
+    /// not one repeated instruction's result, to refer back across it.
+    pub(crate) fn note_repeated_process_boundary(&mut self) {
+        self.repeated_process_end = Some(ClauseId(self.next_clause_id));
     }
 
     /// CR 611.2a: arm (or disarm) the leading-duration stamp for the chunk about to
@@ -1526,6 +1538,13 @@ impl ClauseDraft<'_> {
                     .collect::<Vec<_>>();
                 candidates.sort_unstable();
                 candidates.dedup();
+                if candidates.iter().any(|id| {
+                    self.builder
+                        .repeated_process_end
+                        .is_some_and(|boundary| *id < boundary)
+                }) {
+                    return None;
+                }
                 match candidates.as_slice() {
                     [id] => Some(*id),
                     _ => None,
@@ -1646,7 +1665,33 @@ mod tests {
             AbilityKind::Spell,
             &mut crate::parser::oracle_effect::ParseContext::default(),
         );
+        assert_eq!(
+            ir.clauses.len(),
+            3,
+            "choose, return, and reader must all parse: {ir:#?}"
+        );
+        assert!(
+            ir.repeat_until.is_none() && ir.clauses[0].repeat_for.is_none(),
+            "the bare once directive is consumed but its loop predicate remains deferred: {ir:#?}"
+        );
+        assert!(matches!(
+            ir.clauses[1].parsed.effect,
+            Effect::BounceAll { .. }
+        ));
         let reader = ir.clauses.last().expect("delayed reader clause");
+        assert!(
+            matches!(
+                crate::parser::oracle_effect::imperative::parse_returned_this_way_quantity(
+                    &reader
+                        .source
+                        .fragment()
+                        .unwrap_or_default()
+                        .to_ascii_lowercase()
+                ),
+                Some(Some(_))
+            ),
+            "the printed delayed-result reader grammar must be recognized"
+        );
         assert!(
             matches!(reader.parsed.effect, Effect::Unimplemented { .. }),
             "after-loop aggregate must remain unsupported unless explicitly accumulated: {ir:#?}"
@@ -1655,6 +1700,181 @@ mod tests {
             reader.reads_return_result.is_none(),
             "after-loop reader must not bind one repeated body's result: {ir:#?}"
         );
+        let lowered = crate::parser::oracle_effect::parse_effect_chain(text, AbilityKind::Spell);
+        let mut cursor = &lowered;
+        while let Some(next) = cursor.sub_ability.as_deref() {
+            cursor = next;
+        }
+        assert!(
+            matches!(&*cursor.effect, Effect::Unimplemented { .. }),
+            "lowering must preserve the strict gap: {lowered:#?}"
+        );
+        assert!(cursor.reads_return_result.is_none());
+    }
+
+    #[test]
+    fn delayed_return_reader_inside_repeated_process_keeps_its_instruction_link() {
+        let text = "Choose target creature you own. Return each chosen creature to your hand. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each creature returned to your hand this way. Repeat this process once.";
+        let ir = crate::parser::oracle_effect::parse_effect_chain_ir(
+            text,
+            AbilityKind::Spell,
+            &mut crate::parser::oracle_effect::ParseContext::default(),
+        );
+        assert_eq!(
+            ir.clauses.len(),
+            3,
+            "the directive emits no clause: {ir:#?}"
+        );
+        assert!(
+            ir.repeat_until.is_none() && ir.clauses[0].repeat_for.is_none(),
+            "the bare once directive is consumed but its loop predicate remains deferred: {ir:#?}"
+        );
+        assert_eq!(
+            ir.clauses[2]
+                .reads_return_result
+                .as_ref()
+                .map(|(id, _)| *id),
+            Some(ir.clauses[1].id)
+        );
+        assert!(matches!(
+            ir.clauses[2].parsed.effect,
+            Effect::CreateDelayedTrigger { .. }
+        ));
+        let lowered = crate::parser::oracle_effect::parse_effect_chain(text, AbilityKind::Spell);
+        let mut cursor = &lowered;
+        while let Some(next) = cursor.sub_ability.as_deref() {
+            cursor = next;
+        }
+        assert!(matches!(
+            &*cursor.effect,
+            Effect::CreateDelayedTrigger { .. }
+        ));
+        assert!(cursor.reads_return_result.is_some());
+    }
+
+    #[test]
+    fn delayed_return_reader_cannot_bind_across_any_repeated_process_boundary() {
+        for (directive, expect_count, expect_stop) in [
+            ("Repeat this process once.", false, false),
+            ("Repeat this process one more time.", true, false),
+            (
+                "Repeat this process until you put a card into your hand.",
+                false,
+                true,
+            ),
+            ("Repeat this process.", false, false),
+        ] {
+            let text = format!("Choose target creature you own. Return each chosen creature to your hand. {directive} Choose target artifact you own. Return each chosen artifact to your hand. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each creature returned to your hand this way.");
+            let ir = crate::parser::oracle_effect::parse_effect_chain_ir(
+                &text,
+                AbilityKind::Spell,
+                &mut crate::parser::oracle_effect::ParseContext::default(),
+            );
+            assert_eq!(
+                ir.clauses.len(),
+                5,
+                "both returns and reader must parse: {ir:#?}"
+            );
+            assert!(matches!(
+                ir.clauses[1].parsed.effect,
+                Effect::BounceAll { .. }
+            ));
+            assert!(matches!(
+                ir.clauses[3].parsed.effect,
+                Effect::BounceAll { .. }
+            ));
+            assert!(
+                matches!(
+                    crate::parser::oracle_effect::imperative::parse_returned_this_way_quantity(
+                        &ir.clauses[4]
+                            .source
+                            .fragment()
+                            .unwrap_or_default()
+                            .to_ascii_lowercase()
+                    ),
+                    Some(Some(_))
+                ),
+                "the delayed reader must reach the named-result grammar: {ir:#?}"
+            );
+            if expect_count {
+                assert!(
+                    ir.clauses[0].repeat_for.is_some(),
+                    "fixed-count repeat must be stamped: {ir:#?}"
+                );
+            } else if expect_stop {
+                assert!(
+                    ir.repeat_until.is_some(),
+                    "stop-condition repeat must be stamped: {ir:#?}"
+                );
+            }
+            let reader = &ir.clauses[4];
+            assert!(
+                reader.reads_return_result.is_none(),
+                "a later unrelated return cannot hide the earlier repeated producer: {ir:#?}"
+            );
+            assert!(
+                matches!(reader.parsed.effect, Effect::Unimplemented { .. }),
+                "cross-boundary aggregate needs its own model: {ir:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_repeated_process_boundary_advances_the_reader_cutoff() {
+        let text = "Choose target creature you own. Return each chosen creature to your hand. Repeat this process once. Choose target artifact you own. Return each chosen artifact to your hand. Repeat this process once. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each artifact returned to your hand this way.";
+        let ir = crate::parser::oracle_effect::parse_effect_chain_ir(
+            text,
+            AbilityKind::Spell,
+            &mut crate::parser::oracle_effect::ParseContext::default(),
+        );
+        assert_eq!(
+            ir.clauses.len(),
+            5,
+            "both directives emit no clause: {ir:#?}"
+        );
+        assert!(matches!(
+            ir.clauses[3].parsed.effect,
+            Effect::BounceAll { .. }
+        ));
+        assert!(ir.clauses[4].reads_return_result.is_none());
+        assert!(matches!(
+            ir.clauses[4].parsed.effect,
+            Effect::Unimplemented { .. }
+        ));
+    }
+
+    #[test]
+    fn later_independent_return_after_repeat_can_bind_its_own_reader() {
+        let text = "Choose target creature you own. Return each chosen creature to your hand. Repeat this process once. Choose target artifact you own. Return each chosen artifact to your hand. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each artifact returned to your hand this way.";
+        let ir = crate::parser::oracle_effect::parse_effect_chain_ir(
+            text,
+            AbilityKind::Spell,
+            &mut crate::parser::oracle_effect::ParseContext::default(),
+        );
+        assert_eq!(
+            ir.clauses.len(),
+            5,
+            "both return producers and reader must parse: {ir:#?}"
+        );
+        assert!(
+            matches!(ir.clauses[1].parsed.effect, Effect::BounceAll { .. }),
+            "the pre-boundary return must parse: {ir:#?}"
+        );
+        assert!(matches!(
+            ir.clauses[3].parsed.effect,
+            Effect::BounceAll { .. }
+        ));
+        assert_eq!(
+            ir.clauses[4]
+                .reads_return_result
+                .as_ref()
+                .map(|(id, _)| *id),
+            Some(ir.clauses[3].id)
+        );
+        assert!(matches!(
+            ir.clauses[4].parsed.effect,
+            Effect::CreateDelayedTrigger { .. }
+        ));
     }
 
     #[test]

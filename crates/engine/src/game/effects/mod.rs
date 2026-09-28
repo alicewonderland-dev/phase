@@ -15961,11 +15961,18 @@ fn resolve_chain_body(
                             resolve_ability_chain(state, iter_effective, events, depth.max(1))
                         });
                 } else {
-                    if let Ok(result) =
+                    // The generic effect driver uses this loop for the normal
+                    // one-time case as well. Only an actual `repeat_for` body
+                    // gets a fresh occurrence; an ordinary return publishes
+                    // into its enclosing chain for the following reader.
+                    let resolved = if ability.repeat_for.is_some() {
                         with_iteration_return_result_occurrence(state, iter_effective, |state| {
                             resolve_effect(state, iter_effective, events)
                         })
-                    {
+                    } else {
+                        resolve_effect(state, iter_effective, events)
+                    };
+                    if let Ok(result) = resolved {
                         if iterations == 1 {
                             immediate_effect_result = result;
                         }

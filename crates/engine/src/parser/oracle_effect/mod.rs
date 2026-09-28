@@ -38322,6 +38322,7 @@ pub(crate) fn parse_effect_chain_ir(
         // first" — auto-repeat loop with game-state stop predicates (Tainted Pact).
         if let Some(continuation) = try_parse_repeat_until_stop_conditions(&lower_check) {
             pending_repeat_until = Some(continuation);
+            builder.note_repeated_process_boundary();
             continue;
         }
 
@@ -38355,6 +38356,7 @@ pub(crate) fn parse_effect_chain_ir(
                 }
                 RepeatProcessOutcome::ConsumeOnly => {}
             }
+            builder.note_repeated_process_boundary();
             continue;
         }
 

@@ -6,8 +6,8 @@ use engine::game::scenario::{GameScenario, P0, P1};
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{
     AbilityCondition, AbilityDefinition, AbilityKind, ChoiceType, DelayedTriggerCondition, Effect,
-    PtValue, QuantityExpr, RepeatContinuation, ReplacementDefinition, SubAbilityLink, TargetFilter,
-    TargetRef, TargetSelectionMode,
+    PtValue, QuantityExpr, RepeatContinuation, ReplacementDefinition, ReturnResultId,
+    SubAbilityLink, TargetFilter, TargetRef, TargetSelectionMode, TypeFilter, TypedFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
@@ -27,6 +27,7 @@ const TWINCAST: &str =
 const INTERLEAVED_RETURNS: &str = "Choose target creature you own. Return each chosen creature to your hand. Choose target artifact you own. Return each chosen artifact to your hand. At the beginning of the next upkeep, create a 4/4 white Bird Soldier creature token with flying for each creature returned to your hand this way.";
 const DISTINCT_RETURN_READERS: &str = "Choose target creature you own. Return each chosen creature to your hand. Return target land you control to your hand. Choose target artifact you own. Return each chosen artifact to your hand. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each creature returned to your hand this way. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each artifact returned to your hand this way.";
 const CONDITIONAL_RETURN_WITNESS: &str = "Choose target creature you own. Return each chosen creature to your hand. At the beginning of the next upkeep, create a 4/4 white Bird Soldier creature token with flying for each creature returned to your hand this way.";
+const TAINTED_PACT_PROCESS: &str = "Exile the top card of your library. You may put that card into your hand unless it has the same name as another card exiled this way. Repeat this process until you put a card into your hand or you exile two cards with the same name, whichever comes first.";
 
 fn bird_count(runner: &engine::game::scenario::GameRunner) -> usize {
     runner
@@ -85,6 +86,168 @@ fn repeated_eagles_process_keeps_each_return_result_separate() {
 }
 
 #[test]
+fn repeated_return_after_zone_choice_and_reload_keeps_each_result() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::End);
+    let first = scenario.add_creature(P0, "First Repeated Bear", 2, 2).id();
+    let second = scenario.add_creature(P0, "Second Repeated Bear", 2, 2).id();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "The Eagles Are Coming!", true, EAGLES)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    let object = runner.state_mut().objects.get_mut(&spell).unwrap();
+    let definitions = Arc::make_mut(&mut object.abilities);
+    let mut returned = definitions[0].clone();
+    while returned.declares_return_result.is_none() {
+        returned = *returned
+            .sub_ability
+            .expect("the parsed chain contains the return producer");
+    }
+    returned.reads_chosen_group = None;
+    returned.repeat_for = Some(QuantityExpr::Fixed { value: 2 });
+    returned.effect = Box::new(Effect::BounceAll {
+        target: TargetFilter::Typed(TypedFilter::creature()),
+        destination: None,
+        count: Some(QuantityExpr::Fixed { value: 1 }),
+    });
+    returned
+        .sub_ability
+        .as_mut()
+        .expect("the delayed reader follows the return")
+        .sub_link = SubAbilityLink::ContinuationStep;
+    definitions[0] = returned;
+    object.base_abilities = object.abilities.clone();
+    let outcome = runner.cast(spell).resolve();
+    match outcome.final_waiting_for() {
+        WaitingFor::EffectZoneChoice { cards, .. } => {
+            assert!(cards.contains(&first));
+            assert!(cards.contains(&second));
+        }
+        other => panic!("the first repeated return must prompt for a creature: {other:?}"),
+    }
+    assert!(outcome.state().delayed_triggers.is_empty());
+    assert!(!outcome.state().return_result_frames.is_empty());
+
+    let saved = serde_json::to_value(ResolutionStateWire::from_game_state(runner.state().clone()))
+        .expect("paused repeated return serializes");
+    let restored: ResolutionStateWire =
+        serde_json::from_value(saved).expect("paused repeated return restores");
+    *runner.state_mut() = restored.into_game_state();
+    runner
+        .act(GameAction::SelectCards { cards: vec![first] })
+        .expect("choose the first creature for iteration one");
+    runner.advance_until_stack_empty();
+
+    assert_eq!(runner.state().objects[&first].zone, Zone::Hand);
+    assert_eq!(runner.state().objects[&second].zone, Zone::Hand);
+    let counts: Vec<_> = runner
+        .state()
+        .delayed_triggers
+        .iter()
+        .map(|trigger| match &trigger.ability.effect {
+            Effect::Token {
+                count: QuantityExpr::Fixed { value },
+                ..
+            } => *value,
+            effect => panic!("expected frozen delayed tokens, got {effect:?}"),
+        })
+        .collect();
+    assert_eq!(
+        counts,
+        [1, 1],
+        "each iteration must publish its own settled return"
+    );
+    assert!(runner.state().return_result_frames.is_empty());
+    runner.advance_to_phase(Phase::Upkeep);
+    runner.advance_until_stack_empty();
+    assert_eq!(bird_count(&runner), 2);
+}
+
+#[test]
+fn repeated_return_after_replacement_choice_and_reload_keeps_each_result() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::End);
+    let redirected = scenario
+        .add_creature(P0, "Redirected Bear", 2, 2)
+        .with_replacement_definition(redirect_own_hand_move_to(Zone::Exile))
+        .with_replacement_definition(redirect_own_hand_move_to(Zone::Graveyard))
+        .id();
+    let returned = scenario.add_creature(P0, "Returned Bear", 2, 2).id();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "The Eagles Are Coming!", true, EAGLES)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        (0..4)
+            .map(|_| ManaUnit::new(ManaType::White, ObjectId(0), false, vec![]))
+            .collect(),
+    );
+    let mut runner = scenario.build();
+    let object = runner.state_mut().objects.get_mut(&spell).unwrap();
+    let definitions = Arc::make_mut(&mut object.abilities);
+    let mut returned_ability = definitions[0].clone();
+    while returned_ability.declares_return_result.is_none() {
+        returned_ability = *returned_ability
+            .sub_ability
+            .expect("the parsed chain contains the return producer");
+    }
+    returned_ability.reads_chosen_group = None;
+    returned_ability.repeat_for = Some(QuantityExpr::Fixed { value: 2 });
+    returned_ability.effect = Box::new(Effect::BounceAll {
+        target: TargetFilter::Typed(TypedFilter::creature()),
+        destination: None,
+        count: None,
+    });
+    returned_ability
+        .sub_ability
+        .as_mut()
+        .expect("the delayed reader follows the return")
+        .sub_link = SubAbilityLink::ContinuationStep;
+    definitions[0] = returned_ability;
+    object.base_abilities = object.abilities.clone();
+    let outcome = runner.cast(spell).resolve();
+    assert!(matches!(
+        outcome.final_waiting_for(),
+        WaitingFor::ReplacementChoice { .. }
+    ));
+    assert!(outcome.state().delayed_triggers.is_empty());
+    assert!(!outcome.state().return_result_frames.is_empty());
+    let saved = serde_json::to_value(ResolutionStateWire::from_game_state(runner.state().clone()))
+        .expect("paused repeated return serializes");
+    let restored: ResolutionStateWire =
+        serde_json::from_value(saved).expect("paused repeated return restores");
+    *runner.state_mut() = restored.into_game_state();
+    runner
+        .act(GameAction::ChooseReplacement { index: 0 })
+        .expect("choose first redirect for iteration one");
+    runner.advance_until_stack_empty();
+    assert!(matches!(
+        runner.state().objects[&redirected].zone,
+        Zone::Exile | Zone::Graveyard
+    ));
+    assert_eq!(runner.state().objects[&returned].zone, Zone::Hand);
+    let counts: Vec<_> = runner
+        .state()
+        .delayed_triggers
+        .iter()
+        .map(|trigger| match &trigger.ability.effect {
+            Effect::Token {
+                count: QuantityExpr::Fixed { value },
+                ..
+            } => *value,
+            effect => panic!("expected frozen delayed tokens, got {effect:?}"),
+        })
+        .collect();
+    assert_eq!(counts, [1, 0]);
+    assert!(runner.state().return_result_frames.is_empty());
+    runner.advance_to_phase(Phase::Upkeep);
+    runner.advance_until_stack_empty();
+    assert_eq!(bird_count(&runner), 1);
+}
+
+#[test]
 fn repeated_eagles_controller_choice_and_while_condition_use_new_results() {
     for repeat in [
         RepeatContinuation::ControllerChoice,
@@ -116,6 +279,15 @@ fn repeated_eagles_controller_choice_and_while_condition_use_new_results() {
                 .act(GameAction::DecideOptionalEffect { accept: true })
                 .expect("accept second process iteration");
             assert!(runner.state().return_result_frames.len() <= 1);
+            for _ in 0..3 {
+                runner
+                    .act(GameAction::DecideOptionalEffect { accept: true })
+                    .expect("accept another process iteration");
+                assert!(
+                    runner.state().return_result_frames.len() <= 1,
+                    "completed child occurrences must retire while another repeat prompt remains"
+                );
+            }
             runner
                 .act(GameAction::DecideOptionalEffect { accept: false })
                 .expect("stop repeated process");
@@ -132,12 +304,189 @@ fn repeated_eagles_controller_choice_and_while_condition_use_new_results() {
                 effect => panic!("expected frozen delayed tokens, got {effect:?}"),
             })
             .collect();
-        assert_eq!(counts, [1, 0], "repeat mode {repeat:?}");
+        let expected = if matches!(repeat, RepeatContinuation::ControllerChoice) {
+            vec![1, 0, 0, 0, 0]
+        } else {
+            vec![1, 0]
+        };
+        assert_eq!(counts, expected, "repeat mode {repeat:?}");
         assert!(runner.state().return_result_frames.is_empty());
         runner.advance_to_phase(Phase::Upkeep);
         runner.advance_until_stack_empty();
         assert_eq!(bird_count(&runner), 1);
     }
+}
+
+#[test]
+fn repeated_until_stop_conditions_keeps_each_return_result_separate() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::End);
+    let returned = scenario.add_creature(P0, "Returned Bear", 2, 2).id();
+    let first = scenario
+        .add_spell_to_library_top(P0, "Matching Bolt", true)
+        .id();
+    let second = scenario
+        .add_spell_to_library_top(P0, "Matching Bolt", true)
+        .id();
+    let pact = scenario
+        .add_spell_to_hand_from_oracle(P0, "Tainted Pact", true, TAINTED_PACT_PROCESS)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    let parsed_eagles = parse_oracle_text(
+        EAGLES,
+        "The Eagles Are Coming!",
+        &[],
+        &["Instant".into()],
+        &[],
+    );
+    let mut returned_ability = parsed_eagles.abilities[0].clone();
+    while returned_ability.declares_return_result.is_none() {
+        returned_ability = *returned_ability
+            .sub_ability
+            .expect("the parsed Eagles chain contains a return producer");
+    }
+    returned_ability.reads_chosen_group = None;
+    returned_ability.effect = Box::new(Effect::BounceAll {
+        target: TargetFilter::Typed(TypedFilter::creature()),
+        destination: None,
+        count: None,
+    });
+    returned_ability
+        .sub_ability
+        .as_mut()
+        .expect("the delayed reader follows the return")
+        .sub_link = SubAbilityLink::ContinuationStep;
+    let object = runner.state_mut().objects.get_mut(&pact).unwrap();
+    let definitions = Arc::make_mut(&mut object.abilities);
+    let root = &mut definitions[0];
+    assert!(matches!(
+        root.repeat_until,
+        Some(RepeatContinuation::UntilStopConditions { .. })
+    ));
+    let mut tail = root;
+    while tail.sub_ability.is_some() {
+        tail = tail.sub_ability.as_mut().unwrap();
+    }
+    tail.sub_link = SubAbilityLink::ContinuationStep;
+    tail.sub_ability = Some(Box::new(returned_ability));
+    object.base_abilities = object.abilities.clone();
+
+    let outcome = runner.cast(pact).decline_optional().resolve();
+    outcome.assert_zone(&[first, second], Zone::Exile);
+    outcome.assert_zone(&[returned], Zone::Hand);
+    let counts: Vec<_> = outcome
+        .state()
+        .delayed_triggers
+        .iter()
+        .map(|trigger| match &trigger.ability.effect {
+            Effect::Token {
+                count: QuantityExpr::Fixed { value },
+                ..
+            } => *value,
+            effect => panic!("expected frozen delayed tokens, got {effect:?}"),
+        })
+        .collect();
+    assert_eq!(counts, [1, 0]);
+    assert!(outcome.state().return_result_frames.is_empty());
+    runner.advance_to_phase(Phase::Upkeep);
+    runner.advance_until_stack_empty();
+    assert_eq!(bird_count(&runner), 1);
+}
+
+#[test]
+fn nested_repeat_does_not_shadow_an_outer_named_return_result() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::End);
+    let creature = scenario.add_creature(P0, "Outer Bear", 2, 2).id();
+    let artifact = scenario
+        .add_artifact_from_oracle(P0, "Inner Relic", "")
+        .id();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "The Eagles Are Coming!", true, EAGLES)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    let object = runner.state_mut().objects.get_mut(&spell).unwrap();
+    let definitions = Arc::make_mut(&mut object.abilities);
+    let mut outer = definitions[0].clone();
+    while outer.declares_return_result.is_none() {
+        outer = *outer
+            .sub_ability
+            .expect("the parsed chain contains the return producer");
+    }
+    outer.reads_chosen_group = None;
+    outer.effect = Box::new(Effect::BounceAll {
+        target: TargetFilter::Typed(TypedFilter::creature()),
+        destination: None,
+        count: None,
+    });
+    let outer_reader = outer
+        .sub_ability
+        .take()
+        .expect("the delayed reader follows the return");
+    let mut inner = outer.clone();
+    inner.declares_return_result = Some(ReturnResultId(100));
+    inner.repeat_for = Some(QuantityExpr::Fixed { value: 2 });
+    inner.effect = Box::new(Effect::BounceAll {
+        target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact)),
+        destination: None,
+        count: None,
+    });
+    inner.sub_ability = Some(outer_reader);
+    outer.sub_ability = Some(Box::new(inner));
+    definitions[0] = outer;
+    object.base_abilities = object.abilities.clone();
+
+    let outcome = runner.cast(spell).resolve();
+    outcome.assert_zone(&[creature, artifact], Zone::Hand);
+    assert_eq!(outcome.state().delayed_triggers.len(), 1);
+    assert!(matches!(
+        &outcome.state().delayed_triggers[0].ability.effect,
+        Effect::Token {
+            count: QuantityExpr::Fixed { value: 1 },
+            ..
+        }
+    ));
+    assert!(outcome.state().return_result_frames.is_empty());
+    runner.advance_to_phase(Phase::Upkeep);
+    runner.advance_until_stack_empty();
+    assert_eq!(bird_count(&runner), 1);
+}
+
+#[test]
+fn repeated_process_without_named_results_does_not_allocate_occurrences() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Repeated Life", true, "You gain 1 life.")
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    let object = runner.state_mut().objects.get_mut(&spell).unwrap();
+    for abilities in [&mut object.abilities, &mut object.base_abilities] {
+        Arc::make_mut(abilities)[0].repeat_until = Some(RepeatContinuation::ControllerChoice);
+    }
+    let starting_life = runner.state().players[P0.0 as usize].life;
+    runner.cast(spell).resolve();
+    for _ in 0..3 {
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::RepeatDecision { .. }
+        ));
+        assert!(runner.state().return_result_frames.is_empty());
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: true })
+            .expect("repeat a result-free instruction");
+    }
+    runner
+        .act(GameAction::DecideOptionalEffect { accept: false })
+        .expect("stop result-free repeat");
+    assert!(runner.state().return_result_frames.is_empty());
+    assert_eq!(
+        runner.state().players[P0.0 as usize].life,
+        starting_life + 4
+    );
 }
 
 #[test]
