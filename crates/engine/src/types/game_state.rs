@@ -21197,8 +21197,7 @@ declare_game_state! {
     pub lki_by_incarnation: im::HashMap<ObjectId, im::HashMap<u64, LKISnapshot>>,
 
     /// CR 608.2h + CR 707.2: A spell's stack entry and object as they last
-    /// existed on the stack, recorded when a spell leaves the stack without
-    /// resolving (`stack::record_departed_stack_spell`) — keyed by storage id,
+    /// existed on the stack (`stack::record_departed_stack_spell`) — keyed by storage id,
     /// then the incarnation the spell had on the stack. Consulted by
     /// `targeting::triggering_spell` / `copy_spell::copy_source_entry` once a
     /// spell-cast trigger's spell has left the stack. Cleared with

@@ -40,6 +40,8 @@ const SWARM_INTELLIGENCE: &str = "Whenever you cast an instant or sorcery spell,
 const SAGE_OF_THE_SKIES: &str = "When you cast this spell, if you've cast another spell this \
     turn, copy this spell. (The copy becomes a token.)\nFlying, lifelink";
 const UNSUBSTANTIATE: &str = "Return target spell or creature to its owner's hand.";
+const CHAIN_OF_SMOG: &str = "Target player discards two cards. That player may copy this spell \
+    and may choose a new target for that copy.";
 
 fn floating_mana(n: usize, color: ManaType) -> Vec<ManaUnit> {
     (0..n)
@@ -527,7 +529,7 @@ fn older_trigger_copies_its_own_cast_not_a_later_recast() {
     assert_eq!(runner.state().stack.len(), 3);
 
     // Resolve one trigger with a LOSE — bounces the first Bolt to hand,
-    // leaving its sibling ("old K1") waiting on the stack.
+    // leaving the first cast's other Krark trigger waiting on the stack.
     reseed(&mut runner, 1);
     let lose_events = drive(&mut runner, &Drive::new());
     assert!(saw_coin(&lose_events, false), "{lose_events:?}");
@@ -535,7 +537,7 @@ fn older_trigger_copies_its_own_cast_not_a_later_recast() {
     assert_eq!(
         runner.state().stack.len(),
         1,
-        "only the sibling ('old K1') trigger should remain: {:?}",
+        "only the first cast's other Krark trigger should remain: {:?}",
         runner.state().stack
     );
 
@@ -549,13 +551,13 @@ fn older_trigger_copies_its_own_cast_not_a_later_recast() {
         "reach guard: two SpellCast events for the one object id"
     );
 
-    // New K2 loses -> bounces the second Bolt to hand.
+    // The recast's first Krark trigger loses -> bounces the second Bolt to hand.
     reseed(&mut runner, 1);
     let new_lose_events = drive(&mut runner, &Drive::new());
     assert!(saw_coin(&new_lose_events, false), "{new_lose_events:?}");
     assert_eq!(runner.state().objects[&bolt].zone, Zone::Hand);
 
-    // New K1 wins -> copies the SECOND cast (keeps its P0 target); drive it
+    // The recast's second Krark trigger wins -> copies the SECOND cast (keeps its P0 target); drive it
     // fully through so only the old trigger remains.
     reseed(&mut runner, 0);
     let new_win_events = drive(&mut runner, &Drive::new().keep_retargets());
@@ -1020,4 +1022,115 @@ fn self_cast_copy_trigger_copies_spell_returned_to_hand() {
          (CR 608.3f): battlefield={:?}",
         runner.state().battlefield
     );
+}
+
+/// CR 608.2h + CR 400.7 + CR 601.2i: Chain of Smog's own "may copy this
+/// spell" is offered while the spell itself is resolving — the copy must
+/// read the LIVE (currently resolving) cast, never an earlier departed
+/// record of the same card recast at the same storage id. The first cast is
+/// bounced by Unsubstantiate before it resolves (writing a departed record
+/// targeting P1); the card is then recast targeting P0 and allowed to
+/// resolve. If the resolving-spell lookup fell back to a departed record
+/// keyed by storage id instead of the live entry, the offered copy's default
+/// target would read P1 instead of P0.
+#[test]
+fn resolving_spell_copies_the_live_cast_not_an_earlier_departed_record() {
+    let mut scenario = GameScenario::new_n_player(2, 0);
+    scenario.at_phase(Phase::PreCombatMain);
+    let chain = scenario
+        .add_spell_to_hand_from_oracle(P0, "Chain of Smog", false, CHAIN_OF_SMOG)
+        .id();
+    let unsubstantiate = scenario
+        .add_spell_to_hand_from_oracle(P0, "Unsubstantiate", true, UNSUBSTANTIATE)
+        .id();
+    // P0 is the recast's own target, so P0 needs cards to discard.
+    for i in 0..4 {
+        scenario.add_card_to_hand(P0, &format!("Filler {i}"));
+    }
+    let mut mana = floating_mana(4, ManaType::Black);
+    mana.extend(floating_mana(4, ManaType::Blue));
+    mana.extend(floating_mana(8, ManaType::Colorless));
+    scenario.with_mana_pool(P0, mana);
+    let mut runner = scenario.build();
+
+    // First cast: Chain of Smog -> P1.
+    commit_cast(&mut runner, chain, Some(TargetRef::Player(P1)));
+    assert_eq!(runner.state().stack.len(), 1);
+
+    // Bounce it before it resolves, writing a departed record with target P1.
+    commit_cast(&mut runner, unsubstantiate, Some(TargetRef::Object(chain)));
+    let bounce_events = drive(&mut runner, &Drive::new());
+    assert_eq!(
+        runner.state().objects[&chain].zone,
+        Zone::Hand,
+        "Unsubstantiate must bounce the first Chain of Smog cast to hand: {bounce_events:?}"
+    );
+
+    // Recast the same object -> P0, while the first cast's departed record
+    // still exists.
+    commit_cast(&mut runner, chain, Some(TargetRef::Player(P0)));
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "only the recast is on the stack: {:?}",
+        runner.state().stack
+    );
+
+    // Reach guard: the departed record for the first cast is still present
+    // at this point, so the test is not vacuous — a lookup that ignored the
+    // live cast entirely would still have somewhere to fall back to.
+    assert!(
+        runner.state().departed_stack_spells.contains_key(&chain),
+        "reach guard: the first cast's departed record must exist before the \
+         recast resolves: {:?}",
+        runner.state().departed_stack_spells
+    );
+
+    // Drive through the recast's own resolution (discard choice, then the
+    // optional-copy prompt) without touching the shared `drive` helper, which
+    // does not handle `DiscardChoice`.
+    for _ in 0..32 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::DiscardChoice { count, cards, .. } => {
+                let chosen: Vec<ObjectId> = cards.into_iter().take(count).collect();
+                runner
+                    .act(GameAction::SelectCards { cards: chosen })
+                    .expect("P0 discards the recast's two cards");
+            }
+            WaitingFor::OptionalEffectChoice { .. } => break,
+            WaitingFor::Priority { .. } => {
+                runner
+                    .act(GameAction::PassPriority)
+                    .expect("pass priority toward the recast's own copy prompt");
+            }
+            other => panic!(
+                "unexpected waiting_for while driving the recast to its copy prompt: {other:?}"
+            ),
+        }
+    }
+    match runner.state().waiting_for.clone() {
+        WaitingFor::OptionalEffectChoice { player, .. } => {
+            assert_eq!(
+                player, P0,
+                "the recast's own copy prompt belongs to the targeted player (P0)"
+            );
+        }
+        other => panic!("expected the recast's optional copy prompt, got {other:?}"),
+    }
+
+    runner
+        .act(GameAction::DecideOptionalEffect { accept: true })
+        .expect("P0 accepts the recast's copy");
+
+    match &runner.state().waiting_for {
+        WaitingFor::CopyRetarget { target_slots, .. } => {
+            assert_eq!(
+                target_slots[0].current,
+                Some(TargetRef::Player(P0)),
+                "the resolving spell's own copy must read the LIVE cast's target (P0), \
+                 never the earlier departed record's (P1)"
+            );
+        }
+        other => panic!("expected CopyRetarget for the recast's copy, got {other:?}"),
+    }
 }

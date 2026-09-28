@@ -60,7 +60,7 @@ pub fn resolve(
     })?;
     // CR 608.2h: once the copy source has departed the stack, its object is the
     // departed record's — never a live object that merely reuses the same
-    // storage id (a later recast, a same-turn token at that id).
+    // storage id (a later recast).
     let source_object: Option<&GameObject> = top_entry
         .departed_object
         .as_deref()
