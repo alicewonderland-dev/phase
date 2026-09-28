@@ -21197,8 +21197,8 @@ declare_game_state! {
     pub lki_by_incarnation: im::HashMap<ObjectId, im::HashMap<u64, LKISnapshot>>,
 
     /// CR 608.2h + CR 707.2: A spell's stack entry and object as they last
-    /// existed on the stack, recorded at every non-resolving departure from
-    /// the stack (`stack::record_departed_stack_spell`) — keyed by storage id,
+    /// existed on the stack, recorded when a spell leaves the stack without
+    /// resolving (`stack::record_departed_stack_spell`) — keyed by storage id,
     /// then the incarnation the spell had on the stack. Consulted by
     /// `targeting::triggering_spell` / `copy_spell::copy_source_entry` once a
     /// spell-cast trigger's spell has left the stack. Cleared with
@@ -27625,31 +27625,7 @@ impl GameState {
         // `targeting::triggering_spell`'s on-stack/pin/no-pin-highest-key answer
         // so the retained set agrees with what a live trigger could still read.
         let mut retained_departed_spells: HashSet<ObjectIncarnationRef> = HashSet::new();
-        for entry in &clone.stack {
-            if let StackEntryKind::TriggeredAbility {
-                ability,
-                trigger_event: Some(GameEvent::SpellCast { object_id, .. }),
-                ..
-            } = &entry.kind
-            {
-                match ability.context.triggering_spell {
-                    Some(pin) if pin.object_id == *object_id => {
-                        retained_departed_spells.insert(pin);
-                    }
-                    _ => {
-                        if let Some(key) = clone
-                            .departed_stack_spells
-                            .get(object_id)
-                            .and_then(|records| records.keys().max())
-                        {
-                            retained_departed_spells
-                                .insert(ObjectIncarnationRef::of(*object_id, *key));
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(entry) = clone.resolving_stack_entry.as_ref() {
+        for entry in clone.stack.iter().chain(clone.resolving_stack_entry.iter()) {
             if let StackEntryKind::TriggeredAbility {
                 ability,
                 trigger_event: Some(GameEvent::SpellCast { object_id, .. }),
@@ -36163,7 +36139,7 @@ mod tests {
         );
     }
 
-    /// CR 104.4b (issue #6877, row 1.8): two states differing only in the
+    /// CR 104.4b (issue #6877): two states differing only in the
     /// pinned spell's incarnation must compare equal after
     /// `normalize_for_loop` — the pin carries an advancing all-zone
     /// incarnation (CR 400.7), so a mandatory loop that recasts the pinned
@@ -36223,7 +36199,7 @@ mod tests {
         );
     }
 
-    /// CR 104.4b + CR 608.2h (issue #6877, row 1.8): a `departed_stack_spells`
+    /// CR 104.4b + CR 608.2h (issue #6877): a `departed_stack_spells`
     /// record no live spell-cast trigger can reach is history, not position —
     /// pruned like `lki_by_incarnation`. A reachable record (the pinned
     /// incarnation, or with no pin the highest key) remains, and a change to
@@ -36357,7 +36333,7 @@ mod tests {
         );
     }
 
-    /// CR 608.2h (issue #6877, row 1.10): a `GameState` holding
+    /// CR 608.2h (issue #6877): a `GameState` holding
     /// `departed_stack_spells` records round-trips through serde, and a
     /// payload without the key deserializes to an empty map.
     #[test]

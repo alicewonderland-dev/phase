@@ -8273,9 +8273,8 @@ fn event_attacker_from_trigger_event(
 /// CR 601.2i + CR 400.7: Bind the exact spell object and incarnation a
 /// spell-cast trigger's "that spell" / self-cast "this spell" names, at the
 /// moment the triggered ability is put on the stack. `None` for any trigger
-/// event other than `SpellCast`, or when its spell is no longer on the stack
-/// (a Krark-shape trigger whose sibling already bounced the spell before this
-/// one was constructed). Mirrors `event_attacker_from_trigger_event`'s shape.
+/// event other than `SpellCast`, or when its spell is no longer on the stack.
+/// Mirrors `event_attacker_from_trigger_event`'s shape.
 fn triggering_spell_pin(
     state: &GameState,
     trigger_event: Option<&GameEvent>,

@@ -610,8 +610,7 @@ pub(crate) fn copy_count_with_replacements(
 
 /// CR 608.2h + CR 707.2: the copy source `copy_source_entry` resolved — the
 /// entry to copy, plus (once the spell has left the stack) the object it had
-/// while there. `resolve` and `copy_count_with_replacements` are the only
-/// callers.
+/// while there.
 struct CopySource {
     entry: StackEntry,
     /// `Some` only when `entry` came from a [`DepartedStackSpell`] record
@@ -764,9 +763,8 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> Option<Cop
     // CR 608.2h: final untargeted fallback. With a spell-cast event in scope,
     // use its on-stack/departed/gone answer — never `triggering_spell_stack_entry`'s
     // `source_id` fallback or `state.stack.last()`, either of which can name a
-    // stack object that is not the departed spell at all (row 1.5's hostile
-    // fixture: a sibling trigger entry whose `source_id` happens to equal the
-    // departed spell's id).
+    // stack object that is not the departed spell at all (a sibling trigger
+    // entry whose `source_id` happens to equal the departed spell's id).
     if let Some(source) = crate::game::targeting::triggering_spell(state) {
         return copy_source_from_triggering_spell(source);
     }
@@ -1213,7 +1211,7 @@ mod tests {
         }
     }
 
-    /// CR 608.2h (issue #6877, row 1.5): a spell-cast event names a spell
+    /// CR 608.2h (issue #6877): a spell-cast event names a spell
     /// with neither a live stack entry nor a departed-spell record (never
     /// stamped — see `stack.rs::record_departed_stack_spell`'s
     /// `cast_occurrence` gate). Neither a `TriggeringSource` copy nor an

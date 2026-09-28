@@ -14,7 +14,7 @@ use engine::types::game_state::{
     CastPaymentMode, GameState, StackEntryKind, SyntheticTriggerProvenance, WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
-use engine::types::mana::{ManaColor, ManaType, ManaUnit};
+use engine::types::mana::{ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
@@ -23,8 +23,7 @@ use rand_chacha::ChaCha20Rng;
 
 use crate::support::shared_card_db;
 
-// CR 601.2i + CR 702.79b: Krark's Partner line is a separate keyword unrelated
-// to this class and plays no part in a two-player game, so it is omitted.
+// Krark's Partner line is omitted; it plays no part in a two-player game.
 const KRARK: &str = "Whenever you cast an instant or sorcery spell, flip a coin. \
     If you lose the flip, return that spell to its owner's hand. \
     If you win the flip, copy that spell, and you may choose new targets for the copy.";
@@ -38,9 +37,6 @@ const HESITATION: &str =
     "When a player casts a spell, sacrifice this enchantment and counter that spell.";
 const SWARM_INTELLIGENCE: &str = "Whenever you cast an instant or sorcery spell, you may copy \
     that spell. You may choose new targets for the copy.";
-const CHAIN_OF_VAPOR: &str = "Return target nonland permanent to its owner's hand. Then that \
-    permanent's controller may sacrifice a land of their choice. If the player does, they may \
-    copy this spell and may choose a new target for that copy.";
 const SAGE_OF_THE_SKIES: &str = "When you cast this spell, if you've cast another spell this \
     turn, copy this spell. (The copy becomes a token.)\nFlying, lifelink";
 const UNSUBSTANTIATE: &str = "Return target spell or creature to its owner's hand.";
@@ -301,13 +297,8 @@ fn krark_id(runner: &GameRunner, name: &str) -> ObjectId {
         .unwrap_or_else(|| panic!("{name} must be on the battlefield"))
 }
 
-// ---------------------------------------------------------------------------
-// 1.7 control
-// ---------------------------------------------------------------------------
-
 /// CONTROL: winning while the cast spell is still on the stack copies it —
-/// establishes that the harness can observe a copy at all (PHASE_BASE
-/// behaviour, unchanged by this class).
+/// establishes that the harness can observe a copy at all.
 #[test]
 fn winning_trigger_copies_spell_still_on_stack() {
     let (scenario, spell) = setup_krarks_and_spell(2, 42, "Draw Spell", DRAW_SPELL);
@@ -322,14 +313,10 @@ fn winning_trigger_copies_spell_still_on_stack() {
         "seed 0 must be a WIN for the first trigger: {win_events:?}"
     );
     assert!(
-        saw_spell_copied(&win_events) || library_len(runner.state(), P0) < lib_before,
-        "win while on stack must copy; events={win_events:?}"
+        saw_spell_copied(&win_events) && library_len(runner.state(), P0) < lib_before,
+        "win while on stack must copy and the copy must resolve; events={win_events:?}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// 1.1
-// ---------------------------------------------------------------------------
 
 /// CR 608.2h: two Krark triggers, lose then win — the leftover winning
 /// trigger still copies the spell as it last existed on the stack, even
@@ -367,15 +354,11 @@ fn winning_trigger_copies_spell_bounced_by_earlier_trigger() {
         "seed 0 must be a WIN for the second trigger: {win_events:?}"
     );
     assert!(
-        saw_spell_copied(&win_events) || library_len(runner.state(), P0) < lib_before,
-        "win after bounce must create a copy (SpellCopied or a resolved draw); \
-         events={win_events:?}"
+        saw_spell_copied(&win_events) && library_len(runner.state(), P0) < lib_before,
+        "win after bounce must create a copy that resolves (SpellCopied and a \
+         resolved draw); events={win_events:?}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// 1.2
-// ---------------------------------------------------------------------------
 
 /// CR 707.10c: targeted instant, lose then win — the leftover win still
 /// offers `CopyRetarget`, and the copy's default target is the original's.
@@ -412,10 +395,6 @@ fn winning_trigger_offers_new_targets_for_copy_of_bounced_spell() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 1.3
-// ---------------------------------------------------------------------------
-
 /// CR 608.2h: a spell countered before a winning Krark trigger resolves still
 /// gets copied. Hesitation is P1's (non-active), so under CR 603.3b APNAP its
 /// trigger is placed on the stack after Krark's own and resolves first.
@@ -447,8 +426,9 @@ fn winning_trigger_copies_spell_countered_before_it_resolved() {
         "seed 0 must be a WIN for a remaining trigger: {win_events:?}"
     );
     assert!(
-        saw_spell_copied(&win_events) || library_len(runner.state(), P0) < lib_before,
-        "win after the spell was countered must still create a copy; events={win_events:?}"
+        saw_spell_copied(&win_events) && library_len(runner.state(), P0) < lib_before,
+        "win after the spell was countered must still create a copy that resolves; \
+         events={win_events:?}"
     );
 }
 
@@ -531,10 +511,6 @@ fn optional_copy_of_countered_spell_is_not_created_when_declined() {
         "declining must create no copy: {decline_events:?}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// 1.4
-// ---------------------------------------------------------------------------
 
 /// CR 400.7 + CR 601.2i: the same card cast twice in one step, leaving the
 /// stack each time with a different target — the OLDER trigger's copy must
@@ -767,16 +743,6 @@ fn older_storm_trigger_copies_its_own_cast_not_a_later_recast() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 1.5 (unit-shaped, but driven through the real pipeline via direct state
-// construction — see `copy_spell.rs`'s own `#[cfg(test)]` module for the
-// pure-unit companion asserting `copy_source_entry`'s return value directly)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// 1.6
-// ---------------------------------------------------------------------------
-
 /// CR 712.8a: a spell cast as a modal back face, then departed (bounced by an
 /// earlier trigger) — the copy must be of the back face, not the front.
 #[test]
@@ -840,10 +806,6 @@ fn copy_of_bounced_modal_back_face_spell_is_the_back_face() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 1.9
-// ---------------------------------------------------------------------------
-
 /// CR 400.7 + CR 500.2: a departed-spell record is cleared once the step in
 /// which the spell left ends — it is not readable in a later step.
 #[test]
@@ -879,12 +841,8 @@ fn departed_spell_record_is_cleared_when_the_step_ends() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 1.11 / 1.12 (Storm)
-// ---------------------------------------------------------------------------
-
 /// CR 702.40a control: a spell with Storm stays on the stack -> its copies
-/// are created as at PHASE_BASE.
+/// are created.
 #[test]
 fn storm_copies_spell_still_on_stack() {
     let mut scenario = GameScenario::new_n_player(2, 0);
@@ -999,10 +957,6 @@ fn storm_copies_spell_returned_to_hand_before_storm_resolves() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 1.11 (self-cast copy member)
-// ---------------------------------------------------------------------------
-
 /// CR 702.40a class: a self-cast copy trigger (Sage of the Skies, not Storm)
 /// still copies its own spell after that spell is returned to hand before
 /// the trigger resolves.
@@ -1065,56 +1019,5 @@ fn self_cast_copy_trigger_copies_spell_returned_to_hand() {
         "the copy of a permanent spell must resolve onto the battlefield as a token \
          (CR 608.3f): battlefield={:?}",
         runner.state().battlefield
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 1.12 control (Chain of Vapor)
-// ---------------------------------------------------------------------------
-
-/// CONTROL: a spell that copies itself as it resolves (Chain of Vapor) is
-/// unaffected by this class — its `SelfRef` copy reads
-/// `state.resolving_stack_entry` with no spell-cast trigger event in scope at
-/// all, so `targeting::triggering_spell` returns `None` and the legacy path
-/// runs unchanged. Result recorded from PHASE_BASE, not asserted from a
-/// hypothesis.
-#[test]
-fn spell_that_copies_itself_as_it_resolves_is_unchanged() {
-    let mut scenario = GameScenario::new_n_player(2, 0);
-    scenario.at_phase(Phase::PreCombatMain);
-    let creature = scenario.add_creature(P0, "Target Creature", 2, 2).id();
-    let land = scenario.add_basic_land(P0, ManaColor::Green);
-    let spell = scenario
-        .add_spell_to_hand_from_oracle(P0, "Chain of Vapor", true, CHAIN_OF_VAPOR)
-        .id();
-    scenario.with_mana_pool(P0, floating_mana(10, ManaType::Colorless));
-    let mut runner = scenario.build();
-
-    let outcome = runner
-        .cast(spell)
-        .target_objects(&[creature, land])
-        .accept_optional()
-        .resolve();
-
-    // PHASE_BASE observation (`cargo nextest run -p phase-engine --test
-    // integration -E 'test(spell_that_copies_itself_as_it_resolves_is_unchanged)'`
-    // against 445291b10a7711bd83bc19274019fe54ca978053): the bounce and the
-    // land sacrifice both happen (the land reaches the graveyard), but no
-    // `SpellCopied` and no `CopyRetarget` — accepting the optional sacrifice
-    // does not reach the nested "if the player does, they may copy this
-    // spell" offer in this harness's resolution driver. Not this issue's
-    // class of defect: `copy_spell::resolve`'s `SelfRef` arm is not reached
-    // here at all (no `current_trigger_event` is in scope while the spell
-    // resolves its own effect chain). Recorded so this row stays a control,
-    // asserting the SAME PHASE_BASE result at the candidate.
-    assert_eq!(
-        outcome.state().objects[&land].zone,
-        Zone::Graveyard,
-        "reach guard: the optional sacrifice must have happened"
-    );
-    assert!(
-        !saw_spell_copied(outcome.events()),
-        "PHASE_BASE observation: no SpellCopied event; events={:?}",
-        outcome.events()
     );
 }

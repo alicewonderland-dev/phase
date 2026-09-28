@@ -548,11 +548,10 @@ fn remove_stack_entry_at_unobserved(
 /// (`obj.cast_occurrence` is `Some` —
 /// `casting_costs.rs::stamp_cast_occurrence_on_stack_spell`); a spell copy or
 /// a rolled-back cast was never finalized and has no CR 707.2 choices to
-/// remember. Called from the two exclusive non-resolving-removal seams: the
-/// zone-exit path (`zones.rs::apply_zone_exit_cleanup`, before the
-/// `cast_occurrence` clear that would make this guard vacuous) and
-/// `remove_nonresolving_stack_entry_at` below — a resolution pop
-/// (`pop_top_stack_entry`) calls neither.
+/// remember. Called from the zone-exit path
+/// (`zones.rs::apply_zone_exit_cleanup`, before the `cast_occurrence` clear
+/// that would make this guard vacuous) and `remove_nonresolving_stack_entry_at`
+/// below — a resolution pop (`pop_top_stack_entry`) calls neither.
 pub(crate) fn record_departed_stack_spell(state: &mut GameState, entry: &StackEntry) {
     let StackEntryKind::Spell { .. } = &entry.kind else {
         return;
