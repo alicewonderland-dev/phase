@@ -32468,8 +32468,6 @@ pub struct ResolvedAbility {
     /// whose keyed pins are reserved for delayed-trigger referents.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selected_target_incarnations: Vec<ObjectIncarnationRef>,
-    /// CR 115.1 + CR 601.2c: The targets chosen for this ability as it was put
-    /// on the stack, as changed since (CR 115.7).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declared_targets: Vec<TargetRef>,
     /// CR 602.2b + CR 601.2f: self-referential activation cost modification

@@ -9917,8 +9917,13 @@ fn finalize_copy_retarget(
         .unwrap_or_default();
     if let Some(entry) = state.stack.iter_mut().find(|e| e.id == copy_id) {
         if let Some(ability) = entry.ability_mut() {
-            for (old, new) in ability.targets.clone().iter().zip(targets.iter()) {
-                ability.change_declared_target(old, new);
+            if ability.targets.is_empty() {
+                // CR 707.12 + CR 601.2c: a copy cast without targets chooses them here.
+                crate::game::ability_utils::record_declared_targets(ability, targets.clone());
+            } else {
+                for (old, new) in ability.targets.clone().iter().zip(targets.iter()) {
+                    ability.change_declared_target(old, new);
+                }
             }
             ability.targets = targets;
             for pin in changed_pins {

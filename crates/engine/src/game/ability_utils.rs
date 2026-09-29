@@ -1961,13 +1961,17 @@ fn finish_target_assignment(
     ability: &mut ResolvedAbility,
     chosen: Vec<TargetRef>,
 ) {
+    record_declared_targets(ability, chosen);
+    ability.capture_target_incarnations_recursive(state);
+}
+
+pub(crate) fn record_declared_targets(ability: &mut ResolvedAbility, chosen: Vec<TargetRef>) {
     // CR 115.1: the opponents a per-opponent fanout iterates are not targets.
     ability.declared_targets = if is_per_opponent_target_fanout(ability) {
         object_targets_only(&chosen)
     } else {
         chosen
     };
-    ability.capture_target_incarnations_recursive(state);
 }
 
 /// CR 608.2c + CR 120.1: a pairwise "each of those ... to the other" damage
@@ -2033,8 +2037,6 @@ pub fn flatten_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
     targets
 }
 
-/// CR 115.1 + CR 115.10a: the objects and players chosen as targets for the
-/// chain `ability` heads: its `ResolvedAbility::declared_targets`.
 pub fn flatten_declared_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
     ability.declared_targets.clone()
 }

@@ -14,7 +14,7 @@ use engine::types::game_state::{
 };
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
-use engine::types::mana::{ManaColor, ManaCost};
+use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
@@ -1171,4 +1171,363 @@ fn each_copy_made_for_another_creature_targets_that_creature() {
         declared_of(runner.state(), growth),
         vec![TargetRef::Object(zada)]
     );
+}
+
+const ISOCHRON_SCEPTER: &str = "Imprint — When this artifact enters, you may exile an instant card with mana value 2 or less from your hand.\n{2}, {T}: You may copy the exiled card. If you do, you may cast the copy without paying its mana cost.";
+const DECORUM_DISSERTATION: &str = "Target player draws two cards and loses 2 life.\nParadigm (Then exile this spell. After you first resolve a spell with this name, you may cast a copy of it from exile without paying its mana cost at the beginning of each of your first main phases.)";
+const MIZZIXS_MASTERY: &str = "Exile target card that's an instant or sorcery from your graveyard. For each card exiled this way, copy it, and you may cast the copy without paying its mana cost. Exile Mizzix's Mastery.\nOverload {5}{R}{R}{R} (You may cast this spell for its overload cost. If you do, change \"target\" in its text to \"each.\")";
+const MASS_MUTINY: &str = "For each opponent, gain control of up to one target creature that player controls until end of turn. Untap those creatures. They gain haste until end of turn.";
+const ARC_TRAIL: &str = "Arc Trail deals 2 damage to any target and 1 damage to any other target.";
+
+fn add_colorless(runner: &mut GameRunner, player: PlayerId, amount: usize) {
+    let pool = &mut runner
+        .state_mut()
+        .players
+        .iter_mut()
+        .find(|p| p.id == player)
+        .expect("player")
+        .mana_pool;
+    for _ in 0..amount {
+        pool.add(ManaUnit::new(
+            ManaType::Colorless,
+            ObjectId(0),
+            false,
+            vec![],
+        ));
+    }
+}
+
+/// The copy on the stack whose `CopyRetarget` prompt is open.
+fn copy_being_cast(runner: &GameRunner) -> ObjectId {
+    match &runner.state().waiting_for {
+        WaitingFor::CopyRetarget { copy_id, .. } => *copy_id,
+        other => panic!("expected the copy's target prompt, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_copy_cast_from_isochron_scepter_targets_what_it_is_cast_at() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let bear = scenario.add_creature(P1, "Bear", 2, 2).id();
+    let shock = scenario
+        .add_spell_to_hand_from_oracle(P0, "Shock", true, SHOCK)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Red],
+            generic: 0,
+        })
+        .id();
+    let scepter = scenario
+        .add_artifact_to_hand_from_oracle(P0, "Isochron Scepter", ISOCHRON_SCEPTER)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(scepter).commit();
+    for _ in 0..12 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::OptionalEffectChoice { .. } => {
+                runner
+                    .act(GameAction::DecideOptionalEffect { accept: true })
+                    .expect("imprint");
+            }
+            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => break,
+            WaitingFor::Priority { .. } => {
+                runner.act(GameAction::PassPriority).expect("pass");
+            }
+            other => panic!("unexpected prompt {other:?}"),
+        }
+    }
+    assert_eq!(
+        runner.state().objects[&shock].zone,
+        Zone::Exile,
+        "reach guard: Shock was imprinted"
+    );
+    add_colorless(&mut runner, P0, 2);
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: scepter,
+            ability_index: 0,
+        })
+        .expect("activate");
+    for _ in 0..12 {
+        match runner.state().waiting_for {
+            WaitingFor::OptionalEffectChoice { .. } => {
+                runner
+                    .act(GameAction::DecideOptionalEffect { accept: true })
+                    .expect("copy and cast");
+            }
+            WaitingFor::Priority { .. } => {
+                runner.act(GameAction::PassPriority).expect("pass");
+            }
+            _ => break,
+        }
+    }
+    let copy = copy_being_cast(&runner);
+    runner
+        .act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(bear)),
+        })
+        .expect("choose the copy's target");
+    let (held, declared) = both(runner.state(), copy);
+    assert_eq!(
+        held,
+        vec![TargetRef::Object(bear)],
+        "reach guard: the copy targets the chosen creature"
+    );
+    assert_eq!(declared, vec![TargetRef::Object(bear)], "CR 707.12");
+}
+
+#[test]
+fn a_paradigm_copy_targets_what_it_is_cast_at() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    for _ in 0..8 {
+        scenario.add_card_to_library_top(P0, "Library Card");
+        scenario.add_card_to_library_top(P1, "Library Card");
+    }
+    let dissertation = scenario
+        .add_spell_to_hand_from_oracle(P0, "Decorum Dissertation", false, DECORUM_DISSERTATION)
+        .from_oracle_text_with_keywords(&["Paradigm"], DECORUM_DISSERTATION)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(dissertation).target_player(P1).commit();
+    pass_until(&mut runner, |state| {
+        matches!(state.waiting_for, WaitingFor::CastOffer { .. })
+    });
+    runner
+        .act(GameAction::CastParadigmCopy {
+            source: dissertation,
+        })
+        .expect("cast the copy");
+    let copy = copy_being_cast(&runner);
+    runner
+        .act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Player(P0)),
+        })
+        .expect("choose the copy's target");
+    let (held, declared) = both(runner.state(), copy);
+    assert_eq!(
+        held,
+        vec![TargetRef::Player(P0)],
+        "reach guard: the copy targets the chosen player"
+    );
+    assert_eq!(declared, vec![TargetRef::Player(P0)], "CR 707.12");
+}
+
+#[test]
+fn a_cast_copy_of_a_per_opponent_spell_targets_only_the_creatures_it_is_aimed_at() {
+    let mut scenario = GameScenario::new_n_player(3, 7);
+    scenario.at_phase(Phase::PreCombatMain);
+    let first = scenario.add_creature(P1, "First Bear", 2, 2).id();
+    let second = scenario.add_creature(PlayerId(2), "Second Bear", 2, 2).id();
+    let mutiny = scenario
+        .add_spell_to_graveyard(P0, "Mass Mutiny", false)
+        .from_oracle_text(MASS_MUTINY)
+        .with_mana_cost(ManaCost::generic(5))
+        .id();
+    let mastery = scenario
+        .add_spell_to_hand_from_oracle(P0, "Mizzix's Mastery", false, MIZZIXS_MASTERY)
+        .from_oracle_text_with_keywords(&["Overload"], MIZZIXS_MASTERY)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(mastery).target_objects(&[mutiny]).commit();
+    for _ in 0..12 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::Priority { .. } => {
+                runner.act(GameAction::PassPriority).expect("pass");
+            }
+            WaitingFor::ChooseFromZoneChoice { cards, .. } => {
+                runner
+                    .act(GameAction::SelectCards { cards })
+                    .expect("cast the copy");
+            }
+            _ => break,
+        }
+    }
+    let copy = copy_being_cast(&runner);
+    while let WaitingFor::CopyRetarget {
+        target_slots,
+        current_slot,
+        ..
+    } = runner.state().waiting_for.clone()
+    {
+        let target = target_slots[current_slot].legal_alternatives[0].clone();
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(target),
+            })
+            .expect("choose the copy's targets");
+    }
+    let (held, declared) = both(runner.state(), copy);
+    assert!(
+        held.contains(&TargetRef::Object(first)) && held.contains(&TargetRef::Object(second)),
+        "reach guard: the copy holds both creatures, got {held:?}"
+    );
+    assert_eq!(
+        declared,
+        vec![TargetRef::Object(first), TargetRef::Object(second)],
+        "CR 115.1"
+    );
+}
+
+#[test]
+fn a_copy_given_a_new_first_target_still_targets_its_second() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let first = scenario.add_creature(P1, "First Bear", 2, 2).id();
+    let second = scenario.add_creature(P1, "Second Bear", 2, 2).id();
+    let other = scenario.add_creature(P1, "Other Bear", 2, 2).id();
+    let arc_trail = scenario
+        .add_spell_to_hand_from_oracle(P0, "Arc Trail", false, ARC_TRAIL)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let twincast = scenario
+        .add_spell_to_hand_from_oracle(P0, "Twincast", true, TWINCAST)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner
+        .cast(arc_trail)
+        .target_objects(&[first, second])
+        .commit();
+    assert_eq!(
+        declared_of(runner.state(), arc_trail),
+        vec![TargetRef::Object(first), TargetRef::Object(second)],
+        "reach guard: Arc Trail was cast at both creatures"
+    );
+    runner.cast(twincast).target_objects(&[arc_trail]).commit();
+    pass_until(&mut runner, |state| {
+        matches!(
+            state.waiting_for,
+            WaitingFor::OptionalEffectChoice { .. } | WaitingFor::CopyRetarget { .. }
+        )
+    });
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::OptionalEffectChoice { .. }
+    ) {
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: true })
+            .expect("choose new targets");
+    }
+    let copy = copy_being_cast(&runner);
+    runner
+        .act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(other)),
+        })
+        .expect("choose the copy's new first target");
+    while matches!(runner.state().waiting_for, WaitingFor::CopyRetarget { .. }) {
+        runner
+            .act(GameAction::ChooseTarget { target: None })
+            .expect("keep the copy's other targets");
+    }
+    let (held, declared) = both(runner.state(), copy);
+    assert_eq!(
+        held,
+        vec![TargetRef::Object(other), TargetRef::Object(second)],
+        "reach guard: the copy's first target changed and its second did not"
+    );
+    assert_eq!(
+        declared,
+        vec![TargetRef::Object(other), TargetRef::Object(second)],
+        "CR 707.10c"
+    );
+}
+
+#[test]
+fn a_spell_given_a_creature_in_place_of_a_player_targets_the_creature() {
+    let mut scenario = GameScenario::new();
+    let (_, other, shock) = shock_on_the_stack(&mut scenario);
+    let redirect = scenario
+        .add_spell_to_hand_from_oracle(P1, "Redirect", true, REDIRECT)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(shock).target_player(P1).commit();
+    assert_eq!(
+        declared_of(runner.state(), shock),
+        vec![TargetRef::Player(P1)],
+        "reach guard: Shock was cast at P1"
+    );
+    runner.act(GameAction::PassPriority).expect("pass to P1");
+    runner.cast(redirect).target_objects(&[shock]).commit();
+    pass_until(&mut runner, |state| {
+        matches!(
+            state.waiting_for,
+            WaitingFor::OptionalEffectChoice { .. } | WaitingFor::RetargetChoice { .. }
+        )
+    });
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::OptionalEffectChoice { .. }
+    ) {
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: true })
+            .expect("choose new targets");
+    }
+    runner
+        .act(GameAction::RetargetSpell {
+            new_targets: vec![TargetRef::Object(other)],
+        })
+        .expect("retarget");
+    let (held, declared) = both(runner.state(), shock);
+    assert_eq!(
+        held,
+        vec![TargetRef::Object(other)],
+        "reach guard: the new target was written"
+    );
+    assert_eq!(declared, vec![TargetRef::Object(other)], "CR 115.7d");
+}
+
+#[test]
+fn a_spell_whose_player_target_is_changed_to_a_creature_targets_that_creature() {
+    let mut scenario = GameScenario::new();
+    let (_, _, shock) = shock_on_the_stack(&mut scenario);
+    let spellskite = scenario
+        .add_creature_from_oracle(P1, "Spellskite", 0, 4, SPELLSKITE)
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(shock).target_player(P1).commit();
+    assert_eq!(
+        declared_of(runner.state(), shock),
+        vec![TargetRef::Player(P1)],
+        "reach guard: Shock was cast at P1"
+    );
+    runner.act(GameAction::PassPriority).expect("pass to P1");
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: spellskite,
+            ability_index: 0,
+        })
+        .expect("activate");
+    for _ in 0..8 {
+        match &runner.state().waiting_for {
+            WaitingFor::TargetSelection { .. } => {
+                runner
+                    .act(GameAction::ChooseTarget {
+                        target: Some(TargetRef::Object(shock)),
+                    })
+                    .expect("target Shock");
+            }
+            WaitingFor::PhyrexianPayment { .. } => {
+                runner
+                    .act(GameAction::SubmitPhyrexianChoices {
+                        choices: vec![ShardChoice::PayLife],
+                    })
+                    .expect("pay 2 life");
+            }
+            WaitingFor::Priority { .. } => break,
+            other => panic!("unexpected prompt {other:?}"),
+        }
+    }
+    pass_until(&mut runner, |state| state.stack.len() == 1);
+    let (held, declared) = both(runner.state(), shock);
+    assert_eq!(
+        held,
+        vec![TargetRef::Object(spellskite)],
+        "reach guard: the new target was written"
+    );
+    assert_eq!(declared, vec![TargetRef::Object(spellskite)], "CR 115.7b");
 }
