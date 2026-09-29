@@ -30,12 +30,8 @@ pub fn resolve(
     // chain machinery must see an EffectResolved, exactly as the sibling
     // `stack_entry_cant_be_copied` guard below does.
     //
-    // PLACEMENT IS LOAD-BEARING: this MUST sit ABOVE the `ok_or_else(..)?`
-    // below. Returning `None` from `copy_source_entry` instead converts a
-    // deliberate no-op into `EffectError::MissingParam` and emits NO
-    // EffectResolved, because the `?` short-circuits before any events.push.
-    // The guard belongs at a function that can say "resolved, did nothing", not
-    // one that can only say "absent".
+    // PLACEMENT IS LOAD-BEARING: this guard resolves a stale target before
+    // source lookup; a missing target must not be reported as a missing source.
     //
     // Inert for every non-pinned caller: `pinned_object_targets_all_stale`
     // requires a non-empty `target_incarnations`, which only a pinned delayed
@@ -55,9 +51,22 @@ pub fn resolve(
     // The helper handles explicit object targets (Twincast / Gogo), SelfRef
     // (Casualty triggers whose intermediate stack pushes would make stack.last()
     // wrong), and untargeted fallback (top of stack).
-    let top_entry = copy_source_entry(state, ability).ok_or_else(|| {
-        EffectError::MissingParam("No spell or ability on stack to copy".to_string())
-    })?;
+    let top_entry = match copy_source_entry(state, ability) {
+        CopySourceLookup::Source(source) => source,
+        CopySourceLookup::Gone => {
+            events.push(GameEvent::EffectResolved {
+                kind: EffectKind::from(&ability.effect),
+                source_id: ability.source_id,
+                subject: None,
+            });
+            return Ok(());
+        }
+        CopySourceLookup::Absent => {
+            return Err(EffectError::MissingParam(
+                "No spell or ability on stack to copy".to_string(),
+            ));
+        }
+    };
     // CR 608.2h: once the copy source has departed the stack, its object is the
     // departed record's — never a live object that merely reuses the same
     // storage id (a later recast).
@@ -580,7 +589,8 @@ pub(crate) fn copy_count_with_replacements(
 
     // CR 707.10: Twinning Staff only modifies copying a *spell*, not an ability.
     match copy_source_entry(state, ability) {
-        Some(source) if matches!(source.entry.kind, StackEntryKind::Spell { .. }) => {}
+        CopySourceLookup::Source(source)
+            if matches!(source.entry.kind, StackEntryKind::Spell { .. }) => {}
         _ => return base,
     }
 
@@ -634,21 +644,29 @@ impl CopySource {
     }
 }
 
+enum CopySourceLookup {
+    Source(CopySource),
+    Gone,
+    Absent,
+}
+
 /// CR 608.2h + CR 400.7: Adapt `targeting::triggering_spell`'s answer to a
-/// [`CopySource`]. `Gone` (a spell-cast event names a spell with neither a
-/// live entry nor a departed record) is `None`.
-fn copy_source_from_triggering_spell(source: TriggeringSpell<'_>) -> Option<CopySource> {
+/// [`CopySourceLookup`]. `Gone` means a spell-cast event named a spell with
+/// neither a live entry nor a departed record; it differs from no source.
+fn copy_source_from_triggering_spell(source: TriggeringSpell<'_>) -> CopySourceLookup {
     match source {
-        TriggeringSpell::OnStack(entry) => Some(CopySource::on_stack(entry.clone())),
-        TriggeringSpell::Departed(record) => Some(CopySource {
+        TriggeringSpell::OnStack(entry) => {
+            CopySourceLookup::Source(CopySource::on_stack(entry.clone()))
+        }
+        TriggeringSpell::Departed(record) => CopySourceLookup::Source(CopySource {
             entry: record.entry.clone(),
             departed_object: Some(record.object.clone()),
         }),
-        TriggeringSpell::Gone => None,
+        TriggeringSpell::Gone => CopySourceLookup::Gone,
     }
 }
 
-fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> Option<CopySource> {
+fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> CopySourceLookup {
     if let Effect::CopySpell {
         target, retarget, ..
     } = &ability.effect
@@ -669,7 +687,7 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> Option<Cop
                 return copy_source_from_triggering_spell(source);
             }
             if let Some(entry) = triggering_spell_stack_entry(state) {
-                return Some(CopySource::on_stack(entry));
+                return CopySourceLookup::Source(CopySource::on_stack(entry));
             }
         }
     }
@@ -685,10 +703,13 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> Option<Cop
     if let Effect::CopySpell { target, .. } = &ability.effect {
         if target.references_exiled_by_source() {
             return copy_source_from_exiled_by_source(state, ability, target)
-                .map(CopySource::on_stack);
+                .map(CopySource::on_stack)
+                .map_or(CopySourceLookup::Absent, CopySourceLookup::Source);
         }
         if references_tracked_set(target) {
-            return copy_source_from_tracked_set(state, ability, target).map(CopySource::on_stack);
+            return copy_source_from_tracked_set(state, ability, target)
+                .map(CopySource::on_stack)
+                .map_or(CopySourceLookup::Absent, CopySourceLookup::Source);
         }
     }
     // CR 400.7 + CR 603.7c: covers the partial-stale case, and is defence in
@@ -719,7 +740,8 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> Option<Cop
                     )
             })
             .cloned()
-            .map(CopySource::on_stack);
+            .map(CopySource::on_stack)
+            .map_or(CopySourceLookup::Absent, CopySourceLookup::Source);
     }
     if matches!(
         &ability.effect,
@@ -749,7 +771,7 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> Option<Cop
             .find(|entry| entry.id == ability.source_id)
             .cloned()
         {
-            return Some(CopySource::on_stack(entry));
+            return CopySourceLookup::Source(CopySource::on_stack(entry));
         }
         // CR 707.10: When the `CopySpell` is the resolving spell's OWN effect
         // (the Chain cycle — "you may copy this spell"), `resolve_top` has
@@ -758,10 +780,10 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> Option<Cop
         // itself.
         if let Some(entry) = state.resolving_stack_entry.as_ref() {
             if entry.id == ability.source_id {
-                return Some(CopySource::on_stack(entry.clone()));
+                return CopySourceLookup::Source(CopySource::on_stack(entry.clone()));
             }
         }
-        return None;
+        return CopySourceLookup::Absent;
     }
     // CR 608.2h: final untargeted fallback. With a spell-cast event in scope,
     // use its on-stack/departed/gone answer — never `triggering_spell_stack_entry`'s
@@ -772,9 +794,14 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> Option<Cop
         return copy_source_from_triggering_spell(source);
     }
     if let Some(entry) = triggering_spell_stack_entry(state) {
-        return Some(CopySource::on_stack(entry));
+        return CopySourceLookup::Source(CopySource::on_stack(entry));
     }
-    state.stack.last().cloned().map(CopySource::on_stack)
+    state
+        .stack
+        .last()
+        .cloned()
+        .map(CopySource::on_stack)
+        .map_or(CopySourceLookup::Absent, CopySourceLookup::Source)
 }
 
 fn references_tracked_set(filter: &TargetFilter) -> bool {
@@ -1284,8 +1311,8 @@ mod tests {
             let stack_len_before = state.stack.len();
             let result = resolve(&mut state, &ability, &mut events);
             assert!(
-                matches!(result, Err(EffectError::MissingParam(_))),
-                "{target:?}: a departed spell with no record must copy nothing, got {result:?}"
+                result.is_ok(),
+                "{target:?}: a departed spell with no record must resolve without copying, got {result:?}"
             );
             assert_eq!(
                 state.stack.len(),
@@ -1297,6 +1324,17 @@ mod tests {
                     .iter()
                     .any(|event| matches!(event, GameEvent::SpellCopied { .. })),
                 "{target:?}: no SpellCopied event may be emitted"
+            );
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    GameEvent::EffectResolved {
+                        kind: EffectKind::CopySpell,
+                        source_id,
+                        subject: None,
+                    } if *source_id == krark_id
+                )),
+                "{target:?}: the no-op copy effect must emit EffectResolved"
             );
         }
     }
