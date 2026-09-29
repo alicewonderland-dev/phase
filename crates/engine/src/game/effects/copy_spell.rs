@@ -645,7 +645,7 @@ impl CopySource {
 }
 
 enum CopySourceLookup {
-    Source(CopySource),
+    Source(Box<CopySource>),
     Gone,
     Absent,
 }
@@ -656,12 +656,12 @@ enum CopySourceLookup {
 fn copy_source_from_triggering_spell(source: TriggeringSpell<'_>) -> CopySourceLookup {
     match source {
         TriggeringSpell::OnStack(entry) => {
-            CopySourceLookup::Source(CopySource::on_stack(entry.clone()))
+            CopySourceLookup::Source(Box::new(CopySource::on_stack(entry.clone())))
         }
-        TriggeringSpell::Departed(record) => CopySourceLookup::Source(CopySource {
+        TriggeringSpell::Departed(record) => CopySourceLookup::Source(Box::new(CopySource {
             entry: record.entry.clone(),
             departed_object: Some(record.object.clone()),
-        }),
+        })),
         TriggeringSpell::Gone => CopySourceLookup::Gone,
     }
 }
@@ -687,7 +687,7 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> CopySource
                 return copy_source_from_triggering_spell(source);
             }
             if let Some(entry) = triggering_spell_stack_entry(state) {
-                return CopySourceLookup::Source(CopySource::on_stack(entry));
+                return CopySourceLookup::Source(Box::new(CopySource::on_stack(entry)));
             }
         }
     }
@@ -703,12 +703,12 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> CopySource
     if let Effect::CopySpell { target, .. } = &ability.effect {
         if target.references_exiled_by_source() {
             return copy_source_from_exiled_by_source(state, ability, target)
-                .map(CopySource::on_stack)
+                .map(|entry| Box::new(CopySource::on_stack(entry)))
                 .map_or(CopySourceLookup::Absent, CopySourceLookup::Source);
         }
         if references_tracked_set(target) {
             return copy_source_from_tracked_set(state, ability, target)
-                .map(CopySource::on_stack)
+                .map(|entry| Box::new(CopySource::on_stack(entry)))
                 .map_or(CopySourceLookup::Absent, CopySourceLookup::Source);
         }
     }
@@ -740,7 +740,7 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> CopySource
                     )
             })
             .cloned()
-            .map(CopySource::on_stack)
+            .map(|entry| Box::new(CopySource::on_stack(entry)))
             .map_or(CopySourceLookup::Absent, CopySourceLookup::Source);
     }
     if matches!(
@@ -771,7 +771,7 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> CopySource
             .find(|entry| entry.id == ability.source_id)
             .cloned()
         {
-            return CopySourceLookup::Source(CopySource::on_stack(entry));
+            return CopySourceLookup::Source(Box::new(CopySource::on_stack(entry)));
         }
         // CR 707.10: When the `CopySpell` is the resolving spell's OWN effect
         // (the Chain cycle — "you may copy this spell"), `resolve_top` has
@@ -780,7 +780,7 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> CopySource
         // itself.
         if let Some(entry) = state.resolving_stack_entry.as_ref() {
             if entry.id == ability.source_id {
-                return CopySourceLookup::Source(CopySource::on_stack(entry.clone()));
+                return CopySourceLookup::Source(Box::new(CopySource::on_stack(entry.clone())));
             }
         }
         return CopySourceLookup::Absent;
@@ -794,13 +794,13 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> CopySource
         return copy_source_from_triggering_spell(source);
     }
     if let Some(entry) = triggering_spell_stack_entry(state) {
-        return CopySourceLookup::Source(CopySource::on_stack(entry));
+        return CopySourceLookup::Source(Box::new(CopySource::on_stack(entry)));
     }
     state
         .stack
         .last()
         .cloned()
-        .map(CopySource::on_stack)
+        .map(|entry| Box::new(CopySource::on_stack(entry)))
         .map_or(CopySourceLookup::Absent, CopySourceLookup::Source)
 }
 
