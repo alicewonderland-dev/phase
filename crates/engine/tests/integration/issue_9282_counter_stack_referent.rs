@@ -196,8 +196,6 @@ fn build(scenario: GameScenario) -> GameRunner {
 }
 
 // ---------------------------------------------------------------------------
-// A counter removes the spell, not the spell's own cast trigger.
-// ---------------------------------------------------------------------------
 
 struct CascadeBoard {
     runner: GameRunner,
@@ -1023,7 +1021,7 @@ fn frost_titans_counter_leaves_its_own_enters_trigger_on_the_stack() {
 }
 
 // ---------------------------------------------------------------------------
-// Ward: a declined ward trigger counters what targeted the warded permanent.
+// Ward.
 // ---------------------------------------------------------------------------
 
 fn warded(sc: &mut GameScenario) -> ObjectId {

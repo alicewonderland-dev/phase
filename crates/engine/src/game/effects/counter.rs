@@ -379,8 +379,7 @@ fn event_countered_referent(
         // targeting ability by its source, and not which entry targeted;
         // `countered_stack_index` matches this referent against both.
         GameEvent::BecomesTarget { .. } => Some(object_id),
-        // CR 113.7: the event names the object that moved; "that ability" is
-        // the most recent entry that object is the source of.
+        // CR 113.7: the event names the object that moved.
         GameEvent::ZoneChanged { .. } => state
             .stack
             .iter()

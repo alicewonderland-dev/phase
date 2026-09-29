@@ -894,9 +894,6 @@ fn node_acted_on(
             .map(|(subject, fought)| vec![TargetRef::Object(subject), TargetRef::Object(fought)])
             .unwrap_or_default(),
         Effect::DealDamage { .. } => super::deal_damage::damage_recipients(state, bound),
-        // CR 702.21a: a referent named by a `BecomesTarget` trigger event (ward) can
-        // resolve to an entry other than itself (`counter::countered_stack_index`);
-        // it is then not reported.
         Effect::Counter { .. } => super::counter::countered_targets(state, bound)
             .into_iter()
             .filter(|target| match target {
