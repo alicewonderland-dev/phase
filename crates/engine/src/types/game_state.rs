@@ -17975,6 +17975,22 @@ impl StackEntry {
     }
 }
 
+/// CR 608.2h + CR 707.2: A spell's stack entry and object as they last existed
+/// on the stack, captured at a non-resolving departure (bounced, countered,
+/// exiled) before any off-stack face revert (CR 712.8a). `GameObject` has no
+/// `PartialEq` (see `object_content_eq`), so this carries a manual impl below.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepartedStackSpell {
+    pub entry: StackEntry,
+    pub object: Box<GameObject>,
+}
+
+impl PartialEq for DepartedStackSpell {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry == other.entry && object_content_eq(&self.object, &other.object)
+    }
+}
+
 /// CR 702.94a + CR 603.11: A pending miracle reveal offer queued during the
 /// resolution of an action that caused `player` to draw `object_id` as their
 /// first card of the turn. `cost` is the miracle mana cost taken from the
@@ -21848,6 +21864,16 @@ declare_game_state! {
     #[serde(default, skip_serializing_if = "im::HashMap::is_empty")]
     #[serde(serialize_with = "crate::types::deterministic_serde::im_hash_map_of_im_hash_map")]
     pub lki_by_incarnation: im::HashMap<ObjectId, im::HashMap<u64, LKISnapshot>>,
+
+    /// CR 608.2h + CR 707.2: A spell's stack entry and object as they last
+    /// existed on the stack (`stack::record_departed_stack_spell`) — keyed by storage id,
+    /// then the incarnation the spell had on the stack. Consulted by
+    /// `targeting::triggering_spell` / `copy_spell::copy_source_entry` once a
+    /// spell-cast trigger's spell has left the stack. Cleared with
+    /// `lki_by_incarnation` at step transitions.
+    #[serde(default, skip_serializing_if = "im::HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::im_hash_map_of_im_hash_map")]
+    pub departed_stack_spells: im::HashMap<ObjectId, im::HashMap<u64, DepartedStackSpell>>,
 
     /// CR 607.2b + CR 603.10e: Last-known "cards exiled with [source]" linkage,
     /// captured when a source with `TrackedBySource` exile links leaves the
@@ -27204,6 +27230,7 @@ impl GameState {
             lki_cache: im::HashMap::new(),
             lki_copiable_values: HashMap::new(),
             lki_by_incarnation: im::HashMap::new(),
+            departed_stack_spells: im::HashMap::new(),
             linked_exile_lki: HashMap::new(),
             cost_payment_failed_flag: false,
             pending_taps_for_mana_overrides: std::collections::HashMap::new(),
@@ -28286,6 +28313,38 @@ impl GameState {
                 occurrence.turn_journal_index = 0;
             }
         }
+        // CR 104.4b + CR 608.2h: which `departed_stack_spells` records a live
+        // spell-cast trigger can still name — read BEFORE the stack-carrier loop
+        // below clears each trigger's pin (`clear_trigger_identity_recursive`),
+        // because that clear is what this capture must read past. Mirrors
+        // `targeting::triggering_spell`'s on-stack/pin/no-pin-highest-key answer
+        // so the retained set agrees with what a live trigger could still read.
+        let mut retained_departed_spells: HashSet<ObjectIncarnationRef> = HashSet::new();
+        for entry in clone.stack.iter().chain(clone.resolving_stack_entry.iter()) {
+            if let StackEntryKind::TriggeredAbility {
+                ability,
+                trigger_event: Some(GameEvent::SpellCast { object_id, .. }),
+                ..
+            } = &entry.kind
+            {
+                match ability.context.triggering_spell {
+                    Some(pin) if pin.object_id == *object_id => {
+                        retained_departed_spells.insert(pin);
+                    }
+                    _ => {
+                        if let Some(key) = clone
+                            .departed_stack_spells
+                            .get(object_id)
+                            .and_then(|records| records.keys().max())
+                        {
+                            retained_departed_spells
+                                .insert(ObjectIncarnationRef::of(*object_id, *key));
+                        }
+                    }
+                }
+            }
+        }
+
         // CR 104.4b + CR 400.7: the all-zone incarnation bump advances a source's
         // epoch on every zone change, so a mandatory loop that cycles its source's
         // zones would otherwise carry a growing `TriggerSourceContext` into loop
@@ -28468,6 +28527,19 @@ impl GameState {
             .filter_map(|(object_id, mut history)| {
                 history.retain(|incarnation, _| {
                     referenced_lki.contains(&ObjectIncarnationRef::of(object_id, *incarnation))
+                });
+                (!history.is_empty()).then_some((object_id, history))
+            })
+            .collect();
+        // CR 104.4b + CR 608.2h: records no live spell-cast trigger can reach are
+        // history, not position — prune the same way as `lki_by_incarnation`,
+        // against the set captured above before it was cleared.
+        clone.departed_stack_spells = std::mem::take(&mut clone.departed_stack_spells)
+            .into_iter()
+            .filter_map(|(object_id, mut history)| {
+                history.retain(|incarnation, _| {
+                    retained_departed_spells
+                        .contains(&ObjectIncarnationRef::of(object_id, *incarnation))
                 });
                 (!history.is_empty()).then_some((object_id, history))
             })
@@ -29541,6 +29613,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         lki_cache: _,
         lki_copiable_values: _,
         lki_by_incarnation: _,
+        departed_stack_spells: _,
         linked_exile_lki: _,
         cost_payment_failed_flag: _,
         pending_taps_for_mana_overrides: _,
@@ -29875,6 +29948,7 @@ impl PartialEq for GameState {
             && self.lki_cache == other.lki_cache
             && self.lki_copiable_values == other.lki_copiable_values
             && self.lki_by_incarnation == other.lki_by_incarnation
+            && self.departed_stack_spells == other.departed_stack_spells
             && self.city_blessing == other.city_blessing
             && self.enduring_story == other.enduring_story
             && self.planar_deck == other.planar_deck
@@ -31040,9 +31114,10 @@ mod tests {
     use crate::game::triggers::{PendingTrigger, PendingTriggerContext};
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        AbilityDefinition, AbilityKind, Effect, EffectScope, PostReplacementContinuation,
-        QuantityExpr, ResolvedAbility, TapStateChange, TargetFilter, TriggerBaseSetInstanceRef,
-        TriggerDefinitionOccurrenceRef, TriggerEntry, TriggerGrantInstanceRef,
+        AbilityDefinition, AbilityKind, CopyRetargetPermission, Effect, EffectScope,
+        PostReplacementContinuation, QuantityExpr, ResolvedAbility, TapStateChange, TargetFilter,
+        TriggerBaseSetInstanceRef, TriggerDefinitionOccurrenceRef, TriggerEntry,
+        TriggerGrantInstanceRef,
     };
     use crate::types::deterministic_serde::test_support::ReverseBuildHasher;
     use crate::types::identifiers::{
@@ -36764,6 +36839,264 @@ mod tests {
         assert!(
             !loop_states_equal(&normalized_a, &changed_reference.normalize_for_loop()),
             "different LKI for a still-referenced incarnation remains meaningful"
+        );
+    }
+
+    /// CR 104.4b (issue #6877): two states differing only in the
+    /// pinned spell's incarnation must compare equal after
+    /// `normalize_for_loop` — the pin carries an advancing all-zone
+    /// incarnation (CR 400.7), so a mandatory loop that recasts the pinned
+    /// spell would otherwise never confirm a draw.
+    #[test]
+    fn normalize_for_loop_ignores_triggering_spell_pin_incarnation() {
+        use crate::types::ability::Effect;
+
+        fn krark_trigger_state(pin_incarnation: u64) -> GameState {
+            let spell_id = ObjectId(30);
+            let krark_id = ObjectId(31);
+            let mut ability = ResolvedAbility::new(
+                Effect::CopySpell {
+                    target: TargetFilter::TriggeringSource,
+                    retarget: CopyRetargetPermission::MayChooseNewTargets,
+                    copier: None,
+                    additional_modifications: Vec::new(),
+                    starting_loyalty_from_casualty_sacrifice: false,
+                },
+                vec![],
+                krark_id,
+                PlayerId(0),
+            );
+            ability.context.triggering_spell =
+                Some(ObjectIncarnationRef::of(spell_id, pin_incarnation));
+            let mut state = GameState::new_two_player(7);
+            state.stack.push_back(StackEntry {
+                id: ObjectId(40),
+                source_id: krark_id,
+                controller: PlayerId(0),
+                kind: StackEntryKind::TriggeredAbility {
+                    source_id: krark_id,
+                    ability: Box::new(ability),
+                    condition: None,
+                    trigger_event: Some(GameEvent::SpellCast {
+                        controller: PlayerId(0),
+                        object_id: spell_id,
+                        card_id: CardId(1),
+                        cast_mana_value: None,
+                    }),
+                    description: None,
+                    source_name: String::new(),
+                    subject_match_count: None,
+                    die_result: None,
+                    provenance: None,
+                },
+            });
+            state
+        }
+
+        let a = krark_trigger_state(1);
+        let b = krark_trigger_state(3);
+        assert_ne!(a, b, "fixture differs by pin incarnation alone");
+        assert!(
+            loop_states_equal(&a.normalize_for_loop(), &b.normalize_for_loop()),
+            "two states differing only in the pinned spell's incarnation must confirm a loop"
+        );
+    }
+
+    /// CR 104.4b + CR 608.2h (issue #6877): a `departed_stack_spells`
+    /// record no live spell-cast trigger can reach is history, not position —
+    /// pruned like `lki_by_incarnation`. A reachable record (the pinned
+    /// incarnation, or with no pin the highest key) remains, and a change to
+    /// it remains loop-meaningful.
+    #[test]
+    fn normalize_for_loop_prunes_unreachable_departed_spells_but_keeps_reachable_record() {
+        use crate::types::ability::Effect;
+
+        fn record(power: i32) -> DepartedStackSpell {
+            let mut object = GameObject::new(
+                ObjectId(30),
+                CardId(1),
+                PlayerId(0),
+                "Departed Spell".to_string(),
+                Zone::Hand,
+            );
+            // `power` distinguishes otherwise-identical records so a
+            // replacement at the same key is a genuine content change
+            // (`object_content_eq` compares it) — load-bearing for the
+            // "changed reachable record" assertion below.
+            object.power = Some(power);
+            DepartedStackSpell {
+                entry: StackEntry {
+                    id: ObjectId(41),
+                    source_id: ObjectId(30),
+                    controller: PlayerId(0),
+                    kind: StackEntryKind::ActivatedAbility {
+                        source_id: ObjectId(30),
+                        ability: Box::new(ResolvedAbility::new(
+                            Effect::NoOp,
+                            vec![],
+                            ObjectId(30),
+                            PlayerId(0),
+                        )),
+                    },
+                },
+                object: Box::new(object),
+            }
+        }
+
+        fn krark_trigger_state(pin: Option<u64>) -> GameState {
+            let spell_id = ObjectId(30);
+            let krark_id = ObjectId(31);
+            let mut ability = ResolvedAbility::new(
+                Effect::CopySpell {
+                    target: TargetFilter::TriggeringSource,
+                    retarget: CopyRetargetPermission::MayChooseNewTargets,
+                    copier: None,
+                    additional_modifications: Vec::new(),
+                    starting_loyalty_from_casualty_sacrifice: false,
+                },
+                vec![],
+                krark_id,
+                PlayerId(0),
+            );
+            ability.context.triggering_spell =
+                pin.map(|incarnation| ObjectIncarnationRef::of(spell_id, incarnation));
+            let mut state = GameState::new_two_player(7);
+            state.stack.push_back(StackEntry {
+                id: ObjectId(40),
+                source_id: krark_id,
+                controller: PlayerId(0),
+                kind: StackEntryKind::TriggeredAbility {
+                    source_id: krark_id,
+                    ability: Box::new(ability),
+                    condition: None,
+                    trigger_event: Some(GameEvent::SpellCast {
+                        controller: PlayerId(0),
+                        object_id: spell_id,
+                        card_id: CardId(1),
+                        cast_mana_value: None,
+                    }),
+                    description: None,
+                    source_name: String::new(),
+                    subject_match_count: None,
+                    die_result: None,
+                    provenance: None,
+                },
+            });
+            state.departed_stack_spells.insert(
+                spell_id,
+                im::HashMap::from_iter([(3, record(3)), (4, record(4))]),
+            );
+            state
+        }
+
+        // Pinned to incarnation 3: adding an unreachable record 5 must not
+        // block loop confirmation, and only key 3 survives normalization.
+        let a = krark_trigger_state(Some(3));
+        let mut b = a.clone();
+        b.departed_stack_spells
+            .get_mut(&ObjectId(30))
+            .unwrap()
+            .insert(5, record(5));
+        assert_ne!(a, b, "fixture differs by an unreachable departed record");
+        let normalized_a = a.normalize_for_loop();
+        assert!(
+            loop_states_equal(&normalized_a, &b.normalize_for_loop()),
+            "an unreachable departed record must not block loop recurrence"
+        );
+        assert_eq!(
+            normalized_a.departed_stack_spells[&ObjectId(30)]
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![3],
+            "only the pinned incarnation's record remains"
+        );
+
+        // A change to the still-reachable (pinned) record remains meaningful.
+        let mut changed_reachable = a.clone();
+        changed_reachable
+            .departed_stack_spells
+            .get_mut(&ObjectId(30))
+            .unwrap()
+            .insert(3, record(9));
+        assert!(
+            !loop_states_equal(&normalized_a, &changed_reachable.normalize_for_loop()),
+            "a change to the reachable (pinned) record remains loop-meaningful"
+        );
+
+        // No pin: the highest key (4) is the reachable one.
+        let unpinned = krark_trigger_state(None);
+        assert_eq!(
+            unpinned.normalize_for_loop().departed_stack_spells[&ObjectId(30)]
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![4],
+            "with no pin, only the highest-key record remains"
+        );
+    }
+
+    /// CR 608.2h (issue #6877): a `GameState` holding
+    /// `departed_stack_spells` records round-trips through serde, and a
+    /// payload without the key deserializes to an empty map.
+    #[test]
+    fn departed_stack_spells_round_trip_and_absent_key_is_empty() {
+        use crate::types::ability::Effect;
+
+        let mut state = GameState::new_two_player(7);
+        state.departed_stack_spells.insert(
+            ObjectId(30),
+            im::HashMap::from_iter([(
+                1,
+                DepartedStackSpell {
+                    entry: StackEntry {
+                        id: ObjectId(41),
+                        source_id: ObjectId(30),
+                        controller: PlayerId(0),
+                        kind: StackEntryKind::ActivatedAbility {
+                            source_id: ObjectId(30),
+                            ability: Box::new(ResolvedAbility::new(
+                                Effect::NoOp,
+                                vec![],
+                                ObjectId(30),
+                                PlayerId(0),
+                            )),
+                        },
+                    },
+                    object: Box::new(GameObject::new(
+                        ObjectId(30),
+                        CardId(1),
+                        PlayerId(0),
+                        "Departed Spell".to_string(),
+                        Zone::Hand,
+                    )),
+                },
+            )]),
+        );
+
+        let json = serde_json::to_value(&state).expect("state must serialize");
+        assert!(
+            json.get("departed_stack_spells").is_some(),
+            "a populated map must serialize its key"
+        );
+        let restored: GameState = serde_json::from_value(json).expect("state must round-trip");
+        assert_eq!(
+            restored.departed_stack_spells[&ObjectId(30)][&1],
+            state.departed_stack_spells[&ObjectId(30)][&1],
+            "the record must survive the round trip"
+        );
+
+        let empty_state = GameState::new_two_player(7);
+        let empty_json = serde_json::to_value(&empty_state).expect("state must serialize");
+        assert!(
+            empty_json.get("departed_stack_spells").is_none(),
+            "an empty map must be omitted (skip_serializing_if)"
+        );
+        let restored_empty: GameState =
+            serde_json::from_value(empty_json).expect("payload without the key must deserialize");
+        assert!(
+            restored_empty.departed_stack_spells.is_empty(),
+            "a payload without the key must yield an empty map"
         );
     }
 
