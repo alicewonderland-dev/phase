@@ -8310,10 +8310,15 @@ pub(crate) fn seed_batched_attack_parent_targets(
 /// `current_trigger_event`. CR 603.6 specifically authorizes zone-change
 /// abilities to find and affect the object after it changes zones.
 fn parent_target_seeding_blocked(ability: &ResolvedAbility) -> bool {
+    // CR 115.1: a target chosen for the trigger can't be changed, even when it
+    // is the trigger's own source.
+    if !ability.chosen_target_slots.is_empty() {
+        return true;
+    }
     if ability.targets.is_empty() {
         return false;
     }
-    // CR 608.2c: only skip when real propagated targets exist — a lone source
+    // CR 608.2c: skip when real propagated targets exist — a lone source
     // fallback from `resolved_targets` use_self must be overwritable.
     ability
         .targets
@@ -18067,6 +18072,49 @@ pub mod tests {
             EventContextSeedTiming::StackPush,
         );
         assert_eq!(ability.targets, vec![TargetRef::Object(creature)]);
+    }
+
+    #[test]
+    fn seed_event_context_parent_targets_keeps_a_chosen_source_target() {
+        use crate::types::ability::PerpetualModification;
+
+        let spacecraft = ObjectId(1);
+        let creature = ObjectId(2);
+        let event = GameEvent::Stationed {
+            spacecraft_id: spacecraft,
+            creature_id: creature,
+            counters_added: 1,
+        };
+        for timing in [
+            EventContextSeedTiming::StackPush,
+            EventContextSeedTiming::ResolutionFallback,
+        ] {
+            let mut fallback = ResolvedAbility::new(
+                Effect::ApplyPerpetual {
+                    target: TargetFilter::ParentTarget,
+                    modification: PerpetualModification::GrantKeywords {
+                        keywords: vec![Keyword::Deathtouch],
+                    },
+                },
+                vec![TargetRef::Object(spacecraft)],
+                spacecraft,
+                PlayerId(0),
+            );
+            let mut chosen = fallback.clone();
+            chosen.chosen_target_slots = vec![0];
+            seed_event_context_parent_targets(&mut fallback, Some(&event), timing);
+            seed_event_context_parent_targets(&mut chosen, Some(&event), timing);
+            assert_eq!(
+                fallback.targets,
+                vec![TargetRef::Object(creature)],
+                "reach guard: {timing:?} seeds an unchosen source"
+            );
+            assert_eq!(
+                chosen.targets,
+                vec![TargetRef::Object(spacecraft)],
+                "CR 115.1: {timing:?}"
+            );
+        }
     }
 
     #[test]

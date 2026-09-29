@@ -1896,3 +1896,142 @@ fn a_kicked_spell_given_a_new_target_targets_it() {
         "CR 115.7d"
     );
 }
+
+const THOPTER_ARCHITECT: &str =
+    "Whenever an artifact you control enters, target creature gains flying until end of turn.";
+const GENEMORPH_IMAGO: &str = "Flying\nLandfall — Whenever a land you control enters, target creature has base power and toughness 3/3 until end of turn. If you control six or more lands, that creature has base power and toughness 6/6 until end of turn instead.";
+const SHADOW_ALLEY_DENIZEN: &str = "Whenever another black creature you control enters, target creature gains intimidate until end of turn. (It can't be blocked except by artifact creatures and/or creatures that share a color with it.)";
+const NIGHTMARE: &str = "Flying (This creature can't be blocked except by creatures with flying or reach.)\nNightmare's power and toughness are each equal to the number of Swamps you control.";
+const REANIMATE: &str = "Put target creature card from a graveyard onto the battlefield under your control. You lose life equal to that card's mana value.";
+
+/// P0 controls Thopter Architect and, if `bear`, a 2/2, and casts a
+/// noncreature artifact.
+fn architect_board(bear: bool) -> (GameRunner, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let architect = scenario
+        .add_creature_from_oracle(P0, "Thopter Architect", 2, 3, THOPTER_ARCHITECT)
+        .id();
+    if bear {
+        scenario.add_creature(P0, "Bear", 2, 2);
+    }
+    let relic = scenario
+        .add_artifact_to_hand_from_oracle(P0, "Relic", "")
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(relic).commit();
+    (runner, architect)
+}
+
+#[test]
+fn an_enters_trigger_whose_only_legal_target_is_its_source_targets_its_source() {
+    let (mut runner, architect) = architect_board(false);
+    let entry = trigger_of(&mut runner, architect);
+    let (held, declared) = both(runner.state(), entry);
+    assert_eq!(declared, vec![TargetRef::Object(architect)], "CR 115.1d");
+    assert_eq!(held, vec![TargetRef::Object(architect)], "CR 115.1");
+    runner.advance_until_stack_empty();
+    assert!(
+        runner.state().objects[&architect]
+            .keywords
+            .contains(&Keyword::Flying),
+        "CR 115.1"
+    );
+}
+
+#[test]
+fn an_enters_trigger_aimed_at_its_source_by_choice_targets_its_source() {
+    let (mut runner, architect) = architect_board(true);
+    pass_until(&mut runner, |state| {
+        matches!(state.waiting_for, WaitingFor::TriggerTargetSelection { .. })
+    });
+    runner
+        .act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(architect)),
+        })
+        .expect("choose target");
+    let entry = trigger_of(&mut runner, architect);
+    let (held, declared) = both(runner.state(), entry);
+    assert_eq!(declared, vec![TargetRef::Object(architect)], "CR 115.1d");
+    assert_eq!(held, vec![TargetRef::Object(architect)], "CR 115.1");
+    runner.advance_until_stack_empty();
+    assert!(
+        runner.state().objects[&architect]
+            .keywords
+            .contains(&Keyword::Flying),
+        "CR 115.1"
+    );
+}
+
+#[test]
+fn a_landfall_trigger_whose_only_legal_target_is_its_source_targets_its_source() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let imago = scenario
+        .add_creature(P0, "Genemorph Imago", 1, 3)
+        .from_oracle_text_with_keywords(&["Flying", "Landfall"], GENEMORPH_IMAGO)
+        .id();
+    let forest = scenario.add_land_to_hand(P0, "Forest").id();
+    let mut runner = scenario.build();
+    let card_id = runner.state().objects[&forest].card_id;
+    runner
+        .act(GameAction::PlayLand {
+            object_id: forest,
+            card_id,
+        })
+        .expect("play land");
+    let entry = trigger_of(&mut runner, imago);
+    let (held, declared) = both(runner.state(), entry);
+    assert_eq!(declared, vec![TargetRef::Object(imago)], "CR 115.1d");
+    assert_eq!(held, vec![TargetRef::Object(imago)], "CR 115.1");
+    runner.advance_until_stack_empty();
+    let imago = &runner.state().objects[&imago];
+    assert_eq!(
+        (imago.power, imago.toughness),
+        (Some(3), Some(3)),
+        "CR 115.1"
+    );
+}
+
+/// P0 reanimates P1's Nightmare, which dies as a 0/0 before Shadow Alley
+/// Denizen's trigger is put on the stack, so the Denizen is its only legal
+/// target.
+#[test]
+fn an_enters_trigger_left_with_only_its_source_to_target_commits_no_crime() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let denizen = scenario
+        .add_creature_from_oracle(P0, "Shadow Alley Denizen", 1, 1, SHADOW_ALLEY_DENIZEN)
+        .with_color(vec![ManaColor::Black])
+        .id();
+    let nightmare = scenario
+        .add_creature_to_graveyard(P1, "Nightmare", 0, 0)
+        .from_oracle_text_with_keywords(&["Flying"], NIGHTMARE)
+        .with_color(vec![ManaColor::Black])
+        .id();
+    let reanimate = scenario
+        .add_spell_to_hand_from_oracle(P0, "Reanimate", false, REANIMATE)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(reanimate).target_objects(&[nightmare]).commit();
+    assert_eq!(
+        crimes(runner.state(), P0),
+        1,
+        "reach guard: targeting a card in P1's graveyard is a crime"
+    );
+    let events = pass_until(&mut runner, |state| {
+        pending_trigger_of(state, denizen).is_some()
+    });
+    let entry = pending_trigger_of(runner.state(), denizen).expect("the Denizen's trigger");
+    assert_eq!(
+        runner.state().objects[&nightmare].zone,
+        Zone::Graveyard,
+        "reach guard: the Nightmare died"
+    );
+    let (held, declared) = both(runner.state(), entry);
+    assert_eq!(declared, vec![TargetRef::Object(denizen)], "CR 115.1d");
+    assert_eq!(held, vec![TargetRef::Object(denizen)], "CR 115.1");
+    assert_eq!(criminals(&events), Vec::new(), "CR 700.13");
+}
