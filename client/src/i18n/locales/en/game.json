@@ -1385,6 +1385,8 @@
     },
     "config": {
       "startingLife": "Starting Life",
+      "experimentalDungeons": "Experimental Dungeons",
+      "experimentalDungeonsHelp": "Offer Baldur's Gate Wilderness on ventures and when taking the initiative. Experimental and unofficial.",
       "players": "Players",
       "whoGoesFirst": "Who Goes First",
       "firstPlayer": {
