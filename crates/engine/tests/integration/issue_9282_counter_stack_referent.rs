@@ -1,6 +1,6 @@
 //! Issue #9282 — which stack entry a counter or a targeted copy acts on.
 //!
-//! A counter removes the entry its referent names. A spell's own cast trigger
+//! A spell's own cast trigger
 //! (storm, cascade, "when you cast this spell") is a different stack object that
 //! only shares the spell as its source, so countering the spell leaves it there.
 //! The ward rows assert which entries leave the stack and the resulting damage
@@ -852,22 +852,52 @@ fn stifles_log_lines_name_the_countered_triggers_source() {
         cascade,
         ..
     } = cascade_board("Stifle", 1);
-    let before_cast = runner.state().clone();
-    runner.cast(answer).target_object(cascade).commit();
-    let targeted = engine::game::log::resolve_log_entries(
-        &[GameEvent::BecomesTarget {
-            target: TargetRef::Object(cascade),
-            source_id: answer,
-            source_controller: P1,
-        }],
-        &before_cast,
-        runner.state(),
+    let card_id = runner.state().objects[&answer].card_id;
+    let mut cast = Trace::default();
+    cast.absorb(
+        runner
+            .act(GameAction::CastSpell {
+                object_id: answer,
+                card_id,
+                targets: vec![],
+                payment_mode: CastPaymentMode::Auto,
+            })
+            .expect("cast Stifle"),
     );
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::TargetSelection { .. }
+    ) {
+        cast.absorb(
+            runner
+                .act(GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(cascade)),
+                })
+                .expect("target the cascade trigger"),
+        );
+    }
     assert_eq!(
-        targeted
-            .iter()
-            .map(|entry| card_segments(&entry.segments))
-            .collect::<Vec<_>>(),
+        runner
+            .state()
+            .stack
+            .back()
+            .and_then(|entry| entry.ability())
+            .map(|a| a.targets.clone()),
+        Some(vec![TargetRef::Object(cascade)]),
+        "Stifle is on the stack targeting the cascade trigger"
+    );
+    let targeted: Vec<Vec<(String, ObjectId)>> = cast
+        .log
+        .iter()
+        .filter(|entry| {
+            entry.segments.iter().any(
+                |segment| matches!(segment, LogSegment::Text(text) if text.contains("is targeted by")),
+            )
+        })
+        .map(|entry| card_segments(&entry.segments))
+        .collect();
+    assert_eq!(
+        targeted,
         vec![vec![
             ("Bloodbraid Elf".to_string(), elf),
             ("Stifle".to_string(), answer),
@@ -1096,8 +1126,7 @@ fn ward_counters_a_triggered_ability_with_an_automatic_target() {
     let mut runner = build(sc);
     runner.cast(tapper).commit();
     let mut trace = Trace::default();
-    // Both players pass, so the creature spell resolves and its trigger is put
-    // on the stack; a target prompt here would make the next pass fail.
+    // Both players pass, so the creature spell resolves and its trigger is put on the stack.
     pass(&mut runner, &mut trace);
     pass(&mut runner, &mut trace);
     assert!(

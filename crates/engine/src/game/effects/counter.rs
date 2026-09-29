@@ -307,8 +307,8 @@ pub fn resolve(
 /// CR 701.6a + CR 113.7a: the stack entry `resolve` removes for the countered
 /// referent `obj_id`: the entry whose id is `obj_id`. An entry that only has
 /// `obj_id` as its source, such as a spell's own cast trigger, is a different
-/// stack object and is not matched, except for a referent named by a
-/// `BecomesTarget` trigger event (ward).
+/// stack object and is not matched, except when the counter's
+/// `counter_trigger_event` is a `BecomesTarget` event (ward).
 pub(super) fn countered_stack_index(
     state: &GameState,
     ability: &ResolvedAbility,
