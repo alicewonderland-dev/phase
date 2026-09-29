@@ -551,6 +551,34 @@ fn selected_return_result_publishes_present_empty_result_for_permitted_empty_pic
         *up_to = true;
         *min_count = 0;
     }
+    let producer = runner
+        .state()
+        .resolution_stack
+        .iter()
+        .find_map(|frame| match frame {
+            ResolutionFrame::AbilityContinuation(continuation) => {
+                continuation.pending.pending_return_result_producer
+            }
+            _ => None,
+        })
+        .expect("selected return has a live producer");
+    let displaced_frame = runner
+        .state_mut()
+        .return_result_frames
+        .remove(&producer.0)
+        .expect("selected return has a result frame");
+    assert!(runner
+        .act(GameAction::SelectCards { cards: vec![] })
+        .is_err());
+    assert!(runner.state().resolution_stack.iter().any(|frame| matches!(
+        frame,
+        ResolutionFrame::AbilityContinuation(continuation)
+            if continuation.pending.pending_return_result_producer == Some(producer)
+    )));
+    runner
+        .state_mut()
+        .return_result_frames
+        .insert(producer.0, displaced_frame);
     runner
         .act(GameAction::SelectCards { cards: vec![] })
         .expect("permitted empty choice settles the named instruction");

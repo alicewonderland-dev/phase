@@ -1303,7 +1303,7 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
     if !waits_for_resolution_choice(&state.waiting_for) {
         choose_one_of::resume_pending(state, events);
     }
-    // CR 608.2c + CR 107.1c: After the iteration's choice and any chained
+    // CR 608.2c: After the iteration's choice and any chained
     // continuation have fully drained (state is back at priority), resume a
     // paused "repeat this process" loop — re-set the `ControllerChoice` repeat
     // prompt.
@@ -1708,7 +1708,7 @@ pub(crate) fn resume_resolution_frames(state: &mut GameState, events: &mut Vec<G
     clear_post_replacement_token_choice_seed_if_resolution_drained(state);
 }
 
-/// CR 608.2c + CR 107.1c: Resume a "repeat this process" loop that paused when
+/// CR 608.2c: Resume a "repeat this process" loop that paused when
 /// an iteration's process entered an interactive `WaitingFor` state. Called by
 /// `drain_pending_continuation` once the iteration's choice (and any chained
 /// continuation) has fully drained. A resumed iteration's events join the
@@ -1822,7 +1822,7 @@ fn park_repeat_until_after_inner_pause(
     }
 }
 
-/// CR 608.2c + CR 107.1c: Stop predicates for `RepeatContinuation::UntilStopConditions`.
+/// CR 608.2c: Stop predicates for `RepeatContinuation::UntilStopConditions`.
 ///
 /// `pub(crate)` so `exile_links`'s witness tests can pin the standing argument
 /// for `ExiledStopInput::controller`: a control change with the zone held
@@ -14164,7 +14164,7 @@ pub fn resolve_ability_chain(
             count_top_level_resolution(state, ability);
         }
 
-        // CR 608.2c + CR 107.1c: "Repeat this process" dispatch — the non-count
+        // CR 608.2c: "Repeat this process" dispatch — the non-count
         // companion to `repeat_for`. Instead of a fixed iteration count, a
         // predicate decides per-iteration whether to re-follow the whole
         // resolution chain. The dispatch is ITERATIVE (not recursive): `depth`

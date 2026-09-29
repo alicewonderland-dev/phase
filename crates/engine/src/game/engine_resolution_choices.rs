@@ -6406,17 +6406,24 @@ pub(super) fn handle_resolution_choice(
                         "Return-result producer does not own this zone choice".to_string(),
                     ));
                 }
-                state
-                    .active_ability_continuation_frame_mut()
-                    .expect("validated return-result continuation remains active")
-                    .pending
-                    .pending_return_result_producer = None;
+                if !chosen.is_empty() {
+                    state
+                        .active_ability_continuation_frame_mut()
+                        .expect("validated return-result continuation remains active")
+                        .pending
+                        .pending_return_result_producer = None;
+                }
             }
 
             if chosen.is_empty() {
                 if let Some((occurrence_id, result_id)) = pending_return_result_producer {
                     effects::publish_return_result(state, occurrence_id, result_id, Vec::new())
                         .map_err(|error| EngineError::InvalidAction(error.to_string()))?;
+                    state
+                        .active_ability_continuation_frame_mut()
+                        .expect("validated return-result continuation remains active")
+                        .pending
+                        .pending_return_result_producer = None;
                 }
                 if matches!(effect_kind, EffectKind::ChangeZone)
                     && destination == Some(Zone::Battlefield)
