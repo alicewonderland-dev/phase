@@ -13293,6 +13293,54 @@ pub fn is_chosen_remove_counter_cost_count(count: u32) -> bool {
     )
 }
 
+/// CR 118.3 + CR 601.2h: whether a cost's chosen-count self-`RemoveCounter`
+/// leaves (leaves whose count is [`is_chosen_remove_counter_cost_count`])
+/// combine an `Any`-type leaf with an `OfType` leaf. This is the one
+/// combination with no sound reservation model: reserving the `Any` leaf's
+/// full announced amount against a later `OfType` leaf's typed availability
+/// is overly conservative (an `Any` leaf can draw from ANY type, so its
+/// announced amount doesn't necessarily compete with a specific later type),
+/// but NOT reserving it risks the untyped removal (`remove_counters_for_mana_cost`'s
+/// `Any` arm, which has no player-directed type allocation and iterates the
+/// object's counter types in an unspecified order) silently consuming
+/// counters a later typed leaf needed. Two `OfType` leaves of the same type,
+/// or two `Any` leaves, have no such ambiguity: both members of either pair
+/// draw from literally the same pool, so an exact aggregate reservation is
+/// sound and remains supported.
+///
+/// Shared between the parser (which must not accept this shape as an
+/// ordinary supported cost — `demote_unsupported_composite_counter_choice_costs`
+/// in `oracle.rs`) and the mana-ability runtime (`advance_mana_ability_activation`
+/// in `mana_abilities.rs`, which must refuse to activate it), so the two
+/// layers can never disagree about which shape is unsupported.
+pub fn chosen_count_remove_counter_leaves_mix_any_with_typed(cost: &AbilityCost) -> bool {
+    fn collect<'a>(cost: &'a AbilityCost, leaves: &mut Vec<&'a CounterMatch>) {
+        match cost {
+            AbilityCost::Composite { costs } => {
+                for cost in costs {
+                    collect(cost, leaves);
+                }
+            }
+            AbilityCost::RemoveCounter {
+                count,
+                counter_type,
+                target: None,
+                ..
+            } if is_chosen_remove_counter_cost_count(*count) => {
+                leaves.push(counter_type);
+            }
+            _ => {}
+        }
+    }
+    let mut leaves = Vec::new();
+    collect(cost, &mut leaves);
+    leaves.len() > 1
+        && leaves.iter().any(|leaf| matches!(leaf, CounterMatch::Any))
+        && leaves
+            .iter()
+            .any(|leaf| matches!(leaf, CounterMatch::OfType(_)))
+}
+
 /// CR 606.5: Is this activation cost a planeswalker loyalty-ability cost?
 ///
 /// Two shapes qualify: the fixed `[+N]` / `[−N]` / `[0]` form (`Loyalty`), and
@@ -16174,6 +16222,59 @@ impl DigRestOrder {
     }
 }
 
+/// CR 608.2d vs CR 401.4: WHICH of a Telling Time-class remainder split's two
+/// decisions a given `WaitingFor::DigRestSplitChoice` prompt still carries, and
+/// therefore WHOSE decision it is.
+///
+/// A split bundles two rules-distinct choices with two distinct owners:
+///
+/// * the PARTITION — which cards take the library top and which take the
+///   bottom. CR 608.2d makes this the choice of the player the effect gives it
+///   to ("*you* ... put one on top of your library"), i.e. the dig's chooser.
+/// * the ARRANGEMENT — the order of the cards landing in each position.
+///   CR 401.4: "If an effect puts two or more cards in a specific position in a
+///   library at the same time, **the owner of those cards** may arrange them in
+///   any order." That is the LIBRARY'S OWNER, who need not be the chooser.
+///
+/// For every printed card today the two players coincide (Telling Time digs
+/// "your library"), so the common case answers both in one prompt. Splitting
+/// the vocabulary keeps a cross-player dig ("look at the top three cards of
+/// target player's library ...") from silently handing CR 401.4's arrangement
+/// to the chooser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DigRestSplitScope {
+    /// The acting player is BOTH the chooser and the library's owner, so this
+    /// one prompt answers the CR 608.2d partition and the CR 401.4 arrangement
+    /// together. The default, and the only scope a same-player dig ever parks.
+    #[default]
+    PartitionAndOrder,
+    /// The acting player is the chooser but NOT the library's owner. Only the
+    /// CR 608.2d partition — the SET of cards in the leading `top_count`
+    /// entries — is binding here; the within-pile order they submit is
+    /// discarded and re-asked of the owner as an [`Self::OrderOnly`] prompt
+    /// whenever a resulting pile holds two or more cards.
+    PartitionOnly,
+    /// The acting player is the library's OWNER and the partition is already
+    /// settled. CR 401.4 is all that is left, so the submission must be a
+    /// permutation that keeps the same cards in the leading `top_count`
+    /// entries — the owner may reorder within each pile but may not move a
+    /// card across the top/bottom boundary, which was never their decision.
+    OrderOnly,
+}
+
+impl DigRestSplitScope {
+    /// True when the submission's leading `top_count` entries are free to be
+    /// any subset (the partition is still open), false when they are pinned to
+    /// the already-settled top pile.
+    pub fn partition_is_open(self) -> bool {
+        matches!(
+            self,
+            DigRestSplitScope::PartitionAndOrder | DigRestSplitScope::PartitionOnly
+        )
+    }
+}
+
 /// CR 701.20e + CR 608.2c: Discriminates where `Effect::Dig` reads its
 /// card set from. `Library` (the default) reads from the top of the library;
 /// `PriorLook` reads from `GameState::private_look_ids`, which was populated
@@ -16924,6 +17025,25 @@ pub enum Effect {
         /// Where unchosen cards go (None = Graveyard, Some(Library) = bottom).
         #[serde(default)]
         rest_destination: Option<Zone>,
+        /// CR 401.2 + CR 701.20e + CR 608.2c: Telling Time-class split of the
+        /// unkept remainder between the two rules-legal positions of ONE
+        /// library ("...one on top of your library, and one on the bottom of
+        /// your library"). CR 401.2 keeps a library a single face-down pile
+        /// whose order may only change as an effect allows, so top and bottom
+        /// are the only positions such an instruction can name; the partition
+        /// between them is the looking player's choice (CR 701.20e — the pile
+        /// is known only to them).
+        ///
+        /// `Some(n)` = exactly `n` of the remainder go on top and the rest go
+        /// to the bottom, via a `WaitingFor::DigRestSplitChoice` pause.
+        /// `None` = unchanged behavior: the whole remainder goes uniformly to
+        /// `rest_destination` (defaulting to Graveyard). Note CR 701.20d: the
+        /// remainder cards are reordered within the library by this split, so
+        /// they stop being revealed and become new objects — the shared
+        /// `reorder_within_library` primitive that performs the move already
+        /// advances the library knowledge epoch for exactly that reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rest_split_top_count: Option<QuantityExpr>,
         /// CR 400.5 + CR 608.2c: Ordering instruction for an unchosen
         /// library rest pile. `Random` is only set by exact Oracle text.
         #[serde(default, skip_serializing_if = "DigRestOrder::is_preserve")]
@@ -25643,6 +25763,22 @@ impl TargetChoiceTiming {
 // Definition types -- fully typed, zero HashMap
 // ---------------------------------------------------------------------------
 
+/// Identity of one announced target group within an ability definition chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ChosenGroupId(pub u32);
+
+/// Identity of one return instruction in a parsed ability chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ReturnResultId(pub u32);
+
+/// The prior-object predicate and final destination read by a delayed effect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReturnResultReadSpec {
+    pub noun: TargetFilter,
+    pub destination: Zone,
+    pub recipient: ControllerRef,
+}
+
 /// Parsed ability definition with typed effect. Zero remaining_params.
 ///
 /// `Serialize` is hand-written (see `impl Serialize for AbilityDefinition`) so
@@ -25657,6 +25793,12 @@ impl TargetChoiceTiming {
 pub struct AbilityDefinition {
     pub kind: AbilityKind,
     pub effect: Box<Effect>,
+    /// Group announced by this clause, including its mutually exclusive cost branch.
+    pub declares_chosen_group: Option<ChosenGroupId>,
+    /// Exact announced group consumed by this clause.
+    pub reads_chosen_group: Option<ChosenGroupId>,
+    pub declares_return_result: Option<ReturnResultId>,
+    pub reads_return_result: Option<(ReturnResultId, ReturnResultReadSpec)>,
     pub cost: Option<AbilityCost>,
     pub sub_ability: Option<Box<AbilityDefinition>>,
     /// CR 608.2c: Alternative branch executed when the condition on this ability is NOT met.
@@ -25827,6 +25969,14 @@ struct AbilityDefinitionRepr<'a> {
     // would silently drop a `null` key the existing JSON / snapshots expect.
     kind: &'a AbilityKind,
     effect: &'a Effect,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declares_chosen_group: &'a Option<ChosenGroupId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reads_chosen_group: &'a Option<ChosenGroupId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declares_return_result: &'a Option<ReturnResultId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reads_return_result: &'a Option<(ReturnResultId, ReturnResultReadSpec)>,
     cost: &'a Option<AbilityCost>,
     sub_ability: &'a Option<Box<AbilityDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -25906,6 +26056,10 @@ impl Serialize for AbilityDefinition {
         let AbilityDefinition {
             kind,
             effect,
+            declares_chosen_group,
+            reads_chosen_group,
+            declares_return_result,
+            reads_return_result,
             cost,
             sub_ability,
             else_ability,
@@ -25950,6 +26104,10 @@ impl Serialize for AbilityDefinition {
             kind,
             // `effect` is `&Box<Effect>` from the destructure; deref to `&Effect`.
             effect,
+            declares_chosen_group,
+            reads_chosen_group,
+            declares_return_result,
+            reads_return_result,
             cost,
             sub_ability,
             else_ability,
@@ -26025,6 +26183,14 @@ impl Serialize for AbilityDefinition {
 struct AbilityDefinitionDe {
     kind: AbilityKind,
     effect: Box<Effect>,
+    #[serde(default)]
+    declares_chosen_group: Option<ChosenGroupId>,
+    #[serde(default)]
+    reads_chosen_group: Option<ChosenGroupId>,
+    #[serde(default)]
+    declares_return_result: Option<ReturnResultId>,
+    #[serde(default)]
+    reads_return_result: Option<(ReturnResultId, ReturnResultReadSpec)>,
     #[serde(default)]
     cost: Option<AbilityCost>,
     #[serde(default)]
@@ -26122,6 +26288,10 @@ impl<'de> Deserialize<'de> for AbilityDefinition {
         Ok(AbilityDefinition {
             kind: de.kind,
             effect: de.effect,
+            declares_chosen_group: de.declares_chosen_group,
+            reads_chosen_group: de.reads_chosen_group,
+            declares_return_result: de.declares_return_result,
+            reads_return_result: de.reads_return_result,
             cost: de.cost,
             sub_ability: de.sub_ability,
             else_ability: de.else_ability,
@@ -26382,6 +26552,10 @@ impl AbilityDefinition {
         Self {
             kind,
             effect: Box::new(effect),
+            declares_chosen_group: None,
+            reads_chosen_group: None,
+            declares_return_result: None,
+            reads_return_result: None,
             cost: None,
             sub_ability: None,
             else_ability: None,
@@ -27773,6 +27947,13 @@ impl ForwardedResultContext {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingForwardedZoneResult {
+    pub producer: ObjectId,
+    pub selected: Option<Vec<ObjectIncarnationRef>>,
+    pub group: Option<crate::types::identifiers::LogicalZoneChangeGroupId>,
+}
+
 /// Casting-time facts that flow with a spell from casting through resolution.
 /// Conditions in the sub_ability chain are evaluated against this context.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -27788,6 +27969,8 @@ pub struct SpellContext {
     /// inherited-target fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarded_result_context: Option<Box<ForwardedResultContext>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_forwarded_zone_result: Option<PendingForwardedZoneResult>,
     /// CR 610.3b: specified duration events observed after a triggered ability
     /// triggered but before this initial zone-change effect occurred.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -27838,6 +28021,22 @@ pub struct SpellContext {
     /// `Unlimited` grants (nothing to consume).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alt_cost_grant_source: Option<ObjectId>,
+    /// CR 601.2a + CR 601.2b: For a card cast from the graveyard under a
+    /// graveyard-cast permission (printed cost, Blitz, Bestow), the
+    /// `GraveyardPermission` the player announced, carrying the per-type slot
+    /// when one applies. Stamped as costs begin from the prepared cast. Read by
+    /// the extra-cost lookup and by `finalize_cast`, so the permission whose
+    /// rider was charged is the one spent even if the board changes during
+    /// payment (a permission source sacrificed for mana). `None` for every other
+    /// cast.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graveyard_permission_authority: Option<crate::types::game_state::CastingVariant>,
+    /// CR 601.2f + CR 601.2h + CR 614.1c: the announced graveyard permission's
+    /// terms (its extra cost and "enters with a counter" rider) as they were
+    /// when the cast was announced, applied even if the permission's source
+    /// leaves or loses the ability during casting. `None` for every other cast.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graveyard_permission_latch: Option<crate::types::game_state::GraveyardPermissionLatch>,
     /// CR 601.2b/f/h: Number of non-kicker additional-cost payments declared
     /// while casting this spell. Used by keyword abilities such as Squad
     /// (CR 702.157a), whose repeatable payment count is not a kicker count.
@@ -27942,6 +28141,16 @@ pub struct SpellContext {
     /// `apply_parent_chain_context` so it never reaches a grandchild.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_damage_source: Option<TargetDamageSourceBinding>,
+    /// CR 601.2i + CR 400.7: For a triggered ability whose trigger event is a
+    /// spell being cast ("that spell" / a self-cast "this spell"), that
+    /// spell's object and incarnation as they stood when this ability was put
+    /// on the stack. Bound at the single triggered-stack-entry constructor
+    /// (`triggers.rs::push_pending_trigger_to_stack_with_firing_and_duration_events`)
+    /// and re-bound when a pending entry's ability is assigned
+    /// (`triggers.rs::assign_pending_trigger_entry_ability`); read by
+    /// `targeting::triggering_spell`. `None` for a non-spell-cast trigger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triggering_spell: Option<ObjectIncarnationRef>,
 }
 
 impl SpellContext {
@@ -32415,6 +32624,14 @@ impl AttachTargetBindings {
 pub struct ResolvedAbility {
     pub effect: Effect,
     pub targets: Vec<TargetRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declares_chosen_group: Option<ChosenGroupId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reads_chosen_group: Option<ChosenGroupId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declares_return_result: Option<ReturnResultId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reads_return_result: Option<(ReturnResultId, ReturnResultReadSpec)>,
     /// Attribution only. Triggered abilities additionally carry the exact
     /// context below; callers must never use this raw id to rebind a departed
     /// source to a newer incarnation.
@@ -32854,6 +33071,10 @@ impl PartialEq for ResolvedAbility {
         let Self {
             effect: a_effect,
             targets: a_targets,
+            declares_chosen_group: a_declares_chosen_group,
+            reads_chosen_group: a_reads_chosen_group,
+            declares_return_result: a_declares_return_result,
+            reads_return_result: a_reads_return_result,
             source_id: a_source_id,
             cast_occurrence: a_cast_occurrence,
             source_incarnation: a_source_incarnation,
@@ -32919,6 +33140,10 @@ impl PartialEq for ResolvedAbility {
         let Self {
             effect: b_effect,
             targets: b_targets,
+            declares_chosen_group: b_declares_chosen_group,
+            reads_chosen_group: b_reads_chosen_group,
+            declares_return_result: b_declares_return_result,
+            reads_return_result: b_reads_return_result,
             source_id: b_source_id,
             cast_occurrence: b_cast_occurrence,
             source_incarnation: b_source_incarnation,
@@ -32984,6 +33209,10 @@ impl PartialEq for ResolvedAbility {
 
         a_effect == b_effect
             && a_targets == b_targets
+            && a_declares_chosen_group == b_declares_chosen_group
+            && a_reads_chosen_group == b_reads_chosen_group
+            && a_declares_return_result == b_declares_return_result
+            && a_reads_return_result == b_reads_return_result
             && a_source_id == b_source_id
             && a_cast_occurrence == b_cast_occurrence
             && a_source_incarnation == b_source_incarnation
@@ -33094,6 +33323,10 @@ impl ResolvedAbility {
         Self {
             effect,
             targets,
+            declares_chosen_group: None,
+            reads_chosen_group: None,
+            declares_return_result: None,
+            reads_return_result: None,
             source_id,
             cast_occurrence: None,
             controller,
@@ -33379,6 +33612,10 @@ impl ResolvedAbility {
         self.trigger_source = None;
         self.trigger_definition_ref = None;
         self.force_block_attacker = None;
+        // CR 104.4b: the pin names an advancing incarnation of the triggering
+        // spell (CR 400.7), so it is cleared alongside the other per-instance
+        // identity fields above for the same loop-equality reason.
+        self.context.triggering_spell = None;
         // CR 104.4b + CR 400.7: `normalize_for_loop` compares canonicalized
         // clones for repeated-position equality, and the all-zone incarnation
         // bump advances a pinned referent's epoch on every zone change. A

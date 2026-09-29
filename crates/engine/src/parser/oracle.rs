@@ -2,7 +2,7 @@ use std::{borrow::Cow, ops::ControlFlow};
 
 use crate::parser::oracle_nom::error::{OracleError, OracleResult};
 use nom::branch::alt;
-use nom::bytes::complete::{tag, take_until, take_while};
+use nom::bytes::complete::{tag, take_till, take_until, take_while};
 use nom::character::complete::multispace0;
 use nom::combinator::{all_consuming, map, opt, value};
 use nom::sequence::{preceded, terminated};
@@ -2311,9 +2311,19 @@ fn deliver_coordinated_graveyard_permission_in_ability(def: &mut AbilityDefiniti
     );
 
     if head_is_refused_land_play {
+        // CR 601.3 + CR 611.2a: rebuild the grant only when the printed sentence
+        // ENDS at its graveyard anchor. A trailing gate the lowering dropped
+        // ("… from your graveyard as long as you control a Zombie") would
+        // otherwise become an ungated grant. Keep the refused fragment (an
+        // honest Unimplemented) instead.
+        let sentence_is_fully_modelled = def
+            .description
+            .as_deref()
+            .is_some_and(coordinated_permission_sentence_ends_at_anchor);
         let recovered = def
             .sub_ability
             .as_deref()
+            .filter(|_| sentence_is_fully_modelled)
             .and_then(|sub| match &*sub.effect {
                 Effect::CastFromZone {
                     target, duration, ..
@@ -2409,6 +2419,24 @@ fn deliver_coordinated_graveyard_permission_in_ability(def: &mut AbilityDefiniti
     }
 }
 
+/// CR 601.3 + CR 611.2a: true when the sentence carrying the coordinated
+/// permission's graveyard anchor ends there, i.e. the text between
+/// " from your graveyard" and the next sentence boundary is empty. Any gate
+/// after the anchor ("as long as …", "if …", "unless …") was not lowered into
+/// the recovered grant, so a remainder means the grant must not be synthesized.
+/// A missing anchor fails closed too.
+fn coordinated_permission_sentence_ends_at_anchor(description: &str) -> bool {
+    let lower = description.to_lowercase();
+    parse_graveyard_anchor_sentence_tail(&lower).is_ok_and(|(_, tail)| tail.trim().is_empty())
+}
+
+/// The text after the first " from your graveyard" up to the next `.`.
+fn parse_graveyard_anchor_sentence_tail(input: &str) -> OracleResult<'_, &str> {
+    let (rest, _) = take_until(" from your graveyard").parse(input)?;
+    let (rest, _) = tag(" from your graveyard").parse(rest)?;
+    take_till(|c: char| c == '.').parse(rest)
+}
+
 /// CR 116.2a + CR 601.2a: build the two-part permission from the cast half of the
 /// sentence -- the land axis and the card axis under ONE grant, because the
 /// printed sentence is one permission naming two actions.
@@ -2465,6 +2493,7 @@ fn coordinated_graveyard_permission(cast_target: &TargetFilter) -> Option<Static
             graveyard_destination_replacement: None,
             extra_cost: None,
             enters_with_counter: None,
+            required_cast_keyword: None,
         })
         // CR 611.2c: class-wide and re-evaluated live, so cards that reach the
         // graveyard later this turn are covered.
@@ -9057,6 +9086,7 @@ fn parse_oracle_pipeline(
     render_granting_self_descriptions(&mut parsed, card_name);
     demote_unbound_delayed_sweeps(&mut parsed);
     demote_unenforceable_replacement_lifetimes(&mut parsed);
+    demote_unsupported_composite_counter_choice_costs(&mut parsed);
     #[cfg(debug_assertions)]
     crate::parser::oracle_effect::debug_assert_exile_top_opponent_sentinel_lifted(
         &parsed, card_name,
@@ -9171,6 +9201,45 @@ fn demote_unenforceable_replacement_lifetimes(parsed: &mut ParsedAbilities) {
     }
     for replacement in &mut parsed.replacements {
         demote_lifetimes_in_replacement(replacement);
+    }
+}
+
+/// CR 118.3 + CR 601.2h: an activated ability whose cost mixes an `Any`-type
+/// chosen-count `RemoveCounter` leaf with a typed (`OfType`) chosen-count
+/// leaf has no sound reservation model at runtime —
+/// `mana_abilities::advance_mana_ability_activation` refuses to activate it
+/// outright, rather than risk either wrongly refusing a legal payment or
+/// silently misallocating counters a later leaf needed. See
+/// `types::ability::chosen_count_remove_counter_leaves_mix_any_with_typed`'s
+/// doc comment for the full bin-packing rationale; it is the single shared
+/// authority both this parser demotion and that runtime refusal call, so the
+/// two layers can never disagree about which shape is unsupported.
+///
+/// Demoting the ability's EFFECT to `Effect::unimplemented` here — rather
+/// than leaving the ordinarily-parsed effect in place — keeps the parser and
+/// the coverage report honest: this specific composite-cost shape must not
+/// present as an ordinary supported mana ability when the runtime
+/// deliberately refuses to activate it. Only the top-level cost is checked:
+/// `AbilityCost::RemoveCounter` is a leaf/activation-cost shape, never nested
+/// inside a sub-ability's own effect chain the way `AbilityCost::EffectCost`
+/// can carry one (see `demote_lifetimes_in_cost` above), so `def.sub_ability`
+/// / `def.mode_abilities` need no parallel walk here.
+///
+/// The gap key is a stable snake_case pattern-class key (CLAUDE.md), distinct
+/// from every previously-supported handler so the resulting coverage flip
+/// lands in `coverage-regression-check.sh`'s non-fatal "coverage honesty"
+/// bucket.
+fn demote_unsupported_composite_counter_choice_costs(parsed: &mut ParsedAbilities) {
+    for def in &mut parsed.abilities {
+        let Some(cost) = def.cost.as_ref() else {
+            continue;
+        };
+        if crate::types::ability::chosen_count_remove_counter_leaves_mix_any_with_typed(cost) {
+            let fragment = def.description.clone().unwrap_or_default();
+            // Replace in place rather than reallocating the Box (clippy::replace_box).
+            *def.effect =
+                Effect::unimplemented("counter_choice_cost_mixes_any_with_typed", &fragment);
+        }
     }
 }
 

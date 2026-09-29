@@ -829,6 +829,7 @@ fn is_reorder_only_library_dig(effect: &Effect) -> bool {
             keep_count: None,
             destination: Some(Zone::Library),
             rest_destination: Some(Zone::Library),
+            rest_split_top_count: None,
             reveal: false,
             ..
         }
@@ -1595,6 +1596,24 @@ pub(super) fn split_clause_sequence(text: &str) -> Vec<ClauseChunk> {
                         ))
                         .parse(remainder_lower_for_loses.as_str())
                         .is_ok();
+                        // CR 608.2c: "you gain life and draw cards equal to its power"
+                        // (Lifeblood Hydra) — coordinated amount-elided verbs share ONE
+                        // trailing "equal to" postmodifier, so the " and " is internal
+                        // to a single instruction owned by
+                        // `try_parse_shared_equal_to_quantity_compound`. Same grammar
+                        // (`parse_equal_to_qty_conjuncts`) and same subject tightness as
+                        // the distributor: the chunk so far (reflexive connector
+                        // stripped, as for `compound_subject_each`) must be exactly
+                        // "[you ]<head>[ and <head>]*", and the remainder must continue
+                        // the head run up to " equal to ".
+                        let shared_equal_to_quantity_conjunct =
+                            all_consuming(super::parse_equal_to_qty_conjuncts)
+                                .parse(first_subject_token)
+                                .is_ok()
+                                && super::parse_equal_to_qty_verb_run(
+                                    remainder_lower_for_loses.as_str(),
+                                )
+                                .is_ok();
                         let suppress = (nom_primitives::scan_contains(&before_lower, "from among")
                         && !sacrifice_rest_remainder)
                         || is_inside_temporal_prefix(&before_lower)
@@ -1614,6 +1633,7 @@ pub(super) fn split_clause_sequence(text: &str) -> Vec<ClauseChunk> {
                         || bare_becomes_continuation
                         || mass_exile_union_continuation
                         || loses_all_other_card_types_continuation
+                        || shared_equal_to_quantity_conjunct
                         || inside_prefix_comma_and_continuation;
                         if !suppress && starts_bare_and_clause(remainder_trimmed) {
                             push_clause_chunk(&mut chunks, before_and, Some(ClauseBoundary::Comma));
@@ -5064,6 +5084,7 @@ pub(super) fn apply_clause_continuation(
             filter: card_filter,
             destination: kept_dest,
             rest_destination: rest_dest,
+            rest_split_top_count: rest_split_top,
             rest_order: continuation_rest_order,
             enters_under,
             face_down_profile,
@@ -5161,6 +5182,7 @@ pub(super) fn apply_clause_continuation(
                                 filter: TargetFilter::Any,
                                 destination: None,
                                 rest_destination: Some(Zone::Library),
+                                rest_split_top_count: None,
                                 rest_order: DigRestOrder::Preserve,
                                 reveal: false,
                                 enter_tapped: false,
@@ -5184,6 +5206,7 @@ pub(super) fn apply_clause_continuation(
                                 filter: card_filter,
                                 destination: kept_dest,
                                 rest_destination: Some(rest_dest.unwrap_or(Zone::Library)),
+                                rest_split_top_count: None,
                                 rest_order: continuation_rest_order,
                                 reveal: false,
                                 enter_tapped,
@@ -5228,6 +5251,7 @@ pub(super) fn apply_clause_continuation(
                 filter,
                 destination,
                 rest_destination,
+                rest_split_top_count,
                 rest_order,
                 reveal,
                 enter_tapped: dig_enter_tapped,
@@ -5280,6 +5304,13 @@ pub(super) fn apply_clause_continuation(
                 if let Some(rd) = rest_dest {
                     *rest_destination = Some(rd);
                 }
+                // CR 401.2 + CR 701.20e: carry a Telling Time-class remainder
+                // split onto the Dig it patches. Assigned unconditionally (not
+                // `if let Some`) so a continuation that names a uniform
+                // remainder CLEARS any split a previous continuation set —
+                // the last clause to speak about the remainder owns it
+                // (CR 608.2c, written order).
+                *rest_split_top_count = rest_split_top.map(|boxed| *boxed);
                 *rest_order = continuation_rest_order;
                 *dig_enter_tapped = enter_tapped;
                 *dig_enters_attacking = enters_attacking;
@@ -6616,6 +6647,7 @@ pub(super) fn parse_dig_from_among(
             filter,
             destination,
             rest_destination: None,
+            rest_split_top_count: None,
             rest_order: DigRestOrder::Preserve,
             enters_under,
             face_down_profile,
@@ -6723,6 +6755,7 @@ pub(super) fn parse_dig_from_among(
             filter,
             destination,
             rest_destination,
+            rest_split_top_count: None,
             rest_order,
             enters_under,
             face_down_profile,
@@ -6782,12 +6815,24 @@ pub(super) fn parse_dig_from_among(
                 .map_or((None, DigRestOrder::Preserve), |(destination, order)| {
                     (Some(destination), order)
                 });
+            // CR 401.2 + CR 701.20e: a Telling Time-class clause names both
+            // library positions for the remainder rather than one destination
+            // for all of it. The split implies the remainder's destination IS
+            // the library, so it also supplies the `rest_destination` the
+            // uniform "and the rest ..." grammar above did not find.
+            let rest_split_top_count = parse_of_them_rest_split_top_count(lower).map(Box::new);
+            let rest_destination = if rest_split_top_count.is_some() {
+                Some(Zone::Library)
+            } else {
+                rest_destination
+            };
 
             return Some(ContinuationAst::DigFromAmong {
                 quantity,
                 filter: TargetFilter::Any,
                 destination,
                 rest_destination,
+                rest_split_top_count,
                 rest_order,
                 enters_under: None,
                 face_down_profile: None,
@@ -7198,6 +7243,76 @@ fn parse_of_them_rest_destination(lower: &str) -> Option<(Zone, DigRestOrder)> {
             DigRestOrder::Preserve
         },
     ))
+}
+
+/// CR 401.2: The library named by both halves of a remainder split. Factored
+/// into one combinator precisely because CR 401.2 keeps a library a single
+/// face-down pile — the top half and the bottom half must name the SAME
+/// library, so they must not be able to drift into two different grammars.
+fn parse_split_library_owner(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        alt((
+            tag::<_, _, OracleError<'_>>("your library"),
+            tag("their library"),
+        )),
+    )
+    .parse(input)
+}
+
+/// `<count> on top of <library>` — the top half of a remainder split.
+fn parse_split_top_clause(input: &str) -> OracleResult<'_, u32> {
+    terminated(
+        nom_primitives::parse_number,
+        nom::sequence::pair(tag(" on top of "), parse_split_library_owner),
+    )
+    .parse(input)
+}
+
+/// `<count> on the bottom of <library>` — the bottom half of a remainder split.
+fn parse_split_bottom_clause(input: &str) -> OracleResult<'_, u32> {
+    terminated(
+        nom_primitives::parse_number,
+        nom::sequence::pair(tag(" on the bottom of "), parse_split_library_owner),
+    )
+    .parse(input)
+}
+
+/// CR 401.2 + CR 608.2c: The trailing two-position tail of a Telling
+/// Time-class instruction — `<n> on top of your library, and <m> on the bottom
+/// of your library[.]` — anchored at end of clause.
+///
+/// The `eof` anchor is load-bearing: it is what keeps this from firing on a
+/// card that merely mentions both positions somewhere mid-sentence. Yields the
+/// TOP count; the bottom count is the implied complement (CR 401.2 admits no
+/// third position), so it is parsed for grammar but deliberately not stored.
+fn parse_rest_split_tail(input: &str) -> OracleResult<'_, u32> {
+    let (input, top) = parse_split_top_clause(input)?;
+    let (input, _) = tag(", and ").parse(input)?;
+    let (input, _bottom) = parse_split_bottom_clause(input)?;
+    let (input, _) = opt(tag(".")).parse(input)?;
+    let (input, _) = eof(input)?;
+    Ok((input, top))
+}
+
+/// CR 401.2 + CR 701.20e + CR 608.2c: Recognize a Telling Time-class remainder
+/// split on a dig continuation clause — "put one of those cards into your
+/// hand, one on top of your library, and one on the bottom of your library."
+///
+/// Sibling of [`parse_of_them_rest_destination`], which handles the uniform
+/// "... and the rest <somewhere>" form. The two are mutually exclusive by
+/// grammar: this one requires both library positions to be named, that one
+/// requires a "the rest"/"the other" subject. A plain "put the rest on the
+/// bottom of your library" therefore still yields `None` here and keeps its
+/// existing uniform routing.
+///
+/// Delegates the scan to the shared `scan_at_word_boundaries` building block
+/// rather than assuming a fixed offset, since the kept clause ahead of the tail
+/// varies in length ("put one of those cards into your hand" / "put one of them
+/// into your hand").
+pub(super) fn parse_of_them_rest_split_top_count(lower: &str) -> Option<QuantityExpr> {
+    nom_primitives::scan_at_word_boundaries(lower.trim(), parse_rest_split_tail)
+        .map(|top| QuantityExpr::Fixed { value: top as i32 })
 }
 
 /// CR 608.2c: The controller follows a card's instructions in written order;
@@ -7886,6 +8001,7 @@ pub(super) fn parse_followup_continuation_ast_with_search_destination(
                 ])),
                 destination: Some(Zone::Battlefield),
                 rest_destination: None,
+                rest_split_top_count: None,
                 rest_order: DigRestOrder::Preserve,
                 enters_under: None,
                 face_down_profile: None,
@@ -7909,6 +8025,7 @@ pub(super) fn parse_followup_continuation_ast_with_search_destination(
                     Some(DigRestOrder::Random)
                 )
                 .then_some(Zone::Library),
+                rest_split_top_count: None,
                 rest_order: parse_put_one_dig_card_on_top(&lower)
                     .expect("continuation guard just matched"),
                 enters_under: None,
@@ -11299,6 +11416,7 @@ mod tests {
             up_to: false,
             filter: TargetFilter::Any,
             rest_destination: None,
+            rest_split_top_count: None,
             rest_order: crate::types::ability::DigRestOrder::Preserve,
             reveal: false,
             enter_tapped: false,
@@ -11492,6 +11610,7 @@ mod tests {
                 filter: TargetFilter::Any,
                 destination: Some(Zone::Hand),
                 rest_destination: Some(Zone::Library),
+                rest_split_top_count: None,
                 rest_order: DigRestOrder::Preserve,
                 enters_under: None,
                 face_down_profile: None,
@@ -11519,6 +11638,7 @@ mod tests {
                 filter: TargetFilter::Any,
                 destination: Some(Zone::Hand),
                 rest_destination: Some(Zone::Library),
+                rest_split_top_count: None,
                 rest_order: DigRestOrder::Preserve,
                 enters_under: None,
                 face_down_profile: None,
@@ -11551,6 +11671,7 @@ mod tests {
                 filter: TargetFilter::Any,
                 destination: Some(Zone::Hand),
                 rest_destination: Some(Zone::Library),
+                rest_split_top_count: None,
                 rest_order: DigRestOrder::Preserve,
                 enters_under: None,
                 face_down_profile: None,
@@ -11577,6 +11698,7 @@ mod tests {
                 filter: TargetFilter::Any,
                 destination: Some(Zone::Hand),
                 rest_destination: Some(Zone::Graveyard),
+                rest_split_top_count: None,
                 rest_order: DigRestOrder::Preserve,
                 enters_under: None,
                 face_down_profile: None,
@@ -11603,6 +11725,7 @@ mod tests {
                 filter: TargetFilter::Any,
                 destination: Some(Zone::Hand),
                 rest_destination: Some(Zone::Library),
+                rest_split_top_count: None,
                 rest_order: DigRestOrder::Preserve,
                 enters_under: None,
                 face_down_profile: None,
@@ -11631,6 +11754,7 @@ mod tests {
                     filter: TargetFilter::Any,
                     destination: Some(Zone::Hand),
                     rest_destination: None,
+                    rest_split_top_count: None,
                     rest_order: DigRestOrder::Preserve,
                     enters_under: None,
                     face_down_profile: None,
@@ -11931,6 +12055,7 @@ mod tests {
                 filter: TargetFilter::Any,
                 destination: Some(Zone::Hand),
                 rest_destination: Some(Zone::Library),
+                rest_split_top_count: None,
                 rest_order: DigRestOrder::Preserve,
                 enters_under: None,
                 face_down_profile: None,
@@ -12212,6 +12337,7 @@ mod tests {
                 filter: TargetFilter::Typed(TypedFilter::creature()),
                 destination: Some(Zone::Hand),
                 rest_destination: None,
+                rest_split_top_count: None,
                 rest_order: DigRestOrder::Preserve,
                 enters_under: None,
                 face_down_profile: None,
@@ -12263,6 +12389,7 @@ mod tests {
                 filter: TargetFilter::Typed(TypedFilter::creature()),
                 destination: Some(Zone::Hand),
                 rest_destination: None,
+                rest_split_top_count: None,
                 rest_order: DigRestOrder::Preserve,
                 enters_under: None,
                 face_down_profile: None,
@@ -12332,6 +12459,7 @@ mod tests {
                 filter: or_filter.clone(),
                 destination: Some(Zone::Hand),
                 rest_destination: None,
+                rest_split_top_count: None,
                 rest_order: DigRestOrder::Preserve,
                 enters_under: None,
                 face_down_profile: None,
@@ -13380,6 +13508,7 @@ mod tests {
                 ])),
                 destination: Some(Zone::Battlefield),
                 rest_destination: None,
+                rest_split_top_count: None,
                 rest_order: DigRestOrder::Preserve,
                 enters_under: None,
                 face_down_profile: None,
@@ -14861,6 +14990,7 @@ mod tests {
             up_to: false,
             filter: TargetFilter::Any,
             rest_destination: None,
+            rest_split_top_count: None,
             rest_order: DigRestOrder::Preserve,
             reveal: false,
             enter_tapped: false,

@@ -16,11 +16,12 @@ use engine::types::card_type::CardType;
 use engine::types::definitions::Definitions;
 use engine::types::events::{GameEvent, PlayerActionKind};
 use engine::types::game_state::{
-    AbilityActivationRecord, ActivationTargetFact, AutoPassMode, LandPlayRecord, LiminalEntrant,
-    LiminalEntry, LinkedExileSnapshot, PendingConniveReentry, PersistedGameState,
-    PriorityPassingMode, SpellCastRecord, StackEntry, StackEntryKind, StackPaidSnapshot,
-    StackResolutionAutoPassOverlay, StackResolutionBudget, StackResolutionEntryFence,
-    StackResolutionPolicy, StackResolutionSession, TokenProjection, WaitingFor,
+    AbilityActivationRecord, ActivationTargetFact, AutoPassMode, DepartedStackSpell,
+    LandPlayRecord, LiminalEntrant, LiminalEntry, LinkedExileSnapshot, PendingConniveReentry,
+    PersistedGameState, PriorityPassingMode, SpellCastRecord, StackEntry, StackEntryKind,
+    StackPaidSnapshot, StackResolutionAutoPassOverlay, StackResolutionBudget,
+    StackResolutionEntryFence, StackResolutionPolicy, StackResolutionSession, TokenProjection,
+    WaitingFor,
 };
 use engine::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef, TrackedSetId};
 use engine::types::keywords::ProtectionTarget;
@@ -129,6 +130,7 @@ const NUMERIC_MAP_ROUND_TRIP_OWNERS: &[NumericRoundTripOwner] = &[
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::lki_cache", map_key_types: &["ObjectId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::lki_copiable_values", map_key_types: &["ObjectId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::lki_by_incarnation", map_key_types: &["ObjectId", "u64"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
+    NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::departed_stack_spells", map_key_types: &["ObjectId", "u64"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::linked_exile_lki", map_key_types: &["ObjectId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::ring_level", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::ring_bearer", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
@@ -145,6 +147,7 @@ const NUMERIC_MAP_ROUND_TRIP_OWNERS: &[NumericRoundTripOwner] = &[
     NumericRoundTripOwner { id: "src/types/game_state.rs::WaitingFor::DeclareBlockers::block_requirements", map_key_types: &["ObjectId"], group: RoundTripGroup::DeclareBlockers, numeric_deserializer: Some(NUMERIC_HASH_MAP_DESERIALIZER) },
     NumericRoundTripOwner { id: "src/types/game_state.rs::WaitingFor::DeclareBlockers::blocker_constraints", map_key_types: &["ObjectId"], group: RoundTripGroup::DeclareBlockers, numeric_deserializer: Some(NUMERIC_HASH_MAP_DESERIALIZER) },
     NumericRoundTripOwner { id: "src/types/game_state.rs::WaitingFor::DeclareBlockers::must_be_blocked_targets", map_key_types: &["ObjectId"], group: RoundTripGroup::DeclareBlockers, numeric_deserializer: Some(NUMERIC_HASH_MAP_DESERIALIZER) },
+    NumericRoundTripOwner { id: "src/types/game_state.rs::WaitingFor::DeclareBlockers::block_capacities", map_key_types: &["ObjectId"], group: RoundTripGroup::DeclareBlockers, numeric_deserializer: Some(NUMERIC_HASH_MAP_DESERIALIZER) },
 ];
 
 fn owner_id(file: &str, owner: &str, variant: Option<&str>, field: &str) -> String {
@@ -386,6 +389,15 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
         game_state,
         "GameState",
         None,
+        "departed_stack_spells",
+        "im::HashMap<im::HashMap>",
+        Classification::Canonical(IM_HASH_MAP_OF_IM_HASH_MAP),
+    );
+    add_spec(
+        &mut specs,
+        game_state,
+        "GameState",
+        None,
         "trigger_fire_counts_this_turn",
         "HashMap",
         Classification::Canonical(HASH_MAP_ENTRIES),
@@ -500,6 +512,13 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
             "WaitingFor",
             Some("DeclareBlockers"),
             "must_be_blocked_targets",
+            "HashMap",
+            HASH_MAP,
+        ),
+        (
+            "WaitingFor",
+            Some("DeclareBlockers"),
+            "block_capacities",
             "HashMap",
             HASH_MAP,
         ),
@@ -1188,7 +1207,7 @@ fn serde_hash_owner_census_is_exhaustive_and_every_canonical_owner_names_its_ada
 
     assert_eq!(
         NUMERIC_MAP_ROUND_TRIP_OWNERS.len(),
-        54,
+        56,
         "the reviewed numeric-map owner matrix must remain exact"
     );
     for group in [
@@ -1729,6 +1748,40 @@ fn build_all_direct_numeric_maps_state() -> GameState {
             im::HashMap::from_iter([(1, second_lki.clone()), (2, first_lki.clone())]),
         ),
     ]);
+    let departed_spell =
+        |entry_id: ObjectId, controller: PlayerId, object: &GameObject| DepartedStackSpell {
+            entry: StackEntry {
+                id: entry_id,
+                source_id: entry_id,
+                controller,
+                kind: StackEntryKind::ActivatedAbility {
+                    source_id: entry_id,
+                    ability: Box::new(ResolvedAbility::new(
+                        Effect::NoOp,
+                        Vec::new(),
+                        entry_id,
+                        controller,
+                    )),
+                },
+            },
+            object: Box::new(object.clone()),
+        };
+    state.departed_stack_spells = im::HashMap::from_iter([
+        (
+            ObjectId(1),
+            im::HashMap::from_iter([
+                (1, departed_spell(ObjectId(1), PlayerId(0), &first)),
+                (2, departed_spell(ObjectId(1), PlayerId(0), &second)),
+            ]),
+        ),
+        (
+            ObjectId(2),
+            im::HashMap::from_iter([
+                (1, departed_spell(ObjectId(2), PlayerId(1), &second)),
+                (2, departed_spell(ObjectId(2), PlayerId(1), &first)),
+            ]),
+        ),
+    ]);
     state.linked_exile_lki = HashMap::from([
         (
             ObjectId(1),
@@ -1821,6 +1874,7 @@ fn every_direct_numeric_key_game_state_map_round_trips_populated() {
         "lki_cache",
         "lki_copiable_values",
         "lki_by_incarnation",
+        "departed_stack_spells",
         "linked_exile_lki",
         "ring_level",
         "ring_bearer",
@@ -1829,7 +1883,7 @@ fn every_direct_numeric_key_game_state_map_round_trips_populated() {
     ];
     assert_eq!(
         direct_fields.len(),
-        42,
+        43,
         "private stack_trigger_firings is covered by its unit test"
     );
     for field in direct_fields {
@@ -1844,7 +1898,11 @@ fn every_direct_numeric_key_game_state_map_round_trips_populated() {
             "{field}: exact key/value membership changed"
         );
     }
-    for field in ["tracked_set_member_causes", "lki_by_incarnation"] {
+    for field in [
+        "tracked_set_member_causes",
+        "lki_by_incarnation",
+        "departed_stack_spells",
+    ] {
         for (outer_key, inner) in before[field].as_object().unwrap() {
             assert_eq!(
                 inner.as_object().map(serde_json::Map::len),
@@ -2113,6 +2171,7 @@ fn declare_blockers_numeric_maps_round_trip_through_value_bare_raw_and_trusted()
             (ObjectId(3), vec![ObjectId(1)]),
             (ObjectId(4), vec![ObjectId(1)]),
         ]),
+        block_capacities: HashMap::from([(ObjectId(3), Some(1)), (ObjectId(4), None)]),
     };
     let value = waiting_value(&waiting);
     for field in [
@@ -2120,6 +2179,7 @@ fn declare_blockers_numeric_maps_round_trip_through_value_bare_raw_and_trusted()
         "block_requirements",
         "blocker_constraints",
         "must_be_blocked_targets",
+        "block_capacities",
     ] {
         assert_eq!(
             value["data"][field].as_object().map(serde_json::Map::len),
@@ -2141,6 +2201,7 @@ fn declare_blockers_numeric_maps_round_trip_through_value_bare_raw_and_trusted()
         block_requirements: HashMap::new(),
         blocker_constraints: HashMap::new(),
         must_be_blocked_targets: HashMap::new(),
+        block_capacities: HashMap::new(),
     };
     let empty_value = waiting_value(&empty);
     assert_eq!(

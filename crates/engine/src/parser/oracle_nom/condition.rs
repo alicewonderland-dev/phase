@@ -14,6 +14,7 @@ use nom::Parser;
 
 use super::bridge::nom_on_lower;
 use super::error::{oracle_err, OracleError, OracleResult};
+use super::filter as nom_filter;
 use super::primitives::{
     parse_article, parse_color, parse_keyword_name, parse_mana_cost, parse_number,
     parse_object_recipient_pronoun, parse_property_keyword, parse_superlative_adjective,
@@ -689,6 +690,10 @@ fn parse_damage_dealt_this_turn_conditions(input: &str) -> OracleResult<'_, Stat
         // "was dealt excess damage this turn" wins over the shorter "was dealt
         // damage this turn" prefix in `parse_source_was_dealt_damage_this_turn`.
         parse_subject_was_dealt_excess_damage_this_turn,
+        // Quantity-first passive ("N or more damage was dealt to it this turn")
+        // must precede the subject-first player threshold so a leading numeral
+        // is not left for a later Fail.
+        parse_n_or_more_damage_was_dealt_to_source_this_turn,
         parse_player_was_dealt_damage_threshold_this_turn,
         parse_player_dealt_combat_damage_by_source_this_turn,
         parse_source_dealt_damage_this_turn,
@@ -767,6 +772,44 @@ fn parse_subject_was_dealt_excess_damage_this_turn(
                 channel: DamageChannel::Excess,
             },
             1,
+        ),
+    ))
+}
+
+/// CR 107.1 + CR 120.1 + CR 603.4: "N or more damage was dealt to
+/// it/this creature/~ this turn" — Zubera-class dies intervening-if.
+///
+/// Quantity-first passive, distinct from
+/// `parse_player_was_dealt_damage_threshold_this_turn` (subject-first
+/// "you were dealt N or more damage this turn") and from
+/// `parse_source_was_dealt_damage_this_turn` (existential "this creature
+/// was dealt damage this turn"). Reuses `parse_ge_threshold` and
+/// `DamageDealtThisTurn` (target `SelfRef`); no new variant.
+fn parse_n_or_more_damage_was_dealt_to_source_this_turn(
+    input: &str,
+) -> OracleResult<'_, StaticCondition> {
+    let (rest, amount) = parse_ge_threshold(input)?;
+    let (rest, _) = tag("damage was dealt to ").parse(rest)?;
+    let (rest, _) = alt((
+        tag("this creature"),
+        tag("this permanent"),
+        tag("~"),
+        tag("it"),
+    ))
+    .parse(rest)?;
+    let (rest, _) = tag(" this turn").parse(rest)?;
+    Ok((
+        rest,
+        make_quantity_ge(
+            QuantityRef::DamageDealtThisTurn {
+                source: Box::new(TargetFilter::Any),
+                target: Box::new(TargetFilter::SelfRef),
+                aggregate: AggregateFunction::Sum,
+                group_by: None,
+                damage_kind: DamageKindFilter::Any,
+                channel: DamageChannel::Total,
+            },
+            amount,
         ),
     ))
 }
@@ -7436,23 +7479,21 @@ fn parse_creatures_died_this_turn_threshold(input: &str) -> OracleResult<'_, Sta
 }
 
 /// "a <type-phrase> died this turn" — the filtered Morbid gate without a
-/// controller scope (Undead Sprinter's "a non-Zombie creature died this turn").
-/// Mirrors `parse_died_under_control_this_turn` but terminates on the bare
-/// " died this turn" and injects NO controller constraint. Rejects a non-empty
-/// type-phrase leftover / `TargetFilter::Any` so only a fully-typed subject claims
-/// the arm — a name-negation ("a creature not named X died this turn", Ebondeath)
-/// leaves "not named …" as leftover and falls through to a clean gap.
+/// controller scope (Undead Sprinter's "a non-Zombie creature died this turn";
+/// Ebondeath, Dracolich's "a creature not named Ebondeath, Dracolich died this
+/// turn"). Mirrors `parse_died_under_control_this_turn` but terminates on the
+/// bare " died this turn" and injects NO controller constraint. The subject is
+/// read by the shared `parse_died_subject_filter`.
 fn parse_filtered_creature_died_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = parse_article(input)?;
     let (rest, type_text) = take_until(" died this turn").parse(rest)?;
     let (rest, _) = tag(" died this turn").parse(rest)?;
-    let (filter, leftover) = parse_type_phrase_folding(type_text);
-    if !leftover.trim().is_empty() || filter == TargetFilter::Any {
+    let Some(filter) = parse_died_subject_filter(type_text) else {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
             nom::error::ErrorKind::Fail,
         )));
-    }
+    };
     Ok((
         rest,
         make_quantity_ge(
@@ -7464,6 +7505,39 @@ fn parse_filtered_creature_died_this_turn(input: &str) -> OracleResult<'_, Stati
             1,
         ),
     ))
+}
+
+/// CR 700.4 + CR 201.2: the subject of a "<subject> died [under …] this turn"
+/// gate, shared by the plain and under-control arms. A fully consumed type
+/// phrase keeps today's filter. A trailing "not named <name>" is folded in as
+/// `Not(Named)` (`oracle_nom::filter::parse_not_named_suffix`). The dead
+/// creature's name is read off its death-time zone-change snapshot, which the
+/// Ebondeath ruling requires ("cares what the creature's name was while it was
+/// last on the battlefield").
+///
+/// Returns `None` (the arm fails, leaving an honest gap) when:
+/// - the phrase is unrecognized (`Any`);
+/// - anything besides that suffix is left over;
+/// - the name exclusion would have to bind to a non-`Typed` (`Or`/`And`)
+///   subject, which isn't modelled.
+fn parse_died_subject_filter(type_text: &str) -> Option<TargetFilter> {
+    let (filter, leftover) = parse_type_phrase_folding(type_text);
+    if filter == TargetFilter::Any {
+        return None;
+    }
+    let leftover = leftover.trim();
+    if leftover.is_empty() {
+        return Some(filter);
+    }
+    let TargetFilter::Typed(mut typed) = filter else {
+        return None;
+    };
+    let (rest, name_exclusion) = nom_filter::parse_not_named_suffix(leftover).ok()?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    typed.properties.push(name_exclusion);
+    Some(TargetFilter::Typed(typed))
 }
 
 /// CR 106.3 + CR 601.2h + CR 603.4: Parse
@@ -8429,13 +8503,12 @@ fn parse_died_under_control_this_turn(input: &str) -> OracleResult<'_, StaticCon
     ))
     .parse(rest)?;
     let (rest, _) = tag(" this turn").parse(rest)?;
-    let (filter, leftover) = parse_type_phrase_folding(type_text);
-    if !leftover.trim().is_empty() || filter == TargetFilter::Any {
+    let Some(filter) = parse_died_subject_filter(type_text) else {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
             nom::error::ErrorKind::Fail,
         )));
-    }
+    };
     Ok((
         rest,
         make_quantity_ge(
@@ -24173,6 +24246,74 @@ mod tests {
             !matches!(target.as_ref(), TargetFilter::Any),
             "target filter must be non-Any, got: {target:?}"
         );
+    }
+
+    /// CR 107.1 + CR 120.1 + CR 603.4: quantity-first "N or more damage was
+    /// dealt to it this turn" (Burning-Eye Zubera / Rushing-Tide Zubera).
+    #[test]
+    fn parse_inner_condition_n_or_more_damage_was_dealt_to_it_this_turn() {
+        let (rest, cond) =
+            parse_inner_condition("4 or more damage was dealt to it this turn").unwrap();
+        assert_eq!(rest, "");
+        let StaticCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty:
+                        QuantityRef::DamageDealtThisTurn {
+                            ref source,
+                            ref target,
+                            channel,
+                            damage_kind,
+                            ..
+                        },
+                },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 4 },
+        } = cond
+        else {
+            panic!("expected DamageDealtThisTurn GE 4, got: {cond:?}");
+        };
+        assert_eq!(source.as_ref(), &TargetFilter::Any);
+        assert_eq!(target.as_ref(), &TargetFilter::SelfRef);
+        assert_eq!(channel, DamageChannel::Total);
+        assert_eq!(damage_kind, DamageKindFilter::Any);
+    }
+
+    /// English numeral + `this creature` self-ref, same encoding.
+    #[test]
+    fn parse_inner_condition_four_or_more_damage_was_dealt_to_this_creature() {
+        let (rest, cond) =
+            parse_inner_condition("four or more damage was dealt to this creature this turn")
+                .unwrap();
+        assert_eq!(rest, "");
+        let StaticCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty: QuantityRef::DamageDealtThisTurn { ref target, .. },
+                },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 4 },
+        } = cond
+        else {
+            panic!("expected DamageDealtThisTurn GE 4, got: {cond:?}");
+        };
+        assert_eq!(target.as_ref(), &TargetFilter::SelfRef);
+    }
+
+    /// Existential "was dealt damage this turn" must not swallow the
+    /// quantity-first form (reach-guard for alt order).
+    #[test]
+    fn parse_inner_condition_n_or_more_damage_was_dealt_does_not_collapse_to_ge_1() {
+        let (_, cond) =
+            parse_inner_condition("4 or more damage was dealt to it this turn").unwrap();
+        let StaticCondition::QuantityComparison {
+            rhs: QuantityExpr::Fixed { value },
+            ..
+        } = cond
+        else {
+            panic!("expected QuantityComparison, got: {cond:?}");
+        };
+        assert_eq!(value, 4, "must not collapse to existential GE 1");
     }
 
     /// Assert exact AST equality and full consumption for paired ASCII (`'`) and
