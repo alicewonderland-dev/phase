@@ -954,6 +954,7 @@ mod issue_9143_mad_wizards_lair_pipeline;
 mod issue_9180_force_block_named_attacker_not_attacking;
 mod issue_924_offspring;
 mod issue_927_tireless_provisioner;
+mod issue_9282_counter_stack_referent;
 mod issue_934_ring_goes_south;
 mod issue_941_champions_full_party;
 mod issue_bound_by_moonsilver_sacrifice_attach;

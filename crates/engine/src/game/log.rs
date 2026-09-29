@@ -4,7 +4,7 @@ use crate::game::combat::AttackTarget;
 use crate::game::planechase::PlanarDieFace;
 use crate::types::ability::{AbilityTag, TargetRef};
 use crate::types::events::{GameEvent, PlayerActionKind};
-use crate::types::game_state::{GameState, ZoneChangeRecord};
+use crate::types::game_state::{GameState, StackEntryKind, ZoneChangeRecord};
 use crate::types::identifiers::ObjectId;
 use crate::types::log::{
     GameLogEntry, LogBoundary, LogCategory, LogImportance, LogPresentation, LogSegment, LogTone,
@@ -48,6 +48,7 @@ pub fn resolve_log_entries(
                 && !is_concealed_move(events, index, &batch, after))
             .then(|| {
                 let mut segments = format_segments(event, after);
+                name_ability_entries_by_source(&mut segments, before, after);
                 name_at_event_time(&mut segments, &batch, index + 1);
                 (!segments.is_empty()).then(|| GameLogEntry {
                     seq: 0, // Assigned by frontend
@@ -738,6 +739,26 @@ fn should_exclude_event(event: &GameEvent) -> bool {
         // not be narrated as an attack against the default defender.
         GameEvent::AttackersDeclared { attacker_ids, .. } if attacker_ids.is_empty() => true,
         _ => false,
+    }
+}
+
+/// CR 113.7: a segment citing an activated or triggered ability's stack entry
+/// cites that ability's source instead. Read from `before`, because a
+/// countered ability has already left `after`'s stack.
+fn name_ability_entries_by_source(
+    segments: &mut [LogSegment],
+    before: &GameState,
+    after: &GameState,
+) {
+    for segment in segments {
+        let LogSegment::CardName { object_id, .. } = segment else {
+            continue;
+        };
+        if let Some(entry) = before.stack.iter().find(|entry| {
+            entry.id == *object_id && !matches!(entry.kind, StackEntryKind::Spell { .. })
+        }) {
+            *segment = card_seg(after, entry.source_id);
+        }
     }
 }
 
@@ -2709,6 +2730,81 @@ mod tests {
             excess: 0,
         };
         assert_eq!(categorize(&event), LogCategory::Combat);
+    }
+
+    /// A segment citing an ability's stack entry that was on the stack when the
+    /// batch began names the ability's source.
+    #[test]
+    fn stack_ability_segments_name_the_ability_source() {
+        use crate::types::ability::{Effect, ResolvedAbility};
+        use crate::types::game_state::StackEntry;
+        let mut after = GameState::new_two_player(42);
+        let pinger = create_object(
+            &mut after,
+            CardId(1),
+            PlayerId(0),
+            "Pinger".to_string(),
+            crate::types::zones::Zone::Battlefield,
+        );
+        let countered_by = create_object(
+            &mut after,
+            CardId(2),
+            PlayerId(1),
+            "Stifle".to_string(),
+            crate::types::zones::Zone::Graveyard,
+        );
+        let entry = ObjectId(after.next_object_id);
+        after.next_object_id += 1;
+        let mut before = after.clone();
+        before.stack.push_back(StackEntry {
+            id: entry,
+            source_id: pinger,
+            controller: PlayerId(0),
+            kind: StackEntryKind::ActivatedAbility {
+                source_id: pinger,
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::NoOp,
+                    vec![],
+                    pinger,
+                    PlayerId(0),
+                )),
+            },
+        });
+        let events = [
+            GameEvent::BecomesTarget {
+                target: TargetRef::Object(entry),
+                source_id: countered_by,
+                source_controller: PlayerId(1),
+            },
+            GameEvent::SpellCountered {
+                object_id: entry,
+                countered_by,
+                countered_by_controller: PlayerId(1),
+            },
+        ];
+        let entries = resolve_log_entries(&events, &before, &after);
+        let cards: Vec<Vec<(&str, ObjectId)>> = entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .segments
+                    .iter()
+                    .filter_map(|segment| match segment {
+                        LogSegment::CardName { name, object_id } => {
+                            Some((name.as_str(), *object_id))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            cards,
+            vec![
+                vec![("Pinger", pinger), ("Stifle", countered_by)],
+                vec![("Stifle", countered_by), ("Pinger", pinger)],
+            ]
+        );
     }
 
     #[test]
