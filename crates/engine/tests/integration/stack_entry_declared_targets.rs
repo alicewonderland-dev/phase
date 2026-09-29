@@ -1531,3 +1531,368 @@ fn a_spell_whose_player_target_is_changed_to_a_creature_targets_that_creature() 
     );
     assert_eq!(declared, vec![TargetRef::Object(spellskite)], "CR 115.7b");
 }
+
+const SYMBIOSIS: &str = "Two target creatures each get +2/+2 until end of turn.";
+const CONDUCT_ELECTRICITY: &str = "Conduct Electricity deals 6 damage to target creature and 2 damage to up to one target creature token.";
+
+/// P0 casts Symbiosis at `first` and `second`, then Twincast at it, and gives
+/// the copy `new_targets` one prompt slot at a time.
+fn symbiosis_copy_retargeted(
+    new_targets: fn(ObjectId, ObjectId, ObjectId) -> [ObjectId; 2],
+) -> (GameRunner, ObjectId, [ObjectId; 3]) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let first = scenario.add_creature(P0, "First Bear", 2, 2).id();
+    let second = scenario.add_creature(P0, "Second Bear", 2, 2).id();
+    let third = scenario.add_creature(P0, "Third Bear", 2, 2).id();
+    let symbiosis = scenario
+        .add_spell_to_hand_from_oracle(P0, "Symbiosis", true, SYMBIOSIS)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let twincast = scenario
+        .add_spell_to_hand_from_oracle(P0, "Twincast", true, TWINCAST)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner
+        .cast(symbiosis)
+        .target_objects(&[first, second])
+        .commit();
+    runner.cast(twincast).target_objects(&[symbiosis]).commit();
+    pass_until(&mut runner, |state| {
+        matches!(
+            state.waiting_for,
+            WaitingFor::OptionalEffectChoice { .. } | WaitingFor::CopyRetarget { .. }
+        )
+    });
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::OptionalEffectChoice { .. }
+    ) {
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: true })
+            .expect("choose new targets");
+    }
+    let copy = copy_being_cast(&runner);
+    for target in new_targets(first, second, third) {
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(target)),
+            })
+            .expect("choose the copy's target for this slot");
+    }
+    (runner, copy, [first, second, third])
+}
+
+#[test]
+fn a_copy_given_targets_that_overlap_its_old_ones_targets_them_in_order() {
+    let (runner, copy, [_, second, third]) =
+        symbiosis_copy_retargeted(|_, second, third| [second, third]);
+    let expected = vec![TargetRef::Object(second), TargetRef::Object(third)];
+    let (held, declared) = both(runner.state(), copy);
+    assert_eq!(
+        held, expected,
+        "reach guard: the copy's new targets were written"
+    );
+    assert_eq!(declared, expected, "CR 707.10c");
+}
+
+#[test]
+fn a_copy_given_its_targets_in_swapped_order_targets_them_in_that_order() {
+    let (runner, copy, [first, second, _]) =
+        symbiosis_copy_retargeted(|first, second, _| [second, first]);
+    let expected = vec![TargetRef::Object(second), TargetRef::Object(first)];
+    let (held, declared) = both(runner.state(), copy);
+    assert_eq!(
+        held, expected,
+        "reach guard: the copy's new targets were written"
+    );
+    assert_eq!(declared, expected, "CR 707.10c");
+}
+
+/// P1 casts Redirect at `spell` and chooses `new_targets` for it.
+fn redirect(
+    runner: &mut GameRunner,
+    redirect: ObjectId,
+    spell: ObjectId,
+    new_targets: Vec<TargetRef>,
+) {
+    runner.act(GameAction::PassPriority).expect("pass to P1");
+    runner.cast(redirect).target_objects(&[spell]).commit();
+    pass_until(runner, |state| {
+        matches!(
+            state.waiting_for,
+            WaitingFor::OptionalEffectChoice { .. } | WaitingFor::RetargetChoice { .. }
+        )
+    });
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::OptionalEffectChoice { .. }
+    ) {
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: true })
+            .expect("choose new targets");
+    }
+    runner
+        .act(GameAction::RetargetSpell { new_targets })
+        .expect("retarget");
+}
+
+/// P0 casts Arc Trail at `first` and `second`; P1 gives it the targets
+/// `new_targets` picks.
+fn arc_trail_redirected(
+    new_targets: fn(ObjectId, ObjectId, ObjectId) -> [ObjectId; 2],
+) -> (GameRunner, ObjectId, Vec<TargetRef>) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let first = scenario.add_creature(P1, "First Bear", 2, 2).id();
+    let second = scenario.add_creature(P1, "Second Bear", 2, 2).id();
+    let third = scenario.add_creature(P1, "Third Bear", 2, 2).id();
+    let arc_trail = scenario
+        .add_spell_to_hand_from_oracle(P0, "Arc Trail", false, ARC_TRAIL)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let redirect_card = scenario
+        .add_spell_to_hand_from_oracle(P1, "Redirect", true, REDIRECT)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner
+        .cast(arc_trail)
+        .target_objects(&[first, second])
+        .commit();
+    let new_targets: Vec<TargetRef> = new_targets(first, second, third)
+        .into_iter()
+        .map(TargetRef::Object)
+        .collect();
+    redirect(&mut runner, redirect_card, arc_trail, new_targets.clone());
+    (runner, arc_trail, new_targets)
+}
+
+#[test]
+fn a_spell_given_targets_that_overlap_its_old_ones_targets_them_in_order() {
+    let (runner, arc_trail, expected) = arc_trail_redirected(|_, second, third| [second, third]);
+    let (held, declared) = both(runner.state(), arc_trail);
+    assert_eq!(held, expected, "reach guard: the new targets were written");
+    assert_eq!(declared, expected, "CR 115.7d + CR 115.7e");
+}
+
+#[test]
+fn a_spell_given_its_targets_in_swapped_order_targets_them_in_that_order() {
+    let (runner, arc_trail, expected) = arc_trail_redirected(|first, second, _| [second, first]);
+    let (held, declared) = both(runner.state(), arc_trail);
+    assert_eq!(held, expected, "reach guard: the new targets were written");
+    assert_eq!(declared, expected, "CR 115.7d + CR 115.7e");
+}
+
+#[test]
+fn a_spell_that_targets_one_token_twice_keeps_the_target_left_unchanged() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let token = scenario.add_creature(P1, "Token", 3, 3).id();
+    let other_token = scenario.add_creature(P1, "Other Token", 3, 3).id();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Conduct Electricity", true, CONDUCT_ELECTRICITY)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let redirect_card = scenario
+        .add_spell_to_hand_from_oracle(P1, "Redirect", true, REDIRECT)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    for id in [token, other_token] {
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&id)
+            .expect("token")
+            .is_token = true;
+    }
+    runner.cast(spell).target_objects(&[token, token]).commit();
+    assert_eq!(
+        declared_of(runner.state(), spell),
+        vec![TargetRef::Object(token), TargetRef::Object(token)],
+        "reach guard: CR 115.3 lets one token be both targets"
+    );
+    let expected = vec![TargetRef::Object(token), TargetRef::Object(other_token)];
+    redirect(&mut runner, redirect_card, spell, expected.clone());
+    let (held, declared) = both(runner.state(), spell);
+    assert_eq!(
+        held, expected,
+        "reach guard: only the second target changed"
+    );
+    assert_eq!(declared, expected, "CR 115.3 + CR 115.7d");
+}
+
+const SWORDS_TO_PLOWSHARES: &str =
+    "Exile target creature. Its controller gains life equal to its power.";
+const BLOODCHIEFS_THIRST: &str = "Kicker {2}{B} (You may pay an additional {2}{B} as you cast this spell.)\nDestroy target creature or planeswalker with mana value 2 or less. If this spell was kicked, instead destroy target creature or planeswalker.";
+
+#[test]
+fn swords_to_plowshares_targets_only_the_creature_it_exiles() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let bear = scenario.add_creature(P1, "Bear", 2, 2).id();
+    let swords = scenario
+        .add_spell_to_hand_from_oracle(P0, "Swords to Plowshares", true, SWORDS_TO_PLOWSHARES)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(swords).target_objects(&[bear]).commit();
+    let (held, declared) = both(runner.state(), swords);
+    assert_eq!(
+        held,
+        vec![TargetRef::Object(bear), TargetRef::Object(bear)],
+        "reach guard: the life-gain clause holds a copy of the target"
+    );
+    assert_eq!(declared, vec![TargetRef::Object(bear)], "CR 115.10a");
+}
+
+#[test]
+fn a_kicked_spell_targets_only_what_its_kicked_clause_is_cast_at() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let bear = scenario.add_creature(P1, "Bear", 2, 2).id();
+    let thirst = scenario
+        .add_spell_to_hand_from_oracle(P0, "Bloodchief's Thirst", false, BLOODCHIEFS_THIRST)
+        .from_oracle_text_with_keywords(&["Kicker"], BLOODCHIEFS_THIRST)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        vec![
+            ManaUnit::new(ManaType::Black, thirst, false, vec![]),
+            ManaUnit::new(ManaType::Colorless, thirst, false, vec![]),
+            ManaUnit::new(ManaType::Colorless, thirst, false, vec![]),
+        ],
+    );
+    let mut runner = scenario.build();
+    runner
+        .cast(thirst)
+        .accept_optional()
+        .target_objects(&[bear])
+        .commit();
+    let (held, declared) = both(runner.state(), thirst);
+    assert_eq!(
+        held,
+        vec![TargetRef::Object(bear), TargetRef::Object(bear)],
+        "reach guard: the kicked clause's parent holds a copy of its target"
+    );
+    assert_eq!(declared, vec![TargetRef::Object(bear)], "CR 115.1");
+}
+
+#[test]
+fn a_copy_of_a_kicked_spell_given_a_new_target_targets_it() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let bear = scenario.add_creature(P1, "Bear", 2, 2).id();
+    let other = scenario.add_creature(P1, "Other Bear", 2, 2).id();
+    let thirst = scenario
+        .add_spell_to_hand_from_oracle(P0, "Bloodchief's Thirst", false, BLOODCHIEFS_THIRST)
+        .from_oracle_text_with_keywords(&["Kicker"], BLOODCHIEFS_THIRST)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let twincast = scenario
+        .add_spell_to_hand_from_oracle(P0, "Twincast", true, TWINCAST)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        vec![
+            ManaUnit::new(ManaType::Black, thirst, false, vec![]),
+            ManaUnit::new(ManaType::Colorless, thirst, false, vec![]),
+            ManaUnit::new(ManaType::Colorless, thirst, false, vec![]),
+        ],
+    );
+    let mut runner = scenario.build();
+    runner
+        .cast(thirst)
+        .accept_optional()
+        .target_objects(&[bear])
+        .commit();
+    runner.cast(twincast).target_objects(&[thirst]).commit();
+    pass_until(&mut runner, |state| {
+        matches!(
+            state.waiting_for,
+            WaitingFor::OptionalEffectChoice { .. } | WaitingFor::CopyRetarget { .. }
+        )
+    });
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::OptionalEffectChoice { .. }
+    ) {
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: true })
+            .expect("choose new targets");
+    }
+    let copy = copy_being_cast(&runner);
+    runner
+        .act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(other)),
+        })
+        .expect("choose the copy's new target");
+    let copy_targets = runner
+        .state()
+        .stack
+        .iter()
+        .find(|e| e.id == copy)
+        .and_then(|e| e.ability())
+        .map(|ability| ability.targets.clone());
+    assert_eq!(
+        copy_targets,
+        Some(vec![TargetRef::Object(other)]),
+        "reach guard: the new target was written"
+    );
+    assert_eq!(
+        declared_of(runner.state(), copy),
+        vec![TargetRef::Object(other)],
+        "CR 707.10c"
+    );
+}
+
+#[test]
+fn a_kicked_spell_given_a_new_target_targets_it() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let bear = scenario.add_creature(P1, "Bear", 2, 2).id();
+    let other = scenario.add_creature(P1, "Other Bear", 2, 2).id();
+    let thirst = scenario
+        .add_spell_to_hand_from_oracle(P0, "Bloodchief's Thirst", false, BLOODCHIEFS_THIRST)
+        .from_oracle_text_with_keywords(&["Kicker"], BLOODCHIEFS_THIRST)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let redirect_card = scenario
+        .add_spell_to_hand_from_oracle(P1, "Redirect", true, REDIRECT)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        vec![
+            ManaUnit::new(ManaType::Black, thirst, false, vec![]),
+            ManaUnit::new(ManaType::Colorless, thirst, false, vec![]),
+            ManaUnit::new(ManaType::Colorless, thirst, false, vec![]),
+        ],
+    );
+    let mut runner = scenario.build();
+    runner
+        .cast(thirst)
+        .accept_optional()
+        .target_objects(&[bear])
+        .commit();
+    assert_eq!(
+        declared_of(runner.state(), thirst),
+        vec![TargetRef::Object(bear)],
+        "reach guard: the kicked spell was cast at the first creature"
+    );
+    redirect(
+        &mut runner,
+        redirect_card,
+        thirst,
+        vec![TargetRef::Object(other)],
+    );
+    assert_eq!(
+        declared_of(runner.state(), thirst),
+        vec![TargetRef::Object(other)],
+        "CR 115.7d"
+    );
+}

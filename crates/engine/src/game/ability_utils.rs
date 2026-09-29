@@ -1918,9 +1918,11 @@ pub fn assign_targets_in_chain(
 ) -> Result<(), EngineError> {
     if is_per_opponent_target_fanout(ability) || !chain_has_target_sink(ability) {
         ability.targets = targets.to_vec();
-        finish_target_assignment(state, ability, targets.to_vec());
+        record_root_target_slots(ability);
+        ability.capture_target_incarnations_recursive(state);
         return Ok(());
     }
+    let held_before = chain_target_counts(ability);
     let mut next_target = 0usize;
     assign_targets_recursive(state, ability, targets, &mut next_target)?;
     if next_target != targets.len() {
@@ -1928,8 +1930,9 @@ pub fn assign_targets_in_chain(
             "Unused selected targets".to_string(),
         ));
     }
+    record_appended_target_slots(ability, &held_before, targets);
     stamp_other_batch_source_targets(ability);
-    finish_target_assignment(state, ability, targets.to_vec());
+    ability.capture_target_incarnations_recursive(state);
     Ok(())
 }
 
@@ -1940,10 +1943,12 @@ pub fn assign_selected_slots_in_chain(
 ) -> Result<(), EngineError> {
     let chosen: Vec<TargetRef> = selected_slots.iter().flatten().cloned().collect();
     if is_per_opponent_target_fanout(ability) || !chain_has_target_sink(ability) {
-        ability.targets = chosen.clone();
-        finish_target_assignment(state, ability, chosen);
+        ability.targets = chosen;
+        record_root_target_slots(ability);
+        ability.capture_target_incarnations_recursive(state);
         return Ok(());
     }
+    let held_before = chain_target_counts(ability);
     let mut next_slot = 0usize;
     assign_selected_slots_recursive(state, ability, selected_slots, &mut next_slot)?;
     if next_slot != selected_slots.len() {
@@ -1951,27 +1956,67 @@ pub fn assign_selected_slots_in_chain(
             "Unused selected target slots".to_string(),
         ));
     }
+    record_appended_target_slots(ability, &held_before, &chosen);
     stamp_other_batch_source_targets(ability);
-    finish_target_assignment(state, ability, chosen);
+    ability.capture_target_incarnations_recursive(state);
     Ok(())
 }
 
-fn finish_target_assignment(
-    state: &GameState,
-    ability: &mut ResolvedAbility,
-    chosen: Vec<TargetRef>,
-) {
-    record_declared_targets(ability, chosen);
-    ability.capture_target_incarnations_recursive(state);
+/// Records the chosen slots of an assignment that wrote all its targets to the
+/// root.
+pub(crate) fn record_root_target_slots(ability: &mut ResolvedAbility) {
+    // CR 115.1: the opponents a per-opponent fanout iterates are not targets.
+    let fanout = is_per_opponent_target_fanout(ability);
+    ability.chosen_target_slots = ability
+        .targets
+        .iter()
+        .enumerate()
+        .filter(|(_, target)| !fanout || matches!(target, TargetRef::Object(_)))
+        .map(|(slot, _)| slot)
+        .collect();
 }
 
-pub(crate) fn record_declared_targets(ability: &mut ResolvedAbility, chosen: Vec<TargetRef>) {
-    // CR 115.1: the opponents a per-opponent fanout iterates are not targets.
-    ability.declared_targets = if is_per_opponent_target_fanout(ability) {
-        object_targets_only(&chosen)
-    } else {
-        chosen
-    };
+/// The `targets` length of each chain node, in the order
+/// [`record_appended_target_slots`] visits them.
+fn chain_target_counts(ability: &ResolvedAbility) -> Vec<usize> {
+    let mut counts = vec![ability.targets.len()];
+    if let Some(sub_ability) = ability.sub_ability.as_deref() {
+        counts.extend(chain_target_counts(sub_ability));
+    }
+    if let Some(else_ability) = ability.else_ability.as_deref() {
+        counts.extend(chain_target_counts(else_ability));
+    }
+    counts
+}
+
+/// CR 601.2c: records which chain slots hold `chosen`, claiming the slots each
+/// node gained in the assignment, in chain order. `held_before` is
+/// [`chain_target_counts`] taken before that assignment, so a referent a node
+/// already held is not recorded.
+fn record_appended_target_slots(
+    ability: &mut ResolvedAbility,
+    held_before: &[usize],
+    chosen: &[TargetRef],
+) {
+    fn visit(
+        node: &mut ResolvedAbility,
+        held_before: &mut std::slice::Iter<'_, usize>,
+        unclaimed: &mut usize,
+    ) {
+        let held = held_before.next().copied().unwrap_or_default();
+        node.chosen_target_slots = (held..node.targets.len()).take(*unclaimed).collect();
+        *unclaimed -= node.chosen_target_slots.len();
+        if let Some(sub_ability) = node.sub_ability.as_deref_mut() {
+            visit(sub_ability, held_before, unclaimed);
+        }
+        if let Some(else_ability) = node.else_ability.as_deref_mut() {
+            visit(else_ability, held_before, unclaimed);
+        }
+    }
+    // A slot appended after `chosen` is used up repeats a target recorded before
+    // it, e.g. a sub's copy of its parent's target.
+    visit(ability, &mut held_before.iter(), &mut chosen.len());
+    debug_assert_eq!(flatten_declared_targets_in_chain(ability), chosen);
 }
 
 /// CR 608.2c + CR 120.1: a pairwise "each of those ... to the other" damage
@@ -2038,7 +2083,18 @@ pub fn flatten_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
 }
 
 pub fn flatten_declared_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
-    ability.declared_targets.clone()
+    let mut targets: Vec<TargetRef> = ability
+        .chosen_target_slots
+        .iter()
+        .filter_map(|&slot| ability.targets.get(slot).cloned())
+        .collect();
+    if let Some(sub_ability) = ability.sub_ability.as_deref() {
+        targets.extend(flatten_declared_targets_in_chain(sub_ability));
+    }
+    if let Some(else_ability) = ability.else_ability.as_deref() {
+        targets.extend(flatten_declared_targets_in_chain(else_ability));
+    }
+    targets
 }
 
 /// CR 608.2b: The slots of `declared` — numbered exactly as

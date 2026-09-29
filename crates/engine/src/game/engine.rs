@@ -9917,15 +9917,12 @@ fn finalize_copy_retarget(
         .unwrap_or_default();
     if let Some(entry) = state.stack.iter_mut().find(|e| e.id == copy_id) {
         if let Some(ability) = entry.ability_mut() {
-            if ability.targets.is_empty() {
-                // CR 707.12 + CR 601.2c: a copy cast without targets chooses them here.
-                crate::game::ability_utils::record_declared_targets(ability, targets.clone());
-            } else {
-                for (old, new) in ability.targets.clone().iter().zip(targets.iter()) {
-                    ability.change_declared_target(old, new);
-                }
-            }
+            let first_choice = ability.targets.is_empty();
             ability.targets = targets;
+            if first_choice {
+                // CR 707.12 + CR 601.2c: a copy cast without targets chooses them here.
+                crate::game::ability_utils::record_root_target_slots(ability);
+            }
             for pin in changed_pins {
                 ability.update_selected_target_incarnation(pin);
             }
@@ -16018,9 +16015,6 @@ fn apply_retarget(
                 TargetRef::Player(_) => None,
             })
             .collect();
-        for (old, new) in current_targets.iter().zip(new_targets.iter()) {
-            mutated.change_declared_target(old, new);
-        }
         mutated.targets = new_targets.clone();
         for pin in target_pins {
             mutated.update_selected_target_incarnation(pin);
@@ -16062,7 +16056,6 @@ fn apply_retarget(
                     node.update_selected_target_incarnation(pin);
                 }
             }
-            mutated.change_declared_target(&old, new_target);
         }
     }
     crate::game::ability_utils::restamp_derived_chain_targets(&mut mutated);

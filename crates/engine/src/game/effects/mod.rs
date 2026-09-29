@@ -4341,7 +4341,7 @@ fn instruction_outlives_declined_gate(
         trigger_definition_ref: _,
         target_incarnations: _,
         selected_target_incarnations: _,
-        declared_targets: _,
+        chosen_target_slots: _,
         illegal_target_slots: _,
         controller: _,
         original_controller: _,
