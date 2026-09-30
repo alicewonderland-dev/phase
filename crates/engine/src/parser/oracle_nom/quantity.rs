@@ -7,6 +7,7 @@
 use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until, take_while1};
+use nom::character::complete::satisfy;
 use nom::combinator::{all_consuming, eof, map, map_res, opt, peek, value};
 use nom::multi::separated_list1;
 use nom::sequence::{pair, preceded, terminated};
@@ -28,13 +29,14 @@ use crate::parser::oracle_util::parse_subtype;
 use crate::types::ability::{
     AggregateFunction, CardTypeSetSource, CastManaObjectScope, CastManaSpentMetric, Comparator,
     ControllerRef, CountBinding, CountScope, DamageChannel, DamageKindFilter, DevotionColors,
-    FilterProp, ObjectProperty, ObjectScope, PlayerFilter, PlayerRelation, PlayerScope,
-    PropertyAggregate, PtStat, QuantityExpr, QuantityRef, RoundingMode, SharedQuality,
-    SubtypeExclusion, TargetFilter, ThisWayCause, TrackedAnaphorSource, TurnJournalKind,
-    TypeFilter, TypedFilter, ZoneRef,
+    FilterProp, LetterQuery, NameStickerSet, ObjectProperty, ObjectScope, PlayerFilter,
+    PlayerRelation, PlayerScope, PropertyAggregate, PtStat, QuantityExpr, QuantityRef,
+    RoundingMode, SharedQuality, SubtypeExclusion, TargetFilter, ThisWayCause,
+    TrackedAnaphorSource, TurnJournalKind, TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::keywords::Keyword;
+use crate::types::mana::ManaColor;
 use crate::types::player::PlayerCounterKind;
 use crate::types::zones::Zone;
 
@@ -1980,6 +1982,10 @@ fn parse_object_property_aggregate_ref(input: &str) -> OracleResult<'_, Quantity
 /// Parse the inner part after "the number of".
 fn parse_number_of_inner(input: &str) -> OracleResult<'_, QuantityRef> {
     alt((
+        // CR 123.6d + CR 123.6e: first, so no earlier arm can stop `alt` with a
+        // stranded remainder; its "unique vowels"/"<letter>'s" + sticker-set
+        // language is disjoint from every other arm's.
+        parse_name_sticker_letter_count,
         // CR 110.4: the permanent-type head lowers to `ObjectCountDistinct`, not
         // `DistinctCardTypes`, so it must precede the card-type head.
         parse_distinct_permanent_types_in_zone,
@@ -4778,6 +4784,14 @@ fn parse_devotion_ref(input: &str) -> OracleResult<'_, QuantityRef> {
             },
         ));
     }
+    if let Ok((rest, colors)) = parse_wedge_clan_colors(rest) {
+        return Ok((
+            rest,
+            QuantityRef::Devotion {
+                colors: DevotionColors::Fixed(colors),
+            },
+        ));
+    }
     let (rest, color) = super::primitives::parse_color(rest)?;
     // Check for " and [color]" for multi-color devotion
     if let Ok((rest2, _)) = tag::<_, _, OracleError<'_>>(" and ").parse(rest) {
@@ -4796,6 +4810,37 @@ fn parse_devotion_ref(input: &str) -> OracleResult<'_, QuantityRef> {
             colors: DevotionColors::Fixed(vec![color]),
         },
     ))
+}
+
+/// CR 700.5: A devotion to a Khans-block clan name ("your devotion to Jeskai")
+/// is a devotion to that clan's three colors, i.e. the multi-color form of
+/// devotion ("devotion to [color 1] and [color 2]", extended to three colors).
+/// The clan-to-colors mapping is the printed reminder text on Devoted Abzan /
+/// Jeskai / Mardu / Sultai / Temur. Colors are returned in WUBRG order.
+fn parse_wedge_clan_colors(input: &str) -> OracleResult<'_, Vec<ManaColor>> {
+    alt((
+        value(
+            vec![ManaColor::White, ManaColor::Black, ManaColor::Green],
+            tag("abzan"),
+        ),
+        value(
+            vec![ManaColor::White, ManaColor::Blue, ManaColor::Red],
+            tag("jeskai"),
+        ),
+        value(
+            vec![ManaColor::White, ManaColor::Black, ManaColor::Red],
+            tag("mardu"),
+        ),
+        value(
+            vec![ManaColor::Blue, ManaColor::Black, ManaColor::Green],
+            tag("sultai"),
+        ),
+        value(
+            vec![ManaColor::Blue, ManaColor::Red, ManaColor::Green],
+            tag("temur"),
+        ),
+    ))
+    .parse(input)
 }
 
 /// CR 700.5: Chroma — "the number of \<color\> mana symbols in the mana costs of
@@ -5130,6 +5175,10 @@ fn parse_for_each_clause_ref_with_they_controller(
     they_controller: ControllerRef,
 ) -> OracleResult<'_, QuantityRef> {
     alt((
+        // CR 123.6d + CR 123.6e: first, so no earlier arm can stop `alt` with a
+        // stranded remainder; its "unique vowel"/"<letter>'s" + sticker-set
+        // language is disjoint from every other arm's.
+        parse_name_sticker_letter_count,
         parse_event_context_opponent_dealt_damage,
         parse_for_each_card_drawn_this_way,
         parse_for_each_recipient_attack_count,
@@ -5773,6 +5822,46 @@ fn parse_object_name_word_count_for_each(input: &str) -> OracleResult<'_, Quanti
     Ok((rest, QuantityRef::ObjectNameWordCount { scope }))
 }
 
+/// CR 123.6d + CR 123.6e: "<letter statistic> <name-sticker set>" —
+/// "unique vowel[s] on that sticker", "o's in name stickers on ~".
+fn parse_name_sticker_letter_count(input: &str) -> OracleResult<'_, QuantityRef> {
+    map(
+        (parse_sticker_letter_query, parse_name_sticker_set),
+        |(letters, stickers)| QuantityRef::NameStickerLetterCount { stickers, letters },
+    )
+    .parse(input)
+}
+
+/// CR 123.6e "unique vowel[s]" / CR 123.6d "<letter>'s".
+fn parse_sticker_letter_query(input: &str) -> OracleResult<'_, LetterQuery> {
+    alt((
+        value(
+            LetterQuery::UniqueVowels,
+            (tag("unique vowel"), opt(tag("s"))),
+        ),
+        map(
+            terminated(satisfy(|c: char| c.is_ascii_lowercase()), tag("'s")),
+            |letter| LetterQuery::Letter { letter },
+        ),
+    ))
+    .parse(input)
+}
+
+/// CR 608.2c "on that sticker" / CR 123.6d "in name stickers on <object>".
+fn parse_name_sticker_set(input: &str) -> OracleResult<'_, NameStickerSet> {
+    alt((
+        value(NameStickerSet::ThatSticker, tag(" on that sticker")),
+        map(
+            preceded(
+                tag(" in name stickers on "),
+                parse_object_prepositional_scope,
+            ),
+            |scope| NameStickerSet::OnObject { scope },
+        ),
+    ))
+    .parse(input)
+}
+
 /// CR 107.4 + CR 202.1: Parse
 /// "<color> mana symbol[s] in <object>'s mana cost" into a scoped per-object
 /// mana-cost symbol count. The `"its"` form is recipient-relative so static
@@ -6066,7 +6155,11 @@ fn parse_for_each_commander_cast_count(input: &str) -> OracleResult<'_, Quantity
     let (rest, _) = opt(tag("s")).parse(rest)?;
     let (rest, _) = tag(" ").parse(rest)?;
     let (rest, _) = alt((tag("you've"), tag("youve"))).parse(rest)?;
-    let (rest, _) = tag(" cast your commander from the command zone this game").parse(rest)?;
+    // CR 903.8: "a commander" / "your commander" both count the controller's
+    // command-zone casts; the resolver sums over every commander the player owns.
+    let (rest, _) = tag(" cast ").parse(rest)?;
+    let (rest, _) = alt((tag("your"), tag("a"))).parse(rest)?;
+    let (rest, _) = tag(" commander from the command zone this game").parse(rest)?;
     Ok((rest, QuantityRef::CommanderCastFromCommandZoneCount))
 }
 
@@ -9819,6 +9912,82 @@ mod tests {
         ));
     }
 
+    /// CR 123.6e: "for each unique vowel on that sticker" (_____ Goblin,
+    /// _____-o-saurus) → the sticker this resolution put.
+    #[test]
+    fn test_parse_for_each_unique_vowels_on_that_sticker() {
+        let that_sticker_vowels = QuantityRef::NameStickerLetterCount {
+            stickers: NameStickerSet::ThatSticker,
+            letters: LetterQuery::UniqueVowels,
+        };
+        let (rest, q) = parse_for_each_clause_ref("unique vowel on that sticker").unwrap();
+        assert_eq!(q, that_sticker_vowels);
+        assert_eq!(rest, "");
+        let (rest, q) = parse_for_each_clause_ref_complete("unique vowel on that sticker").unwrap();
+        assert_eq!(q, that_sticker_vowels);
+        assert_eq!(rest, "");
+
+        // Negatives (after the positive above): an object's name (CR 201) and a
+        // card are not name stickers.
+        let is_sticker_count = |result: OracleResult<'_, QuantityRef>| {
+            matches!(result, Ok(("", QuantityRef::NameStickerLetterCount { .. })))
+        };
+        assert!(!is_sticker_count(parse_for_each_clause_ref(
+            "unique vowel in the creature's name"
+        )));
+        assert!(!is_sticker_count(parse_for_each_clause_ref(
+            "unique vowel on that card"
+        )));
+        assert!(!is_sticker_count(parse_quantity_ref(
+            "the number of vowels on that sticker"
+        )));
+    }
+
+    /// CR 123.6e / CR 123.6d: the "the number of" forms — unique vowels on
+    /// that sticker (_____ Bird Gets the Worm, Wizards of the _____, Wolf in
+    /// _____ Clothing) and a letter in the name stickers on an object (_____
+    /// Balls of Fire, Make a _____ Splash).
+    #[test]
+    fn test_parse_number_of_name_sticker_letters() {
+        let cases = [
+            (
+                "the number of unique vowels on that sticker",
+                NameStickerSet::ThatSticker,
+                LetterQuery::UniqueVowels,
+            ),
+            (
+                "the number of o's in name stickers on ~",
+                NameStickerSet::OnObject {
+                    scope: ObjectScope::Source,
+                },
+                LetterQuery::Letter { letter: 'o' },
+            ),
+            (
+                "the number of u's in name stickers on ~",
+                NameStickerSet::OnObject {
+                    scope: ObjectScope::Source,
+                },
+                LetterQuery::Letter { letter: 'u' },
+            ),
+            (
+                "the number of o's in name stickers on it",
+                NameStickerSet::OnObject {
+                    scope: ObjectScope::Recipient,
+                },
+                LetterQuery::Letter { letter: 'o' },
+            ),
+        ];
+        for (text, stickers, letters) in cases {
+            let (rest, q) = parse_quantity_ref(text).unwrap();
+            assert_eq!(
+                q,
+                QuantityRef::NameStickerLetterCount { stickers, letters },
+                "{text}"
+            );
+            assert_eq!(rest, "", "{text}");
+        }
+    }
+
     #[test]
     fn test_parse_number_of_object_name_words() {
         let (rest, q) =
@@ -12321,6 +12490,47 @@ mod tests {
         .unwrap();
         assert_eq!(q, QuantityRef::CommanderCastFromCommandZoneCount);
         assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn test_parse_for_each_commander_cast_count_a_commander() {
+        for text in [
+            "time you've cast a commander from the command zone this game",
+            "times you've cast a commander from the command zone this game",
+            "times youve cast a commander from the command zone this game",
+        ] {
+            let (rest, q) = parse_for_each_clause_ref(text).unwrap();
+            assert_eq!(q, QuantityRef::CommanderCastFromCommandZoneCount, "{text}");
+            assert_eq!(rest, "");
+        }
+        assert!(parse_for_each_clause_ref(
+            "times you've cast an artifact from the command zone this game"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_parse_devotion_wedge_clan() {
+        use ManaColor::*;
+        for (clan, colors) in [
+            ("abzan", vec![White, Black, Green]),
+            ("jeskai", vec![White, Blue, Red]),
+            ("mardu", vec![White, Black, Red]),
+            ("sultai", vec![Blue, Black, Green]),
+            ("temur", vec![Blue, Red, Green]),
+        ] {
+            let text = format!("your devotion to {clan}");
+            let (rest, q) = parse_quantity_ref(&text).unwrap();
+            assert_eq!(
+                q,
+                QuantityRef::Devotion {
+                    colors: DevotionColors::Fixed(colors)
+                },
+                "{clan}"
+            );
+            assert_eq!(rest, "");
+        }
+        assert!(parse_quantity_ref("your devotion to khans").is_err());
     }
 
     // --- Half-rounded fractional expressions (CR 107.1a) ---
