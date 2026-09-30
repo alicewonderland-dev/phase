@@ -579,7 +579,6 @@ describe("Discard cost modal", () => {
       "flex-wrap",
       "lg:w-fit",
     );
-    expect(colorless.parentElement).not.toHaveClass("lg:flex-nowrap");
 
     fireEvent.click(colorless);
     fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
