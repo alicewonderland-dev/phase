@@ -256,7 +256,7 @@ export function TargetingOverlay() {
     const observer = new ResizeObserver(updateOverflow);
     observer.observe(line);
     return () => observer.disconnect();
-  }, [activeModeLabel, enginePrompt, isOpponentChosenSlot, t, triggerDamageAmount]);
+  }, [activeModeLabel, canActForWaitingState, enginePrompt, isOpponentChosenSlot, slotProgress, sourceName, t, triggerDamageAmount]);
   const overlayPrompt = isCopyTargetChoice
     ? t("targeting.choosePermanentToCopy")
     : isCopyRetarget
@@ -552,7 +552,7 @@ export function TargetingOverlay() {
                     </Fragment>
                   ))}
                 </div>
-                {enginePrompt && descriptionOverflows && (
+                {enginePrompt && (descriptionOverflows || descriptionExpanded) && (
                   // The visible label names the action, and `aria-label`
                   // repeats it with the description appended: without the
                   // explicit name a screen reader would hear only "show the

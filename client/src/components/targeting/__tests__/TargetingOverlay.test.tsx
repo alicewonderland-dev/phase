@@ -1,6 +1,6 @@
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import type { GameState } from "../../../adapter/types.ts";
 import { buildGameObject, buildGameObjectWithCoreTypes, buildObjectMap } from "../../../test/factories/gameObjectFactory.ts";
@@ -19,13 +19,8 @@ import { useMultiplayerStore } from "../../../stores/multiplayerStore.ts";
 import { useUiStore } from "../../../stores/uiStore.ts";
 
 function mockDescriptionOverflow(overflowing: boolean): void {
-  vi.spyOn(HTMLDivElement.prototype, "clientWidth", "get").mockImplementation(function (this: HTMLDivElement) {
-    return this.classList.contains("min-w-0") && this.classList.contains("truncate") ? 100 : 0;
-  });
-  vi.spyOn(HTMLDivElement.prototype, "scrollWidth", "get").mockImplementation(function (this: HTMLDivElement) {
-    if (!this.classList.contains("min-w-0") || !this.classList.contains("truncate")) return 0;
-    return overflowing ? 120 : 100;
-  });
+  vi.spyOn(HTMLDivElement.prototype, "clientWidth", "get").mockReturnValue(100);
+  vi.spyOn(HTMLDivElement.prototype, "scrollWidth", "get").mockReturnValue(overflowing ? 120 : 100);
 }
 
 function createGameState(overrides: Partial<GameState> = {}): GameState {
@@ -61,6 +56,7 @@ describe("TargetingOverlay", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   // This inverts a shipped decision. The overlay used to render NO player target
@@ -699,6 +695,78 @@ describe("TargetingOverlay", () => {
 
     expect(screen.getByText(description)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: `Show the full description: ${description}` })).toBeNull();
+  });
+
+  it("measures the description when the local player becomes the chooser", async () => {
+    mockDescriptionOverflow(true);
+    const description = "A description that overflows the caption.";
+    const waitingFor = buildTriggerTargetSelectionWaitingFor({
+      data: {
+        player: 1,
+        target_slots: [buildTargetSelectionSlot({ legal_targets: [{ Player: 1 }] })],
+        selection: buildTargetSelectionProgress({ current_legal_targets: [{ Player: 1 }] }),
+        description,
+      },
+    });
+    const gameState = createGameState({ waiting_for: waitingFor });
+    act(() => {
+      useGameStore.setState({ gameState, waitingFor, dispatch: vi.fn() });
+    });
+    render(<TargetingOverlay />);
+    await waitFor(() => expect(screen.queryByText(description)).not.toBeInTheDocument());
+
+    const localWaitingFor = buildTriggerTargetSelectionWaitingFor({
+      data: { ...waitingFor.data, player: 0 },
+    });
+    act(() => {
+      useGameStore.setState({
+        gameState: { ...gameState, waiting_for: localWaitingFor },
+        waitingFor: localWaitingFor,
+      });
+    });
+    expect(await screen.findByRole("button", {
+      name: `Show the full description: ${description}`,
+    })).toBeInTheDocument();
+  });
+
+  it("keeps the expanded description collapsible when the caption stops overflowing", async () => {
+    mockDescriptionOverflow(true);
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class ControlledResizeObserver {
+      constructor(callback: ResizeObserverCallback) { resizeCallbacks.push(callback); }
+      observe = vi.fn();
+      unobserve = vi.fn();
+      disconnect = vi.fn();
+    }
+    vi.stubGlobal("ResizeObserver", ControlledResizeObserver);
+    const description = "A description that overflows the caption.";
+    const gameState = createGameState({
+      waiting_for: buildTriggerTargetSelectionWaitingFor({
+        data: {
+          player: 0,
+          target_slots: [buildTargetSelectionSlot({ legal_targets: [{ Player: 1 }] })],
+          selection: buildTargetSelectionProgress({ current_legal_targets: [{ Player: 1 }] }),
+          description,
+        },
+      }),
+    });
+    act(() => {
+      useGameStore.setState({ gameState, waitingFor: gameState.waiting_for, dispatch: vi.fn() });
+    });
+    render(<TargetingOverlay />);
+    fireEvent.click(screen.getByRole("button", {
+      name: `Show the full description: ${description}`,
+    }));
+    expect(screen.getAllByText(description)).toHaveLength(2);
+    expect(resizeCallbacks.length).toBeGreaterThan(0);
+
+    mockDescriptionOverflow(false);
+    act(() => resizeCallbacks.forEach((callback) => callback([], {} as ResizeObserver)));
+    fireEvent.click(screen.getByRole("button", { name: `Show less: ${description}` }));
+    expect(screen.getAllByText(description)).toHaveLength(1);
+    await waitFor(() => expect(screen.queryByRole("button", {
+      name: `Show the full description: ${description}`,
+    })).not.toBeInTheDocument());
   });
 
   it("shows the active trigger damage amount during target selection", () => {
