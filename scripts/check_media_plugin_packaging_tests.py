@@ -326,6 +326,21 @@ class MediaPluginPackagingTests(unittest.TestCase):
         self.assertEqual(r.returncode, 2, r.stdout)
         self.assertIn("Linux matrix arm", r.stderr)
 
+    def test_a_composite_apt_step_condition_refuses(self) -> None:
+        # Matching the Linux arm as one part of a larger condition does not
+        # prove that the step runs on Linux; the other part may make it false.
+        t = self.tree()
+        t.write_workflow(condition="matrix.os == 'linux' && false")
+        r = t.run()
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("Linux matrix arm", r.stderr)
+
+    def test_an_exact_github_expression_linux_condition_is_accepted(self) -> None:
+        t = self.tree()
+        t.write_workflow(condition="${{ matrix.os == 'linux' }}")
+        r = t.run()
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+
     def test_absent_deb_depends_refuses(self) -> None:
         t = self.tree()
         t.write_tauri_conf(None)
@@ -712,6 +727,22 @@ class MediaPluginPackagingTests(unittest.TestCase):
                 r = t.run()
                 self.assertEqual(r.returncode, 2, r.stdout)
                 self.assertIn("depends on the command before it", r.stderr)
+                self.assertNotIn("is missing", r.stderr)
+
+    def test_an_install_inside_a_shell_function_is_not_credited(self) -> None:
+        # The line-scoped reader cannot know whether a function is called, so
+        # an install inside its body must be refused like other shell control
+        # flow rather than credited as an executed command.
+        for definition in ("install_media() {", "function install_media {"):
+            with self.subTest(definition=definition):
+                t = self.tree()
+                t.write_workflow(run=(
+                    f"{definition}\n"
+                    f"  sudo apt-get install -y {' '.join(DEFAULT_PACKAGES)}\n"
+                    "}\n"))
+                r = t.run()
+                self.assertEqual(r.returncode, 2, r.stdout)
+                self.assertIn("uses shell control flow", r.stderr)
                 self.assertNotIn("is missing", r.stderr)
 
     def test_a_piped_install_refuses_via_the_more_specific_head_check(self) -> None:
