@@ -1930,7 +1930,7 @@ pub fn assign_targets_in_chain(
         ability.capture_target_incarnations_recursive(state);
         return Ok(());
     }
-    let held_before = chain_target_counts(ability);
+    clear_chosen_target_slots(ability);
     let mut next_target = 0usize;
     assign_targets_recursive(state, ability, targets, &mut next_target)?;
     if next_target != targets.len() {
@@ -1938,7 +1938,7 @@ pub fn assign_targets_in_chain(
             "Unused selected targets".to_string(),
         ));
     }
-    record_appended_target_slots(ability, &held_before, targets);
+    debug_assert_eq!(declared_targets_in_chain(ability), targets);
     stamp_other_batch_source_targets(ability);
     ability.capture_target_incarnations_recursive(state);
     restamp_chosen_group_targets(ability);
@@ -1957,7 +1957,7 @@ pub fn assign_selected_slots_in_chain(
         ability.capture_target_incarnations_recursive(state);
         return Ok(());
     }
-    let held_before = chain_target_counts(ability);
+    clear_chosen_target_slots(ability);
     let mut next_slot = 0usize;
     assign_selected_slots_recursive(state, ability, selected_slots, &mut next_slot)?;
     if next_slot != selected_slots.len() {
@@ -1965,7 +1965,7 @@ pub fn assign_selected_slots_in_chain(
             "Unused selected target slots".to_string(),
         ));
     }
-    record_appended_target_slots(ability, &held_before, &chosen);
+    debug_assert_eq!(declared_targets_in_chain(ability), chosen);
     stamp_other_batch_source_targets(ability);
     ability.capture_target_incarnations_recursive(state);
     restamp_chosen_group_targets(ability);
@@ -1986,47 +1986,14 @@ pub(crate) fn record_root_target_slots(ability: &mut ResolvedAbility) {
         .collect();
 }
 
-/// The `targets` length of each chain node, in the order
-/// [`record_appended_target_slots`] visits them.
-fn chain_target_counts(ability: &ResolvedAbility) -> Vec<usize> {
-    let mut counts = vec![ability.targets.len()];
-    if let Some(sub_ability) = ability.sub_ability.as_deref() {
-        counts.extend(chain_target_counts(sub_ability));
+fn clear_chosen_target_slots(ability: &mut ResolvedAbility) {
+    ability.chosen_target_slots.clear();
+    if let Some(sub_ability) = ability.sub_ability.as_deref_mut() {
+        clear_chosen_target_slots(sub_ability);
     }
-    if let Some(else_ability) = ability.else_ability.as_deref() {
-        counts.extend(chain_target_counts(else_ability));
+    if let Some(else_ability) = ability.else_ability.as_deref_mut() {
+        clear_chosen_target_slots(else_ability);
     }
-    counts
-}
-
-/// CR 601.2c: records which chain slots hold `chosen`, claiming the slots each
-/// node gained in the assignment, in chain order. `held_before` is
-/// [`chain_target_counts`] taken before that assignment, so a referent a node
-/// already held is not recorded.
-fn record_appended_target_slots(
-    ability: &mut ResolvedAbility,
-    held_before: &[usize],
-    chosen: &[TargetRef],
-) {
-    fn visit(
-        node: &mut ResolvedAbility,
-        held_before: &mut std::slice::Iter<'_, usize>,
-        unclaimed: &mut usize,
-    ) {
-        let held = held_before.next().copied().unwrap_or_default();
-        node.chosen_target_slots = (held..node.targets.len()).take(*unclaimed).collect();
-        *unclaimed -= node.chosen_target_slots.len();
-        if let Some(sub_ability) = node.sub_ability.as_deref_mut() {
-            visit(sub_ability, held_before, unclaimed);
-        }
-        if let Some(else_ability) = node.else_ability.as_deref_mut() {
-            visit(else_ability, held_before, unclaimed);
-        }
-    }
-    // A slot appended after `chosen` is used up repeats a target recorded before
-    // it, e.g. a sub's copy of its parent's target.
-    visit(ability, &mut held_before.iter(), &mut chosen.len());
-    debug_assert_eq!(flatten_declared_targets_in_chain(ability), chosen);
 }
 
 /// CR 608.2c + CR 120.1: a pairwise "each of those ... to the other" damage
@@ -2092,32 +2059,15 @@ pub fn flatten_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
     targets
 }
 
-pub fn flatten_declared_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
+/// CR 601.2c: The targets chosen for a chain, in chain order: each node's
+/// `targets` at its `chosen_target_slots`. A value a node holds without having
+/// received it as a choice is not a target (CR 115.10a).
+pub fn declared_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
     let mut targets: Vec<TargetRef> = ability
         .chosen_target_slots
         .iter()
         .filter_map(|&slot| ability.targets.get(slot).cloned())
         .collect();
-    if let Some(sub_ability) = ability.sub_ability.as_deref() {
-        targets.extend(flatten_declared_targets_in_chain(sub_ability));
-    }
-    if let Some(else_ability) = ability.else_ability.as_deref() {
-        targets.extend(flatten_declared_targets_in_chain(else_ability));
-    }
-    targets
-}
-
-/// CR 601.2c: The targets a chain declares, as [`flatten_targets_in_chain`]
-/// lists them except that a node delegating to a paid "instead" sub contributes
-/// only that sub's targets. When the additional cost was paid, the sub's targets
-/// are the spell's alternative targets (CR 601.2c, CR 702.174m, CR 702.194c) and
-/// the delegating node's own `targets` only mirror them
-/// (`assign_targets_recursive`), so they are not a second declaration.
-pub fn declared_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
-    if let Some(sub_ability) = paid_instead_delegate(ability) {
-        return declared_targets_in_chain(sub_ability);
-    }
-    let mut targets = chain_node_targets(ability);
     if let Some(sub_ability) = ability.sub_ability.as_deref() {
         targets.extend(declared_targets_in_chain(sub_ability));
     }
@@ -5265,7 +5215,7 @@ fn assign_attach_attachment_selected_slots(
             ));
         }
         for target in window.iter().flatten() {
-            ability.targets.push(target.clone());
+            ability.push_chosen_target(target.clone());
             if let Some(binding) = attach_object_binding(state, target)? {
                 ability.bind_attach_attachment_target(binding);
             }
@@ -5279,7 +5229,7 @@ fn assign_attach_attachment_selected_slots(
         };
         match selected_slot {
             Some(target) => {
-                ability.targets.push(target.clone());
+                ability.push_chosen_target(target.clone());
                 if let Some(binding) = attach_object_binding(state, target)? {
                     ability.bind_attach_attachment_target(binding);
                 }
@@ -5344,7 +5294,7 @@ fn assign_attach_attachment_declared_targets(
         }
         for slot_index in 0..attachment_window {
             if let Some(target) = targets.get(*next_target) {
-                ability.targets.push(target.clone());
+                ability.push_chosen_target(target.clone());
                 if let Some(binding) = attach_object_binding(state, target)? {
                     ability.bind_attach_attachment_target(binding);
                 }
@@ -5358,7 +5308,7 @@ fn assign_attach_attachment_declared_targets(
             }
         }
     } else if let Some(target) = targets.get(*next_target) {
-        ability.targets.push(target.clone());
+        ability.push_chosen_target(target.clone());
         if let Some(binding) = attach_object_binding(state, target)? {
             ability.bind_attach_attachment_target(binding);
         }
@@ -8701,16 +8651,18 @@ fn assign_targets_recursive(
         ..
     } = &ability.effect
     {
-        for filter in move_counter_stack_target_filters(source, target, *selection) {
-            if !filter.is_context_ref() {
-                if let Some(target) = targets.get(*next_target) {
-                    ability.targets.push(target.clone());
-                    *next_target += 1;
-                } else if !ability.optional_targeting {
-                    return Err(EngineError::InvalidAction(
-                        "Missing required target".to_string(),
-                    ));
-                }
+        let slot_count = move_counter_stack_target_filters(source, target, *selection)
+            .into_iter()
+            .filter(|filter| !filter.is_context_ref())
+            .count();
+        for _ in 0..slot_count {
+            if let Some(target) = targets.get(*next_target) {
+                ability.push_chosen_target(target.clone());
+                *next_target += 1;
+            } else if !ability.optional_targeting {
+                return Err(EngineError::InvalidAction(
+                    "Missing required target".to_string(),
+                ));
             }
         }
         if defers_sub_ability_target_selection(&ability.effect) {
@@ -8752,7 +8704,7 @@ fn assign_targets_recursive(
             )?;
             if attach_host_filter_needs_target_slot(&target) {
                 if let Some(target) = targets.get(*next_target) {
-                    ability.targets.push(target.clone());
+                    ability.push_chosen_target(target.clone());
                     if let Some(binding) = attach_object_binding(state, target)? {
                         ability.bind_attach_host_target(binding);
                     }
@@ -8843,7 +8795,7 @@ fn assign_targets_recursive(
         let claimed = paired_subject_slot_filters(&ability.effect).count();
         for _ in 0..claimed {
             if let Some(chosen) = targets.get(*next_target) {
-                ability.targets.push(chosen.clone());
+                ability.push_chosen_target(chosen.clone());
                 *next_target += 1;
             } else if !ability.optional_targeting {
                 return Err(EngineError::InvalidAction(
@@ -8866,17 +8818,18 @@ fn assign_targets_recursive(
             filters.push(subject);
         }
         filters.push(target);
-        for filter in filters {
-            // Mirror `collect_target_slots`: a context-ref fighter (SelfRef,
-            // ParentTarget, ParentTargetSlot, reciprocal-fight TrackedSet)
-            // surfaces no slot, so it consumes no selected target here either —
-            // otherwise the assign/slot-gen counts diverge and a valid two-target
-            // selection reports a spurious "Missing required target".
-            if filter.is_context_ref() {
-                continue;
-            }
+        // Mirror `collect_target_slots`: a context-ref fighter (SelfRef,
+        // ParentTarget, ParentTargetSlot, reciprocal-fight TrackedSet)
+        // surfaces no slot, so it consumes no selected target here either —
+        // otherwise the assign/slot-gen counts diverge and a valid two-target
+        // selection reports a spurious "Missing required target".
+        let slot_count = filters
+            .into_iter()
+            .filter(|filter| !filter.is_context_ref())
+            .count();
+        for _ in 0..slot_count {
             if let Some(chosen) = targets.get(*next_target) {
-                ability.targets.push(chosen.clone());
+                ability.push_chosen_target(chosen.clone());
                 *next_target += 1;
             } else if !ability.optional_targeting {
                 return Err(EngineError::InvalidAction(
@@ -8911,7 +8864,7 @@ fn assign_targets_recursive(
         let surfaced = role.surfaced_filters().count();
         for _ in 0..surfaced {
             if let Some(target) = targets.get(*next_target) {
-                ability.targets.push(target.clone());
+                ability.push_chosen_target(target.clone());
                 *next_target += 1;
             } else if !ability.optional_targeting {
                 return Err(EngineError::InvalidAction(
@@ -8944,9 +8897,9 @@ fn assign_targets_recursive(
     // next. Slot order matches `collect_target_slots`: source slot first.
     if ability.target_choice_timing == TargetChoiceTiming::Stack {
         if let Some(roles) = damage_replacement_target_roles(&ability.effect) {
-            for _role in roles {
+            for _ in 0..roles.len() {
                 if let Some(target) = targets.get(*next_target) {
-                    ability.targets.push(target.clone());
+                    ability.push_chosen_target(target.clone());
                     *next_target += 1;
                 } else if !ability.optional_targeting {
                     return Err(EngineError::InvalidAction(
@@ -8976,7 +8929,7 @@ fn assign_targets_recursive(
         && damage_replacement_source_slot_filter(&ability.effect).is_some()
     {
         if let Some(target) = targets.get(*next_target) {
-            ability.targets.push(target.clone());
+            ability.push_chosen_target(target.clone());
             *next_target += 1;
         } else if !ability.optional_targeting {
             return Err(EngineError::InvalidAction(
@@ -8995,7 +8948,7 @@ fn assign_targets_recursive(
         && ability_needs_companion_target_player_slot(ability)
     {
         if let Some(target) = targets.get(*next_target) {
-            ability.targets.push(target.clone());
+            ability.push_chosen_target(target.clone());
             *next_target += 1;
         } else if !ability.optional_targeting {
             return Err(EngineError::InvalidAction(
@@ -9008,7 +8961,7 @@ fn assign_targets_recursive(
         && !one_sided_fight_source_supplies_quantity_creature(&ability.effect)
     {
         if let Some(target) = targets.get(*next_target) {
-            ability.targets.push(target.clone());
+            ability.push_chosen_target(target.clone());
             *next_target += 1;
         } else if !ability.optional_targeting {
             return Err(EngineError::InvalidAction(
@@ -9020,7 +8973,7 @@ fn assign_targets_recursive(
         && effect_needs_parent_target_combat_relation_slot(&ability.effect)
     {
         if let Some(target) = targets.get(*next_target) {
-            ability.targets.push(target.clone());
+            ability.push_chosen_target(target.clone());
             *next_target += 1;
         } else if !ability.optional_targeting {
             return Err(EngineError::InvalidAction(
@@ -9043,7 +8996,7 @@ fn assign_targets_recursive(
         && become_copy_recipient_slot_filter(&ability.effect).is_some()
     {
         if let Some(target) = targets.get(*next_target) {
-            ability.targets.push(target.clone());
+            ability.push_chosen_target(target.clone());
             *next_target += 1;
         } else if !ability.optional_targeting {
             return Err(EngineError::InvalidAction(
@@ -9079,15 +9032,15 @@ fn assign_targets_recursive(
                     "Incorrect number of multi-target selections".to_string(),
                 ));
             }
-            // CR 109.4: Use `extend_from_slice` so a companion player target
-            // pushed by the `effect_references_target_player` branch above
-            // survives — both slots live on this node's `targets`.
-            ability
-                .targets
-                .extend_from_slice(&targets[*next_target..*next_target + current_count]);
+            // Append so a companion player target pushed by the
+            // `effect_references_target_player` branch above survives — both
+            // slots live on this node's `targets`.
+            for target in &targets[*next_target..*next_target + current_count] {
+                ability.push_chosen_target(target.clone());
+            }
             *next_target += current_count;
         } else if let Some(target) = targets.get(*next_target) {
-            ability.targets.push(target.clone());
+            ability.push_chosen_target(target.clone());
             *next_target += 1;
         } else if !ability.optional_targeting {
             return Err(EngineError::InvalidAction(
@@ -9151,24 +9104,26 @@ fn assign_selected_slots_recursive(
         ..
     } = &ability.effect
     {
-        for filter in move_counter_stack_target_filters(source, target, *selection) {
-            if !filter.is_context_ref() {
-                let Some(selected_slot) = selected_slots.get(*next_slot) else {
+        let slot_count = move_counter_stack_target_filters(source, target, *selection)
+            .into_iter()
+            .filter(|filter| !filter.is_context_ref())
+            .count();
+        for _ in 0..slot_count {
+            let Some(selected_slot) = selected_slots.get(*next_slot) else {
+                return Err(EngineError::InvalidAction(
+                    "Missing target selection".to_string(),
+                ));
+            };
+            match selected_slot {
+                Some(target) => ability.push_chosen_target(target.clone()),
+                None if ability.optional_targeting => {}
+                None => {
                     return Err(EngineError::InvalidAction(
-                        "Missing target selection".to_string(),
+                        "Missing required target".to_string(),
                     ));
-                };
-                match selected_slot {
-                    Some(target) => ability.targets.push(target.clone()),
-                    None if ability.optional_targeting => {}
-                    None => {
-                        return Err(EngineError::InvalidAction(
-                            "Missing required target".to_string(),
-                        ));
-                    }
                 }
-                *next_slot += 1;
             }
+            *next_slot += 1;
         }
         if defers_sub_ability_target_selection(&ability.effect) {
             assign_selected_slots_after_deferred_effect(
@@ -9202,7 +9157,7 @@ fn assign_selected_slots_recursive(
                 ));
             };
             match selected_slot {
-                Some(target) => ability.targets.push(target.clone()),
+                Some(target) => ability.push_chosen_target(target.clone()),
                 None if ability.optional_targeting => {}
                 None => {
                     return Err(EngineError::InvalidAction(
@@ -9256,7 +9211,7 @@ fn assign_selected_slots_recursive(
                 };
                 match selected_slot {
                     Some(target) => {
-                        ability.targets.push(target.clone());
+                        ability.push_chosen_target(target.clone());
                         if let Some(binding) = attach_object_binding(state, target)? {
                             ability.bind_attach_host_target(binding);
                         }
@@ -9317,7 +9272,7 @@ fn assign_selected_slots_recursive(
                 ));
             };
             match selected_slot {
-                Some(chosen) => ability.targets.push(chosen.clone()),
+                Some(chosen) => ability.push_chosen_target(chosen.clone()),
                 None if ability.optional_targeting => {}
                 None => {
                     return Err(EngineError::InvalidAction(
@@ -9342,20 +9297,21 @@ fn assign_selected_slots_recursive(
             filters.push(subject);
         }
         filters.push(target);
-        for filter in filters {
-            // Mirror `collect_target_slots` and `assign_targets_recursive`:
-            // context-reference fighters resolve from the ability chain, so they
-            // consume no interactive target-selection slot.
-            if filter.is_context_ref() {
-                continue;
-            }
+        // Mirror `collect_target_slots` and `assign_targets_recursive`:
+        // context-reference fighters resolve from the ability chain, so they
+        // consume no interactive target-selection slot.
+        let slot_count = filters
+            .into_iter()
+            .filter(|filter| !filter.is_context_ref())
+            .count();
+        for _ in 0..slot_count {
             let Some(selected_slot) = selected_slots.get(*next_slot) else {
                 return Err(EngineError::InvalidAction(
                     "Missing target selection".to_string(),
                 ));
             };
             match selected_slot {
-                Some(chosen) => ability.targets.push(chosen.clone()),
+                Some(chosen) => ability.push_chosen_target(chosen.clone()),
                 None if ability.optional_targeting => {}
                 None => {
                     return Err(EngineError::InvalidAction(
@@ -9378,14 +9334,14 @@ fn assign_selected_slots_recursive(
     // as normal target assignment, before it descends into the chain.
     if ability.target_choice_timing == TargetChoiceTiming::Stack {
         if let Some(roles) = damage_replacement_target_roles(&ability.effect) {
-            for _role in roles {
+            for _ in 0..roles.len() {
                 let Some(selected_slot) = selected_slots.get(*next_slot) else {
                     return Err(EngineError::InvalidAction(
                         "Missing target selection".to_string(),
                     ));
                 };
                 match selected_slot {
-                    Some(target) => ability.targets.push(target.clone()),
+                    Some(target) => ability.push_chosen_target(target.clone()),
                     None if ability.optional_targeting => {}
                     None => {
                         return Err(EngineError::InvalidAction(
@@ -9414,7 +9370,7 @@ fn assign_selected_slots_recursive(
             ));
         };
         match selected_slot {
-            Some(target) => ability.targets.push(target.clone()),
+            Some(target) => ability.push_chosen_target(target.clone()),
             None if ability.optional_targeting => {}
             None => {
                 return Err(EngineError::InvalidAction(
@@ -9437,7 +9393,7 @@ fn assign_selected_slots_recursive(
             ));
         };
         match selected_slot {
-            Some(target) => ability.targets.push(target.clone()),
+            Some(target) => ability.push_chosen_target(target.clone()),
             None if ability.optional_targeting => {}
             None => {
                 return Err(EngineError::InvalidAction(
@@ -9457,7 +9413,7 @@ fn assign_selected_slots_recursive(
             ));
         };
         match selected_slot {
-            Some(target) => ability.targets.push(target.clone()),
+            Some(target) => ability.push_chosen_target(target.clone()),
             None if ability.optional_targeting => {}
             None => {
                 return Err(EngineError::InvalidAction(
@@ -9476,7 +9432,7 @@ fn assign_selected_slots_recursive(
             ));
         };
         match selected_slot {
-            Some(target) => ability.targets.push(target.clone()),
+            Some(target) => ability.push_chosen_target(target.clone()),
             None if ability.optional_targeting => {}
             None => {
                 return Err(EngineError::InvalidAction(
@@ -9503,7 +9459,7 @@ fn assign_selected_slots_recursive(
             ));
         };
         match selected_slot {
-            Some(target) => ability.targets.push(target.clone()),
+            Some(target) => ability.push_chosen_target(target.clone()),
             None if ability.optional_targeting => {}
             None => {
                 return Err(EngineError::InvalidAction(
@@ -9550,7 +9506,9 @@ fn assign_selected_slots_recursive(
                     "Missing required target".to_string(),
                 ));
             }
-            ability.targets.extend(window.iter().flatten().cloned());
+            for target in window.iter().flatten() {
+                ability.push_chosen_target(target.clone());
+            }
             *next_slot = end_slot;
         } else {
             let Some(selected_slot) = selected_slots.get(*next_slot) else {
@@ -9560,7 +9518,7 @@ fn assign_selected_slots_recursive(
             };
 
             match selected_slot {
-                Some(target) => ability.targets.push(target.clone()),
+                Some(target) => ability.push_chosen_target(target.clone()),
                 None if ability.optional_targeting => {}
                 None => {
                     return Err(EngineError::InvalidAction(

@@ -1,16 +1,17 @@
-//! `ability_utils::flatten_declared_targets_in_chain` on pending stack entries
+//! `ability_utils::declared_targets_in_chain` on pending stack entries
 //! (CR 115.1, CR 115.10a).
 
-use engine::game::ability_utils::{flatten_declared_targets_in_chain, flatten_targets_in_chain};
+use engine::game::ability_utils::{declared_targets_in_chain, flatten_targets_in_chain};
 use engine::game::combat::AttackTarget;
+use engine::game::derived_views::derive_views;
 use engine::game::effects::attach::attach_to;
 use engine::game::game_object::AttachTarget;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::types::ability::{Effect, TargetFilter, TargetRef};
+use engine::types::ability::{AbilityCondition, Effect, TargetFilter, TargetRef};
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
 use engine::types::game_state::{
-    GameState, RetargetScope, ShardChoice, StackEntryKind, WaitingFor,
+    CastPaymentMode, GameState, RetargetScope, ShardChoice, StackEntryKind, WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
@@ -36,7 +37,7 @@ const SWOOPING_PTERANODON: &str = "Flying, haste\nWhenever this creature or anot
 const FATAL_FISSURE: &str = "Choose target creature. When that creature dies this turn, you earthbend 4. (Target land you control becomes a 0/0 creature with haste that's still a land. Put four +1/+1 counters on it. When it dies or is exiled, return it to the battlefield tapped.)";
 const AEGIS_ANGEL: &str = "Flying (This creature can't be blocked except by creatures with flying or reach.)\nWhen this creature enters, another target permanent gains indestructible for as long as you control this creature. (Effects that say \"destroy\" don't destroy it. A creature with indestructible can't be destroyed by damage.)";
 
-/// `(flatten_targets_in_chain, flatten_declared_targets_in_chain)` of the
+/// `(flatten_targets_in_chain, declared_targets_in_chain)` of the
 /// stack entry with `id`.
 fn both(state: &GameState, id: ObjectId) -> (Vec<TargetRef>, Vec<TargetRef>) {
     let ability = state
@@ -47,7 +48,7 @@ fn both(state: &GameState, id: ObjectId) -> (Vec<TargetRef>, Vec<TargetRef>) {
         .expect("entry with an ability");
     (
         flatten_targets_in_chain(ability),
-        flatten_declared_targets_in_chain(ability),
+        declared_targets_in_chain(ability),
     )
 }
 
@@ -343,8 +344,8 @@ fn entity_board(aim_at_self: bool) -> (GameRunner, ObjectId, ObjectId, ObjectId)
 }
 
 #[test]
-fn psionic_entity_targets_what_it_is_aimed_at_and_not_itself() {
-    let (runner, entry, entity, bear) = entity_board(false);
+fn psionic_entity_targets_only_what_it_is_aimed_at() {
+    let (runner, entry, _, bear) = entity_board(false);
     let ability = runner
         .state()
         .stack
@@ -361,7 +362,6 @@ fn psionic_entity_targets_what_it_is_aimed_at_and_not_itself() {
     );
     let (_, declared) = both(runner.state(), entry);
     assert_eq!(declared, vec![TargetRef::Object(bear)]);
-    assert!(!declared.contains(&TargetRef::Object(entity)));
 }
 
 #[test]
@@ -2034,4 +2034,893 @@ fn an_enters_trigger_left_with_only_its_source_to_target_commits_no_crime() {
     assert_eq!(declared, vec![TargetRef::Object(denizen)], "CR 115.1d");
     assert_eq!(held, vec![TargetRef::Object(denizen)], "CR 115.1");
     assert_eq!(criminals(&events), Vec::new(), "CR 700.13");
+}
+
+/// Not a printed card: a paid "instead" clause followed by another targeted
+/// instruction.
+const KICKED_INSTEAD_THEN_TARGET_PLAYER: &str = "Kicker {2}{B} (You may pay an additional {2}{B} as you cast this spell.)\nDestroy target creature or planeswalker with mana value 2 or less. If this spell was kicked, instead destroy target creature or planeswalker. Target player loses 2 life.";
+
+/// P0 holds `KICKED_INSTEAD_THEN_TARGET_PLAYER` and its kicker mana; P1 controls
+/// two creatures. Returns the scenario, the spell, and the creatures.
+fn kicked_then_player_board() -> (GameScenario, ObjectId, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let bear = scenario.add_creature(P1, "Bear", 2, 2).id();
+    let other = scenario.add_creature(P1, "Other Bear", 2, 2).id();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(
+            P0,
+            "Kicked Then Player",
+            false,
+            KICKED_INSTEAD_THEN_TARGET_PLAYER,
+        )
+        .from_oracle_text_with_keywords(&["Kicker"], KICKED_INSTEAD_THEN_TARGET_PLAYER)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        vec![
+            ManaUnit::new(ManaType::Black, spell, false, vec![]),
+            ManaUnit::new(ManaType::Colorless, spell, false, vec![]),
+            ManaUnit::new(ManaType::Colorless, spell, false, vec![]),
+        ],
+    );
+    (scenario, spell, bear, other)
+}
+
+/// Reach guards: the spell was kicked, its "instead" clause is the paid child,
+/// the parent holds a copy of the child's target, and the later clause holds
+/// the player.
+fn assert_kicked_child_and_later_player(state: &GameState, spell: ObjectId, creature: ObjectId) {
+    let ability = state
+        .stack
+        .iter()
+        .find(|e| e.id == spell)
+        .and_then(|e| e.ability())
+        .expect("the spell is on the stack");
+    assert!(
+        ability.context.additional_cost_paid,
+        "reach guard: the spell was kicked"
+    );
+    assert_eq!(
+        ability
+            .sub_ability
+            .as_deref()
+            .and_then(|child| child.condition.clone()),
+        Some(AbilityCondition::AdditionalCostPaidInstead),
+        "reach guard: the kicked clause is the parent's child"
+    );
+    assert_eq!(
+        flatten_targets_in_chain(ability),
+        vec![
+            TargetRef::Object(creature),
+            TargetRef::Object(creature),
+            TargetRef::Player(P1),
+        ],
+        "reach guard: the parent holds a copy of the child's target"
+    );
+}
+
+#[test]
+fn a_kicked_spell_with_a_later_target_chosen_one_by_one_targets_both() {
+    let (scenario, spell, bear, _) = kicked_then_player_board();
+    let mut runner = scenario.build();
+    runner
+        .cast(spell)
+        .accept_optional()
+        .target_object(bear)
+        .target_player(P1)
+        .commit();
+    assert_kicked_child_and_later_player(runner.state(), spell, bear);
+    assert_eq!(
+        declared_of(runner.state(), spell),
+        vec![TargetRef::Object(bear), TargetRef::Player(P1)],
+        "CR 601.2c"
+    );
+}
+
+#[test]
+fn a_kicked_spell_with_a_later_target_chosen_together_targets_both() {
+    let (scenario, spell, bear, _) = kicked_then_player_board();
+    let mut runner = scenario.build();
+    let card_id = runner.state().objects[&spell].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: spell,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("the spell is castable");
+    loop {
+        let action = match &runner.state().waiting_for {
+            WaitingFor::OptionalCostChoice { .. } => GameAction::DecideOptionalCost { pay: true },
+            WaitingFor::TargetSelection { .. } => GameAction::SelectTargets {
+                targets: vec![TargetRef::Object(bear), TargetRef::Player(P1)],
+            },
+            WaitingFor::ManaPayment { .. } => GameAction::PassPriority,
+            WaitingFor::Priority { .. } => break,
+            other => panic!("unexpected prompt while casting: {other:?}"),
+        };
+        runner.act(action).expect("the cast advances");
+    }
+    assert_kicked_child_and_later_player(runner.state(), spell, bear);
+    assert_eq!(
+        declared_of(runner.state(), spell),
+        vec![TargetRef::Object(bear), TargetRef::Player(P1)],
+        "CR 601.2c"
+    );
+}
+
+#[test]
+fn a_kicked_spell_with_a_later_target_given_a_new_kicked_target_targets_it() {
+    let (mut scenario, spell, bear, other) = kicked_then_player_board();
+    let redirect_card = scenario
+        .add_spell_to_hand_from_oracle(P1, "Redirect", true, REDIRECT)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner
+        .cast(spell)
+        .accept_optional()
+        .target_object(bear)
+        .target_player(P1)
+        .commit();
+    redirect(
+        &mut runner,
+        redirect_card,
+        spell,
+        vec![TargetRef::Object(other), TargetRef::Player(P1)],
+    );
+    assert_kicked_child_and_later_player(runner.state(), spell, other);
+    assert_eq!(
+        declared_of(runner.state(), spell),
+        vec![TargetRef::Object(other), TargetRef::Player(P1)],
+        "CR 115.7d"
+    );
+}
+
+fn displayed_targets(state: &GameState, id: ObjectId) -> Vec<TargetRef> {
+    derive_views(state, Some(P0)).stack_entry_details[&id]
+        .targets
+        .iter()
+        .map(|display| display.target.clone())
+        .collect()
+}
+
+fn strip_target_records(value: &mut serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(map) => {
+            let removed = usize::from(map.remove("chosen_target_slots").is_some());
+            removed + map.values_mut().map(strip_target_records).sum::<usize>()
+        }
+        serde_json::Value::Array(items) => items.iter_mut().map(strip_target_records).sum(),
+        _ => 0,
+    }
+}
+
+#[test]
+fn a_spell_restored_from_a_save_without_target_records_shows_its_target() {
+    let mut scenario = GameScenario::new();
+    let (first, _, shock) = shock_on_the_stack(&mut scenario);
+    let mut runner = scenario.build();
+    runner.cast(shock).target_objects(&[first]).commit();
+    let mut saved = serde_json::to_value(runner.state()).expect("serialize");
+    assert!(
+        strip_target_records(&mut saved) > 0,
+        "reach guard: the save held a target record"
+    );
+    let restored: GameState = serde_json::from_value(saved).expect("restore");
+    assert_eq!(
+        declared_of(&restored, shock),
+        Vec::new(),
+        "reach guard: the restored entry has no record"
+    );
+    assert_eq!(
+        displayed_targets(&restored, shock),
+        vec![TargetRef::Object(first)]
+    );
+}
+
+#[test]
+fn swords_to_plowshares_makes_the_creature_it_exiles_a_target_once() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let bear = scenario.add_creature(P1, "Bear", 2, 2).id();
+    let swords = scenario
+        .add_spell_to_hand_from_oracle(P0, "Swords to Plowshares", true, SWORDS_TO_PLOWSHARES)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    let outcome = runner.cast(swords).target_objects(&[bear]).resolve();
+    let became_target = outcome
+        .events()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                GameEvent::BecomesTarget { target, source_id, .. }
+                    if *source_id == swords && *target == TargetRef::Object(bear)
+            )
+        })
+        .count();
+    assert_eq!(became_target, 1, "CR 601.2c");
+}
+
+#[test]
+fn swords_to_plowshares_shows_the_creature_it_exiles_once() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let bear = scenario.add_creature(P1, "Bear", 2, 2).id();
+    let swords = scenario
+        .add_spell_to_hand_from_oracle(P0, "Swords to Plowshares", true, SWORDS_TO_PLOWSHARES)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(swords).target_objects(&[bear]).commit();
+    assert_eq!(
+        displayed_targets(runner.state(), swords),
+        vec![TargetRef::Object(bear)]
+    );
+}
+
+const BURST_LIGHTNING: &str = "Kicker {4} (You may pay an additional {4} as you cast this spell.)\nBurst Lightning deals 2 damage to any target. If this spell was kicked, it deals 4 damage instead.";
+
+#[test]
+fn a_kicked_spell_whose_kicked_clause_reuses_its_target_is_a_crime() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let big = scenario.add_creature(P1, "Big", 5, 5).id();
+    let burst = scenario
+        .add_spell_to_hand_from_oracle(P0, "Burst Lightning", true, BURST_LIGHTNING)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    for _ in 0..4 {
+        scenario.add_basic_land(P0, ManaColor::Red);
+    }
+    let mut runner = scenario.build();
+    runner
+        .cast(burst)
+        .target_object(big)
+        .accept_optional()
+        .commit();
+    let ability = runner
+        .state()
+        .stack
+        .iter()
+        .find(|e| e.id == burst)
+        .and_then(|e| e.ability())
+        .expect("Burst Lightning is on the stack");
+    assert!(
+        ability.context.additional_cost_paid,
+        "reach guard: the spell was kicked"
+    );
+    assert_eq!(
+        ability
+            .sub_ability
+            .as_deref()
+            .map(|child| child.targets.clone()),
+        Some(Vec::new()),
+        "reach guard: the kicked clause holds no target of its own"
+    );
+    assert_eq!(crimes(runner.state(), P0), 1, "CR 700.13");
+}
+
+/// The first half of Trial // Error.
+const TRIAL: &str =
+    "Return all creatures blocking or blocked by target creature to their owner's hand.";
+const TRUE_POLYMORPH: &str =
+    "Target artifact or creature becomes a copy of another target artifact or creature.";
+
+/// Casts `spell` and answers its target prompt with one `SelectTargets`.
+fn cast_selecting_targets_together(
+    runner: &mut GameRunner,
+    spell: ObjectId,
+    targets: Vec<TargetRef>,
+) {
+    let card_id = runner.state().objects[&spell].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: spell,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("the spell is castable");
+    let mut targets = Some(targets);
+    loop {
+        let action = match &runner.state().waiting_for {
+            WaitingFor::TargetSelection { .. } => GameAction::SelectTargets {
+                targets: targets.take().expect("one target prompt"),
+            },
+            WaitingFor::ManaPayment { .. } => GameAction::PassPriority,
+            WaitingFor::Priority { .. } => break,
+            other => panic!("unexpected prompt while casting: {other:?}"),
+        };
+        runner.act(action).expect("the cast advances");
+    }
+}
+
+/// P1 controls two creatures; P0 holds Trial. Returns the scenario, Trial and
+/// the first creature.
+fn trial_board() -> (GameScenario, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let bear = scenario.add_creature(P1, "Bear", 2, 2).id();
+    scenario.add_creature(P1, "Other Bear", 2, 2);
+    let trial = scenario
+        .add_spell_to_hand_from_oracle(P0, "Trial", true, TRIAL)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    (scenario, trial, bear)
+}
+
+/// Reach guards: the spell is one `BounceAll` node, and that node holds the
+/// target.
+fn assert_trial_holds(state: &GameState, trial: ObjectId, creature: ObjectId) {
+    let ability = state
+        .stack
+        .iter()
+        .find(|e| e.id == trial)
+        .and_then(|e| e.ability())
+        .expect("Trial is on the stack");
+    assert!(
+        matches!(ability.effect, Effect::BounceAll { .. }) && ability.sub_ability.is_none(),
+        "reach guard: one `BounceAll` node"
+    );
+    assert_eq!(
+        ability.targets,
+        vec![TargetRef::Object(creature)],
+        "reach guard: the node holds its target"
+    );
+}
+
+#[test]
+fn a_spell_naming_the_creatures_in_combat_with_its_target_chosen_one_by_one_targets_it() {
+    let (scenario, trial, bear) = trial_board();
+    let mut runner = scenario.build();
+    runner.cast(trial).target_object(bear).commit();
+    assert_trial_holds(runner.state(), trial, bear);
+    assert_eq!(
+        declared_of(runner.state(), trial),
+        vec![TargetRef::Object(bear)],
+        "CR 601.2c"
+    );
+}
+
+#[test]
+fn a_spell_naming_the_creatures_in_combat_with_its_target_chosen_together_targets_it() {
+    let (scenario, trial, bear) = trial_board();
+    let mut runner = scenario.build();
+    cast_selecting_targets_together(&mut runner, trial, vec![TargetRef::Object(bear)]);
+    assert_trial_holds(runner.state(), trial, bear);
+    assert_eq!(
+        declared_of(runner.state(), trial),
+        vec![TargetRef::Object(bear)],
+        "CR 601.2c"
+    );
+}
+
+#[test]
+fn true_polymorph_targets_the_creature_it_changes_then_the_one_it_copies() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let own = scenario.add_creature(P0, "Own", 1, 1).id();
+    let theirs = scenario.add_creature(P1, "Theirs", 5, 5).id();
+    let polymorph = scenario
+        .add_spell_to_hand_from_oracle(P0, "True Polymorph", true, TRUE_POLYMORPH)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    cast_selecting_targets_together(
+        &mut runner,
+        polymorph,
+        vec![TargetRef::Object(own), TargetRef::Object(theirs)],
+    );
+    let ability = runner
+        .state()
+        .stack
+        .iter()
+        .find(|e| e.id == polymorph)
+        .and_then(|e| e.ability())
+        .expect("True Polymorph is on the stack");
+    assert!(
+        matches!(ability.effect, Effect::BecomeCopy { .. }) && ability.sub_ability.is_none(),
+        "reach guard: one copy node"
+    );
+    assert_eq!(
+        ability.targets,
+        vec![TargetRef::Object(own), TargetRef::Object(theirs)],
+        "reach guard: the node holds both targets"
+    );
+    assert_eq!(
+        declared_of(runner.state(), polymorph),
+        vec![TargetRef::Object(own), TargetRef::Object(theirs)],
+        "CR 601.2c"
+    );
+}
+
+const AKROAN_CRUSADER: &str = "Heroic — Whenever you cast a spell that targets this creature, create a 1/1 red Soldier creature token with haste. (It can attack and {T} as soon as it comes under your control.)";
+const BLOOMING_BLAST: &str = "Gift a Treasure (You may promise an opponent a gift as you cast this spell. If you do, they create a Treasure token before its other effects. It's an artifact with \"{T}, Sacrifice this token: Add one mana of any color.\")\nBlooming Blast deals 2 damage to target creature. If the gift was promised, Blooming Blast also deals 3 damage to that creature's controller.";
+const HINDERING_LIGHT: &str =
+    "Counter target spell that targets you or a permanent you control.\nDraw a card.";
+const RADIATE: &str = "Choose target instant or sorcery spell that targets only a single permanent or player. Copy that spell for each other permanent or player the spell could target. Each copy targets a different one of those permanents and players.";
+const BOLT_BEND: &str = "This spell costs {3} less to cast if you control a creature with power 4 or greater.\nChange the target of target spell or ability with a single target.";
+
+fn add_blooming_blast(scenario: &mut GameScenario) -> ObjectId {
+    scenario
+        .add_spell_to_hand_from_oracle(P0, "Blooming Blast", true, BLOOMING_BLAST)
+        .from_oracle_text_with_keywords(&["Gift"], BLOOMING_BLAST)
+        .with_mana_cost(ManaCost::generic(0))
+        .id()
+}
+
+/// Reach guards: Blooming Blast is on the stack, its first node holds no
+/// target, and it declares `target` alone.
+fn assert_blast_targets_below_its_root(state: &GameState, blast: ObjectId, target: ObjectId) {
+    let ability = state
+        .stack
+        .iter()
+        .find(|e| e.id == blast)
+        .and_then(|e| e.ability())
+        .expect("Blooming Blast is on the stack");
+    assert_eq!(
+        ability.targets,
+        Vec::new(),
+        "reach guard: the first node holds no target"
+    );
+    assert_eq!(
+        declared_of(state, blast),
+        vec![TargetRef::Object(target)],
+        "reach guard: the spell declares its target"
+    );
+}
+
+/// P0 controls Akroan Crusader, and P1 a 2/2. Returns the scenario and the
+/// Crusader.
+fn crusader_board() -> (GameScenario, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let crusader = scenario
+        .add_creature(P0, "Akroan Crusader", 1, 1)
+        .from_oracle_text_with_keywords(&["Heroic"], AKROAN_CRUSADER)
+        .id();
+    scenario.add_creature(P1, "Bear", 2, 2);
+    (scenario, crusader)
+}
+
+#[test]
+fn blooming_blast_without_its_gift_at_akroan_crusader_triggers_heroic() {
+    let (mut scenario, crusader) = crusader_board();
+    let blast = add_blooming_blast(&mut scenario);
+    let mut runner = scenario.build();
+    runner.cast(blast).target_object(crusader).commit();
+    assert_blast_targets_below_its_root(runner.state(), blast, crusader);
+    let ability = runner
+        .state()
+        .stack
+        .iter()
+        .find(|e| e.id == blast)
+        .and_then(|e| e.ability());
+    assert_eq!(
+        ability.and_then(|a| a.context.gift_recipient),
+        None,
+        "reach guard: the gift was not promised"
+    );
+    assert!(
+        pending_trigger_of(runner.state(), crusader).is_some(),
+        "CR 115.9b"
+    );
+}
+
+#[test]
+fn blooming_blast_with_its_gift_promised_at_akroan_crusader_triggers_heroic() {
+    let (mut scenario, crusader) = crusader_board();
+    let blast = add_blooming_blast(&mut scenario);
+    let mut runner = scenario.build();
+    runner
+        .cast(blast)
+        .target_object(crusader)
+        .accept_optional()
+        .commit();
+    assert_blast_targets_below_its_root(runner.state(), blast, crusader);
+    let ability = runner
+        .state()
+        .stack
+        .iter()
+        .find(|e| e.id == blast)
+        .and_then(|e| e.ability());
+    assert_eq!(
+        ability.and_then(|a| a.context.gift_recipient),
+        Some(P1),
+        "reach guard: the gift was promised"
+    );
+    assert!(
+        pending_trigger_of(runner.state(), crusader).is_some(),
+        "CR 115.9b"
+    );
+}
+
+#[test]
+fn shock_at_akroan_crusader_triggers_heroic() {
+    let (mut scenario, crusader) = crusader_board();
+    let shock = scenario
+        .add_spell_to_hand_from_oracle(P0, "Shock", true, SHOCK)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(shock).target_object(crusader).commit();
+    let ability = runner
+        .state()
+        .stack
+        .iter()
+        .find(|e| e.id == shock)
+        .and_then(|e| e.ability())
+        .expect("Shock is on the stack");
+    assert_eq!(
+        ability.targets,
+        vec![TargetRef::Object(crusader)],
+        "reach guard: the first node holds the target"
+    );
+    assert!(
+        pending_trigger_of(runner.state(), crusader).is_some(),
+        "CR 115.9b"
+    );
+}
+
+/// P0 controls Zada and another creature. Returns the scenario, Zada and the
+/// other creature.
+fn zada_board() -> (GameScenario, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let zada = scenario
+        .add_creature(P0, "Zada, Hedron Grinder", 3, 3)
+        .from_oracle_text_with_keywords(&[], ZADA)
+        .id();
+    let other = scenario.add_creature(P0, "Bear", 2, 2).id();
+    (scenario, zada, other)
+}
+
+#[test]
+fn blooming_blast_at_zada_alone_triggers_zada() {
+    let (mut scenario, zada, _) = zada_board();
+    let blast = add_blooming_blast(&mut scenario);
+    let mut runner = scenario.build();
+    runner.cast(blast).target_object(zada).commit();
+    assert_blast_targets_below_its_root(runner.state(), blast, zada);
+    assert!(
+        pending_trigger_of(runner.state(), zada).is_some(),
+        "CR 115.9c"
+    );
+}
+
+#[test]
+fn arc_trail_at_zada_and_another_creature_does_not_trigger_zada() {
+    let (mut scenario, zada, other) = zada_board();
+    let arc_trail = scenario
+        .add_spell_to_hand_from_oracle(P0, "Arc Trail", false, ARC_TRAIL)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    cast_selecting_targets_together(
+        &mut runner,
+        arc_trail,
+        vec![TargetRef::Object(zada), TargetRef::Object(other)],
+    );
+    let ability = runner
+        .state()
+        .stack
+        .iter()
+        .find(|e| e.id == arc_trail)
+        .and_then(|e| e.ability())
+        .expect("Arc Trail is on the stack");
+    assert_eq!(
+        ability.targets,
+        vec![TargetRef::Object(zada)],
+        "reach guard: the first node holds only Zada"
+    );
+    assert_eq!(
+        declared_of(runner.state(), arc_trail),
+        vec![TargetRef::Object(zada), TargetRef::Object(other)],
+        "reach guard: the spell declares both creatures"
+    );
+    assert!(
+        pending_trigger_of(runner.state(), zada).is_none(),
+        "CR 115.9c"
+    );
+}
+
+/// P0 casts Blooming Blast at a creature it controls while it controls
+/// another. Returns the runner, Blooming Blast, its target and the other
+/// creature.
+fn blast_on_the_stack(scenario: GameScenario) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    let mut scenario = scenario;
+    scenario.at_phase(Phase::PreCombatMain);
+    let first = scenario.add_creature(P0, "Bear", 2, 2).id();
+    let second = scenario.add_creature(P0, "Other Bear", 2, 3).id();
+    let blast = add_blooming_blast(&mut scenario);
+    let mut runner = scenario.build();
+    runner.cast(blast).target_object(first).commit();
+    assert_blast_targets_below_its_root(runner.state(), blast, first);
+    (runner, blast, first, second)
+}
+
+/// Casts `spell`, whose only legal target the engine chooses, and returns
+/// what the cast answered.
+fn cast_at_its_only_target(runner: &mut GameRunner, spell: ObjectId) -> Result<(), String> {
+    let card_id = runner.state().objects[&spell].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: spell,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .map(|_| ())
+        .map_err(|error| format!("{error:?}"))
+}
+
+#[test]
+fn hindering_light_can_target_a_spell_whose_target_sits_below_its_gift() {
+    let mut scenario = GameScenario::new();
+    let hindering_light = scenario
+        .add_spell_to_hand_from_oracle(P0, "Hindering Light", true, HINDERING_LIGHT)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let (mut runner, blast, _, _) = blast_on_the_stack(scenario);
+    assert_eq!(
+        cast_at_its_only_target(&mut runner, hindering_light),
+        Ok(()),
+        "CR 115.9b"
+    );
+    assert_eq!(
+        declared_of(runner.state(), hindering_light),
+        vec![TargetRef::Object(blast)]
+    );
+}
+
+#[test]
+fn radiate_can_target_a_spell_whose_single_target_sits_below_its_gift() {
+    let mut scenario = GameScenario::new();
+    let radiate = scenario
+        .add_spell_to_hand_from_oracle(P0, "Radiate", true, RADIATE)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let (mut runner, blast, _, _) = blast_on_the_stack(scenario);
+    assert_eq!(
+        cast_at_its_only_target(&mut runner, radiate),
+        Ok(()),
+        "CR 115.9c"
+    );
+    assert_eq!(
+        declared_of(runner.state(), radiate),
+        vec![TargetRef::Object(blast)]
+    );
+}
+
+#[test]
+fn bolt_bend_moves_the_target_of_a_spell_whose_target_sits_below_its_gift() {
+    let mut scenario = GameScenario::new();
+    let bolt_bend = scenario
+        .add_spell_to_hand_from_oracle(P0, "Bolt Bend", true, BOLT_BEND)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let (mut runner, blast, first, second) = blast_on_the_stack(scenario);
+    runner.cast(bolt_bend).target_object(blast).commit();
+    pass_until(&mut runner, |state| {
+        matches!(state.waiting_for, WaitingFor::RetargetChoice { .. })
+    });
+    runner
+        .act(GameAction::RetargetSpell {
+            new_targets: vec![TargetRef::Object(second)],
+        })
+        .expect("the new target is legal");
+    pass_until(&mut runner, |state| state.stack.is_empty());
+    assert_eq!(
+        (
+            runner.state().objects[&first].damage_marked,
+            runner.state().objects[&second].damage_marked
+        ),
+        (0, 2),
+        "CR 115.9a + CR 115.7"
+    );
+}
+
+const SEEDS_OF_STRENGTH: &str = "Target creature gets +1/+1 until end of turn.\nTarget creature gets +1/+1 until end of turn.\nTarget creature gets +1/+1 until end of turn.";
+const MUCK_DRUBB: &str = "Flash\nWhen this creature enters, change the target of target spell that targets only a single creature to this creature.\nMadness {2}{B} (If you discard this card, discard it into exile. When you do, cast it for its madness cost or put it into your graveyard.)";
+const NO_LEGAL_TARGETS: &str = "ActionNotAllowed(\"No legal targets available\")";
+
+/// P0 casts Seeds of Strength at creatures it controls, choosing `picks`
+/// (indices into those creatures) in one `SelectTargets`. Returns the runner
+/// and Seeds.
+fn seeds_on_the_stack(scenario: GameScenario, picks: [usize; 3]) -> (GameRunner, ObjectId) {
+    let mut scenario = scenario;
+    scenario.at_phase(Phase::PreCombatMain);
+    let creatures = [
+        scenario.add_creature(P0, "Bear", 2, 2).id(),
+        scenario.add_creature(P0, "Other Bear", 2, 2).id(),
+    ];
+    let seeds = scenario
+        .add_spell_to_hand_from_oracle(P0, "Seeds of Strength", true, SEEDS_OF_STRENGTH)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    let targets: Vec<TargetRef> = picks
+        .iter()
+        .map(|&pick| TargetRef::Object(creatures[pick]))
+        .collect();
+    cast_selecting_targets_together(&mut runner, seeds, targets.clone());
+    let ability = runner
+        .state()
+        .stack
+        .iter()
+        .find(|e| e.id == seeds)
+        .and_then(|e| e.ability())
+        .expect("Seeds of Strength is on the stack");
+    assert_eq!(
+        ability.targets,
+        targets[..1].to_vec(),
+        "reach guard: the first node holds one target"
+    );
+    assert_eq!(
+        declared_of(runner.state(), seeds),
+        targets,
+        "reach guard: the spell declares every target it chose"
+    );
+    (runner, seeds)
+}
+
+fn add_radiate(scenario: &mut GameScenario) -> ObjectId {
+    scenario
+        .add_spell_to_hand_from_oracle(P0, "Radiate", true, RADIATE)
+        .with_mana_cost(ManaCost::generic(0))
+        .id()
+}
+
+#[test]
+fn radiate_can_target_a_spell_that_targets_one_creature_three_times() {
+    let mut scenario = GameScenario::new();
+    let radiate = add_radiate(&mut scenario);
+    let (mut runner, seeds) = seeds_on_the_stack(scenario, [0, 0, 0]);
+    assert_eq!(
+        cast_at_its_only_target(&mut runner, radiate),
+        Ok(()),
+        "CR 115.9c"
+    );
+    assert_eq!(
+        declared_of(runner.state(), radiate),
+        vec![TargetRef::Object(seeds)]
+    );
+}
+
+#[test]
+fn radiate_cannot_target_a_spell_that_targets_two_creatures() {
+    let mut scenario = GameScenario::new();
+    let radiate = add_radiate(&mut scenario);
+    let (mut runner, _) = seeds_on_the_stack(scenario, [0, 0, 1]);
+    assert_eq!(
+        cast_at_its_only_target(&mut runner, radiate),
+        Err(NO_LEGAL_TARGETS.to_string()),
+        "CR 115.9c"
+    );
+}
+
+#[test]
+fn bolt_bend_cannot_target_a_spell_that_targets_one_creature_three_times() {
+    let mut scenario = GameScenario::new();
+    let bolt_bend = scenario
+        .add_spell_to_hand_from_oracle(P0, "Bolt Bend", true, BOLT_BEND)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let (mut runner, _) = seeds_on_the_stack(scenario, [0, 0, 0]);
+    assert_eq!(
+        cast_at_its_only_target(&mut runner, bolt_bend),
+        Err(NO_LEGAL_TARGETS.to_string()),
+        "CR 115.9a"
+    );
+}
+
+#[test]
+fn muck_drubbs_trigger_can_target_a_spell_that_targets_one_creature_three_times() {
+    let mut scenario = GameScenario::new();
+    let drubb = scenario
+        .add_creature_to_hand(P0, "Muck Drubb", 3, 3)
+        .from_oracle_text_with_keywords(&["Flash", "Madness"], MUCK_DRUBB)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let (mut runner, seeds) = seeds_on_the_stack(scenario, [0, 0, 0]);
+    runner.cast(drubb).commit();
+    pass_until(&mut runner, |state| {
+        !state.stack.iter().any(|e| e.id == drubb)
+    });
+    let trigger = pending_trigger_of(runner.state(), drubb);
+    assert!(trigger.is_some(), "CR 115.9c + CR 603.3d");
+    assert_eq!(
+        trigger.map(|trigger| declared_of(runner.state(), trigger)),
+        Some(vec![TargetRef::Object(seeds)])
+    );
+}
+
+const LOKI: &str = "Whenever you cast a spell that targets only a single creature, gain control of that creature until end of turn. If it's your turn, untap that creature and it gains haste until end of turn.";
+const LONGSTALK_BRAWL: &str = "Gift a tapped Fish (You may promise an opponent a gift as you cast this spell. If you do, they create a tapped 1/1 blue Fish creature token before its other effects.)\nChoose target creature you control and target creature you don't control. Put a +1/+1 counter on the creature you control if the gift was promised. Then those creatures fight each other.";
+
+fn add_loki(scenario: &mut GameScenario) -> ObjectId {
+    scenario
+        .add_creature(P0, "Loki, God of Lies", 3, 3)
+        .from_oracle_text_with_keywords(&[], LOKI)
+        .id()
+}
+
+#[test]
+fn loki_triggers_on_a_spell_that_targets_one_creature_three_times() {
+    let mut scenario = GameScenario::new();
+    let loki = add_loki(&mut scenario);
+    let (runner, _) = seeds_on_the_stack(scenario, [0, 0, 0]);
+    assert!(
+        pending_trigger_of(runner.state(), loki).is_some(),
+        "CR 115.9c"
+    );
+}
+
+#[test]
+fn loki_does_not_trigger_on_a_spell_that_targets_two_creatures() {
+    let mut scenario = GameScenario::new();
+    let loki = add_loki(&mut scenario);
+    let (runner, _) = seeds_on_the_stack(scenario, [0, 0, 1]);
+    assert!(
+        pending_trigger_of(runner.state(), loki).is_none(),
+        "CR 115.9c"
+    );
+}
+
+#[test]
+fn loki_triggers_on_a_spell_whose_single_target_sits_below_its_gift() {
+    let mut scenario = GameScenario::new();
+    let loki = add_loki(&mut scenario);
+    let (runner, _, _, _) = blast_on_the_stack(scenario);
+    assert!(
+        pending_trigger_of(runner.state(), loki).is_some(),
+        "CR 115.9c"
+    );
+}
+
+#[test]
+fn loki_does_not_trigger_on_a_spell_whose_two_targets_sit_below_its_gift() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let loki = add_loki(&mut scenario);
+    let own = scenario.add_creature(P0, "Bear", 2, 2).id();
+    let theirs = scenario.add_creature(P1, "Other Bear", 2, 2).id();
+    let brawl = scenario
+        .add_spell_to_hand_from_oracle(P0, "Longstalk Brawl", false, LONGSTALK_BRAWL)
+        .from_oracle_text_with_keywords(&["Gift"], LONGSTALK_BRAWL)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(brawl).target_objects(&[own, theirs]).commit();
+    let ability = runner
+        .state()
+        .stack
+        .iter()
+        .find(|e| e.id == brawl)
+        .and_then(|e| e.ability())
+        .expect("Longstalk Brawl is on the stack");
+    assert_eq!(
+        ability.targets,
+        Vec::new(),
+        "reach guard: the first node holds no target"
+    );
+    assert_eq!(
+        ability.context.gift_recipient, None,
+        "reach guard: the gift was not promised"
+    );
+    assert_eq!(
+        declared_of(runner.state(), brawl),
+        vec![TargetRef::Object(own), TargetRef::Object(theirs)],
+        "reach guard: the spell declares both creatures"
+    );
+    assert!(
+        pending_trigger_of(runner.state(), loki).is_none(),
+        "CR 115.9c"
+    );
 }

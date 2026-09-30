@@ -8574,11 +8574,9 @@ fn push_pending_trigger_to_stack_with_firing_and_duration_events(
         "a source-less rule ability must carry its own name — the display layer \
          has no object from which to read one"
     );
-    // CR 700.13 + CR 115.10a: only a target chosen for the trigger can make
-    // putting it on the stack a crime.
     let crime_candidate = super::casting::targets_commit_crime(
         state,
-        &super::ability_utils::flatten_declared_targets_in_chain(&ability),
+        &super::ability_utils::declared_targets_in_chain(&ability),
         controller,
     );
     let reveal_caused_card = reveal_causing_card(&ability);
@@ -8984,10 +8982,9 @@ fn prepare_trigger_targets(state: &GameState, trigger: &PendingTrigger) -> Prepa
                 return PreparedTriggerTargets::NeedsFallbackPush;
             }
             let mut events = Vec::new();
-            // CR 115.10a: only the targets chosen for the trigger become targets.
             super::casting::emit_targeting_events(
                 &prepared_state,
-                &super::ability_utils::flatten_declared_targets_in_chain(&prepared_trigger.ability),
+                &super::ability_utils::declared_targets_in_chain(&prepared_trigger.ability),
                 prepared_trigger.source_id,
                 prepared_trigger.controller,
                 &mut events,

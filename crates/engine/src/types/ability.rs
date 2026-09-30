@@ -6698,8 +6698,6 @@ pub enum FilterProp {
     /// choice made earlier in the same resolving instruction sequence. Used by
     /// "of the chosen kind" library filters and guess-resolution conditions.
     MatchesLastChosenCardPredicate,
-    /// CR 115.7: Matches stack entries that have exactly one target.
-    /// Used for "with a single target" qualifiers on retarget effects.
     HasSingleTarget,
     /// CR 700.2: Matches a spell/ability on the stack that is modal (its printed
     /// text offers two or more options in a bulleted list). Evaluated against the
@@ -32788,6 +32786,8 @@ pub struct ResolvedAbility {
     /// whose keyed pins are reserved for delayed-trigger referents.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selected_target_incarnations: Vec<ObjectIncarnationRef>,
+    /// CR 601.2c: The indices into `targets` of the targets chosen for this
+    /// node (see [`ResolvedAbility::push_chosen_target`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chosen_target_slots: Vec<usize>,
     /// CR 602.2b + CR 601.2f: self-referential activation cost modification
@@ -33497,6 +33497,12 @@ impl ResolvedAbility {
             mode_abilities: Vec::new(),
             parent_target_missing_reason: None,
         }
+    }
+
+    /// CR 601.2c: Appends a target chosen for this node and records its slot.
+    pub(crate) fn push_chosen_target(&mut self, target: TargetRef) {
+        self.chosen_target_slots.push(self.targets.len());
+        self.targets.push(target);
     }
 
     pub(crate) fn bind_attach_attachment_target(&mut self, target: ObjectIncarnationRef) {

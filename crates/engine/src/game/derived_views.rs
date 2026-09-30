@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::analysis::resource::ResourceAxis;
-use crate::game::ability_utils::declared_targets_in_chain;
+use crate::game::ability_utils::{declared_targets_in_chain, flatten_targets_in_chain};
 use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::game::game_object::{AttachTarget, DisplaySource};
 use crate::game::stack::{
@@ -2938,7 +2938,17 @@ fn stack_entry_targets(state: &GameState, entry: &StackEntry) -> Vec<StackTarget
         StackEntryKind::KeywordAction { action } => keyword_action_targets(action),
         _ => effective_stack_ability(state, entry)
             .ability
-            .map(declared_targets_in_chain)
+            .map(|ability| {
+                let declared = declared_targets_in_chain(ability);
+                // An entry restored from a save written before
+                // `chosen_target_slots` existed has no record; so does one that
+                // declared no target. Both show what they hold.
+                if declared.is_empty() {
+                    flatten_targets_in_chain(ability)
+                } else {
+                    declared
+                }
+            })
             .unwrap_or_default(),
     };
     targets
