@@ -734,21 +734,23 @@ class MediaPluginPackagingTests(unittest.TestCase):
         # an install inside its body must be refused like other shell control
         # flow rather than credited as an executed command.
         definitions = (
-            ("install_media() {", False),
-            ("function install_media {", False),
-            ("install_media()", True),
-            ("function install_media", True),
-            ("install_media() # not called below", True),
-            ("function install_media # not called below", True),
+            ("install_media() {", "", "}"),
+            ("function install_media {", "", "}"),
+            ("install_media()", "{", "}"),
+            ("function install_media", "{", "}"),
+            ("install_media() # not called below", "{", "}"),
+            ("function install_media # not called below", "{", "}"),
+            ("install_media() (", "", ")"),
+            ("function install_media() (", "", ")"),
         )
-        for definition, brace_on_next_line in definitions:
+        for definition, opener, closer in definitions:
             with self.subTest(definition=definition):
                 t = self.tree()
                 run = (
                     f"{definition}\n"
-                    + ("{\n" if brace_on_next_line else "")
+                    + (f"{opener}\n" if opener else "")
                     + f"  sudo apt-get install -y {' '.join(DEFAULT_PACKAGES)}\n"
-                    + "}\n")
+                    + f"{closer}\n")
                 t.write_workflow(run=run)
                 r = t.run()
                 self.assertEqual(r.returncode, 2, r.stdout)
