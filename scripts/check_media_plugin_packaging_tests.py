@@ -738,6 +738,8 @@ class MediaPluginPackagingTests(unittest.TestCase):
             ("function install_media {", False),
             ("install_media()", True),
             ("function install_media", True),
+            ("install_media() # not called below", True),
+            ("function install_media # not called below", True),
         )
         for definition, brace_on_next_line in definitions:
             with self.subTest(definition=definition):
