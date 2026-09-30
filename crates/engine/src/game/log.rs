@@ -4,7 +4,7 @@ use crate::game::combat::AttackTarget;
 use crate::game::planechase::PlanarDieFace;
 use crate::types::ability::{AbilityTag, TargetRef};
 use crate::types::events::{GameEvent, PlayerActionKind};
-use crate::types::game_state::{GameState, StackEntryKind, ZoneChangeRecord};
+use crate::types::game_state::{GameState, StackObjectClass, ZoneChangeRecord};
 use crate::types::identifiers::ObjectId;
 use crate::types::log::{
     GameLogEntry, LogBoundary, LogCategory, LogImportance, LogPresentation, LogSegment, LogTone,
@@ -755,7 +755,7 @@ fn name_ability_entries_by_source(
             continue;
         };
         if let Some(entry) = before.stack.iter().find(|entry| {
-            entry.id == *object_id && !matches!(entry.kind, StackEntryKind::Spell { .. })
+            entry.id == *object_id && matches!(entry.kind.class(), StackObjectClass::Ability(_))
         }) {
             *segment = card_seg(after, entry.source_id);
         }
@@ -2317,6 +2317,7 @@ mod tests {
         start_game, start_game_skip_mulligan, start_game_with_starting_player,
     };
     use crate::game::zones::create_object;
+    use crate::types::game_state::StackEntryKind;
     use crate::types::identifiers::CardId;
 
     /// CR 701.17a + CR 701.17c: the paired `ZoneChanged` names the milled card, so the
@@ -2804,6 +2805,78 @@ mod tests {
                 vec![("Pinger", pinger), ("Stifle", countered_by)],
                 vec![("Stifle", countered_by), ("Pinger", pinger)],
             ]
+        );
+    }
+
+    /// Only an ability's entry is renamed to its source: an entry that is
+    /// neither a spell nor an ability keeps the id the segment cites.
+    #[test]
+    fn combat_damage_entry_segment_is_not_renamed_to_a_source() {
+        use crate::types::ability::{Effect, ResolvedAbility};
+        use crate::types::game_state::{CombatDamageSubStep, StackEntry};
+        let mut state = GameState::new_two_player(42);
+        let pinger = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Pinger".to_string(),
+            crate::types::zones::Zone::Battlefield,
+        );
+        let attacker = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Attacker".to_string(),
+            crate::types::zones::Zone::Battlefield,
+        );
+        let ability_entry = ObjectId(state.next_object_id);
+        let damage_entry = ObjectId(state.next_object_id + 1);
+        state.next_object_id += 2;
+        state.stack.push_back(StackEntry {
+            id: ability_entry,
+            source_id: pinger,
+            controller: PlayerId(0),
+            kind: StackEntryKind::ActivatedAbility {
+                source_id: pinger,
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::NoOp,
+                    vec![],
+                    pinger,
+                    PlayerId(0),
+                )),
+            },
+        });
+        state.stack.push_back(StackEntry {
+            id: damage_entry,
+            source_id: attacker,
+            controller: PlayerId(0),
+            kind: StackEntryKind::CombatDamage {
+                sub_step: CombatDamageSubStep::Regular,
+                assignments: vec![],
+            },
+        });
+        let mut segments = [
+            LogSegment::CardName {
+                name: "ability entry".to_string(),
+                object_id: ability_entry,
+            },
+            LogSegment::CardName {
+                name: "damage entry".to_string(),
+                object_id: damage_entry,
+            },
+        ];
+        name_ability_entries_by_source(&mut segments, &state, &state);
+        assert!(
+            matches!(&segments[0], LogSegment::CardName { name, object_id }
+                if name == "Pinger" && *object_id == pinger),
+            "the ability entry names its source: {:?}",
+            segments[0]
+        );
+        assert!(
+            matches!(&segments[1], LogSegment::CardName { name, object_id }
+                if name == "damage entry" && *object_id == damage_entry),
+            "the combat-damage entry is left as cited: {:?}",
+            segments[1]
         );
     }
 

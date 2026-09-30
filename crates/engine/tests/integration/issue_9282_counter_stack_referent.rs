@@ -3,8 +3,7 @@
 //! A spell's own cast trigger
 //! (storm, cascade, "when you cast this spell") is a different stack object that
 //! only shares the spell as its source, so countering the spell leaves it there.
-//! The ward rows assert which entries leave the stack and the resulting damage
-//! or tap, never the id a `SpellCountered` event carries.
+//! The ward rows never assert the id a `SpellCountered` event carries.
 
 use crate::support::shared_card_db;
 use engine::game::rehydrate_game_from_card_db;
