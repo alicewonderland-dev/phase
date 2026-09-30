@@ -353,12 +353,22 @@ def appimage_apt_packages() -> set[str]:
                 "line at a time, so a line that does not stand on its own -- "
                 "an unbalanced quote opening a multi-line string, a dangling "
                 "escape -- would have its continuation read as commands") from exc
-        if SHELL_FUNCTION_DEFINITION.match(line):
-            raise Refusal(
-                f"{SHELL_RELEASE}: step '{APT_STEP}' uses shell control "
-                f"flow: {line.strip()!r}. This gate reads install lines "
-                "one at a time and cannot tell whether a function containing "
-                "an install is called, so it will not credit packages from it")
+        # Preserve quotes while finding command boundaries: a quoted ";"
+        # is prose, whereas an unquoted separator can precede a definition.
+        lexer = shlex.shlex(line, posix=False, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        command_tokens: list[str] = []
+        for token in [*lexer, ";"]:
+            if token in SHELL_OPERATORS:
+                if SHELL_FUNCTION_DEFINITION.match(" ".join(command_tokens)):
+                    raise Refusal(
+                        f"{SHELL_RELEASE}: step '{APT_STEP}' uses shell control "
+                        f"flow: {line.strip()!r}. This gate reads install lines "
+                        "one at a time and cannot tell whether a function containing "
+                        "an install is called, so it will not credit packages from it")
+                command_tokens.clear()
+            else:
+                command_tokens.append(token)
         # Only in command position. `shlex` strips quotes, so a whole-token
         # match would refuse `echo "done"` and any sentence containing a bare
         # `for` -- a false refusal on a tree that is entirely correct. A

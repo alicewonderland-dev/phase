@@ -597,6 +597,8 @@ class MediaPluginPackagingTests(unittest.TestCase):
         # refusal on a tree that is entirely correct.
         for shape, extra in (
             ("quoted keyword", 'echo "done"'),
+            ("quoted function prose", 'echo "preparing; install_media() {"'),
+            ("quoted separator and header", 'echo ";" "install_media() {"'),
             ("keyword in prose", "echo Installed GStreamer plugins for the AppImage"),
             ("keyword as a package-ish word", "echo done building"),
         ):
@@ -748,6 +750,10 @@ class MediaPluginPackagingTests(unittest.TestCase):
             ("function install:media {", "", "}"),
             ("install-media() (", "", ")"),
             ("function install.media() (", "", ")"),
+            ("echo preparing; install_media() {", "", "}"),
+            ("echo preparing; function install-media {", "", "}"),
+            ("echo preparing&&install.media() (", "", ")"),
+            ("echo preparing || function install:media() (", "", ")"),
         )
         for definition, opener, closer in definitions:
             with self.subTest(definition=definition):
