@@ -1590,11 +1590,13 @@ pub(crate) fn parse_trigger_line_with_index_ir(
         pending_meld_partner: meld_partner,
         pending_mana_symbol_count_color,
         actor: ctx.actor.clone(),
-        // CR 608.2k: nearest antecedent wins. An intervening-`if` that pins the
-        // source OFF the battlefield ("... if ~ is in your graveyard, return it")
-        // re-establishes the source card as the antecedent, and it sits nearer to
-        // the effect body than the trigger condition does — so it outranks the
-        // condition-derived antecedent, not the other way round.
+        // CR 608.2k says an effect still affects a specific untargeted object
+        // previously referred to by the trigger condition despite characteristic
+        // changes; it does not rank competing antecedents. Here an
+        // intervening-`if` that pins the source OFF the battlefield ("... if ~ is
+        // in your graveyard, return it") supplies a nearer source reference than
+        // the trigger condition. Choosing that reference is a parser heuristic
+        // grounded in English grammar, not a rule defined by CR 608.2k.
         //
         // The two were previously ordered condition-first. That was unobservable
         // while `parse_effect_chain_ir` discarded this field wholesale (see the
