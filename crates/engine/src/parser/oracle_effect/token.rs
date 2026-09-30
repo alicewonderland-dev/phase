@@ -257,10 +257,14 @@ fn parse_copy_token_trailing_entry_modifiers(
             // arbitrary text after the entry modifier is not an entry clause.
             opt(preceded(
                 tag(", where x is "),
-                verify(nom::combinator::rest::<_, OracleError<'_>>, |expression: &str| {
-                    super::parse_where_x_quantity_expression(expression).is_some()
-                        || crate::parser::oracle_quantity::parse_cda_quantity(expression).is_some()
-                }),
+                verify(
+                    nom::combinator::rest::<_, OracleError<'_>>,
+                    |expression: &str| {
+                        super::parse_where_x_quantity_expression(expression).is_some()
+                            || crate::parser::oracle_quantity::parse_cda_quantity(expression)
+                                .is_some()
+                    },
+                ),
             ))
             .parse(rest)?
             .0
