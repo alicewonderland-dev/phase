@@ -95,8 +95,17 @@ pub(crate) fn try_parse_token(_lower: &str, text: &str, ctx: &mut ParseContext) 
         // creature and that's tapped and attacking"). Parse only the target
         // parser's unconsumed remainder so the target's Attacking restriction
         // never sets the token's entry flags.
+        let variable_x_count = matches!(
+            &count,
+            QuantityExpr::Ref {
+                qty: QuantityRef::Variable { name }
+            } if name == "X"
+        );
         if let Some((suffix_tapped, suffix_enters_attacking)) =
-            parse_copy_token_trailing_entry_modifiers(&target_remainder.to_lowercase())
+            parse_copy_token_trailing_entry_modifiers(
+                &target_remainder.to_lowercase(),
+                variable_x_count,
+            )
         {
             tapped |= suffix_tapped;
             enters_attacking |= suffix_enters_attacking;
@@ -226,8 +235,11 @@ pub(super) fn parse_copy_token_entry_modifiers(
 /// as `and that's tapped and attacking`. The caller supplies only the
 /// unconsumed target remainder, keeping target restrictions separate from
 /// token-entry instructions.
-fn parse_copy_token_trailing_entry_modifiers(remainder: &str) -> Option<(bool, bool)> {
-    fn parse_suffix(input: &str) -> OracleResult<'_, (bool, bool)> {
+fn parse_copy_token_trailing_entry_modifiers(
+    remainder: &str,
+    variable_x_count: bool,
+) -> Option<(bool, bool)> {
+    fn parse_suffix(input: &str, variable_x_count: bool) -> OracleResult<'_, (bool, bool)> {
         let (rest, _) = tag("and ").parse(input)?;
         let (rest, _) =
             alt((tag("that's"), tag("that is"), tag("thats"), tag("that are"))).parse(rest)?;
@@ -239,12 +251,28 @@ fn parse_copy_token_trailing_entry_modifiers(remainder: &str) -> Option<(bool, b
             value((false, true), tag(" attacking")),
         ))
         .parse(rest)?;
+        let rest = if variable_x_count {
+            // CR 107.3c: A following where-X clause defines the token count.
+            // Accept it only for an X count and only when its quantity parses;
+            // arbitrary text after the entry modifier is not an entry clause.
+            opt(preceded(
+                tag(", where x is "),
+                verify(nom::combinator::rest::<_, OracleError<'_>>, |expression: &str| {
+                    super::parse_where_x_quantity_expression(expression).is_some()
+                        || crate::parser::oracle_quantity::parse_cda_quantity(expression).is_some()
+                }),
+            ))
+            .parse(rest)?
+            .0
+        } else {
+            rest
+        };
         let (rest, _) = opt(alt((tag("."), tag(",")))).parse(rest)?;
         let (rest, _) = nom::character::complete::multispace0.parse(rest)?;
         let (rest, _) = eof.parse(rest)?;
         Ok((rest, flags))
     }
-    parse_suffix(remainder.trim_start())
+    parse_suffix(remainder.trim_start(), variable_x_count)
         .ok()
         .map(|(_, flags)| flags)
 }
@@ -2479,11 +2507,19 @@ mod tests {
             (" and thats attacking,", (false, true)),
         ] {
             assert_eq!(
-                parse_copy_token_trailing_entry_modifiers(suffix),
+                parse_copy_token_trailing_entry_modifiers(suffix, false),
                 Some(expected),
                 "copy-token trailing entry suffix: {suffix:?}"
             );
         }
+        assert_eq!(
+            parse_copy_token_trailing_entry_modifiers(
+                " and that are tapped and attacking, with flying.",
+                true,
+            ),
+            None,
+            "an unrelated trailing clause must not be accepted as an entry modifier"
+        );
 
         let (_, (tapped, enters_attacking, _)) = parse_copy_token_entry_modifiers(
             "create a tapped and attacking token that's a copy of target creature",
@@ -2516,6 +2552,37 @@ mod tests {
                 .contains(&TypeFilter::Subtype("Clue".to_string())),
             "X must count controlled Clues, got {:?}",
             tf.type_filters
+        );
+    }
+
+    #[test]
+    fn nacatl_war_pride_copy_tokens_bind_count_and_entry_state() {
+        // Nacatl War-Pride's printed token sentence combines a copied-source
+        // anaphor, a trailing entry-state clause, and a where-X count binding.
+        let oracle = "create X tokens that are copies of it and that are tapped and attacking, where X is the number of creatures defending player controls.";
+        let effect = try_parse_token(&oracle.to_lowercase(), oracle, &mut ParseContext::default())
+            .expect("Nacatl War-Pride token sentence must parse");
+        let Effect::CopyTokenOf {
+            count,
+            tapped,
+            enters_attacking,
+            ..
+        } = effect
+        else {
+            panic!("expected CopyTokenOf, got {effect:?}");
+        };
+        assert!(tapped && enters_attacking);
+        assert!(
+            matches!(
+                &count,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(filter),
+                    },
+                } if filter.controller == Some(ControllerRef::DefendingPlayer)
+                    && filter.type_filters.contains(&TypeFilter::Creature)
+            ),
+            "where-X must count creatures defending player controls, got {count:?}"
         );
     }
 
