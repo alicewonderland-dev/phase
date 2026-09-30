@@ -18,6 +18,16 @@ import { useGameStore } from "../../../stores/gameStore.ts";
 import { useMultiplayerStore } from "../../../stores/multiplayerStore.ts";
 import { useUiStore } from "../../../stores/uiStore.ts";
 
+function mockDescriptionOverflow(overflowing: boolean): void {
+  vi.spyOn(HTMLDivElement.prototype, "clientWidth", "get").mockImplementation(function (this: HTMLDivElement) {
+    return this.classList.contains("min-w-0") && this.classList.contains("truncate") ? 100 : 0;
+  });
+  vi.spyOn(HTMLDivElement.prototype, "scrollWidth", "get").mockImplementation(function (this: HTMLDivElement) {
+    if (!this.classList.contains("min-w-0") || !this.classList.contains("truncate")) return 0;
+    return overflowing ? 120 : 100;
+  });
+}
+
 function createGameState(overrides: Partial<GameState> = {}): GameState {
   return buildGameState({
     waiting_for: buildTriggerTargetSelectionWaitingFor({
@@ -50,6 +60,7 @@ describe("TargetingOverlay", () => {
 
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
   });
 
   // This inverts a shipped decision. The overlay used to render NO player target
@@ -623,6 +634,7 @@ describe("TargetingOverlay", () => {
   });
 
   it("renders mana symbols in trigger descriptions", () => {
+    mockDescriptionOverflow(true);
     const dispatch = vi.fn().mockResolvedValue([]);
     const sourceObject = buildGameObjectWithCoreTypes(["Instant"], {
       id: 9,
@@ -663,6 +675,30 @@ describe("TargetingOverlay", () => {
     expect(
       screen.getByRole("button", { name: "Show the full description: Deceit costs UU" }),
     ).toBeInTheDocument();
+  });
+
+  it("does not show a disclosure for a description that fits in the caption", () => {
+    mockDescriptionOverflow(false);
+    const description = "A short description.";
+    const gameState = createGameState({
+      waiting_for: buildTriggerTargetSelectionWaitingFor({
+        data: {
+          player: 0,
+          target_slots: [buildTargetSelectionSlot({ legal_targets: [{ Player: 1 }] })],
+          selection: buildTargetSelectionProgress({ current_legal_targets: [{ Player: 1 }] }),
+          description,
+        },
+      }),
+    });
+
+    act(() => {
+      useGameStore.setState({ gameState, waitingFor: gameState.waiting_for, dispatch: vi.fn() });
+    });
+
+    render(<TargetingOverlay />);
+
+    expect(screen.getByText(description)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: `Show the full description: ${description}` })).toBeNull();
   });
 
   it("shows the active trigger damage amount during target selection", () => {
@@ -990,6 +1026,7 @@ describe("TargetingOverlay", () => {
   });
 
   it("collapses a long engine description until the player expands it", () => {
+    mockDescriptionOverflow(true);
     const dispatch = vi.fn().mockResolvedValue([]);
     const description =
       "Whenever this creature attacks, choose target player. That player loses "
