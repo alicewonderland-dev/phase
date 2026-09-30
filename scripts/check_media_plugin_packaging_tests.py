@@ -742,6 +742,12 @@ class MediaPluginPackagingTests(unittest.TestCase):
             ("function install_media # not called below", "{", "}"),
             ("install_media() (", "", ")"),
             ("function install_media() (", "", ")"),
+            ("install-media() {", "", "}"),
+            ("function install-media {", "", "}"),
+            ("install.media() {", "", "}"),
+            ("function install:media {", "", "}"),
+            ("install-media() (", "", ")"),
+            ("function install.media() (", "", ")"),
         )
         for definition, opener, closer in definitions:
             with self.subTest(definition=definition):

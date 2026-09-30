@@ -96,8 +96,8 @@ SHELL_CONTROL_FLOW = frozenset({
     "while", "until", "for", "do", "done",
 })
 SHELL_FUNCTION_DEFINITION = re.compile(
-    r"^\s*(?:function\s+[A-Za-z_][A-Za-z0-9_]*(?:\s*\(\s*\))?|"
-    r"[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\))\s*(?:\{.*|\(.*|#.*|$)")
+    r"^\s*(?:function\s+[^\s(){};|&<>]+(?:\s*\(\s*\))?|"
+    r"[^\s(){};|&<>]+\s*\(\s*\))\s*(?:\{.*|\(.*|#.*|$)")
 PRIVILEGE_WRAPPERS = frozenset({"sudo", "env"})
 APT_COMMANDS = frozenset({"apt-get", "apt"})
 #: A Debian package name, optionally multi-arch qualified. Anything else on an
