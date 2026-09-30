@@ -733,13 +733,21 @@ class MediaPluginPackagingTests(unittest.TestCase):
         # The line-scoped reader cannot know whether a function is called, so
         # an install inside its body must be refused like other shell control
         # flow rather than credited as an executed command.
-        for definition in ("install_media() {", "function install_media {"):
+        definitions = (
+            ("install_media() {", False),
+            ("function install_media {", False),
+            ("install_media()", True),
+            ("function install_media", True),
+        )
+        for definition, brace_on_next_line in definitions:
             with self.subTest(definition=definition):
                 t = self.tree()
-                t.write_workflow(run=(
+                run = (
                     f"{definition}\n"
-                    f"  sudo apt-get install -y {' '.join(DEFAULT_PACKAGES)}\n"
-                    "}\n"))
+                    + ("{\n" if brace_on_next_line else "")
+                    + f"  sudo apt-get install -y {' '.join(DEFAULT_PACKAGES)}\n"
+                    + "}\n")
+                t.write_workflow(run=run)
                 r = t.run()
                 self.assertEqual(r.returncode, 2, r.stdout)
                 self.assertIn("uses shell control flow", r.stderr)
