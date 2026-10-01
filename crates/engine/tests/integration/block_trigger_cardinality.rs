@@ -6,8 +6,10 @@ use engine::types::events::GameEvent;
 use engine::types::game_state::{StackEntryKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
+use engine::types::mana::ManaColor;
 use engine::types::phase::Phase;
 use engine::types::triggers::TriggerMode;
+use engine::types::zones::Zone;
 
 const HIGH_GROUND: &str = "Each creature you control can block an additional creature each combat.";
 const SUSTAINER: &str = "Flying\nWhenever this creature blocks, it gets +0/+2 until end of turn.";
@@ -464,7 +466,6 @@ fn count_qualified_setup(
     name: &str,
     black: &[bool],
 ) -> (GameRunner, Vec<ObjectId>, ObjectId) {
-    use engine::types::mana::ManaColor;
     let mut scenario = GameScenario::new_n_player(2, 42);
     scenario.at_phase(Phase::PreCombatMain);
     let attackers: Vec<_> = black
@@ -616,7 +617,6 @@ fn count_qualified_rashka_two_black_attackers_triggers_once() {
 }
 
 fn rashka_same_name_sources_case(second_black: bool) {
-    use engine::types::mana::ManaColor;
     let mut scenario = GameScenario::new_n_player(2, 42);
     scenario.at_phase(Phase::PreCombatMain);
     let black = scenario
@@ -728,8 +728,6 @@ fn count_qualified_rashka_same_name_sources_match_their_own_groups() {
 }
 
 fn public_count_qualified_removal_case(initial_attackers: usize, oracle: &str, name: &str) {
-    use engine::types::mana::ManaColor;
-    use engine::types::zones::Zone;
     let mut scenario = GameScenario::new_n_player(2, 42);
     scenario.at_phase(Phase::PreCombatMain);
     let attackers: Vec<_> = (0..initial_attackers)
