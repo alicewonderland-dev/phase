@@ -210,6 +210,12 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 98 — PerPlayerScope gains Opponents (CR 102.2 + CR 102.3), written inside
+ *      ZoneOwner as {"Each":"Opponents"}; ZoneOpponentChooserPurpose gains
+ *      PerPlayerChoiceOrder (CR 101.4c) and SubstituteChooser (CR 800.4g);
+ *      the parked per-player zone-choice frame gains current and nominee. A v97 peer cannot deserialize them; the exact-match handshake
+ *      refuses the pairing. P2P moves in lockstep (wire 80); lobby messages
+ *      are unchanged.
  * 97 — ResolvedAbility.target_reads and AbilityDefinition.target_reads
  *      (TargetReadOrigin) are serialized: a ParentAnnouncement instruction
  *      reads the object its immediately preceding instruction announced
@@ -650,7 +656,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 97;
+export const PROTOCOL_VERSION = 98;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

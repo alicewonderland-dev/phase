@@ -3318,6 +3318,11 @@ mod tests {
         }
     }
 
+    /// `ZoneOpponentChooserPurpose::PerPlayerChoiceOrder` (CR 101.4c) and
+    /// `SubstituteChooser` (CR 800.4g), the per-player frame's `current` and
+    /// `nominee` fields, and `PerPlayerScope::Opponents` (CR 102.2 + CR 102.3)
+    /// are serialized; a v97 peer cannot deserialize them, so it must be
+    /// refused before it receives v98 state.
     /// `ResolvedAbility.target_reads` and `AbilityDefinition.target_reads`
     /// (`TargetReadOrigin`, CR 115.1 + CR 608.2c) are serialized; a v96 peer
     /// would default the field and rebuild a target slot the rules do not
@@ -3364,8 +3369,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_97_for_target_read_origin() {
-        assert_eq!(PROTOCOL_VERSION, 97);
+    fn protocol_version_is_98_for_per_player_choice_order() {
+        assert_eq!(PROTOCOL_VERSION, 98);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3376,7 +3381,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_97_for_target_read_origin` stays
+    /// `protocol_version_is_98_for_per_player_choice_order` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
