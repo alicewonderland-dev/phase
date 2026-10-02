@@ -106,6 +106,13 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
+ *  82 — game_setup and state_update carry GameState, whose additional-phase
+ *       abilities now name what they add as a TurnSegment (segment, and
+ *       followed_by's elements) in place of a Phase, and who gets it as an
+ *       ExtraPhaseRecipient (recipient) in place of a TargetFilter. Both peers are browsers
+ *       and neither validates the shape, so a v81 peer would take the new
+ *       shape with no decode error; first contact rejects the skew instead.
+ *       Bumped in lockstep with full-game protocol 100.
  *  81 — game_setup and state_update carry GameState, whose graveyard cast
  *       permissions now carry a pool (GraveyardPermissionPool: AnyGraveyard is
  *       "from any graveyard"). A v80 peer would default it to the own graveyard
@@ -512,7 +519,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 81 as const;
+export const WIRE_PROTOCOL_VERSION = 82 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

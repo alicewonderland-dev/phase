@@ -251,6 +251,7 @@ fn resolved_ability_axes(a: &ResolvedAbility, mode: ScanMode) -> Axes {
         target_incarnations: _,    // CR 400.7 referent pins, no dynamic read
         selected_target_incarnations: _, // CR 400.7 selected-target pins, no dynamic read
         illegal_target_slots: _,   // CR 608.2b resolution legality stamp, no dynamic read
+        illegal_local_target_slots: _, // CR 608.2b node-local legality stamp, no dynamic read
         controller: _,             // player id
         original_controller: _,    // player id
         scoped_player: _,          // player id (iteration binding)
@@ -1910,15 +1911,19 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             acc
         }
         Effect::AdditionalPhase {
-            target,
+            recipient,
             count,
-            phase: _,
+            segment: _,
             after: _,
             followed_by: _,
             attacker_restriction: _,
         } => {
             let mut acc = Axes::NONE;
-            acc = acc.or(scan_target_filter(target, target_ctx, mode));
+            acc = acc.or(scan_target_filter(
+                recipient.as_target_filter(),
+                target_ctx,
+                mode,
+            ));
             acc = acc.or(scan_quantity_expr(count, mode));
             acc
         }

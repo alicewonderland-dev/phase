@@ -35,6 +35,11 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // option's `authority`, the slot prompt's `permission`, the latched terms).
 // v91 retypes PendingManaAbility's required chosen-counter count (#9207).
 // v93 adds the SacrificedForCost reduction provenance.
+// v97 adds TargetReadOrigin instruction provenance.
+// v99 adds the GraveyardCastPermission pool.
+// v100 replaces `AdditionalPhase.phase` with a `TurnSegment` `segment`,
+// retypes `followed_by` to `TurnSegment`, and replaces
+// `AdditionalPhase.target` with an `ExtraPhaseRecipient` `recipient`.
 // Keep the measured base so a future merge cannot collapse independent wire
 // changes onto one number.
 const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
@@ -66,7 +71,8 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // SubstituteChooser chooser purposes, and the per-player frame's current and
 // nominee fields.
 // +28: the v99 GraveyardCastPermission pool (from any graveyard).
-const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 28;
+// +29: the v100 additional-phase segment and recipient parse bump.
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 29;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
 // script never reads itself, so its own EXPECTED_* must stay literals.
@@ -118,7 +124,9 @@ const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 // +26: wire 80 moves with full-game v98 for per-player choice order and
 // PerPlayerScope::Opponents.
 // +27: wire 81 moves with full-game v99 for the graveyard permission pool.
-const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 27;
+// +28: wire 82 moves with full-game v100 for the additional-phase segment and
+// recipient.
+const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 28;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this
 // script previously did not read at all: `DRAFT_PROTOCOL_VERSION` is an
 // EXACT-MATCH first-contact gate (p2p-draft-host.ts / p2p-draft-guest.ts refuse

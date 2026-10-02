@@ -17,7 +17,9 @@ mod active_damage_trigger_recipient_anaphor;
 mod ad_nauseam_repeat;
 mod adamant_enters_with_leading_if_gate;
 mod adapter_contract_fixtures;
+mod added_untap_step_is_not_a_turn_start;
 mod additional_combat_anchor_and_recipient;
+mod additional_phase_recipient_kinds;
 mod advanced_reconstruction_regression;
 mod affinity_plural_subtype;
 mod agent_frank_horrigan_attacked_this_turn_indestructible;
@@ -279,6 +281,7 @@ mod devour_co_entry_regression;
 mod devour_completion_rest_recovery;
 mod devour_intellect_treasure_rider;
 mod die_result_zero_after_modifier;
+mod dig_announced_target_preservation;
 mod dig_impossible_keep_count;
 mod dig_rest_pile_stranding_on_etb_pause;
 mod dihada_graveyard_treasure_count_8159;
@@ -1821,6 +1824,7 @@ mod ripple_reveal_choice_interaction;
 mod siphon_insight_mana_rider;
 mod uba_mask_draw_to_exile_play;
 mod ultimate_magic_meteor_per_opponent_destroy;
+mod untap_upkeep_draw_created_steps;
 
 #[cfg(feature = "test-support")]
 mod owned_you_target_authority;
