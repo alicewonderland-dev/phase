@@ -76,7 +76,7 @@ use crate::parser::oracle_static::parse_passive_cant_be_cast_spell_filter;
 use crate::parser::oracle_trigger::parse_trigger_line;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till, take_until};
-use nom::character::complete::{anychar, multispace0, multispace1, space1};
+use nom::character::complete::{anychar, multispace0, multispace1, one_of, space1};
 use nom::combinator::{
     all_consuming, eof, map, map_opt, not, opt, peek, recognize, rest, value, verify,
 };
@@ -20086,6 +20086,14 @@ fn try_parse_verb_and_target<'a>(
         // leak onto the primary battlefield leg — a non-"and" qualifier still
         // scopes the primary leg's origin.
         let origin = infer_origin_zone(&compound_exile_origin_scan(rest, rem));
+        let (origin, target) = compose_exile_graveyard_origin_and_target(
+            origin,
+            target,
+            rest,
+            rem,
+            ctx,
+            EffectScope::All,
+        );
         return Some((
             TargetedImperativeAst::ZoneCounterProxy(Box::new(ZoneCounterImperativeAst::Exile {
                 origin,
@@ -20113,6 +20121,14 @@ fn try_parse_verb_and_target<'a>(
         // ("instead of putting it into its owner's graveyard", No More Lies)
         // still defines this leg's origin.
         let origin = infer_origin_zone(&compound_exile_origin_scan(rest, rem));
+        let (origin, target) = compose_exile_graveyard_origin_and_target(
+            origin,
+            target,
+            rest,
+            rem,
+            ctx,
+            EffectScope::Single,
+        );
         return Some((
             TargetedImperativeAst::ZoneCounterProxy(Box::new(ZoneCounterImperativeAst::Exile {
                 origin,
@@ -45323,6 +45339,122 @@ pub(super) fn split_counterless_enter_counters(
     }
 }
 
+/// Add operand-local graveyard metadata only within the old scalar producer's
+/// admitted class. The original remainder still belongs to normal lowering.
+fn compose_exile_graveyard_origin_and_target(
+    origin: Option<Zone>,
+    target: TargetFilter,
+    target_input: &str,
+    remainder: &str,
+    ctx: &ParseContext,
+    scope: EffectScope,
+) -> (Option<Zone>, TargetFilter) {
+    // Structural provenance check on a known parser remainder, not text routing.
+    // allow-noncombinator: verify that a borrowed target-parser remainder is this operand's suffix
+    if origin != Some(Zone::Graveyard) || target_input.strip_suffix(remainder).is_none() {
+        return (origin, target);
+    }
+    let lower = remainder.to_lowercase();
+    if nom_primitives::scan_preceded(&lower, |input| {
+        alt((
+            tag::<_, _, OracleError<'_>>("and/or "),
+            tag("or "),
+            tag("and "),
+        ))
+        .parse(input)
+    })
+    .is_some()
+    {
+        return (origin, target);
+    }
+    let Some((before_source, _, source)) = nom_primitives::scan_preceded(&lower, |input| {
+        peek(tag::<_, _, OracleError<'_>>("from ")).parse(input)
+    }) else {
+        return (origin, target);
+    };
+    // The first source must be attached directly to this operand or to one
+    // complete comparison adjective. This recognizes attachment only: the
+    // comparison stays unconsumed and is not implemented by this metadata.
+    if alt((
+        value((), all_consuming(multispace0::<_, OracleError<'_>>)),
+        value(
+            (),
+            all_consuming(terminated(
+                (
+                    tag("with "),
+                    alt((tag("lesser "), tag("greater "), tag("equal "))),
+                    alt((tag("power"), tag("toughness"))),
+                ),
+                multispace1,
+            )),
+        ),
+    ))
+    .parse(before_source.trim_start())
+    .is_err()
+    {
+        return (origin, target);
+    }
+    let Some((props, consumed)) = super::oracle_target::parse_exile_graveyard_source(source) else {
+        return (origin, target);
+    };
+    if all_consuming((
+        multispace0,
+        opt(one_of::<_, _, OracleError<'_>>(".;")),
+        multispace0,
+    ))
+    .parse(&source[consumed..])
+    .is_err()
+    {
+        return (origin, target);
+    }
+    let owner = props.iter().find_map(|prop| match prop {
+        FilterProp::Owned { controller } => Some(controller),
+        _ => None,
+    });
+    if (scope == EffectScope::All && owner.is_none())
+        || (owner == Some(&ControllerRef::ScopedPlayer)
+            && ctx.third_person_player_controller_ref() != Some(ControllerRef::ScopedPlayer))
+    {
+        return (origin, target);
+    }
+    fn compatible_owner(prop: &FilterProp, owner: Option<&ControllerRef>) -> bool {
+        match prop {
+            FilterProp::Owned { controller } => owner.is_none_or(|owner| controller == owner),
+            FilterProp::AnyOf { props } => props.iter().all(|prop| compatible_owner(prop, owner)),
+            FilterProp::Not { prop } => compatible_owner(prop, owner),
+            _ => true,
+        }
+    }
+    fn eligible_class(filter: &TargetFilter, owner: Option<&ControllerRef>) -> bool {
+        if filter.is_context_ref() || !filter.extract_zones().is_empty() {
+            return false;
+        }
+        match filter {
+            TargetFilter::Typed(typed) => {
+                !typed.type_filters.is_empty()
+                    && typed
+                        .properties
+                        .iter()
+                        .all(|prop| compatible_owner(prop, owner))
+            }
+            TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+                !filters.is_empty() && filters.iter().all(|filter| eligible_class(filter, owner))
+            }
+            TargetFilter::Not { filter } => eligible_class(filter, owner),
+            _ => false,
+        }
+    }
+    if !eligible_class(&target, owner) {
+        return (origin, target);
+    }
+    // CR 115.2 + CR 601.2c + CR 115.1d + CR 603.3d: an explicitly named
+    // graveyard population must qualify spell/trigger acquisition before targets
+    // are announced. CR 108.3 + CR 109.5 + CR 400.1 + CR 400.3 + CR 404.1:
+    // owner scope describes that graveyard, using the declaring authority.
+    // Existing composition keeps these positive properties outside a Not class.
+    (origin, add_filter_props(target, &props))
+}
+
 fn add_inferred_origin_constraints_to_target(
     target: TargetFilter,
     origin: Option<Zone>,
@@ -47702,6 +47834,411 @@ mod additional_phase_recipient_subject_tests {
                 recipients("Probe", card_type, subtype, text),
                 vec![None],
                 "{text:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod exile_graveyard_origin_shape {
+    use super::*;
+    use crate::game::scenario::{GameScenario, P0, P1};
+    use crate::types::{TargetRef, TypeFilter};
+
+    fn compose(
+        target: TargetFilter,
+        base: &str,
+        rem: &str,
+        scope: EffectScope,
+        ctx: &ParseContext,
+    ) -> (Option<Zone>, TargetFilter) {
+        compose_exile_graveyard_origin_and_target(
+            Some(Zone::Graveyard),
+            target,
+            base,
+            rem,
+            ctx,
+            scope,
+        )
+    }
+
+    #[test]
+    fn shape_composer_admits_complete_attachment_class_and_scoped_authority() {
+        let ctx = ParseContext::default();
+        for adjective in ["lesser", "greater", "equal"] {
+            for characteristic in ["power", "toughness"] {
+                let rem = format!(" with {adjective} {characteristic} from your graveyard.");
+                let base = format!("target creature card{rem}");
+                let (zone, target) = compose(
+                    TargetFilter::Typed(TypedFilter::creature()),
+                    &base,
+                    &rem,
+                    EffectScope::Single,
+                    &ctx,
+                );
+                assert_eq!(zone, Some(Zone::Graveyard));
+                assert_eq!(target.extract_zones(), vec![Zone::Graveyard]);
+                let TargetFilter::Typed(tf) = target else {
+                    panic!("class retained")
+                };
+                assert!(tf.properties.contains(&FilterProp::Owned {
+                    controller: ControllerRef::You
+                }));
+                assert_eq!(
+                    tf.controller, None,
+                    "the parser keeps owner authority symbolic"
+                );
+            }
+        }
+        let base = "target creature card with lesser power from their graveyard";
+        let rem = " with lesser power from their graveyard";
+        let scoped = ParseContext {
+            relative_player_scope: Some(ControllerRef::ScopedPlayer),
+            ..ParseContext::default()
+        };
+        assert_eq!(
+            compose(
+                TargetFilter::Typed(TypedFilter::creature()),
+                base,
+                rem,
+                EffectScope::Single,
+                &scoped
+            )
+            .1
+            .extract_zones(),
+            vec![Zone::Graveyard]
+        );
+        for context in [
+            ctx.clone(),
+            ParseContext {
+                relative_player_scope: Some(ControllerRef::TargetPlayer),
+                ..ctx.clone()
+            },
+            ParseContext {
+                actor: Some(ControllerRef::TriggeringPlayer),
+                ..ctx.clone()
+            },
+        ] {
+            let original = TargetFilter::Typed(TypedFilter::creature());
+            assert_eq!(
+                compose(original.clone(), base, rem, EffectScope::Single, &context),
+                (Some(Zone::Graveyard), original)
+            );
+        }
+        let class = TargetFilter::Or {
+            filters: vec![
+                TargetFilter::Typed(TypedFilter::creature()),
+                TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact)),
+            ],
+        };
+        assert_eq!(
+            compose(
+                class,
+                "artifact or creature cards with lesser power from your graveyard",
+                " with lesser power from your graveyard",
+                EffectScope::All,
+                &ctx
+            )
+            .1
+            .extract_zones(),
+            vec![Zone::Graveyard]
+        );
+    }
+
+    #[test]
+    fn shape_composer_refusals_preserve_scalar_and_target_exactly() {
+        let ctx = ParseContext::default();
+        let original = TargetFilter::Typed(TypedFilter::creature());
+        assert_eq!(
+            compose(
+                original.clone(),
+                "target creature card from your graveyard",
+                " from your graveyard",
+                EffectScope::Single,
+                &ctx
+            )
+            .1
+            .extract_zones(),
+            vec![Zone::Graveyard]
+        );
+        for zone in [
+            None,
+            Some(Zone::Hand),
+            Some(Zone::Library),
+            Some(Zone::Exile),
+            Some(Zone::Command),
+        ] {
+            assert_eq!(
+                compose_exile_graveyard_origin_and_target(
+                    zone,
+                    original.clone(),
+                    "target creature card from your graveyard",
+                    " from your graveyard",
+                    &ctx,
+                    EffectScope::Single
+                ),
+                (zone, original.clone())
+            );
+        }
+        for (base, rem) in [
+            (
+                "target creature card from your graveyard",
+                " from a graveyard",
+            ),
+            (
+                "target creature card with a creature from your graveyard",
+                " with a creature from your graveyard",
+            ),
+            (
+                "target creature card from nowhere from your graveyard",
+                " from nowhere from your graveyard",
+            ),
+            (
+                "target creature card from your graveyard and draw a card",
+                " from your graveyard and draw a card",
+            ),
+            (
+                "target creature card from your graveyard or from your hand",
+                " from your graveyard or from your hand",
+            ),
+            (
+                "target creature card from your graveyard, then draw a card",
+                " from your graveyard, then draw a card",
+            ),
+            (
+                "target creature card from your graveyard in exile",
+                " from your graveyard in exile",
+            ),
+            (
+                "target creature card from your graveyard from your hand",
+                " from your graveyard from your hand",
+            ),
+            (
+                "target creature card from target player's graveyard",
+                " from target player's graveyard",
+            ),
+            (
+                "target creature card from defending player's graveyard",
+                " from defending player's graveyard",
+            ),
+            (
+                "target creature card from a random graveyard",
+                " from a random graveyard",
+            ),
+            (
+                "target creature card from a single graveyard",
+                " from a single graveyard",
+            ),
+            (
+                "target creature card from all graveyards",
+                " from all graveyards",
+            ),
+        ] {
+            assert_eq!(
+                compose(original.clone(), base, rem, EffectScope::Single, &ctx),
+                (Some(Zone::Graveyard), original.clone()),
+                "{base}"
+            );
+        }
+        assert_eq!(
+            compose(
+                original.clone(),
+                "creature cards from a graveyard",
+                " from a graveyard",
+                EffectScope::All,
+                &ctx
+            ),
+            (Some(Zone::Graveyard), original.clone())
+        );
+        for target in [
+            TargetFilter::Any,
+            TargetFilter::Player,
+            TargetFilter::SelfRef,
+            TargetFilter::ParentTarget,
+            TargetFilter::Typed(TypedFilter::default()),
+            TargetFilter::Or { filters: vec![] },
+            TargetFilter::And { filters: vec![] },
+            TargetFilter::Or {
+                filters: vec![original.clone(), TargetFilter::Player],
+            },
+            TargetFilter::Typed(TypedFilter::creature().properties(vec![FilterProp::InZone {
+                zone: Zone::Graveyard,
+            }])),
+            TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::InAnyZone {
+                    zones: vec![Zone::Hand, Zone::Graveyard],
+                }]),
+            ),
+            TargetFilter::Typed(TypedFilter::creature().properties(vec![FilterProp::Owned {
+                controller: ControllerRef::Opponent,
+            }])),
+        ] {
+            assert_eq!(
+                compose(
+                    target.clone(),
+                    "target creature card from your graveyard",
+                    " from your graveyard",
+                    EffectScope::Single,
+                    &ctx
+                ),
+                (Some(Zone::Graveyard), target)
+            );
+        }
+    }
+
+    #[test]
+    fn shape_positive_zone_stays_outside_negated_class_and_enumerates_real_graveyard() {
+        let mut s = GameScenario::new();
+        let own = s
+            .add_creature_to_graveyard(P0, "Own artifact", 2, 2)
+            .as_artifact()
+            .id();
+        let wrong = s
+            .add_creature_to_graveyard(P1, "Opponent artifact", 2, 2)
+            .as_artifact()
+            .id();
+        let creature = s.add_creature_to_graveyard(P0, "Own creature", 2, 2).id();
+        let battlefield = s
+            .add_creature(P0, "Battlefield artifact", 2, 2)
+            .as_artifact()
+            .id();
+        let class = TargetFilter::Not {
+            filter: Box::new(TargetFilter::Typed(TypedFilter::creature())),
+        };
+        let (_, target) = compose(
+            class,
+            "target noncreature card from your graveyard",
+            " from your graveyard",
+            EffectScope::Single,
+            &ParseContext::default(),
+        );
+        assert!(
+            matches!(&target, TargetFilter::And { filters } if matches!(filters[0], TargetFilter::Not { .. }))
+        );
+        let r = s.build();
+        let def = parse_effect_chain("Exile target creature.", AbilityKind::Spell);
+        let ability = crate::game::ability_utils::build_resolved_from_def(&def, ObjectId(0), P0);
+        let legal = crate::game::targeting::find_legal_targets_for_ability_with_controller(
+            r.state(),
+            &target,
+            &ability,
+            P0,
+        );
+        assert_eq!(legal, vec![TargetRef::Object(own)]);
+        for id in [wrong, creature, battlefield] {
+            assert!(!legal.contains(&TargetRef::Object(id)));
+        }
+    }
+
+    #[test]
+    fn shape_compound_producers_preserve_scalar_input_and_connector_remainder() {
+        for (text, scope) in [
+            (
+                "exile target creature card with lesser power from your graveyard",
+                EffectScope::Single,
+            ),
+            (
+                "exile all creature cards with lesser power from your graveyard",
+                EffectScope::All,
+            ),
+        ] {
+            let mut ctx = ParseContext::default();
+            let (ast, rem) = try_parse_verb_and_target(text, text, &mut ctx).unwrap();
+            let TargetedImperativeAst::ZoneCounterProxy(ast) = ast else {
+                panic!("generic exile")
+            };
+            let ZoneCounterImperativeAst::Exile {
+                origin,
+                target,
+                all,
+                ..
+            } = *ast
+            else {
+                panic!("exile")
+            };
+            assert_eq!(origin, Some(Zone::Graveyard));
+            assert_eq!(target.extract_zones(), vec![Zone::Graveyard]);
+            assert_eq!(all, scope == EffectScope::All);
+            assert_eq!(rem, "with lesser power from your graveyard");
+            let (input, _) =
+                tag::<_, _, OracleError<'_>>(if all { "exile all " } else { "exile " })
+                    .parse(text)
+                    .unwrap();
+            assert_eq!(
+                origin,
+                infer_origin_zone(&compound_exile_origin_scan(input, rem))
+            );
+        }
+        let mut ctx = ParseContext::default();
+        let late =
+            "exile target creature card with lesser power from your graveyard and draw a card";
+        assert!(try_split_targeted_compound(late, &mut ctx).is_none());
+        let direct = "exile target creature and draw a card";
+        let (ast, rem) = try_parse_verb_and_target(direct, direct, &mut ctx).unwrap();
+        assert_eq!(rem, " and draw a card");
+        let TargetedImperativeAst::ZoneCounterProxy(ast) = ast else {
+            panic!("generic exile")
+        };
+        let ZoneCounterImperativeAst::Exile { origin, target, .. } = *ast else {
+            panic!("exile")
+        };
+        assert_eq!(origin, None);
+        assert!(target.extract_zones().is_empty());
+        let compound = try_split_targeted_compound(direct, &mut ctx).unwrap();
+        assert!(matches!(
+            compound.effect,
+            Effect::ChangeZone { origin: None, .. }
+        ));
+        assert!(matches!(
+            compound.sub_ability.unwrap().effect.as_ref(),
+            Effect::Draw { .. }
+        ));
+    }
+
+    #[test]
+    fn shape_ineligible_late_owners_keep_old_scalar_and_private_compound_view() {
+        for qualifier in ["an opponent's", "the chosen player's"] {
+            let operand =
+                format!("target creature card with lesser power from {qualifier} graveyard");
+            let text = format!("exile {operand}");
+            let mut ctx = ParseContext::default();
+            let (original, original_rem) = parse_target_with_ctx(&operand, &mut ctx);
+            assert!(original.extract_zones().is_empty());
+            assert_eq!(
+                infer_origin_zone(&compound_exile_origin_scan(&operand, original_rem)),
+                None
+            );
+            let (ast, rem) = try_parse_verb_and_target(&text, &text, &mut ctx).unwrap();
+            let TargetedImperativeAst::ZoneCounterProxy(ast) = ast else {
+                panic!("generic exile")
+            };
+            let ZoneCounterImperativeAst::Exile { origin, target, .. } = *ast else {
+                panic!("exile")
+            };
+            assert_eq!(origin, None);
+            assert_eq!(target, original);
+            assert_eq!(rem, original_rem);
+        }
+        for operand in [
+            "target creature card from your hand and put two time counters on it",
+            "target creature they control and their graveyard",
+            "target creature card with lesser power from target player's graveyard",
+        ] {
+            let text = format!("exile {operand}");
+            let mut ctx = ParseContext::default();
+            let (original, original_rem) = parse_target_with_ctx(operand, &mut ctx);
+            let scalar = infer_origin_zone(&compound_exile_origin_scan(operand, original_rem));
+            let (ast, rem) = try_parse_verb_and_target(&text, &text, &mut ctx).unwrap();
+            let TargetedImperativeAst::ZoneCounterProxy(ast) = ast else {
+                panic!("generic exile")
+            };
+            let ZoneCounterImperativeAst::Exile { origin, target, .. } = *ast else {
+                panic!("exile")
+            };
+            assert_eq!(
+                (origin, target, rem),
+                (scalar, original, original_rem),
+                "{operand}"
             );
         }
     }

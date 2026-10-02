@@ -10882,6 +10882,14 @@ pub(super) fn parse_exile_ast(
             parsed_target
         };
         let origin = super::infer_origin_zone(rest_lower);
+        let (origin, target) = super::compose_exile_graveyard_origin_and_target(
+            origin,
+            target,
+            rest,
+            _rem,
+            ctx,
+            EffectScope::All,
+        );
         return Some(ZoneCounterImperativeAst::Exile {
             origin,
             target,
@@ -10968,6 +10976,14 @@ pub(super) fn parse_exile_ast(
         #[cfg(debug_assertions)]
         assert_no_compound_remainder(_rem, text);
         let origin = super::infer_origin_zone(rest_lower);
+        let (origin, target) = super::compose_exile_graveyard_origin_and_target(
+            origin,
+            target,
+            rest_text,
+            _rem,
+            ctx,
+            EffectScope::All,
+        );
         return Some(ZoneCounterImperativeAst::Exile {
             origin,
             target,
@@ -11154,6 +11170,14 @@ pub(super) fn parse_exile_ast(
     // creature leg — while a non-"and" qualifier ("instead of putting it into
     // its owner's graveyard") still defines this leg's origin.
     let origin = super::infer_origin_zone(&super::compound_exile_origin_scan(rest_text, rem));
+    let (origin, target) = super::compose_exile_graveyard_origin_and_target(
+        origin,
+        target,
+        target_input,
+        rem,
+        ctx,
+        EffectScope::Single,
+    );
     Some(ZoneCounterImperativeAst::Exile {
         origin,
         target,
@@ -28066,5 +28090,96 @@ mod die_result_row_grammar_tests {
         assert_eq!(try_parse_die_result_line("9 or les | x"), None);
         assert_eq!(try_parse_die_result_line("9 or lesser | x"), None);
         assert_eq!(try_parse_die_result_line("or less | x"), None);
+    }
+}
+
+#[cfg(test)]
+mod exile_graveyard_producer_shape {
+    use super::*;
+    use crate::types::CounterType;
+
+    #[test]
+    fn shape_all_three_imperative_producers_keep_old_scalar_and_counter_rider() {
+        for (text, expected_counters) in [
+            ("exile target creature card with lesser power from your graveyard", vec![]),
+            ("exile all creature cards with lesser power from your graveyard", vec![]),
+            ("exile each artifact or creature cards with greater toughness from your graveyard", vec![]),
+            ("exile target creature card with lesser power from your graveyard with two time counters on it", vec![(CounterType::Time, QuantityExpr::Fixed { value: 2 })]),
+        ] {
+            let mut ctx = ParseContext::default();
+            let ast = parse_exile_ast(text, text, &mut ctx).unwrap();
+            let ZoneCounterImperativeAst::Exile { origin, target, enter_with_counters, .. } = ast else { panic!("generic exile") };
+            assert_eq!(origin, Some(Zone::Graveyard));
+            assert_eq!(target.extract_zones(), vec![Zone::Graveyard], "{text}");
+            assert_eq!(origin, super::super::infer_origin_zone(text));
+            assert_eq!(enter_with_counters, expected_counters);
+        }
+        let text = "exile target player's graveyard";
+        let ast = parse_exile_ast(text, text, &mut ParseContext::default()).unwrap();
+        let ZoneCounterImperativeAst::Exile {
+            origin,
+            target,
+            all,
+            ..
+        } = ast
+        else {
+            panic!("mass zone")
+        };
+        assert!(all);
+        assert_eq!(origin, Some(Zone::Graveyard));
+        assert!(target.extract_zones().is_empty());
+    }
+
+    #[test]
+    fn shape_counter_split_preserves_both_source_positions_and_remainder_sides() {
+        let before = "target creature card with two time counters on it from your graveyard";
+        let (input, lifted) = super::super::split_counterless_enter_counters(before);
+        assert_eq!(input, "target creature card");
+        assert_eq!(
+            lifted,
+            vec![(CounterType::Time, QuantityExpr::Fixed { value: 2 })]
+        );
+        let text = format!("exile {before}");
+        let mut ctx = ParseContext::default();
+        let (original, _) = parse_target_with_ctx(input, &mut ctx);
+        let ast = parse_exile_ast(&text, &text, &mut ctx).unwrap();
+        let ZoneCounterImperativeAst::Exile {
+            origin,
+            target,
+            enter_with_counters,
+            ..
+        } = ast
+        else {
+            panic!("exile")
+        };
+        assert_eq!(origin, super::super::infer_origin_zone(before));
+        assert_eq!(
+            target, original,
+            "the existing split cannot donate a removed source"
+        );
+        assert_eq!(enter_with_counters, lifted);
+
+        // The existing debug remainder guard must inspect both sides of a
+        // counter span. These are parser boundary checks, not accepted cards.
+        #[cfg(debug_assertions)]
+        for remainder in [
+            " and draw a card with two time counters on it",
+            " with two time counters on it and draw a card",
+        ] {
+            let lower = remainder.to_ascii_lowercase();
+            let (counters, span) = super::super::parse_with_counters_suffix_spanned(&lower);
+            assert_eq!(
+                counters,
+                vec![(CounterType::Time, QuantityExpr::Fixed { value: 2 })]
+            );
+            let span = span.unwrap();
+            let head = &remainder[..span.start];
+            let tail = &remainder[span.end..];
+            assert!(std::panic::catch_unwind(|| {
+                assert_no_compound_remainder(head, remainder);
+                assert_no_compound_remainder(tail, remainder);
+            })
+            .is_err());
+        }
     }
 }
