@@ -42031,6 +42031,302 @@ fn reveal_until_x_permanent_cards_choose_any_number_aurora() {
     assert_eq!(*rest_destination, Zone::Library);
 }
 
+/// Parse a full card's Oracle text and assert (reach guard) that no part of it
+/// lowered to `Effect::Unimplemented` — including payloads nested in delayed
+/// or triggered abilities.
+fn parse_card_fully(name: &str, card_type: &str, oracle: &str) -> CardFace {
+    let parsed = parse_oracle_text(oracle, name, &[], &[card_type.to_string()], &[]);
+    let face = CardFace {
+        name: name.to_string(),
+        oracle_text: Some(oracle.to_string()),
+        abilities: parsed.abilities,
+        triggers: parsed.triggers,
+        static_abilities: parsed.statics,
+        replacements: parsed.replacements,
+        additional_cost: parsed.additional_cost,
+        ..Default::default()
+    };
+    assert!(
+        !card_face_has_unimplemented_parts(&face),
+        "{name} must parse with no Unimplemented part: {face:#?}"
+    );
+    face
+}
+
+/// Assert the reveal-until "that many creature cards" → matched set onto the
+/// battlefield → shuffle chain shared by Mass Polymorph and Synthetic Destiny.
+fn assert_that_many_creatures_onto_battlefield_then_shuffle(reveal: &AbilityDefinition) {
+    let Effect::RevealUntil {
+        player,
+        filter,
+        count,
+        matched_disposition,
+        kept_destination,
+        rest_destination,
+        ..
+    } = &*reveal.effect
+    else {
+        panic!("expected RevealUntil, got {:?}", reveal.effect);
+    };
+    assert_eq!(*player, TargetFilter::Controller);
+    assert_eq!(*filter, TargetFilter::Typed(TypedFilter::creature()));
+    assert_eq!(
+        *count,
+        QuantityExpr::Ref {
+            qty: QuantityRef::EventContextAmount
+        },
+        "\"that many\" is the preceding instruction's count"
+    );
+    assert_eq!(*matched_disposition, RevealUntilDisposition::KeepEach);
+    assert_eq!(
+        *kept_destination,
+        Zone::Battlefield,
+        "\"put all creature cards revealed this way onto the battlefield\" is the matched set"
+    );
+    assert_eq!(*rest_destination, Zone::Library);
+    let shuffle = reveal
+        .sub_ability
+        .as_deref()
+        .expect("RevealUntil must chain into the shuffle");
+    assert_eq!(
+        *shuffle.effect,
+        Effect::Shuffle {
+            target: TargetFilter::Controller
+        },
+        "the matched set is absorbed (no ChangeZoneAll sibling); the shuffle follows"
+    );
+    assert!(shuffle.sub_ability.is_none());
+}
+
+/// CR 608.2c + CR 608.2h + CR 701.20a: Mass Polymorph (verbatim) — the count
+/// slot "that many" delegates to the demonstrative-amount authority, and "put
+/// all creature cards revealed this way onto the battlefield" names the matched
+/// set, so the RevealUntil keeps its hits on the battlefield.
+#[test]
+fn reveal_until_that_many_mass_polymorph() {
+    let face = parse_card_fully(
+        "Mass Polymorph",
+        "Sorcery",
+        "Exile all creatures you control, then reveal cards from the top of your library until you reveal that many creature cards. Put all creature cards revealed this way onto the battlefield, then shuffle the rest of the revealed cards into your library.",
+    );
+    let root = face.abilities.first().expect("spell ability");
+    let Effect::ChangeZoneAll {
+        destination,
+        target,
+        ..
+    } = &*root.effect
+    else {
+        panic!("expected ChangeZoneAll root, got {:?}", root.effect);
+    };
+    assert_eq!(*destination, Zone::Exile);
+    assert_eq!(
+        *target,
+        TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You))
+    );
+    let reveal = root
+        .sub_ability
+        .as_deref()
+        .expect("exile must chain into RevealUntil");
+    assert_that_many_creatures_onto_battlefield_then_shuffle(reveal);
+}
+
+/// CR 603.7a + CR 608.2c: Synthetic Destiny (verbatim) — the same reveal chain
+/// inside the end-step delayed trigger created by the spell.
+#[test]
+fn reveal_until_that_many_synthetic_destiny() {
+    let face = parse_card_fully(
+        "Synthetic Destiny",
+        "Instant",
+        "Exile all creatures you control. At the beginning of the next end step, reveal cards from the top of your library until you reveal that many creature cards, put all creature cards revealed this way onto the battlefield, then shuffle the rest of the revealed cards into your library.",
+    );
+    let root = face.abilities.first().expect("spell ability");
+    assert!(
+        matches!(
+            &*root.effect,
+            Effect::ChangeZoneAll {
+                destination: Zone::Exile,
+                ..
+            }
+        ),
+        "expected the exile root, got {:?}",
+        root.effect
+    );
+    let delayed = root
+        .sub_ability
+        .as_deref()
+        .expect("exile must chain into the delayed trigger");
+    let Effect::CreateDelayedTrigger {
+        condition, effect, ..
+    } = &*delayed.effect
+    else {
+        panic!("expected CreateDelayedTrigger, got {:?}", delayed.effect);
+    };
+    assert_eq!(
+        *condition,
+        DelayedTriggerCondition::AtNextPhase { phase: Phase::End }
+    );
+    assert_that_many_creatures_onto_battlefield_then_shuffle(effect);
+}
+
+/// CR 701.20a + CR 608.2c: Old Stickfingers (full verbatim text) — "Put all
+/// creature cards revealed this way into your graveyard" is the matched set's
+/// disposition: the kept zone is the graveyard (not the default hand plus a
+/// stray ChangeZoneAll), and the rest go to the bottom in a random order.
+#[test]
+fn reveal_until_x_matched_set_into_graveyard_old_stickfingers() {
+    let face = parse_card_fully(
+        "Old Stickfingers",
+        "Creature",
+        "When you cast this spell, reveal cards from the top of your library until you reveal X creature cards. Put all creature cards revealed this way into your graveyard, then put the rest on the bottom of your library in a random order.\nOld Stickfingers's power and toughness are each equal to the number of creature cards in your graveyard.",
+    );
+    let trigger = face.triggers.first().expect("cast trigger");
+    let execute = trigger.execute.as_deref().expect("trigger body");
+    let Effect::RevealUntil {
+        count,
+        filter,
+        kept_destination,
+        rest_destination,
+        rest_order,
+        ..
+    } = &*execute.effect
+    else {
+        panic!("expected RevealUntil, got {:?}", execute.effect);
+    };
+    assert_eq!(
+        *count,
+        QuantityExpr::Ref {
+            qty: QuantityRef::Variable {
+                name: "X".to_string()
+            }
+        }
+    );
+    assert_eq!(*filter, TargetFilter::Typed(TypedFilter::creature()));
+    assert_eq!(*kept_destination, Zone::Graveyard);
+    assert_eq!(*rest_destination, Zone::Library);
+    assert_eq!(*rest_order, DigRestOrder::Random);
+    assert!(
+        execute.sub_ability.is_none(),
+        "the matched set is absorbed — no ChangeZoneAll sibling: {:?}",
+        execute.sub_ability
+    );
+}
+
+/// CR 701.20a: "put all <filter> cards revealed this way" names the matched set
+/// only when <filter> is the until-filter. A different filter is a different
+/// set and must not be absorbed as the kept disposition. Paired positive: the
+/// same sentence with the until-filter is absorbed.
+#[test]
+fn reveal_until_matched_set_requires_the_until_filter() {
+    let mismatched = parse_effect_chain(
+        "Reveal cards from the top of your library until you reveal a creature card. Put all land cards revealed this way onto the battlefield.",
+        AbilityKind::Spell,
+    );
+    let Effect::RevealUntil {
+        kept_destination, ..
+    } = &*mismatched.effect
+    else {
+        panic!("expected RevealUntil, got {:?}", mismatched.effect);
+    };
+    assert_ne!(
+        *kept_destination,
+        Zone::Battlefield,
+        "a land-card phrase must not become the creature hit's disposition"
+    );
+
+    let matched = parse_effect_chain(
+        "Reveal cards from the top of your library until you reveal a creature card. Put all creature cards revealed this way onto the battlefield.",
+        AbilityKind::Spell,
+    );
+    let Effect::RevealUntil {
+        kept_destination, ..
+    } = &*matched.effect
+    else {
+        panic!("expected RevealUntil, got {:?}", matched.effect);
+    };
+    assert_eq!(*kept_destination, Zone::Battlefield);
+}
+
+/// CR 701.20a: an until-filter phrase the parser cannot type ("a white card")
+/// degrades to `TargetFilter::Any`, and so does an unparsed "all green cards"
+/// phrase — equal filters that do not establish that both name the same set.
+/// The green-card sentence must not be absorbed as the matched set's
+/// disposition. Paired positive: the same call shape with the typed until-filter
+/// is absorbed.
+#[test]
+fn reveal_until_matched_set_refuses_an_untyped_filter_phrase() {
+    let untyped = parse_effect_chain(
+        "Reveal cards from the top of your library until you reveal a white card. Put all green cards revealed this way onto the battlefield.",
+        AbilityKind::Spell,
+    );
+    let Effect::RevealUntil {
+        filter,
+        kept_destination,
+        ..
+    } = &*untyped.effect
+    else {
+        panic!("expected RevealUntil, got {:?}", untyped.effect);
+    };
+    assert_eq!(
+        *filter,
+        TargetFilter::Any,
+        "fixture precondition: the until-filter phrase degrades to Any"
+    );
+    assert_ne!(
+        *kept_destination,
+        Zone::Battlefield,
+        "an untyped green-card phrase must not become the white hit's disposition"
+    );
+
+    let matched = parse_effect_chain(
+        "Reveal cards from the top of your library until you reveal a creature card. Put all creature cards revealed this way onto the battlefield.",
+        AbilityKind::Spell,
+    );
+    let Effect::RevealUntil {
+        kept_destination, ..
+    } = &*matched.effect
+    else {
+        panic!("expected RevealUntil, got {:?}", matched.effect);
+    };
+    assert_eq!(*kept_destination, Zone::Battlefield);
+}
+
+/// CR 608.2c: "Put all other cards revealed this way into your graveyard" names
+/// the REST of the revealed pile (Dance, Pathetic Marionette; Sharp Eraser), never
+/// the matched set — even when the until-filter is one the bare word "other"
+/// would build ("a white card" builds the same filter as "other"). The rest pile
+/// goes to the graveyard and the hit keeps its own destination.
+#[test]
+fn reveal_until_all_other_cards_revealed_this_way_is_the_rest_pile() {
+    let def = parse_effect_chain(
+        "Reveal cards from the top of your library until you reveal a white card. Put all other cards revealed this way into your graveyard.",
+        AbilityKind::Spell,
+    );
+    let Effect::RevealUntil {
+        filter,
+        kept_destination,
+        rest_destination,
+        ..
+    } = &*def.effect
+    else {
+        panic!("expected RevealUntil, got {:?}", def.effect);
+    };
+    assert_eq!(
+        *filter,
+        build_reveal_until_filter("other"),
+        "fixture precondition: the until-filter is the one \"other\" would build"
+    );
+    assert_eq!(
+        *rest_destination,
+        Zone::Graveyard,
+        "reach guard: the rest-pile clause reached the PutRest arm"
+    );
+    assert_ne!(
+        *kept_destination,
+        Zone::Graveyard,
+        "\"all other cards\" must not become the matched set's disposition"
+    );
+}
+
 /// CR 701.20a + CR 608.2c: Explosive Revelation has a transparent damage
 /// instruction between the RevealUntil and the rest-pile placement. The
 /// RevealUntil already owns "the rest on the bottom"; the parser must not emit

@@ -3202,8 +3202,8 @@ fn is_public_zone(zone: crate::types::zones::Zone) -> bool {
 /// the triggering action (e.g. the number of Treasures sacrificed). At
 /// creation time `last_effect_count` (and the rest of the event-context
 /// cascade) is still live, so resolving `EventContextAmount` here captures the
-/// real count. The reflexive triggered ability resolves later in a fresh
-/// `apply()` where that scratch state has been cleared; `subject_match_count`
+/// real count. The reflexive triggered ability resolves later as its own stack
+/// object, after `stack::resolve_top` has cleared that scratch state; `subject_match_count`
 /// is rehydrated into `current_trigger_match_count` (CR 603.2c) and resolves
 /// the number of targets at target-assign time. Without this freeze the bound
 /// collapses to 0 — yielding "Unused selected target slots" or a silently
@@ -10768,16 +10768,18 @@ pub(crate) fn ability_pins_object_anaphor(ability: &ResolvedAbility) -> bool {
 /// immediately afterward", per prevented event, and its amount is read live from
 /// `state.last_effect_count` (stamped at `game/combat_damage.rs`). Freezing a parent-dependent
 /// quantity at install would pre-empt that.
-/// MEASURED, so the omission is not load-bearing for today's corpus either:
 /// `snapshot_parent_dependent_quantities` walks only EFFECT quantity fields (Mana count,
 /// DealDamage/DamageAll/DamageEachPlayer/GainLife/LoseLife amount, Draw/Mill/PutCounter count,
-/// Pump/PumpAll P/T, ChangeZone.enter_with_counters) — it never walks `ability.repeat_for` —
-/// and `snapshot_quantity_ref` has no `EventContextAmount` arm (it falls to `_ => None`). So
-/// calling it would change nothing for the current riders; it is omitted for the rule, not for
-/// the symptom. `delayed_trigger::resolve` also runs
-/// `stamp_triggering_source_origins_in_ability_chain`, `rebind_last_created_to_parent_target` and
-/// stamps `scoped_player` — all correctly irrelevant at this seam (none of them touch the
-/// referent or its pin).
+/// Pump/PumpAll P/T, ChangeZone.enter_with_counters, RevealUntil.count) — it never walks
+/// `ability.repeat_for` — and its `snapshot_quantity_ref` freezes `EventContextAmount` only at
+/// the first payload instruction of a creation-time-provenance, non-departure delayed trigger
+/// (CR 603.7a) — and only because `delayed_trigger::resolve` passes it the creation-time amount
+/// the creating resolution determined; the walker itself decides nothing about provenance. A rider's "for each 1 damage
+/// prevented this way" is an `EventContextAmount` read live per prevented event (CR 615.5), so
+/// this seam must not freeze it, nor freeze any other parent-dependent leaf at install.
+/// `delayed_trigger::resolve` also runs `stamp_triggering_source_origins_in_ability_chain`,
+/// `rebind_last_created_to_parent_target` and stamps `scoped_player` — all correctly irrelevant
+/// at this seam (none of them touch the referent or its pin).
 /// **DO NOT unify this function with `delayed_trigger::resolve`'s inline binding.** They share
 /// the referent authority (`targeting::parent_chain_referents`) and the pin preference below;
 /// merging the call sites would silently give a prevention rider the CR 603.7c `TriggeringSource`

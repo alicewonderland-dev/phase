@@ -14822,9 +14822,10 @@ fn parse_reveal_until_prefix(input: &str) -> nom::IResult<&str, (), OracleError<
 /// CR 701.20a + CR 608.2c: Parse the count phrase that follows
 /// "…until you reveal " — either the singular article ("a"/"an") for the
 /// dominant "reveal a [filter] card" form (yielding `Fixed(1)`), a spelled or
-/// numeric literal ("two"/"2"), or the variable `X` ("reveal X [filter] cards",
-/// bound by a trailing "where X is …" clause). Returns the count expression and
-/// the remaining input positioned at the filter phrase.
+/// numeric literal ("two"/"2"), the variable `X` ("reveal X [filter] cards",
+/// bound by a trailing "where X is …" clause), or the anaphoric "that many"
+/// ("reveal that many [filter] cards", an earlier instruction's count). Returns
+/// the count expression and the remaining input positioned at the filter phrase.
 fn parse_reveal_until_count(input: &str) -> OracleResult<'_, QuantityExpr> {
     alt((
         // CR 701.20a: singular article → exactly one match (the legacy form).
@@ -14840,6 +14841,13 @@ fn parse_reveal_until_count(input: &str) -> OracleResult<'_, QuantityExpr> {
                 },
             },
             (tag("x"), tag(" ")),
+        ),
+        // CR 608.2c + CR 608.2h: "until you reveal that many [filter] cards" — anaphoric count of
+        // an earlier instruction (Mass Polymorph, Synthetic Destiny). Delegates to the single
+        // demonstrative-amount authority, like search.rs's "for that many".
+        map(
+            terminated(nom_quantity::parse_that_much_or_many, tag(" ")),
+            |qty| QuantityExpr::Ref { qty },
         ),
         // "reveal two [filter] cards" / "reveal 2 [filter] cards".
         map(
@@ -25268,6 +25276,20 @@ fn clause_announces_own_target(clause: &ClauseIr) -> bool {
             def.multi_target.is_some()
                 || triggers::extract_target_filter_from_effect(&def.effect).is_some()
         })
+}
+
+/// CR 115.1 + CR 608.2c: a clause gated by a target P/T threshold
+/// ([`LeadingConditionRoute::TargetPtThreshold`]) whose own instruction announces
+/// a target becomes the strict-failure gap
+/// `target_pt_threshold_rider_declares_target`. The gate's `TargetMatchesFilter
+/// { subject_slot: None }` would read the clause's own object as well as the
+/// antecedent "that creature", so the clause is refused, and
+/// `ClauseIr::replace_with_gap` drops the misbinding gate together with every
+/// other executable field.
+fn refuse_target_pt_threshold_rider_with_own_target(clause: &mut ClauseIr) {
+    if clause_announces_own_target(clause) {
+        clause.replace_with_gap("target_pt_threshold_rider_declares_target");
+    }
 }
 
 /// [`chain_declared_object_target`], also naming WHICH clause declared the
@@ -40603,11 +40625,12 @@ fn parse_effect_chain_ir_body(
         // Runs only when no dedicated leading stripper matched. Handles patterns like
         // "if you control 3 or more creatures, draw a card".
         let (leading_cond, text) = if condition.is_none() {
-            strip_leading_general_conditional(&text, ctx)
+            strip_routed_leading_general_conditional(&text, ctx)
         } else {
             (None, text)
         };
-        let condition = condition.or(leading_cond);
+        let leading_route = leading_cond.as_ref().map(|(_, route)| *route);
+        let condition = condition.or(leading_cond.map(|(condition, _)| condition));
         // CR 608.2c + CR 708.7: a generic "if you can't" rider attached to a
         // preceding `TurnFaceUp` must read the performed-signal, not the
         // zone-change ledger (a successful turn-up changes no zone). See the
@@ -40679,33 +40702,41 @@ fn parse_effect_chain_ir_body(
         } else {
             None
         };
-        let (if_you_do, text, deferred_when_you_do_guard) = if let Some(remainder) = reveal_gate {
-            // CR 603.12 + CR 701.20a: the reflexive's trigger event is the
-            // reveal-until's until-condition, so its creation gate carries the
-            // reveal-until-hit guard (a generic "When you do" does not).
-            (
-                Some(AbilityCondition::when_you_do_with_guard(
-                    AbilityCondition::EffectOutcome {
-                        signal: EffectOutcomeSignal::RevealUntilMatched,
-                    },
-                )),
-                remainder,
-                None,
-            )
-        } else if condition.is_none() {
-            match strip_if_you_do_conditional_with_context(&text, ctx) {
-                conditions::ReflexiveConditionalStrip::Parsed {
-                    condition,
+        let (if_you_do, text, deferred_when_you_do_guard, reflexive_guard_route) =
+            if let Some(remainder) = reveal_gate {
+                // CR 603.12 + CR 701.20a: the reflexive's trigger event is the
+                // reveal-until's until-condition, so its creation gate carries the
+                // reveal-until-hit guard (a generic "When you do" does not).
+                (
+                    Some(AbilityCondition::when_you_do_with_guard(
+                        AbilityCondition::EffectOutcome {
+                            signal: EffectOutcomeSignal::RevealUntilMatched,
+                        },
+                    )),
                     remainder,
-                } => (condition, remainder, None),
-                conditions::ReflexiveConditionalStrip::DeferredWhenYouDoGuard {
-                    condition,
-                    remainder,
-                } => (Some(condition.clone()), remainder, Some(condition)),
-            }
-        } else {
-            (None, text, None)
-        };
+                    None,
+                    None,
+                )
+            } else if condition.is_none() {
+                match strip_if_you_do_conditional_with_context(&text, ctx) {
+                    conditions::ReflexiveConditionalStrip::Parsed {
+                        condition,
+                        guard_route,
+                        remainder,
+                    } => (condition, remainder, None, guard_route),
+                    conditions::ReflexiveConditionalStrip::DeferredWhenYouDoGuard {
+                        condition,
+                        remainder,
+                    } => (Some(condition.clone()), remainder, Some(condition), None),
+                }
+            } else {
+                (None, text, None, None)
+            };
+        // CR 603.12 + CR 608.2c: a `When you do, if <guard>, <body>` guard is
+        // stamped on the reflexive body exactly as a leading general conditional
+        // is stamped on its instruction, so its route joins the same binding
+        // guard below.
+        let leading_route = leading_route.or(reflexive_guard_route);
         // CR 603.4 + CR 608.2c: Counter threshold condition — runs unconditionally
         // on the text output from strip_if_you_do_conditional. For compound
         // "when you do, if it has N counters" patterns, WhenYouDo is always true for
@@ -40800,7 +40831,11 @@ fn parse_effect_chain_ir_body(
         // Super-Adaptoid). Both fail closed instead of shipping a gate they
         // cannot evaluate: a comparison whose "that creature" has no declared
         // object target, or a non-keyword predicate (`Keyword::Unknown`: counter
-        // and P/T thresholds such as Bring Low's "a +1/+1 counter on it").
+        // thresholds such as Bring Low's and Urdnan's "a +1/+1 counter on it" or
+        // Hadana's Climb's "three or more +1/+1 counters on it"). Fixed-N P/T
+        // thresholds ("that creature has power 4 or greater") never reach this
+        // gate: the leading general conditional claims them via
+        // `parse_target_pt_threshold_condition`.
         let mut comparative_gate_producer: Option<usize> = None;
         let (target_has_cond, text) = if condition.is_none()
             && specialized_guard_available
@@ -40878,10 +40913,18 @@ fn parse_effect_chain_ir_body(
             && turn_cond.is_none()
             && target_has_cond.is_none()
         {
-            strip_suffix_conditional(&text, ctx)
+            strip_routed_suffix_conditional(&text, ctx)
         } else {
             (None, text)
         };
+        // CR 608.2c: a trailing "<instruction> if <condition>" gate is stamped on
+        // that same instruction, so its route joins the leading conditional's
+        // binding guard below.
+        let leading_route = match (leading_route, suffix_cond.as_ref().map(|(_, route)| *route)) {
+            (Some(route), Some(suffix_route)) => Some(route.merge(suffix_route)),
+            (route, suffix_route) => route.or(suffix_route),
+        };
+        let suffix_cond = suffix_cond.map(|(condition, _)| condition);
         let guard_condition = condition
             .or(counter_cond)
             .or(mv_cond)
@@ -40964,6 +41007,12 @@ fn parse_effect_chain_ir_body(
                 }
                 for clause in &mut body_ir.clauses {
                     apply_outer_condition_to_clause(outer_condition, clause);
+                    // CR 115.1 + CR 608.2c: the outer gate governs every body
+                    // clause, so each one that announces its own target is
+                    // refused exactly as the single-clause guard below refuses it.
+                    if leading_route == Some(LeadingConditionRoute::TargetPtThreshold) {
+                        refuse_target_pt_threshold_rider_with_own_target(clause);
+                    }
                 }
                 for c in body_ir.clauses {
                     builder.absorb_clause(c);
@@ -43641,6 +43690,19 @@ fn parse_effect_chain_ir_body(
                 } else {
                     reader.target_reads = TargetReadOrigin::ParentAnnouncement;
                 }
+            }
+        }
+
+        // CR 115.1 + CR 608.2c: the target P/T threshold gate's "that creature"
+        // names the earlier instruction's target, but its `TargetMatchesFilter {
+        // subject_slot: None }` also reads this instruction's own first object
+        // target when the instruction resolves. An instruction that announces its
+        // own target ("…, destroy target creature") would have the gate test the
+        // rider's object as well as the antecedent, so that shape is refused
+        // rather than misbound.
+        if leading_route == Some(LeadingConditionRoute::TargetPtThreshold) {
+            if let Some(reader) = builder.last_mut() {
+                refuse_target_pt_threshold_rider_with_own_target(reader);
             }
         }
 

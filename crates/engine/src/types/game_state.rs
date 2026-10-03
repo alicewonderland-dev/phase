@@ -21729,7 +21729,10 @@ declare_game_state! {
     /// Count from the most recent interactive effect resolution (e.g., number of cards
     /// actually discarded in a DiscardChoice). Used as fallback for EventContextAmount
     /// in sub_ability continuations where current_trigger_event has no amount.
-    /// Cleared at the top of apply() (once per player action).
+    /// Scoped to one stack-object resolution (CR 608.2c + CR 608.2h): cleared as
+    /// each stack object begins resolving (`stack::resolve_top`) and at the top of
+    /// apply(). A CR 615.5 rider reads the amount its replacement pipeline stamped
+    /// synchronously, without crossing either boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_effect_count: Option<i32>,
 
