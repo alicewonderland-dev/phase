@@ -2940,9 +2940,7 @@ fn stack_entry_targets(state: &GameState, entry: &StackEntry) -> Vec<StackTarget
             .ability
             .map(|ability| {
                 let declared = declared_targets_in_chain(ability);
-                // An entry restored from a save written before
-                // `chosen_target_slots` existed has no record; so does one that
-                // declared no target. Both show what they hold.
+                // An entry that declared no target shows what it holds.
                 if declared.is_empty() {
                     flatten_targets_in_chain(ability)
                 } else {

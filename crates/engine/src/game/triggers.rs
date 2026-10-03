@@ -8393,7 +8393,7 @@ pub(crate) fn seed_batched_attack_parent_targets(
 fn parent_target_seeding_blocked(ability: &ResolvedAbility) -> bool {
     // CR 115.1: a target chosen for the trigger can't be changed, even when it
     // is the trigger's own source.
-    if !ability.chosen_target_slots.is_empty() {
+    if !ability.chosen_target_slots.slots().is_empty() {
         return true;
     }
     if ability.targets.is_empty() {
@@ -8593,6 +8593,8 @@ fn push_pending_trigger_to_stack_with_firing_and_duration_events(
     let event_attacker = event_attacker_from_trigger_event(state, trigger_event.as_ref());
     ability.bind_force_block_attacker_recursive(event_attacker);
     ability.context.triggering_spell = triggering_spell_pin(state, trigger_event.as_ref());
+    // CR 603.3d: the targets this ability declares are only those chosen for it.
+    ability.start_target_record_recursive();
     seed_batched_attack_parent_targets(&mut ability, trigger_event.as_ref());
     seed_event_context_parent_targets(
         &mut ability,
@@ -18440,7 +18442,8 @@ pub mod tests {
                 PlayerId(0),
             );
             let mut chosen = fallback.clone();
-            chosen.chosen_target_slots = vec![0];
+            chosen.chosen_target_slots =
+                crate::types::ability::ChosenTargetSlots::Recorded(vec![0]);
             seed_event_context_parent_targets(&mut fallback, Some(&event), timing);
             seed_event_context_parent_targets(&mut chosen, Some(&event), timing);
             assert_eq!(

@@ -32860,6 +32860,41 @@ mod parent_target_missing_reason_tests {
 }
 
 #[cfg(test)]
+mod chosen_target_slots_tests {
+    use super::*;
+
+    /// CR 601.2c: a record survives a save whether or not it holds a slot, and
+    /// a node saved without the key restores as unrecorded.
+    #[test]
+    fn a_record_round_trips_and_a_missing_key_restores_unrecorded() {
+        for slots in [
+            ChosenTargetSlots::Recorded(Vec::new()),
+            ChosenTargetSlots::Recorded(vec![0]),
+            ChosenTargetSlots::Unrecorded,
+        ] {
+            let mut ability = ResolvedAbility::new(
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+                vec![],
+                crate::types::identifiers::ObjectId(1),
+                crate::types::player::PlayerId(0),
+            );
+            ability.chosen_target_slots = slots.clone();
+            let json = serde_json::to_value(&ability).unwrap();
+            assert_eq!(
+                json.get("chosen_target_slots").is_some(),
+                slots != ChosenTargetSlots::Unrecorded,
+                "key presence for {slots:?}: {json}"
+            );
+            let back: ResolvedAbility = serde_json::from_value(json).unwrap();
+            assert_eq!(back.chosen_target_slots, slots);
+        }
+    }
+}
+
+#[cfg(test)]
 mod target_read_origin_tests {
     use super::*;
 
@@ -33062,6 +33097,34 @@ impl AttachTargetBindings {
     }
 }
 
+/// CR 601.2c: which of a node's `targets` were chosen as its targets.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ChosenTargetSlots {
+    /// No record.
+    #[default]
+    Unrecorded,
+    /// The indices into `targets` of the targets chosen for this node; empty
+    /// when it chose none.
+    Recorded(Vec<usize>),
+}
+
+impl ChosenTargetSlots {
+    /// Whether this node has no record. Such a node is saved without the key,
+    /// and a missing key restores as [`Self::Unrecorded`].
+    pub fn is_unrecorded(&self) -> bool {
+        matches!(self, Self::Unrecorded)
+    }
+
+    /// The recorded slots; none for an unrecorded node.
+    pub fn slots(&self) -> &[usize] {
+        match self {
+            Self::Unrecorded => &[],
+            Self::Recorded(slots) => slots,
+        }
+    }
+}
+
 /// Runtime ability data passed to effect handlers at resolution time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedAbility {
@@ -33128,10 +33191,10 @@ pub struct ResolvedAbility {
     /// whose keyed pins are reserved for delayed-trigger referents.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selected_target_incarnations: Vec<ObjectIncarnationRef>,
-    /// CR 601.2c: The indices into `targets` of the targets chosen for this
-    /// node (see [`ResolvedAbility::push_chosen_target`]).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub chosen_target_slots: Vec<usize>,
+    /// CR 601.2c: which of `targets` were chosen for this node (see
+    /// [`ResolvedAbility::push_chosen_target`]).
+    #[serde(default, skip_serializing_if = "ChosenTargetSlots::is_unrecorded")]
+    pub chosen_target_slots: ChosenTargetSlots,
     /// CR 602.2b + CR 601.2f: self-referential activation cost modification
     /// carried from the printed ability definition so target-dependent riders
     /// can be applied after targets are committed.
@@ -34091,7 +34154,7 @@ impl ResolvedAbility {
             force_block_attacker: None,
             target_incarnations: Vec::new(),
             selected_target_incarnations: Vec::new(),
-            chosen_target_slots: Vec::new(),
+            chosen_target_slots: ChosenTargetSlots::Unrecorded,
             activation_cost_reduction: None,
             activation_record: None,
             illegal_target_slots: Vec::new(),
@@ -34104,8 +34167,28 @@ impl ResolvedAbility {
 
     /// CR 601.2c: Appends a target chosen for this node and records its slot.
     pub(crate) fn push_chosen_target(&mut self, target: TargetRef) {
-        self.chosen_target_slots.push(self.targets.len());
+        let slot = self.targets.len();
+        match &mut self.chosen_target_slots {
+            ChosenTargetSlots::Recorded(slots) => slots.push(slot),
+            unrecorded @ ChosenTargetSlots::Unrecorded => {
+                *unrecorded = ChosenTargetSlots::Recorded(vec![slot]);
+            }
+        }
         self.targets.push(target);
+    }
+
+    /// CR 601.2c + CR 603.3d: Starts the target record of every node of this
+    /// chain that has none, so a node no assignment reached declares nothing.
+    pub(crate) fn start_target_record_recursive(&mut self) {
+        if self.chosen_target_slots.is_unrecorded() {
+            self.chosen_target_slots = ChosenTargetSlots::Recorded(Vec::new());
+        }
+        if let Some(sub) = self.sub_ability.as_mut() {
+            sub.start_target_record_recursive();
+        }
+        if let Some(else_branch) = self.else_ability.as_mut() {
+            else_branch.start_target_record_recursive();
+        }
     }
 
     pub(crate) fn bind_attach_attachment_target(&mut self, target: ObjectIncarnationRef) {

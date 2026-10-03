@@ -7,11 +7,14 @@ use engine::game::derived_views::derive_views;
 use engine::game::effects::attach::attach_to;
 use engine::game::game_object::AttachTarget;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::types::ability::{AbilityCondition, Effect, TargetFilter, TargetRef};
+use engine::types::ability::{
+    AbilityCondition, ChosenTargetSlots, Effect, ResolvedAbility, TargetFilter, TargetRef,
+};
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
 use engine::types::game_state::{
-    CastPaymentMode, GameState, RetargetScope, ShardChoice, StackEntryKind, WaitingFor,
+    CastPaymentMode, GameState, PersistedGameState, PersistedRestoreFinalization, RetargetScope,
+    ShardChoice, StackEntryKind, WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
@@ -2199,27 +2202,460 @@ fn strip_target_records(value: &mut serde_json::Value) -> usize {
     }
 }
 
+/// Saves `state` as the app persists it, less every `chosen_target_slots` key,
+/// as a save written before target records were kept has none, and restores it
+/// as the app does. Returns the restored state and the number of keys removed.
+fn restore_without_target_records(state: &GameState) -> (GameState, usize) {
+    let mut saved =
+        serde_json::to_value(PersistedGameState::capture(state.clone())).expect("serialize");
+    let removed = strip_target_records(&mut saved);
+    let restored = serde_json::from_value::<PersistedGameState>(saved)
+        .expect("decode")
+        .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
+        .expect("admit")
+        .finalize_after_rehydration(|_| Ok(()))
+        .expect("restore");
+    (restored, removed)
+}
+
+/// Whether the stack entry with `id` carries no target record.
+fn has_no_target_record(state: &GameState, id: ObjectId) -> bool {
+    let ability = state
+        .stack
+        .iter()
+        .find(|e| e.id == id)
+        .and_then(|e| e.ability())
+        .expect("entry with an ability");
+    serde_json::to_value(ability)
+        .expect("serialize")
+        .get("chosen_target_slots")
+        .is_none()
+}
+
 #[test]
-fn a_spell_restored_from_a_save_without_target_records_shows_its_target() {
+fn a_spell_restored_from_a_save_without_target_records_targets_and_shows_its_target() {
     let mut scenario = GameScenario::new();
     let (first, _, shock) = shock_on_the_stack(&mut scenario);
     let mut runner = scenario.build();
     runner.cast(shock).target_objects(&[first]).commit();
-    let mut saved = serde_json::to_value(runner.state()).expect("serialize");
+    let (restored, removed) = restore_without_target_records(runner.state());
+    assert!(removed > 0, "reach guard: the save held a target record");
     assert!(
-        strip_target_records(&mut saved) > 0,
-        "reach guard: the save held a target record"
+        has_no_target_record(&restored, shock),
+        "reach guard: the restored entry has no record"
     );
-    let restored: GameState = serde_json::from_value(saved).expect("restore");
     assert_eq!(
         declared_of(&restored, shock),
-        Vec::new(),
-        "reach guard: the restored entry has no record"
+        vec![TargetRef::Object(first)],
+        "CR 601.2c"
     );
     assert_eq!(
         displayed_targets(&restored, shock),
         vec![TargetRef::Object(first)]
     );
+}
+
+#[test]
+fn a_trigger_in_a_save_written_before_target_records_targets_the_opponent_it_was_aimed_at() {
+    use std::io::Read;
+    let mut json = String::new();
+    flate2::read::GzDecoder::new(
+        &include_bytes!("../fixtures/f4_user_mode1_no_offer_4p.json.gz")[..],
+    )
+    .read_to_string(&mut json)
+    .expect("inflate");
+    let envelope: serde_json::Value = serde_json::from_str(&json).expect("parse");
+    let restored = serde_json::from_value::<PersistedGameState>(envelope["gameState"].clone())
+        .expect("decode")
+        .into_game_state()
+        .expect("restore");
+    let trigger = ObjectId(415);
+    let (held, declared) = both(&restored, trigger);
+    assert_eq!(
+        held,
+        vec![TargetRef::Player(PlayerId(1))],
+        "reach guard: the saved trigger holds its target"
+    );
+    assert!(
+        has_no_target_record(&restored, trigger),
+        "reach guard: the save has no target record"
+    );
+    assert_eq!(declared, held, "CR 603.3d");
+}
+
+#[test]
+fn hindering_light_counters_a_spell_restored_from_a_save_without_target_records() {
+    let mut scenario = GameScenario::new();
+    let (bear, _, shock) = shock_on_the_stack(&mut scenario);
+    let hindering_light = scenario
+        .add_spell_to_hand_from_oracle(P1, "Hindering Light", true, HINDERING_LIGHT)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(shock).target_object(bear).commit();
+    runner.act(GameAction::PassPriority).expect("P0 passes");
+    let (restored, removed) = restore_without_target_records(runner.state());
+    assert!(removed > 0, "reach guard: the save held a target record");
+    assert!(
+        has_no_target_record(&restored, shock),
+        "reach guard: the restored Shock has no record"
+    );
+    let mut runner = GameRunner::from_state(restored);
+    assert_eq!(
+        cast_at_its_only_target(&mut runner, hindering_light),
+        Ok(()),
+        "CR 115.9b"
+    );
+    pass_until(&mut runner, |state| state.stack.is_empty());
+    assert_eq!(runner.state().objects[&shock].zone, Zone::Graveyard);
+    assert_eq!(
+        runner.state().objects[&bear].damage_marked,
+        0,
+        "CR 701.6a: the Shock was countered"
+    );
+}
+
+/// P0 casts Shock, at a generic cost of {1} with one Mountain, at `target`
+/// with manual payment; the game is saved while it waits for that payment,
+/// restored without target records, and paid.
+fn shock_paid_after_a_restore(mut scenario: GameScenario, target: ObjectId) -> GameRunner {
+    scenario.at_phase(Phase::PreCombatMain);
+    let shock = scenario
+        .add_spell_to_hand_from_oracle(P0, "Shock", true, SHOCK)
+        .with_mana_cost(ManaCost::generic(1))
+        .id();
+    scenario.add_basic_land(P0, ManaColor::Red);
+    let mut runner = scenario.build();
+    let card_id = runner.state().objects[&shock].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: shock,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Manual,
+        })
+        .expect("cast");
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::TargetSelection { .. }
+    ) {
+        runner
+            .act(GameAction::SelectTargets {
+                targets: vec![TargetRef::Object(target)],
+            })
+            .expect("target");
+    }
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::ManaPayment { .. }),
+        "reach guard: saved while waiting for payment"
+    );
+    let (restored, removed) = restore_without_target_records(runner.state());
+    assert!(removed > 0, "reach guard: the save held a target record");
+    let mut runner = GameRunner::from_state(restored);
+    runner.act(GameAction::PassPriority).expect("pay");
+    assert!(
+        runner.state().stack.iter().any(|e| e.id == shock),
+        "reach guard: Shock is on the stack"
+    );
+    runner
+}
+
+#[test]
+fn a_cast_paid_after_a_restore_without_target_records_is_a_crime() {
+    let mut scenario = GameScenario::new();
+    let bear = scenario.add_creature(P1, "Bear", 2, 2).id();
+    let runner = shock_paid_after_a_restore(scenario, bear);
+    assert_eq!(crimes(runner.state(), P0), 1, "CR 700.13");
+}
+
+#[test]
+fn a_cast_paid_after_a_restore_without_target_records_triggers_heroic() {
+    let (scenario, crusader) = crusader_board();
+    let runner = shock_paid_after_a_restore(scenario, crusader);
+    assert!(
+        pending_trigger_of(runner.state(), crusader).is_some(),
+        "CR 115.9b"
+    );
+}
+
+const DIVINATION: &str = "Draw two cards.";
+const FOUNTAIN_OF_YOUTH: &str = "{2}, {T}: You gain 1 life.";
+const ABZAN_CHARM: &str = "Choose one \u{2014}\n\u{2022} Exile target creature with power 3 or greater.\n\u{2022} You draw two cards and you lose 2 life.\n\u{2022} Distribute two +1/+1 counters among one or two target creatures.";
+
+/// Whether every node of `ability` records that it chose no target.
+fn records_no_target(ability: &ResolvedAbility) -> bool {
+    ability.chosen_target_slots == ChosenTargetSlots::Recorded(Vec::new())
+        && ability.sub_ability.as_deref().is_none_or(records_no_target)
+        && ability
+            .else_ability
+            .as_deref()
+            .is_none_or(records_no_target)
+}
+
+fn entry_ability(state: &GameState, source: ObjectId) -> &ResolvedAbility {
+    state
+        .stack
+        .iter()
+        .find(|e| e.source_id == source)
+        .and_then(|e| e.ability())
+        .expect("entry with an ability")
+}
+
+#[test]
+fn an_untargeted_spell_is_recorded_as_choosing_no_target() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let divination = scenario
+        .add_spell_to_hand_from_oracle(P0, "Divination", false, DIVINATION)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(divination).commit();
+    assert!(
+        records_no_target(entry_ability(runner.state(), divination)),
+        "CR 601.2c"
+    );
+}
+
+#[test]
+fn an_untargeted_mode_is_recorded_as_choosing_no_target() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let charm = scenario
+        .add_spell_to_hand_from_oracle(P0, "Abzan Charm", true, ABZAN_CHARM)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(charm).modes(&[1]).commit();
+    assert!(
+        records_no_target(entry_ability(runner.state(), charm)),
+        "CR 601.2c"
+    );
+}
+
+#[test]
+fn an_untargeted_activated_ability_is_recorded_as_choosing_no_target() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let fountain = scenario
+        .add_artifact_from_oracle(P0, "Fountain of Youth", FOUNTAIN_OF_YOUTH)
+        .id();
+    scenario.add_basic_land(P0, ManaColor::Green);
+    scenario.add_basic_land(P0, ManaColor::Green);
+    let mut runner = scenario.build();
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: fountain,
+            ability_index: 0,
+        })
+        .expect("activate");
+    assert!(
+        records_no_target(entry_ability(runner.state(), fountain)),
+        "CR 602.2b"
+    );
+}
+
+const CHARMING_PRINCE: &str = "When this creature enters, choose one \u{2014}\n\u{2022} Scry 2.\n\u{2022} You gain 3 life.\n\u{2022} Exile another target creature you own. Return it to the battlefield under your control at the beginning of the next end step.";
+const OPT: &str = "Scry 1. (Look at the top card of your library. You may put that card on the bottom.)\nDraw a card.";
+
+#[test]
+fn an_untargeted_mode_of_a_trigger_is_recorded_as_choosing_no_target() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let prince = scenario
+        .add_creature_to_hand_from_oracle(P0, "Charming Prince", 2, 2, CHARMING_PRINCE)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(prince).commit();
+    pass_until(&mut runner, |state| {
+        matches!(state.waiting_for, WaitingFor::AbilityModeChoice { .. })
+    });
+    runner
+        .act(GameAction::SelectModes { indices: vec![1] })
+        .expect("choose the life mode");
+    assert!(
+        records_no_target(entry_ability(runner.state(), prince)),
+        "CR 603.3c"
+    );
+}
+
+#[test]
+fn an_untargeted_copy_cast_from_isochron_scepter_is_recorded_as_choosing_no_target() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let opt = scenario
+        .add_spell_to_hand_from_oracle(P0, "Opt", true, OPT)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Blue],
+            generic: 0,
+        })
+        .id();
+    let scepter = scenario
+        .add_artifact_to_hand_from_oracle(P0, "Isochron Scepter", ISOCHRON_SCEPTER)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(scepter).commit();
+    for _ in 0..12 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::OptionalEffectChoice { .. } => {
+                runner
+                    .act(GameAction::DecideOptionalEffect { accept: true })
+                    .expect("imprint");
+            }
+            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => break,
+            WaitingFor::Priority { .. } => {
+                runner.act(GameAction::PassPriority).expect("pass");
+            }
+            other => panic!("unexpected prompt {other:?}"),
+        }
+    }
+    assert_eq!(
+        runner.state().objects[&opt].zone,
+        Zone::Exile,
+        "reach guard: Opt was imprinted"
+    );
+    add_colorless(&mut runner, P0, 2);
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: scepter,
+            ability_index: 0,
+        })
+        .expect("activate");
+    let copy = (0..12)
+        .find_map(|_| {
+            let copy = runner
+                .state()
+                .stack
+                .iter()
+                .find(|e| matches!(e.kind, StackEntryKind::Spell { .. }))
+                .map(|e| e.id);
+            if copy.is_none() {
+                match runner.state().waiting_for {
+                    WaitingFor::OptionalEffectChoice { .. } => runner
+                        .act(GameAction::DecideOptionalEffect { accept: true })
+                        .map(|_| ())
+                        .expect("copy and cast"),
+                    _ => runner
+                        .act(GameAction::PassPriority)
+                        .map(|_| ())
+                        .expect("pass"),
+                }
+            }
+            copy
+        })
+        .expect("reach guard: the copy is on the stack");
+    let copy_ability = runner
+        .state()
+        .stack
+        .iter()
+        .find(|e| e.id == copy)
+        .and_then(|e| e.ability())
+        .expect("the copy has an ability");
+    assert!(records_no_target(copy_ability), "CR 707.12");
+}
+
+#[test]
+fn an_untargeted_copy_cast_by_mizzixs_mastery_is_recorded_as_choosing_no_target() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let opt = scenario
+        .add_spell_to_graveyard(P0, "Opt", true)
+        .from_oracle_text(OPT)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Blue],
+            generic: 0,
+        })
+        .id();
+    let mastery = scenario
+        .add_spell_to_hand_from_oracle(P0, "Mizzix's Mastery", false, MIZZIXS_MASTERY)
+        .from_oracle_text_with_keywords(&["Overload"], MIZZIXS_MASTERY)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(mastery).target_objects(&[opt]).commit();
+    let copy = (0..12)
+        .find_map(|_| {
+            let copy = runner
+                .state()
+                .stack
+                .iter()
+                .find(|e| e.id != mastery && matches!(e.kind, StackEntryKind::Spell { .. }))
+                .map(|e| e.id);
+            if copy.is_none() {
+                match runner.state().waiting_for.clone() {
+                    WaitingFor::ChooseFromZoneChoice { cards, .. } => runner
+                        .act(GameAction::SelectCards { cards })
+                        .map(|_| ())
+                        .expect("cast the copy"),
+                    _ => runner
+                        .act(GameAction::PassPriority)
+                        .map(|_| ())
+                        .expect("pass"),
+                }
+            }
+            copy
+        })
+        .expect("reach guard: the copy is on the stack");
+    assert!(
+        records_no_target(entry_ability(runner.state(), copy)),
+        "CR 707.12"
+    );
+}
+
+const GERMINATION_PRACTICUM: &str = "Put two +1/+1 counters on each creature you control.\nParadigm (Then exile this spell. After you first resolve a spell with this name, you may cast a copy of it from exile without paying its mana cost at the beginning of each of your first main phases.)";
+
+#[test]
+fn an_untargeted_paradigm_copy_is_recorded_as_choosing_no_target() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    for _ in 0..8 {
+        scenario.add_card_to_library_top(P0, "Library Card");
+        scenario.add_card_to_library_top(P1, "Library Card");
+    }
+    let practicum = scenario
+        .add_spell_to_hand_from_oracle(P0, "Germination Practicum", false, GERMINATION_PRACTICUM)
+        .from_oracle_text_with_keywords(&["Paradigm"], GERMINATION_PRACTICUM)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(practicum).commit();
+    pass_until(&mut runner, |state| {
+        matches!(state.waiting_for, WaitingFor::CastOffer { .. })
+    });
+    runner
+        .act(GameAction::CastParadigmCopy { source: practicum })
+        .expect("cast the copy");
+    let copy = runner
+        .state()
+        .stack
+        .iter()
+        .find(|e| matches!(e.kind, StackEntryKind::Spell { .. }))
+        .and_then(|e| e.ability())
+        .expect("reach guard: the copy is on the stack");
+    assert!(records_no_target(copy), "CR 707.12");
+}
+
+#[test]
+fn a_trigger_saved_and_restored_still_targets_none_of_the_attackers_it_holds() {
+    let (mut runner, attacker, strategist) = sabotage_board();
+    let entry = trigger_of(&mut runner, strategist);
+    let saved =
+        serde_json::to_value(PersistedGameState::capture(runner.state().clone())).expect("save");
+    let restored = serde_json::from_value::<PersistedGameState>(saved)
+        .expect("decode")
+        .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
+        .expect("admit")
+        .finalize_after_rehydration(|_| Ok(()))
+        .expect("restore");
+    let (held, declared) = both(&restored, entry);
+    assert_eq!(
+        held,
+        vec![TargetRef::Object(attacker)],
+        "reach guard: the trigger holds the attacker"
+    );
+    assert_eq!(declared, Vec::new(), "CR 115.10a");
 }
 
 #[test]

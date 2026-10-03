@@ -2,12 +2,13 @@
 use crate::types::ability::TapStateChange;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AdditionalCost, AttachSelection,
-    CardTypeSetSource, CastManaSpentMetric, CombatRelationSubject, ControllerRef, CountBinding,
-    CounterMoveSelection, DamageSource, EachDamageRecipient, Effect, EffectKind, EffectScope,
-    FilterProp, GameRestriction, ModalChoice, ModalSelectionCondition, ModalSelectionConstraint,
-    MultiTargetSpec, ObjectScope, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef,
-    ResolvedAbility, RestrictionPlayerScope, SpellContext, SubAbilityLink, TargetChoiceTiming,
-    TargetFilter, TargetReadOrigin, TargetRef, TriggerDefinition, TypeFilter, TypedFilter,
+    CardTypeSetSource, CastManaSpentMetric, ChosenTargetSlots, CombatRelationSubject,
+    ControllerRef, CountBinding, CounterMoveSelection, DamageSource, EachDamageRecipient, Effect,
+    EffectKind, EffectScope, FilterProp, GameRestriction, ModalChoice, ModalSelectionCondition,
+    ModalSelectionConstraint, MultiTargetSpec, ObjectScope, PlayerFilter, PlayerScope, PtValue,
+    QuantityExpr, QuantityRef, ResolvedAbility, RestrictionPlayerScope, SpellContext,
+    SubAbilityLink, TargetChoiceTiming, TargetFilter, TargetReadOrigin, TargetRef,
+    TriggerDefinition, TypeFilter, TypedFilter,
 };
 // CR 601.2c: mana recipient / count-source role slot gate.
 use crate::types::ability::mana_multi_role;
@@ -1976,19 +1977,11 @@ pub fn assign_selected_slots_in_chain(
 /// Records the chosen slots of an assignment that wrote all its targets to the
 /// root.
 pub(crate) fn record_root_target_slots(ability: &mut ResolvedAbility) {
-    // CR 115.1: the opponents a per-opponent fanout iterates are not targets.
-    let fanout = is_per_opponent_target_fanout(ability);
-    ability.chosen_target_slots = ability
-        .targets
-        .iter()
-        .enumerate()
-        .filter(|(_, target)| !fanout || matches!(target, TargetRef::Object(_)))
-        .map(|(slot, _)| slot)
-        .collect();
+    ability.chosen_target_slots = ChosenTargetSlots::Recorded(chain_node_target_slots(ability));
 }
 
 fn clear_chosen_target_slots(ability: &mut ResolvedAbility) {
-    ability.chosen_target_slots.clear();
+    ability.chosen_target_slots = ChosenTargetSlots::Recorded(Vec::new());
     if let Some(sub_ability) = ability.sub_ability.as_deref_mut() {
         clear_chosen_target_slots(sub_ability);
     }
@@ -2042,11 +2035,23 @@ fn stamp_other_batch_source_targets(ability: &mut ResolvedAbility) {
 /// The targets one chain node contributes to [`flatten_targets_in_chain`]'s
 /// numbering: a per-opponent fanout contributes only its object targets.
 fn chain_node_targets(ability: &ResolvedAbility) -> Vec<TargetRef> {
-    if is_per_opponent_target_fanout(ability) {
-        object_targets_only(&ability.targets)
-    } else {
-        ability.targets.clone()
-    }
+    chain_node_target_slots(ability)
+        .into_iter()
+        .map(|slot| ability.targets[slot].clone())
+        .collect()
+}
+
+/// The indices into `ability.targets` of [`chain_node_targets`].
+fn chain_node_target_slots(ability: &ResolvedAbility) -> Vec<usize> {
+    // CR 115.1: the opponents a per-opponent fanout iterates are not targets.
+    let fanout = is_per_opponent_target_fanout(ability);
+    ability
+        .targets
+        .iter()
+        .enumerate()
+        .filter(|(_, target)| !fanout || matches!(target, TargetRef::Object(_)))
+        .map(|(slot, _)| slot)
+        .collect()
 }
 
 pub fn flatten_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
@@ -2060,22 +2065,90 @@ pub fn flatten_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
     targets
 }
 
-/// CR 601.2c: The targets chosen for a chain, in chain order: each node's
-/// `targets` at its `chosen_target_slots`. A value a node holds without having
-/// received it as a choice is not a target (CR 115.10a).
+/// CR 601.2c: The targets chosen for a chain, in chain order. The node the walk
+/// starts from decides how they are numbered ([`DeclaredNumbering::of`]).
 pub fn declared_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
-    let mut targets: Vec<TargetRef> = ability
-        .chosen_target_slots
-        .iter()
-        .filter_map(|&slot| ability.targets.get(slot).cloned())
-        .collect();
-    if let Some(sub_ability) = ability.sub_ability.as_deref() {
-        targets.extend(declared_targets_in_chain(sub_ability));
+    fn visit(
+        ability: &ResolvedAbility,
+        numbering: DeclaredNumbering,
+        targets_are_inherited: bool,
+        out: &mut Vec<TargetRef>,
+    ) {
+        if let Some(sub_ability) = numbering.delegate(ability) {
+            visit(sub_ability, numbering, targets_are_inherited, out);
+            return;
+        }
+        out.extend(numbering.node_targets(ability, targets_are_inherited));
+        if let Some(sub_ability) = ability.sub_ability.as_deref() {
+            visit(
+                sub_ability,
+                numbering,
+                rider_entries_are_inherited(ability, sub_ability),
+                out,
+            );
+        }
+        if let Some(else_ability) = ability.else_ability.as_deref() {
+            visit(else_ability, numbering, false, out);
+        }
     }
-    if let Some(else_ability) = ability.else_ability.as_deref() {
-        targets.extend(declared_targets_in_chain(else_ability));
-    }
+
+    let mut targets = Vec::new();
+    visit(ability, DeclaredNumbering::of(ability), false, &mut targets);
     targets
+}
+
+/// How a chain's declared targets are numbered.
+#[derive(Clone, Copy)]
+enum DeclaredNumbering {
+    /// Each node's `targets` at its `chosen_target_slots`. A value a node holds
+    /// without having received it as a choice is not a target (CR 115.10a).
+    Recorded,
+    /// For a chain with no record: what its nodes hold
+    /// ([`chain_node_targets`]), less a paid "instead" delegator's mirror and an
+    /// inheriting rider's snapshot.
+    Layout,
+}
+
+impl DeclaredNumbering {
+    fn of(ability: &ResolvedAbility) -> Self {
+        match ability.chosen_target_slots {
+            ChosenTargetSlots::Recorded(_) => Self::Recorded,
+            ChosenTargetSlots::Unrecorded => Self::Layout,
+        }
+    }
+
+    /// The paid "instead" sub read in `node`'s place, for the layout only. A
+    /// recorded parent is read itself: it can hold a target chosen for it.
+    fn delegate(self, node: &ResolvedAbility) -> Option<&ResolvedAbility> {
+        match self {
+            Self::Recorded => None,
+            Self::Layout => paid_instead_delegate(node),
+        }
+    }
+
+    /// The indices into `node.targets` of the declared targets `node`
+    /// contributes. `targets_are_inherited` is [`rider_entries_are_inherited`]
+    /// of `node` under its parent.
+    fn node_slots(self, node: &ResolvedAbility, targets_are_inherited: bool) -> Vec<usize> {
+        match self {
+            Self::Recorded => node
+                .chosen_target_slots
+                .slots()
+                .iter()
+                .copied()
+                .filter(|&slot| slot < node.targets.len())
+                .collect(),
+            Self::Layout if targets_are_inherited => Vec::new(),
+            Self::Layout => chain_node_target_slots(node),
+        }
+    }
+
+    fn node_targets(self, node: &ResolvedAbility, targets_are_inherited: bool) -> Vec<TargetRef> {
+        self.node_slots(node, targets_are_inherited)
+            .into_iter()
+            .map(|slot| node.targets[slot].clone())
+            .collect()
+    }
 }
 
 /// CR 115.10a: whether `sub`'s own `targets` are a carried snapshot of
@@ -2100,6 +2173,7 @@ fn rider_entries_are_inherited(parent: &ResolvedAbility, sub: &ResolvedAbility) 
 /// `else_ability` entries follow its whole sub-chain in that order, so they
 /// never precede `base`. `base` must lie on `root`'s `sub_ability` line.
 pub(crate) fn declared_slots_ahead_of(root: &ResolvedAbility, base: &ResolvedAbility) -> usize {
+    let numbering = DeclaredNumbering::of(root);
     let mut ahead = 0;
     let mut node = Some(root);
     let mut inherited = false;
@@ -2107,13 +2181,11 @@ pub(crate) fn declared_slots_ahead_of(root: &ResolvedAbility, base: &ResolvedAbi
         if std::ptr::eq(current, base) {
             break;
         }
-        if let Some(delegate) = paid_instead_delegate(current) {
+        if let Some(delegate) = numbering.delegate(current) {
             node = Some(delegate);
             continue;
         }
-        if !inherited {
-            ahead += chain_node_targets(current).len();
-        }
+        ahead += numbering.node_targets(current, inherited).len();
         let next = current.sub_ability.as_deref();
         inherited = next.is_some_and(|sub| rider_entries_are_inherited(current, sub));
         node = next;
@@ -2169,7 +2241,7 @@ pub(crate) fn illegal_declared_target_slots(
 ) -> Vec<usize> {
     let mut illegal = Vec::new();
     visit_illegal_declared_target_slots(
-        Some(declared),
+        Some((declared, DeclaredNumbering::of(declared))),
         Some(validated),
         false,
         &mut 0,
@@ -2186,7 +2258,7 @@ pub(crate) fn clear_illegal_local_target_slots(ability: &mut ResolvedAbility) {
 }
 
 fn visit_illegal_declared_target_slots(
-    declared: Option<&ResolvedAbility>,
+    declared: Option<(&ResolvedAbility, DeclaredNumbering)>,
     mut validated: Option<&mut ResolvedAbility>,
     targets_are_inherited: bool,
     next_slot: &mut usize,
@@ -2196,13 +2268,13 @@ fn visit_illegal_declared_target_slots(
         validated.illegal_local_target_slots.clear();
     }
 
-    if let Some(declared) = declared {
-        if let Some(delegate) = paid_instead_delegate(declared) {
+    if let Some((declared, numbering)) = declared {
+        if let Some(delegate) = numbering.delegate(declared) {
             let validated_delegate = validated
                 .as_deref_mut()
                 .and_then(|node| node.sub_ability.as_deref_mut());
             visit_illegal_declared_target_slots(
-                Some(delegate),
+                Some((delegate, numbering)),
                 validated_delegate,
                 targets_are_inherited,
                 next_slot,
@@ -2210,26 +2282,23 @@ fn visit_illegal_declared_target_slots(
             );
             return;
         }
-        if !targets_are_inherited {
-            let mut survivors = validated
-                .as_deref()
-                .map_or_else(Vec::new, |node| node.targets.clone());
-            for (local_slot, target) in declared.targets.iter().enumerate().filter(|(_, target)| {
-                !is_per_opponent_target_fanout(declared) || matches!(target, TargetRef::Object(_))
-            }) {
-                match survivors.iter().position(|survivor| survivor == target) {
-                    Some(found) => {
-                        survivors.swap_remove(found);
-                    }
-                    None => {
-                        illegal.push(*next_slot);
-                        if let Some(validated) = validated.as_deref_mut() {
-                            validated.illegal_local_target_slots.push(local_slot);
-                        }
+        let mut survivors = validated
+            .as_deref()
+            .map_or_else(Vec::new, |node| node.targets.clone());
+        for local_slot in numbering.node_slots(declared, targets_are_inherited) {
+            let target = &declared.targets[local_slot];
+            match survivors.iter().position(|survivor| survivor == target) {
+                Some(found) => {
+                    survivors.swap_remove(found);
+                }
+                None => {
+                    illegal.push(*next_slot);
+                    if let Some(validated) = validated.as_deref_mut() {
+                        validated.illegal_local_target_slots.push(local_slot);
                     }
                 }
-                *next_slot += 1;
             }
+            *next_slot += 1;
         }
         if let Some(sub_ability) = declared.sub_ability.as_deref() {
             let validated_sub = validated
@@ -2237,7 +2306,7 @@ fn visit_illegal_declared_target_slots(
                 .and_then(|node| node.sub_ability.as_deref_mut());
             let inherited = rider_entries_are_inherited(declared, sub_ability);
             visit_illegal_declared_target_slots(
-                Some(sub_ability),
+                Some((sub_ability, numbering)),
                 validated_sub,
                 inherited,
                 next_slot,
@@ -2249,7 +2318,7 @@ fn visit_illegal_declared_target_slots(
                 .as_deref_mut()
                 .and_then(|node| node.else_ability.as_deref_mut());
             visit_illegal_declared_target_slots(
-                Some(else_ability),
+                Some((else_ability, numbering)),
                 validated_else,
                 false,
                 next_slot,
@@ -16984,6 +17053,85 @@ mod tests {
             .expect("Grim Contest resolves");
         assert_eq!(state.objects[&yours].damage_marked, 4);
         assert_eq!(state.objects[&opponents].damage_marked, 2);
+    }
+
+    /// CR 608.2b + CR 608.2c: in a recorded chain, the illegal-slot stamp and
+    /// the slot offset number the recorded targets, as the slot reader does,
+    /// not the pairwise damage node's copies of the two targets before it.
+    #[test]
+    fn recorded_slots_skip_a_pairwise_damage_nodes_copies() {
+        let state = GameState::new(FormatConfig::standard(), 2, 42);
+        let source = ObjectId(99);
+        let (a, b, c) = (ObjectId(77), ObjectId(78), ObjectId(79));
+        let tap = ResolvedAbility::new(
+            Effect::SetTapState {
+                target: TargetFilter::Typed(TypedFilter::creature()),
+                scope: EffectScope::Single,
+                state: TapStateChange::Tap,
+            },
+            Vec::new(),
+            source,
+            PlayerId(0),
+        );
+        let mut damage = ResolvedAbility::new(
+            Effect::EachSourceDealsDamage {
+                sources: TargetFilter::ParentTarget,
+                amount: QuantityExpr::Fixed { value: 1 },
+                recipient: EachDamageRecipient::OtherBatchSource {
+                    source_filters: [
+                        Box::new(TargetFilter::Typed(TypedFilter::creature())),
+                        Box::new(TargetFilter::Typed(TypedFilter::creature())),
+                    ],
+                },
+            },
+            Vec::new(),
+            source,
+            PlayerId(0),
+        );
+        damage.sub_ability = Some(Box::new(tap));
+        let target_only = || {
+            ResolvedAbility::new(
+                Effect::TargetOnly {
+                    target: TargetFilter::Typed(TypedFilter::creature()),
+                },
+                Vec::new(),
+                source,
+                PlayerId(0),
+            )
+        };
+        let mut second = target_only();
+        second.sub_ability = Some(Box::new(damage));
+        let mut chain = target_only();
+        chain.sub_ability = Some(Box::new(second));
+        let declared = [a, b, c].map(TargetRef::Object).to_vec();
+        assign_targets_in_chain(&state, &mut chain, &declared).expect("three targets assign");
+
+        let damage = chain
+            .sub_ability
+            .as_deref()
+            .and_then(|second| second.sub_ability.as_deref())
+            .expect("pairwise damage node");
+        assert_eq!(
+            damage.targets,
+            [a, b].map(TargetRef::Object).to_vec(),
+            "reach guard: the damage node holds copies of both targets"
+        );
+        assert_eq!(declared_targets_in_chain(&chain), declared);
+        let tap = damage.sub_ability.as_deref().expect("tap node");
+        assert_eq!(declared_slots_ahead_of(&chain, tap), 2);
+        let mut validated = chain.clone();
+        validated
+            .sub_ability
+            .as_deref_mut()
+            .and_then(|second| second.sub_ability.as_deref_mut())
+            .and_then(|damage| damage.sub_ability.as_deref_mut())
+            .expect("tap node")
+            .targets
+            .clear();
+        assert_eq!(
+            illegal_declared_target_slots(&chain, &mut validated),
+            vec![2]
+        );
     }
 
     #[test]
