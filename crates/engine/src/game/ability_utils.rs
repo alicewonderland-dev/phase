@@ -2127,8 +2127,7 @@ impl DeclaredNumbering {
     }
 
     /// The indices into `node.targets` of the declared targets `node`
-    /// contributes. `targets_are_inherited` is [`rider_entries_are_inherited`]
-    /// of `node` under its parent.
+    /// contributes.
     fn node_slots(self, node: &ResolvedAbility, targets_are_inherited: bool) -> Vec<usize> {
         match self {
             Self::Recorded => node
