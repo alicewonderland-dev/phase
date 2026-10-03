@@ -1180,6 +1180,16 @@ pub struct AbilityActivationRecord {
     /// The source as it was when the ability was activated (for a modifier
     /// scoped to abilities "of an artifact" and the like).
     pub source_lki: LKISnapshot,
+    /// CR 602.2: the zone the source was in when the ability was announced.
+    /// An activation trigger takes a cost-moved source's last known information
+    /// only when it was announced from the battlefield (CR 113.7). Records
+    /// predating the field were battlefield activations for every reader that
+    /// existed, so the default is the battlefield; it is omitted on the wire then.
+    #[serde(
+        default = "battlefield_zone",
+        skip_serializing_if = "is_battlefield_zone"
+    )]
+    pub source_zone: Zone,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ability_tag: Option<crate::types::ability::AbilityTag>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1188,6 +1198,14 @@ pub struct AbilityActivationRecord {
     /// untargeted ability.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub targets: Vec<ActivationTargetFact>,
+}
+
+fn battlefield_zone() -> Zone {
+    Zone::Battlefield
+}
+
+fn is_battlefield_zone(zone: &Zone) -> bool {
+    *zone == Zone::Battlefield
 }
 
 /// One committed target of an activation, as it was when the ability was
@@ -2278,6 +2296,17 @@ pub struct ChosenDamageSource {
 
 /// CR 120.1: Snapshot of a damage event for "was dealt damage by" queries.
 ///
+/// CR 702.110b: Record of an exploit sacrifice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExploitRecord {
+    pub exploiter: ObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exploiter_incarnation: Option<u64>,
+    pub sacrificed: ObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sacrificed_incarnation: Option<u64>,
+}
+
 /// CR 608.2i + CR 608.2h: source characteristics snapshot at damage time
 /// (look-back; criteria need not still hold). Queries such as "opponents who
 /// were dealt combat damage by ~ or a Dragon this turn" (Estinien Varlineau)
@@ -4557,20 +4586,22 @@ pub struct PendingChooseOneOf {
 }
 
 /// CR 101.4 + CR 608.2c: Per-player `ChooseFromZone { zone_owner: EachPlayer }`
-/// iteration state. A single chooser (the spell's controller) picks one card
-/// from EACH player's zone in APNAP order; this stashes the players not yet
-/// prompted while the current player's `WaitingFor::ChooseFromZoneChoice` is
-/// outstanding. Created when the first player's choice is parked, drained after
-/// each pick accumulates into the resolution chain's tracked set, and disposed
-/// once every player has been prompted — at which point the parked
+/// iteration state. A single chooser picks one card from EACH player's zone;
+/// this stashes the players not yet chosen for while either the controller's
+/// order prompt (CR 101.4c, `current == None`) or one player's
+/// `WaitingFor::ChooseFromZoneChoice` (`current == Some(player)`) is
+/// outstanding. Created when the first prompt is parked, drained after each
+/// pick accumulates into the resolution chain's tracked set, and disposed
+/// once every player has been chosen for — at which point the parked
 /// `pending_continuation` (e.g. "put those cards onto the battlefield") runs.
-/// Building block for Breach the Multiverse.
+/// Building block for Breach the Multiverse and Ultimate Magic: Meteor.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PendingPerPlayerZoneChoice {
     /// The `Effect::ChooseFromZone` ability whose per-player body repeats. Its
     /// `zone`/`filter`/`count`/`chooser` describe each player's prompt.
     pub ability: Box<ResolvedAbility>,
-    /// Players not yet prompted, in APNAP order.
+    /// Players not yet chosen for, in APNAP order. When the controller makes
+    /// every choice, this is the set they order (CR 101.4c), not an order.
     pub remaining_players: Vec<PlayerId>,
     /// CR 603.7 + CR 608.2c: Whether a pick from THIS per-player iteration has
     /// already started its fresh chosen-card tracked set. The first non-empty
@@ -4581,6 +4612,16 @@ pub struct PendingPerPlayerZoneChoice {
     /// published, then `true` for the remainder of the iteration.
     #[serde(default)]
     pub accumulated: bool,
+    /// The iterated player whose pool choice is pending, or `None` while the
+    /// order choice (CR 101.4c) is pending. Kept through an election, so a
+    /// pending pool is never lost while its maker is being replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<PlayerId>,
+    /// CR 800.4g: the player elected to make the pending pool choice when the
+    /// player who would make it has left the game. Bound to that one choice:
+    /// cleared when it completes or is skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nominee: Option<PlayerId>,
 }
 
 /// CR 401.4 + CR 608.2c: Per-owner library-order prompts for one
@@ -4761,7 +4802,11 @@ pub struct PendingPlayerScopeSacrificeCompletion {
 pub enum PendingPlayerScopeSacrificeFollowUp {
     /// Emit the exploit event only after the chosen creature's sacrifice has
     /// actually completed, including after a graveyard-move replacement choice.
-    Exploit { exploiter: ObjectId },
+    Exploit {
+        exploiter: ObjectId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exploiter_incarnation: Option<u64>,
+    },
 }
 
 /// One discard instruction, parked mid-batch while an optional replacement
@@ -7398,6 +7443,10 @@ pub struct PendingCast {
     /// quantities can resolve later.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub convoked_creatures: Vec<ObjectId>,
+    /// CR 702.66a + CR 601.2h: Graveyard cards selected to pay generic mana.
+    /// They stay in the graveyard until the total cost is paid at commit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delved_cards: Vec<ObjectId>,
     /// CR 601.2g + CR 601.2h: Non-mana spell additional-cost permanents selected
     /// for sacrifice, but whose actual zone move is deferred until the final
     /// payment commit so mana abilities can be activated first.
@@ -7566,6 +7615,25 @@ pub enum PendingCostMoveCompletion {
         resolution_success_waiting_for: Option<Box<WaitingFor>>,
         prepaid_actual_mana_spent: Option<u32>,
     },
+    /// CR 601.2h + CR 702.66a: The cast's mana is already paid and `pending`
+    /// carries that payment; once the Delve exiles settle, re-enter the inner
+    /// finalizer with what the first pass already decided.
+    FinalizeDelvedCast {
+        phyrexian_choices: Option<Vec<ShardChoice>>,
+        /// `None` when the first pass had not reached the pre-payment checks.
+        pre_payment_checks: Option<Box<FinalizePrePaymentChecks>>,
+    },
+}
+
+/// CR 601.2a-b + CR 614.1c: Pre-payment determinations of one cast finalization,
+/// made once; a re-entry after a parked cost move carries them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinalizePrePaymentChecks {
+    pub early_waiting_for: Option<WaitingFor>,
+    pub cascade_cast_transformed: bool,
+    pub resolution_success_waiting_for: Option<WaitingFor>,
+    pub cast_this_way_etb_counter: Option<CounterType>,
+    pub cast_this_way_enters_mods: Vec<ContinuousModification>,
 }
 
 /// CR 605.3b: Selects whether completing a mana-ability cost payment may ask
@@ -7733,8 +7801,6 @@ pub enum WardSacrificePaymentResume {
 /// `Foretell` records the special action until its replacement-aware exile move
 /// has been delivered or prevented. `ManaAbilityPayment` owns the exact
 /// activation and unpaid payment cursor until the move has settled.
-/// `DelveManaPayment` owns the single Delve fuel's post-move payment state;
-/// the zone pipeline's delivery tail owns its delivered-only exile link.
 /// `SacrificeForCost` owns a full selected sacrifice component across one or
 /// more replacement-choice action boundaries, including its event span and
 /// LKI record identities. `CollectEvidencePayment` and `UnlessBouncePayment`
@@ -7799,10 +7865,6 @@ pub enum PendingCostMoveResume {
         object_id: ObjectId,
         cost: ManaCost,
         turn_foretold: u32,
-    },
-    DelveManaPayment {
-        player: PlayerId,
-        fuel_id: ObjectId,
     },
     /// CR 701.59a + CR 614.1 + CR 616.1: The selected evidence cards are
     /// exiled one at a time as a cost. A replacement choice settles the card
@@ -7905,7 +7967,6 @@ impl PendingCostMoveResume {
     pub fn withholds_priority(&self) -> bool {
         match self {
             PendingCostMoveResume::Cast { .. }
-            | PendingCostMoveResume::DelveManaPayment { .. }
             | PendingCostMoveResume::ManaAbilityPayment { .. }
             | PendingCostMoveResume::ActivationMillPayment { .. }
             | PendingCostMoveResume::LoyaltyActivation { .. } => true,
@@ -8035,6 +8096,7 @@ impl PendingCast {
             declared_kickers_to_pay: Vec::new(),
             declined_kickers: Vec::new(),
             convoked_creatures: Vec::new(),
+            delved_cards: Vec::new(),
             deferred_sacrificed_permanents: Vec::new(),
             pinned_pool_units: Vec::new(),
             cancel_restore_prepared_source: None,
@@ -13381,12 +13443,16 @@ pub enum PersistedRestoreError {
     RehydrationFailed(String),
     #[error("persisted state has unsettled resolution ownership at priority")]
     UnsettledPriorityResolution,
+    #[error("persisted state contains an ownerless post-replacement dispatch")]
+    OwnerlessPostReplacementDispatch,
     #[error("persisted terminal-rest recovery did not make strict progress")]
     TerminalRestRecoveryExhausted,
     #[error("persisted priority state has deferred triggers that could not settle")]
     DeferredTriggerSettlement,
     #[error("persisted priority settlement failed: {0}")]
     PrioritySettlementFailed(String),
+    #[error("persisted per-player choice cannot be restored: {0}")]
+    InvalidPerPlayerChoice(String),
 }
 
 impl PreparedPersistedGameState {
@@ -13572,6 +13638,10 @@ impl PersistedGameState {
         state
             .validate_payment_transaction()
             .map_err(PersistedRestoreError::InvalidPaymentTransaction)?;
+        crate::game::effects::choose_from_zone::migrate_legacy_per_player_frame_on_restore(
+            &mut state,
+        )
+        .map_err(PersistedRestoreError::InvalidPerPlayerChoice)?;
         state
             .format_config
             .reject_unimplemented_range_of_influence()
@@ -13598,6 +13668,45 @@ impl PersistedGameState {
         // each caller.
         let recovered_terminal_rest =
             crate::game::engine::recover_terminal_resolution_rest_on_restore(&mut state)?;
+        // Priority-time recovery gets first chance to retire the exact terminal
+        // rest it owns. A Dispatching marker left afterward has no synchronous
+        // dispatch handle at the persistence boundary, wherever it sits in the
+        // typed frame stack or within one PostReplacement frame's drain stack.
+        if state.resolution_stack.iter().any(|frame| match frame {
+            ResolutionFrame::PostReplacement(drains) => drains
+                .drains
+                .iter()
+                .any(|drain| matches!(drain.status, DrainStatus::Dispatching)),
+            ResolutionFrame::AbilityContinuation(_)
+            | ResolutionFrame::RepeatFor(_)
+            | ResolutionFrame::RepeatUntil(_)
+            | ResolutionFrame::RepeatedOptionalPayment(_)
+            | ResolutionFrame::ChangeZone(_)
+            | ResolutionFrame::BatchDelivery(_)
+            | ResolutionFrame::CounterMoves(_)
+            | ResolutionFrame::CounterRemovals(_)
+            | ResolutionFrame::CounterAdditions(_)
+            | ResolutionFrame::CopyToken(_)
+            | ResolutionFrame::DebugCardEntries(_)
+            | ResolutionFrame::EachPlayerCopyChosen(_)
+            | ResolutionFrame::ChooseOneOf(_)
+            | ResolutionFrame::VoteBallot(_)
+            | ResolutionFrame::PerPlayerZoneChoice(_)
+            | ResolutionFrame::PerCategoryZoneChoice(_)
+            | ResolutionFrame::OptionalEffect(_)
+            | ResolutionFrame::CoinFlip(_)
+            | ResolutionFrame::DieRoll(_)
+            | ResolutionFrame::Proliferate(_)
+            | ResolutionFrame::MultiDraw(_)
+            | ResolutionFrame::Discard(_)
+            | ResolutionFrame::ConniveReentry(_)
+            | ResolutionFrame::LifeTotalAssignment(_)
+            | ResolutionFrame::SpellResolution(_)
+            | ResolutionFrame::MutateMerge(_)
+            | ResolutionFrame::CipherEncode(_) => false,
+        }) {
+            return Err(PersistedRestoreError::OwnerlessPostReplacementDispatch);
+        }
         Ok(PreparedPersistedGameState {
             state,
             finalization,
@@ -13625,12 +13734,19 @@ pub struct ResolutionOptionalPaymentOption {
     pub cost: AbilityCost,
 }
 
-/// Why a controller is selecting an opponent for a zone choice.
+/// Why a controller is selecting a player for a zone choice.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ZoneOpponentChooserPurpose {
     #[default]
     Ordinary,
     BindReciprocalConsume,
+    /// CR 101.4c: the single chooser of a per-player iteration picks whose
+    /// selection to make next. Candidates may include the chooser themself.
+    PerPlayerChoiceOrder,
+    /// CR 800.4g + CR 800.4h: the player who would make a pending per-player
+    /// pick has left the game; the next player in turn order after the
+    /// object's controller elects another player to make that one choice.
+    SubstituteChooser,
 }
 
 impl ZoneOpponentChooserPurpose {
@@ -21138,6 +21254,9 @@ declare_game_state! {
     /// of deep-copying them on the AI-search hot path.
     #[serde(default)]
     pub damage_dealt_this_turn: im::Vector<DamageRecord>,
+    /// CR 702.110b + CR 400.7: Exploit records this turn for "if it exploited that creature" queries.
+    #[serde(default, skip_serializing_if = "im::Vector::is_empty")]
+    pub creatures_exploited_this_turn: im::Vector<ExploitRecord>,
     /// CR 702.173a + CR 608.2i: Set of players P such that, at some point this
     /// turn, a creature controlled by P that was an Assassin OR a commander
     /// (snapshot at damage-dealing time per CR 608.2i — "looks back in time")
@@ -22041,6 +22160,15 @@ declare_game_state! {
     /// persists the sidecar and its node, never this marker.
     #[serde(skip)]
     pub(crate) active_accepted_triggered_mana_node: Option<RulesExecutionNodeRef>,
+
+    /// CR 605.3b + CR 605.4a: Depth of inline mana-ability subresolutions
+    /// currently executing (a mana ability's `sub_ability` chain or a stackless
+    /// triggered mana ability). Mana abilities resolve immediately, so this is
+    /// zero at every action boundary. A per-player zone choice refuses to park
+    /// while it is nonzero: such a choice would belong to the mana ability, not
+    /// to the resolution carrier above it.
+    #[serde(skip)]
+    pub(crate) mana_subresolution_depth: u32,
 
     /// Debug-only witness that the trigger-construction finisher ran at most
     /// once per reducer action. The finisher is applied at the outermost handler
@@ -26245,6 +26373,37 @@ impl GameState {
         ManaPipId(id)
     }
 
+    /// CR 702.66a: A graveyard card that may be exiled to pay for `spell`.
+    /// CR 601.2a: the spell being cast has moved to the stack, so it is never
+    /// its own delve fuel even when it was cast from the graveyard.
+    pub fn is_delve_fuel_for(
+        &self,
+        player: PlayerId,
+        spell: ObjectId,
+        object_id: ObjectId,
+    ) -> bool {
+        object_id != spell
+            && self
+                .objects
+                .get(&object_id)
+                .is_some_and(|object| object.is_delve_eligible(player))
+    }
+
+    /// CR 702.66a: A graveyard card the caster may still select to pay generic
+    /// mana: fuel for the pending spell and not already selected.
+    pub fn is_delve_selectable(&self, player: PlayerId, object_id: ObjectId) -> bool {
+        match self.pending_cast.as_ref() {
+            Some(pending) => {
+                self.is_delve_fuel_for(player, pending.object_id, object_id)
+                    && !pending.delved_cards.contains(&object_id)
+            }
+            None => self
+                .objects
+                .get(&object_id)
+                .is_some_and(|object| object.is_delve_eligible(player)),
+        }
+    }
+
     /// CR 106.4 + CR 118.3a: Resolve and apply one real-pool mana insertion.
     /// This is the single authority for mana entering a *real* pool: every
     /// production/refill/convoke/delve injection routes here so that each pooled
@@ -27397,6 +27556,7 @@ impl GameState {
             batched_zone_change_trigger_fired: HashSet::new(),
             battlefield_entries_this_turn: Vec::new(),
             damage_dealt_this_turn: im::Vector::new(),
+            creatures_exploited_this_turn: im::Vector::new(),
             assassin_or_commander_dealt_combat_damage_this_turn: HashSet::new(),
             creature_types_dealt_combat_damage_this_turn: im::HashSet::new(),
             mana_spent_on_spells_this_turn: HashMap::new(),
@@ -27498,6 +27658,7 @@ impl GameState {
             pending_triggered_mana_resume: None,
             pending_trigger_construction_priority_recipient: None,
             active_accepted_triggered_mana_node: None,
+            mana_subresolution_depth: 0,
             trigger_construction_finisher_ran_this_action: false,
             pending_discard_for_cost: None,
             pending_cast: None,
@@ -29796,6 +29957,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         batched_zone_change_trigger_fired: _,
         battlefield_entries_this_turn: _,
         damage_dealt_this_turn: _,
+        creatures_exploited_this_turn: _,
         assassin_or_commander_dealt_combat_damage_this_turn: _,
         creature_types_dealt_combat_damage_this_turn: _,
         mana_spent_on_spells_this_turn: _,
@@ -29887,6 +30049,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         pending_triggered_mana_resume: _,
         pending_trigger_construction_priority_recipient: _,
         active_accepted_triggered_mana_node: _,
+        mana_subresolution_depth: _,
         trigger_construction_finisher_ran_this_action: _,
         pending_discard_for_cost: _,
         pending_cast: _,
@@ -30150,6 +30313,7 @@ impl PartialEq for GameState {
             && self.batched_zone_change_trigger_fired == other.batched_zone_change_trigger_fired
             && self.battlefield_entries_this_turn == other.battlefield_entries_this_turn
             && self.damage_dealt_this_turn == other.damage_dealt_this_turn
+            && self.creatures_exploited_this_turn == other.creatures_exploited_this_turn
             && self.assassin_or_commander_dealt_combat_damage_this_turn
                 == other.assassin_or_commander_dealt_combat_damage_this_turn
             && self.creature_types_dealt_combat_damage_this_turn
@@ -31434,6 +31598,7 @@ mod tests {
             .expect("the fixture emits an authoritative departure record");
         let exploit = GameEvent::CreatureExploited {
             exploiter,
+            exploiter_incarnation: None,
             sacrificed: victim,
             record,
         };
@@ -39778,6 +39943,7 @@ mod tests {
                 declared_kickers_to_pay: Vec::new(),
                 declined_kickers: Vec::new(),
                 convoked_creatures: Vec::new(),
+                delved_cards: Vec::new(),
                 deferred_sacrificed_permanents: Vec::new(),
                 pinned_pool_units: Vec::new(),
                 cancel_restore_prepared_source: None,
@@ -40235,6 +40401,7 @@ mod tests {
             declared_kickers_to_pay: Vec::new(),
             declined_kickers: Vec::new(),
             convoked_creatures: Vec::new(),
+            delved_cards: Vec::new(),
             deferred_sacrificed_permanents: Vec::new(),
             pinned_pool_units: Vec::new(),
             cancel_restore_prepared_source: None,
@@ -41559,6 +41726,7 @@ mod tests {
                 display_source: crate::game::game_object::DisplaySource::Card,
                 printed_ref: Some(printed_ref.clone()),
                 token_image_ref: None,
+                token_art: None,
             }],
             None,
             TransientContinuousEffectBindings {
@@ -41652,6 +41820,7 @@ mod tests {
                 display_source: crate::game::game_object::DisplaySource::Card,
                 printed_ref: Some(top_printed_ref),
                 token_image_ref: None,
+                token_art: None,
             }],
             None,
             TransientContinuousEffectBindings {

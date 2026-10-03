@@ -3,6 +3,8 @@ use super::lower::{
     rewrite_parent_target_to_last_created, target_filter_is_explicit_target_player_graveyard_card,
 };
 use super::*;
+use crate::game::coverage::card_face_has_unimplemented_parts;
+use crate::game::triggers::extract_target_filter_from_effect;
 use crate::parser::oracle_ir::ast::EntersUnderSpec;
 use crate::parser::oracle_ir::diagnostic::{ClauseGap, ClauseGapKind};
 use crate::parser::oracle_nom::enters_under::{
@@ -18,6 +20,7 @@ use crate::types::ability::{
     MassLibraryShuffleMode, ModalChoice, PerpetualModification, PileSource, SeatDirection,
     TurnJournalKind, VoteTally, VoteVisibility, VoterScope,
 };
+use crate::types::card::CardFace;
 use crate::types::card_type::CoreType;
 use crate::types::mana::{ManaCost, ManaCostShard};
 use crate::types::statics::CostModifyMode;
@@ -11712,11 +11715,53 @@ fn singular_battlefield_recall_delayed_keeps_parent_target_payload() {
     assert!(*uses_tracked_set);
 }
 
-/// B7 — positive, nearest-publisher axis: The Great Work's chapter III
-/// (verbatim) has an earlier targeted exile, but the NEAREST publisher before
-/// the recall is the self-exile, so the recall binds SelfRef.
+/// B7 — positive, nearest-publisher axis: an earlier targeted exile, but the
+/// NEAREST publisher before the recall is the self-exile, so the recall binds
+/// SelfRef.
 #[test]
 fn singular_battlefield_recall_nearest_publisher_self_move_binds_self() {
+    let def = parse_effect_chain(
+        "Exile target creature. Exile ~, then return it to the battlefield.",
+        AbilityKind::Spell,
+    );
+    let legs = chain_effects(&def);
+    assert_eq!(
+        legs.len(),
+        3,
+        "typed-exile/self-exile/return legs: {legs:?}"
+    );
+    assert!(
+        matches!(
+            &legs[0],
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::Typed(_),
+                ..
+            }
+        ),
+        "leg[0] must be the earlier chosen-target exile: {:?}",
+        legs[0]
+    );
+    assert!(
+        matches!(
+            &legs[2],
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        ),
+        "nearest publisher is the self-exile, so the recall binds SelfRef: {:?}",
+        legs[2]
+    );
+}
+
+/// CR 601.3 + CR 611.2c + CR 400.7j: The Great Work's chapter III (verbatim).
+/// Its first two sentences lower to ONE graveyard cast permission (the "cast
+/// this way" exile rider rides inside it), so "Exile this Saga, then return it"
+/// is an ordinary two-link chain behind it, and the recall binds SelfRef.
+#[test]
+fn great_work_chapter_three_lowers_to_a_grant_then_a_self_flicker() {
     let parsed = parse_oracle_text(
         "(As this Saga enters and after your draw step, add a lore counter.)\n\
          I — This Saga deals 3 damage to target opponent and each creature they control.\n\
@@ -11737,22 +11782,27 @@ fn singular_battlefield_recall_nearest_publisher_self_move_binds_self() {
         .as_deref()
         .expect("chapter III trigger executes");
     let legs = chain_effects(execute);
-    assert_eq!(legs.len(), 4, "cast/exile/self-exile/return legs: {legs:?}");
+    assert_eq!(legs.len(), 3, "grant/self-exile/return legs: {legs:?}");
+    assert!(
+        crate::parser::oracle_ir::ast::is_graveyard_permission_grant(&legs[0]),
+        "leg[0] must be the graveyard cast permission: {:?}",
+        legs[0]
+    );
     assert!(
         matches!(
-            &legs[2],
+            &legs[1],
             Effect::ChangeZone {
                 destination: Zone::Exile,
                 target: TargetFilter::SelfRef,
                 ..
             }
         ),
-        "leg[2] must be the self-exile publisher: {:?}",
-        legs[2]
+        "leg[1] must be the self-exile publisher: {:?}",
+        legs[1]
     );
     assert!(
         matches!(
-            &legs[3],
+            &legs[2],
             Effect::ChangeZone {
                 destination: Zone::Battlefield,
                 target: TargetFilter::SelfRef,
@@ -11760,9 +11810,144 @@ fn singular_battlefield_recall_nearest_publisher_self_move_binds_self() {
             }
         ),
         "nearest publisher is the self-exile, so the recall binds SelfRef: {:?}",
-        legs[3]
+        legs[2]
     );
     assert!(!tree_has_unimplemented(execute));
+}
+
+/// The graveyard cast permission a class-wide grant lowers to, with the grant's
+/// window, or `None` when `effect` is not such a grant.
+fn graveyard_grant_parts(effect: &Effect) -> Option<(&StaticDefinition, &Option<Duration>)> {
+    let Effect::GenericEffect {
+        static_abilities,
+        duration,
+        ..
+    } = effect
+    else {
+        return None;
+    };
+    let [grant] = static_abilities.as_slice() else {
+        return None;
+    };
+    let [ContinuousModification::GrantStaticAbility { definition }] =
+        grant.modifications.as_slice()
+    else {
+        return None;
+    };
+    matches!(definition.mode, StaticMode::GraveyardCastPermission { .. })
+        .then_some((definition.as_ref(), duration))
+}
+
+/// CR 404.1 + CR 601.3 + CR 611.2c: "from any graveyard" lowers to an
+/// unlimited cast-only permission over EVERY player's graveyard, bound to the
+/// controller for the stated window, with no resolution-time "may" prompt.
+#[test]
+fn class_wide_graveyard_cast_grant_reaches_any_graveyard() {
+    let def = parse_effect_chain(
+        "Until end of turn, you may cast instant and sorcery spells from any graveyard.",
+        AbilityKind::Spell,
+    );
+    let (permission, window) =
+        graveyard_grant_parts(&def.effect).expect("a graveyard cast permission grant");
+    assert_eq!(*window, Some(Duration::UntilEndOfTurn));
+    assert!(
+        !def.optional,
+        "the \"may\" is the later cast, not a prompt now"
+    );
+    assert!(matches!(
+        permission.mode,
+        StaticMode::GraveyardCastPermission {
+            frequency: CastFrequency::Unlimited,
+            play_mode: CardPlayMode::Cast,
+            graveyard_destination_replacement: None,
+            pool: GraveyardPermissionPool::AnyGraveyard,
+            ..
+        }
+    ));
+    let Some(TargetFilter::Typed(filter)) = permission.affected.as_ref() else {
+        panic!("typed card filter, got {:?}", permission.affected);
+    };
+    assert_eq!(
+        filter.type_filters,
+        vec![TypeFilter::AnyOf(vec![
+            TypeFilter::Instant,
+            TypeFilter::Sorcery
+        ])]
+    );
+    assert_eq!(filter.controller, None, "any graveyard names no owner");
+    assert!(filter.properties.contains(&FilterProp::InZone {
+        zone: Zone::Graveyard
+    }));
+}
+
+/// CR 404.1 + CR 611.2a: "from your graveyard … this turn" — the caster's own
+/// graveyard, with the trailing window read by the grant itself (Liliana,
+/// Untouched by Death).
+#[test]
+fn class_wide_graveyard_cast_grant_own_graveyard_with_trailing_window() {
+    let def = parse_effect_chain(
+        "You may cast Zombie spells from your graveyard this turn.",
+        AbilityKind::Activated,
+    );
+    let (permission, window) =
+        graveyard_grant_parts(&def.effect).expect("a graveyard cast permission grant");
+    assert_eq!(*window, Some(Duration::UntilEndOfTurn));
+    assert!(matches!(
+        permission.mode,
+        StaticMode::GraveyardCastPermission {
+            pool: GraveyardPermissionPool::OwnGraveyard,
+            ..
+        }
+    ));
+    let Some(TargetFilter::Typed(filter)) = permission.affected.as_ref() else {
+        panic!("typed card filter, got {:?}", permission.affected);
+    };
+    assert_eq!(filter.controller, Some(ControllerRef::You));
+    // CR 601.3: the leading "You may" is the later cast, not a prompt now.
+    assert!(!def.optional);
+}
+
+/// CR 614.1a: "If a spell cast this way would be put into a graveyard, exile it
+/// instead" folds into the permission it scopes rather than trailing it.
+#[test]
+fn class_wide_graveyard_cast_grant_absorbs_the_cast_this_way_exile_rider() {
+    let def = parse_effect_chain(
+        "Until end of turn, you may cast instant and sorcery spells from any graveyard. \
+         If a spell cast this way would be put into a graveyard, exile it instead.",
+        AbilityKind::Spell,
+    );
+    let (permission, _) =
+        graveyard_grant_parts(&def.effect).expect("a graveyard cast permission grant");
+    assert!(matches!(
+        permission.mode,
+        StaticMode::GraveyardCastPermission {
+            graveyard_destination_replacement: Some(Zone::Exile),
+            ..
+        }
+    ));
+    assert!(
+        def.sub_ability.is_none(),
+        "the rider leaves no clause behind"
+    );
+}
+
+/// The class is the PLURAL grant. "A creature spell" grants one cast (Chainer,
+/// Nightmare Adept's ruling), and a clause with a further rider ("by foraging …")
+/// says more than the grant carries; both keep their previous lowering.
+#[test]
+fn class_wide_graveyard_cast_grant_excludes_singular_and_riders() {
+    for text in [
+        "You may cast a creature spell from your graveyard this turn.",
+        "Until end of turn, you may cast creature spells from your graveyard by foraging \
+         in addition to paying their other costs.",
+    ] {
+        let def = parse_effect_chain(text, AbilityKind::Activated);
+        assert!(
+            matches!(*def.effect, Effect::CastFromZone { .. }),
+            "{text:?} must keep its CastFromZone lowering, got {:?}",
+            def.effect
+        );
+    }
 }
 
 /// B7-negative — with a typed-target leg as the NEAREST publisher, the
@@ -42178,7 +42363,11 @@ fn leading_conditional_threads_condition_through_ast() {
         ),
         "expected Conditional with a lowered guard, got: {ast:?}"
     );
-    let clause = lower_clause_ast(ast, &mut ParseContext::default());
+    let clause = lower_clause_ast(
+        ast,
+        &mut ParseContext::default(),
+        "if it's your turn, draw a card",
+    );
     assert!(
         matches!(clause.condition, Some(AbilityCondition::IsYourTurn)),
         "expected IsYourTurn condition, got: {:?}",
@@ -42234,7 +42423,11 @@ fn leading_conditional_unrecognized_produces_none() {
         ),
         "expected an unlowered STATE guard, got: {ast:?}"
     );
-    let clause = lower_clause_ast(ast, &mut ParseContext::default());
+    let clause = lower_clause_ast(
+        ast,
+        &mut ParseContext::default(),
+        "if a random unrecognized condition, draw a card",
+    );
     assert!(
         clause.condition.is_none(),
         "expected None condition for unrecognized text, got: {:?}",
@@ -42288,7 +42481,11 @@ fn leading_conditional_lowers_through_the_ladder_not_the_nom_rung_alone() {
         })),
         "the ladder's lowered value, not merely that something lowered"
     );
-    let clause = lower_clause_ast(ast, &mut ParseContext::default());
+    let clause = lower_clause_ast(
+        ast,
+        &mut ParseContext::default(),
+        "if X is 1 or more, draw a card",
+    );
     assert!(
         matches!(clause.effect, Effect::Draw { .. }),
         "a lowered guard leaves its body intact, got: {:?}",
@@ -42383,7 +42580,11 @@ fn leading_conditional_accepts_the_then_if_connector() {
         ),
         "expected the connector-prefixed guard to lower, got: {ast:?}"
     );
-    let clause = lower_clause_ast(ast, &mut ParseContext::default());
+    let clause = lower_clause_ast(
+        ast,
+        &mut ParseContext::default(),
+        "then if it's your turn, draw a card",
+    );
     assert!(
         matches!(clause.effect, Effect::Draw { .. }),
         "expected the body intact, got: {:?}",
@@ -42557,7 +42758,11 @@ fn an_o1a_rider_shape_under_a_state_guard_is_not_an_ownership_candidate() {
         ConditionalGuard::Unlowered(GuardReading::State),
         "reach-guard: the fixture must carry the STATE reading, or the row proves nothing"
     );
-    let clause = lower_clause_ast(ast, &mut ParseContext::default());
+    let clause = lower_clause_ast(
+        ast,
+        &mut ParseContext::default(),
+        "if at least three mana of the same color was spent to cast it, exile it instead",
+    );
     // Reach-guard 2: the body really IS the O1a rider shape, so only the reading can refuse it.
     assert!(
         crate::game::effects::cast_from_zone::graveyard_destination_rider(&clause.effect).is_some(),
@@ -42635,7 +42840,7 @@ fn v17s_both_stacked_riders_are_ownership_candidates() {
             "{label} reach-guard: the clause must reach the seam with the EVENT reading"
         );
 
-        let clause = lower_clause_ast(ast, &mut ParseContext::default());
+        let clause = lower_clause_ast(ast, &mut ParseContext::default(), clause_text);
         // The claim: DEFERRED, not decided here.
         assert_eq!(
             clause.unlowered_guard.as_ref().map(|mark| mark.reading),
@@ -43524,17 +43729,541 @@ fn perpetual_parser_maps_grant_ability_multiple_quoted_bodies() {
     }
 }
 
-/// Honest-red: a granted quoted body that classifies to a modification kind
-/// the perpetual runtime cannot install onto a persistent baseline
-/// (`GrantTrigger` — a full triggered ability body has no persistent-baseline
-/// installer) must fail the WHOLE clause closed rather than silently
-/// dropping it or installing a partial/incorrect grant.
+/// SHAPE: a quoted triggered ability with fully-parsed content (Jessie Zane's
+/// "When this creature enters, draw a card.") installs as a `GrantTrigger` —
+/// quoted triggers are a supported perpetual grant kind, not a rejection.
 #[test]
-fn perpetual_grant_ability_rejects_unsupported_triggered_body() {
+fn perpetual_grant_ability_accepts_supported_triggered_body() {
+    use crate::types::ability::{PerpetualGrantModification, PerpetualModification};
+
     let e = parse_effect("~ perpetually gains \"When ~ dies, draw a card.\"");
+    match &e {
+        Effect::ApplyPerpetual {
+            target: TargetFilter::Any,
+            modification: PerpetualModification::GrantAbility { modifications },
+        } => {
+            assert!(
+                matches!(
+                    modifications.as_slice(),
+                    [PerpetualGrantModification::GrantTrigger { .. }]
+                ),
+                "expected a single GrantTrigger install, got {modifications:?}"
+            );
+        }
+        other => panic!("expected ApplyPerpetual GrantAbility, got {other:?}"),
+    }
+}
+
+/// Honest-red (V2N): a quoted trigger whose INNER content never parsed fails
+/// the WHOLE clause closed. Fixture is a single-clause body with a real but
+/// unimplemented mechanic ("draft a card" — Conspiracy): single-clause so the
+/// unparseable body surfaces as `Effect::Unimplemented` in `execute` (a
+/// failing non-head "and"-conjunct is dropped by the generic chain assembler
+/// without a marker — a pre-existing parser-wide limitation shared with the
+/// `GrantAbility` gate, so a multi-conjunct fixture cannot exercise this
+/// gate). Reach-guard: the quote classifies to `GrantTrigger`, proving the
+/// content gate — not a misparse — refused it.
+#[test]
+fn perpetual_grant_trigger_rejects_unimplemented_inner_content() {
+    let body = "When ~ enters, draft a card.";
+    let classified = crate::parser::oracle_static::classify_quoted_inner(body);
+    assert!(
+        classified
+            .iter()
+            .any(|m| matches!(m, ContinuousModification::GrantTrigger { .. })),
+        "reach-guard: the draft quote must classify to GrantTrigger, got {classified:?}"
+    );
+    let e = parse_effect(&format!("~ perpetually gains \"{body}\""));
     assert!(
         matches!(e, Effect::Unimplemented { .. }),
-        "an unsupported (triggered-ability) quoted grant must fail closed, got {e:?}"
+        "a quoted trigger with unparsed inner content must fail the whole clause closed, got {e:?}"
+    );
+}
+
+/// Honest-red: a multi-quote grant where one sibling classifies to a kind with
+/// no persistent-baseline installer (`GrantReplacement`) fails the WHOLE
+/// clause closed rather than install the installable sibling alone.
+#[test]
+fn perpetual_grant_ability_multi_quote_partial_failure_stays_closed() {
+    // Reach-guards: the refusal must come from the uninstallable sibling (not
+    // a misparse of the installable one), and the installable sibling alone
+    // must parse under the same subject.
+    let uninstallable =
+        "If ~ would leave the battlefield, exile it instead of putting it anywhere else.";
+    let classified = crate::parser::oracle_static::classify_quoted_inner(uninstallable);
+    assert!(
+        classified
+            .iter()
+            .any(|m| matches!(m, ContinuousModification::GrantReplacement { .. })),
+        "reach-guard: the exile-instead quote must classify to GrantReplacement, got {classified:?}"
+    );
+    let sibling = parse_effect("~ perpetually gains \"flying\"");
+    assert!(
+        matches!(sibling, Effect::ApplyPerpetual { .. }),
+        "reach-guard: the installable sibling must parse as ApplyPerpetual, got {sibling:?}"
+    );
+    let e = parse_effect(
+        "~ perpetually gains \"flying\" and \"If ~ would leave the battlefield, \
+        exile it instead of putting it anywhere else.\"",
+    );
+    assert!(
+        matches!(e, Effect::Unimplemented { .. }),
+        "a multi-quote grant with an uninstallable sibling must fail the whole clause closed, got {e:?}"
+    );
+}
+
+/// SHAPE (V1): Indris's "They perpetually gain storm" rider binds the
+/// chain-conjured Bolts (`LastCreated`) and installs Storm on each.
+#[test]
+fn perpetual_they_subject_binds_last_created_after_conjure() {
+    use crate::types::ability::PerpetualModification;
+    use crate::types::keywords::Keyword;
+
+    let def = parse_effect_chain(
+        "conjure four cards named Lightning Bolt into your library. They perpetually gain storm.",
+        AbilityKind::Spell,
+    );
+    assert_attachment_chain_has_no_unimplemented(&def);
+    assert!(
+        matches!(def.effect.as_ref(), Effect::Conjure { .. }),
+        "reach-guard: the conjure head must parse, got {:?}",
+        def.effect
+    );
+    let rider = def
+        .sub_ability
+        .as_deref()
+        .expect("rider clause follows conjure");
+    match rider.effect.as_ref() {
+        Effect::ApplyPerpetual {
+            target,
+            modification,
+        } => {
+            assert_eq!(
+                *target,
+                TargetFilter::LastCreated,
+                "they-after-conjure must bind the created set"
+            );
+            assert!(
+                matches!(
+                    modification,
+                    PerpetualModification::GrantKeywords { keywords }
+                        if keywords.as_slice() == [Keyword::Storm]
+                ),
+                "they-after-conjure must install Storm, got {modification:?}"
+            );
+        }
+        other => panic!("expected ApplyPerpetual rider, got {other:?}"),
+    }
+    assert!(
+        rider.sub_ability.is_none(),
+        "rider must be the chain tail: {def:#?}"
+    );
+}
+
+/// SHAPE (V1/A2 mechanism pin): a choose-then-grant SUBJECT shape binds
+/// `ParentTarget` (the tracked chosen set) via `pending_tracked_set_origin`.
+/// The singular head + plural anaphor is deliberately non-card-text: it pins
+/// the A2 gate mechanism (Racketeer Boss's own "choose up to two ... and/or
+/// ..." head does not parse to `ChooseFromZone`, so its production rider
+/// stays red at the subject — pinned by
+/// `perpetual_racketeer_full_rider_stays_unimplemented`).
+#[test]
+fn perpetual_they_subject_binds_parent_target_after_choice() {
+    use crate::types::ability::PerpetualModification;
+    use crate::types::keywords::Keyword;
+
+    let def = parse_effect_chain(
+        "choose a creature card in your hand. They perpetually gain flying.",
+        AbilityKind::Spell,
+    );
+    assert_attachment_chain_has_no_unimplemented(&def);
+    assert!(
+        matches!(def.effect.as_ref(), Effect::ChooseFromZone { .. }),
+        "reach-guard: the choose head must parse to ChooseFromZone, got {:?}",
+        def.effect
+    );
+    let rider = def
+        .sub_ability
+        .as_deref()
+        .expect("rider clause follows choose");
+    match rider.effect.as_ref() {
+        Effect::ApplyPerpetual {
+            target,
+            modification,
+        } => {
+            assert_eq!(
+                *target,
+                TargetFilter::ParentTarget,
+                "they-after-choose must bind the chosen set"
+            );
+            assert!(
+                matches!(
+                    modification,
+                    PerpetualModification::GrantKeywords { keywords }
+                        if keywords.as_slice() == [Keyword::Flying]
+                ),
+                "they-after-choose must install Flying, got {modification:?}"
+            );
+        }
+        other => panic!("expected ApplyPerpetual rider, got {other:?}"),
+    }
+}
+
+/// SHAPE (V1 negative): bare "they gain storm" (no "perpetually") must NOT
+/// take the perpetual arm. Reach-guard: the conjure head still parses, proving
+/// the input reached the rider.
+#[test]
+fn perpetual_they_without_perpetually_does_not_bind() {
+    let def = parse_effect_chain(
+        "conjure four cards named Lightning Bolt into your library. They gain storm.",
+        AbilityKind::Spell,
+    );
+    assert!(
+        matches!(def.effect.as_ref(), Effect::Conjure { .. }),
+        "reach-guard: the conjure head must parse, got {:?}",
+        def.effect
+    );
+    let rider = def
+        .sub_ability
+        .as_deref()
+        .expect("rider clause follows conjure");
+    assert!(
+        !matches!(rider.effect.as_ref(), Effect::ApplyPerpetual { .. }),
+        "bare 'they gain' must not produce ApplyPerpetual, got {:?}",
+        rider.effect
+    );
+}
+
+/// SHAPE (V2b composition): they-subject × trigger-body in one rider — the U1
+/// subject gate and the U2 installable kind compose (Jewel Mine Overseer's
+/// rider shape; its "on top of" conjure head is a separately unsupported
+/// destination form, so the fragment uses the supported into-library head).
+#[test]
+fn perpetual_they_subject_with_trigger_body_composes() {
+    use crate::types::ability::{PerpetualGrantModification, PerpetualModification};
+
+    let def = parse_effect_chain(
+        "conjure seven cards named Seven Dwarves into your library. They perpetually \
+        gain \"When ~ enters, draw a card.\"",
+        AbilityKind::Spell,
+    );
+    assert_attachment_chain_has_no_unimplemented(&def);
+    let rider = def
+        .sub_ability
+        .as_deref()
+        .expect("rider clause follows conjure");
+    match rider.effect.as_ref() {
+        Effect::ApplyPerpetual {
+            target,
+            modification,
+        } => {
+            assert_eq!(
+                *target,
+                TargetFilter::LastCreated,
+                "they-after-conjure must bind the created set"
+            );
+            assert!(
+                matches!(
+                    modification,
+                    PerpetualModification::GrantAbility { modifications }
+                        if matches!(
+                            modifications.as_slice(),
+                            [PerpetualGrantModification::GrantTrigger { .. }]
+                        )
+                ),
+                "they+trigger rider must install GrantTrigger, got {modification:?}"
+            );
+        }
+        other => panic!("expected ApplyPerpetual rider, got {other:?}"),
+    }
+}
+
+/// SHAPE (V2): Jessie Zane's quoted trigger rider binds the conjured Viper
+/// (`LastCreated`) and installs a `GrantTrigger`. "~" here, not "this
+/// creature": card-level parsing normalizes self-references before any clause
+/// reaches classification, so `~` is the form this fragment-level helper must
+/// be fed to match production input.
+#[test]
+fn perpetual_quoted_trigger_rider_binds_last_created() {
+    use crate::types::ability::{PerpetualGrantModification, PerpetualModification};
+
+    let def = parse_effect_chain(
+        "conjure a card named Ambush Viper into the top six cards of your library \
+        at random. It perpetually gains \"When ~ enters, draw a card.\"",
+        AbilityKind::Spell,
+    );
+    assert_attachment_chain_has_no_unimplemented(&def);
+    let rider = def
+        .sub_ability
+        .as_deref()
+        .expect("rider clause follows conjure");
+    match rider.effect.as_ref() {
+        Effect::ApplyPerpetual {
+            target,
+            modification,
+        } => {
+            assert_eq!(
+                *target,
+                TargetFilter::LastCreated,
+                "it-after-conjure must bind the created card"
+            );
+            assert!(
+                matches!(
+                    modification,
+                    PerpetualModification::GrantAbility { modifications }
+                        if matches!(
+                            modifications.as_slice(),
+                            [PerpetualGrantModification::GrantTrigger { .. }]
+                        )
+                ),
+                "quoted trigger rider must install GrantTrigger, got {modification:?}"
+            );
+        }
+        other => panic!("expected ApplyPerpetual rider, got {other:?}"),
+    }
+}
+
+/// SHAPE (V3): Sanguine Soothsayer's two-quote rider (bare self-cost quote +
+/// trigger quote) installs both the self alternative-cost static and the
+/// granted trigger on the conjured Bond.
+#[test]
+fn perpetual_self_alt_cost_two_quote_rider_installs_both() {
+    use crate::types::ability::{PerpetualGrantModification, PerpetualModification};
+    use crate::types::mana::ManaCost;
+    use crate::types::statics::StaticMode;
+
+    let def = parse_effect_chain(
+        "conjure a card named Sanguine Bond into the top fifteen cards of your library \
+        at random. It perpetually gains \"You may pay {0} rather than pay this spell's \
+        mana cost\" and \"When ~ enters, draw a card.\"",
+        AbilityKind::Spell,
+    );
+    assert_attachment_chain_has_no_unimplemented(&def);
+    let rider = def
+        .sub_ability
+        .as_deref()
+        .expect("rider clause follows conjure");
+    match rider.effect.as_ref() {
+        Effect::ApplyPerpetual {
+            target,
+            modification,
+        } => {
+            assert_eq!(
+                *target,
+                TargetFilter::LastCreated,
+                "it-after-conjure must bind the created card"
+            );
+            match modification {
+                PerpetualModification::GrantAbility { modifications } => {
+                    assert_eq!(
+                        modifications.len(),
+                        2,
+                        "both quotes must install, got {modifications:?}"
+                    );
+                    assert!(
+                        matches!(
+                            &modifications[0],
+                            PerpetualGrantModification::AddStaticMode {
+                                mode: StaticMode::CastWithAlternativeCost { cost, .. }
+                            } if matches!(
+                                cost,
+                                AbilityCost::Mana { cost } if *cost == ManaCost::zero()
+                            )
+                        ),
+                        "first quote must install the {{0}} self alternative cost, got {:?}",
+                        modifications[0]
+                    );
+                    assert!(
+                        matches!(
+                            modifications[1],
+                            PerpetualGrantModification::GrantTrigger { .. }
+                        ),
+                        "second quote must install the granted trigger, got {:?}",
+                        modifications[1]
+                    );
+                }
+                other => panic!("expected GrantAbility install, got {other:?}"),
+            }
+        }
+        other => panic!("expected ApplyPerpetual rider, got {other:?}"),
+    }
+}
+
+/// SHAPE (V3): Mine Security's single self-cost quote (period INSIDE the
+/// quote) installs the {0} self alternative cost.
+#[test]
+fn perpetual_self_alt_cost_period_inside_quote_installs() {
+    use crate::types::ability::{PerpetualGrantModification, PerpetualModification};
+    use crate::types::mana::ManaCost;
+    use crate::types::statics::StaticMode;
+
+    let def = parse_effect_chain(
+        "conjure a card named Flametongue Kavu into the top eight cards of your library \
+        at random. It perpetually gains \"You may pay {0} rather than pay this spell's \
+        mana cost.\"",
+        AbilityKind::Spell,
+    );
+    assert_attachment_chain_has_no_unimplemented(&def);
+    let rider = def
+        .sub_ability
+        .as_deref()
+        .expect("rider clause follows conjure");
+    match rider.effect.as_ref() {
+        Effect::ApplyPerpetual {
+            target,
+            modification,
+        } => {
+            assert_eq!(
+                *target,
+                TargetFilter::LastCreated,
+                "it-after-conjure must bind the created card"
+            );
+            assert!(
+                matches!(
+                    modification,
+                    PerpetualModification::GrantAbility { modifications }
+                        if matches!(
+                            modifications.as_slice(),
+                            [PerpetualGrantModification::AddStaticMode {
+                                mode: StaticMode::CastWithAlternativeCost { cost, .. }
+                            }] if matches!(
+                                cost,
+                                AbilityCost::Mana { cost } if *cost == ManaCost::zero()
+                            )
+                        )
+                ),
+                "period-inside-quote self cost must install, got {modification:?}"
+            );
+        }
+        other => panic!("expected ApplyPerpetual rider, got {other:?}"),
+    }
+}
+
+/// Honest-red: Divine Purge's affected-set "They" (the just-exiled mass-filter
+/// set — a binding concept this run does not design) must NOT install. The
+/// rider stays `Unimplemented` (gap `unbound_subject`); the exile head parses
+/// to `ChangeZoneAll` (reach-guard).
+#[test]
+fn perpetual_they_affected_set_subject_stays_unimplemented() {
+    let def = parse_effect_chain(
+        "Exile all artifacts and creatures with mana value 3 or less. They perpetually \
+        gain \"This spell costs {2} more to cast\" and \"This permanent enters the \
+        battlefield tapped.\"",
+        AbilityKind::Spell,
+    );
+    assert!(
+        matches!(def.effect.as_ref(), Effect::ChangeZoneAll { .. }),
+        "reach-guard: the exile head must parse to ChangeZoneAll, got {:?}",
+        def.effect
+    );
+    let rider = def
+        .sub_ability
+        .as_deref()
+        .expect("rider clause follows the exile head");
+    assert!(
+        matches!(
+            rider.effect.as_ref(),
+            Effect::Unimplemented { name, .. } if name == "unbound_subject"
+        ),
+        "Divine Purge's affected-set rider must stay unimplemented, got {:?}",
+        rider.effect
+    );
+}
+
+/// Honest-red: Racketeer Boss's full production rider stays `Unimplemented`.
+/// Its "choose up to two ... and/or ..." head does not parse to
+/// `ChooseFromZone`, so no tracked-set origin exists and the "They" subject
+/// cannot bind — the whole clause fails closed at the subject, before the
+/// quoted content gate is even reached.
+#[test]
+fn perpetual_racketeer_full_rider_stays_unimplemented() {
+    let def = parse_effect_chain(
+        "choose up to two creature and/or planeswalker cards in your hand. They perpetually \
+        gain \"When you cast this spell, create a Treasure token and this spell perpetually \
+        loses this ability.\"",
+        AbilityKind::Spell,
+    );
+    assert!(
+        matches!(def.effect.as_ref(), Effect::Unimplemented { .. }),
+        "reach-guard: the Racketeer choose head must stay unimplemented, got {:?}",
+        def.effect
+    );
+    let rider = def
+        .sub_ability
+        .as_deref()
+        .expect("rider clause follows the choose head");
+    assert!(
+        matches!(
+            rider.effect.as_ref(),
+            Effect::Unimplemented { name, .. } if name == "unbound_subject"
+        ),
+        "Racketeer Boss's full rider must stay unimplemented, got {:?}",
+        rider.effect
+    );
+}
+
+/// Honest-red: Flames of Moradin's definite-plural "The duplicates" subject
+/// matches no designed arm and stays `Unimplemented`.
+#[test]
+fn perpetual_the_duplicates_subject_stays_unimplemented() {
+    // Reach-guard: the same quote under a SUPPORTED subject must parse as
+    // ApplyPerpetual, proving the Unimplemented below comes from the deferred
+    // subject — not from a misparse of the self-cost quote.
+    let sibling = parse_effect(
+        "~ perpetually gains \"You may pay {R} rather than pay this spell's mana cost.\"",
+    );
+    assert!(
+        matches!(sibling, Effect::ApplyPerpetual { .. }),
+        "reach-guard: the installable sibling must parse as ApplyPerpetual, got {sibling:?}"
+    );
+    let e = parse_effect(
+        "the duplicates perpetually gain \"You may pay {R} rather than pay this \
+        spell's mana cost.\"",
+    );
+    assert!(
+        matches!(e, Effect::Unimplemented { .. }),
+        "the deferred 'the duplicates' subject must stay unimplemented, got {e:?}"
+    );
+}
+
+/// SHAPE (V2b head pin): "conjure seven cards named Seven Dwarves on top of
+/// your library" (Jewel Mine Overseer) binds `destination: Library` with
+/// `library_position: Some(Top)`, and the tail passes through to the
+/// following "They perpetually gain …" rider clause.
+#[test]
+fn conjure_on_top_of_your_library_binds_top_position() {
+    let def = parse_effect_chain(
+        "conjure seven cards named Seven Dwarves on top of your library. They perpetually gain \"When this creature enters, draw a card.\"",
+        AbilityKind::Spell,
+    );
+    assert_attachment_chain_has_no_unimplemented(&def);
+    match def.effect.as_ref() {
+        Effect::Conjure {
+            destination,
+            library_position,
+            ..
+        } => {
+            assert_eq!(
+                *destination,
+                Zone::Library,
+                "the on-top head must target the library"
+            );
+            assert_eq!(
+                *library_position,
+                Some(LibraryPosition::Top),
+                "the on-top head must bind LibraryPosition::Top"
+            );
+        }
+        other => panic!("expected Conjure head, got: {other:?}"),
+    }
+    let rider = def
+        .sub_ability
+        .as_deref()
+        .expect("the rider clause must follow the on-top head");
+    assert!(
+        matches!(rider.effect.as_ref(), Effect::ApplyPerpetual { .. }),
+        "the tail must pass through to the perpetual rider, got {:?}",
+        rider.effect
     );
 }
 
@@ -44500,6 +45229,81 @@ fn conjure_multi_card_hand() {
         }
         other => panic!("expected Conjure, got: {other:?}"),
     }
+}
+
+#[test]
+fn conjure_named_group_power_nine_into_library() {
+    // Oracle of the Alpha (verbatim clause): a conjure by collective name
+    // expands to one `Named` entry per Power Nine member.
+    let e = parse_effect("conjure the Power Nine into your library");
+    match e {
+        Effect::Conjure {
+            cards,
+            destination,
+            tapped,
+            library_position,
+            library_players,
+        } => {
+            let names: Vec<_> = cards.iter().map(|c| c.named_name()).collect();
+            assert_eq!(
+                names,
+                [
+                    Some("Ancestral Recall"),
+                    Some("Black Lotus"),
+                    Some("Mox Pearl"),
+                    Some("Mox Sapphire"),
+                    Some("Mox Jet"),
+                    Some("Mox Ruby"),
+                    Some("Mox Emerald"),
+                    Some("Time Walk"),
+                    Some("Timetwister"),
+                ]
+            );
+            assert!(
+                cards
+                    .iter()
+                    .all(|c| c.count == QuantityExpr::Fixed { value: 1 }),
+                "every group member is conjured once: {cards:?}"
+            );
+            assert_eq!(destination, Zone::Library);
+            assert!(!tapped);
+            assert_eq!(library_position, None);
+            // "your library" targets the controller only — no per-player fan-out.
+            assert_eq!(library_players, None);
+        }
+        other => panic!("expected Conjure, got: {other:?}"),
+    }
+}
+
+#[test]
+fn conjure_named_group_unknown_group_stays_unimplemented() {
+    // Reach-guard: the known group parses first, proving the clause shape
+    // reaches the group arm (a bare `Unimplemented` assertion would pass
+    // vacuously if the input never got that far).
+    assert!(matches!(
+        parse_effect("conjure the Power Nine into your library"),
+        Effect::Conjure { .. }
+    ));
+    // An unlisted collective name fails closed — no silent partial conjure.
+    assert!(matches!(
+        parse_effect("conjure the Power Ten into your library"),
+        Effect::Unimplemented { .. }
+    ));
+}
+
+#[test]
+fn conjure_named_group_library_tapped_rider_stays_unimplemented() {
+    // Reach-guard: the bare clause parses (see above).
+    assert!(matches!(
+        parse_effect("conjure the Power Nine into your library"),
+        Effect::Conjure { .. }
+    ));
+    // "tapped" is only modeled after the battlefield; a library rider fails
+    // closed rather than being silently dropped.
+    assert!(matches!(
+        parse_effect("conjure the Power Nine into your library tapped"),
+        Effect::Unimplemented { .. }
+    ));
 }
 
 #[test]
@@ -46475,6 +47279,123 @@ fn maelstrom_pulse_destroys_only_same_named_permanents() {
         typed.properties.contains(&FilterProp::Another),
         "DestroyAll must exclude the targeted permanent itself, got {:?}",
         typed.properties
+    );
+}
+
+/// CR 608.2c + CR 201.2a: "<verb> target <object> an opponent
+/// controls and all <X> that player controls with the same name as that
+/// <object>" — "that player" is the targeted object's controller, so the mass
+/// conjunct binds `ParentTargetController`, never the caster (`You`). Legions
+/// to Ashes additionally needs its token-only conjunct ("all tokens …", no type
+/// filter) to be read as objects, not players (CR 111.1).
+#[test]
+fn that_player_controls_same_name_mass_conjunct_binds_parent_target_controller() {
+    for (name, types, text, expected_types, expect_token) in [
+        (
+            "Legions to Ashes",
+            "Sorcery",
+            "Exile target nonland permanent an opponent controls and all tokens that player controls with the same name as that permanent.",
+            vec![],
+            true,
+        ),
+        (
+            "Legion's End",
+            "Sorcery",
+            "Exile target creature an opponent controls with mana value 2 or less and all other creatures that player controls with the same name as that creature. Then that player reveals their hand and exiles all cards with that name from their hand and graveyard.",
+            vec![TypeFilter::Creature],
+            false,
+        ),
+        (
+            "Deputy of Detention",
+            "Creature",
+            "When this creature enters, exile target nonland permanent an opponent controls and all other nonland permanents that player controls with the same name as that permanent until this creature leaves the battlefield.",
+            vec![TypeFilter::Permanent, TypeFilter::Non(Box::new(TypeFilter::Land))],
+            false,
+        ),
+    ] {
+        let parsed =
+            crate::parser::parse_oracle_text(text, name, &[], &[types.to_string()], &[]);
+        let root = parsed
+            .abilities
+            .first()
+            .or_else(|| parsed.triggers.first().and_then(|t| t.execute.as_deref()))
+            .unwrap_or_else(|| panic!("{name}: no spell ability or trigger"));
+        assert!(
+            matches!(&*root.effect, Effect::ChangeZone { destination: Zone::Exile, .. }),
+            "{name}: root must exile the target, got {:?}",
+            root.effect
+        );
+        let sub = root
+            .sub_ability
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name}: missing mass continuation"));
+        // Reach guard: the conjunct lowered to the mass exile at all.
+        let Effect::ChangeZoneAll {
+            destination: Zone::Exile,
+            target: TargetFilter::Typed(typed),
+            ..
+        } = &*sub.effect
+        else {
+            panic!("{name}: expected ChangeZoneAll(Exile, Typed), got {:?}", sub.effect);
+        };
+        assert_eq!(
+            typed.controller,
+            Some(ControllerRef::ParentTargetController),
+            "{name}: \"that player controls\" must bind the target's controller"
+        );
+        assert_eq!(typed.type_filters, expected_types, "{name}: type filters");
+        assert!(
+            typed.properties.contains(&FilterProp::SameNameAsParentTarget),
+            "{name}: must restrict to the target's name, got {:?}",
+            typed.properties
+        );
+        assert_eq!(
+            typed.properties.contains(&FilterProp::Token),
+            expect_token,
+            "{name}: token restriction, got {:?}",
+            typed.properties
+        );
+        // CR 610.3: the mass conjunct is part of the same "exile … until"
+        // instruction, so it shares the root's return duration.
+        assert_eq!(
+            sub.duration, root.duration,
+            "{name}: the mass exile must carry the root's duration"
+        );
+        if name == "Deputy of Detention" {
+            assert_eq!(root.duration, Some(Duration::UntilHostLeavesPlay));
+        }
+    }
+}
+
+/// CR 608.2c control: a continuation that announces its OWN target ("and target
+/// creature of an opponent's choice they control" — Arena, Magus of the Arena)
+/// is not a mass "that player" continuation, so it must not be seeded with the
+/// first target's controller. Only that property is asserted here; the
+/// conjunct's "they" binding is a separate pre-existing gap.
+#[test]
+fn target_announcing_continuation_is_not_seeded_with_parent_target_controller() {
+    let parsed = crate::parser::parse_oracle_text(
+        "{3}, {T}: Tap target creature you control and target creature of an opponent's choice they control. Those creatures fight each other. (Each deals damage equal to its power to the other.)",
+        "Arena",
+        &[],
+        &["Land".to_string()],
+        &[],
+    );
+    let root = parsed.abilities.first().expect("activated ability");
+    let sub = root.sub_ability.as_ref().expect("second tap conjunct");
+    // Reach guard: the continuation lowered to its own single-target tap.
+    let Effect::SetTapState {
+        target: TargetFilter::Typed(typed),
+        ..
+    } = &*sub.effect
+    else {
+        panic!("expected SetTapState(Typed), got {:?}", sub.effect);
+    };
+    assert_eq!(typed.type_filters, vec![TypeFilter::Creature]);
+    assert_ne!(
+        typed.controller,
+        Some(ControllerRef::ParentTargetController),
+        "a target-announcing continuation must not inherit the parent-controller seed"
     );
 }
 
@@ -61143,7 +62064,12 @@ fn blinding_fog_prevent_binds_to_bare_creatures_recipient() {
          control gain hexproof until end of turn.",
         AbilityKind::Spell,
     );
-    let Effect::PreventDamage { target, .. } = &*def.effect else {
+    let Effect::PreventDamage {
+        target,
+        recipient_scope,
+        ..
+    } = &*def.effect
+    else {
         panic!("expected PreventDamage, got {:?}", def.effect);
     };
     assert!(
@@ -61153,6 +62079,11 @@ fn blinding_fog_prevent_binds_to_bare_creatures_recipient() {
                 if tf.type_filters.contains(&TypeFilter::Creature) && tf.controller.is_none()
         ),
         "bare \"creatures\" must resolve to an unqualified Typed(Creature) filter, got {target:?}"
+    );
+    assert_eq!(
+        *recipient_scope,
+        EffectScope::All,
+        "CR 115.10a: a bare mass recipient is untargeted"
     );
 }
 
@@ -61165,11 +62096,142 @@ fn defend_the_hearth_prevent_binds_to_bare_players_recipient() {
         "Prevent all combat damage that would be dealt to players this turn.",
         AbilityKind::Spell,
     );
-    let Effect::PreventDamage { target, scope, .. } = &*def.effect else {
+    let Effect::PreventDamage {
+        target,
+        scope,
+        recipient_scope,
+        ..
+    } = &*def.effect
+    else {
         panic!("expected PreventDamage, got {:?}", def.effect);
     };
     assert_eq!(*target, TargetFilter::Player);
     assert_eq!(*scope, PreventionScope::CombatDamage);
+    assert_eq!(
+        *recipient_scope,
+        EffectScope::All,
+        "CR 115.10a: a bare mass recipient is untargeted"
+    );
+}
+
+/// CR 115.1a + CR 115.10a + CR 601.2c: the prevention recipient is classified
+/// by its phrase. A "target" phrase is declared (`Single`, mints a slot, and
+/// carries its announced count); a descriptor population is untargeted (`All`,
+/// mints no slot); a singular or context reference is `Single` but mints no
+/// slot. The slot column is read through `extract_target_filter_from_effect`,
+/// the single authority the stack-time slot builder consults.
+#[test]
+fn prevent_recipient_scope_classification() {
+    // (oracle clause, scope, mints a declared slot, expected announced count)
+    let rows: [(&str, EffectScope, bool, Option<MultiTargetSpec>); 8] = [
+        (
+            "Prevent all damage that would be dealt to target creature this turn.",
+            EffectScope::Single,
+            true,
+            None,
+        ),
+        (
+            "Prevent all damage that would be dealt this turn to up to two target creatures.",
+            EffectScope::Single,
+            true,
+            Some(MultiTargetSpec::up_to(QuantityExpr::Fixed { value: 2 })),
+        ),
+        (
+            "Prevent the next 1 damage that would be dealt to target player or planeswalker this turn.",
+            EffectScope::Single,
+            true,
+            None,
+        ),
+        (
+            "Prevent the next 1 damage that would be dealt to target player, planeswalker, or Sliver creature this turn.",
+            EffectScope::Single,
+            true,
+            None,
+        ),
+        (
+            "Prevent all combat damage that would be dealt to creatures you control this turn.",
+            EffectScope::All,
+            false,
+            None,
+        ),
+        (
+            "Prevent the next 1 damage that would be dealt to enchanted creature this turn.",
+            EffectScope::All,
+            false,
+            None,
+        ),
+        (
+            "Prevent all combat damage that would be dealt to players this turn.",
+            EffectScope::All,
+            false,
+            None,
+        ),
+        (
+            "Prevent all damage that would be dealt to artifact creatures this turn.",
+            EffectScope::All,
+            false,
+            None,
+        ),
+    ];
+    for (text, scope, declares_slot, count) in rows {
+        let clause = parse_effect_chain(text, AbilityKind::Spell);
+        let Effect::PreventDamage {
+            recipient_scope, ..
+        } = &*clause.effect
+        else {
+            panic!(
+                "expected PreventDamage for {text:?}, got {:?}",
+                clause.effect
+            );
+        };
+        assert_eq!(*recipient_scope, scope, "{text}");
+        assert_eq!(
+            extract_target_filter_from_effect(&clause.effect).is_some(),
+            declares_slot,
+            "{text}"
+        );
+        assert_eq!(
+            clause.effect.target_filter().is_some(),
+            scope == EffectScope::Single,
+            "{text}"
+        );
+        assert_eq!(clause.multi_target, count, "{text}");
+    }
+
+    // Singular references are `Single` but mint no slot: Gideon's printed-name
+    // self-reference and Energy Arc's frozen tracked set.
+    let gideon = parse_effect_chain(
+        "Prevent all damage that would be dealt to him this turn.",
+        AbilityKind::Spell,
+    );
+    assert!(matches!(
+        &*gideon.effect,
+        Effect::PreventDamage {
+            target: TargetFilter::SelfRef,
+            recipient_scope: EffectScope::Single,
+            ..
+        }
+    ));
+    assert!(extract_target_filter_from_effect(&gideon.effect).is_none());
+
+    let arc = parse_effect_chain(
+        "Untap any number of target creatures. Prevent all combat damage that would be \
+         dealt to and dealt by those creatures this turn.",
+        AbilityKind::Spell,
+    );
+    let to_half = arc
+        .sub_ability
+        .as_deref()
+        .expect("the prevent clause chains after the untap");
+    assert!(matches!(
+        &*to_half.effect,
+        Effect::PreventDamage {
+            target: TargetFilter::TrackedSet { .. },
+            recipient_scope: EffectScope::Single,
+            ..
+        }
+    ));
+    assert!(extract_target_filter_from_effect(&to_half.effect).is_none());
 }
 
 /// CR 608.2c + CR 615 (issue #6682): Energy Arc's bidirectional "dealt to and
@@ -67448,10 +68510,13 @@ fn lost_isle_calling_second_sentence_stays_swallowed() {
 /// Blocker 1 / Minor 5 replacement-collision regression: Bring Low —
 /// "Bring Low deals 3 damage to target creature. If that creature has a
 /// +1/+1 counter on it, Bring Low deals 5 damage to it instead." — present
-/// tense `has`, stays on the `TargetHasKeywordInstead` replacement path,
-/// untouched by the new PAST-tense `had` branch.
+/// tense `has` is the target-gated replacement class, untouched by the new
+/// PAST-tense `had` branch. Its counter gate is not a keyword, so the "if that
+/// creature has" owner fails the rider closed (CR 608.2c) instead of emitting
+/// an inert `TargetHasKeywordInstead{Unknown}` that read as supported; it must
+/// still never be captured as an additive `ChainRootTarget`-gated clause.
 #[test]
-fn bring_low_stays_on_replacement_path() {
+fn bring_low_replacement_rider_fails_closed() {
     let parsed = parse_oracle_text(
         "Bring Low deals 3 damage to target creature. If that creature has a +1/+1 \
          counter on it, Bring Low deals 5 damage to it instead.",
@@ -67464,18 +68529,47 @@ fn bring_low_stays_on_replacement_path() {
         .abilities
         .first()
         .expect("Bring Low must produce a spell ability");
+    // Reach guard: the root damage clause still parses, so the ChainRootTarget
+    // check below inspects a real chain rather than a wholly failed parse.
+    assert!(
+        matches!(
+            &*ability.effect,
+            Effect::DealDamage {
+                amount: QuantityExpr::Fixed { value: 3 },
+                target: TargetFilter::Typed(tf),
+                ..
+            } if tf.type_filters == vec![TypeFilter::Creature]
+        ),
+        "Bring Low's root must stay 3 damage to target creature, got {ability:#?}"
+    );
     let sub = ability
         .sub_ability
         .as_deref()
         .expect("Bring Low's replacement rider must still be represented");
     assert!(
         matches!(
-            sub.condition,
-            Some(AbilityCondition::TargetHasKeywordInstead { .. })
+            &*sub.effect,
+            Effect::Unimplemented { name, .. } if name == "target_has_unknown_keyword_condition"
         ),
-        "present-tense 'has' must stay on the replacement-class condition, \
-         got {:?}",
-        sub.condition
+        "the non-keyword gate must fail closed, got {sub:#?}"
+    );
+    fn unimplemented_names(def: &AbilityDefinition, out: &mut Vec<String>) {
+        if let Effect::Unimplemented { name, .. } = &*def.effect {
+            out.push(name.clone());
+        }
+        for child in [def.sub_ability.as_deref(), def.else_ability.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            unimplemented_names(child, out);
+        }
+    }
+    let mut names = Vec::new();
+    unimplemented_names(ability, &mut names);
+    assert_eq!(
+        names,
+        vec!["target_has_unknown_keyword_condition".to_string()],
+        "the rider must be the only Unimplemented node: {ability:#?}"
     );
     fn tree_mentions_chain_root_target(def: &AbilityDefinition) -> bool {
         let self_hit = matches!(
@@ -78554,4 +79648,174 @@ fn vex_counter_target_spell_that_spells_controller_may_draw_card() {
         Some(TargetFilter::ParentTargetController),
         "the prompt must be presented to that spell's controller"
     );
+}
+
+/// SHAPE: only "dealt [this turn] to target" declares a prevention recipient
+/// (CR 115.1a + CR 615.2); other target roles must fail closed.
+#[test]
+fn prevent_unsupported_target_placements_fail_closed() {
+    for text in [
+        "Prevent all combat damage target creature would deal this turn.",
+        "Prevent all damage that would be dealt to this creature by target creature this turn.",
+        "Prevent all combat damage that would be dealt by creatures other than target creature this turn.",
+        "Prevent the next 1 damage that would be dealt to target creature and each other creature that shares a color with it this turn.",
+        "Prevent all damage target permanent would deal this turn.",
+    ] {
+        let ability = parse_effect_chain(text, AbilityKind::Spell);
+        assert!(matches!(*ability.effect, Effect::Unimplemented { .. }), "{text}: {:?}", ability.effect);
+    }
+    for text in [
+        "Prevent all damage that would be dealt to target creature this turn.",
+        "Prevent all damage that would be dealt this turn to up to two target creatures.",
+        "Prevent the next 1 damage that would be dealt to target player or planeswalker this turn.",
+    ] {
+        let ability = parse_effect_chain(text, AbilityKind::Spell);
+        assert!(
+            matches!(
+                *ability.effect,
+                Effect::PreventDamage {
+                    recipient_scope: EffectScope::Single,
+                    ..
+                }
+            ),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn specialized_prevention_sources_and_any_target_recipient_are_preserved() {
+    let spell_source = parse_effect_chain(
+        "Prevent all damage target instant or sorcery spell would deal this turn.",
+        AbilityKind::Spell,
+    );
+    assert!(matches!(
+        *spell_source.effect,
+        Effect::PreventDamage {
+            target: TargetFilter::Any,
+            damage_source_filter: Some(_),
+            ..
+        }
+    ));
+    let attacking_source = parse_effect_chain(
+        "Prevent all combat damage that would be dealt by target attacking creature this turn.",
+        AbilityKind::Spell,
+    );
+    assert!(matches!(
+        *attacking_source.effect,
+        Effect::PreventDamage {
+            target: TargetFilter::Any,
+            damage_source_filter: Some(_),
+            ..
+        }
+    ));
+    let any_recipient = parse_effect_chain(
+        "Prevent the next 1 damage that would be dealt to any target this turn.",
+        AbilityKind::Spell,
+    );
+    assert!(matches!(
+        *any_recipient.effect,
+        Effect::PreventDamage {
+            target: TargetFilter::Any,
+            ..
+        }
+    ));
+}
+
+/// SHAPE + coverage honesty: unsupported target roles survive the complete
+/// top-level router instead of becoming broad prevention replacements.
+#[test]
+fn prevention_target_role_gaps_survive_top_level_fallback() {
+    let fixtures: &[(&str, &str, &[&str], &[&str])] = &[
+        ("Resistance Fighter", "Sacrifice this creature: Prevent all combat damage target creature would deal this turn.", &["Creature"], &["Human", "Soldier"]),
+        ("Falling Timber", "Kicker—Sacrifice a land. (You may sacrifice a land in addition to any other costs as you cast this spell.)\nPrevent all combat damage target creature would deal this turn. If this spell was kicked, prevent all combat damage another target creature would deal this turn.", &["Instant"], &[]),
+        ("Chain of Silence", "Prevent all damage target creature would deal this turn. That creature's controller may sacrifice a land of their choice. If the player does, they may copy this spell and may choose a new target for that copy.", &["Instant"], &[]),
+        ("Serene Sunset", "Prevent all combat damage X target creatures would deal this turn.", &["Instant"], &[]),
+        ("Soul Parry", "Prevent all damage one or two target creatures would deal this turn.", &["Instant"], &[]),
+        ("Guard Dogs", "{2}{W}, {T}: Choose a permanent you control. Prevent all combat damage target creature would deal this turn if it shares a color with that permanent.", &["Creature"], &["Dog"]),
+        ("Azorius Ploy", "Prevent all combat damage target creature would deal this turn.\nPrevent all combat damage that would be dealt to target creature this turn.", &["Instant"], &[]),
+        ("Gideon of the Trials", "[+1]: Until your next turn, prevent all damage target permanent would deal.\n[0]: Until end of turn, Gideon becomes a 4/4 Human Soldier creature with indestructible that's still a planeswalker. Prevent all damage that would be dealt to him this turn.\n[0]: You get an emblem with \"As long as you control a Gideon planeswalker, you can't lose the game and your opponents can't win the game.\"", &["Planeswalker"], &["Gideon"]),
+        ("Shieldmage Elder", "Tap two untapped Clerics you control: Prevent all damage target creature would deal this turn.\nTap two untapped Wizards you control: Prevent all damage target spell would deal this turn.", &["Creature"], &["Human", "Cleric", "Wizard"]),
+        ("Stonewise Fortifier", "{4}{W}: Prevent all damage that would be dealt to this creature by target creature this turn.", &["Creature"], &["Human", "Wizard"]),
+        ("Terrifying Presence", "Prevent all combat damage that would be dealt by creatures other than target creature this turn.", &["Instant"], &[]),
+        ("Wojek Apothecary", "Radiance — {T}: Prevent the next 1 damage that would be dealt to target creature and each other creature that shares a color with it this turn.", &["Creature"], &["Human", "Cleric"]),
+        ("Encircling Fissure", "Prevent all combat damage that would be dealt this turn by creatures target opponent controls.\nAwaken 2—{4}{W} (If you cast this spell for {4}{W}, also put two +1/+1 counters on target land you control and it becomes a 0/0 Elemental creature with haste. It's still a land.)", &["Instant"], &[]),
+        ("Inquisitor's Snare", "Prevent all damage target attacking or blocking creature would deal this turn. If that creature is black or red, destroy it.", &["Instant"], &[]),
+        ("Old Fat Spider Can't See Me", "(As this Saga enters and after your draw step, add a lore counter. Sacrifice after IV.)\nI — Target creature you control gains hexproof for as long as this Saga remains on the battlefield.\nII — Prevent all damage that would be dealt by up to one target creature for as long as this Saga remains on the battlefield.\nIII, IV — Draw a card.", &["Enchantment"], &["Saga"]),
+    ];
+    for &(name, oracle, types, subtypes) in fixtures {
+        let types = types.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let subtypes = subtypes.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let parsed = parse_oracle_text(oracle, name, &[], &types, &subtypes);
+        assert!(
+            !parsed.abilities.is_empty() || !parsed.triggers.is_empty(),
+            "{name}: reach guard: the complete card produced executable definitions"
+        );
+        assert!(
+            parsed
+                .replacements
+                .iter()
+                .all(|replacement| replacement.event != ReplacementEvent::DamageDone),
+            "{name}: a rejected target role must not become a broad replacement: {:?}",
+            parsed.replacements
+        );
+        let mut has_target_role_gap = false;
+        let mut visit = |effect: &Effect| {
+            has_target_role_gap |= matches!(
+                effect,
+                Effect::Unimplemented { name, .. }
+                    if name == "prevent_damage_recipient_target_role"
+            );
+            std::ops::ControlFlow::Continue(())
+        };
+        for ability in &parsed.abilities {
+            let _ = crate::types::ability_visit::visit_ability_def(ability, &mut visit);
+        }
+        for trigger in &parsed.triggers {
+            let _ = crate::types::ability_visit::visit_trigger(trigger, &mut visit);
+        }
+        assert!(
+            has_target_role_gap,
+            "{name}: the rejected prevention role must retain its specific gap"
+        );
+        let face = CardFace {
+            name: name.to_string(),
+            oracle_text: Some(oracle.to_string()),
+            abilities: parsed.abilities,
+            triggers: parsed.triggers,
+            static_abilities: parsed.statics,
+            replacements: parsed.replacements,
+            additional_cost: parsed.additional_cost,
+            ..Default::default()
+        };
+        assert!(
+            card_face_has_unimplemented_parts(&face),
+            "{name}: strict unsupported coverage must survive the top-level router"
+        );
+    }
+}
+
+#[test]
+fn prevention_declared_prefixes_keep_full_filters_and_counts() {
+    for (text, expected_count) in [
+        ("Prevent all damage that would be dealt to another target creature this turn.", None),
+        ("Prevent all damage that would be dealt to other target creature this turn.", None),
+        ("Prevent all damage that would be dealt this turn to up to two another target creatures.", Some(MultiTargetSpec::fixed(0, 2))),
+        ("Prevent all damage that would be dealt this turn to up to two other target creatures.", Some(MultiTargetSpec::fixed(0, 2))),
+    ] {
+        let ability = parse_effect_chain(text, AbilityKind::Spell);
+        assert!(matches!(
+            *ability.effect,
+            Effect::PreventDamage {
+                target: TargetFilter::Typed(_),
+                recipient_scope: EffectScope::Single,
+                ..
+            }
+        ), "{text}: {:?}", ability.effect);
+        assert_eq!(
+            ability.multi_target,
+            expected_count,
+            "{text}: announced count"
+        );
+    }
 }
