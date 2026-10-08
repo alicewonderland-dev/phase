@@ -10,6 +10,9 @@
   "manaSourceSelection": {
     "title": "Scegli una fonte di mana",
     "description": "Questa abilità di mana richiede di sacrificare un permanente.",
+    "baseOutput_one": "Produzione base: {{count}} mana",
+    "baseOutput_other": "Produzione base: {{count}} mana",
+    "baseOutputVariable": "Quantità base determinata all’attivazione",
     "sacrifice": "Sacrifica",
     "back": "Torna al pagamento del mana",
     "unknownSource": "Fonte di mana"
@@ -1131,6 +1134,8 @@
       "usePowder": "Usa {{name}}",
       "powderDescription": "Esilia ogni carta in mano, pesca lo stesso numero — non è un mulligan",
       "powderTooltip": "Esilia ogni carta nella tua mano e pesca lo stesso numero. Non è un mulligan — il conteggio e le carte in fondo non sono influenzati.",
+      "freeReveal": "Rivela e pesca di nuovo (gratis)",
+      "freeRevealDescription": "Rivela la mano, rimescolala e pesca 7 — gratis, nessuna carta in fondo, non è un mulligan",
       "eyebrowMulligan": "Mulligan {{count}} · Londra",
       "eyebrowOpening": "Mano iniziale · Mulligan di Londra",
       "reviewTitle": "Rivedi la tua mano iniziale",
@@ -1348,8 +1353,6 @@
     },
     "config": {
       "startingLife": "Punti vita iniziali",
-      "experimentalDungeons": "Dungeon sperimentali",
-      "experimentalDungeonsHelp": "Offri Baldur's Gate Wilderness nelle opzioni del dungeon e quando prendi l'iniziativa. Sperimentale e non ufficiale.",
       "players": "Giocatori",
       "whoGoesFirst": "Chi inizia",
       "firstPlayer": {
@@ -1698,6 +1701,10 @@
       "title": "Potenziare Jace",
       "subtitle": "Scegli una pedina Jace che controlli perché ottenga +{{count}} fedeltà"
     },
+    "spellCopyOrder": {
+      "title": "Ordina le copie",
+      "subtitle": "Scegli la magia la cui copia va successivamente in pila"
+    },
     "collectEvidence": {
       "title": "Raccogli prove",
       "subtitle": "Esilia carte dal tuo cimitero con valore di mana totale {{minimum}} o superiore"
@@ -2008,7 +2015,11 @@
   },
   "zoneOpponentChooser": {
     "title": "Scegli avversario",
-    "subtitle": "Scegli quale avversario effettua la scelta."
+    "subtitle": "Scegli quale avversario effettua la scelta.",
+    "orderTitle": "Scegli il giocatore successivo",
+    "orderSubtitle": "Scegli per chi effettuare la prossima selezione.",
+    "substituteTitle": "Scegli giocatore",
+    "substituteSubtitle": "Scegli chi effettua questa scelta."
   },
   "pileOpponent": {
     "title": "Choose Opponent",
@@ -2266,7 +2277,9 @@
     "accept": "Sì",
     "decline": "No",
     "sourceFallback": "Effetto",
-    "entryLabel": "{{source}} — {{decision}}"
+    "entryLabel": "{{source}} — {{decision}}",
+    "optionalTriggers": "Abilità innescate facoltative ({{count, number}})",
+    "replacementChoices": "Scelte di sostituzione ({{count, number}})"
   },
   "optionalEffect": {
     "sourceFallback": "Effetto",
@@ -2346,6 +2359,8 @@
     "confirm": "Conferma"
   },
   "replacement": {
+    "remember": "Ricorda questa scelta per questa partita",
+    "savedChoice": "Sostituzione: {{choice}}",
     "eyebrow": "Ordine di risoluzione",
     "title": "Effetti di sostituzione",
     "orderSubtitle": "Questi effetti cambiano tutti il modo in cui avviene questo evento. Trascina per stabilire l'ordine di applicazione: l'ultimo applicato è quello che ha effetto (CR 616.1).",

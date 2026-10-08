@@ -10,6 +10,9 @@
   "manaSourceSelection": {
     "title": "Wybierz źródło many",
     "description": "Ta zdolność many wymaga poświęcenia permanenta.",
+    "baseOutput_one": "Podstawowa ilość: {{count}} mana",
+    "baseOutput_other": "Podstawowa ilość: {{count}} many",
+    "baseOutputVariable": "Podstawowa ilość ustalana przy aktywacji",
     "sacrifice": "Poświęć",
     "back": "Wróć do płatności many",
     "unknownSource": "Źródło many"
@@ -1131,6 +1134,8 @@
       "usePowder": "Użyj {{name}}",
       "powderDescription": "Wygnaj każdą kartę z ręki, dobierz tyle samo — to nie mulligan",
       "powderTooltip": "Wygnaj każdą kartę z ręki i dobierz tyle samo. To nie mulligan — liczba i karty na spodzie pozostają bez zmian.",
+      "freeReveal": "Pokaż i dobierz ponownie (za darmo)",
+      "freeRevealDescription": "Pokaż rękę, przetasuj ją i dobierz 7 — za darmo, bez kart na spód, to nie mulligan",
       "eyebrowMulligan": "Mulligan {{count}} · Londyński",
       "eyebrowOpening": "Ręka startowa · Mulligan londyński",
       "reviewTitle": "Przejrzyj swoją rękę startową",
@@ -1348,8 +1353,6 @@
     },
     "config": {
       "startingLife": "Życie początkowe",
-      "experimentalDungeons": "Eksperymentalne lochy",
-      "experimentalDungeonsHelp": "Oferuj Baldur's Gate Wilderness w opcjach lochów i przy przejmowaniu inicjatywy. Eksperymentalne i nieoficjalne.",
       "players": "Gracze",
       "whoGoesFirst": "Kto zaczyna",
       "firstPlayer": {
@@ -1698,6 +1701,10 @@
       "title": "Wzmocnij Jace'a",
       "subtitle": "Wybierz kontrolowany przez siebie żeton Jace'a, aby zyskał +{{count}} lojalności"
     },
+    "spellCopyOrder": {
+      "title": "Ustal kolejność kopii",
+      "subtitle": "Wybierz czar, którego kopia trafi teraz na stos"
+    },
     "collectEvidence": {
       "title": "Zbierz dowody",
       "subtitle": "Wygnaj karty ze swojego cmentarza o łącznej wartości many {{minimum}} lub większej"
@@ -2008,7 +2015,11 @@
   },
   "zoneOpponentChooser": {
     "title": "Wybierz przeciwnika",
-    "subtitle": "Wybierz, który przeciwnik dokonuje wyboru."
+    "subtitle": "Wybierz, który przeciwnik dokonuje wyboru.",
+    "orderTitle": "Wybierz następnego gracza",
+    "orderSubtitle": "Wybierz, dla kogo dokonać następnego wyboru.",
+    "substituteTitle": "Wybierz gracza",
+    "substituteSubtitle": "Wybierz, kto dokona tego wyboru."
   },
   "pileOpponent": {
     "title": "Choose Opponent",
@@ -2266,7 +2277,9 @@
     "accept": "Tak",
     "decline": "Nie",
     "sourceFallback": "Efekt",
-    "entryLabel": "{{source}} — {{decision}}"
+    "entryLabel": "{{source}} — {{decision}}",
+    "optionalTriggers": "Opcjonalne zdolności wyzwalane ({{count, number}})",
+    "replacementChoices": "Wybory zastępowania ({{count, number}})"
   },
   "optionalEffect": {
     "sourceFallback": "Efekt",
@@ -2346,6 +2359,8 @@
     "confirm": "Potwierdź"
   },
   "replacement": {
+    "remember": "Zapamiętaj ten wybór w tej grze",
+    "savedChoice": "Zastąpienie: {{choice}}",
     "eyebrow": "Kolejność rozpatrywania",
     "title": "Efekty zastępujące",
     "orderSubtitle": "Wszystkie te efekty zmieniają przebieg tego zdarzenia. Przeciągnij, aby ustalić kolejność — ostatni zastosowany efekt jest tym, który zadziała (CR 616.1).",
