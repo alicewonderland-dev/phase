@@ -32892,6 +32892,183 @@ mod chosen_target_slots_tests {
             assert_eq!(back.chosen_target_slots, slots);
         }
     }
+
+    fn node(targets: Vec<TargetRef>, chosen: Vec<usize>) -> ResolvedAbility {
+        let mut node = ResolvedAbility::new(
+            Effect::NoOp,
+            targets,
+            crate::types::identifiers::ObjectId(1),
+            crate::types::player::PlayerId(0),
+        );
+        node.chosen_target_slots = ChosenTargetSlots::Recorded(chosen);
+        node
+    }
+
+    /// CR 601.2c + CR 608.2d: the guesser is bound at resolution, not chosen,
+    /// so prepending it leaves every node's chosen targets as they were.
+    #[test]
+    fn prepending_a_guesser_keeps_each_node_reading_its_chosen_targets() {
+        let other = TargetRef::Player(crate::types::player::PlayerId(1));
+        let guesser = crate::types::player::PlayerId(2);
+        let object = TargetRef::Object(crate::types::identifiers::ObjectId(7));
+        let sub = node(
+            vec![other.clone(), TargetRef::Player(guesser), object.clone()],
+            vec![0, 2],
+        );
+        let else_branch = node(vec![object.clone()], vec![0]);
+        let mut root = node(Vec::new(), Vec::new())
+            .sub_ability(sub)
+            .else_ability(else_branch);
+
+        root.push_front_player_target_recursive(guesser);
+
+        let sub = root.sub_ability.as_deref().unwrap();
+        assert_eq!(
+            sub.targets,
+            vec![TargetRef::Player(guesser), other.clone(), object.clone()]
+        );
+        let else_branch = root.else_ability.as_deref().unwrap();
+        assert_eq!(
+            else_branch.targets,
+            vec![TargetRef::Player(guesser), object.clone()]
+        );
+        assert_eq!(
+            crate::game::ability_utils::declared_targets_in_chain(&root),
+            vec![other, object.clone(), object]
+        );
+    }
+
+    /// CR 601.2c: a player chosen as a target stays chosen when the same
+    /// player is moved to the front as the guesser.
+    #[test]
+    fn a_guesser_chosen_as_a_target_stays_chosen() {
+        let guesser = crate::types::player::PlayerId(2);
+        let object = TargetRef::Object(crate::types::identifiers::ObjectId(7));
+        let mut root = node(vec![object.clone(), TargetRef::Player(guesser)], vec![0, 1]);
+
+        root.push_front_player_target_recursive(guesser);
+
+        assert_eq!(
+            root.targets,
+            vec![TargetRef::Player(guesser), object.clone()]
+        );
+        assert_eq!(
+            crate::game::ability_utils::declared_targets_in_chain(&root),
+            vec![object, TargetRef::Player(guesser)]
+        );
+    }
+
+    /// CR 115.3 + CR 601.2c: a player chosen for two instances of "target"
+    /// stays declared twice when the same player is moved to the front as the
+    /// guesser.
+    #[test]
+    fn a_guesser_chosen_twice_stays_declared_twice() {
+        let guesser = crate::types::player::PlayerId(2);
+        let g = TargetRef::Player(guesser);
+        let object = TargetRef::Object(crate::types::identifiers::ObjectId(7));
+        let boards = [
+            (vec![g.clone(), object.clone(), g.clone()], vec![0, 2]),
+            (vec![object.clone(), g.clone(), g.clone()], vec![0, 1, 2]),
+        ];
+
+        let read: Vec<_> = boards
+            .into_iter()
+            .map(|(targets, chosen)| {
+                let mut root = node(targets, chosen);
+                root.push_front_player_target_recursive(guesser);
+                let illegal = crate::game::ability_utils::illegal_declared_target_slots(
+                    &root,
+                    &mut root.clone(),
+                );
+                (
+                    root.targets.clone(),
+                    crate::game::ability_utils::declared_targets_in_chain(&root),
+                    illegal,
+                )
+            })
+            .collect();
+
+        let front = vec![g.clone(), object.clone(), g.clone()];
+        assert_eq!(
+            read,
+            vec![
+                (front.clone(), vec![g.clone(), g.clone()], Vec::new()),
+                (front, vec![object, g.clone(), g], Vec::new()),
+            ]
+        );
+    }
+
+    /// CR 115.3 + CR 601.2c: a guesser chosen for a node's unless-payer and
+    /// quantity slots keeps both when moved to the front, so the quantity slot
+    /// still reads the guesser rather than the primary target.
+    #[test]
+    fn a_guesser_chosen_for_a_quantity_slot_keeps_its_reading() {
+        use crate::game::ability_utils::{primary_announced_player, quantity_slot_player_ordinal};
+        let guesser = crate::types::player::PlayerId(2);
+        let g = TargetRef::Player(guesser);
+        let primary = TargetRef::Player(crate::types::player::PlayerId(1));
+        let mut root = node(vec![g.clone(), g.clone(), primary.clone()], vec![0, 1, 2]);
+        root.effect = Effect::DealDamage {
+            amount: QuantityExpr::Ref {
+                qty: QuantityRef::TargetZoneCardCount {
+                    zone: ZoneRef::Hand,
+                    scope: ControllerRef::TargetPlayer,
+                    binding: CountBinding::Explicit,
+                },
+            },
+            target: TargetFilter::Player,
+            damage_source: None,
+            excess: None,
+        };
+        root.unless_pay = Some(UnlessPayModifier {
+            cost: AbilityCost::PayLife {
+                amount: QuantityExpr::Fixed { value: 3 },
+            },
+            payer: TargetFilter::Typed(TypedFilter::default()),
+        });
+        let reads = |node: &ResolvedAbility| {
+            let ordinal = quantity_slot_player_ordinal(&node.targets, Some(node));
+            let counted = ordinal.and_then(|ordinal| {
+                node.targets
+                    .iter()
+                    .filter(|target| matches!(target, TargetRef::Player(_)))
+                    .nth(ordinal)
+                    .cloned()
+            });
+            (
+                ordinal,
+                counted,
+                primary_announced_player(&node.targets, node),
+            )
+        };
+        assert_eq!(reads(&root), (Some(1), Some(g.clone()), Some(guesser)));
+
+        root.push_front_player_target_recursive(guesser);
+
+        assert_eq!(reads(&root), (Some(1), Some(g.clone()), Some(guesser)));
+        assert_eq!(
+            crate::game::ability_utils::declared_targets_in_chain(&root),
+            vec![g.clone(), g, primary]
+        );
+    }
+
+    /// CR 601.2c: a target inserted without being chosen shifts the recorded
+    /// slots after it and leaves those before it.
+    #[test]
+    fn an_unchosen_insert_keeps_recorded_slots_on_their_targets() {
+        let first = TargetRef::Object(crate::types::identifiers::ObjectId(7));
+        let last = TargetRef::Object(crate::types::identifiers::ObjectId(8));
+        let inserted = TargetRef::Object(crate::types::identifiers::ObjectId(9));
+        let mut root = node(vec![first.clone(), last.clone()], vec![0, 1]);
+
+        root.insert_unchosen_target(1, inserted.clone());
+
+        assert_eq!(root.targets, vec![first.clone(), inserted, last.clone()]);
+        assert_eq!(
+            crate::game::ability_utils::declared_targets_in_chain(&root),
+            vec![first, last]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -33121,6 +33298,14 @@ impl ChosenTargetSlots {
         match self {
             Self::Unrecorded => &[],
             Self::Recorded(slots) => slots,
+        }
+    }
+
+    /// Points each recorded slot at `moved(slot)`, dropping a slot that maps
+    /// to `None`.
+    fn remap(&mut self, moved: impl Fn(usize) -> Option<usize>) {
+        if let Self::Recorded(slots) = self {
+            *slots = slots.iter().filter_map(|&slot| moved(slot)).collect();
         }
     }
 }
@@ -34175,6 +34360,46 @@ impl ResolvedAbility {
             }
         }
         self.targets.push(target);
+    }
+
+    /// CR 601.2c: Inserts `target` into `targets` at `index` without recording
+    /// it as chosen; recorded slots keep naming the targets they named.
+    pub(crate) fn insert_unchosen_target(&mut self, index: usize, target: TargetRef) {
+        self.targets.insert(index, target);
+        self.chosen_target_slots
+            .remap(|slot| Some(if slot < index { slot } else { slot + 1 }));
+    }
+
+    /// CR 601.2c: Empties `targets`, dropping every recorded slot with them.
+    pub(crate) fn clear_targets(&mut self) {
+        self.targets.clear();
+        self.chosen_target_slots.remap(|_| None);
+    }
+
+    /// CR 601.2c: Makes `target` the first entry of `targets`. Recorded slots
+    /// keep naming the targets they named; the first entry is recorded only if
+    /// an occurrence it replaces was.
+    ///
+    /// CR 115.3: the first entry replaces every unrecorded occurrence and the
+    /// first recorded one; each further recorded occurrence is kept.
+    pub(crate) fn move_target_to_front(&mut self, target: TargetRef) {
+        let previous = std::mem::take(&mut self.targets);
+        let recorded = self.chosen_target_slots.slots();
+        let mut front_is_recorded = false;
+        let mut moved = Vec::with_capacity(previous.len());
+        self.targets.push(target.clone());
+        for (slot, entry) in previous.into_iter().enumerate() {
+            let is_recorded = recorded.contains(&slot);
+            if entry == target && !(is_recorded && front_is_recorded) {
+                front_is_recorded |= is_recorded;
+                moved.push(0);
+            } else {
+                moved.push(self.targets.len());
+                self.targets.push(entry);
+            }
+        }
+        self.chosen_target_slots
+            .remap(|slot| moved.get(slot).copied());
     }
 
     /// CR 601.2c + CR 603.3d: Starts the target record of every node of this
@@ -35538,13 +35763,9 @@ impl ResolvedAbility {
     /// CR 608.2d: Make `player` available as a player target across the chain so
     /// a `TargetFilter::ParentTarget` anaphor ("they lose life ...") resolves to
     /// the guesser. Inserted at the front so it wins the first-player-target
-    /// lookup. Any existing occurrence of this player is removed first to
-    /// guarantee they land at index 0 regardless of their prior seat position.
+    /// lookup.
     pub fn push_front_player_target_recursive(&mut self, player: PlayerId) {
-        // CR 608.2d: Remove any existing occurrence first so the guesser is
-        // always at index 0 regardless of seat order in the target list.
-        self.targets.retain(|t| t != &TargetRef::Player(player));
-        self.targets.insert(0, TargetRef::Player(player));
+        self.move_target_to_front(TargetRef::Player(player));
         if let Some(sub) = self.sub_ability.as_mut() {
             sub.push_front_player_target_recursive(player);
         }
@@ -41071,14 +41292,11 @@ mod modal_ability_tests {
     }
 
     /// CR 608.2d: `push_front_player_target_recursive` must promote a guesser
-    /// from any non-leading slot to index 0, and the guesser must appear exactly
-    /// once afterward. This is the regression for the prior bug where a
-    /// continuation with targets `[Player(other), Player(guesser)]` — guesser in
-    /// slot 1 — was NOT corrected before the fix, causing `target_player()` to
-    /// bind `other` instead of `guesser` for the "they lose life" rider.
-    ///
-    /// The fix (`retain` before `insert`) must hold for both top-level targets and
-    /// every recursive sub/else branch.
+    /// from any non-leading slot to index 0. This is the regression for the
+    /// prior bug where a continuation with targets
+    /// `[Player(other), Player(guesser)]` — guesser in slot 1 — was NOT
+    /// corrected before the fix, causing `target_player()` to bind `other`
+    /// instead of `guesser` for the "they lose life" rider.
     #[test]
     fn push_front_player_target_recursive_promotes_non_leading_guesser() {
         let other = PlayerId(1);

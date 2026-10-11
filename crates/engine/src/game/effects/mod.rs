@@ -3915,7 +3915,7 @@ fn prepare_one_sided_fight_child(
 fn bind_one_sided_fight_subject(child: &mut ResolvedAbility, subject: OneSidedFightSubject) {
     let binding = match subject {
         OneSidedFightSubject::Prepend(source) => {
-            child.targets.insert(0, TargetRef::Object(source));
+            child.insert_unchosen_target(0, TargetRef::Object(source));
             TargetDamageSourceBinding::Bound
         }
         OneSidedFightSubject::Illegal => TargetDamageSourceBinding::Illegal,
@@ -18165,7 +18165,7 @@ fn resolve_chain_body(
             {
                 let mut sub_with_sources = sub.as_ref().clone();
                 for (i, source) in parent_sources.into_iter().enumerate() {
-                    sub_with_sources.targets.insert(i, source);
+                    sub_with_sources.insert_unchosen_target(i, source);
                 }
                 apply_parent_chain_context(
                     &mut sub_with_sources,
@@ -20517,6 +20517,27 @@ fn resolve_add_pending_enters_modifications(
 mod tests {
     use super::*;
     use crate::database::synthesis::synthesize_extort;
+
+    /// CR 601.2c + CR 120.1: the prepended fight subject is the parent's
+    /// target, so the damage child still declares only its own recipient.
+    #[test]
+    fn a_prepended_fight_subject_is_not_a_target_of_the_damage_child() {
+        let subject = ObjectId(7);
+        let recipient = TargetRef::Object(ObjectId(8));
+        let mut child = ResolvedAbility::new(Effect::NoOp, Vec::new(), ObjectId(1), PlayerId(0));
+        child.push_chosen_target(recipient.clone());
+
+        bind_one_sided_fight_subject(&mut child, OneSidedFightSubject::Prepend(subject));
+
+        assert_eq!(
+            child.targets,
+            vec![TargetRef::Object(subject), recipient.clone()]
+        );
+        assert_eq!(
+            crate::game::ability_utils::declared_targets_in_chain(&child),
+            vec![recipient]
+        );
+    }
 
     /// CR 608.2b: only an empty node carrying measured removal evidence refuses
     /// parent-target inheritance; an intentionally empty node retains it.

@@ -8391,7 +8391,8 @@ pub(crate) fn seed_batched_attack_parent_targets(
 /// `current_trigger_event`. CR 603.6 specifically authorizes zone-change
 /// abilities to find and affect the object after it changes zones.
 fn parent_target_seeding_blocked(ability: &ResolvedAbility) -> bool {
-    // CR 115.1: a target chosen for the trigger can't be changed, even when it
+    // CR 115.1: event-context seeding is not a spell or ability that may change
+    // a chosen target, so it never overwrites one, even when the chosen target
     // is the trigger's own source.
     if !ability.chosen_target_slots.slots().is_empty() {
         return true;
