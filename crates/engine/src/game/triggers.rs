@@ -4575,7 +4575,7 @@ fn collect_pending_triggers_with_collection(
     collection: LogicalZoneTriggerCollection<'_>,
     session: &mut TriggerCollectionSession,
 ) -> Vec<PendingTriggerContext> {
-    // CR 603.6a: Continuous effects (including statics that grant
+    // CR 611.3c + CR 603.6a: Continuous effects (including statics that grant
     // triggered abilities to a class — sliver-lord pattern) apply the moment
     // the affected permanent is on the battlefield. The newcomers must be
     // checked for ETB triggers including any granted by their own static
@@ -39931,7 +39931,7 @@ pub mod tests {
     }
 
     // === L9-23: Sliver-lord self-static keyword/trigger grant ===
-    // CR 603.6a: Static abilities that grant abilities/keywords to
+    // CR 611.3c + CR 603.6a: Static abilities that grant abilities/keywords to
     // a class of permanents apply the moment a newcomer enters the battlefield.
     // ETB-trigger gathering MUST see the granted-trigger on the entering object
     // itself (Harmonic Sliver) and the granted keyword on the entering source
