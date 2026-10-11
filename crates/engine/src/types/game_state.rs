@@ -21314,7 +21314,7 @@ declare_game_state! {
     #[serde(skip)]
     pub static_gate_truth: im::HashMap<StaticGateKey, bool>,
     /// CR 603.2: Candidate pre-filter for `collect_pending_triggers`. Rebuilt
-    /// eagerly at the end of `evaluate_layers` (CR 611.2e) so the post-layer
+    /// eagerly at the end of `evaluate_layers` so the post-layer
     /// trigger set is reflected. `#[serde(skip)]` because the index
     /// is derived state — reconstructed from `state.battlefield` + per-object
     /// `trigger_definitions` whenever needed.
