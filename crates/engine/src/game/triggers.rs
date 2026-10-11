@@ -3787,7 +3787,7 @@ pub(super) fn resolve_tap_mana_triggers_inline(
     events: &mut Vec<GameEvent>,
     events_before: usize,
 ) {
-    // CR 603.2 + CR 611.2e: Resolve against the post-layer live trigger surface,
+    // CR 603.2: Resolve against the post-layer live trigger surface,
     // then restore the serde-skipped index if this is the first post-deserialize
     // consult. Layer evaluation remains the authority for granted definitions.
     super::layers::flush_layers(state);
@@ -4575,7 +4575,7 @@ fn collect_pending_triggers_with_collection(
     collection: LogicalZoneTriggerCollection<'_>,
     session: &mut TriggerCollectionSession,
 ) -> Vec<PendingTriggerContext> {
-    // CR 603.6a + CR 611.2e: Continuous effects (including statics that grant
+    // CR 603.6a: Continuous effects (including statics that grant
     // triggered abilities to a class — sliver-lord pattern) apply the moment
     // the affected permanent is on the battlefield. The newcomers must be
     // checked for ETB triggers including any granted by their own static
@@ -4659,7 +4659,7 @@ fn collect_pending_triggers_with_collection(
             (HashSet::new(), HashSet::new())
         };
 
-        // CR 603.2 + CR 603.6a + CR 611.2e: Consult the maintained TriggerIndex
+        // CR 603.2 + CR 603.6a: Consult the maintained TriggerIndex
         // for candidate battlefield objects. Replaces the legacy full
         // battlefield scan with an event-keyed bucket union. The
         // `evaluate_layers` rebuild at the top of `collect_pending_triggers`
@@ -39931,7 +39931,7 @@ pub mod tests {
     }
 
     // === L9-23: Sliver-lord self-static keyword/trigger grant ===
-    // CR 603.6a + CR 611.2e: Static abilities that grant abilities/keywords to
+    // CR 603.6a: Static abilities that grant abilities/keywords to
     // a class of permanents apply the moment a newcomer enters the battlefield.
     // ETB-trigger gathering MUST see the granted-trigger on the entering object
     // itself (Harmonic Sliver) and the granted keyword on the entering source
@@ -40162,7 +40162,7 @@ pub mod tests {
 
     #[test]
     fn venom_sliver_self_grants_deathtouch_via_layer_flush_in_process_triggers() {
-        // CR 611.2e: Venom Sliver pattern — a printed static "Sliver creatures
+        // CR 613.1f: Venom Sliver pattern — a printed static "Sliver creatures
         // you control have deathtouch" must apply to the source itself once
         // layers are evaluated. Pins that calling `process_triggers` (which
         // happens immediately after a zone change in the post-action pipeline)

@@ -20304,7 +20304,7 @@ pub struct StackPaidSnapshot {
 /// OR in `unclassified`. Over-approximation is correctness-preserving; under-
 /// approximation is a silent trigger drop.
 ///
-/// CR 603.6a + CR 611.2e: Granted triggers (sliver lords, Cairn Wanderer,
+/// CR 613.1f: Granted triggers (sliver lords, Cairn Wanderer,
 /// Bramble Sovereign) are materialized by `evaluate_layers` into
 /// `obj.trigger_definitions`. The index's battlefield-scoped portion is
 /// rebuilt at the end of `evaluate_layers` so it always reflects post-layer

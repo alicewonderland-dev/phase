@@ -3532,7 +3532,7 @@ fn finish_layer_evaluation(
             .retire_absent_grants(&live_instances);
     }
 
-    // CR 603.6a + CR 611.2e: Layer evaluation just finalized post-layer
+    // Layer evaluation just finalized post-layer
     // trigger sets on every battlefield permanent (granted triggers from
     // sliver lords, Changeling, Bramble Sovereign, suppress-triggers statics).
     // Rebuild the TriggerIndex so the next event scan reads the post-layer
@@ -6275,7 +6275,7 @@ fn copy_sublayer_effect_id(
 /// EXISTING global continuous-effect set (restricted to the entered objects via
 /// `apply_continuous_effect_to`), runs the per-object counter / keyword-counter /
 /// P-T-counter / loyalty fixups and the combat-assignment-rule application, then
-/// rebuilds the TriggerIndex (CR 603.6a + CR 611.2e — granted-trigger
+/// rebuilds the TriggerIndex (CR 613.1f — granted-trigger
 /// visibility). It does NOT clear attribution globally or touch the rest of the
 /// battlefield: pre-existing objects keep their already-derived characteristics.
 ///
@@ -6534,7 +6534,7 @@ fn apply_layers_incremental(
     // CR 613.11: Combat-assignment rule effects, restricted to recipient objects.
     apply_combat_assignment_rule_effects_filtered(state, Some(&recipient_ids));
 
-    // CR 603.6a + CR 611.2e: Rebuild the TriggerIndex so the next event scan
+    // Rebuild the TriggerIndex so the next event scan
     // sees the entered objects' (and any granted) trigger sets.
     crate::types::game_state::TriggerIndex::rebuild_from_battlefield(state);
 

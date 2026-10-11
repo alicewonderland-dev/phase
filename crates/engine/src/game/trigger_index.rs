@@ -1,4 +1,4 @@
-//! CR 603.2 + CR 603.6a + CR 611.2e: `TriggerIndex` — battlefield-scoped
+//! CR 603.2 + CR 603.6a: `TriggerIndex` — battlefield-scoped
 //! candidate pre-filter for `collect_pending_triggers`. Replaces a full
 //! battlefield scan with an event-keyed lookup so trigger-firing cost scales
 //! with the number of *relevant* triggers, not with `|battlefield|`.
@@ -25,7 +25,7 @@
 //! # Authority
 //!
 //! The authoritative correctness path is the rebuild at the end of
-//! `evaluate_layers` (CR 611.2e): every continuous-effect-driven mutation of
+//! `evaluate_layers`: every continuous-effect-driven mutation of
 //! `obj.trigger_definitions` (sliver lords, Changeling, Bramble Sovereign,
 //! suppress-triggers statics) flows through the layer pipeline, and
 //! `collect_pending_triggers` flushes pending layers before reading the index.
@@ -1141,7 +1141,7 @@ impl TriggerIndex {
         }
     }
 
-    /// CR 603.6a + CR 611.2e: Rebuild from scratch by scanning every phased-in
+    /// Rebuild from scratch by scanning every phased-in
     /// battlefield permanent and re-deriving its keys via
     /// `keys_from_trigger_def`.
     pub fn rebuild_from_battlefield(state: &mut GameState) {
@@ -1170,7 +1170,7 @@ impl TriggerIndex {
     }
 }
 
-/// CR 603.2 + CR 611.2e: Ensure the serde-skipped candidate index has been
+/// CR 603.2: Ensure the serde-skipped candidate index has been
 /// populated by a full battlefield scan before a consult. Rebuilds only an
 /// `Unbuilt` index (fresh from `Default`, as after deserialize), and only
 /// while the battlefield is non-empty. A `Built` index is not rebuilt here
