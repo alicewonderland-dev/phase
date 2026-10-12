@@ -26,8 +26,8 @@
 //!
 //! The authoritative correctness path is the rebuild at the end of
 //! `evaluate_layers`: every continuous-effect-driven mutation of
-//! `obj.trigger_definitions` (sliver lords, Changeling,
-//! suppress-triggers statics) flows through the layer pipeline, and
+//! `obj.trigger_definitions` (sliver lords, Changeling) flows through the
+//! layer pipeline, and
 //! `collect_pending_triggers` flushes pending layers before reading the index.
 //! The `move_to_zone` incremental hooks are best-effort optimization between
 //! layer flushes — they are NOT the safety net.

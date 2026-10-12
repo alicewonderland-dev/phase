@@ -3534,7 +3534,7 @@ fn finish_layer_evaluation(
 
     // Layer evaluation just finalized post-layer
     // trigger sets on every battlefield permanent (granted triggers from
-    // sliver lords, Changeling, suppress-triggers statics).
+    // sliver lords, Changeling).
     // Rebuild the TriggerIndex so the next event scan reads the post-layer
     // trigger set — CR 603.2 requires the post-layer view. Destructive
     // rebuild replaces both `by_key` and `unclassified` from scratch.
