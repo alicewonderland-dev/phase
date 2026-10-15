@@ -8,15 +8,18 @@ use nom::sequence::{preceded, terminated};
 use nom::Parser;
 
 use super::super::oracle_nom::bridge::nom_on_lower;
+use super::super::oracle_nom::duration::parse_duration;
 use super::super::oracle_nom::enters_under::{
     bind_control_clause, fold_control_clauses, name_entry_control_antecedent,
 };
 use super::super::oracle_nom::primitives as nom_primitives;
 use super::super::oracle_nom::primitives::parse_keyword_name;
+use super::super::oracle_nom::target::controller_phrase_among;
 use super::super::oracle_target::{parse_target, parse_target_with_ctx, parse_type_phrase_folding};
 use super::super::oracle_util::{
     contains_possessive, parse_count_expr, parse_ordinal, parse_subtype, TextPair,
 };
+use super::imperative::CHOOSER_DOMAIN_CONTROLLERS;
 use super::{apply_where_x_to_filter, strip_trailing_where_x};
 use crate::parser::oracle_ir::ast::*;
 use crate::parser::oracle_ir::context::ParseContext;
@@ -1279,6 +1282,14 @@ pub(super) fn split_clause_sequence(text: &str) -> Vec<ClauseChunk> {
     // by the Mara: "... until they exile a nonland card, then you may cast that
     // card ...") and the lead-in is severed into a failing `Unimplemented{face}`.
     let mut villainous_choice_sticky = false;
+    // CR 603.7b + CR 608.2c: once a chunk opens an inline delayed trigger
+    // ("Whenever … this turn, …" / "Until …, whenever …, …"), a following
+    // sentence whose subject is an anaphor for the trigger's referent is part
+    // of that trigger's effect (The Last Ronin III: "…, put three +1/+1
+    // counters on it. It gains trample, lifelink, and indestructible until end
+    // of turn."), so it stays in the trigger's chunk and reaches the delayed
+    // parser with its anaphors bound. See `continues_inline_delayed_body`.
+    let mut inline_delayed_sticky = false;
 
     while let Some(ch) = chars.next() {
         match ch {
@@ -1373,6 +1384,16 @@ pub(super) fn split_clause_sequence(text: &str) -> Vec<ClauseChunk> {
             {
                 in_single_quote = false;
                 single_quote_is_ability = false;
+                let remainder = chars.clone().collect::<String>();
+                if (inline_delayed_sticky
+                    || opens_inline_delayed_trigger(&current.to_ascii_lowercase()))
+                    && continues_inline_delayed_body(&remainder.trim_start().to_ascii_lowercase())
+                {
+                    inline_delayed_sticky = true;
+                    current.push(ch);
+                    continue;
+                }
+                inline_delayed_sticky = false;
                 push_clause_chunk(&mut chunks, &current, Some(ClauseBoundary::Sentence));
                 current.clear();
                 compound_subject_each_sticky = false;
@@ -1901,6 +1922,19 @@ fn quote_closes_sentence_before_sequence(current: &str, remainder: &str) -> bool
     // here is a NOUN, recognized by its type/subtype head plus a following
     // continuous predicate verb.
     if starts_typed_group_continuous_continuation(trimmed_lower.as_str()) {
+        return true;
+    }
+
+    // CR 602.2b + CR 601.2f: a "This ability costs {N} less/more to activate …"
+    // sentence after a closed quote modifies the OUTER activated ability's total
+    // cost — "this ability" names the ability whose text holds the sentence, never
+    // the quoted grant (Llanowar Greenwidow: `It gains "If this permanent would
+    // leave the battlefield, exile it instead …" This ability costs {1} less to
+    // activate for each basic land type among lands you control.`). Splitting here
+    // lets the sentence reach `extract_cost_reduction_from_chain` as its own chain
+    // node; otherwise the quoted grant's static text swallows it and the reduction
+    // is lost.
+    if crate::parser::oracle_cost::is_self_cost_reduction_prefix(trimmed_lower.as_str()) {
         return true;
     }
 
@@ -2434,6 +2468,53 @@ fn starts_except_body_continuation(trimmed_lower: &str) -> bool {
     .is_ok()
 }
 
+/// CR 603.7b: does this chunk open an inline delayed trigger — a "whenever"
+/// head scoped by a "this turn"/"this combat" window, or one behind a leading
+/// stated duration ("Until end of turn, whenever …")? The same two shapes
+/// `try_parse_whenever_this_turn` accepts.
+fn opens_inline_delayed_trigger(chunk_lower: &str) -> bool {
+    let chunk = chunk_lower.trim_start();
+    let (head, has_duration) = match super::lower::strip_leading_duration(chunk) {
+        Some((_, rest)) => (rest.trim_start(), true),
+        None => (chunk, false),
+    };
+    tag::<_, _, OracleError<'_>>("whenever ")
+        .parse(head)
+        .is_ok()
+        && (has_duration
+            || nom_primitives::scan_contains(head, "this turn, ")
+            || nom_primitives::scan_contains(head, "this combat, "))
+}
+
+/// CR 608.2c: does the next sentence continue an open inline delayed trigger's
+/// effect at the TEXT level? Only when its subject is an anaphor for the
+/// trigger's own referent — "It gains trample …" (The Last Ronin III: the
+/// creature attacking alone), "If they can't, they sacrifice …" (Davriel: the
+/// attacking opponent). Read outside the trigger, that anaphor would bind the
+/// ability's source instead. Every other following sentence ("Draw a card.",
+/// "You may play it …", "Sacrifice them at the beginning of the next end
+/// step.") stays its own chunk and is placed by the delayed-payload
+/// continuation classifier (`resolve_delayed_payload_placements`), which nests
+/// it only when the payload introduced what it refers to.
+fn continues_inline_delayed_body(remainder_lower: &str) -> bool {
+    let next_sentence = take_until::<_, _, OracleError<'_>>(".")
+        .parse(remainder_lower)
+        .map_or(remainder_lower, |(_, sentence)| sentence);
+    let opens_with_subject_anaphor = alt((
+        tag::<_, _, OracleError<'_>>("it "),
+        tag("they "),
+        tag("he "),
+        tag("she "),
+        tag("if it "),
+        tag("if they "),
+    ))
+    .parse(remainder_lower)
+    .is_ok();
+    opens_with_subject_anaphor
+        && !nom_primitives::scan_contains(next_sentence, "at the beginning of ")
+        && !nom_primitives::scan_contains(next_sentence, "at end of combat")
+}
+
 fn starts_prefix_clause(current_lower: &str) -> bool {
     // CR 603.7a: Temporal prefix clauses must not be split on their internal comma.
     // CR 611.2b: "For as long as [condition], [effect]" — duration prefix clause.
@@ -2861,10 +2942,11 @@ fn is_inside_temporal_prefix(lower: &str) -> bool {
 ///
 /// Recognized second-subject axes (mirror `try_parse_compound_subject_each`):
 /// - the static player/object axes owned by
-///   `parse_static_compound_second_subject` ("that player each", "target
-///   opponent each", "target player each", "defending player each", "that
-///   creature each"), shared with the effect parser so the two sites cannot
-///   drift.
+///   `parse_static_compound_second_subject` ("that player each", "that
+///   opponent each", "target opponent each", "the attacking player each",
+///   "target player each", "defending player each", "that creature each",
+///   "those players each"),
+///   shared with the effect parser so the two sites cannot drift.
 /// - "target &lt;filter&gt;'s controller/owner each" — the possessive-actor form
 ///   (CR 109.4; Life at Stake's "You and target creature's controller each
 ///   secretly choose a number 0 or greater"), delegated to the shared axis
@@ -3188,6 +3270,17 @@ fn starts_up_to_target_combat_clause_lower(s: &str) -> OracleResult<'_, ()> {
 
 /// Inner implementation operating on pre-lowercased input.
 fn starts_bare_and_clause_lower(s: &str) -> bool {
+    // CR 118.14 + CR 609.4b: "<cast grant> and they may spend mana as though it
+    // were mana of any color to cast that spell" (Curse of Hospitality) — the
+    // mana rider joined without a comma is the same conjunct the comma path cuts
+    // (`starts_mana_spend_rider_conjunct`); split it off so the chunk loop folds
+    // it onto the grant.
+    if (super::parse_mana_spend_rider, opt(tag(".")), eof)
+        .parse(s)
+        .is_ok()
+    {
+        return true;
+    }
     // CR 613.1b + CR 110.2: "<player-subject> gains control of …" control-handoff
     // clause (Slicer, Hired Muscle: "untap it, goad it, and an opponent of your
     // choice gains control of it"). A player subject + "gains control of"
@@ -4034,6 +4127,17 @@ fn next_token_is_player_action_count(s: &str) -> bool {
 /// Used by `starts_bare_and_clause` to split patterns like
 /// "sacrifice ~ and it deals 3 damage to target player".
 fn starts_with_damage_clause(lower: &str) -> bool {
+    // CR 608.2c: a source-pronoun damage instruction follows the earlier effect in order.
+    if (
+        alt((tag::<_, _, OracleError<'_>>("he"), tag("she"))),
+        multispace1,
+        alt((tag("deals "), tag("deal "))),
+    )
+        .parse(lower)
+        .is_ok()
+    {
+        return true;
+    }
     if let Ok((_, before)) = take_until::<_, _, OracleError<'_>>("deals ")
         .parse(lower)
         .or_else(|_| take_until::<_, _, OracleError<'_>>("deal ").parse(lower))
@@ -4259,6 +4363,7 @@ fn static_same_consumption(a: &StaticDefinition, b: &StaticDefinition) -> bool {
         bypass_beneficiary: a_bypass_beneficiary,
         protection_does_not_remove: a_protection_does_not_remove,
         room_door: a_room_door,
+        granting_object: a_granting_object,
     } = a;
     let StaticDefinition {
         mode: b_mode,
@@ -4277,6 +4382,7 @@ fn static_same_consumption(a: &StaticDefinition, b: &StaticDefinition) -> bool {
         bypass_beneficiary: b_bypass_beneficiary,
         protection_does_not_remove: b_protection_does_not_remove,
         room_door: b_room_door,
+        granting_object: b_granting_object,
     } = b;
     a_mode == b_mode
         && a_affected == b_affected
@@ -4293,6 +4399,7 @@ fn static_same_consumption(a: &StaticDefinition, b: &StaticDefinition) -> bool {
         && a_bypass_beneficiary == b_bypass_beneficiary
         && a_protection_does_not_remove == b_protection_does_not_remove
         && a_room_door == b_room_door
+        && a_granting_object == b_granting_object
 }
 
 /// Do two parses CONSUME the same thing? Compares everything the ENGINE READS and
@@ -4569,13 +4676,81 @@ fn recognize_counter_destroy_rider(lower: &str) -> bool {
     .is_ok()
 }
 
+/// Outcome of recognizing the Tishana's Tidebinder-shaped loses-all-abilities
+/// rider clause (see [`recognize_counter_loses_abilities_rider`]).
+enum CounterLosesAbilitiesRider {
+    /// The clause was fully read: the source-permanent type gate is `Some(filter)`
+    /// for the printed type list, `None` for the untyped "a permanent's ability".
+    Gate(Option<Box<TargetFilter>>),
+    /// The clause has the rider's shape but its type list cannot be read. The
+    /// gate must not be dropped (that would widen the rider to every source), so
+    /// the clause is claimed and gapped honestly instead.
+    UnreadableTypeList,
+}
+
+/// CR 608.2c + CR 109.2: nom recognizer for the "if an ability of a <type list>
+/// is countered this way, that permanent loses all abilities for as long as ~
+/// remains on the battlefield" continuation clause (Tishana's Tidebinder).
+/// Operates on lowercased text; tolerates a trailing period/whitespace.
+///
+/// Returns `None` when the clause is not this shape (including a duration other
+/// than the presence-bound one). When the shape matches but the type list is not
+/// fully readable it returns [`CounterLosesAbilitiesRider::UnreadableTypeList`],
+/// so the clause is claimed and gapped rather than silently falling to the
+/// generic sequence path or becoming an unrestricted `source_rider`.
+///
+/// Composed from independent axes rather than enumerated as full strings:
+///   - condition subject ("an ability of <type list>" via
+///     `parse_type_phrase_folding` / "a permanent's ability" / "an ability").
+///   - the loses-abilities consequence on the countered ability's source.
+///   - the CR 611.2b duration, read by `parse_duration`.
+fn recognize_counter_loses_abilities_rider(lower: &str) -> Option<CounterLosesAbilitiesRider> {
+    let clause = lower.trim().trim_end_matches('.').trim_end();
+    let (rest, _) = tag::<_, _, OracleError<'_>>("if ").parse(clause).ok()?;
+    let (rest, subject) = alt((
+        map(
+            preceded(
+                tag::<_, _, OracleError<'_>>("an ability of "),
+                take_until(" is countered this way, "),
+            ),
+            Some,
+        ),
+        value(None, alt((tag("a permanent's ability"), tag("an ability")))),
+    ))
+    .parse(rest)
+    .ok()?;
+    let (rest, _) =
+        tag::<_, _, OracleError<'_>>(" is countered this way, that permanent loses all abilities ")
+            .parse(rest)
+            .ok()?;
+    let (rest, duration) = parse_duration(rest).ok()?;
+    // CR 611.2b + CR 702.26f: the only duration the rider resolver applies is the
+    // presence-bound one ("for as long as ~ remains on the battlefield").
+    if duration != Duration::WhileHostOnBattlefield {
+        return None;
+    }
+    eof::<_, OracleError<'_>>.parse(rest).ok()?;
+    let Some(type_list) = subject else {
+        return Some(CounterLosesAbilitiesRider::Gate(None));
+    };
+    // `parse_type_phrase_folding` is infallible: an unrecognized phrase comes
+    // back unconsumed, so require the whole list to be read.
+    let (filter, remainder) = parse_type_phrase_folding(type_list);
+    if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
+        return Some(CounterLosesAbilitiesRider::UnreadableTypeList);
+    }
+    Some(CounterLosesAbilitiesRider::Gate(Some(Box::new(filter))))
+}
+
 /// CR 701.6a + CR 614.1a: nom recognizer for the "if that spell is countered
 /// this way, put it <zone> instead of into that player's graveyard"
 /// continuation clause (Memory Lapse, Remand, Spell Crumple). Operates on
 /// lowercased text; tolerates a trailing period/whitespace. Returns the parsed
 /// [`SpellStackToGraveyardReplacement`], or `None` for an unsupported destination
-/// (Hinder's "your choice of the top or bottom", Transcendent Dragon's "exile
-/// it instead") so those cards are honestly gapped rather than misparsed.
+/// (Hinder's "your choice of the top or bottom") so those cards are honestly
+/// gapped rather than misparsed. "Exile it instead" also returns `None`: it
+/// lowers to the `ChangeZone { Exile, ParentTarget }` rider `counter::resolve`
+/// reads (Dissipate, Transcendent Dragon).
 ///
 /// Composed from independent axes rather than enumerated as full strings:
 ///   - spell anaphor ("that spell" / "that card" / "it").
@@ -5002,7 +5177,10 @@ pub(super) fn apply_clause_continuation(
                 grants.extend(new_grants);
             }
         }
-        ContinuationAst::CounterSourceStatic { source_static } => {
+        ContinuationAst::CounterSourceStatic {
+            source_static,
+            source_filter,
+        } => {
             let Some(previous) = defs.last_mut() else {
                 return;
             };
@@ -5018,8 +5196,23 @@ pub(super) fn apply_clause_continuation(
                 // a phase-out of this creature, not only on its exit.
                 *existing = Some(CounterSourceRider::LosesAbilities {
                     static_def: source_static,
+                    source_filter,
                     duration: Box::new(Duration::WhileHostOnBattlefield),
                 });
+            }
+        }
+        // CR 608.2c: the rider's source-type gate is unreadable. Dropping it would
+        // widen the rider to every source, so gap the whole counter honestly
+        // (strict-failure marker) rather than counter with a wrong rider.
+        ContinuationAst::CounterSourceRiderUnreadable { fragment } => {
+            let Some(previous) = defs.last_mut() else {
+                return;
+            };
+            if matches!(&*previous.effect, Effect::Counter { .. }) {
+                *previous.effect =
+                    Effect::unimplemented("counter_source_rider_type_list", fragment);
+                previous.sub_ability = None;
+                previous.else_ability = None;
             }
         }
         ContinuationAst::CounterSourceRiderDestroy => {
@@ -5117,7 +5310,8 @@ pub(super) fn apply_clause_continuation(
             ));
         }
         ContinuationAst::GoadLastCreated { duration } => {
-            // CR 701.15b: Goaded is a static ability on the just-created tokens.
+            // CR 701.15b: Goaded is a designation on the created tokens. The
+            // static-mode modification is an intermediate resolution encoding.
             defs.push(AbilityDefinition::new(
                 kind,
                 Effect::GenericEffect {
@@ -6206,6 +6400,52 @@ pub(super) fn apply_clause_continuation(
                 )
                 .or_else(|| defs.len().checked_sub(1));
             if let Some(target_idx) = target_idx {
+                // CR 608.2c: instructions are followed in the order written. When
+                // another instruction sits between the reveal and this pile
+                // placement (Goblin Charbelcher's damage), folding the placement
+                // into the reveal would move the pile BEFORE that instruction.
+                // Leave the cards where the reveal found them and emit the
+                // placement as a later chain instruction over the revealed set.
+                // Scoped to an intervening damage instruction: damage is the
+                // replaceable event whose replacement effects (CR 615.5) act on the
+                // revealed cards before the placement.
+                let intervening_damage = defs[target_idx + 1..]
+                    .iter()
+                    .any(super::def_is_damage_dealer);
+                if intervening_damage && defs[target_idx].sub_ability.is_none() {
+                    if let Effect::RevealUntil {
+                        matched_disposition,
+                        ..
+                    } = &mut *defs[target_idx].effect
+                    {
+                        *matched_disposition = RevealUntilDisposition::RevealOnly;
+                        let mut placement = AbilityDefinition::new(
+                            kind,
+                            Effect::ChangeZoneAll {
+                                origin: Some(Zone::Library),
+                                destination,
+                                // The cards this reveal revealed — those still in the
+                                // library: a card an intervening replacement moved
+                                // elsewhere (Swans's draw) is no longer part of the pile.
+                                target: TargetFilter::LastRevealed,
+                                enters_under: None,
+                                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                                enters_attacking: false,
+                                enter_with_counters: vec![],
+                                face_down_profile: None,
+                                library_position: (destination == Zone::Library)
+                                    .then_some(LibraryPosition::Bottom),
+                                library_shuffle: Default::default(),
+                                random_order: matches!(rest_order, DigRestOrder::Random),
+                            },
+                        );
+                        // An independent following instruction, performed on every
+                        // branch of an intervening "instead" override.
+                        placement.sub_link = SubAbilityLink::SequentialSibling;
+                        defs.push(placement);
+                        return;
+                    }
+                }
                 patch_reveal_until_all_to_zone_recursively(
                     &mut defs[target_idx],
                     destination,
@@ -6565,6 +6805,7 @@ pub(super) fn continuation_absorbs_current(
         ContinuationAst::ManaRestriction { .. }
         | ContinuationAst::ManaGrant { .. }
         | ContinuationAst::CounterSourceStatic { .. }
+        | ContinuationAst::CounterSourceRiderUnreadable { .. }
         | ContinuationAst::CounterSourceRiderDestroy
         | ContinuationAst::CounterSpellZoneRedirect { .. } => true,
         // CR 707.10c: recognition was already gated on a preceding CopySpell in
@@ -7955,7 +8196,10 @@ fn parse_change_zone_enters_tapped_attacking(
     // tail — RevealedHasCardType carries no TargetFilter, so reuse the canonical
     // materializer rather than reconstructing from the recognized condition.
     let type_tail = strip_moved_object_subject(condition_clause)?;
-    let (filter, leftover) = crate::parser::oracle_target::parse_type_phrase_folding(type_tail);
+    let (filter, leftover) = crate::parser::oracle_target::parse_type_phrase_folding_with_ctx(
+        type_tail,
+        &mut ctx.clone_player_antecedents(),
+    );
     if matches!(filter, TargetFilter::Any | TargetFilter::None) || !leftover.trim().is_empty() {
         return None;
     }
@@ -8265,15 +8509,29 @@ pub(super) fn parse_followup_continuation_ast_with_search_destination(
         {
             Some(ContinuationAst::SelfCostKeywordCostClarification)
         }
+        // CR 608.2c + CR 109.2: "If an ability of an artifact, creature, or
+        // planeswalker is countered this way, that permanent loses all
+        // abilities for as long as ~ remains on the battlefield." (Tishana's
+        // Tidebinder). The recognizer carries the printed type gate; a rider-shaped
+        // clause whose type list it cannot read is claimed and gapped.
         Effect::Counter { .. }
-            if nom_primitives::scan_contains(&lower, "countered this way")
-                && nom_primitives::scan_contains(&lower, "loses all abilities") =>
+            if let Some(rider) = recognize_counter_loses_abilities_rider(&lower) =>
         {
-            Some(ContinuationAst::CounterSourceStatic {
-                source_static: Box::new(StaticDefinition::continuous().modifications(vec![
-                    crate::types::ability::ContinuousModification::RemoveAllAbilities,
-                ])),
-            })
+            match rider {
+                CounterLosesAbilitiesRider::Gate(source_filter) => {
+                    Some(ContinuationAst::CounterSourceStatic {
+                        source_static: Box::new(StaticDefinition::continuous().modifications(
+                            vec![crate::types::ability::ContinuousModification::RemoveAllAbilities],
+                        )),
+                        source_filter,
+                    })
+                }
+                CounterLosesAbilitiesRider::UnreadableTypeList => {
+                    Some(ContinuationAst::CounterSourceRiderUnreadable {
+                        fragment: lower.trim().to_string(),
+                    })
+                }
+            }
         }
         // CR 701.8 + CR 608.2c: "If a permanent's ability is countered this way,
         // destroy that permanent." (Teferi's Response, Green Slime). Claiming
@@ -8287,7 +8545,8 @@ pub(super) fn parse_followup_continuation_ast_with_search_destination(
         // Remand, Spell Crumple). The `scan_contains` pre-guard mirrors the
         // source-rider arms above; the real classification is the combinator
         // recognizer, which returns `None` for unsupported destinations
-        // (Hinder, Transcendent Dragon) so those cards stay honestly gapped.
+        // (Hinder) so those cards stay honestly gapped; "exile it instead"
+        // (Transcendent Dragon) also returns `None` and lowers to the exile rider.
         Effect::Counter { .. }
             if nom_primitives::scan_contains(&lower, "countered this way") => // allow-noncombinator
         {
@@ -9114,11 +9373,10 @@ fn parse_explicit_choose_and_sacrifice_rest_filter(
         after_domain,
         &ParseContext::default(),
     ) {
-        let (rest, _) = opt(alt((
-            tag::<_, _, OracleError<'_>>(" they control"),
-            tag(" you control"),
-            tag(" that player controls"),
-        )))
+        let (rest, _) = opt(preceded(
+            tag::<_, _, OracleError<'_>>(" "),
+            controller_phrase_among(CHOOSER_DOMAIN_CONTROLLERS),
+        ))
         .parse(rest)?;
         if let TargetFilter::Typed(ref mut typed) = filter {
             typed.properties.push(prop);
@@ -9133,12 +9391,7 @@ fn parse_explicit_choose_and_sacrifice_rest_filter(
 /// domain for Slaughter the Strong's "sacrifices all other creatures they control".
 fn parse_creature_domain(input: &str) -> Result<(&str, TargetFilter), nom::Err<OracleError<'_>>> {
     let (input, _) = tag::<_, _, OracleError<'_>>("creatures ").parse(input)?;
-    let (input, _) = alt((
-        tag::<_, _, OracleError<'_>>("they control"),
-        tag("you control"),
-        tag("that player controls"),
-    ))
-    .parse(input)?;
+    let (input, _) = controller_phrase_among(CHOOSER_DOMAIN_CONTROLLERS).parse(input)?;
     Ok((input, TargetFilter::Typed(TypedFilter::creature())))
 }
 
@@ -9146,12 +9399,7 @@ fn parse_nonland_permanent_domain(
     input: &str,
 ) -> Result<(&str, TargetFilter), nom::Err<OracleError<'_>>> {
     let (input, _) = tag::<_, _, OracleError<'_>>("nonland permanents ").parse(input)?;
-    let (input, _) = alt((
-        tag::<_, _, OracleError<'_>>("they control"),
-        tag("you control"),
-        tag("that player controls"),
-    ))
-    .parse(input)?;
+    let (input, _) = controller_phrase_among(CHOOSER_DOMAIN_CONTROLLERS).parse(input)?;
     Ok((
         input,
         TargetFilter::Typed(
@@ -9813,7 +10061,7 @@ pub(super) fn does_the_same_unimplemented_name(subject: DoesTheSameSubject) -> S
 /// creature attacking that player. When the rider carries the "attacking that
 /// player" combat qualifier, the affected set is therefore NARROWER than plain
 /// `Opponent` (all opponents): it is only those opponents who control a creature
-/// attacking the enchanted/defending player this combat (CR 102.2 + CR 508.1b).
+/// attacking the enchanted player when the effect is applied (CR 102.2).
 /// The qualifier is folded into a dedicated `OpponentAttackingEnchantedPlayer`
 /// scope so a non-attacking opponent — and, crucially, the enchanted defending
 /// player in a two-player game — never receives the copied effect. A plain
@@ -9848,9 +10096,9 @@ pub(super) fn try_parse_scoped_does_the_same(text: &str) -> Option<PlayerFilter>
         return None;
     }
     if has_attacking_qualifier {
-        // CR 508.6 + CR 102.2 + CR 508.1b: "each opponent attacking that player"
-        // = opponents of the controller who declared a creature attacking the
-        // enchanted player. Only composes with the opponent subject; any other
+        // CR 508.6 + CR 102.2: "each opponent attacking that player"
+        // = opponents of the controller who control a creature attacking the
+        // enchanted player when the effect is applied. Only composes with the opponent subject; any other
         // subject + combat qualifier stays an honest residual (no matching CR
         // scope, and no card exercises it).
         match scope {
@@ -9866,6 +10114,183 @@ pub(super) fn try_parse_scoped_does_the_same(text: &str) -> Option<PlayerFilter>
 mod tests {
     use super::*;
     use crate::types::ability::{QuantityExpr, SearchSelectionConstraint, ZoneChoiceChooser};
+
+    /// The sacrifice-rest domains admit "they control", "you control" and "that
+    /// player controls".
+    const CHOOSER_DOMAIN: [&str; 3] = ["they control", "you control", "that player controls"];
+
+    /// Controller phrases the sacrifice-rest domains decline.
+    const NOT_CHOOSER_DOMAIN: [&str; 2] =
+        ["controlled by that player", "the chosen player controls"];
+
+    #[test]
+    fn sacrifice_rest_trailing_qualifier_marker() {
+        let text = |qualifier: &str| {
+            format!(
+                "each player sacrifices all other creatures they control that don't share a \
+                 creature type with the chosen creature {qualifier}"
+            )
+        };
+        for admitted in CHOOSER_DOMAIN {
+            let Some(ContinuationAst::ChooseAndSacrificeRestFilter {
+                sacrifice_filter: Some(TargetFilter::Typed(filter)),
+            }) = parse_choose_and_sacrifice_rest_followup(&text(admitted))
+            else {
+                panic!("{admitted:?} must be admitted");
+            };
+            assert_eq!(filter.type_filters, vec![TypeFilter::Creature]);
+            assert_eq!(filter.properties.len(), 1, "{admitted:?}");
+        }
+        for declined in NOT_CHOOSER_DOMAIN {
+            let declined_text = text(declined);
+            let (rest, filter) = parse_explicit_choose_and_sacrifice_rest_filter(&declined_text)
+                .expect("the qualifier is optional");
+            assert_eq!(rest, format!(" {declined}"), "{declined:?}");
+            assert!(filter.is_some(), "{declined:?}");
+            assert_eq!(
+                parse_choose_and_sacrifice_rest_followup(&text(declined)),
+                None,
+                "{declined:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sacrifice_rest_domain_marker() {
+        let nonland =
+            TypedFilter::permanent().with_type(TypeFilter::Non(Box::new(TypeFilter::Land)));
+        for admitted in CHOOSER_DOMAIN {
+            assert_eq!(
+                parse_creature_domain(&format!("creatures {admitted} not chosen this way")).ok(),
+                Some((
+                    " not chosen this way",
+                    TargetFilter::Typed(TypedFilter::creature())
+                )),
+                "creatures {admitted:?}"
+            );
+            assert_eq!(
+                parse_nonland_permanent_domain(&format!(
+                    "nonland permanents {admitted} not chosen this way"
+                ))
+                .ok(),
+                Some((" not chosen this way", TargetFilter::Typed(nonland.clone()))),
+                "nonland permanents {admitted:?}"
+            );
+            assert_eq!(
+                parse_choose_and_sacrifice_rest_followup(&format!(
+                    "each player sacrifices all other nonland permanents {admitted}."
+                )),
+                Some(ContinuationAst::ChooseAndSacrificeRestFilter {
+                    sacrifice_filter: Some(TargetFilter::Typed(nonland.clone())),
+                }),
+                "{admitted:?}"
+            );
+        }
+        for declined in NOT_CHOOSER_DOMAIN {
+            assert!(
+                parse_creature_domain(&format!("creatures {declined} not chosen this way"))
+                    .is_err(),
+                "creatures {declined:?}"
+            );
+            assert!(
+                parse_nonland_permanent_domain(&format!(
+                    "nonland permanents {declined} not chosen this way"
+                ))
+                .is_err(),
+                "nonland permanents {declined:?}"
+            );
+            assert_eq!(
+                parse_choose_and_sacrifice_rest_followup(&format!(
+                    "each player sacrifices all creatures {declined} not chosen this way."
+                )),
+                None,
+                "{declined:?}"
+            );
+        }
+    }
+
+    /// CR 603.7b + CR 608.2c: an inline delayed trigger keeps the following
+    /// sentences of its effect in its own chunk (The Last Ronin III), but a
+    /// sentence opening another trigger or restricting the activation stays
+    /// separate; a chunk that isn't an inline delayed trigger splits as usual.
+    #[test]
+    fn inline_delayed_trigger_keeps_its_trailing_effect_sentences() {
+        let ronin = "Whenever a creature you control attacks alone this turn, put three +1/+1 counters on it. It gains trample, lifelink, and indestructible until end of turn.";
+        let chunks = split_clause_sequence(ronin);
+        assert_eq!(chunks.len(), 1, "{chunks:?}");
+        let davriel = "Until your next turn, whenever an opponent attacks you, they discard a card. If they can't, they sacrifice an attacking creature.";
+        assert_eq!(split_clause_sequence(davriel).len(), 1, "{davriel}");
+        let dagger = "Whenever target creature deals combat damage to a creature this turn, destroy that creature. When the targeted creature leaves the battlefield this turn, sacrifice this artifact.";
+        assert_eq!(split_clause_sequence(dagger).len(), 2, "{dagger}");
+        let boa = "Choose a color. Whenever this creature becomes blocked by a creature of that color this turn, destroy that creature. Activate only as a sorcery.";
+        assert_eq!(split_clause_sequence(boa).len(), 3, "{boa}");
+        let dalkovan = "Whenever you attack this turn, create two 1/1 red Warrior creature tokens that are tapped and attacking. Sacrifice them at the beginning of the next end step.";
+        assert_eq!(split_clause_sequence(dalkovan).len(), 2, "{dalkovan}");
+        let draught = "Until end of turn, whenever a creature an opponent controls blocks, draw a card. Draw a card.";
+        assert_eq!(split_clause_sequence(draught).len(), 2, "{draught}");
+        let waltz = "Until end of turn, whenever a creature you control dies, exile the top card of your library. You may play it until the end of your next turn.";
+        assert_eq!(split_clause_sequence(waltz).len(), 2, "{waltz}");
+        let plain = "Draw a card. It gains flying until end of turn.";
+        assert_eq!(split_clause_sequence(plain).len(), 2, "{plain}");
+    }
+
+    #[test]
+    fn source_pronoun_damage_boundaries_compose_pronoun_verb_and_connector() {
+        for pronoun in ["he", "she"] {
+            for verb in ["deal", "deals"] {
+                for connector in [", and ", " and "] {
+                    let tail = format!("{pronoun} {verb} 4 damage to each opponent");
+                    assert!(starts_with_damage_clause(&tail), "{tail}");
+                    let text = format!("put four +1/+1 counters on ~{connector}{tail}");
+                    let chunks = split_clause_sequence(&text);
+                    assert_eq!(chunks.len(), 2, "{text}: {chunks:?}");
+                    assert_eq!(chunks[0].text, "put four +1/+1 counters on ~");
+                    let raw_tail = if connector == ", and " {
+                        format!("and {tail}")
+                    } else {
+                        tail.clone()
+                    };
+                    assert_eq!(chunks[1].text, raw_tail, "{text}");
+                    assert_eq!(
+                        super::super::lower::strip_leading_sequence_connector(&chunks[1].text)
+                            .trim(),
+                        tail,
+                        "{text}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn source_pronoun_damage_boundary_requires_an_immediate_whole_verb() {
+        assert!(starts_with_damage_clause(
+            "she deals 4 damage to each opponent"
+        ));
+        for tail in [
+            "shell deals 4 damage to each opponent",
+            "he dealing 4 damage to each opponent",
+            "she eventually deals 4 damage to each opponent",
+            "they deal 4 damage to each opponent",
+        ] {
+            assert!(!starts_with_damage_clause(tail), "{tail}");
+            let text = format!("put four +1/+1 counters on ~ and {tail}");
+            assert_eq!(split_clause_sequence(&text).len(), 1, "{text}");
+        }
+    }
+
+    #[test]
+    fn source_pronoun_damage_boundaries_do_not_escape_quoted_abilities() {
+        let text = "target creature gains \"{T}: Put a +1/+1 counter on this creature and he deals 1 damage to each opponent.\" until end of turn";
+        assert_eq!(split_clause_sequence(text).len(), 1);
+        assert_eq!(
+            split_clause_sequence(
+                "put a +1/+1 counter on ~ and he deals 1 damage to each opponent"
+            )
+            .len(),
+            2,
+        );
+    }
 
     // CR 401.4: unspecified library placement preserves the owner's choice;
     // explicit randomization and non-library destinations retain their modes.
@@ -14870,10 +15295,14 @@ mod tests {
         assert!(starts_bare_and_clause(
             "she doesn't untap during her next untap step"
         ));
+        // CR 608.2c: a source-pronoun damage instruction is its own clause
+        // (Aang, Master of Elements: "... counters on him, and he deals 4
+        // damage to each opponent").
+        assert!(starts_bare_and_clause("she deals 2 damage to any target"));
         // Guard: a gendered pronoun WITHOUT a recognized continuous/restriction
-        // verb must NOT split (no false clause boundary).
+        // or damage verb must NOT split (no false clause boundary).
         assert!(!starts_bare_and_clause("he attacks this turn"));
-        assert!(!starts_bare_and_clause("she deals 2 damage to any target"));
+        assert!(!starts_bare_and_clause("she eventually deals 2 damage"));
     }
 
     /// CR 104.2b + CR 104.3e + CR 119.7 + CR 119.8: plural-player subject +

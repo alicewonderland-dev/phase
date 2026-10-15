@@ -5,7 +5,7 @@ use crate::types::ability::{
     TargetFilter, TargetRef,
 };
 use crate::types::events::GameEvent;
-use crate::types::game_state::{BatchCompletion, CastingVariant, GameState, WaitingFor};
+use crate::types::game_state::{BatchCompletion, GameState, WaitingFor};
 use crate::types::identifiers::ObjectId;
 use crate::types::mana::ManaCost;
 use crate::types::statics::CastFrequency;
@@ -36,8 +36,10 @@ fn extract_controller_ref(filter: &TargetFilter) -> Option<&crate::types::abilit
 }
 
 /// CR 701.20e + CR 400.2: A private self-library peek keeps its looked-at
-/// cards in the controller-owned library while publishing their identities only
-/// through the resolving effect's `last_revealed_ids` window.
+/// cards in the controller's library while publishing their identities only
+/// through the resolving effect's `last_revealed_ids` window. CR 400.1 as a
+/// shared-library format modifies it: a card is in that library when its
+/// owner's library is the controller's, so the shared pile holds every owner's.
 pub(crate) fn looked_at_controller_library_cards(
     state: &GameState,
     controller: crate::types::player::PlayerId,
@@ -47,10 +49,9 @@ pub(crate) fn looked_at_controller_library_cards(
         .iter()
         .copied()
         .filter(|id| {
-            state
-                .objects
-                .get(id)
-                .is_some_and(|object| object.zone == Zone::Library && object.owner == controller)
+            state.objects.get(id).is_some_and(|object| {
+                state.object_in_players_zone(object, Zone::Library, controller)
+            })
         })
         .collect()
 }
@@ -115,7 +116,7 @@ fn tracked_set_cast_candidates(
     // `filter: Any`, which reads no object scope) and closed here so it stays that
     // way.
     let mut scoped_ability = ability.clone();
-    scoped_ability.targets = deduped.iter().copied().map(TargetRef::Object).collect();
+    scoped_ability.set_unpinned_targets(deduped.iter().copied().map(TargetRef::Object).collect());
     let ctx = crate::game::filter::FilterContext::from_ability(&scoped_ability);
     deduped
         .into_iter()
@@ -328,7 +329,7 @@ pub(crate) fn stash_declined_cast_fallback(
     }
     let mut fallback = sub.clone();
     if fallback.targets.is_empty() && !ability.targets.is_empty() {
-        fallback.targets = ability.targets.clone();
+        fallback.mirror_targets_from(ability);
     }
     super::apply_parent_chain_context(&mut fallback, ability, None, state);
     // Reset AFTER apply_parent_chain_context (which copies the parent's context,
@@ -398,7 +399,7 @@ fn open_private_zone_cast_selection(
             *driver = crate::types::ability::CastFromZoneDriver::DuringResolution;
         }
     }
-    stash.targets.clear();
+    stash.clear_targets();
     let eligible = compute_hand_pick_eligible(state, &stash, &stored_filter, source_zone);
 
     if eligible.is_empty() {
@@ -578,6 +579,13 @@ pub fn resolve(
         return Ok(());
     }
 
+    // CR 601.2c + CR 608.2g: the head slot of a multi-slot free cast (Finale of
+    // Promise) resolves every slot of its instruction as one cast window.
+    let slot_links = cast_slot_group(ability);
+    if !slot_links.is_empty() {
+        return resolve_cast_slot_group(state, ability, target_ids, &slot_links, events);
+    }
+
     // CR 701.20e + CR 608.2c: Look-then-cast chains (Kiora) inject the legal
     // looked-at library cards as targets at the chain seam
     // (`inject_last_revealed_targets`), already filtered through this cast
@@ -640,11 +648,13 @@ pub fn resolve(
         // cast grant, bind the filter's object-scope reads to the current
         // resolution's linked cards, not the source's lifetime exile pile.
         let mut scoped_ability = ability.clone();
-        scoped_ability.targets = candidate_ids
-            .iter()
-            .copied()
-            .map(TargetRef::Object)
-            .collect();
+        scoped_ability.set_unpinned_targets(
+            candidate_ids
+                .iter()
+                .copied()
+                .map(TargetRef::Object)
+                .collect(),
+        );
         let ctx = crate::game::filter::FilterContext::from_ability(&scoped_ability);
         target_ids = candidate_ids
             .iter()
@@ -1068,7 +1078,7 @@ pub fn resolve(
         // The rider has been translated into the window's per-cast metadata;
         // retaining it would run a second destination move after the window.
         window.sub_ability = None;
-        window.targets = target_ids.drain(..).map(TargetRef::Object).collect();
+        window.set_unpinned_targets(target_ids.drain(..).map(TargetRef::Object).collect());
         return super::free_cast_from_zones::resolve_with_face_policy(
             state,
             &window,
@@ -1122,6 +1132,127 @@ pub fn resolve(
     Ok(())
 }
 
+/// CR 601.2c + CR 608.2g: the further target slots of one "you may cast up to
+/// one target A and/or up to one target B … without paying their mana costs"
+/// instruction (Finale of Promise), in printed order, when `ability` is that
+/// instruction's head slot; empty otherwise.
+///
+/// The parser lowers each slot as its own free `CastFromZone` link so every slot
+/// keeps its own filter and target count (CR 601.2c: each "target" is a separate
+/// instance). They are still one instruction: the player casts the chosen cards
+/// during the resolution, in either order, or declines any of them — so the head
+/// resolves all of them through one cast window and the chain skips the slot
+/// links that follow it.
+pub(crate) fn cast_slot_group(ability: &ResolvedAbility) -> Vec<&ResolvedAbility> {
+    fn is_free_cast_slot(link: &ResolvedAbility) -> bool {
+        link.multi_target.is_some()
+            && matches!(
+                link.effect,
+                Effect::CastFromZone {
+                    without_paying_mana_cost: true,
+                    alt_ability_cost: None,
+                    duration: None,
+                    ..
+                }
+            )
+    }
+    if !is_free_cast_slot(ability) {
+        return Vec::new();
+    }
+    std::iter::successors(ability.sub_ability.as_deref(), |link| {
+        link.sub_ability.as_deref()
+    })
+    .take_while(|link| is_free_cast_slot(link))
+    .collect()
+}
+
+/// CR 608.2g + CR 601.2c: resolve a multi-slot free cast (see
+/// [`cast_slot_group`]) as one free-cast window over exactly the cards chosen
+/// for its slots. A card chosen for two slots (a split card that is both an
+/// instant and a sorcery) is offered once: once cast, it can't be cast again.
+/// Each candidate must still satisfy the filter of a slot it was chosen for,
+/// frozen as the effect is applied (CR 608.2h), and the graveyard rider after
+/// the last slot travels with every cast. The chosen cards are published as
+/// the chain's tracked set, which is what a following "those spells" reads.
+fn resolve_cast_slot_group(
+    state: &mut GameState,
+    head: &ResolvedAbility,
+    head_targets: Vec<ObjectId>,
+    slot_links: &[&ResolvedAbility],
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EffectError> {
+    let mut pool = head_targets;
+    for link in slot_links {
+        for target in link.live_object_targets(state) {
+            if let TargetRef::Object(id) = target {
+                if !pool.contains(&id) {
+                    pool.push(id);
+                }
+            }
+        }
+    }
+    let filters = std::iter::once(head)
+        .chain(slot_links.iter().copied())
+        .filter_map(|link| match &link.effect {
+            Effect::CastFromZone { target, .. } => Some(freeze_resolution_cast_filter(
+                state,
+                link,
+                target.clone(),
+                None,
+            )),
+            _ => None,
+        })
+        .collect();
+    let filter = TargetFilter::Or { filters };
+    super::publish_tracked_set(state, pool.clone());
+
+    let mut zones: Vec<Zone> = Vec::new();
+    for zone in pool
+        .iter()
+        .filter_map(|id| state.objects.get(id).map(|obj| obj.zone))
+    {
+        if !zones.contains(&zone) {
+            zones.push(zone);
+        }
+    }
+    let count = u8::try_from(pool.len()).ok();
+    let graveyard_replacement = slot_links
+        .last()
+        .and_then(|last| cast_from_zone_graveyard_destination(last));
+    let constraint = match &head.effect {
+        Effect::CastFromZone { constraint, .. } => constraint.clone(),
+        _ => None,
+    };
+    let face_policy = crate::types::ability::ResolutionCastFacePolicy::new(
+        filter.clone(),
+        head.source_id,
+        head.controller,
+        freeze_cast_permission_constraint(state, head, constraint),
+    );
+    let mut window = head.clone();
+    window.effect = Effect::FreeCastFromZones {
+        count,
+        max_total_mv: None,
+        filter,
+        zones: zones.clone(),
+        graveyard_replacement: graveyard_replacement.clone(),
+    };
+    window.sub_ability = None;
+    window.targets = pool.into_iter().map(TargetRef::Object).collect();
+    super::free_cast_from_zones::resolve_with_face_policy(
+        state,
+        &window,
+        super::free_cast_from_zones::FreeCastWindowRequest {
+            count,
+            max_total_mv: None,
+            zones,
+            graveyard_replacement,
+            face_policy,
+        },
+        events,
+    )
+}
+
 /// CR 400.1 + CR 601.2a: The zones a resolution-scoped batch window may cast
 /// from. CR 601.2a moves the card "from where it is to the stack", and a batch
 /// produced by an exile / mill / reveal step lands in one of these four (exile
@@ -1170,10 +1301,16 @@ fn open_resolution_cast_window(
     // concrete member pool already proves it, while re-evaluating it later
     // would read a different linked-exile snapshot.  The residual filter and
     // fixed constraint are the one policy every projected face must satisfy.
+    //
+    // CR 608.2c: a bare `ParentTarget` anaphor ("one of those two cards" —
+    // Invasion of Alara) is discharged the same way: the pool IS the batch the
+    // chain handed over, and the persisted window has no parent to re-read.
     let window_filter = if target_filter.references_exiled_by_source() {
         target_filter
             .without_exile_anaphor()
             .unwrap_or(TargetFilter::Any)
+    } else if matches!(target_filter, TargetFilter::ParentTarget) {
+        TargetFilter::Any
     } else {
         target_filter.clone()
     };
@@ -1241,7 +1378,7 @@ fn open_resolution_cast_window(
     if graveyard_replacement.is_some() {
         window.sub_ability = None;
     }
-    window.targets = pool.into_iter().map(TargetRef::Object).collect();
+    window.set_unpinned_targets(pool.into_iter().map(TargetRef::Object).collect());
     super::free_cast_from_zones::resolve_with_face_policy(
         state,
         &window,
@@ -1465,7 +1602,7 @@ pub(crate) fn freeze_resolution_cast_filter(
         | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::Opponent
         | TargetFilter::SelfRef
-        | TargetFilter::GrantingObject
+        | TargetFilter::GrantingObject { .. }
         | TargetFilter::SourceOrPaired
         | TargetFilter::StackAbility { .. }
         | TargetFilter::StackSpell
@@ -1487,6 +1624,7 @@ pub(crate) fn freeze_resolution_cast_filter(
         | TargetFilter::TriggeringSourceController
         | TargetFilter::EventTargetController
         | TargetFilter::ParentTargetController
+        | TargetFilter::DeclaredPlayer { .. }
         | TargetFilter::ParentTargetOwner
         | TargetFilter::SourceChosenPlayer
         | TargetFilter::OriginalController
@@ -1677,24 +1815,6 @@ fn cast_stack_spell_copy_during_resolution(
         copy.cast_spell_keywords = cast_spell_keywords;
     }
 
-    let origin = obj.cast_from_zone.unwrap_or(Zone::Exile);
-    events.push(GameEvent::SpellCast {
-        card_id: obj.card_id,
-        controller: ability.controller,
-        object_id: copy_id,
-        cast_mana_value: Some(obj.spell_mana_value()),
-    });
-    let occurrence = crate::game::restrictions::record_spell_cast_from_zone(
-        state,
-        ability.controller,
-        &obj,
-        origin,
-        CastingVariant::Normal,
-    )
-    .map_err(stack_spell_copy_cast_ledger_error)?;
-    crate::game::casting_costs::stamp_cast_occurrence_on_stack_spell(state, copy_id, occurrence)
-        .map_err(|error| EffectError::InvalidParam(error.to_string()))?;
-
     if crate::game::effects::prepare::open_copy_target_selection(
         state,
         copy_id,
@@ -1705,6 +1825,10 @@ fn cast_stack_spell_copy_during_resolution(
     {
         return Ok(());
     }
+    // CR 707.12 + CR 601.2i: with no target to announce, the copy is cast now;
+    // otherwise it becomes cast when its announcement walk completes.
+    crate::game::casting_costs::commit_copy_cast(state, copy_id, ability.controller, events)
+        .map_err(|error| EffectError::InvalidParam(error.to_string()))?;
 
     state.waiting_for = WaitingFor::Priority {
         player: ability.controller,
@@ -1857,30 +1981,34 @@ fn cast_resolution_request_during_resolution(
 /// instead" as a sequential rider sub-ability on `CastFromZone`, targeting the
 /// cast spell (`ParentTarget`). Runtime consumes that rider as permission
 /// metadata (the CR 608.2n redirect destination), not as an immediate zone
-/// move. Returns the redirect destination the rider encodes, or `None` when the
-/// sub-ability is not such a rider.
+/// move. Asked of the LINK, not the effect alone: CR 608.2c — a link whose gate
+/// reads the preceding instruction's outcome
+/// (`condition_depends_on_effect_performed`; the "If you don't [cast it], put it
+/// into your hand / exile it / put it on the bottom" decline branch of Solstice
+/// Revelations, Djinn of Wishes, Descendants' Path) carries a printed "if you
+/// do" / "if you don't" instruction that the controller follows in order, never
+/// a CR 614.1a "instead" replacement of the cast spell's trip to the graveyard.
+/// Returns the redirect destination the rider encodes, or `None` when the link
+/// is not such a rider.
 pub(crate) fn graveyard_destination_rider(
     effect: &Effect,
+    condition: Option<&AbilityCondition>,
 ) -> Option<SpellStackToGraveyardReplacement> {
+    // CR 608.2c + CR 614.1a: an outcome-gated link is an instruction followed in
+    // order, not an "instead" replacement.
+    if condition.is_some_and(super::condition_depends_on_effect_performed) {
+        return None;
+    }
     match effect {
         Effect::ChangeZone {
             destination: Zone::Exile,
             target: TargetFilter::ParentTarget,
             ..
         } => Some(SpellStackToGraveyardReplacement::Exile),
-        // ISSUE #8721, MEASURED AND REJECTED: this arm also swallows Invasion of
-        // Alara's printed "Put one of them into your hand." — an unconditional
-        // move of the OTHER exiled card, not a graveyard replacement. Gating the
-        // arm on the "if you don't cast it" condition (which the four genuine
-        // members carry and Invasion of Alara does not) does let that
-        // instruction run — and it then moves the WRONG object: with no chosen
-        // target on the head, `ParentTarget` binds to the source, and the Siege
-        // returns itself to its owner's hand. Measured end-to-end through
-        // `GameScenario`/`GameRunner`, both accept and decline.
-        //
-        // So the classification stays as it is and the swallowed instruction is
-        // carried as a named gap: repairing it needs the `ParentTarget` binding
-        // fixed first, which is a separate unit with its own gate run.
+        // Invasion of Alara's "Put one of them into your hand." is not such a
+        // rider: it lowers to a choice from the cards its exile loop found
+        // (`ZoneChoiceCandidateSource::ParentTargets`) and never reaches this arm
+        // (issue #8750).
         Effect::ChangeZone {
             destination: Zone::Hand,
             target: TargetFilter::ParentTarget,
@@ -1902,9 +2030,12 @@ pub(crate) fn graveyard_destination_rider(
 /// is the only destination the COUNTER rider ever encodes (Force of Negation,
 /// No More Lies; the counter library/hand redirect rides `countered_spell_zone`
 /// instead, never a sub-ability).
-pub(crate) fn is_graveyard_exile_rider_subability(effect: &Effect) -> bool {
+pub(crate) fn is_graveyard_exile_rider_subability(
+    effect: &Effect,
+    condition: Option<&AbilityCondition>,
+) -> bool {
     matches!(
-        graveyard_destination_rider(effect),
+        graveyard_destination_rider(effect, condition),
         Some(SpellStackToGraveyardReplacement::Exile)
     )
 }
@@ -1938,14 +2069,14 @@ pub(crate) fn is_graveyard_exile_rider_subability(effect: &Effect) -> bool {
 ///
 /// Asked and recorded per `counter::resolve` call: a `player_scope` or
 /// `repeat_for` counter would keep only its last iteration's answer — no
-/// corpus counter head is scoped or repeated (measured: all 20 are chain
-/// heads), so that shape must be decided with its evidence, not inherited.
+/// corpus exile-rider counter head is scoped or repeated (measured over
+/// `card-data.json`: each is a chain head), so that shape must be decided with its evidence, not inherited.
 ///
 /// Fail closed on every other shape: a rider with `destination: Some(_)` names
 /// an arrival this pre-move question cannot see, and a condition of another
-/// kind is one no corpus rider carries (measured over all 20 exile-rider heads:
-/// 18 `Typed[Card]`, 1 `Typed[Permanent]`, 1 whose condition the parser does
-/// not carry — Delay; its printed "if the spell is countered this way" is
+/// kind is one no corpus rider carries (measured over every exile-rider head:
+/// `Typed[Card]`, `Typed[Permanent]` (Thranduil's Decree alone), and Delay
+/// alone, whose condition the parser does not carry; its printed "if the spell is countered this way" is
 /// always true for the countered spell). A new kind must be decided here, not
 /// inherited from the form.
 pub(crate) fn graveyard_exile_rider_applies_to(
@@ -1953,7 +2084,7 @@ pub(crate) fn graveyard_exile_rider_applies_to(
     sub: &ResolvedAbility,
     obj_id: ObjectId,
 ) -> bool {
-    is_graveyard_exile_rider_subability(&sub.effect)
+    is_graveyard_exile_rider_subability(&sub.effect, sub.condition.as_ref())
         && match &sub.condition {
             None => true,
             Some(AbilityCondition::ZoneChangedThisWay {
@@ -1987,7 +2118,7 @@ pub(crate) fn graveyard_exile_rider_applies_to(
 /// `conditional_enter_with_counters` through the shared
 /// `enter_with_counters_for_object`, in the same bound context. Asked only where
 /// `graveyard_exile_rider_applies_to` answered yes; a rider that names no
-/// counters (Force of Negation, Spelljack — 19 of the 20 corpus heads, measured
+/// counters (Force of Negation, Spelljack — every corpus head but Delay, measured
 /// over `card-data.json`) yields an empty list and the move carries none.
 pub(crate) fn graveyard_exile_rider_entry_counters(
     state: &GameState,
@@ -2003,7 +2134,7 @@ pub(crate) fn graveyard_exile_rider_entry_counters(
         return Vec::new();
     };
     let mut rider = sub.clone();
-    rider.targets = vec![TargetRef::Object(obj_id)];
+    rider.set_unpinned_targets(vec![TargetRef::Object(obj_id)]);
     let base: Vec<(crate::types::counter::CounterType, u32)> = enter_with_counters
         .iter()
         .map(|(counter_type, quantity)| {
@@ -2027,7 +2158,7 @@ fn cast_from_zone_graveyard_destination(
     ability
         .sub_ability
         .as_deref()
-        .and_then(|s| graveyard_destination_rider(&s.effect))
+        .and_then(|s| graveyard_destination_rider(&s.effect, s.condition.as_ref()))
 }
 
 /// CR 614.1c + CR 122.1: Osteomancer Adept / The Tomb of Aclazotz class — the
@@ -2468,8 +2599,9 @@ mod tests {
     use crate::game::zones::create_object;
     use crate::types::ability::{
         CardPlayMode, CastFromZoneDriver, CastPermissionConstraint, Comparator, ControllerRef,
-        Effect, FilterProp, ObjectScope, PtStat, PtValueScope, QuantityExpr, QuantityRef,
-        ResolutionCastWindow, TargetFilter, ThisWayCause, TypeFilter, TypedFilter,
+        Effect, EffectOutcomeSignal, FilterProp, LibraryPosition, ObjectScope, PtStat,
+        PtValueScope, QuantityExpr, QuantityRef, ResolutionCastWindow, TargetFilter, ThisWayCause,
+        TypeFilter, TypedFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::card::LayoutKind;
@@ -3845,6 +3977,32 @@ mod tests {
             Some(Zone::Stack),
             "copy remains on the stack"
         );
+        // CR 601.2i: the copy is cast only once its targets are announced.
+        assert!(
+            !events.iter().any(|event| {
+                matches!(event, GameEvent::SpellCast { object_id, .. } if *object_id == copy_id)
+            }),
+            "the copy is not cast before its announcement completes"
+        );
+        assert_eq!(state.objects[&copy_id].cast_occurrence, None);
+        assert!(
+            matches!(
+                state.waiting_for,
+                WaitingFor::CopyRetarget { copy_id: cid, .. } if cid == copy_id
+            ),
+            "targeted copy must open retarget selection, got {:?}",
+            state.waiting_for
+        );
+
+        // Choose a target and finalize the cast.
+        let events = apply_as_current(
+            &mut state,
+            GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(target_creature)),
+            },
+        )
+        .expect("choose shock target")
+        .events;
         assert!(
             events.iter().any(|event| {
                 matches!(event, GameEvent::SpellCast { object_id, .. } if *object_id == copy_id)
@@ -3869,23 +4027,6 @@ mod tests {
             state.spells_cast_this_turn_by_player[&PlayerId(0)][0].spell_object_id,
             Some(copy_id)
         );
-        assert!(
-            matches!(
-                state.waiting_for,
-                WaitingFor::CopyRetarget { copy_id: cid, .. } if cid == copy_id
-            ),
-            "targeted copy must open retarget selection, got {:?}",
-            state.waiting_for
-        );
-
-        // Choose a target and finalize the cast.
-        let _ = apply_as_current(
-            &mut state,
-            GameAction::ChooseTarget {
-                target: Some(TargetRef::Object(target_creature)),
-            },
-        )
-        .expect("choose shock target");
         assert!(
             state.stack.iter().any(|entry| {
                 matches!(
@@ -3923,7 +4064,7 @@ mod tests {
             kind: StackEntryKind::Spell {
                 card_id: CardId(68_655),
                 ability: None,
-                casting_variant: CastingVariant::Normal,
+                casting_variant: crate::types::game_state::CastingVariant::Normal,
                 actual_mana_spent: 0,
             },
         });
@@ -4798,6 +4939,7 @@ mod tests {
             Zone::Hand,
             Zone::Graveyard,
             PlayerId(0),
+            None,
             crate::types::game_state::ZoneChangeRecord::test_minimal(
                 card,
                 Some(Zone::Hand),
@@ -4862,6 +5004,7 @@ mod tests {
             Zone::Graveyard,
             Zone::Exile,
             PlayerId(0),
+            None,
             crate::types::game_state::ZoneChangeRecord::test_minimal(
                 card,
                 Some(Zone::Graveyard),
@@ -5077,6 +5220,185 @@ mod tests {
         );
     }
 
+    fn parent_target_move(destination: Zone) -> Effect {
+        Effect::ChangeZone {
+            origin: None,
+            destination,
+            target: TargetFilter::ParentTarget,
+            owner_library: false,
+            enter_transformed: false,
+            enters_under: None,
+            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+            enters_attacking: false,
+            up_to: false,
+            enter_with_counters: vec![],
+            conditional_enter_with_counters: vec![],
+            face_down_profile: None,
+            enters_modified_if: None,
+        }
+    }
+
+    fn optional_effect_performed() -> AbilityCondition {
+        AbilityCondition::EffectOutcome {
+            signal: EffectOutcomeSignal::OptionalEffectPerformed,
+        }
+    }
+
+    fn optional_effect_declined() -> AbilityCondition {
+        AbilityCondition::Not {
+            condition: Box::new(optional_effect_performed()),
+        }
+    }
+
+    /// CR 608.2c + CR 614.1a: the rider classifier reads the link. Each of the
+    /// three rider shapes is a rider with no condition, and none is a rider
+    /// when its gate reads the preceding instruction's outcome — the "If you
+    /// don't" decline branch, its composite form, and the "if you do" form.
+    #[test]
+    fn graveyard_destination_rider_refuses_an_outcome_gated_link() {
+        let shapes = [
+            (
+                parent_target_move(Zone::Exile),
+                SpellStackToGraveyardReplacement::Exile,
+            ),
+            (
+                parent_target_move(Zone::Hand),
+                SpellStackToGraveyardReplacement::Hand,
+            ),
+            (
+                Effect::PutAtLibraryPosition {
+                    target: TargetFilter::ParentTarget,
+                    count: QuantityExpr::Fixed { value: 1 },
+                    position: LibraryPosition::Bottom,
+                },
+                SpellStackToGraveyardReplacement::Library {
+                    position: LibraryPosition::Bottom,
+                },
+            ),
+        ];
+        let outcome_gates = [
+            optional_effect_declined(),
+            AbilityCondition::And {
+                conditions: vec![
+                    optional_effect_declined(),
+                    AbilityCondition::QuantityCheck {
+                        lhs: QuantityExpr::Fixed { value: 1 },
+                        comparator: Comparator::GE,
+                        rhs: QuantityExpr::Fixed { value: 0 },
+                    },
+                ],
+            },
+            optional_effect_performed(),
+        ];
+        for (effect, destination) in &shapes {
+            let is_exile = *destination == SpellStackToGraveyardReplacement::Exile;
+            assert_eq!(
+                graveyard_destination_rider(effect, None),
+                Some(destination.clone()),
+                "reach: an unconditioned link is the rider"
+            );
+            assert_eq!(is_graveyard_exile_rider_subability(effect, None), is_exile);
+            for gate in &outcome_gates {
+                assert_eq!(
+                    graveyard_destination_rider(effect, Some(gate)),
+                    None,
+                    "an outcome-gated link is an instruction, not a rider: {gate:?}"
+                );
+                assert!(!is_graveyard_exile_rider_subability(effect, Some(gate)));
+            }
+        }
+
+        // The counter rider's "If that spell is countered this way" gate is not
+        // an outcome gate: the rider stays a rider.
+        let countered_this_way = AbilityCondition::ZoneChangedThisWay {
+            filter: TargetFilter::Typed(TypedFilter::card()),
+            destination: None,
+        };
+        let exile = parent_target_move(Zone::Exile);
+        assert_eq!(
+            graveyard_destination_rider(&exile, Some(&countered_this_way)),
+            Some(SpellStackToGraveyardReplacement::Exile)
+        );
+        assert!(is_graveyard_exile_rider_subability(
+            &exile,
+            Some(&countered_this_way)
+        ));
+    }
+
+    /// CR 608.2c: a "you may cast it … If you don't, exile it" decline link
+    /// stamps no graveyard redirect, neither on the permission it grants nor
+    /// on the spell it casts (the two places
+    /// `graveyard_cast_exile_rider_stamps_permission_flag` accepts a rider).
+    #[test]
+    fn graveyard_cast_decline_link_stamps_no_graveyard_redirect() {
+        let mut state = make_test_state();
+        let instant = {
+            let obj_id = add_card_to_graveyard(&mut state, PlayerId(0), CardId(2937));
+            let obj = state.objects.get_mut(&obj_id).unwrap();
+            obj.card_types.core_types.push(CoreType::Instant);
+            obj_id
+        };
+
+        let ability = ResolvedAbility::new(
+            Effect::CastFromZone {
+                target: TargetFilter::ParentTarget,
+                without_paying_mana_cost: true,
+                mode: CardPlayMode::Cast,
+                cast_transformed: false,
+                alt_ability_cost: None,
+                constraint: None,
+                duration: None,
+                driver: CastFromZoneDriver::LingeringPermission,
+                mana_spend_permission: None,
+                additional_cost: None,
+                cast_cost_modifier: None,
+            },
+            vec![TargetRef::Object(instant)],
+            ObjectId(999),
+            PlayerId(0),
+        )
+        .sub_ability(
+            ResolvedAbility::new(
+                parent_target_move(Zone::Exile),
+                vec![],
+                ObjectId(999),
+                PlayerId(0),
+            )
+            .condition(optional_effect_declined()),
+        );
+
+        let mut events = vec![];
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(
+            state.objects[&instant].zone,
+            Zone::Stack,
+            "reach: the instant was cast"
+        );
+        assert!(
+            state.objects[&instant].replacement_definitions.is_empty(),
+            "a decline link installs no graveyard redirect on the cast spell; replacements={:?}",
+            state.objects[&instant].replacement_definitions
+        );
+        let permissions = &state.objects[&instant].casting_permissions;
+        assert!(
+            permissions
+                .iter()
+                .any(|p| matches!(p, CastingPermission::ExileWithAltCost { .. })),
+            "reach: the cast permission was granted; permissions={permissions:?}"
+        );
+        assert!(
+            permissions.iter().all(|p| matches!(
+                p,
+                CastingPermission::ExileWithAltCost {
+                    graveyard_replacement: None,
+                    ..
+                }
+            )),
+            "a decline link is not a graveyard redirect; permissions={permissions:?}"
+        );
+    }
+
     #[test]
     fn grants_mana_value_constraint_on_permission() {
         let mut state = make_test_state();
@@ -5116,5 +5438,44 @@ mod tests {
                 ..
             } if *found == constraint
         )));
+    }
+
+    fn looked_at_window(format: crate::types::format::FormatConfig) -> Vec<ObjectId> {
+        let mut state = GameState::new(format, 2, 42);
+        let mine = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Mine".to_string(),
+            Zone::Library,
+        );
+        let theirs = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Theirs".to_string(),
+            Zone::Library,
+        );
+        state.last_revealed_ids = vec![mine, theirs];
+        let looked = looked_at_controller_library_cards(&state, PlayerId(0));
+        assert!(
+            looked.contains(&mine),
+            "reach: the controller's own card is looked at"
+        );
+        looked.into_iter().filter(|id| *id == theirs).collect()
+    }
+
+    #[test]
+    fn looked_at_cards_follow_the_library_the_controller_reads() {
+        use crate::types::format::FormatConfig;
+        assert!(
+            looked_at_window(FormatConfig::standard()).is_empty(),
+            "another player's library is not the controller's"
+        );
+        assert_eq!(
+            looked_at_window(FormatConfig::dandan()).len(),
+            1,
+            "the shared pile is the controller's library whoever owns a card"
+        );
     }
 }

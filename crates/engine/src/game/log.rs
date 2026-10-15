@@ -1566,6 +1566,7 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             player_id,
             source_amounts,
             total_damage,
+            ..
         } => vec![
             player_seg(state, *player_id),
             text(" is dealt "),
@@ -2465,6 +2466,7 @@ mod tests {
             player_id: PlayerId(1),
             source_amounts: vec![(ObjectId(7), 3), (ObjectId(8), 4)],
             total_damage: 7,
+            source_incarnations: vec![],
         };
 
         assert_eq!(
@@ -2654,6 +2656,7 @@ mod tests {
         let mut record = ZoneChangeRecord::test_minimal(foretold, Some(Zone::Hand), Zone::Exile);
         record.name = "Secret Foretell".to_string();
         record.owner = PlayerId(1);
+        record.arrival.owner = PlayerId(1);
         let entries = resolve_log_entries(
             &[
                 GameEvent::ZoneChanged {
@@ -2725,6 +2728,7 @@ mod tests {
             amount: 3,
             is_combat: false,
             excess: 0,
+            source_incarnation: None,
         };
         assert_eq!(categorize(&event), LogCategory::Life);
     }
@@ -2737,6 +2741,7 @@ mod tests {
             amount: 3,
             is_combat: true,
             excess: 0,
+            source_incarnation: None,
         };
         assert_eq!(categorize(&event), LogCategory::Combat);
     }
@@ -2784,6 +2789,7 @@ mod tests {
                 target: TargetRef::Object(entry),
                 source_id: countered_by,
                 source_controller: PlayerId(1),
+                targeter: None,
             },
             GameEvent::SpellCountered {
                 object_id: entry,
@@ -3033,11 +3039,13 @@ mod tests {
                     amount: 5,
                     is_combat: true,
                     excess: 0,
+                    source_incarnation: None,
                 },
                 GameEvent::CombatDamageDealtToPlayer {
                     player_id: PlayerId(1),
                     source_amounts: vec![(ObjectId(7), 5)],
                     total_damage: 5,
+                    source_incarnations: vec![],
                 },
             ],
             &state,
@@ -3071,16 +3079,19 @@ mod tests {
                 amount: 5,
                 is_combat: true,
                 excess: 0,
+                source_incarnation: None,
             },
             GameEvent::CombatDamageDealtToPlayer {
                 player_id: PlayerId(1),
                 source_amounts: vec![(ObjectId(7), 5)],
                 total_damage: 5,
+                source_incarnations: vec![],
             },
             GameEvent::CombatDamageDealtToPlayer {
                 player_id: PlayerId(1),
                 source_amounts: vec![(ObjectId(7), 5)],
                 total_damage: 5,
+                source_incarnations: vec![],
             },
         ];
 
@@ -3137,6 +3148,7 @@ mod tests {
                     amount: 5,
                     is_combat: false,
                     excess: 0,
+                    source_incarnation: None,
                 },
             ],
             &state,
@@ -3347,6 +3359,7 @@ mod tests {
                     amount: 2,
                     is_combat: false,
                     excess: 0,
+                    source_incarnation: None,
                 },
                 LogImportance::Essential,
                 LogTone::Negative,
@@ -3474,6 +3487,7 @@ mod tests {
         let mut record =
             crate::types::game_state::ZoneChangeRecord::test_minimal(object_id, Some(from), to);
         record.owner = owner;
+        record.arrival.owner = owner;
         record.turn_zone_change_index = turn_zone_change_index;
         GameEvent::ZoneChanged {
             object_id,
@@ -3502,6 +3516,7 @@ mod tests {
                 to: *to,
                 destination_position: 0,
                 owner: record.owner,
+                rebound_from: None,
                 entry_timestamp: None,
                 turn_zone_change_index: record.turn_zone_change_index,
                 zone_change_record: (**record).clone(),
@@ -3907,6 +3922,7 @@ mod tests {
             kind: Default::default(),
             departed_source_lki: None,
             trigger_state: crate::types::events::ActivationTriggerState::Pending,
+            stack_entry: None,
         };
         let keyword = |source_id| GameEvent::KeywordAbilityActivated {
             ability_tag: AbilityTag::Equip,
@@ -3929,6 +3945,7 @@ mod tests {
             kind: crate::types::events::ActivatedAbilityKind::Mana,
             departed_source_lki: None,
             trigger_state: crate::types::events::ActivationTriggerState::Pending,
+            stack_entry: None,
         };
         assert_eq!(lines(&[mana]), 0);
     }

@@ -979,7 +979,7 @@ fn a_spell_given_new_targets_targets_the_new_ones() {
     }
     runner
         .act(GameAction::RetargetSpell {
-            new_targets: vec![TargetRef::Object(other)],
+            new_targets: vec![Some(TargetRef::Object(other))],
         })
         .expect("retarget");
     let (held, declared) = both(runner.state(), shock);
@@ -1012,10 +1012,11 @@ fn a_spell_given_new_targets_at_a_prompt_without_slot_addresses_targets_the_new_
         slots: Vec::new(),
         slot_pools: Vec::new(),
         legal_new_targets: vec![TargetRef::Object(first), TargetRef::Object(other)],
+        keep_is_distinct: Vec::new(),
     };
     runner
         .act(GameAction::RetargetSpell {
-            new_targets: vec![TargetRef::Object(other)],
+            new_targets: vec![Some(TargetRef::Object(other))],
         })
         .expect("retarget");
     let (held, declared) = both(runner.state(), shock);
@@ -1472,7 +1473,7 @@ fn a_spell_given_a_creature_in_place_of_a_player_targets_the_creature() {
     }
     runner
         .act(GameAction::RetargetSpell {
-            new_targets: vec![TargetRef::Object(other)],
+            new_targets: vec![Some(TargetRef::Object(other))],
         })
         .expect("retarget");
     let (held, declared) = both(runner.state(), shock);
@@ -1637,7 +1638,9 @@ fn redirect(
             .expect("choose new targets");
     }
     runner
-        .act(GameAction::RetargetSpell { new_targets })
+        .act(GameAction::RetargetSpell {
+            new_targets: new_targets.into_iter().map(Some).collect(),
+        })
         .expect("retarget");
 }
 
@@ -3148,7 +3151,7 @@ fn bolt_bend_moves_the_target_of_a_spell_whose_target_sits_below_its_gift() {
     });
     runner
         .act(GameAction::RetargetSpell {
-            new_targets: vec![TargetRef::Object(second)],
+            new_targets: vec![Some(TargetRef::Object(second))],
         })
         .expect("the new target is legal");
     pass_until(&mut runner, |state| state.stack.is_empty());

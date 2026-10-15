@@ -308,7 +308,7 @@ impl GameScenario {
     /// Replace a player's mana pool for deterministic payment tests.
     ///
     /// CR 118.3a: routes each unit through `add_mana_to_pool` so every seeded
-    /// unit receives a distinct `ManaPipId` (a direct `mana_pool.mana = mana`
+    /// unit receives a distinct `ManaPipId` (a pool built directly from `mana`
     /// would leave all units at the `ManaPipId(0)` sentinel, so pins would
     /// collide). All callers seed a fresh pool exactly once per player, so
     /// appending is equivalent to replacing.
@@ -1290,6 +1290,32 @@ impl<'a> CardBuilder<'a> {
         self
     }
 
+    /// Make this card an artifact creature.
+    pub fn as_artifact_creature(&mut self) -> &mut Self {
+        let obj = self.obj();
+        if !obj.card_types.core_types.contains(&CoreType::Artifact) {
+            obj.card_types.core_types.push(CoreType::Artifact);
+        }
+        if !obj.card_types.core_types.contains(&CoreType::Creature) {
+            obj.card_types.core_types.push(CoreType::Creature);
+        }
+        self.sync_base_card_types();
+        self
+    }
+
+    /// Make this card an artifact land.
+    pub fn as_artifact_land(&mut self) -> &mut Self {
+        let obj = self.obj();
+        if !obj.card_types.core_types.contains(&CoreType::Artifact) {
+            obj.card_types.core_types.push(CoreType::Artifact);
+        }
+        if !obj.card_types.core_types.contains(&CoreType::Land) {
+            obj.card_types.core_types.push(CoreType::Land);
+        }
+        self.sync_base_card_types();
+        self
+    }
+
     /// CR 305: Make this card a land. Strips the Creature core type pushed by
     /// `add_creature_to_graveyard` and adds Land. Mirrors `as_artifact`/
     /// `as_enchantment`; reusable for graveyard-return targeting tests.
@@ -2059,6 +2085,7 @@ impl GameRunner {
             WaitingFor::ChooseFromZoneChoice { .. } => "ChooseFromZoneChoice",
             WaitingFor::BeholdChoice { .. } => "BeholdChoice",
             WaitingFor::EmpowerJaceChoice { .. } => "EmpowerJaceChoice",
+            WaitingFor::SpellCopyOrderChoice { .. } => "SpellCopyOrderChoice",
             WaitingFor::ChooseOneOfBranch { .. } => "ChooseOneOfBranch",
             WaitingFor::ConniveDiscard { .. } => "ConniveDiscard",
             WaitingFor::DiscardChoice { .. } => "DiscardChoice",
@@ -2160,6 +2187,7 @@ impl GameRunner {
             WaitingFor::PayCost { .. } => "PayCost",
             WaitingFor::ChooseManaColor { .. } => "ChooseManaColor",
             WaitingFor::PayManaAbilityMana { .. } => "PayManaAbilityMana",
+            WaitingFor::ManaAbilityManaPayment { .. } => "ManaAbilityManaPayment",
             WaitingFor::CollectEvidenceChoice { .. } => "CollectEvidenceChoice",
             WaitingFor::HarmonizeTapChoice { .. } => "HarmonizeTapChoice",
             WaitingFor::CastOffer {
@@ -2323,6 +2351,7 @@ pub struct SpellCast<'a> {
     effect_zone_cards: Vec<ObjectId>,
     copy_target: Option<ObjectId>,
     spellbook_pick: Option<String>,
+    payment_mode: CastPaymentMode,
 }
 
 impl<'a> SpellCast<'a> {
@@ -2352,7 +2381,16 @@ impl<'a> SpellCast<'a> {
             effect_zone_cards: Vec::new(),
             copy_target: None,
             spellbook_pick: None,
+            payment_mode: CastPaymentMode::Auto,
         }
+    }
+
+    /// CR 601.2g-h: announce the cast with `mode` — `Auto` pays from the pool at
+    /// announcement; `Manual` surfaces the interactive mana-payment window, which
+    /// the driver finalizes. Default `Auto`.
+    pub fn payment_mode(mut self, mode: CastPaymentMode) -> Self {
+        self.payment_mode = mode;
+        self
     }
 
     /// Submit the first legal candidates at any `SearchChoice` during
@@ -2584,6 +2622,7 @@ impl<'a> SpellCast<'a> {
             effect_zone_cards,
             copy_target,
             spellbook_pick,
+            payment_mode,
         } = self;
 
         // CR 119.3: snapshot life totals before the cast so `life_delta` reads a
@@ -2604,7 +2643,7 @@ impl<'a> SpellCast<'a> {
                 card_id,
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode,
             },
             &mut events,
         )?;
@@ -4789,7 +4828,7 @@ mod tests {
             .expect("pay reduced cost");
         assert_eq!(runner.state().objects[&creature].zone, Zone::Battlefield);
         assert_eq!(runner.state().objects[&decoy].zone, Zone::Hand);
-        assert!(runner.state().players[0].mana_pool.mana.is_empty());
+        assert!(runner.state().players[0].mana_pool.is_empty());
     }
 
     #[test]

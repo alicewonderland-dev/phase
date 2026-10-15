@@ -659,15 +659,11 @@ fn try_parse_multi_type_enchant(line: &str) -> Option<Keyword> {
 
     let filters: Vec<TargetFilter> = legs
         .into_iter()
-        .map(|leg| {
-            let mut f = TypedFilter::new(leg.type_filter);
-            if !leg.properties.is_empty() {
-                f = f.properties(leg.properties);
-            }
+        .map(|mut leg| {
             if let Some(ref c) = controller {
-                f = f.controller(c.clone());
+                leg = leg.controller(c.clone());
             }
-            TargetFilter::Typed(f)
+            TargetFilter::Typed(leg)
         })
         .collect();
 
@@ -1496,6 +1492,29 @@ pub(crate) fn parse_keyword_line_core(text: &str) -> Option<(Keyword, &str)> {
     .parse(text)
     {
         return Some((Keyword::Frenzy(n), ""));
+    }
+
+    // Digital-only Alchemy (no CR entry): "Starting intensity N" — the printed
+    // starting value of the card's intensity (a per-card value, not a CR 122
+    // counter; the variant's own doc says "initial intensity value"). MTGJSON names the
+    // mechanic "Intensity" (AtomicCards `keywords`), which has no
+    // `FromStr` arm, so the Oracle line is the ONLY surface that carries N —
+    // exactly the Renown/Frenzy shape above. Without this arm the line is not
+    // a keyword: all 12 permanent carriers record an `Unimplemented` gap, and on
+    // the spell side it either becomes its own failing unit (Mycelic Ballad,
+    // Colossal Chorus, Static Discharge, Summitfest) or is swallowed into a
+    // parsed ability's `description` (Hymn to the Ages, Legion's Chant, Piece It
+    // Together). Ribald Shanty is the measured silent case — 0 gaps, supported,
+    // `obj.intensity` never seeded, so `QuantityRef::Intensity { Source }`
+    // resolved 0 instead of the printed 2.
+    if let Ok((_, (_, _, n))) = all_consuming((
+        tag::<_, _, OracleError<'_>>("starting intensity"),
+        space1,
+        nom_primitives::parse_number,
+    ))
+    .parse(text)
+    {
+        return Some((Keyword::StartingIntensity(n), ""));
     }
 
     // CR 702.167a/b: Craft with [materials] [cost] — the Oracle line carries the
@@ -2876,7 +2895,7 @@ fn type_filter_subject_name(tf: &TypeFilter) -> String {
 /// exactly how a candidate recognizer starts silently swallowing card text.
 ///
 /// CR 702.29e adds the one NON-fixed rule (typecycling), handled separately below.
-pub(crate) const KEYWORD_COST_PREFIXES: [&str; 97] = [
+pub(crate) const KEYWORD_COST_PREFIXES: [&str; 98] = [
     "cycling",
     "basic landcycling",
     "flashback",
@@ -2974,6 +2993,7 @@ pub(crate) const KEYWORD_COST_PREFIXES: [&str; 97] = [
     "strive",
     "exploit",
     "devoid",
+    "starting intensity",
 ];
 
 /// Check if a line is a keyword with a cost (e.g., "Cycling {2}", "Flashback {3}{R}", "Crew 3").
@@ -3026,9 +3046,100 @@ pub(crate) fn keyword_candidate_ability_word_label(line: &str) -> Option<(&str, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ability::{AbilityCost, SacrificeCost};
+    use crate::types::ability::{AbilityCost, Effect, SacrificeCost};
     use crate::types::mana::ManaCost;
     use crate::types::player::PlayerCounterKind;
+
+    // SHAPE: CR 702.5a: public full-card ingestion preserves each printed
+    // Enchant restriction; unrelated sibling abilities are not claimed fixed.
+    #[test]
+    fn enchant_negated_subtype_full_oracle_shape() {
+        let cards = [
+            ("Puppet Crafting", "Enchant artifact or non-Aura enchantment\nEnchanted permanent is a Construct creature with base power and toughness 5/5 in addition to its other types.\n{4}{G}: Return this card from your graveyard to your hand."),
+            ("Aggression", "Enchant non-Wall creature\nEnchanted creature has first strike and trample.\nAt the beginning of the end step of enchanted creature's controller, destroy that creature if it didn't attack this turn."),
+            ("Consuming Ferocity", "Enchant non-Wall creature\nEnchanted creature gets +1/+0.\nAt the beginning of your upkeep, put a +1/+0 counter on enchanted creature. If that creature has three or more +1/+0 counters on it, it deals damage equal to its power to its controller, then destroy that creature and it can't be regenerated."),
+            ("Krovikan Plague", "Enchant non-Wall creature you control\nWhen this Aura enters, draw a card at the beginning of the next turn's upkeep.\nTap enchanted creature: This Aura deals 1 damage to any target. Put a -0/-1 counter on enchanted creature. Activate only if enchanted creature is untapped."),
+        ];
+        for (name, oracle) in cards {
+            let parsed = crate::parser::oracle::parse_oracle_text(
+                oracle,
+                name,
+                &["enchant".into()],
+                &["Enchantment".into()],
+                &["Aura".into()],
+            );
+            let filter = parsed
+                .extracted_keywords
+                .iter()
+                .find_map(|keyword| {
+                    if let Keyword::Enchant(filter) = keyword {
+                        Some(filter)
+                    } else {
+                        None
+                    }
+                })
+                .expect("every printed full-card Enchant must be retained");
+            if name == "Puppet Crafting" {
+                let TargetFilter::Or { filters } = filter else {
+                    panic!("expected union")
+                };
+                assert_eq!(filters.len(), 2);
+                let TargetFilter::Typed(artifact) = &filters[0] else {
+                    panic!("artifact leg")
+                };
+                assert_eq!(artifact.type_filters, vec![TypeFilter::Artifact]);
+                let TargetFilter::Typed(enchantment) = &filters[1] else {
+                    panic!("enchantment leg")
+                };
+                assert_eq!(
+                    enchantment.type_filters,
+                    vec![
+                        TypeFilter::Enchantment,
+                        TypeFilter::Non(Box::new(TypeFilter::Subtype("Aura".into())))
+                    ]
+                );
+                assert!(
+                    parsed.parse_warnings.is_empty(),
+                    "{:?}",
+                    parsed.parse_warnings
+                );
+                assert!(parsed
+                    .abilities
+                    .iter()
+                    .all(|a| !matches!(*a.effect, Effect::Unimplemented { .. })));
+            } else {
+                let TargetFilter::Typed(typed) = filter else {
+                    panic!("single creature leg")
+                };
+                assert_eq!(
+                    typed.type_filters,
+                    vec![
+                        TypeFilter::Creature,
+                        TypeFilter::Non(Box::new(TypeFilter::Subtype("Wall".into())))
+                    ]
+                );
+                assert_eq!(
+                    typed.controller,
+                    if name == "Krovikan Plague" {
+                        Some(ControllerRef::You)
+                    } else {
+                        None
+                    }
+                );
+            }
+        }
+        assert!(try_parse_multi_type_enchant("Enchant artifact or non-Aura enchantment").is_some());
+        for phrase in [
+            "Enchant artifact or non-Aura",
+            "Enchant artifact or non-Aurora enchantment",
+            "Enchant artifact or non-Aura enchantment if you control a creature",
+        ] {
+            assert!(
+                try_parse_multi_type_enchant(phrase).is_none(),
+                "must decline: {phrase}"
+            );
+        }
+    }
 
     #[test]
     fn parse_keyword_line_core_emerge_from_artifact_preserves_quality() {
@@ -5661,6 +5772,79 @@ mod tests {
             other => panic!("expected Keyword::Freerunning, got {other:?}"),
         }
     }
+
+    /// Digital-only Alchemy "Starting intensity N" (no CR entry — "intensity" has
+    /// zero matches in `docs/MagicCompRules.txt`): the SINGLE keyword-line authority
+    /// must read N and claim full consumption. Reverted, every assertion below
+    /// returns `None`.
+    #[test]
+    fn parse_keyword_line_core_reads_starting_intensity() {
+        // All four spellings the live corpus prints (0 x7, 1 x6, 2 x4, 3 x3 faces).
+        for n in 0..=3u32 {
+            assert_eq!(
+                parse_keyword_line_core(&format!("starting intensity {n}")),
+                Some((Keyword::StartingIntensity(n), "")),
+                "the core must read N={n} and claim full consumption"
+            );
+        }
+        // Hostile siblings. These are `None` pre-fix too: the obligation is that the
+        // new arm does not start claiming a line that carries no count.
+        assert_eq!(parse_keyword_line_core("starting intensity"), None);
+        assert_eq!(parse_keyword_line_core("starting intensity x"), None);
+    }
+
+    /// The whole-line router entry point (spell priority 9 / permanent priority 13),
+    /// including the candidate-prefix gate that rejects before the core is reached.
+    #[test]
+    fn parse_router_keyword_line_routes_starting_intensity() {
+        for (line, n) in [
+            ("Starting intensity 0", 0u32),
+            ("Starting intensity 1", 1),
+            ("Starting intensity 2", 2),
+            ("Starting intensity 3", 3),
+        ] {
+            let routed = parse_router_keyword_line(line)
+                .unwrap_or_else(|| panic!("{line:?} must strictly route"));
+            assert_eq!(routed.keyword, Some(Keyword::StartingIntensity(n)));
+            assert_eq!(
+                routed.tail.permitted_remainder,
+                PermittedKeywordRemainder::None,
+                "{line:?} is fully consumed by the keyword"
+            );
+        }
+        // Unmodelled semantic text must be DECLINED, not absorbed (the
+        // KNOWN_NOUN_PARAM_LEAKS obligation).
+        assert!(
+            parse_router_keyword_line("Starting intensity 0 if you control an artifact").is_none(),
+            "a semantic suffix must never be swallowed by the strict router"
+        );
+        // Same first word, different sentence: the prefix matches the whole phrase at
+        // a word boundary, not the bare word "starting".
+        assert!(
+            parse_router_keyword_line("Starting with you, each player draws a card.").is_none()
+        );
+    }
+
+    /// The strict LIST router on the route all 20 corpus carriers take (priority 1b),
+    /// with production MTGJSON keyword names (lowercased "Intensity").
+    #[test]
+    fn parse_router_keyword_list_extracts_starting_intensity_with_mtgjson_names() {
+        let names = vec!["intensity".to_string()];
+        assert_eq!(
+            parse_router_keyword_list("Starting intensity 2", &names),
+            Some(vec![Keyword::StartingIntensity(2)])
+        );
+        assert_eq!(
+            parse_router_keyword_list("Starting intensity 0", &names),
+            Some(vec![Keyword::StartingIntensity(0)])
+        );
+        // A trailing semantic clause declines the WHOLE line, so it survives for
+        // ordinary parsing and stays honestly red.
+        assert_eq!(
+            parse_router_keyword_list("Starting intensity 2 and draw a card", &names),
+            None
+        );
+    }
 }
 
 /// Plan 02 step 5 item 12 — the exhaustive `is_keyword_cost_line` family registry.
@@ -6200,6 +6384,11 @@ mod router_registry_tests {
         RouterKeywordCase {
             prefix: "devoid",
             valid_line: "Devoid",
+            reach: ProductionReach::KeywordCostLine,
+        },
+        RouterKeywordCase {
+            prefix: "starting intensity",
+            valid_line: "Starting intensity 0",
             reach: ProductionReach::KeywordCostLine,
         },
         RouterKeywordCase {
