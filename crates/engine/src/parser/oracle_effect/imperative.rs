@@ -59,7 +59,7 @@ use crate::types::ability::{
     PreventionScope, PtStat, PtValue, QuantityExpr, QuantityRef, ReassembleControlMode,
     ReturnResultReadSpec, SearchSelectionConstraint, StaticDefinition, StickerTicketCostPayment,
     TapStateChange, TargetChoiceTiming, TargetFilter, TargetSelectionMode, ThisWayCause,
-    TypeFilter, TypedFilter, ZoneChoiceCandidateSource, ZoneOwner, ZoneRef,
+    TokenAttackDestination, TypeFilter, TypedFilter, ZoneChoiceCandidateSource, ZoneOwner, ZoneRef,
 };
 use crate::types::card_type::CoreType;
 use crate::types::phase::{Phase, PhaseGroup, TurnSegment};
@@ -3510,6 +3510,7 @@ pub(super) fn parse_search_and_creation_ast(
                 target,
                 source_filter,
                 enters_attacking,
+                attack_destination,
                 tapped,
                 count,
                 extra_keywords,
@@ -3520,6 +3521,7 @@ pub(super) fn parse_search_and_creation_ast(
                 count,
                 source_filter,
                 enters_attacking,
+                attack_destination,
                 tapped,
                 extra_keywords,
                 additional_modifications,
@@ -3537,6 +3539,7 @@ pub(super) fn parse_search_and_creation_ast(
                 attach_to,
                 static_abilities,
                 enters_attacking,
+                attack_destination,
                 ..
             }) => Some(SearchCreationImperativeAst::Token {
                 token: Box::new(TokenDescription {
@@ -3552,6 +3555,7 @@ pub(super) fn parse_search_and_creation_ast(
                     attach_to,
                     static_abilities,
                     enters_attacking,
+                    attack_destination,
                 }),
             }),
             _ => None,
@@ -3780,6 +3784,7 @@ pub(super) fn lower_search_and_creation_ast(ast: SearchCreationImperativeAst) ->
             count,
             source_filter,
             enters_attacking,
+            attack_destination,
             tapped,
             extra_keywords,
             additional_modifications,
@@ -3788,6 +3793,7 @@ pub(super) fn lower_search_and_creation_ast(ast: SearchCreationImperativeAst) ->
             owner: TargetFilter::Controller,
             source_filter,
             enters_attacking,
+            attack_destination,
             tapped,
             count,
             extra_keywords,
@@ -3805,6 +3811,7 @@ pub(super) fn lower_search_and_creation_ast(ast: SearchCreationImperativeAst) ->
             owner: TargetFilter::Controller,
             attach_to: token.attach_to,
             enters_attacking: token.enters_attacking,
+            attack_destination: token.attack_destination,
             // CR 205.4a: Preserve parsed token supertypes (legendary/snow).
             supertypes: token.supertypes,
             static_abilities: token.static_abilities,
@@ -14754,6 +14761,7 @@ pub(super) fn lower_imperative_family_ast(ast: ImperativeFamilyAst) -> ParsedEff
                     owner: TargetFilter::Controller,
                     attach_to: None,
                     enters_attacking: false,
+                    attack_destination: TokenAttackDestination::ControllerChooses,
                     supertypes: Vec::new(),
                     static_abilities: Vec::new(),
                     enter_with_counters: Vec::new(),

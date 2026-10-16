@@ -16557,6 +16557,8 @@ have been revealed, Aggressive Detective deals 2 damage to each opponent.";
                 owner: TargetFilter::Controller,
                 attach_to: None,
                 enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
                 supertypes: vec![],
                 static_abilities: vec![static_ability],
                 enter_with_counters: vec![],
@@ -20348,6 +20350,8 @@ have been revealed, Aggressive Detective deals 2 damage to each opponent.";
                     owner: TargetFilter::Controller,
                     attach_to: None,
                     enters_attacking: false,
+                    attack_destination:
+                        crate::types::ability::TokenAttackDestination::ControllerChooses,
                     supertypes: vec![],
                     static_abilities: vec![],
                     enter_with_counters: vec![],
@@ -20389,6 +20393,8 @@ have been revealed, Aggressive Detective deals 2 damage to each opponent.";
                     owner: TargetFilter::Controller,
                     attach_to: None,
                     enters_attacking: false,
+                    attack_destination:
+                        crate::types::ability::TokenAttackDestination::ControllerChooses,
                     supertypes: vec![],
                     static_abilities: vec![],
                     enter_with_counters: vec![(

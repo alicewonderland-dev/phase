@@ -39,7 +39,7 @@
 use crate::game::players;
 use crate::types::ability::{
     ContinuousModification, DelayedTriggerCondition, Duration, Effect, EffectError, EffectKind,
-    QuantityExpr, ResolvedAbility, TargetFilter, TargetRef,
+    QuantityExpr, ResolvedAbility, TargetFilter, TargetRef, TokenAttackDestination,
 };
 use crate::types::events::GameEvent;
 use crate::types::game_state::{DelayedTrigger, GameState};
@@ -75,6 +75,7 @@ pub fn resolve(
             owner: TargetFilter::Controller,
             source_filter: None,
             enters_attacking: false,
+            attack_destination: TokenAttackDestination::ControllerChooses,
             tapped: false,
             count: QuantityExpr::Fixed { value: 1 },
             extra_keywords: vec![Keyword::Haste],

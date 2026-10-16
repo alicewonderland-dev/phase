@@ -38330,3 +38330,309 @@ fn becomes_target_object_controller_antecedent_fails_closed() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// CR 508.4: the defender a token instruction names ("attacking that player",
+// "attacking that opponent") is carried on the parsed effect.
+// ---------------------------------------------------------------------------
+
+/// Every token-creating definition along `def`'s `sub_ability` chain, in order.
+fn token_definitions_in_chain(def: &AbilityDefinition) -> Vec<&AbilityDefinition> {
+    let mut found = Vec::new();
+    let mut cursor = Some(def);
+    while let Some(link) = cursor {
+        if matches!(
+            &*link.effect,
+            Effect::Token { .. } | Effect::CopyTokenOf { .. }
+        ) {
+            found.push(link);
+        }
+        cursor = link.sub_ability.as_deref();
+    }
+    found
+}
+
+/// The one token-creating effect of a trigger line, with its definition.
+fn only_token_definition(line: &str, card_name: &str) -> AbilityDefinition {
+    let trigger = parse_trigger_line(line, card_name);
+    let execute = trigger.execute.as_deref().expect("trigger has an execute");
+    assert_no_unimplemented(execute);
+    let tokens = token_definitions_in_chain(execute);
+    assert_eq!(tokens.len(), 1, "reach guard: one token effect in {line}");
+    tokens[0].clone()
+}
+
+fn token_attack_fields(
+    def: &AbilityDefinition,
+) -> (bool, bool, crate::types::ability::TokenAttackDestination) {
+    match &*def.effect {
+        Effect::Token {
+            tapped,
+            enters_attacking,
+            attack_destination,
+            ..
+        }
+        | Effect::CopyTokenOf {
+            tapped,
+            enters_attacking,
+            attack_destination,
+            ..
+        } => (*tapped, *enters_attacking, attack_destination.clone()),
+        other => panic!("expected a token effect, got {other:?}"),
+    }
+}
+
+fn names_that_player() -> crate::types::ability::TokenAttackDestination {
+    crate::types::ability::TokenAttackDestination::Player {
+        player: ControllerRef::DefendingPlayer,
+        scope: crate::types::ability::NamedDefenderScope::Player,
+    }
+}
+
+fn opponent_count() -> QuantityExpr {
+    QuantityExpr::Ref {
+        qty: QuantityRef::PlayerCount {
+            filter: PlayerFilter::Opponent,
+        },
+    }
+}
+
+#[test]
+fn token_trigger_names_that_player_as_its_attack_destination() {
+    for (card, line) in [
+        (
+            "Soaring Lightbringer",
+            "Whenever you attack a player, create a 1/1 white Glimmer enchantment creature token that's tapped and attacking that player.",
+        ),
+        (
+            "Seraphic Greatsword",
+            "Whenever equipped creature attacks the player with the most life or tied for most life, create a 4/4 white Angel creature token with flying that's tapped and attacking that player.",
+        ),
+    ] {
+        let def = only_token_definition(line, card);
+        let (tapped, enters_attacking, destination) = token_attack_fields(&def);
+        assert!(tapped && enters_attacking, "{card}: reach guard");
+        assert_eq!(destination, names_that_player(), "{card}");
+    }
+}
+
+#[test]
+fn token_trigger_names_that_opponent_as_its_attack_destination() {
+    for (card, line) in [
+        (
+            "Ellie, Brick Master",
+            "Whenever a player attacks one of your opponents, that attacking player creates a tapped 1/1 black Fungus Zombie creature token named Cordyceps Infected that's attacking that opponent.",
+        ),
+        (
+            "Combat Calligrapher",
+            "Whenever a player attacks one of your opponents, that attacking player creates a tapped 2/1 white and black Inkling creature token with flying that's attacking that opponent.",
+        ),
+    ] {
+        let def = only_token_definition(line, card);
+        let (tapped, enters_attacking, destination) = token_attack_fields(&def);
+        assert!(tapped && enters_attacking, "{card}: reach guard");
+        assert_eq!(destination, names_that_player(), "{card}");
+    }
+}
+
+#[test]
+fn copy_token_continuation_sentence_names_that_player_as_its_attack_destination() {
+    let line = "Whenever you attack a player, choose target nontoken creature that's attacking that player. Create a token that's a copy of that creature, except it's 1/1. The token enters tapped and attacking that player. Sacrifice it at the beginning of the next end step.";
+    let trigger = parse_trigger_line(line, "Echoing Assault");
+    let execute = trigger.execute.as_deref().expect("trigger has an execute");
+    assert_no_unimplemented(execute);
+
+    let Effect::TargetOnly { target } = &*execute.effect else {
+        panic!(
+            "the chain opens with the choose clause, got {:?}",
+            execute.effect
+        );
+    };
+    assert!(
+        matches!(
+            target,
+            TargetFilter::Typed(typed) if typed.properties.iter().any(|prop| matches!(
+                prop,
+                FilterProp::Attacking { defender: Some(ControllerRef::DefendingPlayer) }
+            ))
+        ),
+        "the choose clause still reads the defending player: {target:?}"
+    );
+
+    let tokens = token_definitions_in_chain(execute);
+    assert_eq!(tokens.len(), 1, "reach guard: one copy effect");
+    let (tapped, enters_attacking, destination) = token_attack_fields(tokens[0]);
+    assert!(
+        tapped && enters_attacking,
+        "reach guard: the sentence applied"
+    );
+    assert_eq!(destination, names_that_player());
+}
+
+#[test]
+fn plural_token_clauses_name_that_player_as_their_attack_destination() {
+    for text in [
+        "Whenever you attack a player, create two 1/1 red Goblin creature tokens that are tapped and attacking that player.",
+        "Whenever you attack a player, create two 1/1 red Goblin creature tokens. They enter tapped and attacking that player.",
+    ] {
+        let parsed = parse_oracle_text(
+            text,
+            "Synthetic Goblin Raider",
+            &[],
+            &["Enchantment".to_string()],
+            &[],
+        );
+        let execute = parsed.triggers[0]
+            .execute
+            .as_deref()
+            .expect("trigger has an execute");
+        assert_no_unimplemented(execute);
+        let tokens = token_definitions_in_chain(execute);
+        assert_eq!(tokens.len(), 1, "reach guard: one token effect in {text}");
+        let Effect::Token { count, .. } = &*tokens[0].effect else {
+            panic!("expected a Token effect");
+        };
+        assert_eq!(*count, QuantityExpr::Fixed { value: 2 }, "{text}");
+        let (_, enters_attacking, destination) = token_attack_fields(tokens[0]);
+        assert!(enters_attacking, "{text}");
+        assert_eq!(destination, names_that_player(), "{text}");
+    }
+}
+
+/// "that player" inside "for each opponent" names the iterated opponent rather
+/// than the defending player, so the defending-player reading is not kept.
+#[test]
+fn per_opponent_token_clauses_do_not_keep_the_defending_player_destination() {
+    for (card, line) in [
+        (
+            "Ainok Strike Leader",
+            "Whenever you attack with this creature and/or your commander, for each opponent, create a 1/1 red Goblin creature token that's tapped and attacking that player.",
+        ),
+        (
+            "Endless Foot Assault",
+            "Whenever you attack, for each opponent, create a 1/1 black Ninja creature token that's tapped and attacking that player.",
+        ),
+        (
+            "Stampede Surfer",
+            "Whenever this creature attacks, for each opponent, you create a 2/2 green Boar creature token that's tapped and attacking that opponent.",
+        ),
+        (
+            "Adeline, Resplendent Cathar",
+            "Whenever you attack, for each opponent, create a 1/1 white Human creature token that's tapped and attacking that player or a planeswalker they control.",
+        ),
+        (
+            "Veteran Soldier",
+            "Whenever this creature attacks a player, if no opponent has more life than that player, for each opponent, create a 1/1 white Soldier creature token that's tapped and attacking that opponent.",
+        ),
+    ] {
+        let def = only_token_definition(line, card);
+        let (_, enters_attacking, destination) = token_attack_fields(&def);
+        assert!(enters_attacking, "{card}: reach guard");
+        let Effect::Token { count, .. } = &*def.effect else {
+            panic!("{card}: expected a Token effect");
+        };
+        assert_eq!(*count, opponent_count(), "{card}: reach guard");
+        assert_eq!(
+            destination,
+            crate::types::ability::TokenAttackDestination::ControllerChooses,
+            "{card}"
+        );
+    }
+}
+
+/// The iteration is held on the definition rather than folded into the count.
+#[test]
+fn unfolded_per_opponent_token_clause_does_not_keep_the_defending_player_destination() {
+    let parsed = parse_oracle_text(
+        "Whenever you attack, for each opponent, create a 1/1 red Goblin creature token that's tapped and attacking that player. You gain 1 life.",
+        "Synthetic Goblin Raider",
+        &[],
+        &["Enchantment".to_string()],
+        &[],
+    );
+    let execute = parsed.triggers[0]
+        .execute
+        .as_deref()
+        .expect("trigger has an execute");
+    assert_no_unimplemented(execute);
+    let tokens = token_definitions_in_chain(execute);
+    assert_eq!(tokens.len(), 1, "reach guard: one token effect");
+    assert_eq!(
+        tokens[0].repeat_for,
+        Some(opponent_count()),
+        "reach guard: the iteration stayed on the definition"
+    );
+    let (_, enters_attacking, destination) = token_attack_fields(tokens[0]);
+    assert!(enters_attacking);
+    assert_eq!(
+        destination,
+        crate::types::ability::TokenAttackDestination::ControllerChooses
+    );
+}
+
+#[test]
+fn suffix_per_opponent_token_clause_does_not_keep_the_defending_player_destination() {
+    let parsed = parse_oracle_text(
+        "Whenever you attack, create a 1/1 red Goblin creature token that's tapped and attacking that player for each opponent you have.",
+        "Synthetic Goblin Raider",
+        &[],
+        &["Enchantment".to_string()],
+        &[],
+    );
+    let execute = parsed.triggers[0]
+        .execute
+        .as_deref()
+        .expect("trigger has an execute");
+    assert_no_unimplemented(execute);
+    let tokens = token_definitions_in_chain(execute);
+    assert_eq!(tokens.len(), 1, "reach guard: one token effect");
+    let Effect::Token { count, .. } = &*tokens[0].effect else {
+        panic!("expected a Token effect");
+    };
+    assert_eq!(*count, opponent_count(), "reach guard: the suffix counted");
+    let (_, enters_attacking, destination) = token_attack_fields(tokens[0]);
+    assert!(enters_attacking);
+    assert_eq!(
+        destination,
+        crate::types::ability::TokenAttackDestination::ControllerChooses
+    );
+}
+
+/// An attacking token whose instruction names no defender stays unspecified.
+#[test]
+fn token_clauses_naming_no_defender_keep_the_unspecified_destination() {
+    for (card, line) in [
+        (
+            "Hero of Bladehold",
+            "Whenever this creature attacks, create two 1/1 white Soldier creature tokens that are tapped and attacking.",
+        ),
+        (
+            "Kari Zev, Skyship Raider",
+            "Whenever Kari Zev attacks, create Ragavan, a legendary 2/1 red Monkey creature token. Ragavan enters tapped and attacking. Exile that token at end of combat.",
+        ),
+    ] {
+        let def = only_token_definition(line, card);
+        let (_, enters_attacking, destination) = token_attack_fields(&def);
+        assert!(enters_attacking, "{card}: reach guard");
+        assert_eq!(
+            destination,
+            crate::types::ability::TokenAttackDestination::ControllerChooses,
+            "{card}"
+        );
+    }
+}
+
+/// A possessive after "that player" is a different phrase and names no player.
+#[test]
+fn possessive_after_that_player_does_not_name_a_destination() {
+    let def = only_token_definition(
+        "Whenever you attack a player, create a 1/1 red Goblin creature token that's tapped and attacking that player's planeswalker.",
+        "Synthetic Goblin Raider",
+    );
+    let (_, enters_attacking, destination) = token_attack_fields(&def);
+    assert!(enters_attacking, "reach guard");
+    assert_eq!(
+        destination,
+        crate::types::ability::TokenAttackDestination::ControllerChooses
+    );
+}

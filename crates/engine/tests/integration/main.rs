@@ -1997,3 +1997,4 @@ mod exile_origin_target_acquisition;
 mod keyword_activation_cancel;
 mod starting_intensity_keyword;
 mod tidebinder_source_type_gate;
+mod token_attack_destination;

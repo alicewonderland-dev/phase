@@ -59,13 +59,15 @@ use crate::types::ability::{
     PreventionFormula, QuantityExpr, QuantityModification, QuantityRef, RedirectionLifetime,
     ReplacementChoiceAuthority, ReplacementCondition, ReplacementDefinition, ReplacementMode,
     ReplacementPlayerScope, RoundingMode, SourceExclusion, StaticCondition, StaticDefinition,
-    TapStateChange, TargetFilter, TriggerDefinition, TypeFilter, TypedFilter,
+    TapStateChange, TargetFilter, TokenAttackDestination, TriggerDefinition, TypeFilter,
+    TypedFilter,
 };
 use crate::types::ability::{CardPlayMode, CastingPermission, PlayerScope};
 use crate::types::ability_visit::{visit_ability_def_scoped, ResolutionScope};
 use crate::types::card_type::Supertype;
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::mana::{ManaColor, ManaCost, ManaType};
+use crate::types::proposed_event::TokenAttackRequest;
 use crate::types::replacements::ReplacementEvent;
 use crate::types::statics::CastFrequency;
 use crate::types::triggers::TriggerMode;
@@ -11339,6 +11341,7 @@ fn copy_token_of(target: TargetFilter) -> Effect {
         owner: TargetFilter::Controller,
         source_filter: None,
         enters_attacking: false,
+        attack_destination: TokenAttackDestination::ControllerChooses,
         tapped: false,
         count: QuantityExpr::Ref {
             qty: QuantityRef::EventContextAmount,
@@ -12138,6 +12141,7 @@ fn token_description_to_spec(
         enter_with_counters: Vec::new(),
         tapped: token.tapped,
         enters_attacking: false,
+        attack_request: TokenAttackRequest::Unspecified,
         sacrifice_at: None,
         // Placeholder: overwritten at apply time with the replacement source's identity.
         source_id: crate::types::identifiers::ObjectId(0),

@@ -36,7 +36,7 @@ use crate::types::ability::{
     ForEachCategoryAction, LibraryPosition, ManaSpendRestriction, MultiTargetSpec, ObjectScope,
     PermissionGrantee, PlayerFilter, PtValue, QuantityExpr, QuantityRef, RevealUntilDisposition,
     SpellStackToGraveyardReplacement, StaticDefinition, SubAbilityLink, TargetChoiceTiming,
-    TargetFilter, ThisWayCause, TypeFilter, TypedFilter,
+    TargetFilter, ThisWayCause, TokenAttackDestination, TypeFilter, TypedFilter,
 };
 use crate::types::card_type::CoreType;
 use crate::types::counter::CounterType;
@@ -6196,7 +6196,10 @@ pub(super) fn apply_clause_continuation(
             );
             append_definition_to_sub_chain(previous, grant_def);
         }
-        ContinuationAst::EntersTappedAttacking { moved_filter } => {
+        ContinuationAst::EntersTappedAttacking {
+            moved_filter,
+            destination,
+        } => {
             let Some(previous) = defs.last_mut() else {
                 return;
             };
@@ -6204,19 +6207,27 @@ pub(super) fn apply_clause_continuation(
             match &mut *previous.effect {
                 Effect::CopyTokenOf {
                     enters_attacking,
+                    attack_destination,
                     tapped,
                     ..
                 } => {
                     *enters_attacking = true;
                     *tapped = true;
+                    if !destination.is_controller_chooses() {
+                        *attack_destination = destination;
+                    }
                 }
                 Effect::Token {
                     enters_attacking,
+                    attack_destination,
                     tapped,
                     ..
                 } => {
                     *enters_attacking = true;
                     *tapped = true;
+                    if !destination.is_controller_chooses() {
+                        *attack_destination = destination;
+                    }
                 }
                 Effect::ChangeZone {
                     enters_attacking,
@@ -8158,7 +8169,7 @@ fn strip_moved_object_subject(clause: &str) -> Option<&str> {
 /// "If that card is an enchantment card, it enters tapped and attacking").
 ///
 /// Returns the continuation to emit, or `None` to emit NOTHING:
-/// - no leading "if"  -> `EntersTappedAttacking { moved_filter: None }`
+/// - no leading "if"  -> `EntersTappedAttacking { moved_filter: None, .. }`
 ///   (Stangg / Shark Shredder; byte-identical to the prior unconditional patch).
 /// - recognized moved-object card-type condition -> `{ moved_filter: Some(..) }`.
 /// - leading "if" present but NOT a recognized, materializable affirmative
@@ -8173,7 +8184,10 @@ fn parse_change_zone_enters_tapped_attacking(
     let trimmed = lower.trim_start();
     // No leading "if": unconditional riders (unchanged behavior).
     let Ok((after_if, _)) = tag::<_, _, OracleError<'_>>("if ").parse(trimmed) else {
-        return Some(ContinuationAst::EntersTappedAttacking { moved_filter: None });
+        return Some(ContinuationAst::EntersTappedAttacking {
+            moved_filter: None,
+            destination: TokenAttackDestination::ControllerChooses,
+        });
     };
     // CR 614.12: the condition clause runs up to the first comma
     // ("that card is an enchantment card" | ", it enters tapped and attacking").
@@ -8205,7 +8219,24 @@ fn parse_change_zone_enters_tapped_attacking(
     }
     Some(ContinuationAst::EntersTappedAttacking {
         moved_filter: Some(filter),
+        destination: TokenAttackDestination::ControllerChooses,
     })
+}
+
+/// CR 508.4: the destination an "... enter(s) tapped and attacking ..." sentence
+/// names.
+fn entry_continuation_destination(lower: &str) -> TokenAttackDestination {
+    nom_primitives::scan_at_word_boundaries(lower, |i| {
+        preceded(
+            (
+                alt((tag("enters"), tag("enter"))),
+                tag(" tapped and attacking"),
+            ),
+            super::token::parse_token_attack_destination,
+        )
+        .parse(i)
+    })
+    .unwrap_or_default()
 }
 
 /// CR 614.12: returns true when `sentence` is a moved-object type-conditional
@@ -9220,7 +9251,10 @@ pub(super) fn parse_followup_continuation_ast_with_search_destination(
             if nom_primitives::scan_contains(&lower, "enters tapped and attacking")
                 || nom_primitives::scan_contains(&lower, "enter tapped and attacking") =>
         {
-            Some(ContinuationAst::EntersTappedAttacking { moved_filter: None })
+            Some(ContinuationAst::EntersTappedAttacking {
+                moved_filter: None,
+                destination: entry_continuation_destination(&lower),
+            })
         }
         // CR 508.4 / CR 614.1 / CR 614.12: the same followup after a ChangeZone,
         // but the riders may be gated on the MOVED object's type by a leading
@@ -12149,6 +12183,7 @@ mod tests {
             owner: TargetFilter::Controller,
             attach_to: None,
             enters_attacking: false,
+            attack_destination: crate::types::ability::TokenAttackDestination::ControllerChooses,
             supertypes: vec![],
             static_abilities: vec![],
             enter_with_counters: vec![],
@@ -12182,6 +12217,7 @@ mod tests {
             owner: TargetFilter::Controller,
             attach_to: None,
             enters_attacking: false,
+            attack_destination: crate::types::ability::TokenAttackDestination::ControllerChooses,
             supertypes: vec![],
             static_abilities: vec![],
             enter_with_counters: vec![],
@@ -12213,6 +12249,7 @@ mod tests {
             owner: TargetFilter::Controller,
             attach_to: None,
             enters_attacking: false,
+            attack_destination: crate::types::ability::TokenAttackDestination::ControllerChooses,
             supertypes: vec![],
             static_abilities: vec![],
             enter_with_counters: vec![],

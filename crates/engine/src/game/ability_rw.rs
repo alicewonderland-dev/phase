@@ -107,8 +107,9 @@ use crate::types::ability::{
     Duration, Effect, GuessSubject, KeeperConstraint, ModalChoice, MultiTargetSpec, NameStickerSet,
     ObjectProperty, ObjectScope, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef,
     ReciprocalZoneChoiceRole, RepeatContinuation, ReplacementDefinition, ResolvedAbility,
-    StaticCondition, StaticDefinition, TargetFilter, TriggerCondition, TriggerDefinition,
-    TurnJournalKind, TypeFilter, TypedFilter, ZoneChoiceCandidateSource, ZoneRef,
+    StaticCondition, StaticDefinition, TargetFilter, TokenAttackDestination, TriggerCondition,
+    TriggerDefinition, TurnJournalKind, TypeFilter, TypedFilter, ZoneChoiceCandidateSource,
+    ZoneRef,
 };
 use crate::types::game_state::TargetSelectionConstraint;
 use crate::types::zones::Zone;
@@ -5502,6 +5503,7 @@ fn rw_effect(
             owner: _,
             attach_to: _,
             enters_attacking: _,
+            attack_destination,
             supertypes: _,
             static_abilities: _,
             enter_with_counters,
@@ -5523,6 +5525,7 @@ fn rw_effect(
             p.merge(rw_quantity_expr(count));
             p.merge(rw_pt_value(power));
             p.merge(rw_pt_value(toughness));
+            p.merge(rw_token_attack_destination(attack_destination));
             (p, Some(WriteScope::Created))
         }
         Effect::CopyTokenOf {
@@ -5530,6 +5533,7 @@ fn rw_effect(
             owner: _,
             source_filter,
             enters_attacking: _,
+            attack_destination,
             tapped: _,
             count,
             extra_keywords: _,
@@ -5573,6 +5577,7 @@ fn rw_effect(
             // retains the batch prompt (CR 603.10a).
             flag_legacy_write_target(&mut p, target);
             p.merge(rw_quantity_expr(count));
+            p.merge(rw_token_attack_destination(attack_destination));
             (p, Some(WriteScope::Created))
         }
         Effect::Conjure {
@@ -7427,6 +7432,14 @@ fn rw_player_scope(x: &PlayerScope) -> RwProfile {
     }
 }
 
+/// CR 508.4: the defender a token instruction names is a player reference.
+fn rw_token_attack_destination(x: &TokenAttackDestination) -> RwProfile {
+    match x {
+        TokenAttackDestination::ControllerChooses => RwProfile::empty(),
+        TokenAttackDestination::Player { player, scope: _ } => rw_controller_ref(player),
+    }
+}
+
 fn rw_controller_ref(x: &ControllerRef) -> RwProfile {
     match x {
         // D5 carriers.
@@ -7929,11 +7942,67 @@ mod tests {
             owner: TargetFilter::Controller,
             attach_to: None,
             enters_attacking: false,
+            attack_destination: crate::types::ability::TokenAttackDestination::ControllerChooses,
             supertypes: vec![],
             static_abilities: vec![],
             enter_with_counters: vec![],
         }
     }
+    /// The destination a token instruction names is a player-reference read:
+    /// the defending player adds nothing, the triggering player reads the event.
+    /// Revert-probe: bind `attack_destination: _` in the `Token` / `CopyTokenOf`
+    /// arms ⇒ the triggering-player rows equal the unnamed profile.
+    #[test]
+    fn token_attack_destination_is_a_player_reference_read() {
+        use crate::types::ability::{NamedDefenderScope, TokenAttackDestination};
+
+        let naming = |player: Option<ControllerRef>| match player {
+            None => TokenAttackDestination::ControllerChooses,
+            Some(player) => TokenAttackDestination::Player {
+                player,
+                scope: NamedDefenderScope::Player,
+            },
+        };
+        let token = |player| {
+            let mut effect = token(&["Creature"], qfix(1));
+            if let Effect::Token {
+                attack_destination, ..
+            } = &mut effect
+            {
+                *attack_destination = naming(player);
+            }
+            effect
+        };
+        let copy = |player| Effect::CopyTokenOf {
+            target: TargetFilter::Typed(TypedFilter::creature()),
+            owner: TargetFilter::Controller,
+            source_filter: None,
+            enters_attacking: true,
+            attack_destination: naming(player),
+            tapped: false,
+            count: qfix(1),
+            extra_keywords: vec![],
+            additional_modifications: vec![],
+        };
+
+        for (label, build) in [
+            ("Token", &token as &dyn Fn(Option<ControllerRef>) -> Effect),
+            ("CopyTokenOf", &copy),
+        ] {
+            let profile = |player| ability_rw_profile(&ra(build(player)));
+            assert_eq!(
+                profile(Some(ControllerRef::DefendingPlayer)),
+                profile(None),
+                "{label}: the defending player adds nothing to the profile"
+            );
+            assert_ne!(
+                profile(Some(ControllerRef::TriggeringPlayer)),
+                profile(None),
+                "{label}: the triggering player is a read the unnamed form is not"
+            );
+        }
+    }
+
     fn change_zone(origin: Option<Zone>, dest: Zone, target: TargetFilter) -> Effect {
         Effect::ChangeZone {
             origin,

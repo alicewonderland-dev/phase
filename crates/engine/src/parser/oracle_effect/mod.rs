@@ -136,10 +136,10 @@ use crate::types::ability::{
     RestrictionPlayerScope, RevealUntilDisposition, RoundingMode, SharedQuality,
     SharedQualityRelation, SiblingCondition, SkipScope, SpellStackToGraveyardReplacement,
     StaticCondition, StaticDefinition, StepSkipTarget, SubAbilityLink, TapStateChange,
-    TargetFilter, TargetReadOrigin, TargetSelectionMode, ThisWayCause, TrackedAnaphorSource,
-    TriggerCondition, TriggerDefinition, TurnGate, TypeFilter, TypedFilter, UnlessPayModifier,
-    UnloweredGuard, UntilCondition, VoteSubject, WheneverEventExpiry, ZoneChoiceCandidateSource,
-    ZoneChoiceChooser, ZoneOwner,
+    TargetFilter, TargetReadOrigin, TargetSelectionMode, ThisWayCause, TokenAttackDestination,
+    TrackedAnaphorSource, TriggerCondition, TriggerDefinition, TurnGate, TypeFilter, TypedFilter,
+    UnlessPayModifier, UnloweredGuard, UntilCondition, VoteSubject, WheneverEventExpiry,
+    ZoneChoiceCandidateSource, ZoneChoiceChooser, ZoneOwner,
 };
 // `DoubleTarget` has no production use in this module since the counter-doubling
 // discriminator moved to `Effect::is_counter_multiplication()`; the child
@@ -8972,6 +8972,7 @@ fn try_parse_for_each_copy_token_source(
     let (source_filter, body_effect) = parse_for_each_object_copy_parts(text, lower, ctx)?;
     let Effect::CopyTokenOf {
         enters_attacking,
+        attack_destination,
         tapped,
         count,
         extra_keywords,
@@ -8986,6 +8987,7 @@ fn try_parse_for_each_copy_token_source(
         owner: TargetFilter::Controller,
         source_filter: Some(source_filter),
         enters_attacking,
+        attack_destination,
         tapped,
         count,
         extra_keywords,
@@ -9064,6 +9066,7 @@ fn try_parse_for_each_target_copy_token(
         owner,
         source_filter: None,
         enters_attacking,
+        attack_destination,
         tapped,
         count,
         extra_keywords,
@@ -9078,6 +9081,7 @@ fn try_parse_for_each_target_copy_token(
         owner,
         source_filter: None,
         enters_attacking,
+        attack_destination,
         tapped,
         count,
         extra_keywords,
@@ -18758,6 +18762,7 @@ fn try_parse_for_each_effect(text: &str, ctx: &mut ParseContext) -> Option<Parse
                 owner,
                 attach_to,
                 enters_attacking,
+                attack_destination,
                 supertypes,
                 static_abilities,
                 enter_with_counters,
@@ -18767,7 +18772,8 @@ fn try_parse_for_each_effect(text: &str, ctx: &mut ParseContext) -> Option<Parse
                 // binds to the player creating the token. Stamp ScopedPlayer
                 // so an "each player creates … for each … in their graveyard"
                 // iteration counts each player's OWN zone.
-                let scoped_count = token::scope_token_for_each_to_iterating_player(quantity);
+                let scoped_count =
+                    token::scope_token_for_each_to_iterating_player(quantity.clone());
                 // CR 608.2c + CR 400.7: this dispatcher builds the Token's
                 // base (name/P/T/types) from `base_tp` — the text BEFORE "for
                 // each" — so `try_parse_token`'s own "this way" dispatch never
@@ -18815,6 +18821,7 @@ fn try_parse_for_each_effect(text: &str, ctx: &mut ParseContext) -> Option<Parse
                     owner,
                     attach_to,
                     enters_attacking,
+                    attack_destination,
                     supertypes,
                     static_abilities,
                     enter_with_counters,
@@ -18823,6 +18830,8 @@ fn try_parse_for_each_effect(text: &str, ctx: &mut ParseContext) -> Option<Parse
             }
             other => other,
         };
+        let mut effect = effect;
+        release_iteration_destination(&mut effect, &quantity);
         return Some(parsed_clause(effect));
     }
 
@@ -45953,10 +45962,42 @@ fn try_fold_token_repeat_into_count(effect: &mut Effect, qty: &QuantityExpr) -> 
     {
         if attach_to.is_none() && matches!(count, QuantityExpr::Fixed { value: 1 }) {
             *count = qty.clone();
+            release_iteration_destination(effect, qty);
             return true;
         }
     }
     false
+}
+
+/// CR 608.2c: in a "for each <players>" iteration, "that player" is the
+/// iterated player rather than the defending player, so the
+/// defending-player reading is not kept.
+pub(super) fn release_iteration_destination(effect: &mut Effect, qty: &QuantityExpr) {
+    if !matches!(
+        qty,
+        QuantityExpr::Ref {
+            qty: QuantityRef::PlayerCount { .. }
+        }
+    ) {
+        return;
+    }
+    if let Effect::Token {
+        attack_destination, ..
+    }
+    | Effect::CopyTokenOf {
+        attack_destination, ..
+    } = effect
+    {
+        if matches!(
+            attack_destination,
+            TokenAttackDestination::Player {
+                player: ControllerRef::DefendingPlayer,
+                ..
+            }
+        ) {
+            *attack_destination = TokenAttackDestination::ControllerChooses;
+        }
+    }
 }
 
 /// CR 608.2c + CR 614.6: Classify a "<...> this way" put-continuation anaphor by
