@@ -8,7 +8,8 @@ use engine::game::effects::attach::attach_to;
 use engine::game::game_object::AttachTarget;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{
-    AbilityCondition, ChosenTargetSlots, Effect, ResolvedAbility, TargetFilter, TargetRef,
+    AbilityCondition, ChosenTargetSlots, ControllerRef, CountBinding, Effect, ManaProduction,
+    ManaTargetRole, QuantityExpr, QuantityRef, ResolvedAbility, TargetFilter, TargetRef, ZoneRef,
 };
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
@@ -115,6 +116,10 @@ fn a_batched_attack_trigger_targets_none_of_the_attackers_it_holds() {
         "reach guard: the trigger holds the attacker"
     );
     assert_eq!(declared, Vec::new());
+    assert_eq!(
+        displayed_targets(runner.state(), entry),
+        vec![TargetRef::Object(attacker)]
+    );
 
     give_keyword(&mut runner, attacker, Keyword::Shroud);
     runner.advance_until_stack_empty();
@@ -3361,5 +3366,156 @@ fn loki_does_not_trigger_on_a_spell_whose_two_targets_sit_below_its_gift() {
     assert!(
         pending_trigger_of(runner.state(), loki).is_none(),
         "CR 115.9c"
+    );
+}
+
+const PREY_UPON: &str = "Target creature you control fights target creature you don't control. (Each deals damage equal to its power to the other.)";
+const CAROM: &str = "The next 1 damage that would be dealt to target creature this turn is dealt to another target creature instead.\nDraw a card.";
+const AWE_STRIKE: &str = "The next time target creature would deal damage this turn, prevent that damage. You gain life equal to the damage prevented this way.";
+
+/// Returns the scenario, the spell `name` in P0's hand, P0's `Bear`, and P1's
+/// `Ogre` and `Other Ogre`.
+fn two_creatures_each_board(
+    name: &str,
+    is_instant: bool,
+    oracle: &str,
+) -> (GameScenario, ObjectId, ObjectId, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let own = scenario.add_creature(P0, "Bear", 2, 2).id();
+    scenario.add_creature(P0, "Other Bear", 2, 2);
+    let theirs = scenario.add_creature(P1, "Ogre", 3, 3).id();
+    let other = scenario.add_creature(P1, "Other Ogre", 3, 3).id();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, name, is_instant, oracle)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    (scenario, spell, own, theirs, other)
+}
+
+#[test]
+fn prey_upon_given_both_creatures_together_targets_both() {
+    let (scenario, prey_upon, own, theirs, _) =
+        two_creatures_each_board("Prey Upon", false, PREY_UPON);
+    let mut runner = scenario.build();
+    cast_selecting_targets_together(
+        &mut runner,
+        prey_upon,
+        vec![TargetRef::Object(own), TargetRef::Object(theirs)],
+    );
+    assert_eq!(
+        declared_of(runner.state(), prey_upon),
+        vec![TargetRef::Object(own), TargetRef::Object(theirs)],
+        "CR 601.2c"
+    );
+    assert_eq!(crimes(runner.state(), P0), 1, "CR 700.13");
+}
+
+#[test]
+fn carom_given_both_creatures_together_targets_both() {
+    let (scenario, carom, _, theirs, other) = two_creatures_each_board("Carom", true, CAROM);
+    let mut runner = scenario.build();
+    cast_selecting_targets_together(
+        &mut runner,
+        carom,
+        vec![TargetRef::Object(theirs), TargetRef::Object(other)],
+    );
+    assert_eq!(
+        declared_of(runner.state(), carom),
+        vec![TargetRef::Object(theirs), TargetRef::Object(other)],
+        "CR 601.2c"
+    );
+    assert_eq!(crimes(runner.state(), P0), 1, "CR 700.13");
+}
+
+#[test]
+fn awe_strike_given_its_creature_in_a_target_list_targets_it() {
+    let (scenario, awe_strike, _, theirs, _) =
+        two_creatures_each_board("Awe Strike", true, AWE_STRIKE);
+    let mut runner = scenario.build();
+    cast_selecting_targets_together(&mut runner, awe_strike, vec![TargetRef::Object(theirs)]);
+    assert_eq!(
+        declared_of(runner.state(), awe_strike),
+        vec![TargetRef::Object(theirs)],
+        "CR 601.2c"
+    );
+    assert_eq!(crimes(runner.state(), P0), 1, "CR 700.13");
+}
+
+#[test]
+fn a_mana_spell_given_its_recipient_and_count_source_one_by_one_targets_both() {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    // Role Split Ritual, as in `mana_target_recipient_and_count_source.rs`.
+    let spell = scenario
+        .add_spell_to_hand(P0, "Role Split Ritual", false)
+        .with_mana_cost(ManaCost::zero())
+        .with_ability(Effect::Mana {
+            produced: ManaProduction::Colorless {
+                count: QuantityExpr::Ref {
+                    qty: QuantityRef::TargetZoneCardCount {
+                        zone: ZoneRef::Hand,
+                        scope: ControllerRef::TargetOpponent,
+                        binding: CountBinding::Explicit,
+                    },
+                },
+            },
+            restrictions: vec![],
+            grants: vec![],
+            expiry: None,
+            target: Some(ManaTargetRole::Both {
+                recipient: TargetFilter::Player,
+                count_source: TargetFilter::Player,
+            }),
+        })
+        .id();
+    let mut runner = scenario.build();
+    let card_id = runner.state().objects[&spell].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: spell,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("the spell is castable");
+    let p2 = PlayerId(2);
+    for player in [P1, p2] {
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Player(player)),
+            })
+            .expect("the target is accepted");
+    }
+    assert_eq!(
+        declared_of(runner.state(), spell),
+        vec![TargetRef::Player(P1), TargetRef::Player(p2)],
+        "CR 601.2c"
+    );
+    assert_eq!(crimes(runner.state(), P0), 1, "CR 700.13");
+}
+
+const BRIGHTMARE: &str = "When this creature enters, tap up to one target creature. You gain life equal to that creature's power.";
+
+#[test]
+fn an_enters_trigger_given_no_target_in_a_target_list_is_recorded_as_choosing_no_target() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_creature(P1, "Bear", 2, 2);
+    let brightmare = scenario
+        .add_creature_to_hand_from_oracle(P0, "Brightmare", 2, 3, BRIGHTMARE)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(brightmare).commit();
+    pass_until(&mut runner, |state| {
+        matches!(state.waiting_for, WaitingFor::TriggerTargetSelection { .. })
+    });
+    runner
+        .act(GameAction::SelectTargets { targets: vec![] })
+        .expect("decline the target");
+    assert!(
+        records_no_target(entry_ability(runner.state(), brightmare)),
+        "CR 603.3d"
     );
 }
