@@ -24735,13 +24735,13 @@ mod player_count_list_tests {
         );
     }
 
-    /// CR 508.6: opponents attacked this combat are listed in seat order, and an
+    /// CR 508.6: opponents attacked this combat are listed in player-id order, and an
     /// attacked player who has since left the game is still listed, as the
     /// count has always counted them.
     /// Revert-probe: remove the `ThisCombat` early return ⇒ the generic arm
     /// drops the eliminated defender from the second list.
     #[test]
-    fn opponents_attacked_this_combat_are_listed_in_seat_order() {
+    fn opponents_attacked_this_combat_are_listed_in_player_id_order() {
         let mut state = GameState::new(FormatConfig::free_for_all(), 4, 1);
         let mut combat = CombatState::default();
         combat
