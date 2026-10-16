@@ -5429,8 +5429,8 @@ fn audit_later_instruction(effect: &Effect) -> LaterInstructionAudit<'_> {
         } => (
             // A token's printed power, toughness and abilities could be defined
             // by what the gated action did ("an X/X token"); only a fixed,
-            // ability-free token is audited. A named destination is a player
-            // reference this `TargetFilter`-typed list cannot hold.
+            // ability-free token is audited. A named destination is not a
+            // `TargetFilter`, so this list cannot hold it.
             (pt_value_is_fixed(power)
                 && pt_value_is_fixed(toughness)
                 && keywords.is_empty()
@@ -22241,8 +22241,8 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("; "));
     }
 
-    /// The destination a token instruction names is a player the audit's
-    /// `TargetFilter` referent list cannot hold, so a fixed token that names one
+    /// A destination a token instruction names is not a `TargetFilter`, so the
+    /// audit's referent list cannot hold it; a fixed token that names one
     /// is read as possibly depending on the gated action, while the same token
     /// naming none still lists its referents.
     #[test]

@@ -701,10 +701,8 @@ pub(crate) fn resolve_token_batch(
     }
     match named {
         Some(request) => (count, true, request),
-        // CR 508.4 + CR 508.4a: the instruction named its destination, so the tokens
-        // are never seated at one it did not name; with no player identified they
-        // enter, never attacking, as CR 508.4a treats a named player who has left
-        // the game.
+        // CR 508.4: the instruction named its destination, so the tokens are never
+        // seated at one it did not name.
         None => (count, false, TokenAttackRequest::Unspecified),
     }
 }
