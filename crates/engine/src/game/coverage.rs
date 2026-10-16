@@ -4305,11 +4305,18 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         Effect::CopyTokenOf {
             target,
             enters_attacking,
+            attack_destination,
             ..
         } => {
             d.push(("copies".into(), fmt_target(target)));
             if *enters_attacking {
                 d.push(("attacking".into(), "yes".into()));
+            }
+            if !attack_destination.is_controller_chooses() {
+                d.push((
+                    "attack_destination".into(),
+                    format!("{attack_destination:?}"),
+                ));
             }
         }
         Effect::CreateTokenCopyFromPool {
@@ -15004,6 +15011,50 @@ mod tests {
             scope: NamedDefenderScope::Player,
         }));
         assert!(named.contains("attacking Player"), "{named}");
+        assert_ne!(named, unnamed);
+    }
+
+    /// A copy-token instruction's named attack destination reaches the parse
+    /// details; an unnamed one renders as before.
+    #[test]
+    fn copy_token_effect_attack_destination_reaches_effect_details_only_when_named() {
+        use crate::types::ability::{NamedDefenderScope, TokenAttackDestination};
+
+        let copy_token = |attack_destination| Effect::CopyTokenOf {
+            target: TargetFilter::SelfRef,
+            owner: TargetFilter::Controller,
+            source_filter: None,
+            enters_attacking: true,
+            attack_destination,
+            tapped: false,
+            count: QuantityExpr::Fixed { value: 1 },
+            extra_keywords: vec![],
+            additional_modifications: vec![],
+        };
+
+        let unnamed = effect_details(&copy_token(TokenAttackDestination::ControllerChooses));
+        assert!(
+            unnamed
+                .iter()
+                .any(|(label, value)| label == "attacking" && value == "yes"),
+            "reach guard: the copy-token arm rendered: {unnamed:?}"
+        );
+        assert!(
+            !unnamed
+                .iter()
+                .any(|(label, _)| label == "attack_destination"),
+            "{unnamed:?}"
+        );
+        let named = effect_details(&copy_token(TokenAttackDestination::Player {
+            player: ControllerRef::DefendingPlayer,
+            scope: NamedDefenderScope::Player,
+        }));
+        assert!(
+            named
+                .iter()
+                .any(|(label, value)| label == "attack_destination" && value.contains("Player")),
+            "{named:?}"
+        );
         assert_ne!(named, unnamed);
     }
 
