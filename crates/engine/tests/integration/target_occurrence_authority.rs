@@ -857,6 +857,18 @@ fn validated_implicit_fight_declares_each_chosen_fighter_once() {
                 ChosenTargetSlots::Recorded(b_slot.into_iter().collect()),
                 "{case}"
             );
+            if shrouded == [false, false] && ancestor_stored {
+                assert_eq!(
+                    fight.target_pin_at(0),
+                    announced.target_pin_at(0),
+                    "inserted ancestor keeps its pin: {case}"
+                );
+                assert_eq!(
+                    fight.target_pin_at(1),
+                    fight_node(announced).target_pin_at(0),
+                    "the fight's own target keeps its pin: {case}"
+                );
+            }
         }
     }
 }
