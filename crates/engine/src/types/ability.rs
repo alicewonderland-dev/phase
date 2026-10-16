@@ -17085,6 +17085,13 @@ pub enum TokenAttackDestination {
         player: ControllerRef,
         scope: NamedDefenderScope,
     },
+    /// CR 608.2c: one token for each player `filter` lists ("for each
+    /// opponent, create … attacking that player"). The instruction's token
+    /// count is the length of that list.
+    EachPlayer {
+        filter: PlayerFilter,
+        scope: NamedDefenderScope,
+    },
 }
 
 impl TokenAttackDestination {
@@ -37604,6 +37611,29 @@ mod tests {
             );
             let back: Effect = serde_json::from_value(with_named).expect("round-trips");
             assert_eq!(back, build(named.clone()));
+        }
+    }
+
+    /// A destination that names each listed player round-trips on both token
+    /// instructions and is written as a typed filter with its scope.
+    #[test]
+    fn each_player_token_attack_destination_round_trips() {
+        let each_opponent = TokenAttackDestination::EachPlayer {
+            filter: PlayerFilter::Opponent,
+            scope: NamedDefenderScope::Player,
+        };
+        for build in [goblin_token, copy_token] {
+            let written = serde_json::to_value(build(each_opponent.clone())).expect("serializes");
+            assert_eq!(
+                written["attack_destination"],
+                serde_json::json!({
+                    "type": "EachPlayer",
+                    "data": {"filter": {"type": "Opponent"}, "scope": "Player"}
+                }),
+                "{written}"
+            );
+            let back: Effect = serde_json::from_value(written).expect("round-trips");
+            assert_eq!(back, build(each_opponent.clone()));
         }
     }
 

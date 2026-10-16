@@ -7432,11 +7432,12 @@ fn rw_player_scope(x: &PlayerScope) -> RwProfile {
     }
 }
 
-/// CR 508.4: the defender a token instruction names is a player reference.
+/// CR 508.4: the reads of the defender a token instruction names.
 fn rw_token_attack_destination(x: &TokenAttackDestination) -> RwProfile {
     match x {
         TokenAttackDestination::ControllerChooses => RwProfile::empty(),
         TokenAttackDestination::Player { player, scope: _ } => rw_controller_ref(player),
+        TokenAttackDestination::EachPlayer { filter, scope: _ } => rw_player_filter(filter),
     }
 }
 
@@ -7999,6 +8000,62 @@ mod tests {
                 profile(Some(ControllerRef::TriggeringPlayer)),
                 profile(None),
                 "{label}: the triggering player is a read the unnamed form is not"
+            );
+        }
+    }
+
+    /// A destination that names each player a filter lists is read as that
+    /// filter: `Opponent` adds nothing to the profile, `OpponentLostLife` reads
+    /// the life journal.
+    /// Revert-probe: make the `EachPlayer` arm return `RwProfile::empty()` ⇒ the
+    /// `OpponentLostLife` rows equal the unnamed profile.
+    #[test]
+    fn each_player_token_attack_destination_is_read_as_its_player_filter() {
+        use crate::types::ability::{NamedDefenderScope, TokenAttackDestination};
+
+        let naming = |filter: Option<PlayerFilter>| match filter {
+            None => TokenAttackDestination::ControllerChooses,
+            Some(filter) => TokenAttackDestination::EachPlayer {
+                filter,
+                scope: NamedDefenderScope::Player,
+            },
+        };
+        let token = |filter| {
+            let mut effect = token(&["Creature"], qfix(1));
+            if let Effect::Token {
+                attack_destination, ..
+            } = &mut effect
+            {
+                *attack_destination = naming(filter);
+            }
+            effect
+        };
+        let copy = |filter| Effect::CopyTokenOf {
+            target: TargetFilter::Typed(TypedFilter::creature()),
+            owner: TargetFilter::Controller,
+            source_filter: None,
+            enters_attacking: true,
+            attack_destination: naming(filter),
+            tapped: false,
+            count: qfix(1),
+            extra_keywords: vec![],
+            additional_modifications: vec![],
+        };
+
+        for (label, build) in [
+            ("Token", &token as &dyn Fn(Option<PlayerFilter>) -> Effect),
+            ("CopyTokenOf", &copy),
+        ] {
+            let profile = |filter| ability_rw_profile(&ra(build(filter)));
+            assert_eq!(
+                profile(Some(PlayerFilter::Opponent)),
+                profile(None),
+                "{label}: each opponent adds nothing to the profile"
+            );
+            assert_ne!(
+                profile(Some(PlayerFilter::OpponentLostLife)),
+                profile(None),
+                "{label}: opponents who lost life are a read the unnamed form is not"
             );
         }
     }

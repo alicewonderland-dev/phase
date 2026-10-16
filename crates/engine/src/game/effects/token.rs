@@ -518,7 +518,7 @@ pub fn resolve(
             colors.clone(),
             keywords.clone(),
             *tapped,
-            resolve_quantity_with_targets(state, count, ability).max(0) as u32,
+            count,
             owner,
             *enters_attacking,
             attack_destination.clone(),
@@ -535,7 +535,7 @@ pub fn resolve(
             vec![],
             vec![],
             false,
-            1,
+            &QuantityExpr::Fixed { value: 1 },
             &TargetFilter::Controller,
             false,
             TokenAttackDestination::ControllerChooses,
@@ -545,8 +545,8 @@ pub fn resolve(
             None,
         ),
     };
-    let (enters_attacking, attack_request) =
-        resolve_token_attack(state, ability, enters_attacking, &attack_destination);
+    let (count, enters_attacking, attack_request) =
+        resolve_token_batch(state, ability, count, enters_attacking, &attack_destination);
     // CR 608.2b: a declared player whose target was illegal creates no token.
     let Some(token_owner) = resolve_token_owner(state, ability, owner_filter) else {
         return no_token(state, ability, events);
@@ -661,35 +661,51 @@ pub fn resolve(
     Ok(())
 }
 
-/// CR 508.4 + CR 608.2h: whether a token batch enters attacking, and at
-/// what, resolved once for the instruction.
-pub(crate) fn resolve_token_attack(
+/// CR 508.4 + CR 608.2h: how many tokens a token instruction creates, whether
+/// they enter attacking, and at what, resolved once for the instruction.
+pub(crate) fn resolve_token_batch(
     state: &GameState,
     ability: &ResolvedAbility,
+    count: &QuantityExpr,
     enters_attacking: bool,
     destination: &TokenAttackDestination,
-) -> (bool, TokenAttackRequest) {
-    if !enters_attacking {
-        return (false, TokenAttackRequest::Unspecified);
-    }
-    match destination {
-        TokenAttackDestination::ControllerChooses => (true, TokenAttackRequest::Unspecified),
-        // CR 508.4: "or a planeswalker they control" also allows that player's
-        // planeswalker. No such choice is offered, so the token attacks the
-        // player, as effects/myriad.rs does.
-        TokenAttackDestination::Player { player, scope: _ } => {
-            let named = TokenAttackRequest::named(
-                crate::game::filter::ability_controller_ref_player(state, ability, player),
-            );
-            match named {
-                Some(request) => (true, request),
-                // CR 508.4 + CR 508.4a: the instruction named its destination, so the tokens
-                // are never seated at one it did not name; with no player identified they
-                // enter, never attacking, as CR 508.4a treats a named player who has left
-                // the game.
-                None => (false, TokenAttackRequest::Unspecified),
-            }
+) -> (u32, bool, TokenAttackRequest) {
+    // CR 508.4: "or a planeswalker they control" also allows that player's
+    // planeswalker. No such choice is offered, so the tokens attack the
+    // player, as effects/myriad.rs does.
+    let (count, named) = match destination {
+        TokenAttackDestination::ControllerChooses => {
+            let count = resolve_quantity_with_targets(state, count, ability).max(0) as u32;
+            return (count, enters_attacking, TokenAttackRequest::Unspecified);
         }
+        TokenAttackDestination::Player { player, scope: _ } => (
+            resolve_quantity_with_targets(state, count, ability).max(0) as u32,
+            TokenAttackRequest::named(crate::game::filter::ability_controller_ref_player(
+                state, ability, player,
+            )),
+        ),
+        TokenAttackDestination::EachPlayer { filter, scope: _ } => {
+            // CR 608.2c + CR 608.2h: the players are enumerated once;
+            // TokenAttackRequest::for_entrant seats each created token by its creation ordinal.
+            let players = crate::game::quantity::player_count_matching_ids_for_ability(
+                state, filter, ability,
+            );
+            (
+                u32::try_from(players.len()).unwrap_or(u32::MAX),
+                TokenAttackRequest::named(players),
+            )
+        }
+    };
+    if !enters_attacking {
+        return (count, false, TokenAttackRequest::Unspecified);
+    }
+    match named {
+        Some(request) => (count, true, request),
+        // CR 508.4 + CR 508.4a: the instruction named its destination, so the tokens
+        // are never seated at one it did not name; with no player identified they
+        // enter, never attacking, as CR 508.4a treats a named player who has left
+        // the game.
+        None => (count, false, TokenAttackRequest::Unspecified),
     }
 }
 
@@ -3146,10 +3162,9 @@ pub(crate) fn resolve_token_spec(
         return None;
     };
 
-    let count = resolve_quantity_with_targets(state, count, ability).max(0) as u32;
     let token_owner = resolve_token_owner(state, ability, owner)?;
-    let (enters_attacking, attack_request) =
-        resolve_token_attack(state, ability, *enters_attacking, attack_destination);
+    let (count, enters_attacking, attack_request) =
+        resolve_token_batch(state, ability, count, *enters_attacking, attack_destination);
     let host_request = TokenHostRequest::from_binding(
         attach_to.is_some(),
         attach_to
@@ -4837,6 +4852,48 @@ mod tests {
         assert!(
             !attackers.contains(&named_token),
             "no player was identified, so the token is not attacking"
+        );
+    }
+
+    /// CR 608.2c: an instruction that names each player a filter lists creates
+    /// one token for each listed player; with nobody listed it creates none and
+    /// nothing attacks. The elimination twin lists a player in the same
+    /// state.
+    #[test]
+    fn each_player_destination_with_nobody_listed_creates_no_token() {
+        use crate::types::ability::{NamedDefenderScope, TokenAttackDestination};
+        use crate::types::proposed_event::TokenAttackRequest;
+
+        let (mut state, source) = attacking_token_board();
+        let ability = ResolvedAbility::new(
+            goblin_token_effect(TokenAttackDestination::ControllerChooses),
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        let destination = TokenAttackDestination::EachPlayer {
+            filter: PlayerFilter::HasLostTheGame,
+            scope: NamedDefenderScope::Player,
+        };
+        let one = QuantityExpr::Fixed { value: 1 };
+
+        assert_eq!(
+            resolve_token_batch(&state, &ability, &one, true, &destination),
+            (0, false, TokenAttackRequest::Unspecified)
+        );
+
+        state.players[1].is_eliminated = true;
+        assert_eq!(
+            resolve_token_batch(&state, &ability, &one, true, &destination),
+            (
+                1,
+                true,
+                TokenAttackRequest::Named {
+                    first: PlayerId(1),
+                    rest: vec![],
+                }
+            ),
+            "reach guard: one listed player is one token seated at that player"
         );
     }
 

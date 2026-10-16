@@ -77,11 +77,13 @@ pub fn resolve(
         ),
         _ => return Err(EffectError::MissingParam("CopyTokenOf".to_string())),
     };
-    let (enters_attacking, attack_request) =
-        super::token::resolve_token_attack(state, ability, enters_attacking, attack_destination);
-    // CR 107.3a + CR 601.2b: `count` may be the X announced while casting, which resolves from `ability.chosen_x`.
-    let count =
-        crate::game::quantity::resolve_quantity_with_targets(state, &count_expr, ability).max(0);
+    let (count, enters_attacking, attack_request) = super::token::resolve_token_batch(
+        state,
+        ability,
+        &count_expr,
+        enters_attacking,
+        attack_destination,
+    );
 
     // CR 109.4 + CR 111.2: The token's creator (and therefore controller) is
     // determined by the `owner` filter. Resolved once, before the creation
@@ -258,7 +260,7 @@ pub fn resolve(
     for source in copy_sources {
         remaining.push_back(PendingCopyTokenBatch {
             owner: token_owner,
-            count: count as u32,
+            count,
             copy: Box::new(CopyTokenSpec {
                 values: Box::new(source.values),
                 display_source: source.display_source,

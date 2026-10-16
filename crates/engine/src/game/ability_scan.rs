@@ -745,7 +745,7 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
                     acc = acc.or(scan_keyword(kw, mode));
                 }
                 acc = acc.or(scan_quantity_expr(count, mode));
-                acc = acc.or(scan_token_attack_destination(attack_destination));
+                acc = acc.or(scan_token_attack_destination(attack_destination, mode));
                 acc = acc.or(scan_target_filter(
                     owner,
                     FilterReadContext::SnapshotOrEvent,
@@ -1112,7 +1112,7 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             ScanMode::Conservative => Axes::CONSERVATIVE,
             ScanMode::LoopFirewall => {
                 let mut acc = scan_target_filter(target, target_ctx, mode);
-                acc = acc.or(scan_token_attack_destination(attack_destination));
+                acc = acc.or(scan_token_attack_destination(attack_destination, mode));
                 acc = acc.or(scan_target_filter(
                     owner,
                     FilterReadContext::SnapshotOrEvent,
@@ -5311,11 +5311,12 @@ fn scan_player_scope(x: &PlayerScope) -> Axes {
     }
 }
 
-/// CR 508.4: the defender a token instruction names is a player reference.
-fn scan_token_attack_destination(x: &TokenAttackDestination) -> Axes {
+/// CR 508.4: the reads of the defender a token instruction names.
+fn scan_token_attack_destination(x: &TokenAttackDestination, mode: ScanMode) -> Axes {
     match x {
         TokenAttackDestination::ControllerChooses => Axes::NONE,
         TokenAttackDestination::Player { player, scope: _ } => scan_controller_ref(player),
+        TokenAttackDestination::EachPlayer { filter, scope: _ } => scan_player_filter(filter, mode),
     }
 }
 
@@ -7898,6 +7899,58 @@ mod tests {
             assert!(
                 triggering.event && !unnamed.event,
                 "{label}: the triggering player is an event read the unnamed form is not"
+            );
+        }
+    }
+
+    /// A destination that names each player a filter lists is read as that
+    /// filter: `Opponent` adds no axis, `OpponentLostLife` reads the projected
+    /// life history.
+    /// Revert-probe: make the `EachPlayer` arm return `Axes::NONE` ⇒ the
+    /// `OpponentLostLife` rows lose their projected axis.
+    #[test]
+    fn each_player_token_attack_destination_is_read_as_its_player_filter_under_loop_firewall() {
+        use crate::types::ability::{NamedDefenderScope, TokenAttackDestination};
+
+        let naming = |filter: Option<PlayerFilter>| match filter {
+            None => TokenAttackDestination::ControllerChooses,
+            Some(filter) => TokenAttackDestination::EachPlayer {
+                filter,
+                scope: NamedDefenderScope::Player,
+            },
+        };
+        let token = |filter| vanilla_token_naming(naming(filter));
+        let copy = |filter| Effect::CopyTokenOf {
+            target: TargetFilter::SelfRef,
+            owner: TargetFilter::Controller,
+            source_filter: None,
+            enters_attacking: true,
+            attack_destination: naming(filter),
+            tapped: false,
+            count: QuantityExpr::Fixed { value: 1 },
+            extra_keywords: vec![],
+            additional_modifications: vec![],
+        };
+
+        for (label, build) in [
+            ("Token", &token as &dyn Fn(Option<PlayerFilter>) -> Effect),
+            ("CopyTokenOf", &copy),
+        ] {
+            let unnamed = scan_effect(&build(None), ScanMode::LoopFirewall);
+            let opponents =
+                scan_effect(&build(Some(PlayerFilter::Opponent)), ScanMode::LoopFirewall);
+            let lost_life = scan_effect(
+                &build(Some(PlayerFilter::OpponentLostLife)),
+                ScanMode::LoopFirewall,
+            );
+            assert_eq!(
+                (opponents.event, opponents.sibling, opponents.projected),
+                (unnamed.event, unnamed.sibling, unnamed.projected),
+                "{label}: each opponent adds no axis"
+            );
+            assert!(
+                lost_life.projected && !unnamed.projected,
+                "{label}: opponents who lost life are a projected read the unnamed form is not"
             );
         }
     }

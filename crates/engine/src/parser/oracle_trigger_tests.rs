@@ -38500,29 +38500,36 @@ fn plural_token_clauses_name_that_player_as_their_attack_destination() {
 }
 
 /// "that player" inside "for each opponent" names the iterated opponent rather
-/// than the defending player, so the defending-player reading is not kept.
+/// than the defending player, so the token names each opponent the count lists.
 #[test]
-fn per_opponent_token_clauses_do_not_keep_the_defending_player_destination() {
-    for (card, line) in [
+fn per_opponent_token_clauses_name_each_opponent_as_the_destination() {
+    use crate::types::ability::NamedDefenderScope;
+
+    for (card, line, scope) in [
         (
             "Ainok Strike Leader",
             "Whenever you attack with this creature and/or your commander, for each opponent, create a 1/1 red Goblin creature token that's tapped and attacking that player.",
+            NamedDefenderScope::Player,
         ),
         (
             "Endless Foot Assault",
             "Whenever you attack, for each opponent, create a 1/1 black Ninja creature token that's tapped and attacking that player.",
+            NamedDefenderScope::Player,
         ),
         (
             "Stampede Surfer",
             "Whenever this creature attacks, for each opponent, you create a 2/2 green Boar creature token that's tapped and attacking that opponent.",
+            NamedDefenderScope::Player,
         ),
         (
             "Adeline, Resplendent Cathar",
             "Whenever you attack, for each opponent, create a 1/1 white Human creature token that's tapped and attacking that player or a planeswalker they control.",
+            NamedDefenderScope::PlayerOrPlaneswalker,
         ),
         (
             "Veteran Soldier",
             "Whenever this creature attacks a player, if no opponent has more life than that player, for each opponent, create a 1/1 white Soldier creature token that's tapped and attacking that opponent.",
+            NamedDefenderScope::Player,
         ),
     ] {
         let def = only_token_definition(line, card);
@@ -38532,9 +38539,16 @@ fn per_opponent_token_clauses_do_not_keep_the_defending_player_destination() {
             panic!("{card}: expected a Token effect");
         };
         assert_eq!(*count, opponent_count(), "{card}: reach guard");
+        assert!(
+            def.repeat_for.is_none(),
+            "{card}: reach guard: the iteration was folded into the count"
+        );
         assert_eq!(
             destination,
-            crate::types::ability::TokenAttackDestination::ControllerChooses,
+            crate::types::ability::TokenAttackDestination::EachPlayer {
+                filter: PlayerFilter::Opponent,
+                scope,
+            },
             "{card}"
         );
     }
