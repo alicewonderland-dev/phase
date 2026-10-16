@@ -92,6 +92,7 @@ pub mod copy_spell;
 pub mod copy_token_blocking;
 pub mod counter;
 pub mod counters;
+pub mod create_boon;
 pub mod create_damage_replacement;
 pub mod create_draw_replacement;
 pub mod create_emblem;
@@ -173,6 +174,7 @@ pub mod mill;
 pub mod monstrosity;
 pub mod myriad;
 pub mod note_mana_spent;
+pub mod note_number;
 pub mod open_booster_pack;
 pub mod opponent_guess;
 pub mod overload;
@@ -4680,6 +4682,10 @@ fn waits_for_resolution_choice(waiting_for: &WaitingFor) -> bool {
             | WaitingFor::ChooseFromZoneOpponentChooser { .. }
             | WaitingFor::ChooseOneOfBranch { .. }
             | WaitingFor::ReturnAsAuraTarget { .. }
+            // CR 608.2c: a "one of them" host choice pauses token creation;
+            // anything chained after it must wait for the host (and any
+            // replacement work the resumed creation opens).
+            | WaitingFor::ChooseTokenHost { .. }
             | WaitingFor::ChooseManaColor { .. }
             | WaitingFor::ManifestDreadChoice { .. }
             | WaitingFor::DiscardChoice { .. }
@@ -5639,6 +5645,10 @@ fn audit_later_instruction(effect: &Effect) -> LaterInstructionAudit<'_> {
         | Effect::BecomeSaddled { .. }
         | Effect::SetClassLevel { .. }
         | Effect::CreateDelayedTrigger { .. }
+        // Digital-only Alchemy (no CR entry): a boon always carries its
+        // granted trigger, whose later referents are unauditable — refused
+        // like every other boundary carrier.
+        | Effect::CreateBoon { .. }
         | Effect::AddTargetReplacement { .. }
         | Effect::AddRestriction { .. }
         | Effect::ReduceNextSpellCost { .. }
@@ -5683,6 +5693,7 @@ fn audit_later_instruction(effect: &Effect) -> LaterInstructionAudit<'_> {
         | Effect::ChooseFromZone { .. }
         | Effect::RememberCard { .. }
         | Effect::NoteManaSpent
+        | Effect::NoteNumber { .. }
         | Effect::ForEachCategory { .. }
         | Effect::ChooseObjectsIntoTrackedSet { .. }
         | Effect::ChooseAndSacrificeRest { .. }
@@ -6185,6 +6196,7 @@ fn quantity_ref_counts_population_matching(
         | QuantityRef::LandsPlayedThisTurn { .. }
         | QuantityRef::TurnsTaken
         | QuantityRef::ChosenNumber
+        | QuantityRef::NotedNumber
         | QuantityRef::DescendedThisTurn
         | QuantityRef::LoyaltyAbilitiesActivatedThisTurn { .. }
         | QuantityRef::SpellsCastLastTurn
@@ -8116,6 +8128,7 @@ pub fn resolve_effect(
             resolve_add_pending_enters_modifications(state, ability, events)
         }
         Effect::CreateEmblem { .. } => create_emblem::resolve(state, ability, events),
+        Effect::CreateBoon { .. } => create_boon::resolve(state, ability, events),
         Effect::PayCost { .. } => pay::resolve(state, ability, events),
         Effect::CastFromZone { .. } => cast_from_zone::resolve(state, ability, events),
         Effect::FreeCastFromZones { .. } => free_cast_from_zones::resolve(state, ability, events),
@@ -8143,6 +8156,7 @@ pub fn resolve_effect(
         Effect::ChooseFromZone { .. } => choose_from_zone::resolve(state, ability, events),
         Effect::RememberCard { .. } => remember_card::resolve(state, ability, events),
         Effect::NoteManaSpent => note_mana_spent::resolve(state, ability, events),
+        Effect::NoteNumber { .. } => note_number::resolve(state, ability, events),
         Effect::ForEachCategory { .. } => {
             choose_from_zone::resolve_for_each_category(state, ability, events)
         }
@@ -15193,6 +15207,11 @@ fn reset_top_level_resolution_state(state: &mut GameState) {
     // CR 608.2c: "that sticker" names a sticker this resolution's own PutSticker
     // instruction placed; a new top-level resolution cannot inherit a prior one's.
     state.placed_sticker_this_resolution = None;
+    // Digital-only Alchemy (no CR entry): a sibling grant snapshots only a
+    // note THIS resolution wrote; a new top-level resolution cannot inherit
+    // a prior one's, so a grant whose own resolution noted nothing captures
+    // `None` and reads fall back to the live global.
+    state.noted_numbers_this_resolution.clear();
     // CR 401.5 + CR 608.2c + CR 609.3 + issue #4950: Defense in depth —
     // `apply_parent_chain_context` already consumes this at the very next
     // parent->child hand-off after a Dig/ChooseFromZone/RevealHand sets
@@ -20569,10 +20588,24 @@ pub(crate) fn evaluate_condition(
             );
             comparator.evaluate(l, r)
         }
-        AbilityCondition::CastDuringPhase { phases } => ability
-            .context
-            .cast_phase
-            .is_some_and(|cast_phase| phases.contains(&cast_phase)),
+        // CR 109.5 + CR 102.1 + CR 601.2: Addendum and timing riders ("if you cast this spell
+        // during your main phase") require the spell to have been cast during the specified
+        // phase of the caster's own turn (caster == active player when cast).
+        AbilityCondition::CastDuringPhase { phases } => {
+            let was_own_phase = match (
+                ability.context.cast_controller,
+                ability.context.cast_active_player,
+            ) {
+                (Some(caster), Some(active)) => caster == active,
+                (Some(caster), None) => caster == ability.controller,
+                (None, _) => true,
+            };
+            was_own_phase
+                && ability
+                    .context
+                    .cast_phase
+                    .is_some_and(|cast_phase| phases.contains(&cast_phase))
+        }
         AbilityCondition::CastTimingPermission { permission } => state
             .objects
             .get(&ability.source_id)
@@ -21588,6 +21621,7 @@ fn resolve_add_pending_enters_modifications(
 mod tests {
     use super::*;
     use crate::database::synthesis::synthesize_extort;
+    use crate::types::ability::ChooseOneOfKind;
     use crate::types::ability::SpentColor;
 
     /// CR 608.2c: the pile placement after a reveal-only until-loop is bound to the
@@ -35197,6 +35231,7 @@ mod tests {
                     single_use: false,
                     cast_cost_modifier: None,
                     alt_ability_cost: None,
+                    without_paying_mana_cost: false,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 },
                 target: TargetFilter::TrackedSet {
@@ -39719,6 +39754,8 @@ mod tests {
             ObjectId(1),
             PlayerId(0),
         );
+        ability.context.cast_controller = Some(PlayerId(0));
+        ability.context.cast_active_player = Some(PlayerId(0));
         ability.context.cast_phase = Some(Phase::PreCombatMain);
 
         assert!(evaluate_condition(
@@ -39738,9 +39775,22 @@ mod tests {
             &ability
         ));
 
+        // CR 109.5 + CR 601.2: Resolution-time active player changes to PlayerId(1), but casting-time
+        // cast_controller == cast_active_player was PlayerId(0): condition holds.
         ability.context.cast_phase = Some(Phase::PostCombatMain);
         state.active_player = PlayerId(1);
         assert!(evaluate_condition(
+            &AbilityCondition::CastDuringPhase {
+                phases: vec![Phase::PreCombatMain, Phase::PostCombatMain],
+            },
+            &state,
+            &ability
+        ));
+
+        // Casting-time active player was PlayerId(1) (opponent's turn) while caster was PlayerId(0):
+        // condition fails even if cast during a main phase.
+        ability.context.cast_active_player = Some(PlayerId(1));
+        assert!(!evaluate_condition(
             &AbilityCondition::CastDuringPhase {
                 phases: vec![Phase::PreCombatMain, Phase::PostCombatMain],
             },
@@ -39906,6 +39956,7 @@ mod tests {
                     single_use: false,
                     cast_cost_modifier: None,
                     alt_ability_cost: None,
+                    without_paying_mana_cost: false,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 },
                 target: TargetFilter::TrackedSet {
@@ -41961,6 +42012,7 @@ mod tests {
             Effect::ChooseOneOf {
                 chooser: crate::types::ability::PlayerFilter::Controller,
                 branches: vec![fixed_branch, dynamic_branch],
+                kind: ChooseOneOfKind::Ordinary,
             },
             vec![],
             source,
@@ -42098,6 +42150,7 @@ mod tests {
             Effect::ChooseOneOf {
                 chooser: crate::types::ability::PlayerFilter::Controller,
                 branches: vec![dynamic_branch],
+                kind: ChooseOneOfKind::Ordinary,
             },
             vec![],
             source,
@@ -42198,6 +42251,7 @@ mod tests {
             Effect::ChooseOneOf {
                 chooser: PlayerFilter::Controller,
                 branches: vec![add_branch, remove_branch],
+                kind: ChooseOneOfKind::Ordinary,
             },
             vec![TargetRef::Object(target)],
             source,

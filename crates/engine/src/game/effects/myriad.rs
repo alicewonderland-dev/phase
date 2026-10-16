@@ -1,7 +1,7 @@
 use crate::game::{combat, players};
 use crate::types::ability::{
-    DelayedTriggerCondition, Effect, EffectError, QuantityExpr, ResolvedAbility, TargetFilter,
-    TargetRef, TokenAttackDestination,
+    DelayedTriggerCondition, DelayedTriggerKind, Effect, EffectError, QuantityExpr,
+    ResolvedAbility, TargetFilter, TargetRef, TokenAttackDestination,
 };
 use crate::types::events::GameEvent;
 use crate::types::game_state::{DelayedTrigger, GameState};
@@ -102,6 +102,7 @@ pub fn resolve(
             controller: ability.controller,
             source_id: ability.source_id,
             one_shot: true,
+            kind: DelayedTriggerKind::Ordinary,
             provenance: crate::types::identifiers::DelayedInstallIdentity::LegacyDelayed,
         };
         crate::game::triggers::install_delayed_trigger(state, exile_tokens, events);
