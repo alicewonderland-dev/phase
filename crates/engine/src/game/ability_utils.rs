@@ -3092,6 +3092,8 @@ fn declared_illegal_local_positions(
         .collect()
 }
 
+type Occurrence = (TargetRef, Option<ObjectIncarnationRef>);
+
 /// CR 608.2b: one node's resolution-validation result.
 enum NodeValidation {
     /// One verdict per announced occurrence; storage is their projection.
@@ -3101,7 +3103,9 @@ enum NodeValidation {
     /// still judge this node's own announced occurrences.
     Rebuilt {
         verdicts: Vec<OccurrenceVerdict>,
-        stored: Vec<(TargetRef, Option<ObjectIncarnationRef>)>,
+        /// The fighters in storage order, each with the position of this
+        /// node's own occurrence it is, or `None` for an ancestor's.
+        stored: Vec<(Option<usize>, Occurrence)>,
     },
 }
 
@@ -3426,7 +3430,6 @@ fn validate_targets_in_chain_inner(
             // it must carry a `Legal` verdict, still be the announced
             // incarnation, and be a phased-in creature on the battlefield. An
             // ineligible referent means no fight, never a substitute.
-            type Occurrence = (TargetRef, Option<ObjectIncarnationRef>);
             let own: Vec<(usize, Occurrence)> = validated
                 .target_occurrences()
                 .into_iter()
@@ -3558,11 +3561,10 @@ fn validate_targets_in_chain_inner(
                     legal_or_dropped(own_fighter || ancestor_fighter)
                 })
                 .collect();
-            let stored = fighters
-                .into_iter()
-                .map(|(_, occurrence)| occurrence)
-                .collect();
-            NodeValidation::Rebuilt { verdicts, stored }
+            NodeValidation::Rebuilt {
+                verdicts,
+                stored: fighters,
+            }
         }
     } else if let Some(roles_legal) = damage_replacement_role_occurrences_legal(state, &validated) {
         // CR 115.1a + CR 601.2c + CR 608.2b: each declared damage-replacement
@@ -3845,7 +3847,15 @@ fn validate_targets_in_chain_inner(
             verdicts
         }
         NodeValidation::Rebuilt { verdicts, stored } => {
-            validated.replace_target_occurrences(stored);
+            // CR 601.2c: an ancestor's occurrence was not chosen for this
+            // node, so it is inserted unrecorded.
+            let own: Vec<usize> = stored.iter().filter_map(|(own, _)| *own).collect();
+            validated.project_target_occurrences(&own);
+            for (index, (own, (target, pin))) in stored.into_iter().enumerate() {
+                if own.is_none() {
+                    validated.insert_target(index, target, pin);
+                }
+            }
             verdicts
         }
     };
