@@ -7099,6 +7099,9 @@ pub struct PendingTokenBattlefieldEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CopyTokenEntryTail {
     pub owner: PlayerId,
+    /// Its `attack_request` is already advanced past the tokens created so far,
+    /// this one included, because the remaining tokens are resumed counting from
+    /// zero.
     pub copy: Box<CopyTokenSpec>,
     pub enter_tapped: EtbTapState,
     pub enter_with_counters: Vec<(CounterType, u32)>,

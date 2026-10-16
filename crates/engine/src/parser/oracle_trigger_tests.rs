@@ -38570,6 +38570,48 @@ fn unfolded_per_opponent_token_clause_does_not_keep_the_defending_player_destina
     );
 }
 
+/// The destination sentence follows the iterated creation clause, so it is
+/// applied after the iteration is attached to the definition.
+#[test]
+fn continuation_sentence_in_a_per_opponent_iteration_does_not_keep_the_defending_player_destination(
+) {
+    let mut keeping_the_defending_player = Vec::new();
+    for text in [
+        "Whenever you attack, for each opponent, create a 1/1 red Goblin creature token. It enters tapped and attacking that player.",
+        "Whenever you attack, for each opponent, create a 1/1 red Goblin creature token. It enters tapped and attacking that player. You gain 1 life.",
+        "Whenever you attack, for each opponent, create a token that's a copy of target creature you control. The token enters tapped and attacking that player.",
+    ] {
+        let parsed = parse_oracle_text(
+            text,
+            "Synthetic Goblin Raider",
+            &[],
+            &["Enchantment".to_string()],
+            &[],
+        );
+        let execute = parsed.triggers[0]
+            .execute
+            .as_deref()
+            .expect("trigger has an execute");
+        assert_no_unimplemented(execute);
+        let tokens = token_definitions_in_chain(execute);
+        assert_eq!(tokens.len(), 1, "reach guard: one token effect in {text}");
+        assert_eq!(
+            tokens[0].repeat_for,
+            Some(opponent_count()),
+            "reach guard: the iteration stayed on the definition in {text}"
+        );
+        let (_, enters_attacking, destination) = token_attack_fields(tokens[0]);
+        assert!(enters_attacking, "reach guard: the sentence applied: {text}");
+        if !destination.is_controller_chooses() {
+            keeping_the_defending_player.push(text);
+        }
+    }
+    assert!(
+        keeping_the_defending_player.is_empty(),
+        "{keeping_the_defending_player:#?}"
+    );
+}
+
 #[test]
 fn suffix_per_opponent_token_clause_does_not_keep_the_defending_player_destination() {
     let parsed = parse_oracle_text(

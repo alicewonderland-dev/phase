@@ -1018,9 +1018,14 @@ pub(crate) fn apply_copy_token_after_replacement_with_created_ids(
                 .expect("resolved copy-token creation must have a live journal cause");
         }
 
+        // CR 508.4: the tail resumes the rest of the batch counting its own
+        // tokens from zero, so its request starts past the tokens created so
+        // far, this one included.
+        let mut resume_copy = copy_spec.clone();
+        resume_copy.attack_request = attack_request.after_entrants(created_ids.len() + 1);
         let tail = CopyTokenEntryTail {
             owner: token_owner,
-            copy: copy_spec.clone(),
+            copy: resume_copy,
             enter_tapped,
             enter_with_counters: enter_with_counters.clone(),
             etb_counters: etb_counters.clone(),
@@ -2121,6 +2126,436 @@ mod tests {
             vec![
                 Some(AttackTarget::Player(PlayerId(1))),
                 Some(AttackTarget::Player(PlayerId(2)))
+            ]
+        );
+    }
+
+    /// The attack target each created token holds in `state.combat`, in id order.
+    fn seats_of_battlefield_tokens(
+        state: &GameState,
+    ) -> Vec<Option<crate::game::combat::AttackTarget>> {
+        let mut token_ids: Vec<ObjectId> = state
+            .objects
+            .values()
+            .filter(|obj| obj.is_token && obj.zone == Zone::Battlefield)
+            .map(|obj| obj.id)
+            .collect();
+        token_ids.sort();
+        token_ids
+            .iter()
+            .map(|id| {
+                state
+                    .combat
+                    .as_ref()
+                    .unwrap()
+                    .attackers
+                    .iter()
+                    .find(|a| a.object_id == *id)
+                    .map(|a| a.attack_target)
+            })
+            .collect()
+    }
+
+    /// A creature copy source for the attack-destination batch tests.
+    fn add_copy_source(state: &mut GameState, name: &str) -> ObjectId {
+        let source_id = create_object(
+            state,
+            CardId(1),
+            PlayerId(0),
+            name.to_string(),
+            Zone::Battlefield,
+        );
+        let source = state.objects.get_mut(&source_id).unwrap();
+        source.base_power = Some(2);
+        source.base_toughness = Some(2);
+        source.power = Some(2);
+        source.toughness = Some(2);
+        source.base_card_types = CardType {
+            supertypes: vec![],
+            core_types: vec![CoreType::Creature],
+            subtypes: vec!["Bear".to_string()],
+        };
+        source.card_types = source.base_card_types.clone();
+        source_id
+    }
+
+    fn named_attack_copy_spec(
+        state: &GameState,
+        source_id: ObjectId,
+        additional_modifications: Vec<ContinuousModification>,
+    ) -> CopyTokenSpec {
+        use crate::types::proposed_event::TokenAttackRequest;
+
+        CopyTokenSpec {
+            values: Box::new(crate::game::printed_cards::intrinsic_copiable_values(
+                &state.objects[&source_id],
+            )),
+            display_source: DisplaySource::Token,
+            printed_ref: None,
+            token_image_ref: None,
+            token_art: None,
+            extra_keywords: Vec::new(),
+            additional_modifications,
+            tapped: true,
+            enters_attacking: true,
+            attack_request: TokenAttackRequest::Named {
+                first: PlayerId(1),
+                rest: vec![PlayerId(2)],
+            },
+            sacrifice_at: None,
+            source_id,
+            controller: PlayerId(0),
+        }
+    }
+
+    /// CR 508.4: a non-liminal copy batch keeps its creation ordinal across a
+    /// counter-replacement pause, so each token is still seated at the
+    /// destination its own position in the request names.
+    #[test]
+    fn copy_batch_ordinal_survives_a_counter_pause() {
+        use crate::game::combat::{AttackTarget, CombatState};
+
+        let mut state = GameState::new(crate::types::format::FormatConfig::commander(), 3, 42);
+        state.combat = Some(CombatState::default());
+        let replacement_source = create_object(
+            &mut state,
+            CardId(9),
+            PlayerId(0),
+            "Counter Choice".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let mut def = ReplacementDefinition::new(ReplacementEvent::AddCounter)
+                .valid_card(TargetFilter::Any)
+                .quantity_modification(QuantityModification::Prevent);
+            def.mode = crate::types::ability::ReplacementMode::Optional { decline: None };
+            let obj = state.objects.get_mut(&replacement_source).unwrap();
+            obj.base_replacement_definitions = Arc::new(vec![def.clone()]);
+            obj.replacement_definitions = vec![def].into();
+        }
+        let source_id = add_copy_source(&mut state, "Grizzly Bears");
+        let copy = named_attack_copy_spec(
+            &state,
+            source_id,
+            vec![ContinuousModification::AddCounterOnEnter {
+                counter_type: CounterType::Plus1Plus1,
+                count: QuantityExpr::Fixed { value: 1 },
+                if_type: None,
+            }],
+        );
+
+        let mut events = Vec::new();
+        let status = apply_copy_token_after_replacement(
+            &mut state,
+            PlayerId(0),
+            copy,
+            EtbTapState::Tapped,
+            Vec::new(),
+            3,
+            &mut events,
+        );
+        assert!(
+            matches!(status.completion, CopyTokenApplyCompletion::Paused),
+            "reach guard: the first token's counter placement paused the batch"
+        );
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ));
+        for _ in 0..3 {
+            if !matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }) {
+                break;
+            }
+            apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 }).unwrap();
+        }
+
+        assert_eq!(
+            seats_of_battlefield_tokens(&state),
+            vec![
+                Some(AttackTarget::Player(PlayerId(1))),
+                Some(AttackTarget::Player(PlayerId(2))),
+                Some(AttackTarget::Player(PlayerId(1))),
+            ]
+        );
+    }
+
+    /// CR 508.4 + CR 614.1c: the same, when the pause is on the copied
+    /// creature's own "enters with a counter" self-replacement.
+    #[test]
+    fn copy_batch_ordinal_survives_an_entry_counter_pause() {
+        use crate::game::combat::{AttackTarget, CombatState};
+
+        let mut state = GameState::new(crate::types::format::FormatConfig::commander(), 3, 42);
+        state.combat = Some(CombatState::default());
+        let counter_choice = create_object(
+            &mut state,
+            CardId(9),
+            PlayerId(0),
+            "Counter Choice".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let mut def = ReplacementDefinition::new(ReplacementEvent::AddCounter)
+                .valid_card(TargetFilter::Any)
+                .quantity_modification(QuantityModification::Prevent);
+            def.mode = crate::types::ability::ReplacementMode::Optional { decline: None };
+            let obj = state.objects.get_mut(&counter_choice).unwrap();
+            obj.base_replacement_definitions = Arc::new(vec![def.clone()]);
+            obj.replacement_definitions = vec![def].into();
+        }
+        let source_id = add_copy_source(&mut state, "Walking Ballista");
+        {
+            let enters_with_counter = ReplacementDefinition::new(ReplacementEvent::Moved)
+                .valid_card(TargetFilter::SelfRef)
+                .destination_zone(Zone::Battlefield)
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::PutCounter {
+                        counter_type: CounterType::Plus1Plus1,
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::SelfRef,
+                    },
+                ));
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source
+                .replacement_definitions
+                .push(enters_with_counter.clone());
+            Arc::make_mut(&mut source.base_replacement_definitions).push(enters_with_counter);
+        }
+        let copy = named_attack_copy_spec(&state, source_id, Vec::new());
+        assert!(
+            !crate::game::printed_cards::self_etb_counter_replacements(
+                &copy.values.replacement_definitions
+            )
+            .is_empty(),
+            "reach guard: the copied values carry the entry counter"
+        );
+
+        let mut events = Vec::new();
+        let status = apply_copy_token_after_replacement(
+            &mut state,
+            PlayerId(0),
+            copy,
+            EtbTapState::Tapped,
+            Vec::new(),
+            3,
+            &mut events,
+        );
+        assert!(
+            matches!(status.completion, CopyTokenApplyCompletion::Paused),
+            "reach guard: the first token's entry counter paused the batch"
+        );
+        for _ in 0..3 {
+            if !matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }) {
+                break;
+            }
+            apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 }).unwrap();
+        }
+
+        let seats = seats_of_battlefield_tokens(&state);
+        assert_eq!(
+            seats,
+            vec![
+                Some(AttackTarget::Player(PlayerId(1))),
+                Some(AttackTarget::Player(PlayerId(2))),
+                Some(AttackTarget::Player(PlayerId(1))),
+            ]
+        );
+    }
+
+    /// CR 508.4 + CR 303.4f: a non-liminal copy batch keeps its creation
+    /// ordinal across the Aura-host choices that pause it.
+    #[test]
+    fn copy_batch_ordinal_survives_an_aura_host_pause() {
+        use crate::game::combat::{AttackTarget, CombatState};
+
+        let mut state = GameState::new(crate::types::format::FormatConfig::commander(), 3, 42);
+        state.combat = Some(CombatState::default());
+        let hosts: Vec<ObjectId> = (0..2)
+            .map(|i| add_copy_source(&mut state, &format!("Host {i}")))
+            .collect();
+        let source_id = add_copy_source(&mut state, "Aura Bear");
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source.base_card_types.core_types = vec![CoreType::Enchantment];
+            source.base_card_types.subtypes = vec!["Aura".to_string()];
+            source.card_types = source.base_card_types.clone();
+            let enchant = Keyword::Enchant(TargetFilter::Typed(TypedFilter::creature()));
+            source.base_keywords = vec![enchant.clone()];
+            source.keywords = vec![enchant];
+        }
+        let copy = named_attack_copy_spec(
+            &state,
+            source_id,
+            vec![ContinuousModification::AddCounterOnEnter {
+                counter_type: CounterType::Plus1Plus1,
+                count: QuantityExpr::Fixed { value: 1 },
+                if_type: None,
+            }],
+        );
+
+        let mut events = Vec::new();
+        let status = apply_copy_token_after_replacement(
+            &mut state,
+            PlayerId(0),
+            copy,
+            EtbTapState::Tapped,
+            Vec::new(),
+            3,
+            &mut events,
+        );
+        assert!(
+            matches!(status.completion, CopyTokenApplyCompletion::Paused),
+            "reach guard: the first token's Aura-host choice paused the batch"
+        );
+        for _ in 0..3 {
+            if !matches!(state.waiting_for, WaitingFor::ReturnAsAuraTarget { .. }) {
+                break;
+            }
+            apply_as_current(
+                &mut state,
+                GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(hosts[0])),
+                },
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            seats_of_battlefield_tokens(&state),
+            vec![
+                Some(AttackTarget::Player(PlayerId(1))),
+                Some(AttackTarget::Player(PlayerId(2))),
+                Some(AttackTarget::Player(PlayerId(1))),
+            ]
+        );
+    }
+
+    /// CR 508.4 + CR 614.12: a liminal copy batch whose entry pauses on its
+    /// enter-as-a-copy target's own entry counters keeps its creation ordinal
+    /// for the tokens parked behind the pause.
+    #[test]
+    fn copy_batch_ordinal_survives_a_copy_target_entry_counter_pause() {
+        use crate::game::combat::{AttackTarget, CombatState};
+
+        let mut state = GameState::new(crate::types::format::FormatConfig::commander(), 3, 42);
+        state.combat = Some(CombatState::default());
+        let counter_choice = create_object(
+            &mut state,
+            CardId(9),
+            PlayerId(0),
+            "Counter Choice".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let mut def = ReplacementDefinition::new(ReplacementEvent::AddCounter)
+                .valid_card(TargetFilter::Any)
+                .quantity_modification(QuantityModification::Prevent);
+            def.mode = crate::types::ability::ReplacementMode::Optional { decline: None };
+            let obj = state.objects.get_mut(&counter_choice).unwrap();
+            obj.base_replacement_definitions = Arc::new(vec![def.clone()]);
+            obj.replacement_definitions = vec![def].into();
+        }
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Cursed Mirror".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let mirror = state.objects.get_mut(&source_id).unwrap();
+            mirror.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Artifact],
+                subtypes: vec![],
+            };
+            mirror.card_types = mirror.base_card_types.clone();
+            let replacement = ReplacementDefinition::new(ReplacementEvent::Moved)
+                .mode(ReplacementMode::Optional { decline: None })
+                .valid_card(TargetFilter::SelfRef)
+                .destination_zone(Zone::Battlefield)
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::BecomeCopy {
+                        target: TargetFilter::Typed(TypedFilter::creature()),
+                        recipient: crate::types::ability::CopyRecipient::Source,
+                        duration: None,
+                        mana_value_limit: None,
+                        additional_modifications: Vec::new(),
+                    },
+                ));
+            mirror.replacement_definitions.push(replacement.clone());
+            Arc::make_mut(&mut mirror.base_replacement_definitions).push(replacement);
+        }
+        // CR 614.1c: the creature the token becomes enters with a counter.
+        let target_id = add_copy_source(&mut state, "Walking Ballista");
+        {
+            let enters_with_counter = ReplacementDefinition::new(ReplacementEvent::Moved)
+                .valid_card(TargetFilter::SelfRef)
+                .destination_zone(Zone::Battlefield)
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::PutCounter {
+                        counter_type: CounterType::Plus1Plus1,
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::SelfRef,
+                    },
+                ));
+            let target = state.objects.get_mut(&target_id).unwrap();
+            target
+                .replacement_definitions
+                .push(enters_with_counter.clone());
+            Arc::make_mut(&mut target.base_replacement_definitions).push(enters_with_counter);
+        }
+        let copy = named_attack_copy_spec(&state, source_id, Vec::new());
+
+        let mut events = Vec::new();
+        let status = apply_copy_token_after_replacement(
+            &mut state,
+            PlayerId(0),
+            copy,
+            EtbTapState::Tapped,
+            Vec::new(),
+            2,
+            &mut events,
+        );
+        assert!(
+            matches!(status.completion, CopyTokenApplyCompletion::Paused),
+            "reach guard: the first token's entry paused the batch"
+        );
+        let mut counter_pauses = 0;
+        for _ in 0..12 {
+            match state.waiting_for.clone() {
+                WaitingFor::ReplacementChoice { .. } => {
+                    apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 })
+                        .unwrap();
+                }
+                WaitingFor::CopyTargetChoice { .. } => {
+                    apply_as_current(
+                        &mut state,
+                        GameAction::ChooseTarget {
+                            target: Some(TargetRef::Object(target_id)),
+                        },
+                    )
+                    .unwrap();
+                    if matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }) {
+                        counter_pauses += 1;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            counter_pauses > 0,
+            "reach guard: a copy target's entry counters paused the batch"
+        );
+
+        assert_eq!(
+            seats_of_battlefield_tokens(&state),
+            vec![
+                Some(AttackTarget::Player(PlayerId(1))),
+                Some(AttackTarget::Player(PlayerId(2))),
             ]
         );
     }

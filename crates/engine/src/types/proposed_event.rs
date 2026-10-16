@@ -450,6 +450,26 @@ impl TokenAttackRequest {
             }
         }
     }
+
+    /// The request for the batch's remaining tokens once `consumed` of its tokens
+    /// have been created, for a resume that counts its own tokens from zero:
+    /// `after_entrants(n).for_entrant(k) == self.for_entrant(n + k)`.
+    pub fn after_entrants(&self, consumed: usize) -> Self {
+        match self {
+            Self::Unspecified => Self::Unspecified,
+            Self::Named { first, rest } => {
+                let mut players: Vec<PlayerId> = std::iter::once(*first)
+                    .chain(rest.iter().copied())
+                    .collect();
+                let shift = consumed % players.len();
+                players.rotate_left(shift);
+                Self::Named {
+                    first: players[0],
+                    rest: players[1..].to_vec(),
+                }
+            }
+        }
+    }
 }
 
 /// CR 303.4i: what the token instruction asked for as a host, and whether
@@ -1619,6 +1639,26 @@ mod tests {
                 EntryAttackDestination::AnyDefender
             );
         }
+    }
+
+    #[test]
+    fn token_attack_request_after_entrants_continues_the_ordinal_sequence() {
+        let request = TokenAttackRequest::named([PlayerId(1), PlayerId(2), PlayerId(3)])
+            .expect("a non-empty player list names a request");
+        for consumed in 0..7 {
+            let resumed = request.after_entrants(consumed);
+            for ordinal in 0..7 {
+                assert_eq!(
+                    resumed.for_entrant(ordinal),
+                    request.for_entrant(consumed + ordinal),
+                    "consumed {consumed}, ordinal {ordinal}"
+                );
+            }
+        }
+        assert_eq!(
+            TokenAttackRequest::Unspecified.after_entrants(3),
+            TokenAttackRequest::Unspecified
+        );
     }
 
     fn token_spec_with(attack_request: TokenAttackRequest) -> TokenSpec {

@@ -20,7 +20,7 @@ use super::super::oracle_util::{
     contains_possessive, parse_count_expr, parse_ordinal, parse_subtype, TextPair,
 };
 use super::imperative::CHOOSER_DOMAIN_CONTROLLERS;
-use super::{apply_where_x_to_filter, strip_trailing_where_x};
+use super::{apply_where_x_to_filter, release_iteration_destination, strip_trailing_where_x};
 use crate::parser::oracle_ir::ast::*;
 use crate::parser::oracle_ir::context::ParseContext;
 use crate::parser::oracle_ir::effect_chain::DoesTheSameSubject;
@@ -6265,6 +6265,11 @@ pub(super) fn apply_clause_continuation(
                     };
                 }
                 _ => {}
+            }
+            // The iteration was attached to the definition before this sentence
+            // was applied, so the destination it just named is released here.
+            if let Some(qty) = &previous.repeat_for {
+                release_iteration_destination(&mut previous.effect, qty);
             }
         }
         ContinuationAst::TokenEntersWithCounters {

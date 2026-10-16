@@ -138,9 +138,7 @@ fn make_enchantment_creature(runner: &mut GameRunner, id: ObjectId) {
 // ---------------------------------------------------------------------------
 
 /// CR 508.4 + CR 508.3e: P1 attacks P2; P1 creates the token, and it attacks
-/// "that opponent", P2. Revert-failing: the token is seated at the creating
-/// player's own attacked opponent through the ability controller's combat, so it
-/// attacks P1 itself.
+/// "that opponent", P2. Revert-failing: at BASE the token attacks P1, its own controller.
 #[test]
 fn ellie_token_attacks_the_opponent_its_creator_attacked() {
     let mut scenario = GameScenario::new_n_player(3, 42);
