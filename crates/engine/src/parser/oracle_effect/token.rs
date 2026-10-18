@@ -237,18 +237,14 @@ fn parse_copy_token_trailing_entry_modifiers(
         .parse(rest)?;
         let rest = if count_bound_by_where_x {
             // CR 107.3c: A following where-X clause defines the token count.
-            // Accept it only for an X count and only when its quantity parses;
-            // arbitrary text after the entry modifier is not an entry clause.
+            // `parse_count_slot` already bound the count from this binder and
+            // parsed its quantity in full, so the clause is consumed whole here
+            // rather than re-validated by a second quantity grammar; without
+            // that binder, arbitrary text after the entry modifier is not an
+            // entry clause.
             opt(preceded(
                 tag(", where x is "),
-                verify(
-                    nom::combinator::rest::<_, OracleError<'_>>,
-                    |expression: &str| {
-                        super::parse_where_x_quantity_expression(expression).is_some()
-                            || crate::parser::oracle_quantity::parse_cda_quantity(expression)
-                                .is_some()
-                    },
-                ),
+                nom::combinator::rest::<_, OracleError<'_>>,
             ))
             .parse(rest)?
             .0
