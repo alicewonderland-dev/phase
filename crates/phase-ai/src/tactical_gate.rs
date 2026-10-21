@@ -69,7 +69,8 @@ use crate::policies::effect_classify::{
     effect_polarity, extract_target_filter, targets_creatures_only, EffectPolarity,
 };
 use crate::policies::stack_awareness::{
-    damage_kills, has_pending_removal, node_damage, nodes_acting_on, will_target_die_from_stack,
+    can_be_destroyed, damage_kills, has_pending_removal, node_damage, nodes_acting_on,
+    will_target_die_from_stack,
 };
 use crate::policies::strategy_helpers::can_pay_ward_cost;
 use crate::search::ability_is_temporary_combat_modifier;
@@ -2009,10 +2010,11 @@ fn should_reject_pump_window(
 ///
 /// The nodes acting on the creature are read in the order they resolve
 /// ([`nodes_acting_on`]) up to the first `Destroy`, `Counter`, `Bounce` or
-/// `ChangeZone` node. A `Destroy` or `Counter` there answers false: a pump
-/// does not stop it. A `Bounce` or `ChangeZone` there ends the read: damage
-/// that resolves after it does not reach the creature (CR 400.7), so only the
-/// damage before it is judged.
+/// `ChangeZone` node, where a `Destroy` counts only if it can destroy the
+/// creature ([`can_be_destroyed`]). A `Destroy` or `Counter` there answers
+/// false: a pump does not stop it. A `Bounce` or `ChangeZone` there ends the
+/// read: damage that resolves after it does not reach the creature (CR 400.7),
+/// so only the damage before it is judged.
 fn pump_can_save_from_hostile_stack(
     state: &GameState,
     ai_player: PlayerId,
@@ -2044,7 +2046,8 @@ fn pump_can_save_from_hostile_stack(
         let mut dealt = Vec::new();
         for reach in nodes_acting_on(state, *object_id) {
             match &reach.node.effect {
-                Effect::Destroy { .. } | Effect::Counter { .. } => return false,
+                Effect::Destroy { .. } if can_be_destroyed(object) => return false,
+                Effect::Counter { .. } => return false,
                 Effect::Bounce { .. } | Effect::ChangeZone { .. } => break,
                 // Damage whose amount is not fixed is not judged.
                 Effect::DealDamage { .. } => {
@@ -11271,24 +11274,34 @@ mod tests {
     const CLOUDSHIFT: &str = "Exile target creature you control, then return that card to the battlefield under your control.";
     const OTHERWORLDLY_JOURNEY: &str = "Exile target creature. At the beginning of the next end step, return that card to the battlefield under its owner's control with a +1/+1 counter on it.";
     const GIANT_GROWTH: &str = "Target creature gets +3/+3 until end of turn.";
+    const NO_KEYWORDS: &[&str] = &[];
     const UNSUMMON: &str = "Return target creature to its owner's hand.";
 
-    /// Each of `spells` (caster, name, Oracle text) cast in order at P1's 2/2,
-    /// each its own stack entry, then, when `pumped`, P1's Giant Growth at the
-    /// 2/2 on top of them. Returns the board before the Giant Growth and the
-    /// zone the 2/2 is in once the stack has resolved.
+    /// Each of `spells` (caster, name, MTGJSON keyword names, Oracle text) cast
+    /// in order at P1's 2/2 with `victim_keywords`, each its own stack entry,
+    /// then, when `pumped`, P1's Giant Growth at the 2/2 on top of them.
+    /// Returns the board before the Giant Growth and the zone the 2/2 is in
+    /// once the stack has resolved.
     fn spells_then_giant_growth(
-        spells: &[(PlayerId, &str, &str)],
+        spells: &[(PlayerId, &str, &[&str], &str)],
+        victim_keywords: &[Keyword],
         pumped: bool,
     ) -> (GameState, Zone) {
         let mut scenario = GameScenario::new();
         scenario.at_phase(Phase::PreCombatMain);
-        let victim = scenario.add_creature(P1, "Victim", 2, 2).id();
+        let victim = {
+            let mut builder = scenario.add_creature(P1, "Victim", 2, 2);
+            for keyword in victim_keywords {
+                builder.with_keyword(keyword.clone());
+            }
+            builder.id()
+        };
         let ids: Vec<(PlayerId, ObjectId)> = spells
             .iter()
-            .map(|(caster, name, text)| {
+            .map(|(caster, name, keyword_names, text)| {
                 let id = scenario
-                    .add_spell_to_hand_from_oracle(*caster, name, true, text)
+                    .add_spell_to_hand(*caster, name, true)
+                    .from_oracle_text_with_keywords(keyword_names, text)
                     .with_mana_cost(ManaCost::zero())
                     .id();
                 (*caster, id)
@@ -11336,12 +11349,15 @@ mod tests {
         (board, zone)
     }
 
-    /// Whether, once the stack has resolved, P1's 2/2 is in the graveyard
-    /// without the Giant Growth and elsewhere with it, paired with the board
-    /// before the Giant Growth.
-    fn giant_growth_saves_the_two_two(spells: &[(PlayerId, &str, &str)]) -> (bool, GameState) {
-        let (board, unpumped) = spells_then_giant_growth(spells, false);
-        let (_, pumped) = spells_then_giant_growth(spells, true);
+    /// Whether, once the stack has resolved, P1's 2/2 with `victim_keywords`
+    /// is in the graveyard without the Giant Growth and elsewhere with it,
+    /// paired with the board before the Giant Growth.
+    fn giant_growth_saves_the_two_two(
+        spells: &[(PlayerId, &str, &[&str], &str)],
+        victim_keywords: &[Keyword],
+    ) -> (bool, GameState) {
+        let (board, unpumped) = spells_then_giant_growth(spells, victim_keywords, false);
+        let (_, pumped) = spells_then_giant_growth(spells, victim_keywords, true);
         (
             unpumped == Zone::Graveyard && pumped != Zone::Graveyard,
             board,
@@ -11351,12 +11367,19 @@ mod tests {
     #[test]
     fn a_pump_is_judged_against_the_damage_that_resolves_before_a_zone_change() {
         for zone_change in [
-            (P1, "Cloudshift", CLOUDSHIFT),
-            (P0, "Otherworldly Journey", OTHERWORLDLY_JOURNEY),
-            (P0, "Unsummon", UNSUMMON),
+            (P1, "Cloudshift", NO_KEYWORDS, CLOUDSHIFT),
+            (
+                P0,
+                "Otherworldly Journey",
+                NO_KEYWORDS,
+                OTHERWORLDLY_JOURNEY,
+            ),
+            (P0, "Unsummon", NO_KEYWORDS, UNSUMMON),
         ] {
-            let (saves, board) =
-                giant_growth_saves_the_two_two(&[zone_change, (P0, "Shock", SHOCK)]);
+            let (saves, board) = giant_growth_saves_the_two_two(
+                &[zone_change, (P0, "Shock", NO_KEYWORDS, SHOCK)],
+                &[],
+            );
             assert!(saves, "engine: {}, then Shock", zone_change.1);
             assert_eq!(pump_can_save_from_hostile_stack(&board, P1, 3), saves);
         }
@@ -11364,8 +11387,13 @@ mod tests {
 
     #[test]
     fn damage_below_a_zone_change_leaves_the_pump_nothing_to_save() {
-        let (saves, board) =
-            giant_growth_saves_the_two_two(&[(P0, "Shock", SHOCK), (P1, "Cloudshift", CLOUDSHIFT)]);
+        let (saves, board) = giant_growth_saves_the_two_two(
+            &[
+                (P0, "Shock", NO_KEYWORDS, SHOCK),
+                (P1, "Cloudshift", NO_KEYWORDS, CLOUDSHIFT),
+            ],
+            &[],
+        );
         assert!(!saves, "engine: Shock, then Cloudshift");
         assert_eq!(pump_can_save_from_hostile_stack(&board, P1, 3), saves);
     }
@@ -11373,12 +11401,46 @@ mod tests {
     #[test]
     fn a_pump_saves_nothing_from_a_destroy_above_or_below_the_damage() {
         for spells in [
-            [(P0, "Murder", MURDER), (P0, "Shock", SHOCK)],
-            [(P0, "Shock", SHOCK), (P0, "Murder", MURDER)],
+            [
+                (P0, "Murder", NO_KEYWORDS, MURDER),
+                (P0, "Shock", NO_KEYWORDS, SHOCK),
+            ],
+            [
+                (P0, "Shock", NO_KEYWORDS, SHOCK),
+                (P0, "Murder", NO_KEYWORDS, MURDER),
+            ],
         ] {
-            let (saves, board) = giant_growth_saves_the_two_two(&spells);
+            let (saves, board) = giant_growth_saves_the_two_two(&spells, &[]);
             assert!(!saves, "engine: {}, then {}", spells[0].1, spells[1].1);
             assert_eq!(pump_can_save_from_hostile_stack(&board, P1, 3), saves);
+        }
+    }
+
+    const PUNCTURE_BLAST: &str = "Wither (This deals damage to creatures in the form of -1/-1 counters.)\nPuncture Blast deals 3 damage to any target.";
+
+    #[test]
+    fn a_pump_is_judged_past_a_destroy_that_cannot_destroy_the_creature() {
+        for (victim_keywords, indestructible) in
+            [(&[Keyword::Indestructible][..], true), (&[][..], false)]
+        {
+            for spells in [
+                [
+                    (P0, "Murder", NO_KEYWORDS, MURDER),
+                    (P0, "Puncture Blast", &["Wither"][..], PUNCTURE_BLAST),
+                ],
+                [
+                    (P0, "Puncture Blast", &["Wither"][..], PUNCTURE_BLAST),
+                    (P0, "Murder", NO_KEYWORDS, MURDER),
+                ],
+            ] {
+                let (saves, board) = giant_growth_saves_the_two_two(&spells, victim_keywords);
+                assert_eq!(
+                    saves, indestructible,
+                    "engine: {}, then {}, indestructible {indestructible}",
+                    spells[0].1, spells[1].1
+                );
+                assert_eq!(pump_can_save_from_hostile_stack(&board, P1, 3), saves);
+            }
         }
     }
 }

@@ -13,12 +13,12 @@ use engine::types::ability::{Effect, TargetFilter, TargetRef};
 use engine::types::actions::GameAction;
 use engine::types::game_state::GameState;
 use engine::types::identifiers::ObjectId;
-use engine::types::keywords::Keyword;
 use engine::types::player::PlayerId;
 
 use super::context::PolicyContext;
 use super::effect_classify::{effect_polarity, EffectPolarity};
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
+use super::stack_awareness::can_be_destroyed;
 use crate::features::DeckFeatures;
 
 fn reject(kind: &'static str) -> PolicyVerdict {
@@ -68,10 +68,8 @@ fn stack_has_redirectable_threat(
                         TargetRef::Player(pid) => *pid == ai_player,
                         TargetRef::Object(obj_id) => state.objects.get(obj_id).is_some_and(|o| {
                             o.controller == ai_player
-                                // CR 702.12b: an indestructible permanent can't
-                                // be destroyed.
-                                && !(matches!(reach.node.effect, Effect::Destroy { .. })
-                                    && o.has_keyword(&Keyword::Indestructible))
+                                && (!matches!(reach.node.effect, Effect::Destroy { .. })
+                                    || can_be_destroyed(o))
                         }),
                     })
             });

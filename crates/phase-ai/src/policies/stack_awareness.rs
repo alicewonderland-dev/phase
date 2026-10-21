@@ -339,7 +339,7 @@ pub(crate) fn will_target_die_from_stack(state: &GameState, target_id: ObjectId)
     for reach in nodes_acting_on(state, target_id) {
         match &reach.node.effect {
             // Destroy is lethal unless target is indestructible
-            Effect::Destroy { .. } if !object.has_keyword(&Keyword::Indestructible) => {
+            Effect::Destroy { .. } if can_be_destroyed(object) => {
                 return true;
             }
             // Counter removes the spell from the stack. CR 101.2: unless
@@ -360,6 +360,11 @@ pub(crate) fn will_target_die_from_stack(state: &GameState, target_id: ObjectId)
     }
 
     damage_kills(object, &dealt, 0)
+}
+
+/// CR 702.12b: a permanent with indestructible can't be destroyed.
+pub(crate) fn can_be_destroyed(object: &GameObject) -> bool {
+    !object.has_keyword(&Keyword::Indestructible)
 }
 
 /// The nodes that act on `object_id` ([`stack_entry_node_reach`]) of every
