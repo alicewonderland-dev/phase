@@ -7462,6 +7462,9 @@ pub enum PendingCounterPostAction {
     },
     ContinueTokenCreation {
         owner: PlayerId,
+        /// Its `attack_request` is already advanced past the tokens created so far,
+        /// this one included, because the remaining tokens are resumed counting from
+        /// zero.
         spec: Box<TokenSpec>,
         enter_tapped: EtbTapState,
         remaining_count: u32,

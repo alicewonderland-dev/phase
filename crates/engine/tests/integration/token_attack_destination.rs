@@ -1228,3 +1228,97 @@ fn listed_tokens_that_do_not_enter_attacking_attack_nothing() {
         "reach guard: the same instruction attacks when its tokens enter attacking"
     );
 }
+
+const PEREGRIN_TOOK: &str = "If one or more tokens would be created under your control, those tokens plus an additional Food token are created instead.";
+const HALVING_SEASON: &str = "If an opponent would create one or more tokens, they create half that many of each of those kinds of tokens instead, rounded down.\nIf an opponent would put one or more counters on a permanent or player, they put half that many of each of those kinds of counters on that permanent or player instead, rounded down.";
+
+/// The Goblins' seats, in creation order, after Ainok Strike Leader's trigger
+/// resolves in a four-player game where P0 controls the counter doublers that
+/// pause each Goblin and, optionally, Peregrin Took. With `halved`, P1 also
+/// controls Halving Season and P0 controls Parallel Lives, so the batch is
+/// sized by replacements applied around Peregrin Took's. Replacement prompts are
+/// answered in the order Halving Season, Peregrin Took, Parallel Lives.
+fn goblin_seats_with_a_replacement_adding_a_token(
+    peregrin: bool,
+    halved: bool,
+) -> (usize, usize, Vec<Option<AttackTarget>>) {
+    let mut runner = per_opponent_board(4, |s| {
+        if halved {
+            s.add_enchantment_from_oracle(P1, "Halving Season", HALVING_SEASON);
+            s.add_enchantment_from_oracle(P0, "Parallel Lives", PARALLEL_LIVES);
+        }
+        s.add_creature_from_oracle(P0, "Grumgully, the Generous", 3, 3, GRUMGULLY);
+        s.add_enchantment_from_oracle(P0, "Hardened Scales", HARDENED_SCALES);
+        s.add_enchantment_from_oracle(P0, "Branching Evolution", BRANCHING_EVOLUTION);
+        if peregrin {
+            s.add_creature_from_oracle(P0, "Peregrin Took", 2, 2, PEREGRIN_TOOK);
+        }
+        s.add_creature_from_oracle(P0, "Ainok Strike Leader", 2, 2, AINOK_STRIKE_LEADER)
+            .id()
+    });
+    let order = ["Halving Season", "Peregrin Took", "Parallel Lives"];
+    let mut prompts = 0;
+    drain_with(&mut runner, TriggerOrder::AsOffered, &mut |runner| {
+        let WaitingFor::ReplacementChoice { candidates, .. } = runner.state().waiting_for.clone()
+        else {
+            panic!("expected a replacement prompt");
+        };
+        let index = order
+            .iter()
+            .find_map(|name| candidates.iter().position(|c| c.source_name == *name))
+            .unwrap_or(0);
+        prompts += 1;
+        runner
+            .act(GameAction::ChooseReplacement { index })
+            .expect("choose a replacement order");
+    });
+    assert!(
+        prompts > 0,
+        "reach guard: a replacement prompt paused the batch"
+    );
+    let goblins = tokens_named(&runner, "Goblin");
+    let foods = runner
+        .state()
+        .objects
+        .values()
+        .filter(|o| {
+            o.is_token
+                && o.zone == Zone::Battlefield
+                && o.card_types.subtypes.iter().any(|s| s == "Food")
+        })
+        .count();
+    let seats = seats_in_creation_order(&runner, &goblins);
+    (goblins.len(), foods, seats)
+}
+
+/// CR 508.4 + CR 608.2c: the batch's own tokens are counted for seating. P1's
+/// Halving Season halves the three Goblins to one and Parallel Lives doubles
+/// that to two, so the Goblins go to P1 and P2 even though Peregrin Took's
+/// appended Foods lengthen the shared created-token list.
+/// Revert-failing: both Goblins attack P1.
+#[test]
+fn per_opponent_tokens_keep_their_seats_when_a_replacement_adds_tokens_and_the_batch_pauses() {
+    let (goblins, foods, seats) = goblin_seats_with_a_replacement_adding_a_token(true, true);
+    assert_eq!(goblins, 2, "reach guard: halved, then doubled");
+    assert!(foods > 0, "reach guard: Peregrin Took added Food tokens");
+    assert_eq!(seats, players_attacked(&[P1, P2]));
+}
+
+/// The same board without Peregrin Took: no token is added to the event.
+#[test]
+fn halved_and_doubled_per_opponent_tokens_keep_their_seats_when_the_batch_pauses() {
+    let (goblins, foods, seats) = goblin_seats_with_a_replacement_adding_a_token(false, true);
+    assert_eq!(goblins, 2, "reach guard: halved, then doubled");
+    assert_eq!(foods, 0, "reach guard: no replacement added a token");
+    assert_eq!(seats, players_attacked(&[P1, P2]));
+}
+
+/// Peregrin Took with the batch's size unchanged: every opponent's Goblin is
+/// seated at that opponent.
+#[test]
+fn per_opponent_tokens_keep_their_seats_when_a_replacement_adds_tokens_and_the_size_is_unchanged() {
+    let (goblins, foods, seats) = goblin_seats_with_a_replacement_adding_a_token(true, false);
+    assert_eq!(goblins, 3, "reach guard: one Goblin for each opponent");
+    assert!(foods > 0, "reach guard: Peregrin Took added Food tokens");
+    assert_eq!(seats, players_attacked(&[P1, P2, P3]));
+}

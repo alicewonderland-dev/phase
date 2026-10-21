@@ -1060,6 +1060,10 @@ pub(crate) fn apply_create_token_after_replacement_with_created_ids(
 
     let mut created_ids = initial_created_ids;
     created_ids.reserve(final_count as usize);
+    // CR 508.4: a resume carries the earlier ids so they are republished, but a
+    // token's destination is selected by its ordinal among the tokens this call
+    // creates, so the carried ids do not shift it.
+    let carried_ids = created_ids.len();
 
     for index in 0..final_count {
         let ch = &spec.characteristics;
@@ -1146,7 +1150,9 @@ pub(crate) fn apply_create_token_after_replacement_with_created_ids(
                 obj_id,
                 spec.source_id,
                 spec.controller,
-                &spec.attack_request.for_entrant(created_ids.len()),
+                &spec
+                    .attack_request
+                    .for_entrant(created_ids.len() - carried_ids),
             );
         }
 
@@ -1178,6 +1184,10 @@ pub(crate) fn apply_create_token_after_replacement_with_created_ids(
                     })
                     .collect();
                 let remaining_count = final_count.saturating_sub(index + 1);
+                let mut resume_spec = spec.clone();
+                resume_spec.attack_request = spec
+                    .attack_request
+                    .after_entrants(created_ids.len() - carried_ids + 1);
                 let post_actions = vec![
                     PendingCounterPostAction::FinalizeTokenEntry {
                         object_id: obj_id,
@@ -1189,7 +1199,7 @@ pub(crate) fn apply_create_token_after_replacement_with_created_ids(
                     },
                     PendingCounterPostAction::ContinueTokenCreation {
                         owner,
-                        spec: spec.clone(),
+                        spec: resume_spec,
                         enter_tapped,
                         remaining_count,
                     },
