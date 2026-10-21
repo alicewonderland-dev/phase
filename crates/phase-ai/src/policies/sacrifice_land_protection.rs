@@ -517,9 +517,20 @@ mod tests {
 
     const SYLVAN_SAFEKEEPER: &str = "Sacrifice a land: Target creature you control gains shroud until end of turn. (It can't be the target of spells or abilities.)";
 
-    /// The reason kinds of this policy's and `ReactiveSelfProtectionPolicy`'s
-    /// verdicts on activating `source_id`'s first ability.
-    fn verdict_kinds(state: &GameState, source_id: ObjectId) -> [&'static str; 2] {
+    /// Which `PolicyVerdict` variant a policy returned.
+    #[derive(Debug, PartialEq)]
+    enum VerdictVariant {
+        Reject,
+        Score,
+    }
+
+    /// The verdict variant and reason kind of this policy's and
+    /// `ReactiveSelfProtectionPolicy`'s verdicts on activating `source_id`'s
+    /// first ability.
+    fn verdict_kinds(
+        state: &GameState,
+        source_id: ObjectId,
+    ) -> [(VerdictVariant, &'static str); 2] {
         use super::super::reactive_self_protection::ReactiveSelfProtectionPolicy;
         let candidate = CandidateAction {
             action: GameAction::ActivateAbility {
@@ -549,7 +560,8 @@ mod tests {
             ReactiveSelfProtectionPolicy.verdict(&ctx),
         ]
         .map(|verdict| match verdict {
-            PolicyVerdict::Reject { reason } | PolicyVerdict::Score { reason, .. } => reason.kind,
+            PolicyVerdict::Reject { reason } => (VerdictVariant::Reject, reason.kind),
+            PolicyVerdict::Score { reason, .. } => (VerdictVariant::Score, reason.kind),
         })
     }
 
@@ -590,8 +602,14 @@ mod tests {
         assert_eq!(
             verdict_kinds(runner.state(), safekeeper),
             [
-                "sacrifice_land_protection_answerable_threat",
-                "reactive_self_protection_exact_payoff"
+                (
+                    VerdictVariant::Score,
+                    "sacrifice_land_protection_answerable_threat"
+                ),
+                (
+                    VerdictVariant::Score,
+                    "reactive_self_protection_exact_payoff"
+                )
             ]
         );
     }
@@ -642,8 +660,11 @@ mod tests {
         assert_eq!(
             verdict_kinds(runner.state(), safekeeper),
             [
-                "sacrifice_land_protection_no_payoff",
-                "reactive_self_protection_no_payoff"
+                (
+                    VerdictVariant::Reject,
+                    "sacrifice_land_protection_no_payoff"
+                ),
+                (VerdictVariant::Reject, "reactive_self_protection_no_payoff")
             ]
         );
     }
