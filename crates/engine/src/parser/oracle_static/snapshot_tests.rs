@@ -25,6 +25,15 @@ fn static_conditional_as_long_as() {
 }
 
 #[test]
+fn elenda_life_threshold_static() {
+    let def = parse_static_line(
+        "Elenda gets an additional +5/+5 as long as your life total is at least 10 greater than your starting life total.",
+    )
+    .expect("Elenda's life-threshold static must parse");
+    insta::assert_json_snapshot!("elenda_life_threshold_static", &def);
+}
+
+#[test]
 fn static_granted_keyword() {
     let def = parse_static_line("Creatures you control have flying.").unwrap();
     insta::assert_json_snapshot!(def);
@@ -616,6 +625,57 @@ fn parses_teferi_cast_only_at_sorcery_speed_regression() {
     }
 }
 
+/// CR 603.2d + CR 604.1: "triggers while <condition>, that ability triggers an
+/// additional time" attaches the parsed condition to the doubler; the same text
+/// without the "while" clause stays unconditional.
+#[test]
+fn double_triggers_while_condition_is_attached() {
+    for text in [
+        "If a triggered ability of another Shrine you control triggers while you control six or more Shrines, that ability triggers an additional time.",
+        "If a triggered ability of a creature you control triggers while you control three or more creatures, that ability triggers an additional time.",
+    ] {
+        let def = parse_static_line(text).expect("expected DoubleTriggers static");
+        assert!(matches!(def.mode, StaticMode::DoubleTriggers { .. }));
+        assert!(
+            matches!(
+                def.condition,
+                Some(StaticCondition::QuantityComparison { .. })
+            ),
+            "condition must be a typed quantity gate for {text:?}, got {:?}",
+            def.condition
+        );
+    }
+    let unconditional = parse_static_line(
+        "If a triggered ability of a creature you control triggers, that ability triggers an additional time.",
+    )
+    .expect("expected DoubleTriggers static");
+    assert_eq!(unconditional.condition, None);
+    // An unparseable gate declines instead of doubling unconditionally.
+    assert!(parse_static_line(
+        "If a triggered ability of a creature you control triggers while the moon is full, that ability triggers an additional time.",
+    )
+    .is_none());
+    // A gate whose continuation is not ", that ability trigger…" (Roaming
+    // Throne's "it triggers an additional time") cannot be anchored; it declines
+    // instead of dropping the printed "while" clause into an unconditional
+    // doubler. The ungated "it triggers" spelling stays a paired positive.
+    assert!(parse_static_line(
+        "If a triggered ability of a creature you control triggers while you control three or more creatures, it triggers an additional time.",
+    )
+    .is_none());
+    assert!(parse_static_line(
+        "If a triggered ability of a creature you control triggers, it triggers an additional time.",
+    )
+    .is_some());
+    // The gate runs up to the doubler's own continuation, so a condition that
+    // contains a comma is not truncated at its first ", " into a weaker gate:
+    // the whole text is judged, and an unparseable whole declines.
+    assert!(parse_static_line(
+        "If a triggered ability of a creature you control triggers while you control three or more creatures, and the moon is full, that ability triggers an additional time.",
+    )
+    .is_none());
+}
+
 /// CR 603.2d: Damage-caused trigger doubler (Wayta, Trainer Prodigy).
 #[test]
 fn parses_wayta_damage_caused_doubler() {
@@ -998,7 +1058,9 @@ fn cloud_midgar_mercenary_self_and_equipment_doubler_gated_on_equipped() {
         equip.type_filters
     );
     assert!(
-        equip.properties.contains(&FilterProp::AttachedToSource),
+        equip.properties.contains(&FilterProp::AttachedTo {
+            to: crate::types::ability::AttachmentReferent::Source
+        }),
         "expected AttachedToSource property, got {:?}",
         equip.properties
     );
@@ -1053,7 +1115,7 @@ fn three_way_oxford_disjunctive_doubler_source() {
 /// CR 613.1d + CR 613.4b + CR 613.1f (issue #2363): Grand Master of Flowers —
 /// "As long as ~ has seven or more loyalty counters on him, he's a 7/7 Dragon
 /// God creature with flying and indestructible."
-/// The parser must emit SetPower(7), SetToughness(7), AddType(Creature),
+/// The parser must emit SetPower(7), SetToughness(7), SetCardTypes([Creature]),
 /// AddSubtype(Dragon), AddSubtype(God), AddKeyword(Flying),
 /// AddKeyword(Indestructible), plus a non-null HasCounters condition.
 #[test]
@@ -1073,10 +1135,10 @@ fn grand_master_of_flowers_becomes_777_dragon_god_creature() {
         "expected SetToughness(7) in {mods:?}"
     );
     assert!(
-        mods.contains(&ContinuousModification::AddType {
-            core_type: CoreType::Creature
+        mods.contains(&ContinuousModification::SetCardTypes {
+            core_types: vec![CoreType::Creature]
         }),
-        "expected AddType(Creature) in {mods:?}"
+        "expected SetCardTypes([Creature]) in {mods:?}"
     );
     assert!(
         mods.contains(&ContinuousModification::AddSubtype {
@@ -1153,10 +1215,10 @@ fn gendered_pronoun_she_becomes_creature_static() {
         "expected SetToughness(3) in {mods:?}"
     );
     assert!(
-        mods.contains(&ContinuousModification::AddType {
-            core_type: CoreType::Creature
+        mods.contains(&ContinuousModification::SetCardTypes {
+            core_types: vec![CoreType::Creature]
         }),
-        "expected AddType(Creature) in {mods:?}"
+        "expected SetCardTypes([Creature]) in {mods:?}"
     );
     assert!(
         mods.contains(&ContinuousModification::AddSubtype {
@@ -1195,10 +1257,10 @@ fn neutral_plural_pronoun_they_becomes_creature_static() {
         "expected SetToughness(4) in {mods:?}"
     );
     assert!(
-        mods.contains(&ContinuousModification::AddType {
-            core_type: CoreType::Creature
+        mods.contains(&ContinuousModification::SetCardTypes {
+            core_types: vec![CoreType::Creature]
         }),
-        "expected AddType(Creature) in {mods:?}"
+        "expected SetCardTypes([Creature]) in {mods:?}"
     );
     assert!(
         mods.contains(&ContinuousModification::AddSubtype {

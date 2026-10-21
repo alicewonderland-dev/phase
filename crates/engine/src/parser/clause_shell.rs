@@ -229,8 +229,12 @@ fn peel_inner(text: String, mut ctx: ClauseContext) -> (String, ClauseContext) {
     }
 
     // Repeat-for: "for each [qty], " leading prefix (CR 608.2c: the instruction is
-    // followed as written, once per counted iteration).
-    if ctx.repeat_for.is_none() {
+    // followed as written, once per counted iteration). CR 102.2: "for each
+    // opponent, choose … that player controls" is a per-opponent choice, not a
+    // repeat count, and keeps its prefix.
+    if ctx.repeat_for.is_none()
+        && !super::oracle_effect::is_for_each_opponent_choose_controlled(&text.to_lowercase())
+    {
         let (qty, rest) = peel_for_each_prefix(&text);
         if qty.is_some() {
             ctx.repeat_for = qty;
@@ -314,6 +318,22 @@ fn try_peel_opponent_may_prefix(
     text: &str,
 ) -> Option<(Option<OpponentMayScope>, Option<PlayerFilter>, String)> {
     let lower = text.to_lowercase();
+    // CR 608.2d + CR 115.1: "target opponent may draw …" names the ANNOUNCED
+    // target opponent as the actor, not a controller-held optional that fans out
+    // to every opponent. Declining the peel lets the whole clause parse through
+    // the subject-predicate path, where `subject.rs` marks the clause optional and
+    // `assembly.rs` stamps `optional_player = TargetFilter::DeclaredPlayer { group }`
+    // from this same clause provenance — deliberately NOT a `player_scope`, which
+    // would rebind the whole chain's controller to the opponent's seat.
+    // Mirrors `is_specialized_you_may_phrase`: a dedicated body path needs the
+    // full surface form. The discriminator is evaluated on the WHOLE clause
+    // (the shared `targeted_opponent_may_player_action`), matching the subject
+    // witness and the assembly stamp so the three cannot drift; every other
+    // `target opponent may <verb>` shape (`may have you …`, `may sacrifice …`,
+    // …) fails it and peels exactly as before (M2, `draw`-only axis).
+    if super::oracle_effect::subject::targeted_opponent_may_player_action(&lower) {
+        return None;
+    }
     if let Some((_, rest)) = nom_on_lower(text, &lower, |i| {
         value((), tag("each player may ")).parse(i)
     }) {

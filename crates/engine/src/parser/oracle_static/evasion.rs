@@ -1,11 +1,13 @@
 // CR 509.1b — combat restriction / evasion statics.
 
-#[allow(unused_imports)]
 use super::prelude::*;
 #[allow(unused_imports)]
 use super::support::*;
 use crate::parser::oracle_nom::defender_exception;
 use crate::parser::oracle_nom::defender_exception::DefenderExceptionSegment;
+use crate::parser::oracle_nom::target::{controller_phrase_among_mixed_case, ControllerPhrase};
+#[allow(unused_imports)]
+use crate::types::ability::AttachmentReferent;
 
 /// CR 509.1b / CR 702.111b: "<N> or more creatures" minimum-blocker phrase.
 /// Composed from `parse_number` + `tag(" or more creatures")`.
@@ -181,7 +183,7 @@ fn doubler_source_is_restrictive(filter: &TargetFilter) -> bool {
 /// - `~` — the normalized source name → [`TargetFilter::SelfRef`] (Cloud doubling
 ///   "a triggered ability of ~").
 /// - "an Equipment attached to it" — here "it" is anaphoric on the doubler's own
-///   source, so it is the source-relative [`FilterProp::AttachedToSource`] set.
+///   source, so it is the source-relative [`FilterProp::AttachedTo { to: AttachmentReferent::Source }`] set.
 ///   `parse_type_phrase_folding` maps "attached to it" to `AttachedToRecipient` (an
 ///   enchanted-creature host), which is the wrong referent in a doubler, so this
 ///   clause is hand-built.
@@ -192,7 +194,9 @@ fn parse_doubler_disjunct(phrase: &str) -> (TargetFilter, &str) {
             TargetFilter::Typed(
                 TypedFilter::default()
                     .subtype("Equipment".to_string())
-                    .properties(vec![FilterProp::AttachedToSource]),
+                    .properties(vec![FilterProp::AttachedTo {
+                        to: AttachmentReferent::Source,
+                    }]),
             ),
             alt((
                 tag("an equipment attached to it"),
@@ -2258,6 +2262,76 @@ fn parse_nominative_pronoun(input: &str) -> OracleResult<'_, &str> {
     alt((tag("it"), tag("he"), tag("she"), tag("they"))).parse(input)
 }
 
+/// CR 510.1c + CR 609.4: Shared tail of every "assign its combat damage as though
+/// it weren't blocked" grammar: " assign <its> combat damage as though <it>
+/// weren't blocked". Returns the remainder so each caller decides how strictly to
+/// consume what follows.
+fn parse_assign_damage_unblocked_tail(input: &str) -> OracleResult<'_, ()> {
+    let (rest, _) = tag(" assign ").parse(input)?;
+    let (rest, _) = parse_possessive_pronoun(rest)?;
+    let (rest, _) = tag(" combat damage as though ").parse(rest)?;
+    let (rest, _) = parse_nominative_pronoun(rest)?;
+    let (rest, _) = tag(" weren't blocked").parse(rest)?;
+    Ok((rest, ()))
+}
+
+/// CR 510.1c + CR 609.4 + CR 508.1k + CR 611.3a: Parse the per-creature class grant
+/// "[As long as <condition>, ]for each <creature class> you control, you may have
+/// that creature assign its combat damage as though it weren't blocked." (Siege
+/// Behemoth; Zilortha, Apex of Ikoria; Ruxa, Patient Professor).
+///
+/// Fails closed: an unparsable gate, a subject that is not a controller-scoped
+/// typed filter with a type anchor, or any unconsumed tail yields `None`, so a
+/// gated line can never degrade to an ungated static.
+pub(crate) fn parse_for_each_assign_damage_as_though_unblocked(
+    tp: &TextPair<'_>,
+    text: &str,
+) -> Option<StaticDefinition> {
+    type VE<'a> = OracleError<'a>;
+
+    let lower = tp.lower.trim_end_matches('.');
+    let (rest, gate_text) = opt(terminated(
+        preceded(
+            tag::<_, _, VE<'_>>("as long as "),
+            take_until(", for each "),
+        ),
+        tag(", "),
+    ))
+    .parse(lower)
+    .ok()?;
+    let condition = match gate_text {
+        Some(gate_text) => Some(parse_static_condition(gate_text)?),
+        None => None,
+    };
+    let (rest, _) = tag::<_, _, VE<'_>>("for each ").parse(rest).ok()?;
+
+    // `parse_type_phrase_folding` is infallible: unrecognized input yields an empty
+    // filter, so decline anything that is not a controller-scoped, type-anchored
+    // typed filter.
+    let (subject, rest) = parse_type_phrase_folding(rest);
+    let TargetFilter::Typed(typed) = &subject else {
+        return None;
+    };
+    if typed.controller != Some(ControllerRef::You) || typed.type_filters.is_empty() {
+        return None;
+    }
+
+    let (rest, _) = tag::<_, _, VE<'_>>(", you may have that creature")
+        .parse(rest)
+        .ok()?;
+    let (rest, ()) = parse_assign_damage_unblocked_tail(rest).ok()?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+
+    let mut def = StaticDefinition::continuous()
+        .affected(subject)
+        .modifications(vec![ContinuousModification::AssignDamageAsThoughUnblocked])
+        .description(text.to_string());
+    def.condition = condition;
+    Some(def)
+}
+
 /// CR 510.1c: Parse "you may have this creature assign its combat damage as though it
 /// weren't blocked" self-referential static. Accepts gendered pronouns
 /// (his/her/he/she/they) so named characters parse the same as neuter creatures.
@@ -2275,13 +2349,7 @@ pub(crate) fn parse_assign_damage_as_though_unblocked(
     .parse(clean)
     .ok()?;
     let (rest, _) = result;
-    let (rest, _) = tag::<_, _, VE<'_>>(" assign ").parse(rest).ok()?;
-    let (rest, _) = parse_possessive_pronoun(rest).ok()?;
-    let (rest, _) = tag::<_, _, VE<'_>>(" combat damage as though ")
-        .parse(rest)
-        .ok()?;
-    let (rest, _) = parse_nominative_pronoun(rest).ok()?;
-    let (rest, _) = tag::<_, _, VE<'_>>(" weren't blocked").parse(rest).ok()?;
+    let (rest, ()) = parse_assign_damage_unblocked_tail(rest).ok()?;
     if !rest.is_empty() {
         return None;
     }
@@ -2324,13 +2392,7 @@ pub(crate) fn parse_attached_creature_assign_damage_as_though_unblocked(
         .parse(rest.lower)
         .ok()?;
     let (after, _) = parse_nominative_pronoun(after).ok()?;
-    let (after, _) = tag::<_, _, VE<'_>>(" assign ").parse(after).ok()?;
-    let (after, _) = parse_possessive_pronoun(after).ok()?;
-    let (after, _) = tag::<_, _, VE<'_>>(" combat damage as though ")
-        .parse(after)
-        .ok()?;
-    let (after, _) = parse_nominative_pronoun(after).ok()?;
-    let (_, _) = tag::<_, _, VE<'_>>(" weren't blocked").parse(after).ok()?;
+    let (_, ()) = parse_assign_damage_unblocked_tail(after).ok()?;
 
     Some(
         StaticDefinition::continuous()
@@ -2993,17 +3055,30 @@ pub(crate) fn parse_combat_tax_body(input: &str) -> OracleResult<'_, CombatTaxPa
     //     tax to "attacking-you" creatures — already implicit in the affected
     //     filter for the attack side.
     let (input, per_affected) = opt(alt((
-        tag_no_case::<_, _, OracleError<'_>>(" for each of those creatures"),
-        tag_no_case::<_, _, OracleError<'_>>(
-            " for each creature they control that's attacking you or a planeswalker you control",
+        value(
+            (),
+            tag_no_case::<_, _, OracleError<'_>>(" for each of those creatures"),
         ),
-        tag_no_case::<_, _, OracleError<'_>>(
-            " for each creature they control that's attacking a planeswalker you control",
+        value(
+            (),
+            preceded(
+                (
+                    tag_no_case(" for each creature "),
+                    controller_phrase_among_mixed_case(&[ControllerPhrase::THEY_CONTROL]),
+                    tag_no_case(" that's attacking "),
+                ),
+                // Longest first: "you" is a prefix of "you or a planeswalker …".
+                alt((
+                    tag_no_case("you or a planeswalker you control"),
+                    tag_no_case("a planeswalker you control"),
+                    tag_no_case("you"),
+                )),
+            ),
         ),
-        tag_no_case::<_, _, OracleError<'_>>(
-            " for each creature they control that's attacking you",
+        preceded(
+            tag_no_case(" for each attacking creature "),
+            controller_phrase_among_mixed_case(&[ControllerPhrase::THEY_CONTROL]),
         ),
-        tag_no_case::<_, _, OracleError<'_>>(" for each attacking creature they control"),
     )))
     .parse(input)?;
 
@@ -3437,22 +3512,21 @@ pub(crate) fn try_parse_scoped_must_attack_block(
     )
 }
 
-/// CR 611.3a + CR 613.1f: Detect and split
-/// `"PRIMARY and FOREIGN_SUBJECT have/has/gains/gain KEYWORD [as long as COND]"`
-/// (including the inverted form `"As long as COND, PRIMARY and FOREIGN_SUBJECT …"`).
-///
-/// A "foreign subject" is any noun phrase parseable by `parse_continuous_subject_filter`
-/// that does NOT resolve to `SelfRef`. Example: "creatures you control have vigilance"
-/// after "~ gets +2/+2 and" — Angelic Field Marshal's Lieutenant ability.
-///
-/// Returns two `StaticDefinition`s: one for the primary (existing `affected`) plus a
-/// companion `Continuous` def for the foreign-subject keyword grant. Both inherit the
-/// same `StaticCondition` when present so the gate applies to both effects.
-///
-/// CR 109.5 + CR 611.3a: the condition binds each effect independently (CR 611.3a),
-/// but MTG print convention always states one condition for the whole clause, so both
-/// defs receive the same condition object.
-pub(crate) fn try_split_and_foreign_keyword_grant(text: &str) -> Option<Vec<StaticDefinition>> {
+/// CR 611.3a + CR 613.1f + CR 613.4c: Split
+/// `"PRIMARY and FOREIGN_SUBJECT <predicate> [as long as COND]"` (and the inverted
+/// `"As long as COND, …"` form) into the primary's static(s) plus one `Continuous`
+/// companion scoped to FOREIGN_SUBJECT — any subject `parse_continuous_subject_filter`
+/// resolves to something other than `SelfRef`. The predicate is a keyword grant
+/// ("~ gets +2/+2 and creatures you control have vigilance") or a characteristic
+/// modification ("~ gets +2/+2 and other creatures you control get +2/+2 and have
+/// trample"). Both halves are gated on the clause's condition.
+pub(crate) fn try_split_and_foreign_subject_grant(text: &str) -> Option<Vec<StaticDefinition>> {
+    #[derive(Clone, Copy)]
+    enum ForeignPredicate {
+        KeywordGrant,
+        Modification,
+    }
+
     let lower = text.to_lowercase();
     let tp = TextPair::new(text, &lower);
 
@@ -3475,9 +3549,15 @@ pub(crate) fn try_split_and_foreign_keyword_grant(text: &str) -> Option<Vec<Stat
 
     let effect_lower = effect_original.to_lowercase();
 
-    // Scan for "and FOREIGN_SUBJECT verb KEYWORD" in the effect text.
-    // We try each grant verb and check every " and " position.
-    for verb in [" have ", " has ", " gains ", " gain "] {
+    // Scan for "and FOREIGN_SUBJECT <verb> <predicate>" in the effect text.
+    for (verb, predicate_kind) in [
+        (" have ", ForeignPredicate::KeywordGrant),
+        (" has ", ForeignPredicate::KeywordGrant),
+        (" gains ", ForeignPredicate::KeywordGrant),
+        (" gain ", ForeignPredicate::KeywordGrant),
+        (" get ", ForeignPredicate::Modification),
+        (" gets ", ForeignPredicate::Modification),
+    ] {
         let mut search_lower = effect_lower.as_str();
         let mut search_offset = 0;
         while let Some((before_and, subject_lower, keyword_lower)) =
@@ -3507,7 +3587,7 @@ pub(crate) fn try_split_and_foreign_keyword_grant(text: &str) -> Option<Vec<Stat
                 }
             };
 
-            // Keyword text is everything after the verb.
+            // Predicate text is everything after the verb.
             let kw_start = effect_lower.len() - keyword_lower.len();
             if kw_start >= effect_original.len() {
                 search_offset = and_pos + "and ".len();
@@ -3521,11 +3601,23 @@ pub(crate) fn try_split_and_foreign_keyword_grant(text: &str) -> Option<Vec<Stat
                 continue;
             }
 
-            // Parse keyword list into companion modifications.
-            let mut companion_mods = Vec::new();
-            for part in split_keyword_list(keyword_text) {
-                push_grant_clause_modifications(&mut companion_mods, part.as_ref(), None);
-            }
+            let companion_mods = match predicate_kind {
+                ForeignPredicate::KeywordGrant => {
+                    let mut companion_mods = Vec::new();
+                    for part in split_keyword_list(keyword_text) {
+                        push_grant_clause_modifications(&mut companion_mods, part.as_ref(), None);
+                    }
+                    companion_mods
+                }
+                ForeignPredicate::Modification => {
+                    let predicate_start = kw_start - verb.trim_start().len();
+                    parse_continuous_modifications(
+                        effect_original[predicate_start..]
+                            .trim()
+                            .trim_end_matches('.'),
+                    )
+                }
+            };
             if companion_mods.is_empty() {
                 search_offset = and_pos + "and ".len();
                 search_lower = &effect_lower[search_offset..];
@@ -3548,7 +3640,13 @@ pub(crate) fn try_split_and_foreign_keyword_grant(text: &str) -> Option<Vec<Stat
                 format!("{primary_text}.")
             };
             let mut primary_defs = parse_static_line_multi(&primary_full);
-            if primary_defs.is_empty() {
+            // Also decline when the primary re-parses to a `Continuous` def with no
+            // modifications (e.g. "Insects" of "Insects and Spiders you control get …").
+            if primary_defs.is_empty()
+                || primary_defs.iter().any(|def| {
+                    matches!(def.mode, StaticMode::Continuous) && def.modifications.is_empty()
+                })
+            {
                 search_offset = and_pos + "and ".len();
                 search_lower = &effect_lower[search_offset..];
                 continue;
@@ -3627,5 +3725,111 @@ mod assign_damage_pronoun_tests {
             "you may have ~ assign its combat damage to any target",
         )
         .is_none());
+    }
+}
+
+/// Structural-marker site: the combat tax's per-affected-creature tail reads
+/// "they control" as a marker; the tax subject already names the creatures.
+#[cfg(test)]
+mod structural_marker_tests {
+    use super::*;
+    use crate::types::ability::UnlessPayScaling;
+
+    #[test]
+    fn combat_tax_per_affected_marker() {
+        let parse = |tail: &str| {
+            let text =
+                format!("creatures can't attack you unless their controller pays {{2}}{tail}");
+            let (rest, tax) = parse_combat_tax_body(&text).expect("combat tax body");
+            (rest.to_string(), tax.scaling)
+        };
+        for defender in [
+            "you or a planeswalker you control",
+            "a planeswalker you control",
+            "you",
+        ] {
+            assert_eq!(
+                parse(&format!(
+                    " for each creature they control that's attacking {defender}"
+                )),
+                (String::new(), UnlessPayScaling::PerAffectedCreature),
+                "{defender:?}"
+            );
+        }
+        assert_eq!(
+            parse(" for each attacking creature they control"),
+            (String::new(), UnlessPayScaling::PerAffectedCreature)
+        );
+        // A declined controller phrase leaves the per-affected tail unread, so the
+        // text reaches the generic "for each <quantity>" reader instead: either it
+        // counts the named creatures once, or nothing reads the tail.
+        let attacking_creatures = |controller: ControllerRef| UnlessPayScaling::PerQuantityRef {
+            quantity: QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(
+                    TypedFilter::creature()
+                        .controller(controller)
+                        .properties(vec![FilterProp::Attacking { defender: None }]),
+                ),
+            },
+        };
+        for declined in [
+            "you control",
+            "that player controls",
+            "controlled by that player",
+            "the chosen player controls",
+        ] {
+            let tail = format!(" for each creature {declined} that's attacking you");
+            assert_eq!(
+                parse(&tail),
+                (tail.clone(), UnlessPayScaling::Flat),
+                "{tail:?}"
+            );
+        }
+        for (declined, expected) in [
+            (
+                "you control",
+                (String::new(), attacking_creatures(ControllerRef::You)),
+            ),
+            (
+                "the chosen player controls",
+                (
+                    String::new(),
+                    attacking_creatures(ControllerRef::SourceChosenPlayer),
+                ),
+            ),
+        ] {
+            assert_eq!(
+                parse(&format!(" for each attacking creature {declined}")),
+                expected,
+                "{declined:?}"
+            );
+        }
+        for declined in ["that player controls", "controlled by that player"] {
+            let tail = format!(" for each attacking creature {declined}");
+            assert_eq!(
+                parse(&tail),
+                (tail.clone(), UnlessPayScaling::Flat),
+                "{tail:?}"
+            );
+        }
+    }
+
+    /// The combat-tax body reads original-case text, so a capitalized controller
+    /// phrase scales exactly as its lowercase spelling does.
+    #[test]
+    fn combat_tax_per_affected_marker_mixed_case() {
+        for tail in [
+            " For Each Creature They Control That's Attacking You",
+            " for each attacking creature They Control",
+        ] {
+            let text =
+                format!("Creatures can't attack you unless their controller pays {{2}}{tail}");
+            let (rest, tax) = parse_combat_tax_body(&text).expect("combat tax body");
+            assert_eq!(
+                (rest, tax.scaling),
+                ("", UnlessPayScaling::PerAffectedCreature),
+                "{tail:?}"
+            );
+        }
     }
 }

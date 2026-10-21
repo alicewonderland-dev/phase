@@ -116,6 +116,25 @@ pub enum BestowCost {
     NonMana(AbilityCost),
 }
 
+/// CR 702.152a + CR 118.9: Blitz cost — the alternative cost paid to cast the
+/// card with blitz. The Streets of New Capenna cycle uses a pure mana cost
+/// ("Blitz {1}{R}" on Caldaia Guardian), delivered via MTGJSON's keywords array.
+/// Later printings introduced compound blitz costs with a non-mana rider
+/// ("Blitz—{2}{B}{B}, Pay 2 life." on Tenacious Underdog; "Blitz—{2}{R}{R},
+/// Discard a card." on Sabin, Master Monk), where the residual non-mana sub-cost
+/// is paid alongside the mana sub-cost. Mirrors `BestowCost`/`EvokeCost`/
+/// `FlashbackCost` so the non-mana portion composes through the existing
+/// `AbilityCost` / `pay_additional_cost` pipeline.
+/// `split_blitz_cost_components` (casting.rs) separates the mana sub-cost (paid
+/// via the normal mana flow, CR 601.2g) from the residual non-mana sub-cost
+/// (paid via `pay_additional_cost`, CR 601.2h).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum BlitzCost {
+    Mana(ManaCost),
+    NonMana(AbilityCost),
+}
+
 /// CR 702.119a-b: Emerge's mana cost and the permanent quality required for
 /// its sacrifice cost. Ordinary emerge sacrifices a creature; "emerge from
 /// [quality]" uses the printed permanent filter instead.
@@ -818,7 +837,7 @@ pub enum Keyword {
     Mutate(ManaCost),
     Disturb(ManaCost),
     Disguise(DisguiseCost),
-    Blitz(ManaCost),
+    Blitz(BlitzCost),
     Overload(ManaCost),
     Spectacle(ManaCost),
     Surge(ManaCost),
@@ -2364,7 +2383,7 @@ fn parse_affinity_type(s: &str) -> Option<TypedFilter> {
                 .filter(|(_, consumed)| *consumed == s.len())
                 .map(|(subtype, _)| subtype)
                 .unwrap_or_else(|| {
-                    let capitalized = format!("{}{}", &s[..1].to_uppercase(), &s[1..]);
+                    let capitalized = capitalize_first(s);
                     // Unknown plural subtype words retain the legacy fallback
                     // ("Daleks" → "Dalek"), while values returned by
                     // `parse_subtype` above are already canonical and must not be
@@ -2495,24 +2514,14 @@ fn parse_enchant_target(s: &str) -> Option<TargetFilter> {
 
     // CR 303.4a: When the type leg is absent (Don't Worry About It), the
     // class is "any card", encoded as `TypeFilter::Card`.
-    let mut props = Vec::new();
-    let type_filter = if let Some(leg) = type_leg {
-        props.extend(leg.properties);
-        leg.type_filter
-    } else {
-        TypeFilter::Card
-    };
+    let mut filter = type_leg.unwrap_or_else(TypedFilter::card);
     if let Some(z) = zone {
-        props.push(FilterProp::InZone { zone: z });
+        filter.properties.push(FilterProp::InZone { zone: z });
     }
     if let Some(prop) = attachment {
-        props.push(prop);
+        filter.properties.push(prop);
     }
-    props.extend(without_keyword);
-    let mut filter = TypedFilter::new(type_filter);
-    if !props.is_empty() {
-        filter = filter.properties(props);
-    }
+    filter.properties.extend(without_keyword);
     if let Some(c) = controller {
         filter = filter.controller(c);
     }
@@ -2733,7 +2742,7 @@ impl FromStr for Keyword {
                 "mutate" => return Ok(Keyword::Mutate(parse_keyword_mana_cost(p))),
                 "disturb" => return Ok(Keyword::Disturb(parse_keyword_mana_cost(p))),
                 "disguise" => return Ok(Keyword::Disguise(parse_keyword_mana_cost(p).into())),
-                "blitz" => return Ok(Keyword::Blitz(parse_keyword_mana_cost(p))),
+                "blitz" => return Ok(Keyword::Blitz(BlitzCost::Mana(parse_keyword_mana_cost(p)))),
                 "overload" => return Ok(Keyword::Overload(parse_keyword_mana_cost(p))),
                 // CR 702.162a: More Than Meets the Eye {cost} — alternative cost to cast converted.
                 "more than meets the eye" => {
@@ -3613,7 +3622,15 @@ fn keyword_from_tagged(variant: &str, data: &serde_json::Value) -> Result<Keywor
             serde_json::from_value::<DisguiseCost>(data.clone())
                 .or_else(|_| mana(data).map(DisguiseCost::Mana))?,
         )),
-        "Blitz" => Ok(Keyword::Blitz(mana(data)?)),
+        "Blitz" => {
+            // Accept both the legacy bare ManaCost format and the new tagged
+            // BlitzCost format (Mana / NonMana) — mirrors Flashback/Bestow.
+            if let Ok(blitz_cost) = serde_json::from_value::<BlitzCost>(data.clone()) {
+                Ok(Keyword::Blitz(blitz_cost))
+            } else {
+                Ok(Keyword::Blitz(BlitzCost::Mana(mana(data)?)))
+            }
+        }
         "Overload" => Ok(Keyword::Overload(mana(data)?)),
         // CR 702.162a: More Than Meets the Eye {cost} — alternative cost to cast converted.
         "MoreThanMeetsTheEye" => Ok(Keyword::MoreThanMeetsTheEye(mana(data)?)),
@@ -3975,6 +3992,49 @@ mod tests {
     use super::*;
     use crate::types::ability::Effect;
 
+    // SHAPE: CR 702.5a + CR 205.3m: the single-leg adapter must retain the
+    // creature head, canonical Wall exclusion and controller suffix together.
+    #[test]
+    fn enchant_negated_subtype_from_str_and_declines_shape() {
+        for phrase in [
+            "Enchant:non-Wall creature",
+            "Enchant:non-Wall creature you control",
+        ] {
+            let Keyword::Enchant(TargetFilter::Typed(typed)) = Keyword::from_str(phrase).unwrap()
+            else {
+                panic!("expected typed Enchant");
+            };
+            assert_eq!(
+                typed.type_filters,
+                vec![
+                    TypeFilter::Creature,
+                    TypeFilter::Non(Box::new(TypeFilter::Subtype("Wall".into())))
+                ]
+            );
+            assert_eq!(
+                typed.controller,
+                if phrase == "Enchant:non-Wall creature you control" {
+                    Some(ControllerRef::You)
+                } else {
+                    None
+                }
+            );
+        }
+        for phrase in [
+            "",
+            "non-Aurora enchantment",
+            "non- enchantment",
+            "non-Aura",
+            "non-Wall creature if you control an artifact",
+            "Goblin",
+        ] {
+            assert!(
+                parse_enchant_target(phrase).is_none(),
+                "must decline: {phrase}"
+            );
+        }
+    }
+
     /// CR 702.62a + CR 702.7a: the ordinary case — a keyword whose `kind()` names
     /// it and nothing else supports a kind-level presence test.
     #[test]
@@ -4282,6 +4342,19 @@ mod tests {
 
         let equip = Keyword::from_str("Equip:3").unwrap();
         assert!(matches!(equip, Keyword::Equip(ManaCost::Cost { .. })));
+    }
+
+    /// CR 702.41a + CR 205.3: an unknown subtype whose first letter is not ASCII is capitalized by
+    /// character, not by byte.
+    #[test]
+    fn parse_affinity_for_a_subtype_with_a_non_ascii_initial() {
+        let Keyword::Affinity(filter) = Keyword::from_str("Affinity for éclats").unwrap() else {
+            panic!("expected Affinity keyword");
+        };
+        assert_eq!(
+            filter.type_filters,
+            vec![TypeFilter::Subtype("Éclat".to_string())]
+        );
     }
 
     #[test]
@@ -5662,7 +5735,7 @@ mod tests {
                     condition: None,
                 }),
             }),
-            Keyword::Blitz(mc("{2}{R}")),
+            Keyword::Blitz(BlitzCost::NonMana(pay_life_cost())),
             Keyword::Overload(mc("{2}{R}")),
             Keyword::Spectacle(mc("{2}{R}")),
             Keyword::Surge(mc("{2}{R}")),
@@ -6201,6 +6274,99 @@ mod tests {
             Keyword::CumulativeUpkeep(AbilityCost::Mana {
                 cost: parse_keyword_mana_cost("{1}{W}"),
             })
+        );
+    }
+
+    /// The mana arm of every keyword cost type whose `payload_bearing_samples`
+    /// entry takes a non-mana arm: the `Mana(ManaCost)` side of the
+    /// FlashbackCost family, `DisguiseCost::Mana`, WardCost's mana-bearing
+    /// costs, and `AbilityCost::Mana` for the AbilityCost keywords. Plus the
+    /// "its mana cost reduced by {N}" placeholder, which the parser emits on
+    /// granted keywords (Dream Devourer's foretell) and which is resolved only
+    /// at lookup time, so it is a serialized keyword payload.
+    fn mana_arm_samples() -> Vec<Keyword> {
+        vec![
+            Keyword::Foretell(ManaCost::SelfManaCostReduced { reduction: 2 }),
+            Keyword::Bestow(BestowCost::Mana(mc("{3}{G}{G}"))),
+            Keyword::Embalm(EmbalmCost::Mana(mc("{3}{W}"))),
+            Keyword::Eternalize(EternalizeCost::Mana(mc("{4}{B}{B}"))),
+            Keyword::Cycling(CyclingCost::Mana(mc("{2}"))),
+            Keyword::Flashback(FlashbackCost::Mana(mc("{1}{U}"))),
+            Keyword::Escape(EscapeCost::Mana(mc("{2}{B}"))),
+            Keyword::Evoke(EvokeCost::Mana(mc("{2}{U}"))),
+            Keyword::Buyback(BuybackCost::Mana(mc("{3}"))),
+            Keyword::Echo(EchoCost::Mana(mc("{1}{R}"))),
+            Keyword::Blitz(BlitzCost::Mana(mc("{2}{R}"))),
+            Keyword::Disguise(DisguiseCost::Mana(mc("{1}{W/U}"))),
+            Keyword::Ward(WardCost::Mana(mc("{2}"))),
+            Keyword::Ward(WardCost::Waterbend(mc("{4}"))),
+            Keyword::Ward(WardCost::Compound(vec![
+                WardCost::Mana(mc("{2}")),
+                WardCost::PayLife(2),
+            ])),
+            Keyword::CumulativeUpkeep(AbilityCost::Mana { cost: mc("{1}") }),
+            Keyword::Escalate(AbilityCost::Mana { cost: mc("{1}{R}") }),
+        ]
+    }
+
+    /// Ward costs parsed from Oracle text (CR 702.21a), keyed by that text. The
+    /// first is Captain Howler, Sea Scourge's printed ward; the other two are
+    /// parser-accepted compound shapes whose non-mana leg the client cannot
+    /// render, which the client must show as no detail rather than as the
+    /// mana leg alone.
+    fn parsed_ward_samples() -> std::collections::BTreeMap<&'static str, Keyword> {
+        [
+            "Ward\u{2014}{2}, Pay 2 life.",
+            "Ward\u{2014}{2}, Pay life equal to this creature's power.",
+            "Ward\u{2014}{1}, Get a poison counter.",
+        ]
+        .into_iter()
+        .map(|oracle| {
+            let lower = oracle.to_lowercase();
+            let (kw, rest) = crate::parser::oracle_keyword::parse_keyword_line_core(&lower)
+                .unwrap_or_else(|| panic!("{oracle} parses as a keyword line"));
+            assert!(rest.is_empty(), "{oracle} left {rest:?} unconsumed");
+            assert!(
+                matches!(&kw, Keyword::Ward(WardCost::Compound(legs)) if legs.len() == 2),
+                "{oracle} parses as a two-leg compound ward, got {kw:?}"
+            );
+            (oracle, kw)
+        })
+        .collect()
+    }
+
+    /// Engine-authored wire golden for the client's keyword-detail formatter
+    /// (`client/src/viewmodel/keywordProps.ts`). The client once formatted a
+    /// hand-written, externally tagged `ManaCost` shape that the engine never
+    /// emits, and its tests agreed with themselves: every keyword mana cost
+    /// rendered blank. Serializing the real payloads here and failing on drift
+    /// keeps the client's fixture the engine's actual output.
+    #[test]
+    fn keyword_payload_wire_golden_matches_the_client_fixture() {
+        let mut samples = payload_bearing_samples();
+        samples.extend(mana_arm_samples());
+        let wire = serde_json::json!({
+            "samples": samples,
+            "parsed_ward": parsed_ward_samples(),
+        });
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../client/src/test/fixtures/keyword-payload-wire.json"
+        );
+        if std::env::var_os("UPDATE_WIRE_GOLDEN").is_some() {
+            std::fs::write(
+                path,
+                format!("{}\n", serde_json::to_string_pretty(&wire).unwrap()),
+            )
+            .expect("write the keyword payload golden");
+        }
+        let committed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(path).expect("committed keyword payload golden"),
+        )
+        .expect("the keyword payload golden parses");
+        assert_eq!(
+            wire, committed,
+            "the client's keyword payload golden drifted — re-run with UPDATE_WIRE_GOLDEN=1"
         );
     }
 

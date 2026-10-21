@@ -1,3 +1,4 @@
+use crate::types::game_state::RandomDraw;
 use rand::Rng;
 
 use crate::game::game_object::AttachTarget;
@@ -13,8 +14,8 @@ use crate::types::ability::{EffectScope, TapStateChange};
 use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    GameState, MassLibraryOrderBatch, MassLibraryOrderMember, PendingCounterPostAction,
-    PendingZoneChangeDelivery, WaitingFor,
+    ChangeZoneMemberEntry, GameState, MassLibraryOrderBatch, MassLibraryOrderMember,
+    PendingCounterPostAction, PendingZoneChangeDelivery, WaitingFor,
 };
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use crate::types::player::PlayerId;
@@ -66,7 +67,7 @@ fn resolve_forward_result_search_attach_host(
     }
     let targets = forward_result_attach_host_targets(ability);
     match target {
-        TargetFilter::SelfRef => Some(AttachTarget::Object(ability.source_id)),
+        TargetFilter::SelfRef => ability.self_ref_binding(state).map(AttachTarget::Object),
         // CR 303.4b + CR 109.4: "attached to you" (Lynde, Cheerful Tormentor)
         // binds the Aura host to the resolving ability's controller.
         TargetFilter::Controller => Some(AttachTarget::Player(ability.controller)),
@@ -274,6 +275,10 @@ pub(crate) fn change_zone_all_player_scope_member_matches(
     origin_zones: &[Zone],
 ) -> bool {
     origin_zones.contains(&object.zone)
+        // CR 108.2 + CR 109.1: a player-scoped mass move ("all cards you own
+        // in exile") ranges over cards; the CR 722.3c retained prepare copy is
+        // not one. Battlefield tokens stay members (CR 110.1, CR 111.1).
+        && object.is_card_population_member()
         && if object.zone == Zone::Battlefield {
             object.controller == player
         } else {
@@ -445,7 +450,16 @@ fn resolution_zone_candidates(
         .filter(|(id, object)| {
             scan_zones.contains(&object.zone)
                 && !object.is_emblem
-                && crate::game::filter::matches_target_filter(state, **id, target_filter, &ctx)
+                // CR 108.2 + CR 109.1: a zone scan chooses among the cards in
+                // the zone; the CR 722.3c retained prepare copy is not one.
+                && object.is_card_population_member()
+                && crate::game::filter::matches_target_filter_for_zone(
+                    state,
+                    **id,
+                    object.zone,
+                    target_filter,
+                    &ctx,
+                )
         })
         .filter(|(id, object)| {
             destination != Zone::Exile
@@ -612,6 +626,37 @@ fn capture_devour_snapshot_before_single_entry(
 }
 
 /// Move target objects between zones.
+/// CR 610.3 + CR 610.3a + CR 610.3b: True when the "until" event bounding THIS
+/// node's own zone change (`ResolvedAbility::bounded_zone_change_event`) already
+/// occurred — latched on this node after the ability was put onto the stack
+/// (activated) or triggered (triggered), or emitted earlier in this same
+/// resolution. The initial one-shot move then does not happen. Shared by
+/// the single-object and mass resolvers so each bounded node refuses on its own
+/// latch.
+pub(crate) fn until_event_already_occurred(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    events: &[GameEvent],
+) -> bool {
+    let Some(duration_event) = ability.bounded_zone_change_event() else {
+        return false;
+    };
+    ability.context.duration_events.contains(&duration_event)
+        || events.iter().any(|event| {
+            crate::game::engine::duration_event_matches(
+                state,
+                ability.source_id,
+                ability
+                    .trigger_source
+                    .as_ref()
+                    .map(|source| source.identity.reference),
+                ability.controller,
+                duration_event,
+                event,
+            )
+        })
+}
+
 pub fn resolve(
     state: &mut GameState,
     ability: &ResolvedAbility,
@@ -694,37 +739,16 @@ pub fn resolve(
             .map(|cause| EffectResolutionResult { cause, count })
     };
 
-    // CR 610.3b: If the specified event occurred after this triggered ability
-    // triggered but before its initial one-shot zone change, the object does
-    // not move.
-    if let Some(duration_event) = ability
-        .duration
-        .as_ref()
-        .and_then(Duration::zone_change_event)
-    {
-        let occurred_before_this_resolution =
-            ability.context.duration_events.contains(&duration_event);
-        let occurred_earlier_this_resolution = events.iter().any(|event| {
-            crate::game::engine::duration_event_matches(
-                state,
-                ability.source_id,
-                ability
-                    .trigger_source
-                    .as_ref()
-                    .map(|source| source.identity.reference),
-                ability.controller,
-                duration_event,
-                event,
-            )
+    // CR 610.3a / CR 610.3b: If the specified event occurred after this ability
+    // was put onto the stack (activated) or triggered (triggered) but before its
+    // initial one-shot zone change, the object does not move.
+    if until_event_already_occurred(state, ability, events) {
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::from(&ability.effect),
+            source_id: ability.source_id,
+            subject: None,
         });
-        if occurred_before_this_resolution || occurred_earlier_this_resolution {
-            events.push(GameEvent::EffectResolved {
-                kind: EffectKind::from(&ability.effect),
-                source_id: ability.source_id,
-                subject: None,
-            });
-            return Ok(completed_result(0));
-        }
+        return Ok(completed_result(0));
     }
 
     let mut origin = origin;
@@ -733,7 +757,7 @@ pub fn resolve(
         Effect::ChangeZone { target, .. } => target.clone(),
         _ => TargetFilter::Any,
     };
-    // CR 603.7: Resolve the `TrackedSetId(0)` sentinel emitted by the parser
+    // CR 608.2c: Resolve the `TrackedSetId(0)` sentinel emitted by the parser
     // for "from among the milled cards" / "X cards revealed this way"
     // continuations to the most recent non-empty tracked set. Done up front so
     // every downstream path (interactive scan, `matches_target_filter`,
@@ -850,6 +874,22 @@ pub fn resolve(
             .collect()
     } else {
         targeted_objects
+    };
+
+    // CR 614.12: the event's effect-carried entry modifications, resolved per
+    // member by `resolve_change_zone_member_entry` before any member moves.
+    let entry_spec = ChangeZoneEntrySpec {
+        entry: EntryGateContext {
+            destination: dest_zone,
+            controller_override: enters_under_player,
+            enter_transformed: effect_enter_transformed,
+        },
+        source_id: ability.source_id,
+        enter_with_counters: &effect_enter_with_counters,
+        conditional_enter_with_counters: &effect_conditional_enter_with_counters,
+        enter_tapped: effect_enter_tapped,
+        enters_attacking: effect_enters_attacking,
+        enters_modified_if: effect_enters_modified_if.as_ref(),
     };
 
     if !targeted_objects.is_empty() {
@@ -1043,26 +1083,17 @@ pub fn resolve(
             && !choice_up_to
             && choice_count == 1
         {
-            let index = state.rng.random_range(0..eligible.len());
+            let index = state
+                .rng
+                .draw(RandomDraw::Outcome)
+                .random_range(0..eligible.len());
             let chosen = eligible[index];
             publish_finalized_owner_library_subjects(state, ability, &[chosen]);
             capture_devour_snapshot_before_single_entry(state, chosen, dest_zone);
-            let per_obj_enter_counters = enter_with_counters_for_object(
-                state,
-                ability,
-                chosen,
-                &effect_enter_with_counters,
-                &effect_conditional_enter_with_counters,
-            );
-            // CR 614.12: gate the tapped/attacking riders on the chosen object's type.
-            let (eff_tapped, eff_attacking) = effective_enter_mods(
-                state,
-                chosen,
-                ability.source_id,
-                effect_enter_tapped,
-                effect_enters_attacking,
-                effect_enters_modified_if.as_ref(),
-            );
+            // CR 614.12: resolve the chosen object's gated entry counters and
+            // tapped/attacking riders before it moves.
+            let member =
+                resolve_change_zone_member_entry(state, Some(ability), &entry_spec, chosen);
             // CR 110.2a: `enters_under_player` was resolved once at resolver
             // entry — pass it straight through (no per-branch re-resolution).
             match crate::game::zone_pipeline::execute_zone_move_with_controller(
@@ -1073,10 +1104,10 @@ pub fn resolve(
                 ability.source_id,
                 ability.duration.as_ref(),
                 effect_enter_transformed,
-                eff_tapped,
-                eff_attacking,
+                member.enter_tapped,
+                member.enters_attacking,
                 enters_under_player,
-                &per_obj_enter_counters,
+                &member.enter_with_counters,
                 face_down_profile.as_ref(),
                 ability.context.face_down_in_exile,
                 track_exiled_by_source,
@@ -1136,22 +1167,10 @@ pub fn resolve(
             let chosen = eligible[0];
             publish_finalized_owner_library_subjects(state, ability, &[chosen]);
             capture_devour_snapshot_before_single_entry(state, chosen, dest_zone);
-            let per_obj_enter_counters = enter_with_counters_for_object(
-                state,
-                ability,
-                chosen,
-                &effect_enter_with_counters,
-                &effect_conditional_enter_with_counters,
-            );
-            // CR 614.12: gate the tapped/attacking riders on the chosen object's type.
-            let (eff_tapped, eff_attacking) = effective_enter_mods(
-                state,
-                chosen,
-                ability.source_id,
-                effect_enter_tapped,
-                effect_enters_attacking,
-                effect_enters_modified_if.as_ref(),
-            );
+            // CR 614.12: resolve the chosen object's gated entry counters and
+            // tapped/attacking riders before it moves.
+            let member =
+                resolve_change_zone_member_entry(state, Some(ability), &entry_spec, chosen);
             // CR 110.2a: pre-resolved controller override (single-eligible
             // branch). No per-branch re-resolution.
             match crate::game::zone_pipeline::execute_zone_move_with_controller(
@@ -1162,10 +1181,10 @@ pub fn resolve(
                 ability.source_id,
                 ability.duration.as_ref(),
                 effect_enter_transformed,
-                eff_tapped,
-                eff_attacking,
+                member.enter_tapped,
+                member.enters_attacking,
                 enters_under_player,
-                &per_obj_enter_counters,
+                &member.enter_with_counters,
                 face_down_profile.as_ref(),
                 ability.context.face_down_in_exile,
                 track_exiled_by_source,
@@ -1270,17 +1289,12 @@ pub fn resolve(
         origin,
         destination: dest_zone,
         enter_transformed: effect_enter_transformed,
-        enter_tapped: effect_enter_tapped,
         enters_under_player,
-        enters_attacking: effect_enters_attacking,
-        enter_with_counters: effect_enter_with_counters.clone(),
-        conditional_enter_with_counters: effect_conditional_enter_with_counters.clone(),
         duration: ability.duration.clone(),
         track_exiled_by_source,
         face_down_in_exile: ability.context.face_down_in_exile,
         face_down_profile: face_down_profile.clone(),
         library_placement: None,
-        enters_modified_if: effect_enters_modified_if,
         enter_attached_to: forward_result_search_attach_host(state, ability),
     };
     let _ = owner_library; // routing handled by move_to_zone (CR 400.7)
@@ -1298,6 +1312,11 @@ pub fn resolve(
         state.push_devour_change_zone_snapshot(state.battlefield.iter().copied().collect());
     }
 
+    // CR 603.6a + CR 614.12: one event — every member's gates read the board
+    // before any member moves.
+    let members =
+        resolve_change_zone_member_entries(state, Some(ability), &entry_spec, &targeted_objects);
+
     // CR 608.2c: "that many" in a later instruction refers back to the number
     // of objects this targeted move actually relocated (e.g. Vengeful Regrowth:
     // "Return up to three target land cards ... Create that many ... tokens").
@@ -1307,7 +1326,8 @@ pub fn resolve(
     let mut logical_zone_change_group =
         crate::game::triggers::allocate_logical_zone_change_group(state, &targeted_objects);
     let logical_group_event_start = events.len();
-    for (i, obj_id) in targeted_objects.iter().enumerate() {
+    for (i, member) in members.iter().enumerate() {
+        let obj_id = &member.object_id;
         if dest_zone == Zone::Exile {
             let acting_player = state
                 .objects
@@ -1343,26 +1363,16 @@ pub fn resolve(
                     .get(obj_id)
                     .is_some_and(|object| object.zone == dest_zone)
         };
-        let per_obj_ctx = ChangeZoneIterationCtx {
-            enter_with_counters: enter_with_counters_for_object(
-                state,
-                ability,
-                *obj_id,
-                &effect_enter_with_counters,
-                &effect_conditional_enter_with_counters,
-            ),
-            ..ctx.clone()
-        };
         let anticipated_pause = anticipated_zone_change_delivery(
             state,
             *obj_id,
-            per_obj_ctx.destination,
-            per_obj_ctx.source_id,
-            per_obj_ctx.face_down_in_exile,
+            ctx.destination,
+            ctx.source_id,
+            ctx.face_down_in_exile,
         );
         let delivery_start = events.len();
         let stack_depth_before_zone_move = state.resolution_stack.capture_child_boundary();
-        match process_one_zone_move_with_terminal(state, &per_obj_ctx, *obj_id, events) {
+        match process_one_zone_move_with_terminal(state, &ctx, member, events) {
             crate::game::zone_pipeline::ZoneMoveTerminalResult::Completed(completion) => {
                 logical_zone_change_group
                     .record_delivery_completion(*obj_id, completion)
@@ -1383,25 +1393,20 @@ pub fn resolve(
                 .expect("paused ChangeZone retains its explicit delivery prefix");
                 state.push_change_zone_iteration(
                     crate::types::game_state::PendingChangeZoneIteration {
+                        pending_return_result_producer: None,
                         logical_zone_change_group,
                         paused_current: anticipated_pause.map(|mut boundary| {
                             boundary.append_delivery_events(&events[delivery_start..]);
                             boundary.mark_counted();
                             boundary
                         }),
-                        remaining: targeted_objects[i + 1..].to_vec(),
+                        remaining: members[i + 1..].to_vec(),
                         source_id: ctx.source_id,
                         controller: ctx.controller,
                         origin: ctx.origin,
                         destination: ctx.destination,
                         enter_transformed: ctx.enter_transformed,
-                        enter_tapped: ctx.enter_tapped,
                         enters_under_player: ctx.enters_under_player,
-                        enters_attacking: ctx.enters_attacking,
-                        enter_with_counters: ctx.enter_with_counters.clone(),
-                        conditional_enter_with_counters: ctx
-                            .conditional_enter_with_counters
-                            .clone(),
                         duration: ctx.duration.clone(),
                         track_exiled_by_source: ctx.track_exiled_by_source,
                         face_down_in_exile: ctx.face_down_in_exile,
@@ -1414,9 +1419,6 @@ pub fn resolve(
                         // enter face down.
                         face_down_profile: ctx.face_down_profile.clone(),
                         library_placement: ctx.library_placement,
-                        // CR 614.12: preserve the moved-object type gate across a
-                        // further as-enters / replacement pause.
-                        enters_modified_if: ctx.enters_modified_if.clone(),
                         enter_attached_to: ctx.enter_attached_to,
                         effect_kind: EffectKind::from(&ability.effect),
                     },
@@ -1437,6 +1439,7 @@ pub fn resolve(
                 .expect("paused ChangeZone retains its explicit delivery prefix");
                 state.push_change_zone_iteration_after_child(
                     crate::types::game_state::PendingChangeZoneIteration {
+                        pending_return_result_producer: None,
                         logical_zone_change_group,
                         paused_current: Some(
                             state
@@ -1449,19 +1452,13 @@ pub fn resolve(
                                 })
                                 .expect("zone-change pause must retain its exact boundary"),
                         ),
-                        remaining: targeted_objects[i + 1..].to_vec(),
+                        remaining: members[i + 1..].to_vec(),
                         source_id: ctx.source_id,
                         controller: ctx.controller,
                         origin: ctx.origin,
                         destination: ctx.destination,
                         enter_transformed: ctx.enter_transformed,
-                        enter_tapped: ctx.enter_tapped,
                         enters_under_player: ctx.enters_under_player,
-                        enters_attacking: ctx.enters_attacking,
-                        enter_with_counters: ctx.enter_with_counters.clone(),
-                        conditional_enter_with_counters: ctx
-                            .conditional_enter_with_counters
-                            .clone(),
                         duration: ctx.duration.clone(),
                         track_exiled_by_source: ctx.track_exiled_by_source,
                         face_down_in_exile: ctx.face_down_in_exile,
@@ -1474,9 +1471,6 @@ pub fn resolve(
                         // enter face down.
                         face_down_profile: ctx.face_down_profile.clone(),
                         library_placement: ctx.library_placement,
-                        // CR 614.12: preserve the moved-object type gate across a
-                        // further as-enters / replacement pause.
-                        enters_modified_if: ctx.enters_modified_if.clone(),
                         enter_attached_to: ctx.enter_attached_to,
                         effect_kind: EffectKind::from(&ability.effect),
                     },
@@ -1549,12 +1543,184 @@ pub(crate) fn count_selected_zone_arrivals(
         .count()
 }
 
+/// CR 614.12 + CR 110.2a + CR 712.14a: how a moved object will enter — the
+/// inputs an effect-carried entry gate needs to read it as it would exist on
+/// the battlefield.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EntryGateContext {
+    pub destination: Zone,
+    /// The resolved `enters_under` override; `None` = the zone move's default.
+    pub controller_override: Option<PlayerId>,
+    pub enter_transformed: bool,
+}
+
+impl EntryGateContext {
+    /// The entry descriptor of a `ChangeZone` ability; `None` for any other
+    /// effect, which keeps the pre-move read.
+    fn from_change_zone(state: &GameState, ability: &ResolvedAbility) -> Option<Self> {
+        let Effect::ChangeZone {
+            destination,
+            enters_under,
+            enter_transformed,
+            ..
+        } = &ability.effect
+        else {
+            return None;
+        };
+        let controller_override = match resolve_enters_under_player(
+            state,
+            ability,
+            "ChangeZone",
+            enters_under.as_ref(),
+        ) {
+            Ok(controller_override) => controller_override,
+            // CR 110.2a: the resolver already surfaced this error at resolver entry; keep the pre-move read.
+            Err(_) => return None,
+        };
+        Some(Self {
+            destination: *destination,
+            controller_override,
+            enter_transformed: *enter_transformed,
+        })
+    }
+}
+
+/// CR 614.12: the effect-carried entry modifications of one `ChangeZone`
+/// event, before they are resolved per member: the entry descriptor, the
+/// unconditional and conditional entry counters, and the tapped/attacking
+/// riders with their moved-object gate.
+pub(crate) struct ChangeZoneEntrySpec<'a> {
+    pub entry: EntryGateContext,
+    pub source_id: ObjectId,
+    pub enter_with_counters: &'a [(CounterType, u32)],
+    pub conditional_enter_with_counters: &'a [(TargetFilter, CounterType, QuantityExpr)],
+    pub enter_tapped: EtbTapState,
+    pub enters_attacking: bool,
+    pub enters_modified_if: Option<&'a TargetFilter>,
+}
+
+/// CR 603.6a + CR 614.12: resolve the entry modifications one member of a
+/// `ChangeZone` event enters with. Call before any member of the event moves;
+/// `state` is the pre-event board every member's projection reads.
+///
+/// `binding` binds the conditional counter filters and quantities. `None` is
+/// the `EffectZoneChoice` case with no resolvable root ability, which keeps
+/// the unconditional counters only.
+pub(crate) fn resolve_change_zone_member_entry(
+    state: &GameState,
+    binding: Option<&ResolvedAbility>,
+    spec: &ChangeZoneEntrySpec<'_>,
+    object_id: ObjectId,
+) -> ChangeZoneMemberEntry {
+    let enter_with_counters = binding.map_or_else(
+        || spec.enter_with_counters.to_vec(),
+        |ability| {
+            enter_with_counters_for_entry(
+                state,
+                ability,
+                object_id,
+                Some(spec.entry),
+                spec.enter_with_counters,
+                spec.conditional_enter_with_counters,
+            )
+        },
+    );
+    let (enter_tapped, enters_attacking) = effective_enter_mods(
+        state,
+        object_id,
+        spec.entry,
+        spec.source_id,
+        spec.enter_tapped,
+        spec.enters_attacking,
+        spec.enters_modified_if,
+    );
+    ChangeZoneMemberEntry {
+        object_id,
+        enter_with_counters,
+        enter_tapped,
+        enters_attacking,
+    }
+}
+
+/// CR 603.6a + CR 614.12: resolve every member of one `ChangeZone` event.
+/// Call before any member of the event moves; `state` is the pre-event board
+/// every member's projection reads, so a co-entrant's presence and statics never
+/// affect another member's gates. `binding` is as for
+/// [`resolve_change_zone_member_entry`].
+pub(crate) fn resolve_change_zone_member_entries(
+    state: &GameState,
+    binding: Option<&ResolvedAbility>,
+    spec: &ChangeZoneEntrySpec<'_>,
+    members: &[ObjectId],
+) -> Vec<ChangeZoneMemberEntry> {
+    members
+        .iter()
+        .map(|&object_id| resolve_change_zone_member_entry(state, binding, spec, object_id))
+        .collect()
+}
+
+/// CR 614.12: the reading an effect-carried entry gate checks. Battlefield entry
+/// reads the projected entrant; any other destination keeps the pre-move read.
+///
+/// Each gate consumer (`enter_with_counters_for_object`, `effective_enter_mods`,
+/// and through them `resolve_change_zone_member_entry`) builds its own
+/// projection, and only when its gate is non-empty, so an entrant costs at most
+/// two projections. No printed card carries both gates on one
+/// entrant, so one shared projection is not threaded through the two call paths.
+fn entry_gate_projection(
+    state: &GameState,
+    obj_id: ObjectId,
+    entry: EntryGateContext,
+) -> Option<crate::game::filter::BattlefieldEntrantProjection> {
+    if entry.destination != Zone::Battlefield {
+        return None;
+    }
+    crate::game::filter::BattlefieldEntrantProjection::new(
+        state,
+        obj_id,
+        entry.controller_override,
+        entry.enter_transformed,
+    )
+}
+
+/// CR 614.12: evaluate an entry gate's `filter` against the projected entrant
+/// when there is one, otherwise against the object where it is.
+fn entry_gate_matches(
+    state: &GameState,
+    obj_id: ObjectId,
+    projection: Option<&crate::game::filter::BattlefieldEntrantProjection>,
+    filter: &TargetFilter,
+    ctx: &crate::game::filter::FilterContext<'_>,
+) -> bool {
+    projection.map_or_else(
+        || crate::game::filter::matches_target_filter(state, obj_id, filter, ctx),
+        |projection| projection.matches(filter, ctx),
+    )
+}
+
 /// CR 122.1 + CR 614.1c: Merge unconditional and conditional entry-time counters
 /// for one object about to enter via `ChangeZone`.
+///
+/// CR 614.12: on battlefield entry each conditional filter reads the entrant as it would exist on the battlefield (`BattlefieldEntrantProjection`); other destinations read the object where it is.
 pub(crate) fn enter_with_counters_for_object(
     state: &GameState,
     ability: &ResolvedAbility,
     obj_id: ObjectId,
+    base: &[(CounterType, u32)],
+    conditional: &[(TargetFilter, CounterType, QuantityExpr)],
+) -> Vec<(CounterType, u32)> {
+    let entry = EntryGateContext::from_change_zone(state, ability);
+    enter_with_counters_for_entry(state, ability, obj_id, entry, base, conditional)
+}
+
+/// CR 614.12: the entry-counter merge with the entry descriptor supplied by the
+/// caller; `None` keeps the pre-move read. `ability` binds the gate filters and
+/// the counter quantities.
+fn enter_with_counters_for_entry(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    obj_id: ObjectId,
+    entry: Option<EntryGateContext>,
     base: &[(CounterType, u32)],
     conditional: &[(TargetFilter, CounterType, QuantityExpr)],
 ) -> Vec<(CounterType, u32)> {
@@ -1563,8 +1729,9 @@ pub(crate) fn enter_with_counters_for_object(
         return counters;
     }
     let ctx = crate::game::filter::FilterContext::from_ability(ability);
+    let projection = entry.and_then(|entry| entry_gate_projection(state, obj_id, entry));
     for (filter, counter_type, count) in conditional {
-        if crate::game::filter::matches_target_filter(state, obj_id, filter, &ctx) {
+        if entry_gate_matches(state, obj_id, projection.as_ref(), filter, &ctx) {
             let n = crate::game::quantity::resolve_quantity_with_targets(state, count, ability)
                 .max(0) as u32;
             counters.push((counter_type.clone(), n));
@@ -1594,30 +1761,12 @@ pub(crate) fn resolving_stack_ability_for_source(
         .cloned()
 }
 
-/// Merge unconditional and conditional entry counters for one object during a
-/// paused multi-object `ChangeZone` resume.
-pub(crate) fn enter_with_counters_for_pending_object(
-    state: &GameState,
-    source_id: ObjectId,
-    obj_id: ObjectId,
-    base: &[(CounterType, u32)],
-    conditional: &[(TargetFilter, CounterType, QuantityExpr)],
-) -> Vec<(CounterType, u32)> {
-    if base.is_empty() && conditional.is_empty() {
-        return vec![];
-    }
-    if let Some(ability) = resolving_stack_ability_for_source(state, source_id) {
-        enter_with_counters_for_object(state, &ability, obj_id, base, conditional)
-    } else {
-        base.to_vec()
-    }
-}
-
 /// Per-iteration context for the multi-target `ChangeZone` loop. Captured once
 /// per `resolve` call (and once per `EffectZoneChoice` resolution) so that the
 /// loop body and the post-pause drain share one parameter bundle. Mirrors
 /// the captured fields on [`crate::types::game_state::PendingChangeZoneIteration`]
-/// minus the resume-only fields (`remaining`, `effect_kind`).
+/// minus `remaining`, `effect_kind` and the logical-group fields. Per-member
+/// entry modifications travel on each [`ChangeZoneMemberEntry`] instead.
 #[derive(Clone)]
 pub(crate) struct ChangeZoneIterationCtx {
     pub source_id: ObjectId,
@@ -1625,17 +1774,11 @@ pub(crate) struct ChangeZoneIterationCtx {
     pub origin: Option<Zone>,
     pub destination: Zone,
     pub enter_transformed: bool,
-    pub enter_tapped: EtbTapState,
     /// CR 110.2a: Resolved-once controller override. `Some(pid)` routes the
     /// moved object to `pid` on battlefield entry; `None` keeps the object
     /// under its owner's control. Pre-resolved from
     /// `Effect::ChangeZone.enters_under` at resolver entry.
     pub enters_under_player: Option<PlayerId>,
-    pub enters_attacking: bool,
-    pub enter_with_counters: Vec<(CounterType, u32)>,
-    #[allow(dead_code)]
-    // carried for resume ctx parity; merged into enter_with_counters at move time
-    pub conditional_enter_with_counters: Vec<(TargetFilter, CounterType, QuantityExpr)>,
     pub duration: Option<Duration>,
     pub track_exiled_by_source: bool,
     /// Typed SearchLibrary intent carried through multi-object and pause/resume paths.
@@ -1647,27 +1790,21 @@ pub(crate) struct ChangeZoneIterationCtx {
     /// CR 401.4 + CR 701.24a: When `Some`, suppresses auto-shuffle and places
     /// each object at the specified library position.
     pub library_placement: Option<LibraryPosition>,
-    /// CR 614.12: gates the `enter_tapped`/`enters_attacking` riders on the
-    /// moved object's type (Summoner's Grimoire). `None` = apply
-    /// unconditionally. Carried so the gate survives the `EffectZoneChoice`
-    /// pick pause and is evaluated per chosen object in `process_one_zone_move`.
-    pub enters_modified_if: Option<TargetFilter>,
     /// CR 303.4f: Pre-resolved Aura host for search/tutor "enters attached" wiring.
     pub enter_attached_to: Option<AttachTarget>,
 }
 
 /// CR 614.12 + CR 614.12a: Resolve the effective enter-modifiers for one moved
 /// object. The riders (`base_tapped`, `base_attacking`) apply only when `gate`
-/// is `None` (unconditional) or the chosen object matches the gate filter;
-/// otherwise the object enters normally `(Unspecified, false)`.
-///
-/// The object is still in its origin zone here — the choice is made before it
-/// enters (CR 614.12a) — and a card-type filter is stable from hand to
-/// battlefield, so this pre-move `matches_target_filter` check equals the
-/// as-it-would-exist-on-battlefield check (CR 614.12).
+/// is `None` (unconditional) or the moved object, read as it would exist on the
+/// battlefield (`BattlefieldEntrantProjection`), matches it; otherwise the object
+/// enters normally `(Unspecified, false)`. The choice is still made before the
+/// object enters (CR 614.12a). A non-battlefield destination reads the object
+/// where it is.
 pub(crate) fn effective_enter_mods(
     state: &GameState,
     obj_id: ObjectId,
+    entry: EntryGateContext,
     source_id: ObjectId,
     base_tapped: EtbTapState,
     base_attacking: bool,
@@ -1677,7 +1814,8 @@ pub(crate) fn effective_enter_mods(
         None => (base_tapped, base_attacking),
         Some(filter) => {
             let ctx = crate::game::filter::FilterContext::from_source(state, source_id);
-            if crate::game::filter::matches_target_filter(state, obj_id, filter, &ctx) {
+            let projection = entry_gate_projection(state, obj_id, entry);
+            if entry_gate_matches(state, obj_id, projection.as_ref(), filter, &ctx) {
                 (base_tapped, base_attacking)
             } else {
                 (EtbTapState::Unspecified, false)
@@ -1697,18 +1835,19 @@ pub(crate) fn effective_enter_mods(
 pub(crate) fn process_one_zone_move(
     state: &mut GameState,
     ctx: &ChangeZoneIterationCtx,
-    obj_id: ObjectId,
+    member: &ChangeZoneMemberEntry,
     events: &mut Vec<GameEvent>,
 ) -> ZoneMoveResult {
-    process_one_zone_move_with_terminal(state, ctx, obj_id, events).into_zone_move_result()
+    process_one_zone_move_with_terminal(state, ctx, member, events).into_zone_move_result()
 }
 
 pub(crate) fn process_one_zone_move_with_terminal(
     state: &mut GameState,
     ctx: &ChangeZoneIterationCtx,
-    obj_id: ObjectId,
+    member: &ChangeZoneMemberEntry,
     events: &mut Vec<GameEvent>,
 ) -> crate::game::zone_pipeline::ZoneMoveTerminalResult {
+    let obj_id = member.object_id;
     // CR 400.7 + CR 111.7: An object that has already left the game (a token
     // that ceased to exist via CR 704.5d, or any other object removed from
     // `state.objects` since this effect snapshotted it as a target) cannot
@@ -1755,15 +1894,8 @@ pub(crate) fn process_one_zone_move_with_terminal(
     // (Yedora's dies trigger, target `TriggeringSource`) turns the returned
     // permanent face down with the effect's characteristics. `None` keeps the
     // normal face-up entry for every non-face-down move.
-    // CR 614.12: gate the tapped/attacking riders on this chosen object's type.
-    let (eff_tapped, eff_attacking) = effective_enter_mods(
-        state,
-        obj_id,
-        ctx.source_id,
-        ctx.enter_tapped,
-        ctx.enters_attacking,
-        ctx.enters_modified_if.as_ref(),
-    );
+    // CR 614.12: entry modifications were resolved before the event
+    // (`resolve_change_zone_member_entries`).
     let result = crate::game::zone_pipeline::execute_zone_move_with_terminal_and_controller(
         state,
         obj_id,
@@ -1772,10 +1904,10 @@ pub(crate) fn process_one_zone_move_with_terminal(
         ctx.source_id,
         ctx.duration.as_ref(),
         ctx.enter_transformed,
-        eff_tapped,
-        eff_attacking,
+        member.enter_tapped,
+        member.enters_attacking,
         ctx.enters_under_player,
-        &ctx.enter_with_counters,
+        &member.enter_with_counters,
         ctx.face_down_profile.as_ref(),
         ctx.face_down_in_exile,
         ctx.track_exiled_by_source,
@@ -1916,6 +2048,21 @@ pub fn resolve_all(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
+    // CR 610.3a / CR 610.3b: an "until" event that already occurred before this
+    // mass move's initial zone change means nothing moves and no return link is
+    // installed. That refusal is non-performance for this node's own "if you
+    // do" rider (CR 118.12); `resolve_ability_chain` derives it from this same
+    // predicate over the call's own event window, so no resolution-wide flag
+    // is written here.
+    if until_event_already_occurred(state, ability, events) {
+        state.last_effect_count = Some(0);
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::from(&ability.effect),
+            source_id: ability.source_id,
+            subject: None,
+        });
+        return Ok(());
+    }
     // CR 400.3 + CR 701.23: When the target filter encodes multiple zones via
     // `InAnyZone`, scan their union; otherwise fall back to the explicit `origin`
     // (or `Battlefield`). Single-zone filters (`InZone` alone) preserve legacy
@@ -2014,7 +2161,7 @@ pub fn resolve_all(
         crate::game::effects::resolved_object_filter(state, ability, &target_filter)
     };
 
-    // CR 603.7: Resolve the `TrackedSetId(0)` sentinel emitted by the parser for
+    // CR 608.2c: Resolve the `TrackedSetId(0)` sentinel emitted by the parser for
     // inline "the exiled card[s]" continuations (e.g., Sword of Hearth and Home's
     // chain: exile creature → search land → return the exiled card). The
     // delayed-trigger resolver performs the same binding at delayed-trigger
@@ -2108,7 +2255,15 @@ pub fn resolve_all(
             .objects
             .iter()
             .filter(|(_, obj)| {
-                change_zone_all_player_scope_member_matches(obj, player, &origin_zones)
+                // CR 108.3 + CR 400.1 as modified by a shared-zone format: a card
+                // in the scoped player's shared graveyard or library is theirs
+                // whichever seat owns it.
+                crate::game::filter::zone_axis_admits(
+                    state,
+                    (obj.zone != Zone::Battlefield).then_some(obj.zone),
+                    player,
+                    |seat| change_zone_all_player_scope_member_matches(obj, seat, &origin_zones),
+                )
             })
             .map(|(id, _)| *id)
             .collect()
@@ -2118,15 +2273,19 @@ pub fn resolve_all(
             .iter()
             .filter(|(&id, obj)| {
                 origin_zones.contains(&obj.zone)
+                    // CR 108.2 + CR 109.1: a mass move out of exile moves
+                    // cards; the CR 722.3c retained prepare copy is not one.
+                    && obj.is_card_population_member()
                     && (!tracked_members_name_parent_object
                         || if delayed_exile_return {
                             target_pin_is_current_or_delayed_exile_successor(state, ability, id)
                         } else {
                             ability.target_pin_is_current(id, state)
                         })
-                    && crate::game::filter::matches_target_filter(
+                    && crate::game::filter::matches_target_filter_for_zone(
                         state,
                         id,
+                        obj.zone,
                         &effective_filter,
                         &ctx,
                     )
@@ -2206,8 +2365,8 @@ pub fn resolve_all(
             .map(|(owner, cards)| snapshot_mass_library_order_batch(state, owner, cards))
             .collect();
         if !remaining_batches.is_empty() {
-            state.pending_mass_library_order_choice =
-                Some(crate::types::game_state::PendingMassLibraryOrderChoice {
+            state.pending_mass_library_order_choice = Some(Box::new(
+                crate::types::game_state::PendingMassLibraryOrderChoice {
                     source_id: ability.source_id,
                     library_position: effect_library_position
                         .clone()
@@ -2218,7 +2377,8 @@ pub fn resolve_all(
                         crate::types::game_state::PendingMassLibraryOrderBatches::Typed(
                             remaining_batches,
                         ),
-                });
+                },
+            ));
         }
         state.waiting_for = mass_library_order_effect_zone_choice(
             snapshot_mass_library_order_batch(state, first_owner, first_cards),
@@ -2240,7 +2400,7 @@ pub fn resolve_all(
     let mut matching = matching;
     if random_order {
         use rand::seq::SliceRandom;
-        matching.shuffle(&mut state.rng);
+        matching.shuffle(state.rng.draw(RandomDraw::Placement));
     }
 
     let mut moved_count: i32 = 0;
@@ -2338,6 +2498,7 @@ pub fn resolve_all(
                 .expect("paused ChangeZoneAll retains its explicit delivery prefix");
                 state.push_change_zone_iteration_after_child(
                     crate::types::game_state::PendingChangeZoneIteration {
+                        pending_return_result_producer: None,
                         logical_zone_change_group,
                         paused_current: (!entry_target_choice).then(|| {
                             state
@@ -2350,27 +2511,31 @@ pub fn resolve_all(
                                 })
                                 .expect("replacement pause must retain its exact boundary")
                         }),
-                        remaining: matching[i + 1..].to_vec(),
+                        // CR 122.1h: resumed members of a paused mass return still
+                        // receive their counters (Shilgengar's finality counter).
+                        // ChangeZoneAll carries no entry gate, so every member's
+                        // entry is the unconditional one.
+                        remaining: matching[i + 1..]
+                            .iter()
+                            .map(|&object_id| ChangeZoneMemberEntry {
+                                object_id,
+                                enter_with_counters: enter_with_counters.clone(),
+                                enter_tapped,
+                                enters_attacking,
+                            })
+                            .collect(),
                         source_id: ability.source_id,
                         controller: ability.controller,
                         origin: None,
                         destination: dest_zone,
                         enter_transformed: false,
-                        enter_tapped,
                         enters_under_player,
-                        enters_attacking,
-                        // CR 122.1h: resumed members of a paused mass return still
-                        // receive their counters (Shilgengar's finality counter).
-                        enter_with_counters: enter_with_counters.clone(),
-                        conditional_enter_with_counters: vec![],
                         duration: ability.duration.clone(),
                         track_exiled_by_source,
                         face_down_in_exile: ability.context.face_down_in_exile,
                         moved_count: Some(moved_count + i32::from(entry_target_choice)),
                         face_down_profile: face_down_profile.clone(),
                         library_placement: member_library_placement.clone(),
-                        // CR 614.12: mass zone moves carry no moved-object type gate.
-                        enters_modified_if: None,
                         enter_attached_to: None,
                         effect_kind: EffectKind::from(&ability.effect),
                     },
@@ -2401,25 +2566,32 @@ pub fn resolve_all(
                 .expect("paused ChangeZoneAll retains its explicit delivery prefix");
                 state.push_change_zone_iteration(
                     crate::types::game_state::PendingChangeZoneIteration {
+                        pending_return_result_producer: None,
                         logical_zone_change_group,
                         paused_current: anticipated_pause.map(|mut boundary| {
                             boundary.append_delivery_events(&events[delivery_start..]);
                             boundary.mark_counted();
                             boundary
                         }),
-                        remaining: matching[i + 1..].to_vec(),
+                        // CR 122.1h: resumed members of a paused mass return still
+                        // receive their counters (Shilgengar's finality counter).
+                        // ChangeZoneAll carries no entry gate, so every member's
+                        // entry is the unconditional one.
+                        remaining: matching[i + 1..]
+                            .iter()
+                            .map(|&object_id| ChangeZoneMemberEntry {
+                                object_id,
+                                enter_with_counters: enter_with_counters.clone(),
+                                enter_tapped,
+                                enters_attacking,
+                            })
+                            .collect(),
                         source_id: ability.source_id,
                         controller: ability.controller,
                         origin: None,
                         destination: dest_zone,
                         enter_transformed: false,
-                        enter_tapped,
                         enters_under_player,
-                        enters_attacking,
-                        // CR 122.1h: resumed members of a paused mass return still
-                        // receive their counters (Shilgengar's finality counter).
-                        enter_with_counters: enter_with_counters.clone(),
-                        conditional_enter_with_counters: vec![],
                         duration: ability.duration.clone(),
                         track_exiled_by_source,
                         face_down_in_exile: ability.context.face_down_in_exile,
@@ -2429,8 +2601,6 @@ pub fn resolve_all(
                         // face down.
                         face_down_profile: face_down_profile.clone(),
                         library_placement: member_library_placement.clone(),
-                        // CR 614.12: mass zone moves carry no moved-object type gate.
-                        enters_modified_if: None,
                         enter_attached_to: None,
                         effect_kind: EffectKind::from(&ability.effect),
                     },
@@ -4063,11 +4233,17 @@ mod tests {
             properties: vec![],
         });
         let src = ObjectId(100);
+        let entry = EntryGateContext {
+            destination: Zone::Battlefield,
+            controller_override: None,
+            enter_transformed: false,
+        };
         // Enchantment moved object -> base riders apply.
         assert_eq!(
             effective_enter_mods(
                 &state,
                 ench,
+                entry,
                 src,
                 crate::types::zones::EtbTapState::Tapped,
                 true,
@@ -4080,6 +4256,7 @@ mod tests {
             effective_enter_mods(
                 &state,
                 plain,
+                entry,
                 src,
                 crate::types::zones::EtbTapState::Tapped,
                 true,
@@ -4092,6 +4269,7 @@ mod tests {
             effective_enter_mods(
                 &state,
                 plain,
+                entry,
                 src,
                 crate::types::zones::EtbTapState::Tapped,
                 true,
@@ -4188,6 +4366,1546 @@ mod tests {
                 attacking, expect_tapped,
                 "enchantment={is_enchantment}: attacking rider must be gated on the moved object's type (CR 508.4 / CR 614.12)"
             );
+        }
+    }
+
+    /// March of the Machines — verbatim Oracle text.
+    const MARCH_OF_THE_MACHINES: &str = "Each noncreature artifact is an artifact creature with \
+         power and toughness each equal to its mana value. (Equipment that's a creature can't \
+         equip a creature.)";
+
+    /// Enchanted Evening — verbatim Oracle text.
+    const ENCHANTED_EVENING: &str =
+        "All permanents are enchantments in addition to their other types.";
+
+    /// A noncreature artifact card (mana value 1) in `owner`'s graveyard.
+    fn graveyard_noncreature_artifact(state: &mut GameState, owner: PlayerId) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(900),
+            owner,
+            "Graveyard Artifact".to_string(),
+            Zone::Graveyard,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Artifact);
+        obj.base_card_types = obj.card_types.clone();
+        obj.mana_cost = crate::types::mana::ManaCost::Cost {
+            generic: 1,
+            shards: vec![],
+        };
+        obj.base_mana_cost = obj.mana_cost.clone();
+        id
+    }
+
+    fn typed(type_filter: TypeFilter) -> TargetFilter {
+        TargetFilter::Typed(TypedFilter::new(type_filter))
+    }
+
+    /// A graveyard-to-`destination` `ChangeZone` carrying a conditional
+    /// "if a creature enters this way, +1/+1 counter" entry gate.
+    fn conditional_creature_counter_move(
+        destination: Zone,
+        enters_under: Option<ControllerRef>,
+        targets: Vec<TargetRef>,
+    ) -> (
+        ResolvedAbility,
+        Vec<(TargetFilter, CounterType, QuantityExpr)>,
+    ) {
+        let conditional = vec![(
+            typed(TypeFilter::Creature),
+            CounterType::Plus1Plus1,
+            QuantityExpr::Fixed { value: 1 },
+        )];
+        let ability = ResolvedAbility::new(
+            Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                destination,
+                target: TargetFilter::Any,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: conditional.clone(),
+                face_down_profile: None,
+                enters_modified_if: None,
+            },
+            targets,
+            ObjectId(100),
+            PlayerId(0),
+        );
+        (ability, conditional)
+    }
+
+    /// CR 614.12 (V-P4, destination axis): the conditional entry-counter gate
+    /// reads the projected entrant only on battlefield entry. On a March of the
+    /// Machines board a graveyard noncreature artifact would be a creature on the
+    /// battlefield, so the battlefield move gets the counter; the same ability
+    /// moving it to exile reads the card where it is (not a creature) and gets
+    /// none. Reverting the projection flips the battlefield arm to `[]`.
+    #[test]
+    fn conditional_entry_counters_project_only_on_battlefield_entry() {
+        let mut scenario = crate::game::scenario::GameScenario::new();
+        scenario.add_enchantment_from_oracle(
+            PlayerId(0),
+            "March of the Machines",
+            MARCH_OF_THE_MACHINES,
+        );
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        let artifact = graveyard_noncreature_artifact(state, PlayerId(0));
+
+        let (to_battlefield, conditional) =
+            conditional_creature_counter_move(Zone::Battlefield, None, vec![]);
+        assert_eq!(
+            enter_with_counters_for_object(state, &to_battlefield, artifact, &[], &conditional),
+            vec![(CounterType::Plus1Plus1, 1)],
+            "battlefield entry must read the March-projected creature (CR 614.12)"
+        );
+
+        let (to_exile, conditional) = conditional_creature_counter_move(Zone::Exile, None, vec![]);
+        assert_eq!(
+            enter_with_counters_for_object(state, &to_exile, artifact, &[], &conditional),
+            vec![],
+            "a non-battlefield destination keeps the read of the card where it is"
+        );
+    }
+
+    /// CR 110.2a + CR 614.12 (V-P5, controller axis): the projection places the
+    /// entrant under the controller it will enter under. P1 controls a static
+    /// "artifacts you control are creatures"; P0 owns the graveyard noncreature
+    /// artifact. With no `enters_under` it enters under its owner P0, P1's static
+    /// doesn't apply, and no counter; with `enters_under: TargetPlayer` and P1
+    /// targeted it enters under P1, the static applies, and it gets the counter.
+    /// No P0-controlled static exists, so the override is the only route to the
+    /// counter.
+    #[test]
+    fn conditional_entry_counters_project_under_entering_controller() {
+        let mut scenario = crate::game::scenario::GameScenario::new();
+        scenario
+            .add_enchantment_from_oracle(PlayerId(1), "Artifact Animator", "")
+            .with_static_definition(
+                crate::types::ability::StaticDefinition::continuous()
+                    .affected(TargetFilter::Typed(TypedFilter {
+                        type_filters: vec![TypeFilter::Artifact],
+                        controller: Some(ControllerRef::You),
+                        properties: vec![],
+                    }))
+                    .modifications(vec![
+                        crate::types::ability::ContinuousModification::AddType {
+                            core_type: CoreType::Creature,
+                        },
+                    ]),
+            );
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        let artifact = graveyard_noncreature_artifact(state, PlayerId(0));
+
+        let (owner_entry, conditional) =
+            conditional_creature_counter_move(Zone::Battlefield, None, vec![]);
+        assert_eq!(
+            enter_with_counters_for_object(state, &owner_entry, artifact, &[], &conditional),
+            vec![],
+            "entering under its owner P0, P1's static must not apply"
+        );
+
+        let (override_entry, conditional) = conditional_creature_counter_move(
+            Zone::Battlefield,
+            Some(ControllerRef::TargetPlayer),
+            vec![TargetRef::Player(PlayerId(1))],
+        );
+        assert_eq!(
+            enter_with_counters_for_object(state, &override_entry, artifact, &[], &conditional),
+            vec![(CounterType::Plus1Plus1, 1)],
+            "entering under P1 (CR 110.2a), P1's static applies on the projection"
+        );
+    }
+
+    /// CR 614.12: a paused multi-object `ChangeZone` resume reads each entrant
+    /// through the paused move's own entry descriptor, not the resolving stack
+    /// root. Here the root is a `Draw` whose sub-ability returns up to two
+    /// graveyard noncreature artifacts to the battlefield with the "if a creature
+    /// enters this way" gate, chosen at resolution. On a March of the Machines
+    /// board each would be a creature on the battlefield, so both get the counter.
+    /// REVERT: deriving the `EffectZoneChoice` precompute's `EntryGateContext`
+    /// from the root (`Draw`, no battlefield entry) instead of the paused move's
+    /// own descriptor drops the projection and both enter with no counter.
+    #[test]
+    fn paused_multi_object_resume_projects_the_paused_move() {
+        let mut scenario = crate::game::scenario::GameScenario::new();
+        scenario.add_enchantment_from_oracle(
+            PlayerId(0),
+            "March of the Machines",
+            MARCH_OF_THE_MACHINES,
+        );
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        let first = graveyard_noncreature_artifact(state, PlayerId(0));
+        let second = graveyard_noncreature_artifact(state, PlayerId(0));
+
+        let mut move_ability = ResolvedAbility::new(
+            Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Battlefield,
+                target: TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Artifact],
+                    controller: Some(ControllerRef::You),
+                    properties: vec![FilterProp::InZone {
+                        zone: Zone::Graveyard,
+                    }],
+                }),
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: true,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![(
+                    typed(TypeFilter::Creature),
+                    CounterType::Plus1Plus1,
+                    QuantityExpr::Fixed { value: 1 },
+                )],
+                face_down_profile: None,
+                enters_modified_if: None,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        move_ability.multi_target = Some(MultiTargetSpec::fixed(0, 2));
+        move_ability.target_choice_timing = TargetChoiceTiming::Resolution;
+        let root = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        )
+        .sub_ability(move_ability.clone());
+        state.resolving_stack_entry = Some(StackEntry {
+            id: ObjectId(1000),
+            controller: PlayerId(0),
+            source_id: ObjectId(100),
+            kind: StackEntryKind::TriggeredAbility {
+                source_id: ObjectId(100),
+                ability: Box::new(root),
+                condition: None,
+                trigger_event: None,
+                description: None,
+                source_name: String::new(),
+                subject_match_count: None,
+                die_result: None,
+                provenance: None,
+            },
+        });
+
+        let mut events = Vec::new();
+        resolve(state, &move_ability, &mut events).unwrap();
+        assert!(
+            matches!(state.waiting_for, WaitingFor::EffectZoneChoice { .. }),
+            "premise: the move pauses for its resolution-time choice, got {:?}",
+            state.waiting_for
+        );
+        apply_as_current(
+            state,
+            GameAction::SelectCards {
+                cards: vec![first, second],
+            },
+        )
+        .expect("the paused move resumes with both chosen artifacts");
+
+        for id in [first, second] {
+            assert_eq!(state.objects[&id].zone, Zone::Battlefield);
+            assert_eq!(
+                state.objects[&id]
+                    .counters
+                    .get(&CounterType::Plus1Plus1)
+                    .copied()
+                    .unwrap_or(0),
+                1,
+                "the March-projected entrant gets the gated counter (CR 614.12)"
+            );
+        }
+    }
+
+    /// Rusted Relic {4} Artifact — verbatim Oracle text.
+    const RUSTED_RELIC: &str = "Metalcraft \u{2014} This artifact is a 5/5 Golem artifact \
+         creature as long as you control three or more artifacts.";
+
+    /// Ornithopter {0} Artifact Creature — Thopter 0/2 — verbatim Oracle text.
+    const ORNITHOPTER: &str = "Flying";
+
+    /// Stage `id` as a card whose core types are exactly `core_types`, with no
+    /// printed power/toughness unless it is a creature card.
+    fn set_core_types(state: &mut GameState, id: ObjectId, core_types: &[CoreType]) {
+        let obj = state.objects.get_mut(&id).expect("fixture present");
+        obj.card_types.core_types = core_types.to_vec();
+        obj.base_card_types = obj.card_types.clone();
+        if !core_types.contains(&CoreType::Creature) {
+            obj.power = None;
+            obj.toughness = None;
+            obj.base_power = None;
+            obj.base_toughness = None;
+        }
+    }
+
+    /// A graveyard Rusted Relic owned by P0 (core types fixed after `build`).
+    fn add_graveyard_rusted_relic(scenario: &mut crate::game::scenario::GameScenario) -> ObjectId {
+        scenario
+            .add_creature_to_graveyard(PlayerId(0), "Rusted Relic", 0, 0)
+            .with_mana_cost(crate::types::mana::ManaCost::Cost {
+                generic: 4,
+                shards: vec![],
+            })
+            .from_oracle_text(RUSTED_RELIC)
+            .id()
+    }
+
+    /// A graveyard Ornithopter owned by P0 (core types fixed after `build`).
+    fn add_graveyard_ornithopter(scenario: &mut crate::game::scenario::GameScenario) -> ObjectId {
+        scenario
+            .add_creature_to_graveyard(PlayerId(0), "Ornithopter", 0, 2)
+            .with_mana_cost(crate::types::mana::ManaCost::Cost {
+                generic: 0,
+                shards: vec![],
+            })
+            .from_oracle_text(ORNITHOPTER)
+            .id()
+    }
+
+    /// A graveyard March of the Machines owned by P0 (core types fixed after `build`).
+    fn add_graveyard_march(scenario: &mut crate::game::scenario::GameScenario) -> ObjectId {
+        scenario
+            .add_creature_to_graveyard(PlayerId(0), "March of the Machines", 0, 0)
+            .with_mana_cost(crate::types::mana::ManaCost::Cost {
+                generic: 3,
+                shards: vec![crate::types::mana::ManaCostShard::Blue],
+            })
+            .from_oracle_text(MARCH_OF_THE_MACHINES)
+            .id()
+    }
+
+    fn plus_one_counters(state: &GameState, id: ObjectId) -> u32 {
+        state.objects[&id]
+            .counters
+            .get(&CounterType::Plus1Plus1)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn is_creature(state: &GameState, id: ObjectId) -> bool {
+        state.objects[&id]
+            .card_types
+            .core_types
+            .contains(&CoreType::Creature)
+    }
+
+    /// The parked `ChangeZone` iteration wherever it sits on the resolution
+    /// stack (a replacement pause may park it below a child frame).
+    fn parked_change_zone_iteration(
+        state: &GameState,
+    ) -> Option<&crate::types::game_state::PendingChangeZoneIteration> {
+        state
+            .resolution_stack
+            .iter()
+            .filter_map(|frame| match frame {
+                crate::types::resolution::ResolutionFrame::ChangeZone(frame) => {
+                    frame.pending.as_ref()
+                }
+                _ => None,
+            })
+            .last()
+    }
+
+    /// A graveyard-to-battlefield `ChangeZone` over `targets` carrying an
+    /// optional "if a creature enters this way, +1/+1 counter" gate and an
+    /// optional creature-gated tapped rider.
+    fn gated_graveyard_return(
+        targets: &[ObjectId],
+        counter_gate: bool,
+        tapped_rider_gate: bool,
+    ) -> ResolvedAbility {
+        let conditional = if counter_gate {
+            vec![(
+                typed(TypeFilter::Creature),
+                CounterType::Plus1Plus1,
+                QuantityExpr::Fixed { value: 1 },
+            )]
+        } else {
+            vec![]
+        };
+        ResolvedAbility::new(
+            Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Battlefield,
+                target: TargetFilter::Any,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: if tapped_rider_gate {
+                    crate::types::zones::EtbTapState::Tapped
+                } else {
+                    crate::types::zones::EtbTapState::Unspecified
+                },
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: conditional,
+                face_down_profile: None,
+                enters_modified_if: tapped_rider_gate.then(|| typed(TypeFilter::Creature)),
+            },
+            targets.iter().map(|&id| TargetRef::Object(id)).collect(),
+            ObjectId(100),
+            PlayerId(0),
+        )
+    }
+
+    /// Set a `Draw` root whose sub-ability is `move_ability` as the resolving
+    /// stack entry, so any root-bound read sees a non-move root.
+    fn set_draw_root(state: &mut GameState, move_ability: &ResolvedAbility) {
+        let root = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        )
+        .sub_ability(move_ability.clone());
+        state.resolving_stack_entry = Some(StackEntry {
+            id: ObjectId(1000),
+            controller: PlayerId(0),
+            source_id: ObjectId(100),
+            kind: StackEntryKind::TriggeredAbility {
+                source_id: ObjectId(100),
+                ability: Box::new(root),
+                condition: None,
+                trigger_event: None,
+                description: None,
+                source_name: String::new(),
+                subject_match_count: None,
+                die_result: None,
+                provenance: None,
+            },
+        });
+    }
+
+    /// CR 603.6a + CR 614.12 (targeted loop): one event puts every target onto
+    /// the battlefield, so each member's entry gate reads the board before any
+    /// member moved. With two other artifacts, P0 controls two before the event,
+    /// so Rusted Relic's metalcraft is off as it would enter and it is not a
+    /// creature: no counter, in either target order. Ornithopter is a creature
+    /// either way and gets the counter (reach: the gate ran). After the event
+    /// P0 controls four artifacts, so the Relic is a 5/5 creature. With three
+    /// other artifacts metalcraft already holds before the event: the Relic gets
+    /// the counter (positive control).
+    /// REVERT: computing each member's counters inside the loop, after earlier
+    /// members moved, lets the Ornithopter count toward metalcraft and gives the
+    /// Relic a counter in row (a).
+    #[test]
+    fn multi_object_gated_move_reads_the_pre_event_population() {
+        for (anchors, relic_first, relic_counters) in
+            [(2usize, false, 0), (2, true, 0), (3, false, 1)]
+        {
+            let mut scenario = crate::game::scenario::GameScenario::new();
+            let relic = add_graveyard_rusted_relic(&mut scenario);
+            let orni = add_graveyard_ornithopter(&mut scenario);
+            for i in 0..anchors {
+                scenario.add_artifact_from_oracle(PlayerId(0), &format!("Artifact Anchor {i}"), "");
+            }
+            let mut runner = scenario.build();
+            let state = runner.state_mut();
+            set_core_types(state, relic, &[CoreType::Artifact]);
+            set_core_types(state, orni, &[CoreType::Artifact, CoreType::Creature]);
+
+            let targets = if relic_first {
+                [relic, orni]
+            } else {
+                [orni, relic]
+            };
+            let ability = gated_graveyard_return(&targets, true, false);
+            let mut events = Vec::new();
+            resolve(state, &ability, &mut events).unwrap();
+
+            let row = format!("anchors={anchors} relic_first={relic_first}");
+            assert_eq!(state.objects[&relic].zone, Zone::Battlefield, "{row}");
+            assert_eq!(state.objects[&orni].zone, Zone::Battlefield, "{row}");
+            assert_eq!(
+                plus_one_counters(state, orni),
+                1,
+                "{row}: reach — Ornithopter is a creature, so the gate gives it the counter"
+            );
+            assert_eq!(
+                plus_one_counters(state, relic),
+                relic_counters,
+                "{row}: the Relic's gate reads the artifacts P0 controlled before the event"
+            );
+            assert!(
+                is_creature(state, relic),
+                "{row}: reach — metalcraft holds after the event"
+            );
+        }
+    }
+
+    /// CR 603.6a + CR 614.12 (`EffectZoneChoice` resume): the same pre-event
+    /// reading when the members are chosen at resolution under a non-move root.
+    /// Two other artifacts: Ornithopter gets the counter, Rusted Relic does not,
+    /// in either selection order, and the Relic is a creature after the event.
+    /// Choosing no cards (up to two) moves nothing and leaves no parked frame.
+    /// REVERT: computing each chosen member's counters inside the handler's move
+    /// loop gives the Relic a counter once the Ornithopter has entered.
+    #[test]
+    fn multi_object_gated_choice_reads_the_pre_event_population() {
+        for selection in [Some(false), Some(true), None] {
+            let mut scenario = crate::game::scenario::GameScenario::new();
+            let relic = add_graveyard_rusted_relic(&mut scenario);
+            let orni = add_graveyard_ornithopter(&mut scenario);
+            for i in 0..2 {
+                scenario.add_artifact_from_oracle(PlayerId(0), &format!("Artifact Anchor {i}"), "");
+            }
+            let mut runner = scenario.build();
+            let state = runner.state_mut();
+            set_core_types(state, relic, &[CoreType::Artifact]);
+            set_core_types(state, orni, &[CoreType::Artifact, CoreType::Creature]);
+
+            let mut move_ability = ResolvedAbility::new(
+                Effect::ChangeZone {
+                    origin: Some(Zone::Graveyard),
+                    destination: Zone::Battlefield,
+                    target: TargetFilter::Typed(TypedFilter {
+                        type_filters: vec![TypeFilter::Artifact],
+                        controller: Some(ControllerRef::You),
+                        properties: vec![FilterProp::InZone {
+                            zone: Zone::Graveyard,
+                        }],
+                    }),
+                    owner_library: false,
+                    enter_transformed: false,
+                    enters_under: None,
+                    enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                    enters_attacking: false,
+                    up_to: true,
+                    enter_with_counters: vec![],
+                    conditional_enter_with_counters: vec![(
+                        typed(TypeFilter::Creature),
+                        CounterType::Plus1Plus1,
+                        QuantityExpr::Fixed { value: 1 },
+                    )],
+                    face_down_profile: None,
+                    enters_modified_if: None,
+                },
+                vec![],
+                ObjectId(100),
+                PlayerId(0),
+            );
+            move_ability.multi_target = Some(MultiTargetSpec::fixed(0, 2));
+            move_ability.target_choice_timing = TargetChoiceTiming::Resolution;
+            set_draw_root(state, &move_ability);
+
+            let mut events = Vec::new();
+            resolve(state, &move_ability, &mut events).unwrap();
+            assert!(
+                matches!(state.waiting_for, WaitingFor::EffectZoneChoice { .. }),
+                "premise: the move pauses for its resolution-time choice, got {:?}",
+                state.waiting_for
+            );
+            let cards = match selection {
+                Some(false) => vec![orni, relic],
+                Some(true) => vec![relic, orni],
+                None => vec![],
+            };
+            apply_as_current(state, GameAction::SelectCards { cards })
+                .expect("the paused move resumes with the chosen artifacts");
+
+            let Some(relic_first) = selection else {
+                assert_eq!(state.objects[&relic].zone, Zone::Graveyard);
+                assert_eq!(state.objects[&orni].zone, Zone::Graveyard);
+                assert!(
+                    parked_change_zone_iteration(state).is_none(),
+                    "an empty selection leaves no parked ChangeZone iteration"
+                );
+                continue;
+            };
+            let row = format!("relic_first={relic_first}");
+            assert_eq!(state.objects[&relic].zone, Zone::Battlefield, "{row}");
+            assert_eq!(state.objects[&orni].zone, Zone::Battlefield, "{row}");
+            assert_eq!(
+                plus_one_counters(state, orni),
+                1,
+                "{row}: reach — the Ornithopter's gate ran"
+            );
+            assert_eq!(
+                plus_one_counters(state, relic),
+                0,
+                "{row}: the Relic's gate reads the artifacts P0 controlled before the event"
+            );
+            assert!(
+                is_creature(state, relic),
+                "{row}: reach — metalcraft holds after the event"
+            );
+        }
+    }
+
+    /// CR 603.6a + CR 614.12: a co-entering permanent's static is not a
+    /// continuous effect that already exists when another member's entry gate
+    /// is checked. March of the Machines and a noncreature artifact return
+    /// together with no March on the battlefield: the artifact would not be a
+    /// creature as it enters, so the counter gate gives it nothing and the
+    /// creature-gated tapped rider leaves it untapped. Once March is on the
+    /// battlefield the artifact is a 1/1 creature, plus any counter (reach). With a March already
+    /// on the battlefield the artifact would be a creature as it enters: it
+    /// gets the counter and enters tapped (positive controls).
+    /// REVERT: computing the counters per iteration gives the counters arm a
+    /// counter; leaving `effective_enter_mods` inside the mover reads the live
+    /// board with the co-entering March present and taps the artifact.
+    #[test]
+    fn co_entering_static_is_not_an_existing_effect_for_entry_gates() {
+        for rider_arm in [false, true] {
+            for existing_march in [false, true] {
+                let mut scenario = crate::game::scenario::GameScenario::new();
+                let march = add_graveyard_march(&mut scenario);
+                if existing_march {
+                    scenario.add_enchantment_from_oracle(
+                        PlayerId(0),
+                        "March of the Machines",
+                        MARCH_OF_THE_MACHINES,
+                    );
+                }
+                let mut runner = scenario.build();
+                let state = runner.state_mut();
+                set_core_types(state, march, &[CoreType::Enchantment]);
+                let artifact = graveyard_noncreature_artifact(state, PlayerId(0));
+
+                let ability = gated_graveyard_return(&[march, artifact], !rider_arm, rider_arm);
+                let mut events = Vec::new();
+                resolve(state, &ability, &mut events).unwrap();
+
+                let row = format!("rider_arm={rider_arm} existing_march={existing_march}");
+                assert_eq!(state.objects[&march].zone, Zone::Battlefield, "{row}");
+                assert_eq!(state.objects[&artifact].zone, Zone::Battlefield, "{row}");
+                assert!(
+                    is_creature(state, artifact),
+                    "{row}: reach — March applies once it is on the battlefield"
+                );
+                // March sets it to 1/1 (mana value 1); a +1/+1 counter adds to that.
+                let pt = 1 + i32::try_from(plus_one_counters(state, artifact)).unwrap();
+                assert_eq!(
+                    (
+                        state.objects[&artifact].power,
+                        state.objects[&artifact].toughness
+                    ),
+                    (Some(pt), Some(pt)),
+                    "{row}: reach — March makes the artifact a 1/1 creature after the event"
+                );
+                assert_eq!(plus_one_counters(state, march), 0, "{row}");
+                if rider_arm {
+                    assert_eq!(
+                        state.objects[&artifact].tapped, existing_march,
+                        "{row}: the tapped rider reads the board before the event"
+                    );
+                    assert!(!state.objects[&march].tapped, "{row}: March is no creature");
+                } else {
+                    assert_eq!(
+                        plus_one_counters(state, artifact),
+                        u32::from(existing_march),
+                        "{row}: the counter gate reads the board before the event"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A shock-style "pay 2 life or enter tapped" permanent card in `owner`'s
+    /// graveyard with exactly `core_types`.
+    fn add_shock_in_graveyard_for_test(
+        state: &mut GameState,
+        id: u64,
+        owner: PlayerId,
+        core_types: &[CoreType],
+    ) -> ObjectId {
+        use crate::game::game_object::GameObject;
+        use crate::types::ability::AbilityCost;
+
+        let obj_id = ObjectId(id);
+        let mut obj = GameObject::new(
+            obj_id,
+            CardId(id),
+            owner,
+            format!("Shock {id}"),
+            Zone::Graveyard,
+        );
+        obj.card_types.core_types = core_types.to_vec();
+        obj.base_card_types = obj.card_types.clone();
+        let repl = ReplacementDefinition::new(ReplacementEvent::Moved)
+            .mode(ReplacementMode::MayCost {
+                cost: AbilityCost::PayLife {
+                    amount: QuantityExpr::Fixed { value: 2 },
+                },
+                decline: Some(Box::new(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::SetTapState {
+                        target: TargetFilter::SelfRef,
+                        scope: EffectScope::Single,
+                        state: TapStateChange::Tap,
+                    },
+                ))),
+            })
+            .valid_card(TargetFilter::SelfRef);
+        obj.replacement_definitions = vec![repl].into();
+        state.objects.insert(obj_id, obj);
+        state
+            .players
+            .iter_mut()
+            .find(|p| p.id == owner)
+            .unwrap()
+            .graveyard
+            .push_back(obj_id);
+        obj_id
+    }
+
+    /// CR 603.6a + CR 614.12 (mid-loop pause drain): a targeted multi-object
+    /// move parks on the first member's shock replacement and resumes through
+    /// `drain_pending_change_zone_iteration`, under a non-move (`Draw`) root.
+    /// Row (a): two other artifacts; the parked carrier holds each remaining
+    /// member's pre-event entry (Relic none, Ornithopter the counter), and after
+    /// the decline the drain applies them: the shock artifact land, now on the
+    /// battlefield, does not count toward the Relic's metalcraft. Row (b): with
+    /// March on the battlefield, the remaining noncreature artifact keeps the
+    /// counter resolved from the move's own descriptor, not the root's.
+    /// REVERT: recomputing in the drain against the live board counts the shock
+    /// artifact land and gives the Relic a counter in row (a); recomputing from
+    /// the root descriptor (`Draw`, no battlefield entry) gives row (b) none.
+    #[test]
+    fn paused_multi_object_drain_applies_pre_event_entries_under_a_non_move_root() {
+        for row_a in [true, false] {
+            let mut scenario = crate::game::scenario::GameScenario::new();
+            let relic = add_graveyard_rusted_relic(&mut scenario);
+            let orni = add_graveyard_ornithopter(&mut scenario);
+            if row_a {
+                for i in 0..2 {
+                    scenario.add_artifact_from_oracle(
+                        PlayerId(0),
+                        &format!("Artifact Anchor {i}"),
+                        "",
+                    );
+                }
+            } else {
+                scenario.add_enchantment_from_oracle(
+                    PlayerId(0),
+                    "March of the Machines",
+                    MARCH_OF_THE_MACHINES,
+                );
+            }
+            let mut runner = scenario.build();
+            let state = runner.state_mut();
+            set_core_types(state, relic, &[CoreType::Artifact]);
+            set_core_types(state, orni, &[CoreType::Artifact, CoreType::Creature]);
+            state.active_player = PlayerId(0);
+            state.priority_player = PlayerId(0);
+
+            let (shock, rest) = if row_a {
+                let shock = add_shock_in_graveyard_for_test(
+                    state,
+                    701,
+                    PlayerId(0),
+                    &[CoreType::Artifact, CoreType::Land],
+                );
+                (shock, vec![relic, orni])
+            } else {
+                let shock =
+                    add_shock_in_graveyard_for_test(state, 701, PlayerId(0), &[CoreType::Land]);
+                let artifact = graveyard_noncreature_artifact(state, PlayerId(0));
+                (shock, vec![artifact])
+            };
+            let mut targets = vec![shock];
+            targets.extend(rest.iter().copied());
+            let ability = gated_graveyard_return(&targets, true, false);
+            set_draw_root(state, &ability);
+
+            let mut events = Vec::new();
+            resolve(state, &ability, &mut events).unwrap();
+            assert!(
+                matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }),
+                "premise: the shock member parks the targeted loop, got {:?}",
+                state.waiting_for
+            );
+
+            let unconditional =
+                |object_id, counters: Vec<(CounterType, u32)>| ChangeZoneMemberEntry {
+                    object_id,
+                    enter_with_counters: counters,
+                    enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                    enters_attacking: false,
+                };
+            let expected_remaining = if row_a {
+                vec![
+                    unconditional(relic, vec![]),
+                    unconditional(orni, vec![(CounterType::Plus1Plus1, 1)]),
+                ]
+            } else {
+                vec![unconditional(rest[0], vec![(CounterType::Plus1Plus1, 1)])]
+            };
+            assert_eq!(
+                parked_change_zone_iteration(state).map(|pending| pending.remaining.clone()),
+                Some(expected_remaining),
+                "row_a={row_a}: the parked carrier holds each member's pre-event entry"
+            );
+
+            apply_as_current(state, GameAction::ChooseReplacement { index: 1 })
+                .expect("decline the shock payment");
+
+            assert_eq!(state.objects[&shock].zone, Zone::Battlefield);
+            assert!(
+                state.objects[&shock].tapped,
+                "reach: the declined shock enters tapped"
+            );
+            for id in &rest {
+                assert_eq!(state.objects[id].zone, Zone::Battlefield, "row_a={row_a}");
+            }
+            if row_a {
+                assert_eq!(
+                    plus_one_counters(state, orni),
+                    1,
+                    "reach — the Ornithopter applies its carried counter"
+                );
+                assert_eq!(
+                    plus_one_counters(state, relic),
+                    0,
+                    "the co-entered shock artifact land must not count toward metalcraft"
+                );
+                assert!(
+                    is_creature(state, relic),
+                    "reach — metalcraft holds after the event"
+                );
+            } else {
+                assert_eq!(
+                    plus_one_counters(state, rest[0]),
+                    1,
+                    "the March-projected artifact keeps the counter from the move's descriptor"
+                );
+            }
+            assert!(
+                parked_change_zone_iteration(state).is_none(),
+                "row_a={row_a}: the drained iteration retires its frame"
+            );
+        }
+    }
+
+    /// Synthetic (no printed card): a multi-target graveyard return cast through
+    /// the real stack, so a paused carrier has a resolving spell entry.
+    const MASS_RETURN: &str =
+        "Return up to three target permanent cards from your graveyard to the battlefield.";
+
+    /// Gives the committed Mass Return move ungated, non-default entry
+    /// modifications: it enters attacking with two +1/+1 counters.
+    fn attacking_with_two_counters(effect: &mut Effect) {
+        let Effect::ChangeZone {
+            enters_attacking,
+            enter_with_counters,
+            ..
+        } = effect
+        else {
+            panic!("premise: Mass Return resolves a ChangeZone, got {effect:?}");
+        };
+        *enters_attacking = true;
+        *enter_with_counters = vec![(CounterType::Plus1Plus1, QuantityExpr::Fixed { value: 2 })];
+    }
+
+    /// Casts [`MASS_RETURN`] on a shock-style land, a Rusted Relic and an
+    /// Ornithopter from P0's graveyard, applies `mods` to the committed move,
+    /// and passes priority until the shock member parks the loop on its
+    /// `ReplacementChoice`. With `shock_first` the Relic and the Ornithopter are
+    /// the parked carrier's unprocessed members; otherwise the shock is the last
+    /// member and the carrier's `remaining` is empty. Returns the paused state
+    /// and `(shock, relic, orni)`.
+    fn paused_mass_return(
+        mods: impl FnOnce(&mut Effect),
+        shock_first: bool,
+    ) -> (GameState, ObjectId, ObjectId, ObjectId) {
+        let mut scenario = crate::game::scenario::GameScenario::new();
+        scenario.at_phase(crate::types::phase::Phase::PreCombatMain);
+        let spell = scenario
+            .add_spell_to_hand_from_oracle(PlayerId(0), "Mass Return", false, MASS_RETURN)
+            .id();
+        let relic = add_graveyard_rusted_relic(&mut scenario);
+        let orni = add_graveyard_ornithopter(&mut scenario);
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_core_types(state, relic, &[CoreType::Artifact]);
+        set_core_types(state, orni, &[CoreType::Artifact, CoreType::Creature]);
+        let shock = add_shock_in_graveyard_for_test(state, 701, PlayerId(0), &[CoreType::Land]);
+        let targets = if shock_first {
+            [shock, relic, orni]
+        } else {
+            [relic, orni, shock]
+        };
+
+        let mut commit = runner.cast(spell).target_objects(&targets).commit();
+        {
+            let stack = &mut commit.state_mut().stack;
+            let top = stack.len() - 1;
+            let ability = stack
+                .get_mut(top)
+                .and_then(StackEntry::ability_mut)
+                .expect("premise: the committed spell carries its ability");
+            mods(&mut ability.effect);
+        }
+        for _ in 0..6 {
+            if matches!(
+                commit.state().waiting_for,
+                WaitingFor::ReplacementChoice { .. }
+            ) {
+                break;
+            }
+            commit
+                .act(GameAction::PassPriority)
+                .expect("priority passes while Mass Return resolves");
+        }
+        assert!(
+            matches!(
+                commit.state().waiting_for,
+                WaitingFor::ReplacementChoice { .. }
+            ),
+            "premise: the shock member parks the loop, got {:?}",
+            commit.state().waiting_for
+        );
+        assert_eq!(
+            commit
+                .state()
+                .resolution_stack
+                .iter()
+                .map(crate::types::resolution::ResolutionFrame::kind)
+                .collect::<Vec<_>>(),
+            vec![crate::types::resolution::FrameKind::ChangeZone],
+            "premise: the parked ChangeZone owns the only resolution frame"
+        );
+        (commit.state().clone(), shock, relic, orni)
+    }
+
+    /// Restores `wire` through the public persisted-state reader exactly as a
+    /// production loader does: decode, checked preparation, finalization.
+    fn restore_persisted(wire: serde_json::Value) -> Result<GameState, String> {
+        serde_json::from_value::<crate::types::game_state::PersistedGameState>(wire)
+            .map_err(|error| error.to_string())?
+            .prepare_for_restore(crate::types::game_state::PersistedRestoreFinalization::Immediate)
+            .map_err(|error| error.to_string())?
+            .finalize_immediately()
+            .map_err(|error| error.to_string())
+    }
+
+    /// `state` written by both public persisted-state envelopes: the raw wire
+    /// and the trusted envelope.
+    fn both_wires(state: &GameState) -> [(&'static str, serde_json::Value); 2] {
+        use crate::types::game_state::PersistedGameState;
+        [
+            (
+                "raw",
+                serde_json::to_value(PersistedGameState::Raw(Box::new(state.clone())))
+                    .expect("the raw wire serializes"),
+            ),
+            (
+                "trusted",
+                serde_json::to_value(PersistedGameState::capture(state.clone()))
+                    .expect("the trusted envelope serializes"),
+            ),
+        ]
+    }
+
+    /// The serialized `GameState` inside a persisted wire (the trusted envelope
+    /// nests it under `state`).
+    fn wire_state(wire: &serde_json::Value) -> &serde_json::Value {
+        wire.get("state").unwrap_or(wire)
+    }
+
+    fn wire_state_mut(wire: &mut serde_json::Value) -> &mut serde_json::Value {
+        if wire.get("state").is_some() {
+            wire.get_mut("state")
+                .expect("the trusted envelope has an inner state")
+        } else {
+            wire
+        }
+    }
+
+    /// The parked ChangeZone carrier in the serialized frame stack under `key`
+    /// (`resolution_frames` on a versioned wire, `resolution_stack` on an
+    /// unversioned raw payload).
+    fn change_zone_carrier_mut<'a>(
+        state: &'a mut serde_json::Value,
+        key: &str,
+    ) -> &'a mut serde_json::Value {
+        state[key]["frames"]
+            .as_array_mut()
+            .expect("premise: the payload carries a frame stack")
+            .iter_mut()
+            .find(|frame| frame["type"] == "ChangeZone")
+            .map(|frame| &mut frame["data"]["pending"])
+            .expect("premise: a parked ChangeZone carrier")
+    }
+
+    /// Rewrites a current carrier into what the v1–v6 writer wrote: bare member
+    /// ids, plus the carrier-level entry fields in `legacy` (`enter_tapped` as a
+    /// bool, `enters_attacking` always present, the other entry fields only when
+    /// non-default).
+    fn legacy_change_zone_carrier(carrier: &mut serde_json::Value, legacy: &serde_json::Value) {
+        let ids = carrier["remaining"]
+            .as_array()
+            .expect("premise: the carrier lists its members")
+            .iter()
+            .map(|member| member["object_id"].clone())
+            .collect::<Vec<_>>();
+        carrier["remaining"] = serde_json::Value::Array(ids);
+        for (key, value) in legacy.as_object().expect("legacy fields are an object") {
+            carrier[key.as_str()] = value.clone();
+        }
+    }
+
+    /// Projects a current persisted wire onto the wire a v`version` writer
+    /// produced for the same pause: the carrier in its legacy shape, the
+    /// declared version, and for v1 the carrier at the top-level
+    /// `pending_change_zone_iteration` slot with no typed frame stack.
+    fn downgrade_change_zone_carrier(
+        wire: &serde_json::Value,
+        version: u64,
+        legacy: &serde_json::Value,
+    ) -> serde_json::Value {
+        let mut wire = wire.clone();
+        {
+            let state = wire_state_mut(&mut wire);
+            legacy_change_zone_carrier(change_zone_carrier_mut(state, "resolution_frames"), legacy);
+            state["resolution_state_version"] = serde_json::Value::from(version);
+            if version == 1 {
+                let object = state.as_object_mut().expect("the state is an object");
+                let frames = object
+                    .remove("resolution_frames")
+                    .expect("premise: a typed frame stack");
+                let carrier = frames["frames"]
+                    .as_array()
+                    .expect("premise: frames")
+                    .iter()
+                    .find(|frame| frame["type"] == "ChangeZone")
+                    .map(|frame| frame["data"]["pending"].clone())
+                    .expect("premise: a parked ChangeZone carrier");
+                object.insert("pending_change_zone_iteration".to_string(), carrier);
+            }
+        }
+        wire
+    }
+
+    /// CR 603.6a + CR 614.12 (persisted-version boundary): a v1–v6 save paused
+    /// inside a multi-object ChangeZone wrote bare member ids with carrier-level
+    /// entry modifications. With no gate, every member's pre-event entry is
+    /// exactly those carrier fields (as `resolve_change_zone_member_entry`
+    /// resolves them and the old drain applied them), so the reader migrates it
+    /// and the restored game equals the current-wire restore of the same pause,
+    /// through both the raw and the trusted envelope. The current writer declares
+    /// `RESOLUTION_STATE_WIRE_VERSION` and round-trips the member records.
+    /// REVERT: removing the `migrate_legacy_change_zone_member_entries` call in
+    /// `ResolutionStateWire::from_value` makes every v2–v6 row fail, and removing
+    /// the v1 reader arm's `migrate_legacy_change_zone_carrier` call makes the v1
+    /// rows fail, each with serde `invalid type: integer`; keeping the writer at 6 makes the migration read
+    /// the current member records as bare ids and the current round-trip fails.
+    #[test]
+    fn legacy_ungated_parked_change_zone_migrates_through_both_readers() {
+        use crate::types::resolution::RESOLUTION_STATE_WIRE_VERSION;
+        use crate::types::zones::EtbTapState;
+
+        let (mut paused, shock, relic, orni) =
+            paused_mass_return(attacking_with_two_counters, true);
+        // Labelled synthetic: with Tapped on the move itself the shock decline is
+        // moot and no pause occurs, so Tapped is set on the parked members. This
+        // models an ungated v6 carrier written with `enter_tapped: true`.
+        let mut pending = parked_change_zone_iteration(&paused)
+            .cloned()
+            .expect("premise: a parked carrier");
+        for member in &mut pending.remaining {
+            member.enter_tapped = EtbTapState::Tapped;
+        }
+        paused.replace_active_change_zone_iteration(pending);
+        let member = |object_id| ChangeZoneMemberEntry {
+            object_id,
+            enter_with_counters: vec![(CounterType::Plus1Plus1, 2)],
+            enter_tapped: EtbTapState::Tapped,
+            enters_attacking: true,
+        };
+        let expected_members = vec![member(relic), member(orni)];
+        let legacy = serde_json::json!({
+            "enter_tapped": true,
+            "enters_attacking": true,
+            "enter_with_counters": [["P1P1", 2]],
+        });
+
+        let mut post_decline = None;
+        for (label, current) in both_wires(&paused) {
+            let state = wire_state(&current);
+            assert_eq!(
+                state["resolution_state_version"],
+                serde_json::Value::from(RESOLUTION_STATE_WIRE_VERSION),
+                "{label}: the current writer declares the current version"
+            );
+            let carrier = state["resolution_frames"]["frames"]
+                .as_array()
+                .and_then(|frames| frames.iter().find(|frame| frame["type"] == "ChangeZone"))
+                .map(|frame| &frame["data"]["pending"])
+                .expect("premise: a parked carrier");
+            assert!(
+                carrier["remaining"]
+                    .as_array()
+                    .is_some_and(|members| !members.is_empty()
+                        && members.iter().all(serde_json::Value::is_object)),
+                "{label}: the current carrier writes member records"
+            );
+
+            let expected = restore_persisted(current.clone())
+                .unwrap_or_else(|error| panic!("{label}: current round-trip: {error}"));
+            assert_eq!(
+                parked_change_zone_iteration(&expected).map(|pending| pending.remaining.clone()),
+                Some(expected_members.clone()),
+                "{label}: the current round-trip keeps each member's entry"
+            );
+
+            for version in 1..=6 {
+                let migrated =
+                    restore_persisted(downgrade_change_zone_carrier(&current, version, &legacy))
+                        .unwrap_or_else(|error| {
+                            panic!("{label} v{version}: legacy restore: {error}")
+                        });
+                assert_eq!(
+                    migrated, expected,
+                    "{label} v{version}: the migrated save equals the current restore"
+                );
+                if version != 1 && version != 6 {
+                    continue;
+                }
+                let mut resumed = migrated;
+                apply_as_current(&mut resumed, GameAction::ChooseReplacement { index: 1 })
+                    .expect("decline the shock payment");
+                assert_eq!(resumed.objects[&shock].zone, Zone::Battlefield);
+                assert!(
+                    resumed.objects[&shock].tapped,
+                    "reach ({label} v{version}): the declined shock enters tapped"
+                );
+                for id in [relic, orni] {
+                    assert_eq!(resumed.objects[&id].zone, Zone::Battlefield);
+                    assert!(
+                        resumed.objects[&id].tapped,
+                        "{label} v{version}: the migrated member enters tapped"
+                    );
+                    assert_eq!(
+                        plus_one_counters(&resumed, id),
+                        2,
+                        "{label} v{version}: the migrated member enters with its counters"
+                    );
+                }
+                assert!(
+                    parked_change_zone_iteration(&resumed).is_none(),
+                    "{label} v{version}: the drained iteration retires its frame"
+                );
+                if version == 6 {
+                    post_decline = Some(resumed);
+                }
+            }
+        }
+
+        // Unaffected old state: with no parked carrier, a v6 declaration restores
+        // exactly as the current one does.
+        let post_decline = post_decline.expect("the v6 row resumed");
+        for (label, current) in both_wires(&post_decline) {
+            let mut old = current.clone();
+            wire_state_mut(&mut old)["resolution_state_version"] = serde_json::Value::from(6_u64);
+            assert_eq!(
+                restore_persisted(old)
+                    .unwrap_or_else(|error| panic!("{label}: v6 restore: {error}")),
+                restore_persisted(current)
+                    .unwrap_or_else(|error| panic!("{label}: current restore: {error}")),
+                "{label}: a v6 save with no parked carrier restores unchanged"
+            );
+        }
+    }
+
+    /// CR 603.6a + CR 614.12 (persisted-version boundary): when a v1–v6
+    /// carrier's unprocessed members' entries depend on a gate (conditional
+    /// counters, or a tapped/attacking rider gate), each member's entry is a
+    /// verdict against the board before the event's first member moved, which
+    /// the save does not hold. Both readers refuse it with the exact
+    /// `LEGACY_GATED_CHANGE_ZONE_ENTRY_RESTORE_ERROR`; the same row without the
+    /// gate key restores (reach). A gate over default riders cannot change any
+    /// member, and gate fields on an empty `remaining` drove no member, so both
+    /// migrate and equal the current restore.
+    /// REVERT: without `entry_depends_on_gate` the refused rows migrate (Ok);
+    /// without the migration the error is the serde message, not the constant;
+    /// dropping the rider-default clause of `entry_depends_on_gate` refuses the
+    /// inert-gate row.
+    #[test]
+    fn legacy_gated_parked_change_zone_refuses_with_the_exact_diagnostic() {
+        use crate::types::resolution::LEGACY_GATED_CHANGE_ZONE_ENTRY_RESTORE_ERROR;
+
+        let creature =
+            serde_json::to_value(typed(TypeFilter::Creature)).expect("gate filter serializes");
+        let conditional = serde_json::json!([[
+            creature,
+            "P1P1",
+            serde_json::to_value(QuantityExpr::Fixed { value: 1 }).expect("quantity serializes"),
+        ]]);
+        let refused_rows = [
+            (
+                "conditional counters",
+                serde_json::json!({
+                    "enters_attacking": false,
+                    "conditional_enter_with_counters": conditional,
+                }),
+                "conditional_enter_with_counters",
+            ),
+            (
+                "tapped rider gate",
+                serde_json::json!({
+                    "enters_attacking": false,
+                    "enter_tapped": true,
+                    "enters_modified_if": creature,
+                }),
+                "enters_modified_if",
+            ),
+            (
+                "attacking rider gate",
+                serde_json::json!({
+                    "enters_attacking": true,
+                    "enters_modified_if": creature,
+                }),
+                "enters_modified_if",
+            ),
+        ];
+        let inert_gate = serde_json::json!({
+            "enters_attacking": false,
+            "enters_modified_if": creature,
+        });
+
+        let (paused, ..) = paused_mass_return(|_| {}, true);
+        assert!(
+            parked_change_zone_iteration(&paused)
+                .is_some_and(|pending| !pending.remaining.is_empty()),
+            "premise: the carrier has unprocessed members"
+        );
+        for (label, current) in both_wires(&paused) {
+            let expected = restore_persisted(current.clone())
+                .unwrap_or_else(|error| panic!("{label}: current round-trip: {error}"));
+            for version in [1, 3, 6] {
+                for (row, legacy, gate_key) in &refused_rows {
+                    let error =
+                        restore_persisted(downgrade_change_zone_carrier(&current, version, legacy))
+                            .expect_err("a gated legacy carrier must be refused");
+                    assert_eq!(
+                        error, LEGACY_GATED_CHANGE_ZONE_ENTRY_RESTORE_ERROR,
+                        "{label} v{version} {row}: the exact diagnostic"
+                    );
+                    assert!(error.starts_with("RESTORE_INCOMPATIBLE_GATED_CHANGE_ZONE_ENTRY:"));
+
+                    let mut ungated = legacy.clone();
+                    ungated
+                        .as_object_mut()
+                        .expect("legacy fields are an object")
+                        .remove(*gate_key);
+                    restore_persisted(downgrade_change_zone_carrier(&current, version, &ungated))
+                        .unwrap_or_else(|error| {
+                            panic!("reach ({label} v{version} {row}): ungated restores: {error}")
+                        });
+                }
+                let inert = restore_persisted(downgrade_change_zone_carrier(
+                    &current,
+                    version,
+                    &inert_gate,
+                ))
+                .unwrap_or_else(|error| panic!("{label} v{version}: inert gate: {error}"));
+                assert_eq!(
+                    inert, expected,
+                    "{label} v{version}: a gate over default riders migrates exactly"
+                );
+            }
+        }
+
+        // Gate fields on an empty `remaining` drove no member.
+        let (drained, ..) = paused_mass_return(|_| {}, false);
+        assert!(
+            parked_change_zone_iteration(&drained)
+                .is_some_and(|pending| pending.remaining.is_empty()),
+            "premise: the shock is the last member, so nothing remains"
+        );
+        let every_gate = serde_json::json!({
+            "enters_attacking": false,
+            "conditional_enter_with_counters": conditional,
+            "enters_modified_if": creature,
+            "enter_tapped": true,
+        });
+        for (label, current) in both_wires(&drained) {
+            let expected = restore_persisted(current.clone())
+                .unwrap_or_else(|error| panic!("{label}: current round-trip: {error}"));
+            for version in [1, 6] {
+                let migrated = restore_persisted(downgrade_change_zone_carrier(
+                    &current,
+                    version,
+                    &every_gate,
+                ))
+                .unwrap_or_else(|error| panic!("{label} v{version}: empty remaining: {error}"));
+                assert_eq!(
+                    migrated, expected,
+                    "{label} v{version}: gate fields with nothing remaining are dropped"
+                );
+            }
+        }
+    }
+
+    /// CR 603.6a + CR 614.12 (unversioned raw ingress): a derived `GameState`
+    /// payload (phase-ai saved state, a bare-object WASM restore) has no
+    /// declared version. A current writer's member records date it to
+    /// `RESOLUTION_STATE_WIRE_VERSION`, so it decodes directly; a legacy
+    /// bare-id payload is still read as v3 and migrated, or refused when gated.
+    /// REVERT: removing the member-record inference in
+    /// `declare_raw_resolution_wire` declares v3, the migration rejects the
+    /// member records, and the current unversioned restore fails.
+    #[test]
+    fn unversioned_raw_parked_change_zone_declares_its_member_shape() {
+        use crate::types::resolution::{
+            declare_raw_resolution_wire, LEGACY_GATED_CHANGE_ZONE_ENTRY_RESTORE_ERROR,
+            RESOLUTION_STATE_WIRE_VERSION,
+        };
+
+        let (paused, ..) = paused_mass_return(attacking_with_two_counters, true);
+        let paused_remaining =
+            parked_change_zone_iteration(&paused).map(|pending| pending.remaining.clone());
+        assert!(
+            paused_remaining
+                .as_ref()
+                .is_some_and(|remaining| !remaining.is_empty()),
+            "premise: the carrier has unprocessed members"
+        );
+        let raw = serde_json::to_value(&paused).expect("derived state serializes");
+        assert!(
+            raw.get("resolution_state_version").is_none() && raw.get("resolution_stack").is_some(),
+            "premise: an unversioned derived payload carrying the frame stack"
+        );
+        let declared_version = |payload: &serde_json::Value| {
+            let mut payload = payload.clone();
+            declare_raw_resolution_wire(&mut payload).expect("the payload declares a version");
+            payload["resolution_state_version"].clone()
+        };
+
+        assert_eq!(
+            declared_version(&raw),
+            serde_json::Value::from(RESOLUTION_STATE_WIRE_VERSION),
+            "member records date the payload to the current version"
+        );
+        let restored = restore_persisted(raw.clone())
+            .unwrap_or_else(|error| panic!("current unversioned restore: {error}"));
+        assert_eq!(
+            parked_change_zone_iteration(&restored).map(|pending| pending.remaining.clone()),
+            paused_remaining
+        );
+
+        let mut legacy = raw.clone();
+        legacy_change_zone_carrier(
+            change_zone_carrier_mut(&mut legacy, "resolution_stack"),
+            &serde_json::json!({
+                "enters_attacking": true,
+                "enter_with_counters": [["P1P1", 2]],
+            }),
+        );
+        // `LEGACY_RESULT_OWNERSHIP_RESOLUTION_STATE_WIRE_VERSION`: a bare-id
+        // typed stack with no draw `delivery_owner`.
+        assert_eq!(declared_version(&legacy), serde_json::Value::from(3_u64));
+        let migrated = restore_persisted(legacy.clone())
+            .unwrap_or_else(|error| panic!("legacy unversioned restore: {error}"));
+        assert_eq!(
+            parked_change_zone_iteration(&migrated).map(|pending| pending.remaining.clone()),
+            paused_remaining,
+            "the legacy bare-id payload migrates to the same member entries"
+        );
+
+        let mut gated = legacy;
+        change_zone_carrier_mut(&mut gated, "resolution_stack")
+            ["conditional_enter_with_counters"] = serde_json::json!([[
+            serde_json::to_value(typed(TypeFilter::Creature)).expect("gate filter serializes"),
+            "P1P1",
+            serde_json::to_value(QuantityExpr::Fixed { value: 1 }).expect("quantity serializes"),
+        ]]);
+        assert_eq!(
+            restore_persisted(gated).expect_err("a gated legacy payload must be refused"),
+            LEGACY_GATED_CHANGE_ZONE_ENTRY_RESTORE_ERROR
+        );
+    }
+
+    /// CR 614.12 (V-P7): the `enters_modified_if` gate reads the projected
+    /// entrant. Under Enchanted Evening a plain creature card in hand would be an
+    /// enchantment on the battlefield, so the tapped/attacking riders apply.
+    /// Without Enchanted Evening, or for a non-battlefield destination, the gate
+    /// reads the card as it is and suppresses them. Reverting the projection
+    /// flips the Enchanted Evening arm to `(Unspecified, false)`.
+    #[test]
+    fn effective_enter_mods_reads_projected_types() {
+        for with_evening in [true, false] {
+            let mut scenario = crate::game::scenario::GameScenario::new();
+            if with_evening {
+                scenario.add_enchantment_from_oracle(
+                    PlayerId(0),
+                    "Enchanted Evening",
+                    ENCHANTED_EVENING,
+                );
+            }
+            let mut runner = scenario.build();
+            let state = runner.state_mut();
+            let card = create_object(
+                state,
+                CardId(1),
+                PlayerId(0),
+                "Bear".to_string(),
+                Zone::Hand,
+            );
+            {
+                let obj = state.objects.get_mut(&card).unwrap();
+                obj.card_types.core_types.push(CoreType::Creature);
+                obj.base_card_types = obj.card_types.clone();
+            }
+            let gate = typed(TypeFilter::Enchantment);
+            let to = |destination| EntryGateContext {
+                destination,
+                controller_override: None,
+                enter_transformed: false,
+            };
+            let expected = if with_evening {
+                (crate::types::zones::EtbTapState::Tapped, true)
+            } else {
+                (crate::types::zones::EtbTapState::Unspecified, false)
+            };
+            assert_eq!(
+                effective_enter_mods(
+                    state,
+                    card,
+                    to(Zone::Battlefield),
+                    ObjectId(100),
+                    crate::types::zones::EtbTapState::Tapped,
+                    true,
+                    Some(&gate),
+                ),
+                expected,
+                "evening={with_evening}: battlefield entry reads the projected types"
+            );
+            assert_eq!(
+                effective_enter_mods(
+                    state,
+                    card,
+                    to(Zone::Graveyard),
+                    ObjectId(100),
+                    crate::types::zones::EtbTapState::Tapped,
+                    true,
+                    Some(&gate),
+                ),
+                (crate::types::zones::EtbTapState::Unspecified, false),
+                "evening={with_evening}: a non-battlefield destination reads the card as it is"
+            );
+        }
+    }
+
+    /// CR 614.12 + CR 508.4 (V-P7b, production path): drive `resolve` through
+    /// both `effective_enter_mods` call-site families. Arm 1 is the
+    /// `EffectZoneChoice` resume (`resolve_change_zone_member_entries`, the
+    /// handler-built entry context); arm 2 is the single-eligible auto-pick branch
+    /// (the locally built entry context). Under Enchanted Evening the plain
+    /// creature card would be an enchantment on the battlefield, so it enters
+    /// tapped and attacking; without it, it enters normally. A call site that
+    /// passed the wrong destination or skipped the projection fails the
+    /// Enchanted Evening arm.
+    #[test]
+    fn enters_modified_if_reads_projection_through_resolve() {
+        for choice_resume in [true, false] {
+            for with_evening in [true, false] {
+                let mut scenario = crate::game::scenario::GameScenario::new();
+                if with_evening {
+                    scenario.add_enchantment_from_oracle(
+                        PlayerId(0),
+                        "Enchanted Evening",
+                        ENCHANTED_EVENING,
+                    );
+                }
+                let mut runner = scenario.build();
+                let state = runner.state_mut();
+                // CR 508.4: the attacking rider is observable only with live combat.
+                state.combat = Some(crate::game::combat::CombatState::default());
+                let card = create_object(
+                    state,
+                    CardId(1),
+                    PlayerId(0),
+                    "Bear".to_string(),
+                    Zone::Hand,
+                );
+                {
+                    let obj = state.objects.get_mut(&card).unwrap();
+                    obj.card_types.core_types.push(CoreType::Creature);
+                    obj.base_card_types = obj.card_types.clone();
+                }
+                let mut ability = ResolvedAbility::new(
+                    Effect::ChangeZone {
+                        origin: Some(Zone::Hand),
+                        destination: Zone::Battlefield,
+                        target: TargetFilter::Typed(TypedFilter {
+                            type_filters: vec![TypeFilter::Creature],
+                            controller: Some(ControllerRef::You),
+                            properties: vec![FilterProp::InZone { zone: Zone::Hand }],
+                        }),
+                        owner_library: false,
+                        enter_transformed: false,
+                        enters_under: None,
+                        enter_tapped: crate::types::zones::EtbTapState::Tapped,
+                        enters_attacking: true,
+                        up_to: choice_resume,
+                        enter_with_counters: vec![],
+                        conditional_enter_with_counters: vec![],
+                        face_down_profile: None,
+                        enters_modified_if: Some(typed(TypeFilter::Enchantment)),
+                    },
+                    vec![],
+                    ObjectId(100),
+                    PlayerId(0),
+                );
+                if choice_resume {
+                    ability.multi_target = Some(MultiTargetSpec::unlimited(0));
+                }
+                ability.target_choice_timing =
+                    crate::types::ability::TargetChoiceTiming::Resolution;
+                let mut events = Vec::new();
+                resolve(state, &ability, &mut events).unwrap();
+                if choice_resume {
+                    assert!(
+                        matches!(state.waiting_for, WaitingFor::EffectZoneChoice { .. }),
+                        "arm 1 must reach the EffectZoneChoice pause"
+                    );
+                    apply_as_current(state, GameAction::SelectCards { cards: vec![card] }).unwrap();
+                } else {
+                    assert!(
+                        !matches!(state.waiting_for, WaitingFor::EffectZoneChoice { .. }),
+                        "arm 2 must auto-pick the single eligible card"
+                    );
+                }
+                assert!(
+                    state.battlefield.contains(&card),
+                    "resume={choice_resume} evening={with_evening}: the card must enter"
+                );
+                assert_eq!(
+                    state.objects[&card].tapped, with_evening,
+                    "resume={choice_resume} evening={with_evening}: tapped rider reads the projection"
+                );
+                let attacking = state
+                    .combat
+                    .as_ref()
+                    .is_some_and(|c| c.attackers.iter().any(|a| a.object_id == card));
+                assert_eq!(
+                    attacking, with_evening,
+                    "resume={choice_resume} evening={with_evening}: attacking rider reads the projection"
+                );
+            }
         }
     }
 
@@ -6900,94 +8618,53 @@ mod tests {
         );
     }
 
-    /// `drain_pending_change_zone_iteration` must re-evaluate conditional entry
-    /// counters per remaining object — not reuse one object's resolved vector.
+    /// CR 603.6a + CR 614.12: `drain_pending_change_zone_iteration` applies each
+    /// remaining member's own carried entry (resolved before the event's first
+    /// member moved) — it neither reuses one member's vector for every member nor
+    /// recomputes. The carried values are constructed and card-independent.
+    /// REVERT: applying `remaining[0]`'s entry to every member gives the Soldier
+    /// a counter; recomputing in the drain (no resolving ability, no base
+    /// counters) gives the Hero none.
     #[test]
-    fn pending_change_zone_drain_recomputes_conditional_entry_counters_per_object() {
+    fn pending_change_zone_drain_applies_each_members_carried_entry() {
         let mut state = GameState::new_two_player(42);
         let hero = creature_in_graveyard(&mut state, 1, PlayerId(0));
-        state
-            .objects
-            .get_mut(&hero)
-            .unwrap()
-            .card_types
-            .subtypes
-            .push("Hero".to_string());
         let soldier = creature_in_graveyard(&mut state, 2, PlayerId(0));
-
-        let hero_filter = TargetFilter::Typed(TypedFilter {
-            type_filters: vec![TypeFilter::Subtype("Hero".into())],
-            controller: None,
-            properties: vec![],
-        });
-        let conditional = vec![(
-            hero_filter,
-            CounterType::Plus1Plus1,
-            QuantityExpr::Fixed { value: 1 },
-        )];
-
-        let ability = ResolvedAbility::new(
-            Effect::ChangeZone {
-                origin: Some(Zone::Graveyard),
-                destination: Zone::Battlefield,
-                target: TargetFilter::Any,
-                owner_library: false,
-                enter_transformed: false,
-                enters_under: None,
-                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
-                enters_attacking: false,
-                up_to: false,
-                enter_with_counters: vec![],
-                conditional_enter_with_counters: conditional.clone(),
-                face_down_profile: None,
-                enters_modified_if: None,
-            },
-            vec![],
-            ObjectId(100),
-            PlayerId(0),
-        );
 
         let logical_zone_change_group =
             crate::game::triggers::allocate_logical_zone_change_group(&mut state, &[hero, soldier]);
         state.push_change_zone_iteration(crate::types::game_state::PendingChangeZoneIteration {
+            pending_return_result_producer: None,
             logical_zone_change_group,
             paused_current: None,
-            remaining: vec![hero, soldier],
+            remaining: vec![
+                ChangeZoneMemberEntry {
+                    object_id: hero,
+                    enter_with_counters: vec![(CounterType::Plus1Plus1, 1)],
+                    enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                    enters_attacking: false,
+                },
+                ChangeZoneMemberEntry {
+                    object_id: soldier,
+                    enter_with_counters: vec![],
+                    enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                    enters_attacking: false,
+                },
+            ],
             source_id: ObjectId(100),
             controller: PlayerId(0),
             origin: Some(Zone::Graveyard),
             destination: Zone::Battlefield,
             enter_transformed: false,
-            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             enters_under_player: None,
-            enters_attacking: false,
-            enter_with_counters: vec![],
-            conditional_enter_with_counters: conditional,
             duration: None,
             track_exiled_by_source: false,
             face_down_in_exile: crate::types::ability::ExileConcealment::Public,
             moved_count: None,
             face_down_profile: None,
             library_placement: None,
-            enters_modified_if: None,
             enter_attached_to: None,
             effect_kind: EffectKind::ChangeZone,
-        });
-        state.resolving_stack_entry = Some(StackEntry {
-            id: ObjectId(101),
-            controller: PlayerId(0),
-            source_id: ObjectId(100),
-            kind: StackEntryKind::TriggeredAbility {
-                source_id: ObjectId(100),
-                ability: Box::new(ability),
-                condition: None,
-                trigger_event: None,
-                description: None,
-                source_name: String::new(),
-                subject_match_count: None,
-                die_result: None,
-                provenance: None,
-            },
         });
         state.waiting_for = WaitingFor::Priority {
             player: PlayerId(0),
@@ -6999,28 +8676,22 @@ mod tests {
         assert_eq!(state.objects[&hero].zone, Zone::Battlefield);
         assert_eq!(state.objects[&soldier].zone, Zone::Battlefield);
         assert_eq!(
-            state
-                .objects
-                .get(&hero)
-                .unwrap()
+            state.objects[&hero]
                 .counters
                 .get(&CounterType::Plus1Plus1)
                 .copied()
                 .unwrap_or(0),
             1,
-            "Hero must receive the conditional counter on drain"
+            "the Hero must enter with its own carried counter"
         );
         assert_eq!(
-            state
-                .objects
-                .get(&soldier)
-                .unwrap()
+            state.objects[&soldier]
                 .counters
                 .get(&CounterType::Plus1Plus1)
                 .copied()
                 .unwrap_or(0),
             0,
-            "non-Hero must not inherit another object's resolved counter vector"
+            "the Soldier must not inherit another member's carried counter"
         );
     }
 
@@ -8365,7 +10036,7 @@ mod tests {
         );
     }
 
-    /// CR 603.7 + CR 400.7: Sword of Hearth and Home's triggered ability chains
+    /// CR 608.2c + CR 400.7: Sword of Hearth and Home's triggered ability chains
     /// `ChangeZone` (exile target creature) → `SearchLibrary` → `ChangeZone`
     /// (land → battlefield) → `ChangeZoneAll { target: TrackedSet(0) }` (return
     /// the exiled creature). The final step uses the sentinel `TrackedSetId(0)`
@@ -8734,7 +10405,7 @@ mod tests {
         assert_eq!(state.objects[&creature].zone, Zone::Library);
     }
 
-    /// CR 603.7: `TrackedSetId(0)` must bind through `chain_tracked_set_id`
+    /// CR 608.2c: `TrackedSetId(0)` must bind through `chain_tracked_set_id`
     /// before falling back to the globally latest tracked set, matching the
     /// target-filter resolver used by `matches_target_filter`.
     #[test]
@@ -11010,5 +12681,276 @@ mod tests {
 
         assert_eq!(state.objects[&obj].zone, Zone::Battlefield);
         assert_eq!(state.objects[&obj].controller, PlayerId(2));
+    }
+
+    /// Resolves a `TrackedSetFiltered` creature-you-control move for P0 over the chosen members of
+    /// (P0 pile creature, P1 pile creature, P1 battlefield creature); returns every one's zone.
+    fn mixed_tracked_set_run(
+        format: crate::types::format::FormatConfig,
+        members: &[usize],
+    ) -> (Zone, Zone, Zone) {
+        let mut state = GameState::new(format, 2, 1);
+        let pile = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Pile P0".to_string(),
+            Zone::Graveyard,
+        );
+        let pile1 = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Pile P1".to_string(),
+            Zone::Graveyard,
+        );
+        let theirs = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Theirs".to_string(),
+            Zone::Battlefield,
+        );
+        for id in [pile, pile1, theirs] {
+            state.objects.get_mut(&id).unwrap().card_types.core_types = vec![CoreType::Creature];
+        }
+        let set_id = TrackedSetId(state.next_tracked_set_id);
+        state.next_tracked_set_id += 1;
+        let all = [pile, pile1, theirs];
+        state
+            .tracked_object_sets
+            .insert(set_id, members.iter().map(|&i| all[i]).collect());
+        state.chain_tracked_set_id = Some(set_id);
+        let filter = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Creature],
+            controller: Some(crate::types::ability::ControllerRef::You),
+            properties: vec![],
+        });
+        let ability = ResolvedAbility::new(
+            Effect::ChangeZoneAll {
+                origin: None,
+                destination: Zone::Hand,
+                target: TargetFilter::TrackedSetFiltered {
+                    id: TrackedSetId(0),
+                    filter: Box::new(filter),
+                    caused_by: None,
+                },
+                enters_under: None,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enters_attacking: false,
+                enter_with_counters: vec![],
+                face_down_profile: None,
+                library_position: None,
+                library_shuffle: Default::default(),
+                random_order: false,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve_all(&mut state, &ability, &mut events).unwrap();
+        (
+            state.objects[&pile].zone,
+            state.objects[&pile1].zone,
+            state.objects[&theirs].zone,
+        )
+    }
+
+    /// A tracked set spanning two zones is judged per member by the zone it is in.
+    #[test]
+    fn a_mixed_tracked_set_is_judged_per_member_zone() {
+        use crate::types::format::FormatConfig;
+        let all = [0, 1, 2];
+        assert_eq!(
+            mixed_tracked_set_run(FormatConfig::dandan(), &all),
+            (Zone::Hand, Zone::Hand, Zone::Battlefield)
+        );
+        assert_eq!(
+            mixed_tracked_set_run(FormatConfig::standard(), &all),
+            (Zone::Hand, Zone::Graveyard, Zone::Battlefield)
+        );
+        for format in [FormatConfig::dandan(), FormatConfig::standard()] {
+            assert_eq!(
+                mixed_tracked_set_run(format, &[0, 2]),
+                (Zone::Hand, Zone::Graveyard, Zone::Battlefield)
+            );
+        }
+    }
+}
+
+/// CR 108.2 + CR 109.1 + CR 722.3c: zone scans that choose or move CARDS out of
+/// exile range over the card population. Each row puts one real Instant card
+/// and one non-card copy of a card (the CR 722.3c retained prepare copy's
+/// shape: `is_copy`, not a token, an Instant owned by P0) in P0's exile.
+#[cfg(test)]
+mod exile_card_population_tests {
+    use super::*;
+    use crate::game::zones::create_object;
+    use crate::types::ability::MultiTargetSpec;
+    use crate::types::card_type::CoreType;
+    use crate::types::identifiers::CardId;
+
+    const P0: PlayerId = PlayerId(0);
+    const SOURCE: ObjectId = ObjectId(100);
+
+    /// Returns `(state, card, copy)`.
+    fn board() -> (GameState, ObjectId, ObjectId) {
+        let mut state = GameState::new_two_player(42);
+        let mut exiled = Vec::new();
+        for (card, name) in [(10, "Exiled Instant"), (11, "Retained Prepare Copy")] {
+            let id = create_object(&mut state, CardId(card), P0, name.to_string(), Zone::Exile);
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Instant);
+            exiled.push(id);
+        }
+        let (card, copy) = (exiled[0], exiled[1]);
+        state.objects.get_mut(&copy).unwrap().is_copy = true;
+        // Reach guard: the copy is a non-card object in P0's exile.
+        assert!(state.exile.contains(&copy));
+        assert!(!state.objects[&copy].is_represented_by_a_card());
+        assert_eq!(state.objects[&copy].owner, P0);
+        (state, card, copy)
+    }
+
+    fn owned_exiled_instants() -> TargetFilter {
+        TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant).properties(vec![
+            FilterProp::Owned {
+                controller: ControllerRef::You,
+            },
+            FilterProp::InZone { zone: Zone::Exile },
+        ]))
+    }
+
+    fn change_zone_all(origin: Zone, destination: Zone, target: TargetFilter) -> ResolvedAbility {
+        ResolvedAbility::new(
+            Effect::ChangeZoneAll {
+                origin: Some(origin),
+                destination,
+                target,
+                enters_under: None,
+                enter_tapped: EtbTapState::Unspecified,
+                enters_attacking: false,
+                enter_with_counters: vec![],
+                face_down_profile: None,
+                library_position: None,
+                library_shuffle: Default::default(),
+                random_order: false,
+            },
+            vec![],
+            SOURCE,
+            P0,
+        )
+    }
+
+    fn assert_card_moved_copy_stayed(state: &GameState, card: ObjectId, copy: ObjectId) {
+        assert_eq!(
+            state.objects[&card].zone,
+            Zone::Hand,
+            "the real card moves (reach guard)"
+        );
+        assert!(state.players[0].hand.contains(&card));
+        assert_eq!(
+            state.objects[&copy].zone,
+            Zone::Exile,
+            "the non-card copy is not a card in exile and is not moved"
+        );
+        assert!(state.exile.contains(&copy));
+        assert!(!state.players[0].hand.contains(&copy));
+    }
+
+    /// "Return all instant cards you own from exile to your hand": the
+    /// filter-scoped mass scan moves the real card and leaves the copy.
+    #[test]
+    fn exile_card_population_filter_scoped_mass_move_leaves_the_copy() {
+        let (mut state, card, copy) = board();
+        let ability = change_zone_all(Zone::Exile, Zone::Hand, owned_exiled_instants());
+        resolve_all(&mut state, &ability, &mut Vec::new()).unwrap();
+        assert_card_moved_copy_stayed(&state, card, copy);
+    }
+
+    /// Player-scoped mass move ("all cards you own in exile"): the shared
+    /// per-object member authority admits the real card only.
+    #[test]
+    fn exile_card_population_player_scoped_mass_move_leaves_the_copy() {
+        let (mut state, card, copy) = board();
+        assert!(change_zone_all_player_scope_member_matches(
+            &state.objects[&card],
+            P0,
+            &[Zone::Exile]
+        ));
+        let ability = change_zone_all(Zone::Exile, Zone::Hand, TargetFilter::Controller);
+        resolve_all(&mut state, &ability, &mut Vec::new()).unwrap();
+        assert_card_moved_copy_stayed(&state, card, copy);
+    }
+
+    /// CR 110.1 + CR 111.1: the zone-aware population keeps battlefield
+    /// tokens — "exile all creatures you control" still moves a token.
+    #[test]
+    fn exile_card_population_battlefield_mass_move_still_moves_tokens() {
+        let mut state = GameState::new_two_player(42);
+        let token = create_object(
+            &mut state,
+            CardId(20),
+            P0,
+            "Creature Token".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&token).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.is_token = true;
+        }
+        let ability = change_zone_all(
+            Zone::Battlefield,
+            Zone::Exile,
+            TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
+        );
+        resolve_all(&mut state, &ability, &mut Vec::new()).unwrap();
+        assert!(
+            !state.battlefield.contains(&token),
+            "the battlefield token is a member of the creatures-you-control population"
+        );
+    }
+
+    /// CR 608.2d: a choice of an exiled card announced while the effect is
+    /// applied offers the real card only.
+    #[test]
+    fn exile_card_population_resolution_choice_offers_only_cards() {
+        let (mut state, card, copy) = board();
+        let mut ability = ResolvedAbility::new(
+            Effect::ChangeZone {
+                origin: Some(Zone::Exile),
+                destination: Zone::Hand,
+                target: owned_exiled_instants(),
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: true,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
+            },
+            vec![],
+            SOURCE,
+            P0,
+        );
+        ability.multi_target = Some(MultiTargetSpec::unlimited(0));
+        ability.target_choice_timing = TargetChoiceTiming::Resolution;
+        resolve(&mut state, &ability, &mut Vec::new()).unwrap();
+        match &state.waiting_for {
+            WaitingFor::EffectZoneChoice { cards, .. } => {
+                assert_eq!(cards, &vec![card], "the copy {copy:?} is not offered");
+            }
+            other => panic!("expected EffectZoneChoice, got {other:?}"),
+        }
     }
 }

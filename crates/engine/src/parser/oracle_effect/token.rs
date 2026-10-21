@@ -7,7 +7,7 @@ use nom::bytes::complete::{tag, take_until};
 use nom::character::complete::anychar;
 use nom::combinator::{all_consuming, eof, opt, peek, recognize, rest, value, verify};
 use nom::multi::many_till;
-use nom::sequence::preceded;
+use nom::sequence::{preceded, terminated};
 use nom::Parser;
 
 use crate::parser::oracle_ir::context::{ParseContext, TokenPtFollowup};
@@ -23,10 +23,11 @@ use crate::types::zones::Zone;
 
 use super::super::oracle_nom::primitives as nom_primitives;
 use super::super::oracle_static::{parse_quoted_ability_modifications, parse_static_line_multi};
-use super::super::oracle_target::{parse_target, parse_target_with_ctx};
+use super::super::oracle_target::parse_target_with_ctx;
 use super::super::oracle_util::{
-    comma_short_self_name, normalize_card_name_refs, parse_count_expr, parse_rounding_suffix_only,
-    rewrite_quantity_expr_rounding, strip_reminder_text, TextPair,
+    comma_short_self_name, normalize_card_name_refs, parse_count_expr, parse_count_head,
+    parse_count_slot, parse_rounding_suffix_only, rewrite_quantity_expr_rounding,
+    strip_reminder_text, CountHead, TextPair,
 };
 use crate::parser::oracle_ir::ast::*;
 
@@ -46,8 +47,7 @@ pub(crate) fn try_parse_token(_lower: &str, text: &str, ctx: &mut ParseContext) 
     let lower = text.to_lowercase();
 
     // "create a token that's a copy of {target}"
-    if let Ok((_, (tapped, enters_attacking, mut count))) = parse_copy_token_entry_modifiers(&lower)
-    {
+    if let Ok((_, (mut tapped, mut enters_attacking))) = parse_copy_token_entry_modifiers(&lower) {
         let tp = TextPair::new(&text, &lower);
         let after_copy_tp = tp
             .strip_after("copy of ")
@@ -76,7 +76,7 @@ pub(crate) fn try_parse_token(_lower: &str, text: &str, ctx: &mut ParseContext) 
         let (target_text, extra_keywords, additional_modifications) =
             split_token_except_clause(target_text, ctx);
         let target_lower = target_text.trim().to_lowercase();
-        let (mut target, _) = if parse_cost_paid_object_copy_target(&target_lower) {
+        let (mut target, target_remainder) = if parse_cost_paid_object_copy_target(&target_lower) {
             (TargetFilter::CostPaidObject, "")
         } else {
             parse_target_with_ctx(target_text, ctx)
@@ -103,26 +103,29 @@ pub(crate) fn try_parse_token(_lower: &str, text: &str, ctx: &mut ParseContext) 
         if let (TargetFilter::ParentTarget, Some(host)) = (&target, &ctx.host_self_reference) {
             target = host.clone();
         }
-        // CR 107.3: bind a variable "X" count to its "where X is <quantity>"
-        // clause (Devastating Onslaught, Nacatl War-Pride, Rionya), mirroring the
-        // non-copy token path. A bare X with no where-clause (Aggressive Biomancy)
-        // is left as `Variable("X")` for the spell's X cost to resolve.
-        if matches!(&count, QuantityExpr::Ref { qty: QuantityRef::Variable { ref name } } if name == "X")
+        // CR 107.3c + CR 111.1: the copy count is the shared count position
+        // ("X tokens …, where X is …" binds X — Devastating Onslaught, Nacatl
+        // War-Pride, Rionya; a bare X stays `Variable("X")` for the spell's X
+        // cost — Aggressive Biomancy). An unrepresentable binder fails the clause
+        // instead of fabricating a count.
+        let (_, after_create) =
+            nom_on_lower(&text, &lower, |i| value((), tag("create ")).parse(i))?;
+        let count_slot = parse_count_slot(after_create, ctx)?;
+        let count = count_slot.count;
+        // CR 508.4: A creature put onto the battlefield attacking is attacking
+        // without having attacked. Some copy effects state this entry condition
+        // after the copy target (for example, Flamerush Rider's "...attacking
+        // creature and that's tapped and attacking"). Parse only the target
+        // parser's unconsumed remainder so the target's Attacking restriction
+        // never sets the token's entry flags.
+        if let Some((suffix_tapped, suffix_enters_attacking)) =
+            parse_copy_token_trailing_entry_modifiers(
+                &target_remainder.to_lowercase(),
+                count_slot.where_x.is_some(),
+            )
         {
-            if let Some(where_expression) = extract_token_where_x_expression(&text) {
-                // CR 107.3c: the clause DEFINES X. If the definition is not
-                // representable, this copy-token clause does not lower — fail the
-                // parse instead of fabricating a raw-text placeholder. The
-                // fabricated `QuantityRef::Variable { name: "<oracle text>" }` is
-                // well-typed but DEAD (game/quantity.rs resolves a non-`X` variable
-                // name to 0), so the effect copied ZERO tokens while the raw text
-                // still rendered as a supported dynamic quantity. This mirrors the
-                // sibling non-copy token path below.
-                count =
-                    super::parse_where_x_quantity_expression(&where_expression).or_else(|| {
-                        crate::parser::oracle_quantity::parse_cda_quantity(&where_expression)
-                    })?;
-            }
+            tapped |= suffix_tapped;
+            enters_attacking |= suffix_enters_attacking;
         }
         return Some(Effect::CopyTokenOf {
             target,
@@ -142,7 +145,20 @@ pub(crate) fn try_parse_token(_lower: &str, text: &str, ctx: &mut ParseContext) 
         .map(|(_, rest)| rest)
         .unwrap_or(&text)
         .trim();
-    let token = parse_token_description_with_context(after, ctx)?;
+    let mut token = parse_token_description_with_context(after, ctx)?;
+    // CR 608.2k + CR 113.7a: an "its" in the count whose antecedent is the
+    // trigger's own self subject ("Whenever this creature enters or attacks,
+    // create … equal to its power") is the ability's source, read live or from
+    // its last known information. The deferred anaphor has no referent when the
+    // trigger event names several objects (an attack beside other creatures).
+    // A nearer antecedent (an earlier clause's target, an "if you do" object, a
+    // condition pin) keeps the deferred anaphor.
+    if ctx.in_trigger
+        && ctx.subject == Some(TargetFilter::SelfRef)
+        && super::resolve_it_pronoun(ctx) == TargetFilter::SelfRef
+    {
+        super::rebind_anaphoric_object_scope(&mut token.count, ObjectScope::Source);
+    }
     Some(Effect::Token {
         name: token.name,
         power: token.power.unwrap_or(PtValue::Fixed(0)),
@@ -163,25 +179,22 @@ pub(crate) fn try_parse_token(_lower: &str, text: &str, ctx: &mut ParseContext) 
     })
 }
 
-pub(super) fn parse_copy_token_entry_modifiers(
-    input: &str,
-) -> OracleResult<'_, (bool, bool, QuantityExpr)> {
+pub(super) fn parse_copy_token_entry_modifiers(input: &str) -> OracleResult<'_, (bool, bool)> {
     let (rest, _) = tag("create ").parse(input)?;
-    // The bare article "a"/"one" → a count of 1. `parse_count_expr` intentionally
-    // excludes the article (to avoid matching the "a" in "another"), so handle it
-    // here; otherwise delegate to the shared count grammar so "X", "two", "twice
-    // X", "that many", etc. all parse uniformly — mirroring the non-copy token
-    // path's `parse_token_count_prefix`. Without this, "Create X tokens that are
-    // copies of …" failed to parse and the whole effect was dropped.
-    let (rest, count) =
+    // The count word ("a", "one", "X", "two", "twice X", "that many", …) is only
+    // recognized here to reach the copy wording; `try_parse_token` reads the
+    // count itself through the shared count position. Without this, "Create X
+    // tokens that are copies of …" failed to parse and the whole effect was
+    // dropped.
+    let (rest, has_count) =
         if let Ok((rest, _)) = alt((tag::<_, _, OracleError<'_>>("a "), tag("one "))).parse(rest) {
-            (rest, Some(QuantityExpr::Fixed { value: 1 }))
-        } else if let Some((expr, rest_after)) = parse_count_expr(rest) {
-            (rest_after, Some(expr))
+            (rest, true)
+        } else if let Some((_, rest_after)) = parse_count_expr(rest) {
+            (rest_after, true)
         } else {
-            (rest, None)
+            (rest, false)
         };
-    let (rest, _) = if count.is_some() {
+    let (rest, _) = if has_count {
         opt(tag(" ")).parse(rest)?
     } else {
         (rest, None)
@@ -199,14 +212,53 @@ pub(super) fn parse_copy_token_entry_modifiers(
         tag("tokens that are copies of"),
     ))
     .parse(rest)?;
-    Ok((
-        rest,
-        (
-            flags.0,
-            flags.1,
-            count.unwrap_or(QuantityExpr::Fixed { value: 1 }),
-        ),
-    ))
+    Ok((rest, flags))
+}
+
+/// Parse an optional entry-state suffix after the copied-object target, such
+/// as `and that's tapped and attacking`. The caller supplies only the
+/// unconsumed target remainder, keeping target restrictions separate from
+/// token-entry instructions.
+fn parse_copy_token_trailing_entry_modifiers(
+    remainder: &str,
+    count_bound_by_where_x: bool,
+) -> Option<(bool, bool)> {
+    fn parse_suffix(input: &str, count_bound_by_where_x: bool) -> OracleResult<'_, (bool, bool)> {
+        let (rest, _) = tag("and ").parse(input)?;
+        let (rest, _) =
+            alt((tag("that's"), tag("that is"), tag("thats"), tag("that are"))).parse(rest)?;
+        let (rest, flags) = alt((
+            // The longer alternative must precede `tapped` so it is not
+            // consumed as a tapped-only suffix.
+            value((true, true), tag(" tapped and attacking")),
+            value((true, false), tag(" tapped")),
+            value((false, true), tag(" attacking")),
+        ))
+        .parse(rest)?;
+        let rest = if count_bound_by_where_x {
+            // CR 107.3c: A following where-X clause defines the token count.
+            // `parse_count_slot` already bound the count from this binder and
+            // parsed its quantity in full, so the clause is consumed whole here
+            // rather than re-validated by a second quantity grammar; without
+            // that binder, arbitrary text after the entry modifier is not an
+            // entry clause.
+            opt(preceded(
+                tag(", where x is "),
+                nom::combinator::rest::<_, OracleError<'_>>,
+            ))
+            .parse(rest)?
+            .0
+        } else {
+            rest
+        };
+        let (rest, _) = opt(alt((tag("."), tag(",")))).parse(rest)?;
+        let (rest, _) = nom::character::complete::multispace0.parse(rest)?;
+        let (rest, _) = eof.parse(rest)?;
+        Ok((rest, flags))
+    }
+    parse_suffix(remainder.trim_start(), count_bound_by_where_x)
+        .ok()
+        .map(|(_, flags)| flags)
 }
 
 fn parse_cost_paid_object_copy_target(lower: &str) -> bool {
@@ -544,9 +596,22 @@ fn parse_token_description_with_context(
     let (text, attach_to) = first_token_attachment_connector(&lower)
         .and_then(|connector| tp.split_around(connector))
         .map_or((text, None), |(before, after)| {
-            let (target, _) = parse_target(after.original);
+            let (target, _) =
+                parse_target_with_ctx(after.original, &mut ctx.clone_player_antecedents());
             (before.original, Some(target))
         });
+
+    let (text, rider_count) = split_token_for_each_rider(text);
+    // CR 111.1 + CR 107.3c: the token count is the shared count position; its
+    // noun is the token descriptor. A body with no count word is a named-token
+    // preamble ("Tibalt, the Fiend-Blooded, a … token").
+    let (slot_count, slot_where_x, text) = if matches!(parse_count_head(text).0, CountHead::Absent)
+    {
+        (None, None, text)
+    } else {
+        let slot = parse_count_slot(text, &mut ctx.clone())?;
+        (Some(slot.count), slot.where_x, slot.noun)
+    };
 
     // CR 508.4 + CR 506.3a: Strip inline "that's tapped and attacking" /
     // "that is tapped and attacking" / "thats tapped and attacking" /
@@ -606,21 +671,20 @@ fn parse_token_description_with_context(
     // When the attacking clause is detected and text is truncated at `pos`, any
     // trailing ", where X is …" that followed the clause is cut off from the
     // token body.  Extract and save it now (from the pre-truncation text) so
-    // the X-binding step below can still resolve a variable count.
+    // the X-binding step below can still bind an X/X token's P/T.
     let saved_where_x_expr: Option<String> =
         entry_clause.and_then(|(pos, _)| extract_token_where_x_expression(&text[pos..]));
-    let (text, enters_attacking, enters_tapped_attacking) = match entry_clause {
+    let (text, mut enters_attacking, enters_tapped_attacking) = match entry_clause {
         Some((len, tapped)) => (&text[..len], true, tapped),
         None => (text, false, false),
     };
-    let (mut count, leading_name, mut rest) =
-        if let Some((count, rest)) = parse_token_count_prefix(text) {
-            (count, None, rest)
-        } else if let Some((name, rest)) = parse_named_token_preamble(text) {
+    let (mut count, leading_name, mut rest) = match slot_count {
+        Some(count) => (count, None, text),
+        None => {
+            let (name, rest) = parse_named_token_preamble(text)?;
             (QuantityExpr::Fixed { value: 1 }, Some(name), rest)
-        } else {
-            return None;
-        };
+        }
+    };
     // CR 603.2 + CR 603.4 + CR 107.4: "create that many tokens" on a colored-pip
     // cast trigger (Namor the Sub-Mariner) back-references the cast spell's
     // colored-symbol count (EventSource), not the generic EventContextAmount —
@@ -652,6 +716,26 @@ fn parse_token_description_with_context(
     loop {
         let trimmed = rest.trim_start();
         let trimmed_lower = trimmed.to_lowercase();
+        // CR 508.4: a token created attacking, never declared as an attacker,
+        // via the LEADING-modifier surface form ("Create a tapped and attacking
+        // X/X green Dinosaur creature token...", Ghalta and Mavren / Pugnacious
+        // Pugilist / Maestros Diabolist) as opposed to the TRAILING "...that's
+        // tapped and attacking" form the `entry_clause` combinator above already
+        // handles. Mirrors `parse_copy_token_entry_modifiers`'s leading 3-way
+        // alt (token.rs:189-194) for the copy-token path. Longest alternative
+        // first: without this ordering (or without this arm at all) the bare
+        // "tapped " arm below consumes only the first word and strands
+        // "and attacking ..." unconsumed, which fails every downstream step
+        // (P/T, color, type) and drops the whole clause to
+        // `Effect::Unimplemented`.
+        if let Some((_, after)) = nom_on_lower(trimmed, &trimmed_lower, |i| {
+            value((), tag("tapped and attacking ")).parse(i)
+        }) {
+            tapped = true;
+            enters_attacking = true;
+            rest = after;
+            continue;
+        }
         if let Some((_, after)) = nom_on_lower(trimmed, &trimmed_lower, |i| {
             value((), tag("tapped ")).parse(i)
         }) {
@@ -662,6 +746,18 @@ fn parse_token_description_with_context(
         if let Some((_, after)) = nom_on_lower(trimmed, &trimmed_lower, |i| {
             value((), tag("untapped ")).parse(i)
         }) {
+            rest = after;
+            continue;
+        }
+        // CR 508.4: leading "attacking" without "tapped" — completes the same
+        // three-way flag pair `parse_copy_token_entry_modifiers` already exposes
+        // for copy tokens (its third alt arm, token.rs:192). No currently-
+        // unsupported non-copy card needs this arm alone, but the building
+        // block should not stop short of its sibling's coverage.
+        if let Some((_, after)) = nom_on_lower(trimmed, &trimmed_lower, |i| {
+            value((), tag("attacking ")).parse(i)
+        }) {
+            enters_attacking = true;
             rest = after;
             continue;
         }
@@ -732,40 +828,46 @@ fn parse_token_description_with_context(
 
     // CR 107.3: when the attacking clause was stripped and took the ", where X
     // is …" tail with it, `saved_where_x_expr` carries the expression; fall
-    // back to it so the variable count is still resolved.
-    if let Some(where_expression) = extract_token_where_x_expression(suffix)
-        .or(saved_where_x_expr)
-        .or(saved_all_colors_where_x_expr)
-    {
-        // CR 107.3i + CR 117.1: The Token-effect `where X is …` rebind shares
-        // the Join-Forces normalization path with non-Token effects via
-        // `super::parse_where_x_quantity_expression`. This makes phrases like
-        // "the total amount of mana paid this way" (Alliance of Arms) collapse
-        // to `QuantityRef::Variable("X")` so the upstream `PayCost { Mana { X } }`
-        // loop's accumulated total flows through. Falls back to the CDA path
-        // (and then the raw variable name) for phrases neither layer recognizes.
-        let binds_x = matches!(&count, QuantityExpr::Ref { qty: QuantityRef::Variable { ref name } } if name == "X")
-            || matches!(&power, Some(PtValue::Variable(alias)) if alias == "X")
-            || matches!(&toughness, Some(PtValue::Variable(alias)) if alias == "X");
-        if binds_x {
-            // CR 107.3c: the clause DEFINES X. If the definition is not
-            // representable, this token clause does not lower — fail the parse
-            // instead of fabricating a raw-text placeholder.
-            //
-            // The fabricated forms (`PtValue::Variable("<oracle text>")` and
-            // `QuantityRef::Variable { name: "<oracle text>" }`) are well-typed
-            // but DEAD: nothing resolves a non-`X` variable name, so the token
-            // entered as a 0/0 (or with a count of 0) while the raw text still
-            // rendered as a supported dynamic quantity in the coverage report —
-            // a fabricated green. Honest failure is the only correct answer.
-            let bound =
+    // back to it so an X/X token's P/T is still bound.
+    // CR 107.3c + CR 107.3i: a token's "X/X … where X is …" P/T binds X through
+    // `super::parse_where_x_quantity_expression`, then the CDA grammar; a
+    // definition neither reads fails the clause. A where-X binder on the count
+    // ("create X … tokens, where X is …", Alliance of Arms) is bound by
+    // `oracle_util::parse_count_slot` and reaches here as `slot_where_x`.
+    let binds_x = matches!(&power, Some(PtValue::Variable(alias)) if alias == "X")
+        || matches!(&toughness, Some(PtValue::Variable(alias)) if alias == "X");
+    if binds_x {
+        // CR 107.3c: the clause DEFINES X. If the definition is not
+        // representable, this token clause does not lower — fail the parse
+        // instead of fabricating a raw-text placeholder.
+        //
+        // The fabricated forms (`PtValue::Variable("<oracle text>")` and
+        // `QuantityRef::Variable { name: "<oracle text>" }`) are well-typed
+        // but DEAD: nothing resolves a non-`X` variable name, so the token
+        // entered as a 0/0 (or with a count of 0) while the raw text still
+        // rendered as a supported dynamic quantity in the coverage report —
+        // a fabricated green. Honest failure is the only correct answer.
+        //
+        // A where-X binder the count position consumed ("X X/X … tokens,
+        // where X is …") already defined X there.
+        let bound = match (
+            slot_where_x,
+            extract_token_where_x_expression(suffix)
+                .or(saved_where_x_expr)
+                .or(saved_all_colors_where_x_expr),
+        ) {
+            (Some(bound), _) => Some(bound),
+            (None, Some(where_expression)) => Some(
                 super::parse_where_x_quantity_expression(&where_expression).or_else(|| {
-                    crate::parser::oracle_quantity::parse_cda_quantity(&where_expression)
-                })?;
-            if matches!(&count, QuantityExpr::Ref { qty: QuantityRef::Variable { ref name } } if name == "X")
-            {
-                count = bound.clone();
-            }
+                    crate::parser::oracle_quantity::parse_cda_quantity_with_context(
+                        &where_expression,
+                        &mut ctx.clone_player_antecedents(),
+                    )
+                })?,
+            ),
+            (None, None) => None,
+        };
+        if let Some(bound) = bound {
             if matches!(&power, Some(PtValue::Variable(alias)) if alias == "X") {
                 power = Some(PtValue::Quantity(bound.clone()));
             }
@@ -777,135 +879,10 @@ fn parse_token_description_with_context(
     bind_bare_token_x_pt_to_cost_x(&mut power);
     bind_bare_token_x_pt_to_cost_x(&mut toughness);
 
-    if let Some(count_expression) = extract_token_count_expression(suffix) {
-        if matches!(&count, QuantityExpr::Ref { qty: QuantityRef::Variable { ref name } } if name == "count")
-        {
-            // CR 706.2: "the result" (die roll / coin flip) flows through
-            // `EventContextAmount`, consistent with the `"the result"` arm in
-            // `oracle_quantity::parse_event_context_quantity`.
-            // `parse_event_context_quantity` only fires when `parse_cda_quantity`
-            // returns None and itself returns None for unrecognized phrases, so
-            // it strictly widens coverage without disturbing existing matches.
-            // CR 122.1 + CR 608.2c: bind the deferred "a number of" count to the
-            // quantity its "equal to <expr>" clause names. An unrepresentable
-            // expression FAILS the token clause — the raw-text placeholder it used
-            // to fabricate is dead at runtime (game/quantity.rs resolves a non-`X`
-            // variable name to 0), so the card created ZERO tokens while still
-            // reading as supported.
-            // CR 107.3i + CR 601.2h: "equal to the amount of mana [they] paid
-            // this way" (Liege of the Hollows) is the same paid-mana binding as
-            // the "where X is …" token path above — reuse the shared recognizer
-            // so the count collapses to `Variable("X")` and reads the upstream
-            // PayCost loop's accumulated `chosen_x` total. Tried only after the
-            // CDA / event-context recognizers so no existing match changes; it
-            // strictly rescues phrases that previously fell to the dead
-            // raw-string `Variable` node this clause used to fabricate.
-            count = crate::parser::oracle_quantity::parse_cda_quantity(&count_expression)
-                .or_else(|| {
-                    crate::parser::oracle_quantity::parse_event_context_quantity(&count_expression)
-                })
-                .or_else(|| super::parse_where_x_quantity_expression(&count_expression))
-                .or_else(|| {
-                    // CR 608.2c: bare anaphoric "the difference" — the two operands
-                    // live on the enclosing ability's condition, not this clause
-                    // ("create a number of tapped Treasure tokens equal to the
-                    // difference" — Hit the Mother Lode). Emit the deferred
-                    // placeholder that the difference binding resolves against the
-                    // condition's `QuantityCheck` operands, mirroring the
-                    // put-counter parser. Distinct from the `parse_cda_quantity`
-                    // "the difference between A and B" form, which carries operands.
-                    all_consuming(tag::<_, _, OracleError<'_>>("the difference"))
-                        .parse(count_expression.trim())
-                        .is_ok()
-                        .then(crate::parser::oracle_effect::difference_anaphor_placeholder)
-                })?;
-        }
-    }
-
-    // CR 120.1 + CR 603.2c + CR 608.2c: Malcolm-style trigger-context player
-    // counts do not always carry the literal "this way" ("for each opponent
-    // dealt damage"). Recognize that phrase before the tracked-set block below,
-    // whose object-set fallback would be the wrong anaphor class.
-    {
-        let suffix_lower = suffix.to_lowercase();
-        if let Ok((clause, _)) = take_until::<_, _, OracleError<'_>>("for each ")
-            .parse(suffix_lower.as_str())
-            .and_then(|(rest, _)| tag("for each ").parse(rest))
-        {
-            let clause = clause.trim_end_matches('.').trim();
-            if let Ok(("", qty)) =
-                crate::parser::oracle_nom::quantity::parse_event_context_opponent_dealt_damage(
-                    clause,
-                )
-            {
-                count = QuantityExpr::Ref { qty };
-            }
-        };
-    }
-
-    // CR 608.2c: "for each [thing] this way" -- the "this way" anaphor counts from
-    // the preceding zone moves in the same effect.
-    // Matches "for each card put into a graveyard this way", "for each creature
-    // exiled this way", etc.
-    {
-        let suffix_lower = suffix.to_lowercase();
-        if suffix_lower.contains("for each") && suffix_lower.contains("this way") {
-            // CR 608.2c + CR 205.2a: route ONLY "card type among cards <verb> this
-            // way" to the cause-filtered distinct-card-types count (Occult
-            // Epiphany #3307); every other "... this way" token keeps
-            // `TrackedSetSize`. The dispatch decision is the nom combinator's
-            // Ok/Err — the post-"for each " clause is extracted with nom
-            // (`take_until` + `tag`), not string-method splitting.
-            let after_for_each = take_until::<_, _, OracleError<'_>>("for each ")
-                .parse(suffix_lower.as_str())
-                .and_then(|(rest, _)| tag("for each ").parse(rest))
-                .map(|(clause, _)| clause.trim_end_matches('.').trim());
-            count = after_for_each
-                .ok()
-                .and_then(|clause| {
-                    crate::parser::oracle_nom::quantity::parse_distinct_card_types_among_tracked_set(
-                        clause,
-                    )
-                    .ok()
-                    .filter(|(rest, _)| rest.is_empty())
-                    .map(|(_, qty)| QuantityExpr::Ref { qty })
-                    // CR 120.1 + CR 603.2c + CR 608.2c: Malcolm-style token
-                    // counts named players in the current trigger event batch,
-                    // not the previous chain tracked object set.
-                    .or_else(|| {
-                        crate::parser::oracle_quantity::parse_for_each_clause(clause)
-                            .filter(|qty| {
-                                matches!(qty, QuantityRef::EventContextPlayerCount { .. })
-                            })
-                            .map(|qty| QuantityExpr::Ref { qty })
-                    })
-                    // CR 608.2c + CR 205.2a: a TYPE-restricted "for each <type> card
-                    // <verb> this way" (Dread Summons: "for each creature card put
-                    // into a graveyard this way") counts only the matching cards
-                    // moved this way — `FilteredTrackedSetSize` — not every card
-                    // moved (`TrackedSetSize`, which would create X tokens). Only a
-                    // restrictive type overrides; a bare/"card" filter keeps
-                    // `TrackedSetSize`.
-                    .or_else(|| {
-                        crate::parser::oracle_quantity::parse_for_each_clause(clause)
-                            .filter(tracked_set_count_is_type_restricted)
-                            .map(|qty| QuantityExpr::Ref { qty })
-                    })
-                    // CR 608.2c + CR 400.7: a bare "card put into a/your/their
-                    // graveyard this way" TOKEN count (Dihada, Binder of
-                    // Wills). Tried last, after every TYPE-restricted count
-                    // above declines, so a Dread Summons-style "creature card
-                    // put into a graveyard this way" still binds to its own
-                    // FilteredTrackedSetSize rather than being re-tagged here.
-                    .or_else(|| {
-                        parse_bare_graveyard_this_way_token_count(clause)
-                            .map(|qty| QuantityExpr::Ref { qty })
-                    })
-                })
-                .unwrap_or(QuantityExpr::Ref {
-                    qty: QuantityRef::TrackedSetSize,
-                });
-        }
+    // CR 608.2c: a "for each … this way" / "for each opponent dealt damage"
+    // rider names the token count itself.
+    if let Some(rider_count) = rider_count {
+        count = rider_count;
     }
 
     if power.is_none() || toughness.is_none() {
@@ -915,7 +892,10 @@ fn parse_token_description_with_context(
             // expression to a typed quantity. If it is not representable the
             // token clause does not lower — a raw-text `PtValue::Variable` is a
             // dead node that silently produces a 0/0 token.
-            let parsed = crate::parser::oracle_quantity::parse_cda_quantity(&pt_expression)?;
+            let parsed = crate::parser::oracle_quantity::parse_cda_quantity_with_context(
+                &pt_expression,
+                &mut ctx.clone_player_antecedents(),
+            )?;
             power = Some(PtValue::Quantity(parsed.clone()));
             toughness = Some(PtValue::Quantity(parsed));
         }
@@ -954,6 +934,81 @@ fn parse_token_description_with_context(
     })
 }
 
+/// CR 608.2c + CR 120.1 + CR 603.2c: split a trailing token-count rider off a
+/// create-token body — "for each opponent dealt damage" (Malcolm) or "for each
+/// <thing> … this way" (the preceding instruction's tracked set). The rider's
+/// quantity IS the token count, so it is read ahead of the count position and
+/// the body before "for each" is the token descriptor. Any other "for each"
+/// stays in the body for the count position's for-each binder.
+fn split_token_for_each_rider(text: &str) -> (&str, Option<QuantityExpr>) {
+    let lower = text.to_lowercase();
+    let Ok((clause, before)) = terminated(
+        take_until::<_, _, OracleError<'_>>("for each "),
+        tag("for each "),
+    )
+    .parse(lower.as_str()) else {
+        return (text, None);
+    };
+    let clause = clause.trim_end_matches('.').trim();
+    let rider = if let Ok(("", qty)) =
+        crate::parser::oracle_nom::quantity::parse_event_context_opponent_dealt_damage(clause)
+    {
+        QuantityExpr::Ref { qty }
+    } else if nom_primitives::scan_contains(&lower, "this way") {
+        this_way_token_count(clause)
+    } else {
+        return (text, None);
+    };
+    let body = text[..before.len()]
+        .trim_end()
+        .trim_end_matches(',')
+        .trim_end();
+    (body, Some(rider))
+}
+
+/// CR 608.2c: "for each [thing] this way" — the "this way" anaphor counts from
+/// the preceding zone moves in the same effect ("for each card put into a
+/// graveyard this way", "for each creature exiled this way"). `clause` is the
+/// lowercased text after "for each ".
+fn this_way_token_count(clause: &str) -> QuantityExpr {
+    // CR 608.2c + CR 205.2a: route ONLY "card type among cards <verb> this way"
+    // to the cause-filtered distinct-card-types count (Occult Epiphany #3307);
+    // every other "... this way" token keeps `TrackedSetSize`.
+    crate::parser::oracle_nom::quantity::parse_distinct_card_types_among_tracked_set(clause)
+        .ok()
+        .filter(|(rest, _)| rest.is_empty())
+        .map(|(_, qty)| qty)
+        // CR 120.1 + CR 603.2c + CR 608.2c: Malcolm-style token counts named
+        // players in the current trigger event batch, not the previous chain
+        // tracked object set.
+        .or_else(|| {
+            crate::parser::oracle_quantity::parse_for_each_clause(clause)
+                .filter(|qty| matches!(qty, QuantityRef::EventContextPlayerCount { .. }))
+        })
+        // CR 608.2c + CR 205.2a: a TYPE-restricted "for each <type> card <verb>
+        // this way" (Dread Summons: "for each creature card put into a graveyard
+        // this way") counts only the matching cards moved this way —
+        // `FilteredTrackedSetSize` — not every card moved (`TrackedSetSize`,
+        // which would create X tokens). Only a restrictive type overrides; a
+        // bare/"card" filter keeps `TrackedSetSize`.
+        .or_else(|| {
+            crate::parser::oracle_quantity::parse_for_each_clause(clause)
+                .filter(tracked_set_count_is_type_restricted)
+        })
+        // CR 608.2c + CR 400.7: a bare "card put into a/your/their graveyard
+        // this way" TOKEN count (Dihada, Binder of Wills). Tried last, after
+        // every TYPE-restricted count above declines, so a Dread Summons-style
+        // "creature card put into a graveyard this way" still binds to its own
+        // FilteredTrackedSetSize rather than being re-tagged here.
+        .or_else(|| parse_bare_graveyard_this_way_token_count(clause))
+        .map_or(
+            QuantityExpr::Ref {
+                qty: QuantityRef::TrackedSetSize,
+            },
+            |qty| QuantityExpr::Ref { qty },
+        )
+}
+
 fn bind_bare_token_x_pt_to_cost_x(value: &mut Option<PtValue>) {
     // CR 107.3a + CR 107.3i + CR 111.3: a bare X in token P/T shares the
     // spell or ability's chosen X unless an explicit "where X is" clause
@@ -965,40 +1020,6 @@ fn bind_bare_token_x_pt_to_cost_x(value: &mut Option<PtValue>) {
             },
         }));
     }
-}
-
-fn parse_token_count_prefix(text: &str) -> Option<(QuantityExpr, &str)> {
-    let trimmed = text.trim_start();
-    let lower = trimmed.to_lowercase();
-
-    // "that many " -> EventContextAmount
-    if let Some((_, rest)) =
-        nom_on_lower(trimmed, &lower, |i| value((), tag("that many ")).parse(i))
-    {
-        return Some((
-            QuantityExpr::Ref {
-                qty: QuantityRef::EventContextAmount,
-            },
-            rest,
-        ));
-    }
-    // "a number of " -> deferred count
-    if let Some((_, rest)) =
-        nom_on_lower(trimmed, &lower, |i| value((), tag("a number of ")).parse(i))
-    {
-        return Some((
-            QuantityExpr::Ref {
-                qty: QuantityRef::Variable {
-                    name: "count".to_string(),
-                },
-            },
-            rest,
-        ));
-    }
-    // Delegate to parse_count_expr for all numeric/variable/multiplied
-    // quantities: "X", "twice X", "three", "half X rounded up", etc.
-    let (count, rest) = parse_count_expr(trimmed)?;
-    Some((count, rest))
 }
 
 fn parse_named_token_preamble(text: &str) -> Option<(String, &str)> {
@@ -1418,7 +1439,7 @@ fn push_parsed_statics(ability_text: &str, token_name: &str, out: &mut Vec<Stati
 ///     cannot pose as opening quotes).
 ///   - The closing `'` is the last `'` in `text` (so any internal apostrophe
 ///     from contractions or possessives is treated as content, not delimiter).
-fn find_anchored_single_quoted_span(text: &str) -> Option<&str> {
+pub(crate) fn find_anchored_single_quoted_span(text: &str) -> Option<&str> {
     let close = text.rfind('\'')?;
     let prefix = &text[..close];
 
@@ -1520,18 +1541,6 @@ pub(super) fn scope_token_for_each_to_iterating_player(expr: QuantityExpr) -> Qu
         },
         other => other,
     }
-}
-
-fn extract_token_count_expression(text: &str) -> Option<String> {
-    let lower = text.to_lowercase();
-    let tp = TextPair::new(text, &lower);
-    Some(
-        tp.strip_after("equal to ")?
-            .original
-            .trim()
-            .trim_end_matches('.')
-            .to_string(),
-    )
 }
 
 fn extract_token_pt_expression(text: &str) -> Option<String> {
@@ -1793,6 +1802,7 @@ pub(super) fn push_unique_string(values: &mut Vec<String>, value: impl Into<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::oracle_target::parse_target;
     use crate::types::ability::{
         ObjectScope, PlayerFilter, QuantityExpr, QuantityRef, RoundingMode, TypeFilter,
     };
@@ -2253,6 +2263,182 @@ mod tests {
     }
 
     #[test]
+    fn flamerush_rider_copy_target_and_post_target_entry_clause_parse() {
+        // Flamerush Rider: the attacking property on the copied target is a
+        // target restriction; the later "and that's tapped and attacking"
+        // independently controls how the token enters.
+        let target_text = "target attacking creature and that's tapped and attacking.";
+        let (target, remainder) = parse_target(target_text);
+        let TargetFilter::Typed(typed_target) = target else {
+            panic!("expected typed target, got {target:?}");
+        };
+        assert!(typed_target.type_filters.contains(&TypeFilter::Creature));
+        assert!(typed_target
+            .properties
+            .contains(&FilterProp::Attacking { defender: None }));
+        assert_eq!(remainder, " and that's tapped and attacking.");
+
+        let oracle = "Create a token that's a copy of another target attacking creature and that's tapped and attacking.";
+        let effect = try_parse_token(&oracle.to_lowercase(), oracle, &mut ParseContext::default())
+            .expect("Flamerush Rider copy clause must parse");
+        let Effect::CopyTokenOf {
+            target,
+            tapped,
+            enters_attacking,
+            ..
+        } = effect
+        else {
+            panic!("expected CopyTokenOf, got {effect:?}");
+        };
+        let TargetFilter::Typed(typed_target) = target else {
+            panic!("expected typed copy target, got {target:?}");
+        };
+        assert!(typed_target.type_filters.contains(&TypeFilter::Creature));
+        assert!(typed_target
+            .properties
+            .contains(&FilterProp::Attacking { defender: None }));
+        assert!(typed_target.properties.contains(&FilterProp::Another));
+        assert!(tapped, "trailing tapped clause must set tapped=true");
+        assert!(
+            enters_attacking,
+            "trailing attacking clause must set enters_attacking=true"
+        );
+
+        let restricted_target = "Create a token that's a copy of target attacking creature.";
+        let effect = try_parse_token(
+            &restricted_target.to_lowercase(),
+            restricted_target,
+            &mut ParseContext::default(),
+        )
+        .expect("copy of an attacking target must parse");
+        let Effect::CopyTokenOf {
+            target,
+            tapped,
+            enters_attacking,
+            ..
+        } = effect
+        else {
+            panic!("expected CopyTokenOf, got {effect:?}");
+        };
+        assert!(matches!(
+            target,
+            TargetFilter::Typed(ref typed)
+                if typed.properties.contains(&FilterProp::Attacking { defender: None })
+        ));
+        assert!(
+            !tapped,
+            "target's Attacking restriction must not tap the token"
+        );
+        assert!(
+            !enters_attacking,
+            "target's Attacking restriction must not make the token enter attacking"
+        );
+
+        // Exercise the full printed Oracle through trigger parsing too. The
+        // delayed end-of-combat exile must remain linked after the target
+        // suffix is consumed.
+        let full_oracle = "Whenever this creature attacks, create a token that's a copy of another target attacking creature and that's tapped and attacking. Exile the token at end of combat.\nDash {2}{R}{R} (You may cast this spell for its dash cost. If you do, it gains haste, and it's returned from the battlefield to its owner's hand at the beginning of the next end step.)";
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            full_oracle,
+            "Flamerush Rider",
+            &["Dash".to_string()],
+            &["Creature".to_string()],
+            &["Human".to_string(), "Warrior".to_string()],
+        );
+        let attack_trigger = parsed
+            .triggers
+            .iter()
+            .find(|trigger| trigger.mode == crate::types::triggers::TriggerMode::Attacks)
+            .expect("full Flamerush Rider Oracle must parse its attack trigger");
+        let execute = attack_trigger
+            .execute
+            .as_deref()
+            .expect("Flamerush Rider attack trigger execute");
+        let Effect::CopyTokenOf {
+            target: TargetFilter::Typed(target),
+            tapped,
+            enters_attacking,
+            ..
+        } = execute.effect.as_ref()
+        else {
+            panic!("expected full attack trigger to start with CopyTokenOf, got {execute:?}");
+        };
+        assert!(target.type_filters.contains(&TypeFilter::Creature));
+        assert!(target
+            .properties
+            .contains(&FilterProp::Attacking { defender: None }));
+        assert!(target.properties.contains(&FilterProp::Another));
+        assert!(*tapped && *enters_attacking);
+
+        fn find_delayed_exile(
+            definition: &crate::types::ability::AbilityDefinition,
+        ) -> Option<&crate::types::ability::AbilityDefinition> {
+            if matches!(
+                definition.effect.as_ref(),
+                Effect::CreateDelayedTrigger {
+                    condition: crate::types::ability::DelayedTriggerCondition::AtNextPhase {
+                        phase: crate::types::phase::Phase::EndCombat,
+                    },
+                    effect,
+                    ..
+                } if matches!(
+                    effect.effect.as_ref(),
+                    Effect::ChangeZone {
+                        destination: Zone::Exile,
+                        target: TargetFilter::LastCreated,
+                        ..
+                    }
+                )
+            ) {
+                return Some(definition);
+            }
+            definition
+                .sub_ability
+                .as_deref()
+                .and_then(find_delayed_exile)
+                .or_else(|| {
+                    definition
+                        .else_ability
+                        .as_deref()
+                        .and_then(find_delayed_exile)
+                })
+        }
+        assert!(
+            find_delayed_exile(execute).is_some(),
+            "the full attack trigger must retain its end-of-combat exile of the created token"
+        );
+    }
+
+    #[test]
+    fn copy_token_entry_suffix_and_leading_forms_remain_composable() {
+        for (suffix, expected) in [
+            (" and that's tapped and attacking.", (true, true)),
+            (" and that is tapped.", (true, false)),
+            (" and thats attacking,", (false, true)),
+        ] {
+            assert_eq!(
+                parse_copy_token_trailing_entry_modifiers(suffix, false),
+                Some(expected),
+                "copy-token trailing entry suffix: {suffix:?}"
+            );
+        }
+        assert_eq!(
+            parse_copy_token_trailing_entry_modifiers(
+                " and that are tapped and attacking, with flying.",
+                true,
+            ),
+            None,
+            "an unrelated trailing clause must not be accepted as an entry modifier"
+        );
+
+        let (_, (tapped, enters_attacking)) = parse_copy_token_entry_modifiers(
+            "create a tapped and attacking token that's a copy of target creature",
+        )
+        .expect("existing leading copy-token form must stay supported");
+        assert!(tapped && enters_attacking);
+    }
+
+    #[test]
     fn copy_x_tokens_binds_where_clause() {
         // CR 107.3: X bound to a trailing "where X is <quantity>" clause.
         let txt = "Create X tokens that are copies of target creature you control, where X is the number of Clues you control.";
@@ -2276,6 +2462,37 @@ mod tests {
                 .contains(&TypeFilter::Subtype("Clue".to_string())),
             "X must count controlled Clues, got {:?}",
             tf.type_filters
+        );
+    }
+
+    #[test]
+    fn nacatl_war_pride_copy_tokens_bind_count_and_entry_state() {
+        // Nacatl War-Pride's printed token sentence combines a copied-source
+        // anaphor, a trailing entry-state clause, and a where-X count binding.
+        let oracle = "create X tokens that are copies of it and that are tapped and attacking, where X is the number of creatures defending player controls.";
+        let effect = try_parse_token(&oracle.to_lowercase(), oracle, &mut ParseContext::default())
+            .expect("Nacatl War-Pride token sentence must parse");
+        let Effect::CopyTokenOf {
+            count,
+            tapped,
+            enters_attacking,
+            ..
+        } = effect
+        else {
+            panic!("expected CopyTokenOf, got {effect:?}");
+        };
+        assert!(tapped && enters_attacking);
+        assert!(
+            matches!(
+                &count,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(filter),
+                    },
+                } if filter.controller == Some(ControllerRef::DefendingPlayer)
+                    && filter.type_filters.contains(&TypeFilter::Creature)
+            ),
+            "where-X must count creatures defending player controls, got {count:?}"
         );
     }
 
@@ -3309,6 +3526,129 @@ mod tests {
     }
 
     #[test]
+    fn ghalta_and_mavren_dinosaur_mode_shape() {
+        // CR 508.4: leading "tapped and attacking" modifier before the P/T,
+        // not the trailing "...that's tapped and attacking" form. Positive
+        // reach-guard: the `Some(..)` match itself — on unfixed code
+        // (missing leading-modifier arms) this returns `None` and the whole
+        // clause falls back to `Effect::Unimplemented`.
+        let txt = "Create a tapped and attacking X/X green Dinosaur creature token with trample, \
+            where X is the greatest power among other attacking creatures.";
+        let effect = try_parse_token(&txt.to_lowercase(), txt, &mut ParseContext::default())
+            .expect("expected Token effect, not None (leading-modifier loop must consume the full 'tapped and attacking' phrase)");
+        let Effect::Token {
+            tapped,
+            enters_attacking,
+            power,
+            toughness,
+            types,
+            keywords,
+            ..
+        } = effect
+        else {
+            panic!("expected Effect::Token, got {effect:?}");
+        };
+        assert!(
+            tapped,
+            "leading 'tapped and attacking' must set tapped=true"
+        );
+        assert!(
+            enters_attacking,
+            "leading 'tapped and attacking' must set enters_attacking=true"
+        );
+        let expected = crate::parser::oracle_quantity::parse_cda_quantity(
+            "the greatest power among other attacking creatures",
+        )
+        .expect("greatest-power-among-other-attacking-creatures quantity must parse");
+        let expected_pt = PtValue::Quantity(expected);
+        assert_eq!(
+            power,
+            expected_pt.clone(),
+            "X/X power must resolve to the greatest power among other attacking creatures"
+        );
+        assert_eq!(
+            toughness, expected_pt,
+            "X/X toughness must equal power's quantity expression"
+        );
+        assert!(
+            types.iter().any(|t| t == "Dinosaur"),
+            "types must include Dinosaur, got {types:?}"
+        );
+        assert!(
+            keywords.contains(&Keyword::Trample),
+            "token must have trample, got {keywords:?}"
+        );
+    }
+
+    #[test]
+    fn pugnacious_pugilist_devil_mode_shape() {
+        // Pugnacious Pugilist / Maestros Diabolist share this exact
+        // leading-modifier clause shape with Ghalta and Mavren's mode 1 —
+        // locks in the sibling-card coverage claim (cargo coverage, run
+        // separately, is the regression gate for those 2 cards by name).
+        let txt = "create a tapped and attacking 1/1 red Devil creature token with \
+            \"When ~ dies, it deals 1 damage to any target.\"";
+        let effect = try_parse_token(&txt.to_lowercase(), txt, &mut ParseContext::default())
+            .expect("expected Token effect, not None");
+        let Effect::Token {
+            tapped,
+            enters_attacking,
+            power,
+            toughness,
+            types,
+            ..
+        } = effect
+        else {
+            panic!("expected Effect::Token, got {effect:?}");
+        };
+        assert!(
+            tapped,
+            "leading 'tapped and attacking' must set tapped=true"
+        );
+        assert!(
+            enters_attacking,
+            "leading 'tapped and attacking' must set enters_attacking=true"
+        );
+        assert_eq!(power, PtValue::Fixed(1), "fixed 1/1 token power");
+        assert_eq!(toughness, PtValue::Fixed(1), "fixed 1/1 token toughness");
+        assert!(
+            types.iter().any(|t| t == "Devil"),
+            "types must include Devil, got {types:?}"
+        );
+    }
+
+    #[test]
+    fn leading_attacking_without_tapped_shape() {
+        // Building-block test (not a single card): the bare leading
+        // "attacking " arm completes the same three-way flag pair
+        // `parse_copy_token_entry_modifiers` already exposes for copy tokens
+        // (token.rs:192). No currently-unsupported non-copy card needs this
+        // arm alone; this proves the building block itself.
+        let txt = "create an attacking 4/4 green beast creature token";
+        let effect = try_parse_token(&txt.to_lowercase(), txt, &mut ParseContext::default())
+            .expect("expected Token effect, not None");
+        let Effect::Token {
+            tapped,
+            enters_attacking,
+            power,
+            toughness,
+            types,
+            ..
+        } = effect
+        else {
+            panic!("expected Effect::Token, got {effect:?}");
+        };
+        assert!(!tapped, "bare leading 'attacking' must NOT set tapped=true");
+        assert!(
+            enters_attacking,
+            "bare leading 'attacking' must set enters_attacking=true"
+        );
+        assert_eq!(power, PtValue::Fixed(4));
+        assert_eq!(toughness, PtValue::Fixed(4));
+        assert!(types.iter().any(|t| t == "Beast"), "got {types:?}");
+    }
+
+    #[test]
     fn plural_that_are_tapped_and_attacking_suffix_strips() {
         // CR 508.4 + CR 506.3a: "create two 1/1 white Cat creature tokens that
         // are tapped and attacking" (Leonin Warleader) should set both
@@ -3880,9 +4220,13 @@ mod kazar_token_landfall_tests {
     /// `GrantAbility(Unimplemented)`.
     #[test]
     fn catalog_landfall_rules_text_classifies_as_grant_trigger() {
-        let rules_text =
-            "Landfall — Whenever a land you control enters, put a +1/+1 counter on Zabu.";
-        let mods = crate::parser::oracle_static::classify_quoted_inner(rules_text);
+        // Mirror the runtime path (`catalog_rules_text_abilities`), which
+        // normalizes the token's name to `~` before classification (CR 201.5).
+        let rules_text = crate::parser::oracle_util::normalize_card_name_refs(
+            "Landfall — Whenever a land you control enters, put a +1/+1 counter on Zabu.",
+            "Zabu",
+        );
+        let mods = crate::parser::oracle_static::classify_quoted_inner(&rules_text);
         assert!(
             mods.iter()
                 .any(|m| matches!(m, ContinuousModification::GrantTrigger { .. })),
@@ -3916,6 +4260,199 @@ mod kazar_token_landfall_tests {
             !debug.contains("Unimplemented"),
             "Ka-Zar must parse to zero residual Unimplemented, got: {debug}"
         );
+    }
+}
+
+#[cfg(test)]
+mod granted_activated_pump_tests {
+    use super::*;
+    use crate::types::ability::{AbilityCost, AbilityKind, Duration};
+    use crate::types::mana::{ManaCost, ManaCostShard};
+
+    const DRAGON_EGG_TOKEN_CLAUSE: &str = "Create a 2/2 red Dragon creature token with flying and \"{R}: This token gets +1/+0 until end of turn.\"";
+    /// Nesting Dragon's nested single-quoted binding, masked as one span by
+    /// `strip_quoted_segments` (verbatim Oracle text).
+    const NESTING_DRAGON: &str = "Flying\nLandfall — Whenever a land you control enters, create a 0/2 red Dragon Egg creature token with defender and \"When this token dies, create a 2/2 red Dragon creature token with flying and '{R}: This token gets +1/+0 until end of turn.'\"";
+    /// Brood Keeper is the in-corpus control: the same granted ability reaching a
+    /// token through the `It has \"…\"` path, which already carried the guard one
+    /// level down (`parse_quoted_rule_static_modifications`).
+    const BROOD_KEEPER: &str = "Whenever an Aura becomes attached to this creature, create a 2/2 red Dragon creature token with flying. It has \"{R}: This creature gets +1/+0 until end of turn.\"";
+
+    /// CR 602.1 + CR 602.1a + CR 604.1 + CR 611.2a: the token's granted ability is
+    /// an ACTIVATED `{R}` pump +1/+0 on the recipient lasting until end of turn.
+    ///
+    /// Revert-failing at every assertion past the first: before the static-line
+    /// guard, `push_parsed_statics` took the `parse_static_line_multi` early return
+    /// and emitted `Continuous { SelfRef, [AddPower 1, AddToughness 0] }` — no
+    /// granted ability at all, cost and duration dropped outright.
+    ///
+    /// Asserted as a SHAPE, never byte equality: Brood Keeper's wrapper is built by
+    /// the `It has "…"` path and carries a `description`, while Dragon Egg's is built
+    /// by `push_parsed_statics`' fallback (`token.rs:1359-1367`) and carries none.
+    fn assert_granted_red_pump(statics: &[StaticDefinition], token: &str) {
+        assert_eq!(
+            statics.len(),
+            1,
+            "{token}: expected exactly one static definition, got {statics:#?}"
+        );
+        let def = &statics[0];
+        assert_eq!(
+            def.affected,
+            Some(TargetFilter::SelfRef),
+            "{token}: the recipient must be the token itself"
+        );
+        assert_eq!(
+            def.modifications.len(),
+            1,
+            "{token}: a bare AddPower/AddToughness would show up here — got {:#?}",
+            def.modifications
+        );
+        let ContinuousModification::GrantAbility { definition } = &def.modifications[0] else {
+            panic!(
+                "{token}: expected GrantAbility, got {:#?}",
+                def.modifications[0]
+            );
+        };
+        assert_eq!(definition.kind, AbilityKind::Activated, "{token}");
+        assert_eq!(
+            definition.cost,
+            Some(AbilityCost::Mana {
+                cost: ManaCost::Cost {
+                    shards: vec![ManaCostShard::Red],
+                    generic: 0,
+                },
+            }),
+            "{token}: the {{R}} activation cost must be carried, not dropped"
+        );
+        let Effect::Pump {
+            power,
+            toughness,
+            target,
+        } = &*definition.effect
+        else {
+            panic!("{token}: expected Pump, got {:?}", definition.effect);
+        };
+        assert_eq!(
+            (power, toughness),
+            (&PtValue::Fixed(1), &PtValue::Fixed(0)),
+            "{token}: expected +1/+0"
+        );
+        assert_eq!(target, &TargetFilter::SelfRef, "{token}");
+        assert_eq!(
+            definition.duration,
+            Some(Duration::UntilEndOfTurn),
+            "{token}: the duration must be carried, not dropped"
+        );
+    }
+
+    /// Reach guard: the unit parsed through to a real payload instead of tripping
+    /// the `Effect::Unimplemented` short-circuit that would make every absence
+    /// assertion below vacuous.
+    fn assert_no_unimplemented(debugged: &impl std::fmt::Debug, what: &str) {
+        assert!(
+            // allow-noncombinator: test assertion scanning debug output, not parsing dispatch.
+            !format!("{debugged:?}").contains("Unimplemented"),
+            "{what} must have no residual Unimplemented effect"
+        );
+    }
+
+    /// Dragon Egg's token clause at the seam the defect was reached through:
+    /// `try_parse_token` → `push_parsed_statics`.
+    #[test]
+    fn dragon_egg_token_clause_grants_an_activated_pump() {
+        let effect = try_parse_token(
+            &DRAGON_EGG_TOKEN_CLAUSE.to_lowercase(),
+            DRAGON_EGG_TOKEN_CLAUSE,
+            &mut ParseContext::default(),
+        )
+        .expect("Dragon Egg's token clause must parse");
+        assert_no_unimplemented(&effect, "Dragon Egg's token clause");
+        let Effect::Token {
+            static_abilities, ..
+        } = &effect
+        else {
+            panic!("expected Effect::Token, got {effect:?}");
+        };
+        assert_granted_red_pump(static_abilities, "Dragon Egg");
+    }
+
+    /// Nesting Dragon: the same granted ability, one token nesting deeper — the
+    /// Dragon Egg token's dies trigger creates the Dragon token whose quoted grant
+    /// is the defect site.
+    #[test]
+    fn nesting_dragon_inner_token_grants_an_activated_pump() {
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            NESTING_DRAGON,
+            "Nesting Dragon",
+            &["Flying".to_string()],
+            &["Creature".to_string()],
+            &[],
+        );
+        let execute = parsed
+            .triggers
+            .first()
+            .expect("Nesting Dragon's Landfall trigger must parse")
+            .execute
+            .as_deref()
+            .expect("Landfall trigger must have an execute chain");
+        let Effect::Token {
+            static_abilities, ..
+        } = &*execute.effect
+        else {
+            panic!("expected the outer Effect::Token, got {:?}", execute.effect);
+        };
+        let inner_trigger = static_abilities
+            .iter()
+            .flat_map(|def| def.modifications.iter())
+            .find_map(|modification| match modification {
+                ContinuousModification::GrantTrigger { trigger } => Some(trigger),
+                _ => None,
+            })
+            .expect("the Dragon Egg token must carry a granted dies trigger");
+        let inner_execute = inner_trigger
+            .execute
+            .as_deref()
+            .expect("the granted dies trigger must have an execute chain");
+        assert_no_unimplemented(inner_execute, "Nesting Dragon's inner trigger");
+        let Effect::Token {
+            static_abilities, ..
+        } = &*inner_execute.effect
+        else {
+            panic!(
+                "expected the inner Effect::Token, got {:?}",
+                inner_execute.effect
+            );
+        };
+        assert_granted_red_pump(static_abilities, "Nesting Dragon's inner Dragon token");
+    }
+
+    /// Brood Keeper parity: a different host path (`It has "…"`) must reach the
+    /// identical shape, so the two are asserted by the same helper rather than by
+    /// two independently drifting expectations.
+    #[test]
+    fn brood_keeper_token_grant_has_the_same_shape() {
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            BROOD_KEEPER,
+            "Brood Keeper",
+            &[],
+            &["Creature".to_string()],
+            &[],
+        );
+        let execute = parsed
+            .triggers
+            .first()
+            .expect("Brood Keeper's Aura trigger must parse")
+            .execute
+            .as_deref()
+            .expect("the Aura trigger must have an execute chain");
+        let Effect::Token {
+            static_abilities, ..
+        } = &*execute.effect
+        else {
+            panic!("expected Effect::Token, got {:?}", execute.effect);
+        };
+        assert_no_unimplemented(static_abilities, "Brood Keeper's token");
+        assert_granted_red_pump(static_abilities, "Brood Keeper");
     }
 }
 

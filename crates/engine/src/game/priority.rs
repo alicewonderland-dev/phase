@@ -1,6 +1,8 @@
 use crate::game::engine::EngineError;
 use crate::types::events::GameEvent;
-use crate::types::game_state::{AutoPassMode, GameState, WaitingFor};
+use crate::types::game_state::{
+    AutoPassMode, GameState, PriorityPassingMode, StackEntry, WaitingFor,
+};
 use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
 
@@ -41,23 +43,20 @@ pub fn handle_priority_pass(
 pub(crate) struct PriorityPassOutcome {
     pub(crate) waiting_for: WaitingFor,
     pub(crate) consumed_stack_entries: u32,
-    pub(crate) cleanup_deferred: bool,
+    /// A phase transition (the cleanup step, or a leave that ends the turn)
+    /// deferred until a live resolution settles; the engine pipeline settles
+    /// it and retries the transition once.
+    pub(crate) transition_deferred: bool,
 }
 
-/// Preserve the Cleanup settlement signal when automatic phase advancement
-/// reaches Cleanup from another phase. `auto_advance` intentionally exposes
-/// only its waiting state; a deferred Cleanup boundary returns the unchanged
-/// Priority window, so the caller must retain the settlement predicate for the
-/// engine pipeline's retry.
-fn auto_advance_with_cleanup_deferred(
-    state: &mut GameState,
-    events: &mut Vec<GameEvent>,
-) -> (WaitingFor, bool) {
-    let waiting_for = turns::auto_advance(state, events);
-    let cleanup_deferred = state.phase == Phase::Cleanup
-        && matches!(&waiting_for, WaitingFor::Priority { .. })
-        && turns::phase_transition_requires_settlement(state);
-    (waiting_for, cleanup_deferred)
+/// The pass leaves the step's priority window open while its phase transition
+/// waits for a live resolution to settle.
+fn deferred_transition_outcome(state: &GameState) -> PriorityPassOutcome {
+    PriorityPassOutcome {
+        waiting_for: state.waiting_for.clone(),
+        consumed_stack_entries: 0,
+        transition_deferred: true,
+    }
 }
 
 pub(crate) fn handle_priority_pass_with_limit(
@@ -89,14 +88,8 @@ pub(crate) fn handle_priority_pass_with_limit(
             // and typed continuation.  Returning the current Priority window
             // lets `engine::pass_priority_once_with_pipeline` perform that
             // settlement before asking the turn interpreter to retry.
-            if state.phase == crate::types::phase::Phase::Cleanup
-                && turns::phase_transition_requires_settlement(state)
-            {
-                return PriorityPassOutcome {
-                    waiting_for: state.waiting_for.clone(),
-                    consumed_stack_entries: 0,
-                    cleanup_deferred: true,
-                };
+            if state.phase == Phase::Cleanup && turns::phase_transition_requires_settlement(state) {
+                return deferred_transition_outcome(state);
             }
             // CR 510.4: The combat damage step's turn-based action runs in two
             // sub-steps when a first-strike/double-strike creature is present. If
@@ -117,12 +110,12 @@ pub(crate) fn handle_priority_pass_with_limit(
                     .as_ref()
                     .is_some_and(|c| !c.regular_damage_done);
             if combat_damage_incomplete {
-                let (waiting_for, cleanup_deferred) =
-                    auto_advance_with_cleanup_deferred(state, events);
+                let (waiting_for, transition_deferred) =
+                    turns::auto_advance_reporting_deferral(state, events);
                 PriorityPassOutcome {
                     waiting_for,
                     consumed_stack_entries: 0,
-                    cleanup_deferred,
+                    transition_deferred,
                 }
             } else if state.phase == crate::types::phase::Phase::Cleanup {
                 // CR 514.3a: Triggered abilities that triggered during the
@@ -135,33 +128,46 @@ pub(crate) fn handle_priority_pass_with_limit(
                 // returns `None` and advances normally (the until-EOT control
                 // TCE is already pruned, so no new loss event re-fires — the
                 // one-shot trigger is gone, guaranteeing termination).
-                let (waiting_for, cleanup_deferred) =
-                    auto_advance_with_cleanup_deferred(state, events);
+                // CR 514.3a: "another cleanup step begins", re-running the cleanup arm
+                // directly rather than through the turn machine's step entry.
+                turns::record_step_begin(state, crate::types::phase::Phase::Cleanup);
+                let (waiting_for, transition_deferred) =
+                    turns::auto_advance_reporting_deferral(state, events);
                 PriorityPassOutcome {
                     waiting_for,
                     consumed_stack_entries: 0,
-                    cleanup_deferred,
+                    transition_deferred,
                 }
             } else {
-                // CR 117.4: Empty stack — advance to next phase.
+                // CR 117.4: Empty stack — advance to next phase. CR 500.1 +
+                // CR 500.8: a leave that ends the turn (the final step of a
+                // unit added after the cleanup step) defers while a
+                // resolution is live; the step's priority window stays open
+                // for the engine pipeline's retry.
                 match turns::advance_phase_once(state, events) {
-                    turns::AdvancePhaseOnce::Deferred => {}
+                    turns::AdvancePhaseOnce::Deferred => {
+                        return deferred_transition_outcome(state);
+                    }
                     turns::AdvancePhaseOnce::Entry(_) | turns::AdvancePhaseOnce::Skipped => {}
                 }
-                let (waiting_for, cleanup_deferred) =
-                    auto_advance_with_cleanup_deferred(state, events);
+                let (waiting_for, transition_deferred) =
+                    turns::auto_advance_reporting_deferral(state, events);
                 PriorityPassOutcome {
                     waiting_for,
                     consumed_stack_entries: 0,
-                    cleanup_deferred,
+                    transition_deferred,
                 }
             }
         } else {
             // CR 117.4: Non-empty stack — resolve the next object. A batch-safe
             // run of identical token triggers collapses into one step that
             // consumes K entries (Tier 3); otherwise exactly one entry resolves.
+            let traced = super::play_trace::stack_before_resolution(state);
             let consumed =
                 super::stack::resolve_next_with_limit(state, events, stack_resolution_limit);
+            if let Some(before) = traced {
+                super::play_trace::record_resolutions(state, &before, consumed);
+            }
 
             // After resolve_next: the stack shrank by `consumed` entries.
             // Update auto-pass baselines by the SAME amount so trigger-growth
@@ -210,7 +216,7 @@ pub(crate) fn handle_priority_pass_with_limit(
             PriorityPassOutcome {
                 waiting_for,
                 consumed_stack_entries: consumed,
-                cleanup_deferred: false,
+                transition_deferred: false,
             }
         }
     } else {
@@ -228,7 +234,7 @@ pub(crate) fn handle_priority_pass_with_limit(
         PriorityPassOutcome {
             waiting_for: WaitingFor::Priority { player: next },
             consumed_stack_entries: 0,
-            cleanup_deferred: false,
+            transition_deferred: false,
         }
     }
 }
@@ -315,6 +321,53 @@ pub fn pass_priority_structurally_legal(state: &GameState, player: PlayerId) -> 
         return false;
     }
     pass_priority_legality(state, player).is_ok()
+}
+
+/// CR 117.1 + CR 723.5: whether `player` has set Full Control, a standing
+/// refusal to have any priority window passed for them. Preference ownership
+/// follows the authorized submitter, as it does in `auto_pass_recommended`, so
+/// a controlled seat answers with its controller's preference.
+pub(crate) fn holds_full_control(state: &GameState, player: PlayerId) -> bool {
+    state.priority_passing_mode(turn_control::authorized_submitter_for_player(state, player))
+        == PriorityPassingMode::FullControl
+}
+
+/// The Standard ladder's standing answer for `player`'s priority window while
+/// `window_top` is the top of the stack (CR 117.1 + CR 117.3d).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StandingPriorityPass {
+    /// CR 117.1: Full Control refuses to have any window passed for this player.
+    Withheld,
+    /// CR 117.3d: the player stands committed to pass this window — a yield to
+    /// the top triggered ability, or the player's own object on top.
+    Granted,
+    /// No standing answer; the window needs a fresh decision.
+    Undecided,
+}
+
+/// CR 117.1 + CR 117.3d: the single authority for the Standard ladder's
+/// standing rungs, shared by `ai_support::auto_pass_recommended` (a
+/// recommendation the client submits as `PassPriority`) and the
+/// stack-resolution session, which executes it for every window it passes
+/// (`engine::stack_resolution_session_participant_authorizes_pass`), and by
+/// the turn-boundary auto-pass interrupt (`engine::priority_auto_pass_decision`).
+pub(crate) fn standing_priority_pass(
+    state: &GameState,
+    player: PlayerId,
+    window_top: Option<&StackEntry>,
+) -> StandingPriorityPass {
+    if holds_full_control(state, player) {
+        return StandingPriorityPass::Withheld;
+    }
+    match window_top {
+        // CR 117.3d: a yield is a pre-committed pass; an own object on top is
+        // the ladder's MTGA-parity standing pass (it outranks castability, see
+        // `auto_pass_recommended`).
+        Some(top) if state.is_priority_yielded(player, top) || top.controller == player => {
+            StandingPriorityPass::Granted
+        }
+        Some(_) | None => StandingPriorityPass::Undecided,
+    }
 }
 
 /// Determine the next player to receive priority, using APNAP order (CR 101.4).
@@ -458,7 +511,7 @@ mod tests {
         let outcome =
             handle_priority_pass_with_limit(PlayerId(1), &mut state, &mut Vec::new(), None);
 
-        assert!(outcome.cleanup_deferred);
+        assert!(outcome.transition_deferred);
         assert_eq!(state.phase, Phase::Cleanup);
         assert!(matches!(
             outcome.waiting_for,
@@ -885,6 +938,122 @@ mod tests {
             matches!(result, WaitingFor::RevealChoice { .. }),
             "Expected RevealChoice, got {:?}",
             result
+        );
+    }
+
+    fn spell_entry(id: u64, controller: PlayerId, card_id: CardId) -> StackEntry {
+        StackEntry {
+            id: ObjectId(id),
+            source_id: ObjectId(id),
+            controller,
+            kind: crate::types::game_state::StackEntryKind::Spell {
+                card_id,
+                ability: None,
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        }
+    }
+
+    /// A triggered ability whose latched source card is `card_id`.
+    fn trigger_entry(id: u64, controller: PlayerId, card_id: CardId) -> StackEntry {
+        let source_id = ObjectId(id);
+        let mut ability = ResolvedAbility::new(
+            crate::types::ability::Effect::NoOp,
+            vec![],
+            source_id,
+            controller,
+        );
+        ability.set_test_trigger_source_recursive(2, card_id);
+        StackEntry {
+            id: source_id,
+            source_id,
+            controller,
+            kind: crate::types::game_state::StackEntryKind::TriggeredAbility {
+                source_id,
+                ability: Box::new(ability),
+                condition: None,
+                trigger_event: None,
+                description: None,
+                source_name: String::new(),
+                subject_match_count: None,
+                die_result: None,
+                provenance: None,
+            },
+        }
+    }
+
+    fn yield_all_copies(state: &mut GameState, card_id: CardId) {
+        state.add_priority_yield(
+            PlayerId(0),
+            crate::types::game_state::YieldTarget::AllCopies {
+                card_id,
+                trigger_description: None,
+            },
+        );
+    }
+
+    #[test]
+    fn standing_pass_is_withheld_under_full_control() {
+        let mut state = setup();
+        state
+            .priority_passing_modes
+            .insert(PlayerId(0), PriorityPassingMode::FullControl);
+        let own_top = spell_entry(1, PlayerId(0), CardId(1));
+
+        assert_eq!(
+            standing_priority_pass(&state, PlayerId(0), Some(&own_top)),
+            StandingPriorityPass::Withheld
+        );
+        assert_eq!(
+            standing_priority_pass(&state, PlayerId(0), None),
+            StandingPriorityPass::Withheld
+        );
+    }
+
+    #[test]
+    fn standing_pass_is_granted_for_an_own_object_or_a_yielded_trigger() {
+        let mut state = setup();
+        let own_top = spell_entry(1, PlayerId(0), CardId(1));
+        assert_eq!(
+            standing_priority_pass(&state, PlayerId(0), Some(&own_top)),
+            StandingPriorityPass::Granted
+        );
+
+        let yielded_top = trigger_entry(2, PlayerId(1), CardId(77));
+        yield_all_copies(&mut state, CardId(77));
+        assert_eq!(
+            standing_priority_pass(&state, PlayerId(0), Some(&yielded_top)),
+            StandingPriorityPass::Granted
+        );
+    }
+
+    #[test]
+    fn standing_pass_is_undecided_without_a_standing_rung() {
+        let mut state = setup();
+        let opponent_top = trigger_entry(1, PlayerId(1), CardId(77));
+        assert_eq!(
+            standing_priority_pass(&state, PlayerId(0), Some(&opponent_top)),
+            StandingPriorityPass::Undecided
+        );
+        assert_eq!(
+            standing_priority_pass(&state, PlayerId(0), None),
+            StandingPriorityPass::Undecided
+        );
+
+        // Reach guard: P1 controls this trigger, so only the yield rung can
+        // grant it, and the stored yield does.
+        yield_all_copies(&mut state, CardId(77));
+        assert_eq!(
+            standing_priority_pass(&state, PlayerId(0), Some(&opponent_top)),
+            StandingPriorityPass::Granted
+        );
+        // Yields match only triggered abilities (`GameState::is_priority_yielded`),
+        // so the same stored yield does not cover a spell from that card.
+        let opponent_spell = spell_entry(2, PlayerId(1), CardId(77));
+        assert_eq!(
+            standing_priority_pass(&state, PlayerId(0), Some(&opponent_spell)),
+            StandingPriorityPass::Undecided
         );
     }
 }

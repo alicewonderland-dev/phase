@@ -530,10 +530,12 @@ fn counter_target_worth(ctx: &PolicyContext<'_>, entry: &StackEntry) -> f64 {
 /// every stack entry the AI does not control.
 ///
 /// Approximation: the counter's own target filter is not applied (the engine
-/// matcher is not reachable from here), so a counter that can only hit creature
-/// spells still sees a noncreature entry's impact. Accepted — the filter narrows
-/// the set, so this can only over-estimate, and `SelectTarget` still picks
-/// legally.
+/// matcher is not reachable from here), so a counter that can only hit
+/// noncreature spells still sees a creature entry's impact. Accepted — the
+/// filter narrows the set, so this can only over-estimate. Target selection
+/// picks legally, but "legally" can mean the AI's own spell when that is all
+/// the filter reaches; that cast is vetoed in `tactical_gate`
+/// (`counter_reaches_nothing_foreign`), not here.
 fn best_counter_impact(ctx: &PolicyContext<'_>) -> f64 {
     ctx.state
         .stack
@@ -606,16 +608,17 @@ mod tests {
     use engine::game::zones::create_object;
     use engine::types::ability::{
         AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, ContinuousModification,
-        ControllerRef, Duration, MultiTargetSpec, ResolvedAbility, StaticDefinition, TargetFilter,
-        TargetRef, TypeFilter, TypedFilter,
+        ControllerRef, Duration, ExtraPhaseAnchor, ExtraPhaseRecipient, MultiTargetSpec,
+        ResolvedAbility, StaticDefinition, TargetFilter, TargetRef, TypeFilter, TypedFilter,
     };
     use engine::types::format::FormatConfig;
     use engine::types::game_state::{
         ExtraPhase, GameState, PendingCast, StackEntryKind, TargetEffectDetail,
         TargetSelectionProgress, TargetSelectionSlot, WaitingFor,
     };
-    use engine::types::identifiers::{CardId, ObjectId};
+    use engine::types::identifiers::{CardId, ExtraPhaseId, ObjectId};
     use engine::types::mana::ManaCost;
+    use engine::types::phase::{PhaseGroup, TurnSegment};
     use engine::types::player::PlayerId;
     use engine::types::statics::StaticMode;
     use engine::types::zones::Zone;
@@ -1650,10 +1653,10 @@ mod tests {
                 AbilityDefinition::new(
                     AbilityKind::Activated,
                     Effect::AdditionalPhase {
-                        target: TargetFilter::Controller,
-                        phase: Phase::BeginCombat,
-                        after: Phase::PreCombatMain,
-                        followed_by: vec![Phase::PostCombatMain],
+                        recipient: ExtraPhaseRecipient::Controller,
+                        segment: TurnSegment::Phase(PhaseGroup::Combat),
+                        after: ExtraPhaseAnchor::this_main_phase(),
+                        followed_by: vec![TurnSegment::Phase(PhaseGroup::PostcombatMain)],
                         count: engine::types::ability::QuantityExpr::Fixed { value: 1 },
                         attacker_restriction: None,
                     },
@@ -1689,7 +1692,7 @@ mod tests {
             .state()
             .extra_phases
             .iter()
-            .any(|extra| extra.phase == Phase::BeginCombat));
+            .any(|extra| extra.segment == TurnSegment::Phase(PhaseGroup::Combat)));
         assert!(get_valid_attacker_ids(runner.state()).contains(&ready));
 
         runner
@@ -1758,14 +1761,9 @@ mod tests {
 
         // Reach guards.
         assert!(outcome.state().stack.is_empty());
-        assert!(
-            runner
-                .state()
-                .extra_phases
-                .iter()
-                .any(|extra| extra.phase == Phase::BeginCombat
-                    && extra.attacker_restriction.is_some())
-        );
+        assert!(runner.state().extra_phases.iter().any(|extra| extra.segment
+            == TurnSegment::Phase(PhaseGroup::Combat)
+            && extra.attacker_restriction.is_some()));
         assert!(get_valid_attacker_ids(runner.state()).contains(&unchosen));
 
         runner
@@ -1817,9 +1815,10 @@ mod tests {
         state.current_combat_attacker_restriction_source = Some(source);
         state.extra_phases.push(ExtraPhase {
             anchor: Phase::PostCombatMain,
-            phase: Phase::BeginCombat,
+            segment: TurnSegment::Phase(PhaseGroup::Combat),
             attacker_restriction: None,
             attacker_restriction_source: None,
+            id: ExtraPhaseId::default(),
         });
 
         // Reach guard: this is exactly the value HEAD's conjunct reads, so
@@ -1860,10 +1859,10 @@ mod tests {
                 AbilityDefinition::new(
                     AbilityKind::Activated,
                     Effect::AdditionalPhase {
-                        target: TargetFilter::Controller,
-                        phase: Phase::BeginCombat,
-                        after: Phase::PreCombatMain,
-                        followed_by: vec![Phase::PostCombatMain],
+                        recipient: ExtraPhaseRecipient::Controller,
+                        segment: TurnSegment::Phase(PhaseGroup::Combat),
+                        after: ExtraPhaseAnchor::this_main_phase(),
+                        followed_by: vec![TurnSegment::Phase(PhaseGroup::PostcombatMain)],
                         count: engine::types::ability::QuantityExpr::Fixed { value: 1 },
                         attacker_restriction: None,
                     },
@@ -1913,7 +1912,7 @@ mod tests {
         assert!(!state
             .extra_phases
             .iter()
-            .any(|e| e.phase == Phase::BeginCombat));
+            .any(|e| e.segment == TurnSegment::Phase(PhaseGroup::Combat)));
         assert!(state
             .combat
             .as_ref()

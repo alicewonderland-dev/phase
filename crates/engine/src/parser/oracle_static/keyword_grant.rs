@@ -247,7 +247,14 @@ pub(crate) fn parse_spells_have_keyword_for_test(text: &str) -> Option<StaticDef
 ///     Replicate functions end-to-end with no engine change.
 fn parse_granted_self_cost_keyword(keyword_str: &str) -> Option<Keyword> {
     [
-        ("blitz", Keyword::Blitz as fn(ManaCost) -> Keyword),
+        // CR 702.152a: Blitz's cost enum (`BlitzCost`) admits a non-mana residual
+        // (Sabin/Underdog), but a *granted* self-referential blitz is always pure
+        // mana ("equal to its mana cost"), so the grant binds `BlitzCost::Mana`.
+        (
+            "blitz",
+            (|c| Keyword::Blitz(crate::types::keywords::BlitzCost::Mana(c)))
+                as fn(ManaCost) -> Keyword,
+        ),
         ("replicate", Keyword::Replicate as fn(ManaCost) -> Keyword),
     ]
     .into_iter()
@@ -843,24 +850,31 @@ pub(crate) fn parse_chosen_qualifier_subject(tp: &TextPair<'_>) -> Option<Target
     Some(TargetFilter::Typed(typed))
 }
 
-/// CR 602.1 + CR 603.1: The set of ability categories a "[~ has] all
-/// [activated|triggered|activated and triggered] abilities of [source]" grant
-/// donates. Activated and triggered abilities land in different stores via
-/// different continuous modifications (`GrantAllActivatedAbilitiesOf` →
-/// `obj.abilities`; `GrantAllTriggeredAbilitiesOf` → `obj.trigger_definitions`),
+/// CR 602.1 + CR 603.1 + CR 606.2: The set of ability categories a "[~ has]
+/// all [activated|triggered|loyalty|activated and triggered] abilities of
+/// [source]" grant donates. Activated and triggered abilities land in
+/// different stores via different continuous modifications
+/// (`GrantAllActivatedAbilitiesOf` → `obj.abilities`;
+/// `GrantAllTriggeredAbilitiesOf` → `obj.trigger_definitions`), and loyalty
+/// abilities donate via the kind selector on the activated authority
+/// (`GrantAllActivatedAbilitiesOf { kind: Some(Loyalty) }` → `obj.abilities`,
+/// since loyalty abilities ARE activated abilities),
 /// so the parser captures which categories the phrase named.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GrantedAbilityKinds {
     Activated,
     Triggered,
+    Loyalty,
     ActivatedAndTriggered,
 }
 
-/// CR 602.1 + CR 603.1: The grant-phrase category axis. The conjunction form
-/// ("activated and triggered" / "triggered and activated", order-insensitive) is
-/// tried before the single-category leaves so the longer phrase wins. The plural
-/// and the singular-distributive activated form ("each activated ability of",
-/// Locus of Enlightenment) map to the same activated set.
+/// CR 602.1 + CR 603.1 + CR 606.2: The grant-phrase category axis. The
+/// conjunction form ("activated and triggered" / "triggered and activated",
+/// order-insensitive) is tried before the single-category leaves so the longer
+/// phrase wins. The plural and the singular-distributive activated form ("each
+/// activated ability of", Locus of Enlightenment) map to the same activated
+/// set; the loyalty leaf ("all loyalty abilities of", Nicol Bolas,
+/// Dragon-God) maps to the loyalty subset.
 fn parse_granted_ability_kinds(input: &str) -> OracleResult<'_, GrantedAbilityKinds> {
     alt((
         value(
@@ -873,6 +887,10 @@ fn parse_granted_ability_kinds(input: &str) -> OracleResult<'_, GrantedAbilityKi
         value(
             GrantedAbilityKinds::Triggered,
             tag("all triggered abilities of "),
+        ),
+        value(
+            GrantedAbilityKinds::Loyalty,
+            tag("all loyalty abilities of "),
         ),
         value(
             GrantedAbilityKinds::Activated,
@@ -933,7 +951,8 @@ fn parse_activate_once_each_turn_rider(input: &str) -> OracleResult<'_, Activati
 /// rider (a trailing sentence that yields no standalone static) into the `cap` of
 /// the most recently emitted `GrantAllActivatedAbilitiesOf` modification, returning
 /// `true` when the fold lands. Returns `false` when `segment` is not the rider, or
-/// when there is no still-uncapped ability grant preceding it to attach to.
+/// when there is no still-uncapped ability grant preceding it to attach to, or
+/// the nearest grant has an unsupported kind-selected rider.
 ///
 /// This is the SHARED grant-rider primitive: it composes the once-per-turn cap with
 /// the STANDARD grant parse (sentence 1 → `GrantAllActivatedAbilitiesOf` via the
@@ -951,10 +970,16 @@ pub(super) fn fold_grant_cap_rider(segment: &str, defs: &mut [StaticDefinition])
     else {
         return false;
     };
-    // Attach to the most recent grant modification that is still uncapped.
+    // Kind-selected grant riders are unsupported here. Stop at that grant so
+    // the caller declines the whole line instead of capping an older sibling.
     for def in defs.iter_mut().rev() {
         for modification in def.modifications.iter_mut().rev() {
-            if let ContinuousModification::GrantAllActivatedAbilitiesOf { cap, .. } = modification {
+            if let ContinuousModification::GrantAllActivatedAbilitiesOf { cap, kind, .. } =
+                modification
+            {
+                if kind.is_some() {
+                    return false;
+                }
                 if cap.is_none() {
                     *cap = Some(restriction);
                     return true;
@@ -1026,20 +1051,9 @@ fn grant_source_noun_phrase(input: &str) -> OracleResult<'_, crate::types::abili
             ),
             tag("all creatures your opponents control"),
         ),
-        // CR 613.1f: "all creature cards in all graveyards" (Necrotic Ooze)
-        value(
-            TargetFilter::Typed(TypedFilter::creature().properties(vec![FilterProp::InZone {
-                zone: Zone::Graveyard,
-            }])),
-            tag("all creature cards in all graveyards"),
-        ),
-        // CR 613.1f: "all land cards in all graveyards"
-        value(
-            TargetFilter::Typed(TypedFilter::land().properties(vec![FilterProp::InZone {
-                zone: Zone::Graveyard,
-            }])),
-            tag("all land cards in all graveyards"),
-        ),
+        // CR 613.1f + CR 108.3: "all <type> cards in your graveyard | all
+        // graveyards" (Necrotic Ooze, Thranduil, the Elvenking).
+        grant_graveyard_source,
         // CR 613.1f: "all lands on the battlefield" (Manascape Refractor)
         // — zone is explicit in the phrase; encode it so graveyard/hand land
         // cards are excluded from the runtime provider scan.
@@ -1048,6 +1062,25 @@ fn grant_source_noun_phrase(input: &str) -> OracleResult<'_, crate::types::abili
                 zone: Zone::Battlefield,
             }])),
             tag("all lands on the battlefield"),
+        ),
+        // CR 613.1f: "all other planeswalkers on the battlefield" (Nicol Bolas,
+        // Dragon-God) — zone is explicit in the phrase, encoded so planeswalker
+        // cards in other zones are excluded from the runtime provider scan; the
+        // English "other" is the self-exclusion conjunct (Kraj precedent).
+        value(
+            TargetFilter::And {
+                filters: vec![
+                    TargetFilter::Typed(TypedFilter::new(TypeFilter::Planeswalker).properties(
+                        vec![FilterProp::InZone {
+                            zone: Zone::Battlefield,
+                        }],
+                    )),
+                    TargetFilter::Not {
+                        filter: Box::new(TargetFilter::SelfRef),
+                    },
+                ],
+            },
+            tag("all other planeswalkers on the battlefield"),
         ),
         // CR 613.1f: "all legendary creatures you control" (Robaran Mercenaries)
         // — battlefield permanents; scope to InZone { Battlefield } so
@@ -1066,20 +1099,6 @@ fn grant_source_noun_phrase(input: &str) -> OracleResult<'_, crate::types::abili
                     ]),
             ),
             tag("all legendary creatures you control"),
-        ),
-        // CR 613.1f: "all artifact cards in your graveyard"
-        // CR 108.3: Graveyard cards are "yours" by ownership, not control —
-        // use FilterProp::Owned rather than TypedFilter::controller here.
-        value(
-            TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact).properties(vec![
-                FilterProp::Owned {
-                    controller: ControllerRef::You,
-                },
-                FilterProp::InZone {
-                    zone: Zone::Graveyard,
-                },
-            ])),
-            tag("all artifact cards in your graveyard"),
         ),
         // CR 607.2a + CR 607.2d: "the last chosen card" (Koh, the Face Stealer) —
         // the card most recently recorded on the host via `Effect::RememberCard`
@@ -1123,26 +1142,85 @@ fn grant_exiled_source(input: &str) -> OracleResult<'_, crate::types::ability::T
             ),
         ),
         value(TargetFilter::ExiledBySource, tag("the exiled card")),
-        // "all [creature] cards exiled with it/~". The optional "creature"
-        // qualifier intersects `ExiledBySource` with the Creature type filter
-        // (CR 205.3 — a creature card is type Creature in exile) so Agatha grants
-        // only creature cards' abilities; the untyped form (Myr Welder, Territory
+        // "all [creature|land] cards exiled with it/~". The optional card-type
+        // qualifier intersects `ExiledBySource` with the matching type filter
+        // (CR 205.2a — a creature/land card is type Creature/Land in exile) so
+        // Agatha grants only creature cards' abilities and Steward of the
+        // Harvest only land cards'; the untyped form (Myr Welder, Territory
         // Forge) stays a bare `ExiledBySource`.
         (
             tag("all "),
-            opt(tag("creature ")),
+            opt(grant_exiled_card_type_qualifier),
             tag("cards exiled with "),
             alt((tag("it"), tag("~"))),
         )
-            .map(|(_, creature_qualifier, _, _)| match creature_qualifier {
-                Some(_) => TargetFilter::And {
-                    filters: vec![
-                        TargetFilter::Typed(TypedFilter::creature()),
-                        TargetFilter::ExiledBySource,
-                    ],
+            .map(|(_, qualifier, _, _)| match qualifier {
+                Some(typed) => TargetFilter::And {
+                    filters: vec![TargetFilter::Typed(typed), TargetFilter::ExiledBySource],
                 },
                 None => TargetFilter::ExiledBySource,
             }),
+    ))
+    .parse(input)
+}
+
+/// CR 205.2a + CR 607.2a: card-type qualifier of the exiled-cards grant set.
+/// Only card types printed with this phrase are accepted; any other word
+/// (nonland, artifact, ...) fails the following `cards exiled with ` tag so the
+/// whole clause declines rather than mis-scoping the set. The trailing space is
+/// part of each tag so "lands"/"landfall" cannot match.
+fn grant_exiled_card_type_qualifier(input: &str) -> OracleResult<'_, TypedFilter> {
+    alt((
+        value(TypedFilter::creature(), tag("creature ")),
+        value(TypedFilter::land(), tag("land ")),
+    ))
+    .parse(input)
+}
+
+/// CR 613.1f + CR 113.3: "all <type> cards in your graveyard | all graveyards" —
+/// the graveyard-card source set of an ability-grant-by-reference static
+/// (Necrotic Ooze: creature cards in all graveyards; Thranduil, the Elvenking:
+/// Elf cards in your graveyard). Composed along two independent axes rather
+/// than one arm per printed type:
+///   - the type word, via the shared [`nom_target::parse_type_filter_word`]
+///     alphabet — a card type ("creature", "land", "artifact") or a subtype
+///     (CR 205.3m: the creature type "Elf");
+///   - the graveyard owner scope ([`grant_graveyard_owner`]).
+///
+/// CR 109.2a: a description naming "card" and a zone means a card matching it
+/// in that zone, so the set is pinned to `Zone::Graveyard`.
+fn grant_graveyard_source(input: &str) -> OracleResult<'_, TargetFilter> {
+    (
+        tag("all "),
+        nom_target::parse_type_filter_word,
+        tag(" cards in "),
+        grant_graveyard_owner,
+    )
+        .map(|(_, type_filter, _, owner)| {
+            // CR 108.3: a card in a graveyard is "yours" by ownership, not
+            // control — scope with `FilterProp::Owned`, never
+            // `TypedFilter::controller`. "All graveyards" carries no owner axis.
+            let properties = owner
+                .map(|controller| FilterProp::Owned { controller })
+                .into_iter()
+                .chain(std::iter::once(FilterProp::InZone {
+                    zone: Zone::Graveyard,
+                }))
+                .collect();
+            TargetFilter::Typed(TypedFilter::new(type_filter).properties(properties))
+        })
+        .parse(input)
+}
+
+/// CR 108.3 + CR 109.5: the graveyard owner axis of [`grant_graveyard_source`].
+/// "your graveyard" names the graveyard of the player who controls the object
+/// with the ability (`ControllerRef::You` resolves against the recipient's
+/// controller in the layer-6 expansion); "all graveyards" spans every
+/// player's (`None`).
+fn grant_graveyard_owner(input: &str) -> OracleResult<'_, Option<ControllerRef>> {
+    alt((
+        value(Some(ControllerRef::You), tag("your graveyard")),
+        value(None, tag("all graveyards")),
     ))
     .parse(input)
 }
@@ -1270,7 +1348,19 @@ pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModifi
     // (Myr Welder / Agatha activated; Koh, the Face Stealer activated AND
     // triggered, source = the last chosen card). Typed/counter-gated sources stay
     // a gap (follow-ups).
-    if let Some((kinds, source)) = parse_grant_all_abilities_clause(unquoted_tp.lower) {
+    if let Some((kinds, source)) = parse_grant_all_abilities_clause(&grant_clause_probe_lower(text))
+    {
+        // CR 607.5 + CR 606.2 + Bolas ruling 2024-01-12: a kind-selected loyalty
+        // grant donates linked pairs (e.g. Karn −3 + Ashiok −X onto one Bolas)
+        // that the source-level exile ledger cannot attribute to their donor pair
+        // (no donor binding on the installed grant, activation, or links).
+        // Refuse at emission so the sentence stays a loud `static_structure` gap
+        // rather than over-granting into the recipient's source-wide pile.
+        // Unblocks when the
+        // ledger carries donor/pair identity (see plan-r2 §4).
+        if matches!(kinds, GrantedAbilityKinds::Loyalty) {
+            return Vec::new();
+        }
         // CR 602.1 + CR 603.1: emit one continuous modification per donated
         // category. Activated and triggered land in different stores, so a
         // conjunction grant produces BOTH mods over the same `source`.
@@ -1286,6 +1376,19 @@ pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModifi
             mods.push(ContinuousModification::GrantAllActivatedAbilitiesOf {
                 source: source.clone(),
                 cap: None,
+                kind: None,
+            });
+        }
+        // CR 606.1 + CR 606.2: a loyalty grant donates the loyalty abilities
+        // (activated abilities with a loyalty symbol in the cost) of the source
+        // set, via the kind selector on the activated authority. Kind-selected
+        // grant riders remain unsupported by `fold_grant_cap_rider`, which
+        // declines the whole line when one follows this grant.
+        if matches!(kinds, GrantedAbilityKinds::Loyalty) {
+            mods.push(ContinuousModification::GrantAllActivatedAbilitiesOf {
+                source: source.clone(),
+                cap: None,
+                kind: Some(ActivatedAbilityKind::Loyalty),
             });
         }
         if matches!(
@@ -1657,6 +1760,70 @@ pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModifi
     ));
 
     modifications
+}
+
+/// The clause-probe recipe the by-reference grant match evaluates: lowercase →
+/// where-X strip (unless quoted) → `nom_tag_tp "also "` →
+/// `strip_quoted_segments` → lowercase. Shared by the `:1351` emission-site
+/// call and [`find_refused_loyalty_grant_sentence`] so the finder and the
+/// emission site can never disagree about what the clause parser saw.
+fn grant_clause_probe_lower(text: &str) -> String {
+    let text_lower = text.to_lowercase();
+    let text_tp = TextPair::new(text, &text_lower);
+    // allow-noncombinator: structural normalization branch, not dispatch
+    let (stripped_tp, _) = if text.contains('"') {
+        (text_tp, None)
+    } else {
+        super::oracle_effect::strip_trailing_where_x(text_tp)
+    };
+    let tp = nom_tag_tp(&stripped_tp, "also ").unwrap_or(stripped_tp);
+    let text_stripped = tp.original;
+    let unquoted_text = strip_quoted_segments(text_stripped);
+    unquoted_text.to_lowercase()
+}
+
+/// CR 606.2 + CR 607.5: locate the first refused by-reference loyalty sentence
+/// (`:1360` shape) on an adopted static line, so the Priority-7 gate can carry
+/// the recognized refusal as the same typed `static_structure` residual 14a
+/// would have emitted (Matt review 5564241267 MED).
+///
+/// Exact-mirror contract: the verdict runs the EXACT clause parser
+/// ([`parse_grant_all_abilities_clause`]) over the EXACT emission-site clause
+/// probe ([`grant_clause_probe_lower`]) per quote-aware sentence, so
+/// finder-verdict ⟺ `:1360` would-have-refused for direct-dispatch sentences.
+/// Bound: emission applies anthem-level predicate transforms the finder does
+/// not replicate (turn-suffix strip, for-each/as-long-as routing), so a
+/// turn-suffixed loyalty sentence refuses at emission yet fails the finder's
+/// clause — a false negative for which the old silent drop persists; no
+/// in-repo or printed instance exists.
+///
+/// Re-admission coupling trap: deleting the `:1360` early return makes this
+/// finder a FALSE POSITIVE (honestly-emitted loyalty grants would also match),
+/// so re-admission must delete or gate the finder in the same change.
+///
+/// One-gap-per-line boundary: returns the FIRST refused sentence only. If a
+/// multi-leaf composed line ever prints, widen to one gap per leaf plus a
+/// multi-leaf positive leg.
+pub(crate) fn find_refused_loyalty_grant_sentence(static_line: &str) -> Option<String> {
+    let line_lower = static_line.to_lowercase();
+    if !nom_primitives::scan_contains(&line_lower, "loyalty abilities of") {
+        return None;
+    }
+    for sentence in split_static_sentences(static_line) {
+        let sentence_lower = sentence.to_lowercase();
+        let Some(subject_end) = find_continuous_predicate_start(&sentence_lower) else {
+            continue;
+        };
+        let predicate = sentence[subject_end + 1..].trim();
+        let probe = grant_clause_probe_lower(predicate);
+        if let Some((kinds, _)) = parse_grant_all_abilities_clause(&probe) {
+            // Same expression as the `:1360` early return — grep-able coupling.
+            if matches!(kinds, GrantedAbilityKinds::Loyalty) {
+                return Some(sentence);
+            }
+        }
+    }
+    None
 }
 
 /// CR 613.4c + CR 702: In a granted-keyword "where X is its `<P/T/mana value>`"

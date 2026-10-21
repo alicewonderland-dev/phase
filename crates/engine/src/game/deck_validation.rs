@@ -14,7 +14,7 @@ use crate::types::custom_format::{
     passes_legacy_axis_gate, AntePolicy, CommandZoneMode, LegalityRules, SetCode,
 };
 use crate::types::format::{
-    CardPool, DeckCopyLimit, DeckSizeSubject, FormatConfig, GameFormat, SelectedFormat,
+    CardPool, DeckCopyLimit, DeckSizeSubject, DeckSupply, FormatConfig, GameFormat, SelectedFormat,
     SideboardPolicy,
 };
 use crate::types::keywords::{Keyword, PartnerType};
@@ -63,6 +63,19 @@ pub struct DeckCompatibilityRequest {
         deserialize_with = "deserialize_draft_set_codes"
     )]
     pub draft_set_codes: Vec<String>,
+}
+
+impl DeckCompatibilityRequest {
+    /// Whether every card slot of the submission is empty.
+    pub fn is_empty_submission(&self) -> bool {
+        self.main_deck.is_empty()
+            && self.sideboard.is_empty()
+            && self.commander.is_empty()
+            && self.companion.is_empty()
+            && self.planar_deck.is_empty()
+            && self.scheme_deck.is_empty()
+            && self.signature_spell.is_empty()
+    }
 }
 
 /// Engine-authored deck-builder state for selecting an Oathbreaker's signature
@@ -397,6 +410,15 @@ pub fn validate_deck_for_format(
         .is_some_and(|selected| selected.rules().is_err())
     {
         return Err(vec![CUSTOM_FORMAT_UNRESOLVED.to_string()]);
+    }
+    // An empty submission requests the engine-supplied deck.
+    if request.is_empty_submission()
+        && request
+            .selected_format
+            .as_ref()
+            .is_some_and(|selected| selected.tag().deck_supply() != DeckSupply::PlayerBuilt)
+    {
+        return Ok(());
     }
     let unknown_cards = collect_unknown_cards(db, request);
     // CR 100.4a / CR 903.5e: A "BO3-ready" deck is one with a real sideboard
@@ -750,6 +772,20 @@ fn printed_in_any_set(db: &CardDatabase, name: &str, sets: &[SetCode]) -> bool {
         sets.iter()
             .any(|allowed| allowed.0.eq_ignore_ascii_case(printed))
     })
+}
+
+/// Every name in a Limited deck must resolve before game admission.
+/// A draft session applies its configured minimum at submission; this
+/// generic gate has no session provenance from which to recover that minimum.
+fn evaluate_limited(unknown_cards: &BTreeSet<String>) -> CompatibilityCheck {
+    let mut reasons = Vec::new();
+    if !unknown_cards.is_empty() {
+        reasons.push(summarize_cards("Unknown cards", unknown_cards, 6));
+    }
+    CompatibilityCheck {
+        compatible: reasons.is_empty(),
+        reasons,
+    }
 }
 
 /// Shared validation for constructed-shaped formats (Standard, Pioneer,
@@ -2604,7 +2640,8 @@ fn evaluate_selected_format_summary(
         | GameFormat::Historic
         | GameFormat::Timeless
         | GameFormat::Pauper
-        | GameFormat::Freeform => quick_constructed_check(
+        | GameFormat::Freeform
+        | GameFormat::Dandan => quick_constructed_check(
             db,
             request,
             &format_rules,
@@ -2653,8 +2690,14 @@ fn evaluate_selected_format_summary(
         GameFormat::Brawl | GameFormat::HistoricBrawl => {
             quick_brawl_check(db, request, &format.label(), &format_rules)
         }
-        GameFormat::FreeForAll | GameFormat::TwoHeadedGiant | GameFormat::Limited => {
-            QuickCheckResult::compatible()
+        GameFormat::FreeForAll | GameFormat::TwoHeadedGiant => QuickCheckResult::compatible(),
+        GameFormat::Limited => {
+            let unknown_cards = collect_unknown_cards(db, request);
+            let check = evaluate_limited(&unknown_cards);
+            QuickCheckResult {
+                reason: check.reasons.into_iter().next(),
+                unknown_cards,
+            }
         }
         // Phase 1d: reachable for a `Resolved` Custom config (the early guard
         // above only answers "no opinion" for an unresolvable bare
@@ -3063,7 +3106,8 @@ fn evaluate_selected_format(
         | GameFormat::Historic
         | GameFormat::Timeless
         | GameFormat::Pauper
-        | GameFormat::Freeform => {
+        | GameFormat::Freeform
+        | GameFormat::Dandan => {
             let check = evaluate_constructed(
                 db,
                 request,
@@ -3175,7 +3219,14 @@ fn evaluate_selected_format(
             }
             check.compatible
         }
-        GameFormat::FreeForAll | GameFormat::TwoHeadedGiant | GameFormat::Limited => true,
+        GameFormat::FreeForAll | GameFormat::TwoHeadedGiant => true,
+        GameFormat::Limited => {
+            let check = evaluate_limited(unknown_cards);
+            if !check.compatible {
+                reasons.extend(check.reasons);
+            }
+            check.compatible
+        }
         // Phase 1d: reachable for a `Resolved` Custom config (the early guard
         // above only fails closed for an unresolvable bare `Tag(Custom(_))`),
         // and delegates to the real evaluator.
@@ -5613,6 +5664,88 @@ mod tests {
         let counts = combined_copy_counts(&db, &request, CommandZoneNetting::NetAgainstMainDeck);
         assert_eq!(counts.get("nazgûl"), Some(&10));
         assert!(!copy_limit_violations(&db, &counts, DeckCopyLimit::UpTo(1)).is_empty());
+    }
+
+    #[test]
+    fn slash_spellings_are_known_and_share_one_copy_count() {
+        let db_json = serde_json::json!({
+            "summon: choco/mog": {
+                "name": "Summon: Choco/Mog",
+                "mana_cost": { "type": "NoCost" },
+                "card_type": { "supertypes": [], "core_types": [], "subtypes": [] },
+                "power": null, "toughness": null, "loyalty": null, "defense": null,
+                "oracle_text": null, "non_ability_text": null, "flavor_name": null,
+                "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": null, "scryfall_oracle_id": null
+            },
+            "revival": {
+                "name": "Revival",
+                "mana_cost": { "type": "NoCost" },
+                "card_type": { "supertypes": [], "core_types": [], "subtypes": [] },
+                "power": null, "toughness": null, "loyalty": null, "defense": null,
+                "oracle_text": null, "non_ability_text": null, "flavor_name": null,
+                "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": null, "scryfall_oracle_id": null
+            },
+            "revenge": {
+                "name": "Revenge",
+                "mana_cost": { "type": "NoCost" },
+                "card_type": { "supertypes": [], "core_types": [], "subtypes": [] },
+                "power": null, "toughness": null, "loyalty": null, "defense": null,
+                "oracle_text": null, "non_ability_text": null, "flavor_name": null,
+                "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": null, "scryfall_oracle_id": null
+            },
+            // Supports the request's commander field so it does not itself
+            // register as unknown and pollute the assertion below.
+            "legal commander": {
+                "name": "Legal Commander",
+                "mana_cost": { "type": "NoCost" },
+                "card_type": { "supertypes": ["Legendary"], "core_types": ["Creature"], "subtypes": [] },
+                "power": null, "toughness": null, "loyalty": null, "defense": null,
+                "oracle_text": null, "non_ability_text": null, "flavor_name": null,
+                "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": null, "scryfall_oracle_id": null
+            }
+        })
+        .to_string();
+        let db = CardDatabase::from_json_str(&db_json).unwrap();
+
+        let mut main = expand("Summon: Choco/Mog", 3);
+        main.extend(expand("Summon: Choco // Mog", 2));
+        main.extend(expand("Revival/Revenge", 3));
+        main.extend(expand("Revival // Revenge", 2));
+        main.extend(expand("Summon: Choco", 1));
+        let request = DeckCompatibilityRequest {
+            main_deck: main,
+            sideboard: Vec::new(),
+            commander: vec!["Legal Commander".to_string()],
+            companion: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
+            selected_format: None,
+            selected_match_type: None,
+            player_count: default_player_count(),
+            summary_only: false,
+            draft_set_codes: Vec::new(),
+        };
+
+        let unknown: Vec<String> = collect_unknown_cards(&db, &request).into_iter().collect();
+        assert_eq!(unknown, vec!["Summon: Choco".to_string()]);
+
+        let counts = combined_copy_counts(&db, &request, CommandZoneNetting::NetAgainstMainDeck);
+        assert_eq!(counts.get("summon: choco/mog"), Some(&5));
+        assert_eq!(counts.get("revival"), Some(&5));
+
+        let violations = copy_limit_violations(&db, &counts, DeckCopyLimit::UpTo(4));
+        assert!(violations.contains("Summon: Choco/Mog (5 copies)"));
+        assert!(violations.contains("Revival (5 copies)"));
+        assert_eq!(
+            violations.len(),
+            2,
+            "exactly these two names exceed the cap"
+        );
     }
 
     #[test]
@@ -8888,6 +9021,107 @@ mod tests {
     /// ever drift, `momir_madness_snow_basics_pass` below catches it.
     fn momir_madness_deck() -> Vec<String> {
         crate::game::deck_loading::momir_fixed_deck_names()
+    }
+
+    fn dandan_request(main: Vec<String>, summary_only: bool) -> DeckCompatibilityRequest {
+        DeckCompatibilityRequest {
+            main_deck: main,
+            sideboard: Vec::new(),
+            commander: Vec::new(),
+            companion: Vec::new(),
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Dandan)),
+            selected_match_type: None,
+            player_count: default_player_count(),
+            summary_only,
+            draft_set_codes: Vec::new(),
+        }
+    }
+
+    /// Dandân's deck rules come from its format axes (exactly 80, no sideboard,
+    /// no commander slot, unlimited copies, no card pool), read by the shared
+    /// constructed validator on both dispatch paths.
+    #[test]
+    fn dandan_deck_compatibility_reads_the_format_axes_on_both_paths() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        for summary_only in [false, true] {
+            let reasons_of = |request: &DeckCompatibilityRequest| {
+                let result = evaluate_deck_compatibility(&db, request);
+                (
+                    result.selected_format_compatible,
+                    result.selected_format_reasons,
+                )
+            };
+
+            // Positive reach-guard: eighty copies of one nonbasic card pass, so
+            // the refusals below are measured against an accepted request.
+            let (compatible, reasons) =
+                reasons_of(&dandan_request(expand("Legal Standard", 80), summary_only));
+            assert_eq!(
+                compatible,
+                Some(true),
+                "summary_only={summary_only}: {reasons:?}"
+            );
+
+            let (compatible, reasons) =
+                reasons_of(&dandan_request(expand("Legal Standard", 79), summary_only));
+            assert_eq!(compatible, Some(false));
+            assert!(
+                reasons.iter().any(|r| r.contains("exactly 80")),
+                "summary_only={summary_only}: {reasons:?}"
+            );
+
+            // The pool is `AdmitsEveryCard`: a card no legality table admits is
+            // accepted, while the same list under Standard is refused for that card.
+            let (compatible, reasons) =
+                reasons_of(&dandan_request(expand("Not Standard", 80), summary_only));
+            assert_eq!(
+                compatible,
+                Some(true),
+                "summary_only={summary_only}: {reasons:?}"
+            );
+            let mut under_standard = dandan_request(expand("Not Standard", 80), summary_only);
+            under_standard.selected_format = Some(SelectedFormat::Tag(GameFormat::Standard));
+            let (compatible, reasons) = reasons_of(&under_standard);
+            assert_eq!(compatible, Some(false));
+            assert!(
+                reasons.iter().any(|r| r.contains("Not Standard")),
+                "summary_only={summary_only}: {reasons:?}"
+            );
+
+            let mut sideboarded = dandan_request(expand("Legal Standard", 80), summary_only);
+            sideboarded.sideboard = vec!["Legal Standard".to_string()];
+            let (compatible, reasons) = reasons_of(&sideboarded);
+            assert_eq!(compatible, Some(false));
+            assert!(
+                reasons
+                    .iter()
+                    .any(|r| r.contains("does not allow a sideboard")),
+                "summary_only={summary_only}: {reasons:?}"
+            );
+
+            let mut commanded = dandan_request(expand("Legal Standard", 80), summary_only);
+            commanded.commander = vec!["Legal Commander".to_string()];
+            let (compatible, reasons) = reasons_of(&commanded);
+            assert_eq!(compatible, Some(false));
+            assert!(
+                reasons
+                    .iter()
+                    .any(|r| r.contains("do not use a commander slot")),
+                "summary_only={summary_only}: {reasons:?}"
+            );
+
+            let mut unknown = expand("Legal Standard", 79);
+            unknown.push("No Such Card".to_string());
+            let (compatible, reasons) = reasons_of(&dandan_request(unknown, summary_only));
+            assert_eq!(compatible, Some(false));
+            assert!(
+                reasons.iter().any(|r| r.contains("No Such Card")),
+                "summary_only={summary_only}: {reasons:?}"
+            );
+        }
     }
 
     #[test]

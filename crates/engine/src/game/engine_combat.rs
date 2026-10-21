@@ -302,12 +302,10 @@ fn process_declaration_triggers_with_delayed_phase(
     let waiting_before = state.waiting_for.clone();
     let mut batch_events = vec![GameEvent::PhaseChanged { phase: state.phase }];
     batch_events.extend_from_slice(trigger_events);
-    let outcome = triggers::process_triggers_with_delayed_phase_events(
-        state,
-        &batch_events,
-        &batch_events,
-        events,
-    );
+    // CR 603.3b: printed and delayed triggers from one declaration are ordered
+    // in the same choice.
+    let outcome =
+        triggers::process_triggers_with_delayed_declaration_events(state, &batch_events, events);
     outcome.prompt.filter(|prompt| {
         matches!(prompt, WaitingFor::OrderTriggers { .. }) || *prompt != waiting_before
     })
@@ -858,18 +856,9 @@ fn next_blocker_or_finish_declaration(
     _events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
     if let Some(player) = super::combat::next_defending_player_to_declare_blockers(state) {
-        let valid_block_targets = super::combat::get_valid_block_targets_for_player(state, player);
-        let valid_blocker_ids = super::combat::ordered_valid_blocker_ids(&valid_block_targets);
-        let block_requirements = super::combat::block_requirements_for_player(state, player);
-        let blocker_constraints =
-            super::combat::blocker_constraints_for_player(state, player, &valid_block_targets);
-        return Ok(WaitingFor::DeclareBlockers {
-            player,
-            valid_blocker_ids,
-            valid_block_targets,
-            block_requirements,
-            blocker_constraints,
-        });
+        return Ok(super::combat::build_declare_blockers_waiting_for(
+            state, player,
+        ));
     }
 
     // CR 509.2a + CR 802.4: After each defending player has declared blockers

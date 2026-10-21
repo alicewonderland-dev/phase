@@ -4,9 +4,9 @@ use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::game::game_object::AttachTarget;
 use crate::game::targeting::resolved_object_ids_for_filter;
 use crate::types::ability::{
-    AbilityCondition, AttachCardinality, AttachSelection, Effect, EffectError, EffectKind,
-    FilterProp, MultiTargetSpec, QuantityExpr, ResolvedAbility, TargetChoiceTiming, TargetFilter,
-    TargetRef, TypedFilter,
+    AbilityCondition, AttachCardinality, AttachSelection, AttachmentReferent, Effect, EffectError,
+    EffectKind, FilterProp, MultiTargetSpec, QuantityExpr, ResolvedAbility, TargetChoiceTiming,
+    TargetFilter, TargetRef, TypedFilter,
 };
 use crate::types::card_type::CoreType;
 use crate::types::events::GameEvent;
@@ -269,6 +269,48 @@ fn resolve_bound_attachment_operation(
         return Ok(AttachResolutionOutcome::Completed);
     }
 
+    // CR 115.6 + CR 601.2c + CR 602.2b + CR 603.3d + CR 608.2c: a printed
+    // "attach … to up to one target creature …" makes the HOST optional — zero
+    // targets may be chosen. The ability still requires targets, but with none
+    // chosen it is not targeted, and it still resolves. An announced host slot is bound before this resolver runs
+    // (CR 601.2c for spells, CR 602.2b for activated abilities, CR 603.3d for
+    // triggered abilities), so arriving here with NO host binding means the
+    // controller chose none: the instruction is followed in order and does
+    // nothing (CR 608.2c). The ability itself resolved, so emit the resolution
+    // event and complete rather than surfacing a missing-operand error.
+    //
+    // Gate on an OBJECT host population. `attach_host_target()` only ever binds
+    // object hosts, so a player-host Attach (no corpus card prints one) must not
+    // be silently skipped, and a context-ref/scan host needs no announced slot —
+    // its absence stays the missing-operand error below, unchanged.
+    // CR 115.1a/c/d + CR 115.6 + CR 601.2c + CR 602.2b + CR 603.3d + CR 608.2c: an announced object target
+    // is HOST evidence only when it occupies the HOST slot. The ATTACHMENT
+    // operand prints "target …" on the same class ("attach target Equipment you
+    // control to up to one target creature you control", Iron Hills Stalwart;
+    // Blacksmith's Talent level 2), so that Equipment sits in `ability.targets`
+    // too. Treating ANY object target as the chosen host would therefore skip
+    // this no-op when the controller chose the Equipment and declined the host;
+    // the resolver would then fall through to `resolve_object_filter`'s
+    // battlefield scan and auto-attach to an unchosen creature. Match against
+    // the HOST filter instead — the same filter authority the resolver uses —
+    // so only a target that could BE the host counts. If the host was chosen
+    // (or its binding was lost downstream — a separate pre-existing chain
+    // defect), keep the existing resolution path rather than turning an error
+    // into a silent no-op.
+    if ability.optional_targeting
+        && ability.attach_host_target().is_none()
+        && !host_slot_announced(state, ability, target_filter)
+        && crate::game::ability_utils::attach_host_filter_needs_target_slot(target_filter)
+        && target_filter.denotes_battlefield_objects()
+    {
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::from(&ability.effect),
+            source_id,
+            subject: None,
+        });
+        return Ok(AttachResolutionOutcome::Completed);
+    }
+
     // CR 608.2h + CR 608.2k: Typed attachment operands resolve from the
     // battlefield/LKI unless they are explicit player-chosen targets.
     // Typed/scan-based attachment filters (e.g. "Equipment attached to ~") resolve
@@ -471,17 +513,24 @@ pub(crate) fn deliver_attach(
     source_id: ObjectId,
     events: &mut Vec<GameEvent>,
 ) -> Option<WaitingFor> {
+    let host_of = |state: &GameState| state.objects.get(&attachment_id)?.attached_to;
+    let already_on_host = host_of(state) == Some(AttachTarget::Object(target_id));
     if let Some(old_target) = attach_to(state, attachment_id, target_id) {
         events.push(GameEvent::Unattached {
             attachment_id,
             old_target,
         });
     }
+    // CR 701.3b: a refused or same-host attach did nothing, so it carries no subject.
+    let attached = !already_on_host && host_of(state) == Some(AttachTarget::Object(target_id));
 
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::Attach,
         source_id,
-        subject: None,
+        subject: attached
+            .then(|| state.capture_event_object_snapshot(attachment_id))
+            .flatten()
+            .map(Box::new),
     });
 
     crate::game::engine_replacement::apply_pending_post_replacement_effect(
@@ -937,10 +986,15 @@ pub(crate) fn attachment_candidates_from_zone_change(
     else {
         return Vec::new();
     };
+    // CR 603.12: a "When … this way" reflexive carries the zone change as its
+    // creation-gate event; it names the same event-scoped set as an "if" head.
     let Some(AbilityCondition::ZoneChangedThisWay {
         filter,
         destination: Some(Zone::Battlefield),
-    }) = ability.condition.as_ref()
+    }) = ability
+        .condition
+        .as_ref()
+        .and_then(AbilityCondition::zone_changed_this_way_head)
     else {
         return Vec::new();
     };
@@ -1271,7 +1325,7 @@ pub(crate) fn bind_resolution_attachment_choice(
                     .to_string(),
             ));
         }
-        choice_ability.targets.push(TargetRef::Object(selected_id));
+        choice_ability.push_target(TargetRef::Object(selected_id));
         let selected = state
             .objects
             .get(&selected_id)
@@ -1312,6 +1366,7 @@ pub(crate) fn resolve_selected_attachment_choice(
                 "Attach EffectZoneChoice missing typed attachment operation".to_string(),
             )
         })?;
+    let events_before = events.len();
     let selecting_host = parked_attach_choice_selects_host(&operation);
     let bound_operation = bind_resolution_attachment_choice(state, operation, attachment_ids)?;
     let operation = {
@@ -1345,6 +1400,25 @@ pub(crate) fn resolve_selected_attachment_choice(
                 .take_active_attachment_choice_continuation()
                 .expect("completed attach choice must retain its active child")
                 .expect("completed attach choice must own its active child");
+            // CR 608.2c: the tail parked under this choice reads whether this answer attached.
+            let performed = !super::compound_run_unperformed(&operation)
+                && super::mandatory_parent_effect_performed(
+                    &operation.effect,
+                    &events[events_before..],
+                );
+            if let Some(tail) = state
+                .active_ability_continuation_frame_mut()
+                .map(|frame| frame.pending.chain.as_mut())
+                .filter(|tail| {
+                    tail.sub_link == crate::types::ability::SubAbilityLink::SequentialSibling
+                        && tail
+                            .condition
+                            .as_ref()
+                            .is_some_and(super::condition_depends_on_effect_performed)
+                })
+            {
+                tail.set_optional_effect_performed_recursive(performed);
+            }
             Ok(true)
         }
     }
@@ -1559,6 +1633,52 @@ fn explicit_attachment_target_chosen(
     })
 }
 
+/// CR 115.1a/c/d + CR 115.6 + CR 601.2c + CR 602.2b + CR 603.3d + CR 608.2c: whether an announced object
+/// target occupies the HOST slot of this Attach instruction.
+///
+/// Both roles can print "target" on one instruction ("attach target Equipment
+/// you control to up to one target creature you control"), so the ATTACHMENT
+/// object also appears in `ability.targets`. Filter membership and the resolver's attachment-slot
+/// window are the discriminators — a target that could not be the host, or that
+/// the attachment operand already consumed, cannot be host evidence — and it is the same filter the resolver itself matches host
+/// candidates against (see `resolve_attach_target`), so the two seams cannot
+/// disagree about what counts as a host.
+fn host_slot_announced(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    host_filter: &TargetFilter,
+) -> bool {
+    let attachment_filter = match &ability.effect {
+        Effect::Attach { attachment, .. } => attachment,
+        _ => return false,
+    };
+    // CR 115.1a/c/d/e + CR 601.2c + CR 702.151b: the resolver consumes the
+    // attachment operand's announced slot(s) FIRST, so only the slots after that
+    // window can be host evidence. A reconfigure Equipment is itself a creature
+    // while unattached (and an animated Equipment matches "creature you
+    // control"), so an announced ATTACHMENT that also satisfies the host filter
+    // must not be read as a chosen host — otherwise the declined-host no-op is
+    // skipped and the resolver attaches to an unchosen object.
+    let mut remaining = ability.targets.iter();
+    let mut attachment_ids =
+        resolve_attachment_ids(state, ability, attachment_filter, &mut remaining);
+    if attachment_ids.is_empty() {
+        // `resolve_attachment_ids` short-circuits on bound attachment targets
+        // without advancing the iterator; exclude those ids explicitly.
+        attachment_ids = current_attachment_target_ids(state, ability);
+    }
+    let ctx = FilterContext::from_ability(ability);
+    let effective = crate::game::effects::resolved_object_filter(state, ability, host_filter);
+    remaining.any(|target| {
+        matches!(
+            target,
+            TargetRef::Object(id)
+                if !attachment_ids.contains(id)
+                    && matches_target_filter(state, *id, &effective, &ctx)
+        )
+    })
+}
+
 /// CR 603.6a + CR 608.2c + CR 301.5b: In "When this/that Equipment enters,
 /// attach it/that Equipment to target creature" triggers, the attachment operand
 /// is the object that caused the ETB trigger, while the creature is the chosen
@@ -1594,7 +1714,16 @@ fn resolve_object_filter<'a>(
     target_slots: &mut impl Iterator<Item = &'a TargetRef>,
 ) -> Option<ObjectId> {
     match filter {
-        TargetFilter::SelfRef => Some(ability.source_id),
+        // CR 400.7: the source names itself only while it is the same object.
+        TargetFilter::SelfRef => match &ability.trigger_source {
+            Some(source) if source.identity.reference.object_id != ability.source_id => {
+                Some(ability.source_id)
+            }
+            Some(_) => ability
+                .source_is_current(state)
+                .then_some(ability.source_id),
+            None => ability.self_ref_binding(state),
+        },
         TargetFilter::LastCreated => target_slots
             .find_map(|target| match target {
                 TargetRef::Object(id) => Some(*id),
@@ -1657,10 +1786,14 @@ fn resolve_object_filter<'a>(
 
 fn filter_has_attached_to_source(filter: &TargetFilter) -> bool {
     match filter {
-        TargetFilter::Typed(tf) => tf
-            .properties
-            .iter()
-            .any(|p| matches!(p, FilterProp::AttachedToSource)),
+        TargetFilter::Typed(tf) => tf.properties.iter().any(|p| {
+            matches!(
+                p,
+                FilterProp::AttachedTo {
+                    to: AttachmentReferent::Source
+                }
+            )
+        }),
         TargetFilter::And { filters } | TargetFilter::Or { filters } => {
             filters.iter().any(filter_has_attached_to_source)
         }
@@ -1675,7 +1808,14 @@ fn strip_attached_to_source_prop(filter: &TargetFilter) -> TargetFilter {
             properties: tf
                 .properties
                 .iter()
-                .filter(|p| !matches!(p, FilterProp::AttachedToSource))
+                .filter(|p| {
+                    !matches!(
+                        p,
+                        FilterProp::AttachedTo {
+                            to: AttachmentReferent::Source
+                        }
+                    )
+                })
                 .cloned()
                 .collect(),
             ..tf.clone()
@@ -1882,12 +2022,17 @@ pub(crate) fn attach_to_with_authority(
     }
 
     crate::game::layers::mark_layers_full(state);
-    crate::game::layers::flush_layers(state);
+    let recorded_reference = reference.filter(|_| moving_to_new_host);
+    if recorded_reference.is_some() {
+        crate::game::layers::flush_layers_for_attachment_command(state);
+    } else {
+        crate::game::layers::flush_layers(state);
+    }
 
     // CR 733: journal the settled edit through its owning family. A same-host
     // re-attach (CR 701.3b) leaves every field above unchanged, so only a real
     // host transition is recorded.
-    if let Some(reference) = reference.filter(|_| moving_to_new_host) {
+    if let Some(reference) = recorded_reference {
         record_attachment_edit(
             state,
             reference,
@@ -1937,15 +2082,13 @@ pub(crate) enum AttachIllegality {
     Prohibited,
 }
 
-/// Returns `Some(reason)` when an object host forbids `attachment` via
-/// protection or a can't-be-attached static, else `None`.
-///
-/// Does NOT evaluate the Enchant filter or zone — that legality is applied by
-/// the caller (`is_valid_attachment_target` checks it for the SBA path). The
-/// checks here are purely additive prohibitions that apply equally at attach
-/// time and continuously thereafter, so routing both paths through this resolver
-/// keeps them from drifting.
-pub(crate) fn attachment_illegality(
+/// Live-object convenience over [`attachment_illegality_projected`], kept for
+/// the unit tests below: production routes live reads through
+/// `sba::is_valid_attachment_target_for_attacher` (which feeds the stored
+/// object) and pre-entry reads through the projected resolver directly, so a
+/// second production entry point would be a second authority to drift.
+#[cfg(test)]
+fn attachment_illegality(
     state: &GameState,
     attachment_id: ObjectId,
     host_id: ObjectId,
@@ -2609,12 +2752,17 @@ pub(crate) fn attach_to_player_with_authority(
     });
 
     crate::game::layers::mark_layers_full(state);
-    crate::game::layers::flush_layers(state);
+    let recorded_reference = reference.filter(|_| moving_to_new_host);
+    if recorded_reference.is_some() {
+        crate::game::layers::flush_layers_for_attachment_command(state);
+    } else {
+        crate::game::layers::flush_layers(state);
+    }
 
     // CR 733: journal the settled edit through its owning family, on the same
     // terms as the object-host authority — a same-player re-attach (CR 701.3b)
     // changed nothing and is not recorded.
-    if let Some(reference) = reference.filter(|_| moving_to_new_host) {
+    if let Some(reference) = recorded_reference {
         record_attachment_edit(
             state,
             reference,
@@ -2648,7 +2796,7 @@ pub(crate) fn unattach(state: &mut GameState, attachment_id: ObjectId) -> Option
         attachment.attached_to = None;
     }
     crate::game::layers::mark_layers_full(state);
-    crate::game::layers::flush_layers(state);
+    crate::game::layers::flush_layers_for_attachment_command(state);
 
     // CR 733 + CR 701.3d: an unattach installs no host and, unlike an attach,
     // draws no new timestamp (CR 613.7e applies to attaching to a new host).
@@ -2724,7 +2872,7 @@ pub fn apply_resolved_attachment(
     }
 
     crate::game::layers::mark_layers_full(state);
-    crate::game::layers::flush_layers(state);
+    crate::game::layers::flush_layers_for_attachment_command(state);
     Ok(())
 }
 
@@ -5156,7 +5304,9 @@ mod tests {
                 attachment: TargetFilter::Typed(
                     TypedFilter::default()
                         .subtype("Equipment".to_string())
-                        .properties(vec![FilterProp::AttachedToSource]),
+                        .properties(vec![FilterProp::AttachedTo {
+                            to: AttachmentReferent::Source,
+                        }]),
                 ),
                 target: TargetFilter::ParentTarget,
                 selection: AttachSelection::Targeted,
@@ -5206,7 +5356,9 @@ mod tests {
                 attachment: TargetFilter::Typed(
                     TypedFilter::default()
                         .subtype("Equipment".to_string())
-                        .properties(vec![FilterProp::AttachedToSource]),
+                        .properties(vec![FilterProp::AttachedTo {
+                            to: AttachmentReferent::Source,
+                        }]),
                 ),
                 target: TargetFilter::ParentTarget,
                 selection: AttachSelection::Targeted,
@@ -5550,5 +5702,279 @@ mod tests {
             None,
             "opponent-controlled matching Equipment must unattach"
         );
+    }
+
+    /// CR 115.1a/c/d/e + CR 601.2c + CR 702.151b: the resolver consumes the
+    /// attachment operand's announced slot first. An attachment that ALSO matches
+    /// the host filter (a reconfigure Equipment is a creature while unattached;
+    /// an animated Equipment likewise) must not count as host evidence, or a
+    /// declined optional host would fall through to the battlefield scan.
+    #[test]
+    fn host_slot_announced_excludes_the_attachment_slot() {
+        let mut state = setup();
+        let equipment = spawn_equipment(&mut state, "Animated Relic", 910);
+        state
+            .objects
+            .get_mut(&equipment)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        let bystander = spawn_creature(&mut state, "Bystander");
+        let effect = Effect::Attach {
+            attachment: TargetFilter::Any,
+            target: TargetFilter::Any,
+            selection: AttachSelection::Targeted,
+        };
+        // Production tier (CR 601.2c): the trigger binds the chosen attachment,
+        // so `resolve_attachment_ids` short-circuits without advancing the
+        // iterator; only the bound-id exclusion keeps the Equipment out of the
+        // host evidence.
+        let mut attachment_only = ResolvedAbility::new(
+            effect.clone(),
+            vec![TargetRef::Object(equipment)],
+            equipment,
+            PlayerId(0),
+        );
+        attachment_only.set_attach_attachment_targets(vec![ObjectIncarnationRef::from_object(
+            &state.objects[&equipment],
+        )]);
+        assert!(
+            !host_slot_announced(&state, &attachment_only, &TargetFilter::Any),
+            "the bound attachment slot is not host evidence"
+        );
+        let mut with_host = ResolvedAbility::new(
+            effect,
+            vec![TargetRef::Object(equipment), TargetRef::Object(bystander)],
+            equipment,
+            PlayerId(0),
+        );
+        with_host.set_attach_attachment_targets(vec![ObjectIncarnationRef::from_object(
+            &state.objects[&equipment],
+        )]);
+        assert!(
+            host_slot_announced(&state, &with_host, &TargetFilter::Any),
+            "a target beyond the attachment window is host evidence"
+        );
+
+        // Defensive fallback: a bound attachment that no longer matches the
+        // attachment filter resolves empty, so the bound-id fallback must still
+        // exclude it from host evidence.
+        let plain = spawn_equipment(&mut state, "Plain Relic", 911);
+        let mut stale_binding = ResolvedAbility::new(
+            Effect::Attach {
+                attachment: TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Creature],
+                    ..Default::default()
+                }),
+                target: TargetFilter::Any,
+                selection: AttachSelection::Targeted,
+            },
+            vec![TargetRef::Object(plain)],
+            plain,
+            PlayerId(0),
+        );
+        stale_binding.set_attach_attachment_targets(vec![ObjectIncarnationRef::from_object(
+            &state.objects[&plain],
+        )]);
+        assert!(
+            !host_slot_announced(&state, &stale_binding, &TargetFilter::Any),
+            "a bound id that no longer matches the attachment filter is not host evidence"
+        );
+    }
+}
+
+#[cfg(test)]
+mod retirement_ownership_tests {
+    use super::*;
+    use crate::game::scenario::{GameScenario, P0, P1};
+    use crate::types::ability::{ContinuousModification, Duration, ObjectScope, StaticCondition};
+    use crate::types::game_state::{LayersDirty, TransientContinuousEffectBindings};
+    use crate::types::phase::Phase;
+    use crate::types::resolved_commands::{ResolvedContinuousEffectEdit, ResolvedRulesCommand};
+
+    #[test]
+    fn same_host_object_and_player_flushes_keep_standalone_retirement_ownership() {
+        for player_host in [false, true] {
+            for real_transition in [false, true] {
+                let mut scenario = GameScenario::new();
+                scenario.at_phase(Phase::PreCombatMain);
+                let first = scenario.add_vanilla(P0, 2, 2);
+                let second = scenario.add_vanilla(P0, 2, 2);
+                let subject = scenario.add_vanilla(P0, 2, 2);
+                // A typed unrestricted Aura isolates graph ownership from
+                // printed enchant restrictions in these authority-level tests.
+                let aura = scenario
+                    .add_enchantment_from_oracle(P0, "Typed Aura", "")
+                    .with_subtypes(vec!["Aura"])
+                    .id();
+                let mut runner = scenario.build();
+                let state = runner.state_mut();
+                if player_host {
+                    attach_to_player(state, aura, P0);
+                } else {
+                    attach_to(state, aura, first);
+                }
+                let expected = if player_host {
+                    AttachTarget::Player(P0)
+                } else {
+                    AttachTarget::Object(first)
+                };
+                assert_eq!(state.objects[&aura].attached_to, Some(expected));
+                state.objects.get_mut(&subject).unwrap().tapped = true;
+                let reference = ObjectIncarnationRef::from_object(&state.objects[&subject]);
+                let id = state
+                    .add_transient_continuous_effect_with_bindings(
+                        subject,
+                        P0,
+                        Duration::ForAsLongAs {
+                            condition: StaticCondition::IsTapped {
+                                scope: ObjectScope::Recipient,
+                            },
+                        },
+                        TargetFilter::SpecificObject { id: subject },
+                        vec![ContinuousModification::AddPower { value: 1 }],
+                        None,
+                        TransientContinuousEffectBindings {
+                            affected_recipient: Some(reference),
+                            duration_subject: Some(reference),
+                            granting_object: None,
+                        },
+                    )
+                    .expect("the fixture's duration begins");
+                crate::game::layers::flush_layers(state);
+                assert_eq!(state.objects[&subject].power, Some(3));
+                let installed = state
+                    .transient_continuous_effects
+                    .iter()
+                    .find(|e| e.id == id)
+                    .unwrap()
+                    .clone();
+                state.objects.get_mut(&subject).unwrap().tapped = false;
+                let prefix = state.clone();
+                let start = state.resolved_rules_journal.entries().len();
+                if player_host {
+                    attach_to_player(state, aura, if real_transition { P1 } else { P0 });
+                } else {
+                    attach_to(state, aura, if real_transition { second } else { first });
+                }
+                assert_eq!(state.objects[&subject].power, Some(2));
+                assert_eq!(state.layers_dirty, LayersDirty::Clean);
+                assert!(!state
+                    .transient_continuous_effects
+                    .iter()
+                    .any(|e| e.id == id));
+                let commands: Vec<_> = state
+                    .resolved_rules_journal
+                    .entries()
+                    .iter()
+                    .skip(start)
+                    .filter_map(|e| e.command.as_ref())
+                    .collect();
+                assert_eq!(commands.len(), 1);
+                let mut replay = prefix;
+                let journal = replay.resolved_rules_journal.clone();
+                match commands[0] {
+                    ResolvedRulesCommand::Attachment(command) => {
+                        assert!(real_transition);
+                        for invalidation in ["missing", "stale", "old_host"] {
+                            let mut rejected = replay.clone();
+                            match invalidation {
+                                "missing" => {
+                                    rejected.objects.remove(&aura);
+                                }
+                                "stale" => {
+                                    rejected.objects.get_mut(&aura).unwrap().bump_incarnation();
+                                }
+                                "old_host" => {
+                                    rejected.objects.get_mut(&aura).unwrap().attached_to = None;
+                                }
+                                _ => unreachable!(),
+                            }
+                            let before = rejected.clone();
+                            assert!(apply_resolved_attachment(&mut rejected, command).is_err());
+                            assert_eq!(
+                                serde_json::to_value(&rejected).unwrap(),
+                                serde_json::to_value(&before).unwrap()
+                            );
+                            assert_eq!(rejected.layers_dirty, before.layers_dirty);
+                            assert_eq!(
+                                rejected.resolved_rules_journal,
+                                before.resolved_rules_journal
+                            );
+                        }
+                        apply_resolved_attachment(&mut replay, command).unwrap();
+                        assert_eq!(replay.layers_dirty, LayersDirty::Clean);
+                    }
+                    ResolvedRulesCommand::ContinuousEffect(edit) => {
+                        assert!(!real_transition);
+                        assert!(
+                            matches!(edit.as_ref(), ResolvedContinuousEffectEdit::Retire(command) if command.effects == vec![installed])
+                        );
+                        replay.apply_resolved_continuous_effect_edit(edit).unwrap();
+                    }
+                    other => panic!("unexpected owner: {other:?}"),
+                }
+                assert!(!replay
+                    .transient_continuous_effects
+                    .iter()
+                    .any(|e| e.id == id));
+                assert_eq!(replay.resolved_rules_journal, journal);
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_attachment_and_unattached_early_return_do_not_settle_unowned_work() {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let subject = scenario.add_vanilla(P0, 2, 2);
+        let equipment = scenario
+            .add_artifact_from_oracle(P0, "Typed Equipment", "")
+            .with_subtypes(vec!["Equipment"])
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        state.objects.get_mut(&subject).unwrap().tapped = true;
+        let reference = ObjectIncarnationRef::from_object(&state.objects[&subject]);
+        let id = state
+            .add_transient_continuous_effect_with_bindings(
+                subject,
+                P0,
+                Duration::ForAsLongAs {
+                    condition: StaticCondition::IsTapped {
+                        scope: ObjectScope::Recipient,
+                    },
+                },
+                TargetFilter::SpecificObject { id: subject },
+                vec![ContinuousModification::AddPower { value: 1 }],
+                None,
+                TransientContinuousEffectBindings {
+                    affected_recipient: Some(reference),
+                    duration_subject: Some(reference),
+                    granting_object: None,
+                },
+            )
+            .expect("the fixture's duration begins");
+        crate::game::layers::flush_layers(state);
+        assert_eq!(state.objects[&subject].power, Some(3));
+        state.objects.get_mut(&subject).unwrap().tapped = false;
+        let before = state.clone();
+        assert_eq!(attach_to_player(state, equipment, P0), None);
+        assert_eq!(unattach(state, equipment), None);
+        assert_eq!(unattach(state, ObjectId(u64::MAX)), None);
+        assert_eq!(state.resolved_rules_journal, before.resolved_rules_journal);
+        assert_eq!(state.layers_dirty, before.layers_dirty);
+        assert_eq!(state.next_timestamp, before.next_timestamp);
+        assert!(state
+            .transient_continuous_effects
+            .iter()
+            .any(|e| e.id == id));
+        crate::game::layers::mark_layers_full(state);
+        crate::game::layers::flush_layers(state);
+        assert!(!state
+            .transient_continuous_effects
+            .iter()
+            .any(|e| e.id == id));
     }
 }

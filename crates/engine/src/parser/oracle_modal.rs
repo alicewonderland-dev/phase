@@ -1,10 +1,10 @@
-use crate::parser::oracle_nom::error::{OracleError, OracleResult};
+use crate::parser::oracle_nom::error::{oracle_err, OracleError, OracleResult};
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
-use nom::character::complete::{alpha1, multispace0, multispace1};
+use nom::character::complete::{alpha1, multispace0, multispace1, satisfy};
 use nom::combinator::{map, map_opt, not, opt, peek, rest, success, value};
-use nom::multi::fold_many1;
-use nom::sequence::{delimited, preceded, terminated};
+use nom::multi::{fold_many1, many_till};
+use nom::sequence::{delimited, pair, preceded, terminated};
 use nom::Parser;
 
 use crate::types::ability::{
@@ -23,7 +23,9 @@ use super::oracle_cost::parse_oracle_cost;
 #[cfg(test)]
 use super::oracle_effect::lower_ability_ir;
 use super::oracle_effect::{
-    conditions::{split_leading_conditional, strip_leading_general_conditional},
+    conditions::{
+        split_leading_conditional, strip_routed_leading_general_conditional, LeadingConditionRoute,
+    },
     parse_ability_ir_with_context, try_parse_named_choice,
 };
 use super::oracle_ir::context::ParseContext;
@@ -38,7 +40,9 @@ use super::oracle_ir::trigger::{
 };
 use super::oracle_nom::bridge::nom_on_lower;
 use super::oracle_nom::condition as nom_condition;
-use super::oracle_nom::primitives::{self as nom_primitives, scan_preceded};
+use super::oracle_nom::primitives::{
+    self as nom_primitives, scan_at_word_boundaries, scan_preceded,
+};
 use super::oracle_quantity::parse_cda_quantity;
 #[cfg(test)]
 use super::oracle_static::parse_static_line;
@@ -46,6 +50,7 @@ use super::oracle_static::{parse_pt_mod, parse_static_line_ir};
 #[cfg(test)]
 use super::oracle_trigger::parse_trigger_lines;
 use super::oracle_trigger::parse_trigger_lines_at_index_ir;
+use super::oracle_trigger::unhoisted_modal_guard_body;
 use super::oracle_util::{parse_mana_symbols, strip_reminder_text, TextPair};
 use crate::parser::oracle_ir::ast::{
     parsed_clause, ModalHeaderAst, ModalOptionality, ModeAst, OracleBlockAst, ReflexiveModalParent,
@@ -149,6 +154,17 @@ pub(crate) fn parse_oracle_block(lines: &[&str], start: usize) -> Option<(Oracle
             // `WhenYouDo` sub carries the modal, instead of firing the modes
             // unconditionally on the trigger.
             let (trigger_line, reflexive_parent) = classify_reflexive_modal_parent(trigger_line);
+            // CR 603.4: the modal splitter accepts a header that opens with the
+            // trigger's intervening-if ("Whenever X, if Y, choose one —"), so the
+            // guard lands in `header.raw` and the plain-modal lowering, which
+            // replaces the trigger body, would never see it. Return it to the
+            // trigger line so the trigger parser hoists it or fails the trigger
+            // closed. A reflexive parent keeps it in the header for
+            // `reflexive_modal_connector`.
+            let trigger_line = match (&reflexive_parent, split_leading_conditional(&header.raw)) {
+                (None, Some((guard, _))) => format!("{trigger_line}, {guard}"),
+                _ => trigger_line,
+            };
             return Some((
                 OracleBlockAst::TriggeredModal {
                     trigger_line,
@@ -1020,12 +1036,32 @@ fn reflexive_modal_connector(
     header: &ModalHeaderAst,
     ctx: &mut ParseContext,
 ) -> Result<AbilityCondition, Box<Effect>> {
-    let (guard, _) = strip_leading_general_conditional(&header.raw, ctx);
-    if let Some(guard) = guard {
-        return Ok(AbilityCondition::when_you_do_with_guard(guard));
+    match strip_routed_leading_general_conditional(&header.raw, ctx) {
+        // CR 115.1 + CR 608.2c: a target P/T threshold guard's
+        // `TargetMatchesFilter { subject_slot: None }` reads the gated node's own
+        // first object target, and a mode may announce its own target, so the
+        // guard cannot bind the antecedent "that creature" here; refuse it.
+        (Some((_, LeadingConditionRoute::TargetPtThreshold)), _) => {
+            return Err(Box::new(Effect::unimplemented(
+                "modal_reflexive_condition",
+                &header.raw,
+            )));
+        }
+        (Some((guard, LeadingConditionRoute::General)), _) => {
+            // CR 603.12 + CR 603.4: a zone-change guard cannot be a reflexive's
+            // intervening "if" (see `AbilityCondition::zone_changed_this_way_head`).
+            if guard.has_root_zone_changed_this_way() {
+                return Err(Box::new(Effect::unimplemented(
+                    "modal_reflexive_condition",
+                    &header.raw,
+                )));
+            }
+            return Ok(AbilityCondition::when_you_do_with_guard(guard));
+        }
+        (None, _) => {}
     }
 
-    // `strip_leading_general_conditional` returns `None` both for a header
+    // `strip_routed_leading_general_conditional` returns `None` both for a header
     // with no guard and for an unmodeled leading conditional. Only the first
     // may become a bare `WhenYouDo`: lowering the second that way would make
     // an unsupported intervening-if condition silently permissive.
@@ -1217,6 +1253,13 @@ pub(crate) fn lower_oracle_block_ir(
             );
             ctx.diagnostics.extend(trigger_ctx.diagnostics);
             for trigger in &mut triggers {
+                // CR 603.4: a trailing "if <guard>" left on the trigger line that
+                // did not hoist would be silently dropped when the modal payload
+                // replaces the body; fail the trigger closed instead.
+                if let Some(gap_body) = unhoisted_modal_guard_body(trigger) {
+                    trigger.body = Some(gap_body);
+                    continue;
+                }
                 // `body_context` is captured before normal trigger-body parsing.
                 // Clone it per sibling: each mode receives all trigger-established
                 // facts, but no mode can leak chain-local state into another.
@@ -1266,6 +1309,7 @@ pub(crate) fn lower_oracle_block_ir(
                     ),
                     choice: build_modal_choice(&header, &modes),
                     modes: parse_modal_mode_irs(&modes, AbilityKind::Spell, &mut mode_ctx),
+                    optionality: header.optionality,
                 };
                 ctx.diagnostics.extend(mode_ctx.diagnostics);
                 // CR 603.12: the printed instruction the mode list rides on is
@@ -1446,10 +1490,15 @@ fn parse_modal_mode_irs(
             // `base_ctx` holds — a reset base stays reset, and no mode can
             // invent authority its parent lacked.
             mode_ctx.subject = mode_anaphor_subject(mode_ctx.subject.take());
+            // CR 700.2: declared-slot numbering is mode-local at runtime, so a
+            // mode never admits a declared-slot referent.
+            mode_ctx.body_scope = super::oracle_ir::context::BodyScope::ModalMode;
             mode_ctx.diagnostics.clear();
             let mut ability = parse_ability_ir_with_context(&mode.body, kind, &mut mode_ctx);
             guard_unsupported_mode_qualifiers_ir(&mut ability, kind, &mode_ctx);
             base_ctx.diagnostics.extend(mode_ctx.diagnostics);
+            // CR 700.2: the selected modes resolve as one chain, so their declared-player groups must not repeat.
+            base_ctx.next_declared_player_group = mode_ctx.next_declared_player_group;
             ModalModeIr {
                 source_text: mode.source_text.clone(),
                 source_line: mode.source_line,
@@ -1806,6 +1855,7 @@ fn lower_as_enters_anchor_word_modal(
             bypass_beneficiary: None,
             protection_does_not_remove: None,
             room_door: None,
+            granting_object: None,
         };
         result.statics.push(placeholder);
     }
@@ -2134,12 +2184,38 @@ pub(crate) fn lower_mode_abilities_with_scope(
 /// The `relative_player_scope` from the trigger condition (e.g.
 /// `TriggeringPlayer` for DamageDone triggers) is propagated into every mode
 /// body so "that player" anaphora resolve to the correct player.
-pub(crate) fn try_parse_inline_modal_ir(effect_body: &str, ctx: &ParseContext) -> Option<ModalIr> {
-    let em_dash_pos = effect_body.find('\u{2014}')?;
-    let header_text = effect_body[..em_dash_pos].trim();
-    let modes_text = effect_body[em_dash_pos + '\u{2014}'.len_utf8()..].trim();
-
-    let header = parse_modal_header_ast(header_text)?;
+/// Split the mode list of an INLINE modal body (header and modes on one line)
+/// into `ModeAst`s, or `None` when it does not carry two or more modes.
+///
+/// CR 700.2: "A spell or ability is modal if it has two or more options in a
+/// bulleted list preceded by instructions for a player to choose a number of
+/// those options." Two inline shapes reach this seam:
+///
+///   * **bullet-delimited** — `• Mode one. • Mode two.` This is the printed form
+///     CR 700.2 describes. It arrives inline (rather than as its own lines,
+///     which `collect_mode_asts` handles) whenever a preprocessor has already
+///     joined the bullet lines into a single body — as the Saga chapter
+///     preprocessor does for a `"{rN} — Choose one —"` chapter (CR 714.2b).
+///   * **`"; or "`-delimited** — `mode one; or mode two`.
+///
+/// Bullets are tried first because a bulleted body is the printed modal form,
+/// and `"; or "` can legitimately occur *inside* a single bullet's text.
+///
+/// Bullet bodies are lowered through `parse_mode_ast`, the same building block
+/// the line-based path uses, so an inline `• Defense! — …` mode gets identical
+/// label/cost/pawprint treatment to its own-line counterpart rather than a
+/// second, divergent label parser.
+fn split_inline_mode_asts(modes_text: &str) -> Option<Vec<ModeAst>> {
+    // allow-noncombinator: structural delimiter split for modal modes
+    let bulleted: Vec<ModeAst> = modes_text
+        .split(['\u{2022}', '\u{00b7}'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|body| parse_mode_ast(body, body, None))
+        .collect();
+    if bulleted.len() >= 2 {
+        return Some(bulleted);
+    }
 
     let raw_modes: Vec<&str> = modes_text
         .split("; or ") // allow-noncombinator: structural delimiter split for modal modes
@@ -2150,21 +2226,85 @@ pub(crate) fn try_parse_inline_modal_ir(effect_body: &str, ctx: &ParseContext) -
         return None;
     }
 
-    let modes: Vec<ModeAst> = raw_modes
-        .iter()
-        .map(|body| {
-            let body = body.trim_end_matches('.');
-            ModeAst {
-                raw: body.to_string(),
-                source_text: body.to_string(),
-                source_line: None,
-                label: None,
-                body: body.to_string(),
-                mode_cost: None,
-                mode_pawprint: None,
-            }
-        })
-        .collect();
+    Some(
+        raw_modes
+            .iter()
+            .map(|body| {
+                let body = body.trim_end_matches('.');
+                ModeAst {
+                    raw: body.to_string(),
+                    source_text: body.to_string(),
+                    source_line: None,
+                    label: None,
+                    body: body.to_string(),
+                    mode_cost: None,
+                    mode_pawprint: None,
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Split an inline modal body into its header AST and mode ASTs.
+///
+/// Shared by the IR path (`try_parse_inline_modal_ir`, used by triggers) and the
+/// `AbilityDefinition` path (`try_parse_inline_modal_ability`, used by Saga
+/// chapters) so both agree on what counts as an inline modal.
+fn split_inline_modal_parts(effect_body: &str) -> Option<(ModalHeaderAst, Vec<ModeAst>)> {
+    let em_dash_pos = effect_body.find('\u{2014}')?;
+    let header_text = effect_body[..em_dash_pos].trim();
+    let modes_text = effect_body[em_dash_pos + '\u{2014}'.len_utf8()..].trim();
+
+    let header = parse_modal_header_ast(header_text)?;
+    let modes = split_inline_mode_asts(modes_text)?;
+    Some((header, modes))
+}
+
+/// Parse an inline modal body directly into an `AbilityDefinition`.
+///
+/// CR 700.2b: the controller of a modal *triggered* ability chooses the mode(s)
+/// as it is put on the stack. A Saga chapter ability is a triggered ability
+/// (CR 714.2b), so a chapter whose body is `"Choose one — • … • …"` must become
+/// a real modal ability rather than a sequential chain of every bullet.
+///
+/// Lowers through the same chokepoints as the trigger modal path
+/// (`oracle_trigger`'s `TriggerBody::Modal` arm): the marker chain through
+/// `lower_effect_chain_ir` + `finalize_effect_chain`, each mode through
+/// `lower_ability_ir`. Callers that already hold a `ParseContext` and want the
+/// IR should use [`try_parse_inline_modal_ir`] instead; this wrapper exists for
+/// definition-level callers that have no IR pipeline of their own.
+///
+/// `ctx` is the caller's body context, threaded to the marker and every mode
+/// exactly as the trigger modal path threads its live trigger-body context, so
+/// a trigger-only clause in a mode lowers with its event referent.
+pub(crate) fn try_parse_inline_modal_ability(
+    effect_body: &str,
+    ctx: &ParseContext,
+) -> Option<AbilityDefinition> {
+    let modal = try_parse_inline_modal_ir(effect_body, ctx)?;
+    let mut ability = crate::parser::oracle_effect::lower_effect_chain_ir(&modal.marker);
+    crate::parser::oracle_effect::finalize_effect_chain(&mut ability);
+    // CR 603.3c + CR 700.2b: "you may choose one —" lets the controller choose
+    // no mode, a choice made as the ability is put on the stack. The engine
+    // models that decline as `optional` on the ability that resolves, as the
+    // block-level modal lowering does; `ModalChoice.min_choices` stays 1.
+    if matches!(modal.optionality, ModalOptionality::MayDecline) {
+        ability.optional = true;
+    }
+    Some(
+        ability.with_modal(
+            modal.choice,
+            modal
+                .modes
+                .iter()
+                .map(|mode| crate::parser::oracle_effect::lower_ability_ir(&mode.ability))
+                .collect(),
+        ),
+    )
+}
+
+pub(crate) fn try_parse_inline_modal_ir(effect_body: &str, ctx: &ParseContext) -> Option<ModalIr> {
+    let (header, modes) = split_inline_modal_parts(effect_body)?;
 
     let mut mode_ctx = ctx.clone();
     // CR 700.2 + CR 608.2c: an INLINE modal ("choose one — …; or …") is ordinary
@@ -2182,6 +2322,7 @@ pub(crate) fn try_parse_inline_modal_ir(effect_body: &str, ctx: &ParseContext) -
         ),
         choice: build_modal_choice(&header, &modes),
         modes: parse_modal_mode_irs(&modes, AbilityKind::Spell, &mut mode_ctx),
+        optionality: header.optionality,
     })
 }
 
@@ -2338,7 +2479,7 @@ pub(super) fn strip_ability_word_with_name(line: &str) -> Option<(String, String
 /// branch re-validates via `has_trigger_prefix`. The 6-word ceiling bounds how
 /// far an em-dash sentence may be treated as a label on that path.
 ///
-/// The activated-ability cost-label path uses the wider
+/// The activated-ability cost-label path and the additional-cost line use the wider
 /// `FLAVOR_WORD_COST_LABEL_MAX_WORDS` instead — see that constant for why a word
 /// count is the wrong guard there.
 ///
@@ -2355,6 +2496,11 @@ pub(super) const FLAVOR_WORD_MAX_WORDS: usize = 6;
 /// arbitrarily long ("I've Come Up with a New Recipe!", 7 words — Ignis
 /// Scientia; "The Most Important Punch in History", 6 words — Duggan), so this
 /// path is uncapped and leans entirely on `cost_prefix_is_activated`.
+///
+/// The additional-cost line (`oracle_casting::additional_cost_line_text`) uses
+/// the same uncapped split for the same reason: its remainder is re-validated
+/// by the "as an additional cost to cast this spell" opener, and the label by
+/// `label_names_rules_term`.
 pub(super) const FLAVOR_WORD_COST_LABEL_MAX_WORDS: usize = usize::MAX;
 
 pub(super) fn strip_flavor_word_with_name(line: &str) -> Option<(String, String)> {
@@ -2480,6 +2626,378 @@ pub(super) fn parse_known_ability_word_name(
         "",
         nom::error::ErrorKind::Fail,
     )))
+}
+
+/// CR 701: the keyword actions the Comprehensive Rules list (CR 701.2–701.71, rules effective
+/// September 25, 2026), lowercase; CR 701.26 gives "tap" and "untap". Regenerate from
+/// `docs/MagicCompRules.txt` (fetch it with `scripts/fetch-comp-rules.sh`): every `701.N.` heading
+/// with N ≥ 2, lowercased. A keyword the CR adds after these rules is read past until it is added
+/// here.
+const KEYWORD_ACTION_NAMES: &[&str] = &[
+    "activate",
+    "attach",
+    "behold",
+    "cast",
+    "counter",
+    "create",
+    "destroy",
+    "discard",
+    "double",
+    "triple",
+    "exchange",
+    "exile",
+    "fight",
+    "goad",
+    "investigate",
+    "mill",
+    "play",
+    "regenerate",
+    "reveal",
+    "sacrifice",
+    "scry",
+    "search",
+    "shuffle",
+    "surveil",
+    "tap",
+    "untap",
+    "transform",
+    "convert",
+    "fateseal",
+    "clash",
+    "planeswalk",
+    "set in motion",
+    "abandon",
+    "proliferate",
+    "detain",
+    "populate",
+    "monstrosity",
+    "vote",
+    "bolster",
+    "manifest",
+    "support",
+    "meld",
+    "exert",
+    "explore",
+    "assemble",
+    "adapt",
+    "amass",
+    "learn",
+    "venture into the dungeon",
+    "connive",
+    "open an attraction",
+    "roll to visit your attractions",
+    "incubate",
+    "the ring tempts you",
+    "face a villainous choice",
+    "time travel",
+    "discover",
+    "cloak",
+    "collect evidence",
+    "suspect",
+    "forage",
+    "manifest dread",
+    "endure",
+    "harness",
+    "airbend",
+    "earthbend",
+    "waterbend",
+    "blight",
+    "heal",
+    "recruit",
+    "empower jace",
+];
+
+/// CR 702: the keyword abilities the Comprehensive Rules list (CR 702.2–702.195, rules effective
+/// September 25, 2026), lowercase; CR 702.145 gives "daybound" and "nightbound", and CR 702.186a
+/// writes infinity as "∞". Regenerate from `docs/MagicCompRules.txt` (fetch it with
+/// `scripts/fetch-comp-rules.sh`): every `702.N.` heading with N ≥ 2, lowercased. A keyword the CR
+/// adds after these rules is read past until it is added here.
+const KEYWORD_ABILITY_NAMES: &[&str] = &[
+    "deathtouch",
+    "defender",
+    "double strike",
+    "enchant",
+    "equip",
+    "first strike",
+    "flash",
+    "flying",
+    "haste",
+    "hexproof",
+    "indestructible",
+    "intimidate",
+    "landwalk",
+    "lifelink",
+    "protection",
+    "reach",
+    "shroud",
+    "trample",
+    "vigilance",
+    "ward",
+    "banding",
+    "rampage",
+    "cumulative upkeep",
+    "flanking",
+    "phasing",
+    "buyback",
+    "shadow",
+    "cycling",
+    "echo",
+    "horsemanship",
+    "fading",
+    "kicker",
+    "flashback",
+    "madness",
+    "fear",
+    "morph",
+    "amplify",
+    "provoke",
+    "storm",
+    "affinity",
+    "entwine",
+    "modular",
+    "sunburst",
+    "bushido",
+    "soulshift",
+    "splice",
+    "offering",
+    "ninjutsu",
+    "epic",
+    "convoke",
+    "dredge",
+    "transmute",
+    "bloodthirst",
+    "haunt",
+    "replicate",
+    "forecast",
+    "graft",
+    "recover",
+    "ripple",
+    "split second",
+    "suspend",
+    "vanishing",
+    "absorb",
+    "aura swap",
+    "delve",
+    "fortify",
+    "frenzy",
+    "gravestorm",
+    "poisonous",
+    "transfigure",
+    "champion",
+    "changeling",
+    "evoke",
+    "hideaway",
+    "prowl",
+    "reinforce",
+    "conspire",
+    "persist",
+    "wither",
+    "retrace",
+    "devour",
+    "exalted",
+    "unearth",
+    "cascade",
+    "annihilator",
+    "level up",
+    "rebound",
+    "umbra armor",
+    "infect",
+    "battle cry",
+    "living weapon",
+    "undying",
+    "miracle",
+    "soulbond",
+    "overload",
+    "scavenge",
+    "unleash",
+    "cipher",
+    "evolve",
+    "extort",
+    "fuse",
+    "bestow",
+    "tribute",
+    "dethrone",
+    "hidden agenda",
+    "outlast",
+    "prowess",
+    "dash",
+    "exploit",
+    "menace",
+    "renown",
+    "awaken",
+    "devoid",
+    "ingest",
+    "myriad",
+    "surge",
+    "skulk",
+    "emerge",
+    "escalate",
+    "melee",
+    "crew",
+    "fabricate",
+    "partner",
+    "undaunted",
+    "improvise",
+    "aftermath",
+    "embalm",
+    "eternalize",
+    "afflict",
+    "ascend",
+    "assist",
+    "jump-start",
+    "mentor",
+    "afterlife",
+    "riot",
+    "spectacle",
+    "escape",
+    "companion",
+    "mutate",
+    "encore",
+    "boast",
+    "foretell",
+    "demonstrate",
+    "daybound",
+    "nightbound",
+    "disturb",
+    "decayed",
+    "cleave",
+    "training",
+    "compleated",
+    "reconfigure",
+    "blitz",
+    "casualty",
+    "enlist",
+    "read ahead",
+    "ravenous",
+    "squad",
+    "space sculptor",
+    "visit",
+    "prototype",
+    "living metal",
+    "more than meets the eye",
+    "for mirrodin!",
+    "toxic",
+    "backup",
+    "bargain",
+    "craft",
+    "disguise",
+    "solved",
+    "plot",
+    "saddle",
+    "spree",
+    "freerunning",
+    "gift",
+    "offspring",
+    "impending",
+    "exhaust",
+    "max speed",
+    "start your engines!",
+    "harmonize",
+    "mobilize",
+    "job select",
+    "tiered",
+    "station",
+    "warp",
+    "∞",
+    "mayhem",
+    "web-slinging",
+    "firebending",
+    "sneak",
+    "increment",
+    "paradigm",
+    "power-up",
+    "teamwork",
+    "storied",
+];
+
+const RULES_LABEL_TERMS: &[&str] = &[
+    // CR 702.37b, CR 702.33c, CR 702.106f, CR 702.124k, CR 702.22b, CR 702.89b and CR 701.49d:
+    // variant names that contain no heading word.
+    "megamorph",
+    "multikicker",
+    "double agenda",
+    "choose a background",
+    "bands with other",
+    "totem armor",
+    "venture into",
+    // CR 702.124i: the "partner—[text]" ability names.
+    "character select",
+    "father & son",
+    "friends forever",
+    "survivors",
+    // CR 702.159b: "Prize" opens the second paragraph of an Attraction's visit ability.
+    "prize",
+    // CR 719.3a: "To solve — [Condition]" is a Case's solve trigger.
+    "to solve",
+    // CR 711.2 + CR 716.2a: the level symbol and a Class's "Level N —".
+    "level",
+    // CR 700.2 + CR 614.12c: a bullet opens a mode or an anchor-word ability.
+    "•",
+    // Keywords the engine models that the CR does not list (`Keyword::Augment`,
+    // `Keyword::DoubleTeam`, `Keyword::Specialize`, `Keyword::StartingIntensity`).
+    "augment",
+    "double team",
+    "specialize",
+    "starting intensity",
+];
+
+/// A listed term at the start of `input`, ending at a word boundary.
+fn parse_listed_rules_term(input: &str) -> OracleResult<'_, ()> {
+    KEYWORD_ACTION_NAMES
+        .iter()
+        .chain(KEYWORD_ABILITY_NAMES)
+        .chain(RULES_LABEL_TERMS)
+        .find_map(|term| {
+            value(
+                (),
+                terminated(
+                    tag::<_, _, OracleError<'_>>(*term),
+                    not(satisfy(char::is_alphanumeric)),
+                ),
+            )
+            .parse(input)
+            .ok()
+        })
+        .ok_or_else(|| oracle_err(input))
+}
+
+/// CR 702.29e + CR 702.14a: a "[type]cycling" or "[type]walk" word.
+fn parse_type_compound_keyword(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        pair(
+            satisfy(|c: char| c.is_ascii_lowercase()),
+            many_till(
+                satisfy(|c: char| c.is_ascii_lowercase()),
+                terminated(
+                    alt((tag("cycling"), tag("walk"))),
+                    not(satisfy(char::is_alphanumeric)),
+                ),
+            ),
+        ),
+    )
+    .parse(input)
+}
+
+fn parse_rules_label_term(input: &str) -> OracleResult<'_, ()> {
+    alt((parse_listed_rules_term, parse_type_compound_keyword)).parse(input)
+}
+
+/// CR 207.2c + CR 207.2d: whether an em-dash label contains a keyword term. The terms are a keyword
+/// action (CR 701) or keyword ability (CR 702) name, a variant name, label word or engine-modeled
+/// keyword in `RULES_LABEL_TERMS`, and a "[type]cycling" or "[type]walk" word.
+///
+/// A term matches at the label's start or after a space. It must end at the label's end or before a
+/// non-alphanumeric character.
+///
+/// A label that contains a keyword term may be a keyword with a parameter or a variant ("Commander
+/// ninjutsu", "Protection from red"), so it is never read past as an ability word or flavor word.
+/// No CR 207.2c ability word contains a keyword term.
+///
+/// The check is fail-closed: a flavor word that contains a keyword term ("Echo of the Lost"
+/// contains "echo") also answers `true`, and its line keeps its other route. `label` is lowercase.
+pub(super) fn label_names_rules_term(label: &str) -> bool {
+    scan_at_word_boundaries(label, parse_rules_label_term).is_some()
 }
 
 /// Pattern A (CR 207.2c): Detect a line of the form `<ability-word> (<body>)`
@@ -2698,6 +3216,97 @@ mod tests {
                 Effect::Unimplemented { .. }
             )
         }));
+    }
+
+    /// CR 700.2: "An ability is modal if it has two or more options in a
+    /// bulleted list preceded by instructions for a player to choose." The
+    /// bulleted list *is* the printed modal form, so an inline body whose modes
+    /// arrive as bullets must split on the bullets — not only on `"; or "`.
+    #[test]
+    fn inline_modal_splits_bullet_delimited_modes() {
+        let modes = split_inline_mode_asts(
+            "• Target creature gets +2/+2 until end of turn. • You gain 2 life.",
+        )
+        .expect("two bullets are two modes");
+
+        assert_eq!(modes.len(), 2);
+        assert_eq!(
+            modes[0].body,
+            "Target creature gets +2/+2 until end of turn."
+        );
+        assert_eq!(modes[1].body, "You gain 2 life.");
+    }
+
+    /// Bulleted modes route through `parse_mode_ast`, the same building block
+    /// the own-line path uses, so a named bullet (`• Defense! — …`) yields the
+    /// same label/body split inline as it does on its own line.
+    #[test]
+    fn inline_modal_bullet_modes_split_label_from_body() {
+        let modes = split_inline_mode_asts(
+            "• Combine Powers! — Draw a card. • Defense! — You gain 3 life.",
+        )
+        .expect("two named bullets are two modes");
+
+        assert_eq!(modes.len(), 2);
+        assert_eq!(modes[0].label.as_deref(), Some("Combine Powers!"));
+        assert_eq!(modes[0].body, "Draw a card.");
+        assert_eq!(modes[1].label.as_deref(), Some("Defense!"));
+        assert_eq!(modes[1].body, "You gain 3 life.");
+    }
+
+    /// Anti-widening control. Bullet splitting must not lower the bar for what
+    /// counts as a modal: CR 700.2 requires *two or more* options, so a single
+    /// bullet stays a plain effect chain, and a body with no bullets and no
+    /// `"; or "` is still not modal.
+    #[test]
+    fn inline_modal_declines_bodies_with_fewer_than_two_modes() {
+        assert!(split_inline_mode_asts("• Draw a card.").is_none());
+        assert!(split_inline_mode_asts("Draw a card. You gain 2 life.").is_none());
+        assert!(
+            try_parse_inline_modal_ir("Choose one — • Draw a card.", &ParseContext::default())
+                .is_none()
+        );
+        // No "choose" header, so the em-dash is a flavor title, not a modal head.
+        assert!(try_parse_inline_modal_ir(
+            "Fight! — • Draw a card. • You gain 2 life.",
+            &ParseContext::default()
+        )
+        .is_none());
+    }
+
+    /// CR 603.3c + CR 700.2b: an inline trigger modal ("you may choose one — A;
+    /// or B") lets the controller choose no mode. The trigger parser reads "you
+    /// may" as trigger optionality before the modal body is parsed, so this pins
+    /// that the inline modal path keeps it. The plain "choose one" trigger is the
+    /// control.
+    #[test]
+    fn inline_modal_trigger_you_may_choose_one_is_optional() {
+        for (text, optional) in [
+            (
+                "When this creature enters, you may choose one \u{2014} Draw a card; or You gain 2 life.",
+                true,
+            ),
+            (
+                "When this creature enters, choose one \u{2014} Draw a card; or You gain 2 life.",
+                false,
+            ),
+        ] {
+            let parsed = crate::parser::oracle::parse_oracle_text(
+                text,
+                "Test Creature",
+                &[],
+                &["Creature".into()],
+                &[],
+            );
+            let trigger = parsed
+                .triggers
+                .first()
+                .unwrap_or_else(|| panic!("{text}: must parse to a trigger"));
+            let execute = trigger.execute.as_deref().expect("trigger has an ability");
+            assert!(execute.modal.is_some(), "{text}: must be modal");
+            assert_eq!(trigger.optional, optional, "{text}: trigger.optional");
+            assert_eq!(execute.optional, optional, "{text}: execute.optional");
+        }
     }
 
     #[test]
@@ -5313,5 +5922,55 @@ When The Ruinous Wrecking Crew enters, choose up to X —\n\
             TargetFilter::ParentTarget,
             "a mode-internal referent preceding the pronoun outranks the pin"
         );
+    }
+
+    #[test]
+    fn label_names_rules_term_finds_every_listed_term_at_a_word_boundary() {
+        let mut mismatches = Vec::new();
+        for term in KEYWORD_ACTION_NAMES
+            .iter()
+            .chain(KEYWORD_ABILITY_NAMES)
+            .chain(RULES_LABEL_TERMS)
+        {
+            for label in [term.to_string(), format!("old {term} 4")] {
+                if !label_names_rules_term(&label) {
+                    mismatches.push(label);
+                }
+            }
+        }
+        for label in [
+            "swampcycling",
+            "desertwalk",
+            "legendary landwalk",
+            "goblin offering",
+        ] {
+            if !label_names_rules_term(label) {
+                mismatches.push(label.to_string());
+            }
+        }
+        // "increment" is a CR 702.191 keyword the table lists.
+        let ability_words = ABILITY_WORD_NAMES
+            .iter()
+            .filter(|w| **w != "increment")
+            .copied();
+        for label in [
+            "wind walk",
+            "fallen warrior",
+            "frenzied metabolism",
+            "titanic",
+            "wardens unite",
+            "flashpoint",
+            "echoing call",
+            "one two three four five",
+            "grant an advantage",
+        ]
+        .into_iter()
+        .chain(ability_words)
+        {
+            if label_names_rules_term(label) {
+                mismatches.push(format!("not a term: {label}"));
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:?}");
     }
 }

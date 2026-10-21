@@ -5,7 +5,7 @@ use crate::types::ability::{
     SpellCastingOptionKind, TargetFilter, TypeFilter,
 };
 use crate::types::card_type::{CoreType, Supertype};
-use crate::types::counter::{CounterMatch, CounterType};
+use crate::types::counter::CounterType;
 use crate::types::game_state::{BattlefieldEntryRecord, CastOccurrence, CastingVariant};
 use crate::types::keywords::Keyword;
 use crate::types::mana::{ManaColor, ManaCost};
@@ -281,6 +281,13 @@ pub(crate) fn spell_cast_record_for(
         // history record carries provenance so own-cast exclusion (CR 601.2i)
         // can identify a permanent's own pending cast positionally.
         spell_object_id: Some(obj.id),
+        // CR 722.3d + CR 601.2i: capture the prepare-spell designation the
+        // spell has as it becomes cast (the CR 722.3c linked copy's marker), so
+        // `FilterProp::PrepareSpell` and its negation are exact on the history
+        // record after the spell leaves the stack. Unconditional on zone: the
+        // live candidate seam projects the linked copy while it still waits in
+        // exile, and that object can only be cast as a prepare spell.
+        prepared_copy_source: obj.prepared_copy_source,
     }
 }
 
@@ -430,7 +437,7 @@ pub fn record_battlefield_entry(
     }
 
     let record = battlefield_entry_record_for(obj);
-    state.battlefield_entries_this_turn.push(record);
+    state.battlefield_entries_this_turn.push_back(record);
 }
 
 fn entry_controller_matches(
@@ -879,22 +886,23 @@ pub(crate) fn tap_permanent_for_cost(
     )
     .map_err(|error| EngineError::InvalidAction(error.to_string()))?
     {
-        events.push(GameEvent::PermanentTapped {
-            object_id: id,
-            caused_by: None,
-        });
+        events.push(GameEvent::permanent_tapped(state, id, None));
     }
     Ok(())
 }
 
 /// CR 602.5b: If an activated ability has a restriction on its use (e.g., "Activate only once
 /// each turn"), the restriction continues to apply even if its controller changes.
+///
+/// CR 602.2 + CR 601.2i: `record` is the activation's facts captured before
+/// its cost was paid; it joins the activator's turn journal here.
 pub fn record_ability_activation(
     state: &mut crate::types::game_state::GameState,
     source_id: ObjectId,
     ability_index: usize,
+    record: Option<crate::types::game_state::AbilityActivationRecord>,
 ) {
-    crate::game::ledger::record_ability_activation(state, source_id, ability_index)
+    crate::game::ledger::record_ability_activation(state, source_id, ability_index, record)
         .expect("activated ability must have a valid ledger prefix");
 }
 
@@ -918,6 +926,31 @@ fn effective_activation_limit(
         return 1; // No tag → default once-per-turn
     };
     activation_limit_from_statics(state, player, source_id, tag.keyword_str(), gates)
+}
+
+/// CR 606.3 + CR 611.3a: The loyalty-activation cap's static term — the max
+/// `new_limit` over `ModifyActivationLimit { keyword: "loyalty" }` statics
+/// (Oath of Teferi class) whose controller is `player` and whose affected
+/// filter matches the planeswalker `source_id`. Base limit 1; max semantics
+/// (multiple Oaths do not stack, per the card's ruling). Read live at
+/// activation time — nothing is latched. Fills `None` gates via the O(1)
+/// presence index.
+pub(crate) fn loyalty_activation_cap_from_statics(
+    state: &crate::types::game_state::GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    gates: Option<&ActivationRestrictionStaticGates>,
+) -> u32 {
+    match gates {
+        Some(gates) => activation_limit_from_statics(state, player, source_id, "loyalty", gates),
+        None => activation_limit_from_statics(
+            state,
+            player,
+            source_id,
+            "loyalty",
+            &ActivationRestrictionStaticGates::compute(state),
+        ),
+    }
 }
 
 /// CR 602.5b: Scan the battlefield for `ModifyActivationLimit` statics that
@@ -1091,7 +1124,11 @@ fn activation_restriction_applies(
                     gates,
                 )
         }
-        ActivationRestriction::AsInstant => true,
+        // CR 304.5 + CR 605.3a: This printed restriction limits mana activation to priority.
+        ActivationRestriction::AsInstant => {
+            matches!(state.waiting_for, crate::types::WaitingFor::Priority { player: holder } if holder == player)
+                && state.pending_cast.is_none()
+        }
         // CR 702.62a: "If you could begin to cast this card by putting it onto the
         // stack from your hand" — defer to the underlying card type's natural
         // cast timing. Instants activate any time priority is held; sorceries
@@ -1156,9 +1193,17 @@ fn activation_restriction_applies(
                 .unwrap_or(0)
                 < u32::from(*count)
         }
-        ActivationRestriction::RequiresCondition { condition } => condition
-            .as_ref()
-            .is_none_or(|cond| evaluate_condition(state, player, source_id, cond)),
+        // CR 201.5a + CR 602.5c: the condition reads the granter stamped on the ability being activated.
+        ActivationRestriction::RequiresCondition { condition } => {
+            condition.as_ref().is_none_or(|cond| {
+                let granting_object = state
+                    .objects
+                    .get(&source_id)
+                    .and_then(|obj| obj.abilities.get(ability_index))
+                    .and_then(|ability| ability.granting_object);
+                evaluate_condition_for_granter(state, player, source_id, granting_object, cond)
+            })
+        }
         // CR 719.3c: Only activatable while the source Case is solved.
         ActivationRestriction::IsSolved => state
             .objects
@@ -1200,15 +1245,14 @@ fn activation_restriction_applies(
             minimum,
             maximum,
         } => {
-            let count: u32 = state
+            // CR 122.1: exact total, compared in u64 so an upper bound is never
+            // satisfied by a count that actually exceeds it.
+            let count = state
                 .objects
                 .get(&source_id)
-                .map(|obj| match counters {
-                    CounterMatch::Any => obj.counters.values().sum(),
-                    CounterMatch::OfType(ct) => obj.counters.get(ct).copied().unwrap_or(0),
-                })
+                .map(|obj| counters.count_in(&obj.counters))
                 .unwrap_or(0);
-            count >= *minimum && maximum.is_none_or(|max| count <= max)
+            crate::game::conditions::counter_count_within_bounds(count, *minimum, *maximum)
         }
     }
 }
@@ -1288,6 +1332,17 @@ pub(crate) fn evaluate_condition(
     state: &crate::types::game_state::GameState,
     player: PlayerId,
     source_id: ObjectId,
+    condition: &ParsedCondition,
+) -> bool {
+    evaluate_condition_for_granter(state, player, source_id, None, condition)
+}
+
+/// CR 201.5a: [`evaluate_condition`] for a definition carrying a granter stamp.
+fn evaluate_condition_for_granter(
+    state: &crate::types::game_state::GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    granting_object: Option<crate::types::identifiers::ObjectIncarnationRef>,
     condition: &ParsedCondition,
 ) -> bool {
     match condition {
@@ -1435,19 +1490,26 @@ pub(crate) fn evaluate_condition(
             rhs,
         } => {
             let lhs_expr = QuantityExpr::Ref { qty: lhs.clone() };
-            let lhs_val =
-                crate::game::quantity::resolve_quantity_scoped(state, &lhs_expr, source_id, player);
-            state
-                .players
-                .iter()
-                .filter(|candidate| candidate.id != player)
-                .all(|candidate| {
+            let lhs_val = crate::game::quantity::resolve_quantity_scoped(
+                state,
+                &lhs_expr,
+                source_id,
+                player,
+                granting_object,
+            );
+            // CR 102.2 + CR 102.3 + CR 800.4a: each opponent still in the game,
+            // not every other seat (a player who left the game or a teammate is
+            // not an opponent).
+            crate::game::players::opponents(state, player)
+                .into_iter()
+                .all(|opponent| {
                     let rhs_expr = QuantityExpr::Ref { qty: rhs.clone() };
                     let rhs_val = crate::game::quantity::resolve_quantity_scoped(
                         state,
                         &rhs_expr,
                         source_id,
-                        candidate.id,
+                        opponent,
+                        granting_object,
                     );
                     comparator.evaluate(lhs_val, rhs_val)
                 })
@@ -1457,10 +1519,20 @@ pub(crate) fn evaluate_condition(
             comparator,
             rhs,
         } => {
-            let lhs_val =
-                crate::game::quantity::resolve_quantity_scoped(state, lhs, source_id, player);
-            let rhs_val =
-                crate::game::quantity::resolve_quantity_scoped(state, rhs, source_id, player);
+            let lhs_val = crate::game::quantity::resolve_quantity_scoped(
+                state,
+                lhs,
+                source_id,
+                player,
+                granting_object,
+            );
+            let rhs_val = crate::game::quantity::resolve_quantity_scoped(
+                state,
+                rhs,
+                source_id,
+                player,
+                granting_object,
+            );
             comparator.evaluate(lhs_val, rhs_val)
         }
         ParsedCondition::CreaturesYouControlTotalPowerAtLeast { minimum } => {
@@ -1568,7 +1640,8 @@ pub(crate) fn evaluate_condition(
             Some(filter) => {
                 let filter_ctx = crate::game::filter::FilterContext::from_source_with_controller(
                     source_id, player,
-                );
+                )
+                .with_granting_object(granting_object);
                 state
                     .attacker_declarations_this_turn
                     .iter()
@@ -1680,20 +1753,16 @@ pub(crate) fn evaluate_condition(
                 .count() as u32
                 >= *count
         }
-        // CR 602.5b: "Activate only if [player condition]" — count matching non-eliminated players.
+        // CR 602.5: "Activate only if [player condition]" — count matching non-eliminated
+        // players (departed ones too for the life-history filters, CR 800.4i).
         ParsedCondition::PlayerCountAtLeast { filter, minimum } => {
             crate::game::quantity::resolve_player_count(
                 state,
                 filter,
                 player,
                 crate::game::quantity::QuantityContext {
-                    entering: None,
-                    source: source_id,
-                    trigger_source: None,
-                    recipient: None,
-                    scoped_player: None,
-                    damage_source: None,
-                    event_amount: None,
+                    granting_object,
+                    ..crate::game::quantity::QuantityContext::new(source_id)
                 },
             ) as usize
                 >= *minimum
@@ -1789,14 +1858,14 @@ pub(crate) fn evaluate_condition(
         // CR 601.3 / CR 602.5: Compound restriction — all inner conditions must be true.
         ParsedCondition::And { conditions } => conditions
             .iter()
-            .all(|c| evaluate_condition(state, player, source_id, c)),
+            .all(|c| evaluate_condition_for_granter(state, player, source_id, granting_object, c)),
         // CR 601.3 / CR 602.5: Disjunctive restriction — any inner condition must be true.
         ParsedCondition::Or { conditions } => conditions
             .iter()
-            .any(|c| evaluate_condition(state, player, source_id, c)),
+            .any(|c| evaluate_condition_for_granter(state, player, source_id, granting_object, c)),
         // CR 601.3 / CR 602.5: Logical negation — true when the inner condition is false.
         ParsedCondition::Not { condition } => {
-            !evaluate_condition(state, player, source_id, condition)
+            !evaluate_condition_for_granter(state, player, source_id, granting_object, condition)
         }
     }
 }
@@ -1834,7 +1903,7 @@ fn spell_targets_filter(
         .pending_cast
         .as_ref()
         .filter(|pending| pending.object_id == source_id)
-        .map(|pending| super::ability_utils::flatten_targets_in_chain(&pending.ability))
+        .map(|pending| super::ability_utils::declared_targets_in_chain(&pending.ability))
         .or_else(|| {
             state
                 .stack
@@ -1845,7 +1914,7 @@ fn spell_targets_filter(
                     crate::types::game_state::StackEntryKind::Spell {
                         ability: Some(resolved),
                         ..
-                    } => Some(super::ability_utils::flatten_targets_in_chain(resolved)),
+                    } => Some(super::ability_utils::declared_targets_in_chain(resolved)),
                     _ => None,
                 })
         });
@@ -1915,7 +1984,7 @@ fn spell_cast_targets(
             StackEntryKind::Spell {
                 ability: Some(resolved),
                 ..
-            } => Some(super::ability_utils::flatten_targets_in_chain(resolved)),
+            } => Some(super::ability_utils::declared_targets_in_chain(resolved)),
             _ => None,
         })
         .or_else(|| {
@@ -1932,7 +2001,7 @@ fn spell_cast_targets(
                             StackEntryKind::Spell {
                                 ability: Some(resolved),
                                 ..
-                            } => Some(super::ability_utils::flatten_targets_in_chain(resolved)),
+                            } => Some(super::ability_utils::declared_targets_in_chain(resolved)),
                             _ => None,
                         }),
                     _ => None,
@@ -2010,7 +2079,7 @@ pub(crate) fn target_dependent_flash_permission_satisfied(
     if has_real_flash {
         return true;
     }
-    let targets = super::ability_utils::flatten_targets_in_chain(ability);
+    let targets = super::ability_utils::declared_targets_in_chain(ability);
     let ctx = super::filter::FilterContext::from_source(state, object_id);
     let evaluate_target_filter = |filter: &crate::types::ability::TargetFilter| -> bool {
         targets.iter().any(|t| match t {
@@ -2363,9 +2432,9 @@ fn player_zone_ids<'a>(
         return Box::new(std::iter::empty());
     };
     match zone {
-        crate::types::zones::Zone::Graveyard => Box::new(p.graveyard.iter()),
+        crate::types::zones::Zone::Graveyard => Box::new(state.graveyard_of(p.id).iter()),
         crate::types::zones::Zone::Hand => Box::new(p.hand.iter()),
-        crate::types::zones::Zone::Library => Box::new(p.library.iter()),
+        crate::types::zones::Zone::Library => Box::new(state.library_of(p.id).iter()),
         _ => Box::new(std::iter::empty()),
     }
 }
@@ -2434,7 +2503,7 @@ pub(crate) fn is_source_blocked(
     // CR 509.1h: "blocked" is the attacker's `blocked` flag, not the presence of
     // blocker assignments — a creature made blocked by an effect (no blockers) is
     // still blocked, and a creature stays blocked even if all its blockers are
-    // removed. Mirrors `unblocked_attackers` / `FilterProp::Unblocked`, which read
+    // removed. Mirrors `combat::attacker_block_status` / `FilterProp::BlockStatus`, which read
     // the same flag.
     state.combat.as_ref().is_some_and(|combat| {
         combat
@@ -2516,9 +2585,36 @@ mod tests {
     use crate::types::ability::{AbilityKind, Effect, ParsedCondition, QuantityExpr};
     use crate::types::card_type::CoreType;
     use crate::types::counter::CounterType;
-    use crate::types::game_state::WaitingFor;
+    use crate::types::game_state::{ArrivalIdentity, WaitingFor, ZoneChangeRecord};
     use crate::types::identifiers::CardId;
     use crate::types::zones::Zone;
+
+    #[test]
+    fn cards_left_your_graveyard_counts_the_departure_owner() {
+        let mut state = crate::types::game_state::GameState::new(
+            crate::types::format::FormatConfig::dandan(),
+            2,
+            42,
+        );
+        let mut record =
+            ZoneChangeRecord::test_minimal(ObjectId(1), Some(Zone::Graveyard), Zone::Battlefield);
+        record.owner = PlayerId(0);
+        record.controller = PlayerId(0);
+        record.arrival = ArrivalIdentity {
+            owner: PlayerId(1),
+            controller: PlayerId(1),
+        };
+        state.zone_changes_this_turn.push_back(record);
+        let condition = ParsedCondition::CardsLeftYourGraveyardThisTurnAtLeast { count: 1 };
+        assert!(
+            evaluate_condition(&state, PlayerId(0), ObjectId(9), &condition),
+            "the card left the departure owner's graveyard"
+        );
+        assert!(
+            !evaluate_condition(&state, PlayerId(1), ObjectId(9), &condition),
+            "the installed owner's graveyard lost nothing"
+        );
+    }
 
     /// Two-step pattern: parse condition text, then evaluate.
     /// Returns `true` for unrecognized conditions (matching prior permissive behavior).
@@ -2537,7 +2633,7 @@ mod tests {
     #[test]
     fn activation_once_each_turn_uses_shared_counter() {
         let mut state = crate::types::game_state::GameState::new_two_player(42);
-        record_ability_activation(&mut state, ObjectId(10), 1);
+        record_ability_activation(&mut state, ObjectId(10), 1, None);
 
         let result = check_activation_restrictions(
             &state,
@@ -3264,7 +3360,7 @@ mod tests {
         let mut state = crate::types::game_state::GameState::new_two_player(42);
         state
             .battlefield_entries_this_turn
-            .push(BattlefieldEntryRecord {
+            .push_back(BattlefieldEntryRecord {
                 object_id: ObjectId(99),
                 name: "Green Creature".to_string(),
                 core_types: vec![CoreType::Creature],
@@ -3333,7 +3429,7 @@ mod tests {
                 for _ in 0..*count {
                     state
                         .battlefield_entries_this_turn
-                        .push(BattlefieldEntryRecord {
+                        .push_back(BattlefieldEntryRecord {
                             object_id: ObjectId(next_id),
                             name: "Bear".to_string(),
                             core_types: vec![CoreType::Creature],
@@ -3940,6 +4036,7 @@ mod tests {
                 cast_variant: crate::types::game_state::CastingVariant::Normal,
                 was_kicked: false,
                 spell_object_id: None,
+                prepared_copy_source: None,
             }]),
         );
 
@@ -3977,6 +4074,7 @@ mod tests {
                     cast_variant: crate::types::game_state::CastingVariant::Normal,
                     was_kicked: false,
                     spell_object_id: None,
+                    prepared_copy_source: None,
                 },
                 crate::types::game_state::SpellCastRecord {
                     name: String::new(),
@@ -3992,6 +4090,7 @@ mod tests {
                     cast_variant: crate::types::game_state::CastingVariant::Normal,
                     was_kicked: false,
                     spell_object_id: None,
+                    prepared_copy_source: None,
                 },
                 crate::types::game_state::SpellCastRecord {
                     name: String::new(),
@@ -4007,6 +4106,7 @@ mod tests {
                     cast_variant: crate::types::game_state::CastingVariant::Normal,
                     was_kicked: false,
                     spell_object_id: None,
+                    prepared_copy_source: None,
                 },
             ]),
         );
@@ -5371,5 +5471,86 @@ mod tests {
             vec![],
             Some(ControllerRef::Opponent)
         )));
+    }
+}
+
+#[cfg(test)]
+mod dandan_read_sweep_tests {
+    use super::*;
+    use crate::game::zones::create_object;
+    use crate::types::ability::ParsedCondition;
+    use crate::types::card_type::CoreType;
+    use crate::types::format::FormatConfig;
+    use crate::types::game_state::GameState;
+    use crate::types::identifiers::CardId;
+    use crate::types::zones::Zone;
+
+    const P0: PlayerId = PlayerId(0);
+    const P1: PlayerId = PlayerId(1);
+
+    fn holds(state: &GameState, seat: PlayerId, condition: ParsedCondition) -> bool {
+        evaluate_condition(state, seat, ObjectId(0), &condition)
+    }
+
+    fn put(state: &mut GameState, id: u64, owner: PlayerId, zone: Zone, core: CoreType) {
+        let object = create_object(state, CardId(id), owner, format!("Card {id}"), zone);
+        state
+            .objects
+            .get_mut(&object)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(core);
+    }
+
+    /// CR 400.1 + CR 404.1: "N or more cards (of M types) in your graveyard or
+    /// library" reads the shared pile for either seat of a shared-pile format.
+    #[test]
+    fn zone_count_conditions_read_the_shared_pile() {
+        let mut state = GameState::new(FormatConfig::dandan(), 2, 1);
+        put(&mut state, 1, P1, Zone::Graveyard, CoreType::Creature);
+        put(&mut state, 2, P0, Zone::Graveyard, CoreType::Instant);
+        put(&mut state, 3, P1, Zone::Graveyard, CoreType::Land);
+        put(&mut state, 4, P1, Zone::Library, CoreType::Land);
+        put(&mut state, 5, P1, Zone::Library, CoreType::Land);
+
+        for seat in [P0, P1] {
+            let zone = |zone, count| ParsedCondition::ZoneCardCountAtLeast { zone, count };
+            assert!(holds(&state, seat, zone(Zone::Graveyard, 3)), "{seat:?}");
+            assert!(!holds(&state, seat, zone(Zone::Graveyard, 4)), "{seat:?}");
+            assert!(holds(&state, seat, zone(Zone::Library, 2)), "{seat:?}");
+            assert!(!holds(&state, seat, zone(Zone::Library, 3)), "{seat:?}");
+            let types = |count| ParsedCondition::ZoneCardTypeCountAtLeast {
+                zone: Zone::Graveyard,
+                count,
+            };
+            assert!(holds(&state, seat, types(3)), "{seat:?}");
+            assert!(!holds(&state, seat, types(4)), "{seat:?}");
+            assert!(
+                holds(
+                    &state,
+                    seat,
+                    ParsedCondition::ZoneCoreTypeCardCountAtLeast {
+                        zone: Zone::Graveyard,
+                        core_type: CoreType::Land,
+                        count: 1,
+                    }
+                ),
+                "{seat:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn zone_count_conditions_in_a_per_seat_format_read_the_seats_own_zone() {
+        let mut state = GameState::new_two_player(1);
+        put(&mut state, 1, P1, Zone::Graveyard, CoreType::Creature);
+        let one = ParsedCondition::ZoneCardCountAtLeast {
+            zone: Zone::Graveyard,
+            count: 1,
+        };
+
+        assert!(holds(&state, P1, one.clone()));
+        assert!(!holds(&state, P0, one));
     }
 }

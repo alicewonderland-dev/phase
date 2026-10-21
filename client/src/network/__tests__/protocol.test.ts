@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
 
+import {
+  LOBBY_PROTOCOL_VERSION,
+  MIN_LOBBY_PROTOCOL_FOR_DANDAN,
+  MIN_LOBBY_PROTOCOL_FOR_FREEFORM_FORMATS,
+  lobbyProtocolRequiredForFormat,
+} from "../../adapter/ws-adapter";
 import type { EndContinuousEffectOffer } from "../../adapter/types";
 import { buildGameState } from "../../test/factories/gameStateFactory";
 import {
@@ -70,9 +76,22 @@ const PREVIEW_ANSWER = {
   summaries: ["confirmAvailable", "progress"],
 } as never;
 
+describe("lobby capability floor for the Dandan format", () => {
+  it("requires the frozen Dandan floor for a lobby frame naming the format", () => {
+    expect(lobbyProtocolRequiredForFormat("Dandan")).toBe(16);
+    expect(MIN_LOBBY_PROTOCOL_FOR_DANDAN).toBe(16);
+    expect(MIN_LOBBY_PROTOCOL_FOR_DANDAN).toBeLessThanOrEqual(LOBBY_PROTOCOL_VERSION);
+  });
+
+  it("reads the floor per format, not as a constant", () => {
+    expect(lobbyProtocolRequiredForFormat("Freeform")).toBe(MIN_LOBBY_PROTOCOL_FOR_FREEFORM_FORMATS);
+    expect(lobbyProtocolRequiredForFormat("Standard")).toBeNull();
+  });
+});
+
 describe("encodeWireMessage / decodeWireMessage", () => {
-  it("pins the P2P wire protocol to v62", () => {
-    expect(WIRE_PROTOCOL_VERSION).toBe(62);
+  it("pins the P2P wire protocol to v137", () => {
+    expect(WIRE_PROTOCOL_VERSION).toBe(137);
   });
 
   it("defaults shortcut actions for a legacy payload created before the additive field", () => {
@@ -284,6 +303,52 @@ describe("encodeWireMessage / decodeWireMessage", () => {
     expect(out).toEqual(msg);
   });
 
+  // CR 601.2a + CR 601.2b: an announced graveyard permission's digest travels
+  // as a string, so a value above 2^53 survives JSON between JavaScript peers
+  // bit for bit (a JSON number would have lost its low bits).
+  it("round-trips an announced graveyard permission with a digest above 2^53", async () => {
+    const digest = (2n ** 60n + 1n).toString(16).padStart(16, "0");
+    expect(Number.parseInt(digest, 16)).toBeGreaterThan(Number.MAX_SAFE_INTEGER);
+    const msg: P2PMessage = {
+      type: "state_update",
+      state: buildGameState({
+        waiting_for: {
+          type: "CastingVariantChoice",
+          data: {
+            player: 0,
+            object_id: 7,
+            card_id: 7,
+            options: [
+              {
+                variant: { type: "Blitz" },
+                face: "Current",
+                mana_cost: { type: "Cost", shards: ["Green"], generic: 3 },
+                authority: {
+                  announcement: {
+                    permission: { source: 3, grant: { type: "Static", index: 1 } },
+                    grant_digest: digest,
+                    slot_type: "Creature",
+                  },
+                  frequency: "OncePerTurnPerPermanentType",
+                },
+              },
+            ],
+          },
+        },
+      }),
+      events: [],
+      legalActions: [],
+      manaPaymentShortcutActions: [],
+      viewerInteraction: viewerInteractionWithProducedMana,
+    };
+    const out = await decodeWireMessage(await encodeWireMessage(msg));
+    expect(out).toEqual(msg);
+    const decoded = out as Extract<P2PMessage, { type: "state_update" }>;
+    const waiting = decoded.state.waiting_for;
+    if (waiting.type !== "CastingVariantChoice") throw new Error("menu lost");
+    expect(waiting.data.options[0].authority?.announcement.grant_digest).toBe(digest);
+  });
+
   it("round-trips monarch-bounded exile links", async () => {
     const msg: P2PMessage = {
       type: "state_update",
@@ -322,6 +387,16 @@ describe("encodeWireMessage / decodeWireMessage", () => {
               type: "GraveyardPaidCast",
               hit_card: 17,
               cast_transformed: false,
+              // CR 608.2c + CR 601.2a: a populated gains-modifications rider —
+              // the typed modifications AND the printed spell-quality predicate
+              // must survive the wire round trip.
+              enters_with_modifications: {
+                modifications: [{ type: "AddKeyword", keyword: "Haste" }],
+                cast_filter: {
+                  type: "Typed",
+                  type_filters: [{ type: "Creature" }],
+                },
+              },
               graveyard_replacement: {
                 type: "Library",
                 position: { type: "BeneathTop", depth: { type: "Fixed", value: 2 } },
@@ -381,7 +456,41 @@ describe("encodeWireMessage / decodeWireMessage", () => {
       }),
     };
 
-    for (const message of [nonempty, legacyEmpty]) {
+    // FreeCastWindow — a populated rider on the window carrier, with the
+    // optional offer fields (remaining_casts / remaining_mv_budget /
+    // member_pool) omitted; the round trip must keep the populated values and
+    // keep the omitted values omitted.
+    const windowMessage: P2PMessage = {
+      ...nonempty,
+      state: buildGameState({
+        waiting_for: {
+          type: "CastOffer",
+          data: {
+            player: 0,
+            kind: {
+              type: "FreeCastWindow",
+              candidates: [17, 18],
+              face_policy: {
+                filter: { type: "Any" },
+                source_id: 11,
+                controller: 0,
+                constraint: null,
+              },
+              zones: ["Exile"],
+              enters_with_modifications: {
+                modifications: [{ type: "AddKeyword", keyword: "Haste" }],
+                cast_filter: {
+                  type: "Typed",
+                  type_filters: [{ type: "Creature" }],
+                },
+              },
+            },
+          },
+        },
+      }),
+    };
+
+    for (const message of [nonempty, legacyEmpty, windowMessage]) {
       const bytes = await encodeWireMessage(message);
       await expect(decodeWireMessage(bytes)).resolves.toEqual(message);
     }

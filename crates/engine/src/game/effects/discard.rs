@@ -1,3 +1,4 @@
+use crate::types::game_state::RandomDraw;
 use std::collections::HashSet;
 
 use rand::Rng;
@@ -75,6 +76,7 @@ pub(crate) fn complete_discard_to_graveyard(
         face_down_in_exile: crate::types::ability::ExileConcealment::Public,
         chain_referent: crate::types::zones::ChainReferentIntent::Silent,
         enter_as_copy: None,
+        enter_with_choices: None,
         discard_frame,
         performed_by: None,
         applied,
@@ -182,10 +184,11 @@ fn park_discard_batch(
     effect_kind: EffectKind,
     paused_card: ObjectIncarnationRef,
     discard_frame: Option<crate::types::identifiers::DiscardFrameId>,
-    preceding_events: Vec<GameEvent>,
+    events: &mut Vec<GameEvent>,
+    events_before_self: usize,
     completion: crate::types::game_state::PendingDiscardBatchCompletion,
 ) {
-    let paused_events = preceding_events.clone();
+    let preceding_events = events[events_before_self..].to_vec();
     state.pending_discard_batch = Some(Box::new(crate::types::game_state::PendingDiscardBatch {
         player,
         cursor,
@@ -201,8 +204,8 @@ fn park_discard_batch(
     }));
     crate::game::engine_resolution_choices::defer_observer_triggers_for_paused_choice(
         state,
-        &paused_events,
-        0,
+        events,
+        events_before_self,
     );
 }
 
@@ -379,8 +382,9 @@ pub fn resolve(
     // an unrelated card whenever hand size happened to equal the discard
     // count. The one bit those four PLAYER-scoped shapes never carry, and
     // that Thoughtseize's empty-reveal case DOES, is a
-    // `parent_target_missing_reason` of `RevealHandChoice` — stamped ONLY by
-    // `apply_parent_chain_context` immediately after a `RevealHand`
+    // `parent_target_missing_reason` of `RevealHandChoice` — stamped at a
+    // parent->child hand-off (see `ResolvedAbility::parent_target_missing_reason`)
+    // immediately after a `RevealHand`
     // reveal-choice whose eligible set was empty (see
     // `GameState::last_parent_target_missing_reason`). So: enter the specific-
     // targets loop (a no-op when `specific_targets` is empty, which IS the
@@ -465,7 +469,8 @@ pub fn resolve(
                                     EffectKind::from(&ability.effect),
                                     pin_paused_occurrence(state, obj_id),
                                     discard_frame,
-                                    events[events_before_self..].to_vec(),
+                                    events,
+                                    events_before_self,
                                     crate::types::game_state::PendingDiscardBatchCompletion::Standard,
                                 );
                                 return Ok(());
@@ -524,7 +529,8 @@ pub fn resolve(
                         EffectKind::from(&ability.effect),
                         pin_paused_occurrence(state, obj_id),
                         discard_frame,
-                        events[events_before_self..].to_vec(),
+                        events,
+                        events_before_self,
                         crate::types::game_state::PendingDiscardBatchCompletion::Standard,
                     );
                     return Ok(());
@@ -539,7 +545,18 @@ pub fn resolve(
         // a card") does not inherit the parent's chosen player and discard from
         // the wrong hand. `resolve_player_for_context_ref` skips `ability.targets`
         // when the filter is a context-ref and falls back to `ability.controller`.
-        let discard_player = super::resolve_player_for_context_ref(state, ability, &target_filter);
+        // CR 608.2b: a declared player whose target was illegal discards nothing.
+        let Some(discard_player) =
+            super::resolve_player_for_context_ref(state, ability, &target_filter)
+        else {
+            // CR 608.2b: a missing player discards nothing; the completion marker is what publishes the zero count.
+            events.push(GameEvent::EffectResolved {
+                kind: EffectKind::from(&ability.effect),
+                source_id: ability.source_id,
+                subject: None,
+            });
+            return Ok(());
+        };
 
         // CR 701.9a + CR 609.3: Tamiyo, Collector of Tales class — an
         // opponent's spell or ability can't force the protected player to
@@ -624,7 +641,8 @@ pub fn resolve(
                     EffectKind::from(&ability.effect),
                     paused_card,
                     discard_frame,
-                    events[events_before_self..].to_vec(),
+                    events,
+                    events_before_self,
                     crate::types::game_state::PendingDiscardBatchCompletion::Standard,
                 );
                 return Ok(());
@@ -664,7 +682,8 @@ pub fn resolve(
                         // CR 400.7: the pause parks the pre-move occurrence.
                         pin_paused_occurrence(state, *obj_id),
                         discard_frame,
-                        events[events_before_self..].to_vec(),
+                        events,
+                        events_before_self,
                         crate::types::game_state::PendingDiscardBatchCompletion::Standard,
                     );
                     return Ok(());
@@ -876,7 +895,10 @@ pub(crate) fn discard_at_random(
         if remaining.is_empty() {
             break;
         }
-        let index = state.rng.random_range(0..remaining.len());
+        let index = state
+            .rng
+            .draw(RandomDraw::Outcome)
+            .random_range(0..remaining.len());
         let obj_id = remaining.swap_remove(index);
         let object = state
             .objects

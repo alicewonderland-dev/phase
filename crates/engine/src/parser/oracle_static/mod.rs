@@ -68,8 +68,9 @@ mod prelude {
         CastCostMode, CastExtraCost, CastFreeOrigin, CastFrequency, CastingProhibitionCondition,
         CombatAloneAction, CombatAloneRequirement, CostModifyMode, CostPaymentProhibition,
         CostReductionReach, CrewAction, CrewContributionKind, ExileCardPool, ExileCastCost,
-        ExileCastGrantee, ExileCastTiming, HandSizeModification, ProhibitionScope,
-        RequiredDefender, StaticMode, SuppressedTriggerEvent, TriggerCause, ZoneChangeQualifier,
+        ExileCastGrantee, ExileCastTiming, GraveyardPermissionPool, HandSizeModification,
+        ProhibitionScope, RequiredDefender, StaticMode, SuppressedTriggerEvent, TriggerCause,
+        ZoneChangeQualifier,
     };
     pub(super) use crate::types::zones::Zone;
 }
@@ -94,6 +95,7 @@ mod shared;
 mod static_helpers;
 mod type_change;
 
+pub(crate) use shared::add_property;
 pub(crate) use shared::parse_commander_subject_filter_prefix;
 pub(crate) use shared::peel_color_quality_prefix;
 
@@ -125,7 +127,7 @@ mod support {
         try_split_and_cant_attack_scoped, try_split_and_cant_be_attached,
         try_split_and_cant_be_blocked, try_split_and_cant_be_sacrificed,
         try_split_and_cant_be_targeted, try_split_and_cant_block, try_split_and_doesnt_untap,
-        try_split_and_foreign_keyword_grant, try_split_and_must_attack_block,
+        try_split_and_foreign_subject_grant, try_split_and_must_attack_block,
     };
     pub(super) use super::grammar::*;
     pub(super) use super::keyword_grant::{
@@ -135,8 +137,9 @@ mod support {
         with_protection_does_not_remove, RuleStaticPredicate,
     };
     pub(super) use super::restriction::{
-        parse_cant_be_activated_exemption_in_text, parse_cast_and_activate_only_during,
-        parse_relative_count_typed_cast_prohibitions, strip_casting_prohibition_subject,
+        parse_cant_be_activated_exemption_in_text, parse_cant_draw_cards_or_gain_life,
+        parse_cast_and_activate_only_during, parse_relative_count_typed_cast_prohibitions,
+        strip_casting_prohibition_subject,
     };
     pub(super) use super::shared::*;
     pub(super) use super::static_helpers::*;
@@ -151,7 +154,7 @@ mod support {
 pub(crate) use cost_mod::{
     parse_activated_ability_cost_head, parse_alt_cost_frequency_prefix,
     parse_alternative_keyword_cost, parse_cast_spells_alternative_cost_multi,
-    parse_collect_evidence_alt_cost, parse_spells_alternative_cost,
+    parse_collect_evidence_alt_cost, parse_spells_alternative_cost, ActivatedAbilityCostHead,
 };
 pub(crate) use evasion::{
     classify_block_exception, is_extra_blockers_static_candidate, is_forced_block_static_candidate,
@@ -162,8 +165,9 @@ pub(crate) use grammar::parse_pt_mod;
 pub(crate) use grammar::promote_nested_ability_quotes;
 pub(crate) use grammar::typed_filter_for_subtype;
 pub(crate) use keyword_grant::{
-    classify_quoted_inner, parse_chosen_qualifier_subject, parse_continuous_modifications,
-    parse_graveyard_granted_keyword_kind, parse_quoted_ability_modifications, split_keyword_list,
+    classify_quoted_inner, find_refused_loyalty_grant_sentence, parse_chosen_qualifier_subject,
+    parse_continuous_modifications, parse_graveyard_granted_keyword_kind,
+    parse_quoted_ability_modifications, split_keyword_list,
     try_parse_graveyard_keyword_grant_clause, try_parse_graveyard_keyword_grant_static,
 };
 pub(crate) use mana_transform::{
@@ -180,6 +184,7 @@ pub(crate) use shared::parse_continuous_subject_filter;
 pub(crate) use shared::parse_dynamic_x_clause;
 pub use shared::parse_static_line_multi;
 pub(crate) use shared::parse_subtype_or_list_insensitive_prefix;
+pub(crate) use shared::parse_targeting_bypass_tail;
 pub(crate) use shared::target_filter_is_your_graveyard;
 pub(crate) use shared::GrantedCastKeywordKind;
 pub(crate) use shared::{

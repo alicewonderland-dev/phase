@@ -6,8 +6,76 @@ use super::prelude::*;
 #[allow(unused_imports)]
 use super::support::*;
 use nom::character::complete::anychar;
-use nom::combinator::not;
+use nom::combinator::{map_opt, not, success, value};
 use nom::multi::many1;
+
+/// Whose spells and abilities a "can be the target of spells and abilities …
+/// as though it didn't have <quality>" clause opens its subject to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetingBypassBeneficiary {
+    /// No qualifier (Nowhere to Run): every player's spells and abilities.
+    Anyone,
+    /// "… you control" (Glaring Spotlight, Detection Tower): the controller's.
+    YouControl,
+    /// "… controlled by target player" (Autumn Willow).
+    ControlledByTargetPlayer,
+}
+
+/// The targeting-restriction keyword a bypass clause pretends the subject lacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetingBypassQuality {
+    /// CR 702.11b: Hexproof.
+    Hexproof,
+    /// CR 702.18a: Shroud.
+    Shroud,
+}
+
+/// CR 702.11e + CR 702.18a + CR 609.4: Parse the shared tail of a targeting
+/// bypass clause, starting at the space before "can be the target[s]":
+/// " can be the target[s] of spells and abilities[ you control | controlled by
+/// target player] as though (it|they) didn't have (hexproof|shroud)".
+///
+/// Single authority for the static form ([`parse_ignore_hexproof_static`]) and
+/// the effect form (`oracle_effect::subject`), which differ only in what they do
+/// with the recognized beneficiary and quality.
+pub(crate) fn parse_targeting_bypass_tail(
+    i: &str,
+) -> OracleResult<'_, (TargetingBypassBeneficiary, TargetingBypassQuality)> {
+    let (i, _) = tag::<_, _, OracleError<'_>>(" can be the target").parse(i)?;
+    let (i, _) = opt(tag::<_, _, OracleError<'_>>("s")).parse(i)?;
+    let (i, _) = tag::<_, _, OracleError<'_>>(" of spells and abilities").parse(i)?;
+    // CR 609.4 + CR 109.5: the beneficiary qualifier is semantically load-bearing in
+    // multiplayer — without it every player's spells and abilities gain the bypass.
+    let (i, beneficiary) = alt((
+        value(
+            TargetingBypassBeneficiary::YouControl,
+            tag::<_, _, OracleError<'_>>(" you control"),
+        ),
+        value(
+            TargetingBypassBeneficiary::ControlledByTargetPlayer,
+            tag(" controlled by target player"),
+        ),
+        success(TargetingBypassBeneficiary::Anyone),
+    ))
+    .parse(i)?;
+    let (i, _) = tag::<_, _, OracleError<'_>>(" as though ").parse(i)?;
+    // Plural ("they") or singular ("it") subject pronoun.
+    let (i, _) = alt((
+        tag::<_, _, OracleError<'_>>("they didn't"),
+        tag("it didn't"),
+    ))
+    .parse(i)?;
+    let (i, _) = tag::<_, _, OracleError<'_>>(" have ").parse(i)?;
+    let (i, quality) = alt((
+        value(
+            TargetingBypassQuality::Hexproof,
+            tag::<_, _, OracleError<'_>>("hexproof"),
+        ),
+        value(TargetingBypassQuality::Shroud, tag("shroud")),
+    ))
+    .parse(i)?;
+    Ok((i, (beneficiary, quality)))
+}
 
 /// CR 702.11e + CR 609.4 + CR 702.21a: Parse the "[subject] can be the targets
 /// of spells and abilities[ you control] as though they didn't have hexproof[.
@@ -35,32 +103,27 @@ pub(crate) fn parse_ignore_hexproof_static(
     let (after_subject, subject) = take_until::<_, _, OracleError<'_>>(" can be the target")
         .parse(tp.lower)
         .ok()?;
-    let bypass: OracleResult<'_, bool> = (|| {
-        let (i, _) = tag::<_, _, OracleError<'_>>(" can be the target").parse(after_subject)?;
-        let (i, _) = opt(tag::<_, _, OracleError<'_>>("s")).parse(i)?;
-        let (i, _) = tag::<_, _, OracleError<'_>>(" of spells and abilities").parse(i)?;
-        // CR 702.11e + CR 609.4: an optional "you control" qualifier restricts
-        // which spells and abilities bypass hexproof to the static controller's
-        // (Glaring Spotlight — "spells and abilities you control"). Its presence
-        // is semantically load-bearing in multiplayer: without it (Nowhere to
-        // Run) every player's spells and abilities gain the bypass; with it, only
-        // the controller's do. The flag drives `bypass_beneficiary` below.
-        let (i, you_control) = opt(tag::<_, _, OracleError<'_>>(" you control")).parse(i)?;
-        let (i, _) = tag::<_, _, OracleError<'_>>(" as though ").parse(i)?;
-        // CR 702.11e: plural ("they") or singular ("it") subject pronoun.
-        let (i, _) = alt((
-            tag::<_, _, OracleError<'_>>("they didn't"),
-            tag::<_, _, OracleError<'_>>("it didn't"),
-        ))
-        .parse(i)?;
-        let (i, _) = tag::<_, _, OracleError<'_>>(" have hexproof").parse(i)?;
-        Ok((i, you_control.is_some()))
-    })();
-    let (rest, you_control) = bypass.ok()?;
-    // CR 109.5: "you control" resolves relative to the static's source
-    // controller, so the beneficiary is `ControllerRef::You`; absent, the bypass
-    // benefits every player (`None`).
-    let beneficiary = you_control.then_some(ControllerRef::You);
+    let (rest, (beneficiary, quality)) = parse_targeting_bypass_tail(after_subject).ok()?;
+    // CR 702.18a: Shroud has no static bypass form; only the hexproof bypass is
+    // modeled here. CR 109.5: "you control" resolves relative to the static's
+    // source controller (`ControllerRef::You`); absent, the bypass benefits every
+    // player (`None`).
+    let beneficiary = match (quality, beneficiary) {
+        (TargetingBypassQuality::Hexproof, TargetingBypassBeneficiary::Anyone) => None,
+        (TargetingBypassQuality::Hexproof, TargetingBypassBeneficiary::YouControl) => {
+            Some(ControllerRef::You)
+        }
+        (
+            TargetingBypassQuality::Hexproof,
+            TargetingBypassBeneficiary::ControlledByTargetPlayer,
+        )
+        | (
+            TargetingBypassQuality::Shroud,
+            TargetingBypassBeneficiary::Anyone
+            | TargetingBypassBeneficiary::YouControl
+            | TargetingBypassBeneficiary::ControlledByTargetPlayer,
+        ) => return None,
+    };
 
     // Map the subject phrase to a typed filter; require it to fully consume so a
     // partial parse never silently scopes the bypass wider than written.
@@ -969,6 +1032,7 @@ fn continuous_modification_dynamic_quantity_mut(
         | ContinuousModification::SetBasicLandType { .. }
         | ContinuousModification::SetChosenBasicLandType
         | ContinuousModification::SetChosenName
+        | ContinuousModification::SubstituteTextWord { .. }
         | ContinuousModification::RetainPrintedTriggerFromSource { .. }
         | ContinuousModification::RetainPrintedAbilityFromSource { .. }
         | ContinuousModification::RetainAllOtherAbilitiesFromSource
@@ -1512,7 +1576,7 @@ fn segment_is_back_referential_continuation(segment: &str) -> bool {
 /// inside a quoted granted ability or a mana symbol never ends a sentence. Each
 /// returned segment keeps its terminating period and is trimmed; empty segments
 /// are dropped.
-fn split_static_sentences(text: &str) -> Vec<String> {
+pub(crate) fn split_static_sentences(text: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut brace_depth = 0usize;
@@ -2895,6 +2959,12 @@ fn parse_static_line_multi_dispatch(text: &str) -> Vec<StaticDefinition> {
         ];
     }
 
+    // CR 101.2 + CR 121.3 + CR 119.7: "Players can't draw cards or gain life"
+    // (Mornsong Aria) — CantDraw plus CantGainLife for the same subject.
+    if let Some(defs) = parse_cant_draw_cards_or_gain_life(tp.lower, &stripped) {
+        return defs;
+    }
+
     // CR 104.2b + CR 104.3e + CR 810.8a: "<player-scope> can't lose/win the
     // game and <player-scope> can't win/lose the game" — one game-outcome-lock
     // static per conjunct, each with its own player scope (Platinum Angel
@@ -3077,12 +3147,10 @@ fn parse_static_line_multi_dispatch(text: &str) -> Vec<StaticDefinition> {
         return defs;
     }
 
-    // CR 611.3a + CR 613.1f: "PRIMARY and FOREIGN_SUBJECT have/has/gains/gain
-    // KEYWORD [as long as COND]" — compound static where the second conjunct has
-    // a different subject (e.g., Angelic Field Marshal: "~ gets +2/+2 and
-    // creatures you control have vigilance as long as you control your commander").
-    // Must run before the single-return fallback that can only produce one def.
-    if let Some(defs) = try_split_and_foreign_keyword_grant(&stripped) {
+    // CR 611.3a + CR 613.1f + CR 613.4c: "PRIMARY and FOREIGN_SUBJECT <keyword grant |
+    // P/T modification> [as long as COND]" (Angelic Field Marshal, Thunderfoot Baloth).
+    // Must run before the `parse_static_line` fallback below.
+    if let Some(defs) = try_split_and_foreign_subject_grant(&stripped) {
         return defs;
     }
 
@@ -3530,6 +3598,15 @@ pub(crate) fn rebind_source_object_quantities_to_recipient(
             counters,
             minimum,
             maximum,
+        },
+        // CR 611.3a + CR 506.5: an attached-subject gate's "it" names the host
+        // creature (Gutter Shortcut's "as long as it's attacking alone"), while the
+        // source is the Aura/Equipment, which is never an attacker. The shape
+        // matches the inverted form Security Bypass already produces.
+        StaticCondition::SourceAttackingAlone => StaticCondition::RecipientMatchesFilter {
+            filter: TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::AttackingAlone]),
+            ),
         },
         other => other,
     }
@@ -5231,15 +5308,24 @@ fn parse_subtype_or_list_prefix_with_word_parser(
     }
 }
 
-/// Try to strip a leading "with [counter] counter(s) on it/them" clause from `text`,
-/// returning the `FilterProp` and the remaining text after the clause.
-/// CR 613.1 + CR 613.7: Used to parse conditional static keyword grants in layer 6.
-pub(crate) fn strip_counter_condition_prefix(text: &str) -> Option<(FilterProp, &str)> {
+/// Strip a leading "with <qualifier>" object qualifier sitting between a static's
+/// subject ("… creatures you control") and its predicate, returning the
+/// conjoined `FilterProp`s it denotes and the remaining text. Two forms:
+/// - CR 122.1: "with [counter] counter(s) on it/them" — one `Counters` prop via
+///   `parse_counter_suffix` (conditional anthems / keyword grants);
+/// - CR 208.4b: "with base power and toughness N/M" — two base-scope
+///   `PtComparison` props via `nom_filter::parse_with_base_pt_designation`
+///   (Andrios, Roaming Explorer: "tapped creatures you control with base power
+///   and toughness 4/3 have base power and toughness 16/9").
+pub(crate) fn strip_with_qualifier_prefix(text: &str) -> Option<(Vec<FilterProp>, &str)> {
     let lower = text.to_lowercase();
     nom_tag_lower(&lower, &lower, "with ")?;
     // parse_counter_suffix expects optional leading whitespace before "with"
-    let (prop, consumed) = parse_counter_suffix(&lower)?;
-    Some((prop, text[consumed..].trim_start()))
+    if let Some((prop, consumed)) = parse_counter_suffix(&lower) {
+        return Some((vec![prop], text[consumed..].trim_start()));
+    }
+    let (props, rest) = nom_on_lower(text, &lower, nom_filter::parse_with_base_pt_designation)?;
+    Some((Vec::from(props), rest.trim_start()))
 }
 
 pub(crate) fn parse_modified_creature_subject_filter(subject: &str) -> Option<TargetFilter> {
@@ -5518,32 +5604,59 @@ pub(crate) fn descriptor_is_supertype(descriptor: &str) -> bool {
 }
 
 /// Nom-backed helper: split a subject string into (descriptor_core, controller)
-/// by trying to parse a trailing controller suffix. Only accepts the controller
-/// scopes that this static subject seam can actually resolve:
+/// by trying to parse a trailing controller suffix. A present-tense direct
+/// projection of `nom_target::parse_controller_phrase` that only accepts the
+/// controller scopes this static subject seam can actually resolve:
 ///
 /// - `ControllerRef::You` — "you control"
 /// - `ControllerRef::Opponent` — "your opponents control" / "you don't control"
 /// - `ControllerRef::EnchantedPlayer` — "enchanted player controls" (CR 303.4b)
-///
-/// `TargetPlayer` and `DefendingPlayer` are deliberately excluded because this
-/// call site builds a continuous static `TargetFilter` with no companion
-/// target-player authority or combat context.
-///
-/// Uses nom `alt`/`tag`/`value` combinators so the phrase set is maintained
-/// alongside the shared grammar rather than as raw suffix literals.
 fn parse_static_controller_suffix(input: &str) -> OracleResult<'_, ControllerRef> {
-    alt((
-        value(ControllerRef::You, tag("you control")),
-        value(ControllerRef::Opponent, tag("your opponents control")),
-        value(ControllerRef::Opponent, tag("you don't control")),
+    map_opt(nom_target::parse_controller_phrase, |phrase| {
+        match (phrase.subject, phrase.tense) {
+            (
+                nom_target::ControllerSubject::Direct(controller),
+                nom_target::ControllerTense::Present,
+            ) => admits_static_subject_controller(&controller, phrase.form).then_some(controller),
+            (nom_target::ControllerSubject::Direct(_), nom_target::ControllerTense::Past)
+            | (nom_target::ControllerSubject::Anaphoric(_), _) => None,
+        }
+    })
+    .parse(input)
+}
+
+/// The direct controllers, by clause form, a static subject's controller
+/// suffix admits.
+fn admits_static_subject_controller(
+    controller: &ControllerRef,
+    form: nom_target::ControllerForm,
+) -> bool {
+    match controller {
         // CR 303.4b + CR 702.5a: "enchanted player controls" — the controller
         // scope is the player the source Aura is attached to.
-        value(
-            ControllerRef::EnchantedPlayer,
-            tag("enchanted player controls"),
-        ),
-    ))
-    .parse(input)
+        ControllerRef::You | ControllerRef::EnchantedPlayer => true,
+        // "your opponents control" / "you don't control"; "an opponent
+        // controls" is not admitted.
+        ControllerRef::Opponent => match form {
+            nom_target::ControllerForm::Plural | nom_target::ControllerForm::Negated => true,
+            nom_target::ControllerForm::Singular | nom_target::ControllerForm::Passive => false,
+        },
+        // `TargetPlayer` and `DefendingPlayer` are deliberately excluded because
+        // this call site builds a continuous static `TargetFilter` with no
+        // companion target-player authority or combat context.
+        ControllerRef::TargetPlayer | ControllerRef::DefendingPlayer => false,
+        ControllerRef::ScopedPlayer
+        | ControllerRef::TargetOpponent
+        | ControllerRef::ParentTargetController
+        | ControllerRef::EventTargetController
+        | ControllerRef::ParentTargetOwner
+        | ControllerRef::ChosenPlayer { .. }
+        | ControllerRef::SourceChosenPlayer
+        | ControllerRef::TriggeringPlayer
+        | ControllerRef::ActivePlayer
+        | ControllerRef::SpecificPlayer { .. }
+        | ControllerRef::DeclaredPlayer { .. } => false,
+    }
 }
 
 /// Strip a trailing controller suffix from a subject string using the
@@ -5778,20 +5891,25 @@ pub(crate) fn add_another_filter(filter: TargetFilter) -> TargetFilter {
     }
 }
 
-/// Add a single `FilterProp` to an existing `TargetFilter`.
-pub(crate) fn add_property(filter: TargetFilter, prop: FilterProp) -> TargetFilter {
+/// Add `FilterProp`s (conjoined) to an existing `TargetFilter`.
+pub(crate) fn add_properties(filter: TargetFilter, props: Vec<FilterProp>) -> TargetFilter {
     match filter {
         TargetFilter::Typed(mut typed) => {
-            typed.properties.push(prop);
+            typed.properties.extend(props);
             TargetFilter::Typed(typed)
         }
         other => TargetFilter::And {
             filters: vec![
                 other,
-                TargetFilter::Typed(TypedFilter::default().properties(vec![prop])),
+                TargetFilter::Typed(TypedFilter::default().properties(props)),
             ],
         },
     }
+}
+
+/// Add a single `FilterProp` to an existing `TargetFilter`.
+pub(crate) fn add_property(filter: TargetFilter, prop: FilterProp) -> TargetFilter {
+    add_properties(filter, vec![prop])
 }
 
 /// CR 109.5: True when `filter` is anchored to the source's controller via a

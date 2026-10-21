@@ -251,9 +251,10 @@ pub fn resolve(
     // target propagation would otherwise leak the parent's Player target into
     // a sub-ability with `target: Controller`. Mirror Draw / Mill / Discard.
     let players = if target.is_context_ref() {
-        vec![super::resolve_player_for_context_ref(
-            state, ability, target,
-        )]
+        // CR 608.2b: a declared player whose target was illegal is not affected.
+        super::resolve_player_for_context_ref(state, ability, target)
+            .into_iter()
+            .collect()
     } else {
         let targeted: Vec<_> = ability
             .targets
@@ -339,9 +340,10 @@ pub fn resolve_lose_all(
     // `ability.targets`, which would inherit a parent's chosen Player target
     // through chain propagation.
     let players: Vec<PlayerId> = if target.is_context_ref() {
-        vec![super::resolve_player_for_context_ref(
-            state, ability, target,
-        )]
+        // CR 608.2b: a declared player whose target was illegal is not affected.
+        super::resolve_player_for_context_ref(state, ability, target)
+            .into_iter()
+            .collect()
     } else {
         ability
             .targets
@@ -450,6 +452,10 @@ mod tests {
         controller: PlayerId,
     ) -> ResolvedAbility {
         ResolvedAbility {
+            declares_chosen_group: None,
+            reads_chosen_group: None,
+            declares_return_result: None,
+            reads_return_result: None,
             detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: Effect::GivePlayerCounter {
                 counter_kind,
@@ -465,10 +471,15 @@ mod tests {
             source_incarnation: None,
             trigger_source: None,
             trigger_definition_ref: None,
+            delayed_origin: None,
             force_block_attacker: None,
             target_incarnations: Vec::new(),
-            selected_target_incarnations: Vec::new(),
+            target_pins: Vec::new(),
+            legacy_selected_target_incarnations: Vec::new(),
+            chosen_target_slots: Default::default(),
             illegal_target_slots: Vec::new(),
+            unjudged_target_slots: Vec::new(),
+            illegal_local_target_slots: Vec::new(),
             targets: vec![],
             kind: AbilityKind::Spell,
             sub_ability: None,
@@ -500,6 +511,7 @@ mod tests {
             min_x_value: 0,
             announced_x: None,
             cant_be_copied: false,
+            illegal_targets_disposition: Default::default(),
             copy_count_status: crate::types::ability::CopyCountStatus::Pending,
             forward_result: false,
             unless_pay: None,
@@ -510,10 +522,13 @@ mod tests {
             repeat_until: None,
             replacement_applied: Default::default(),
             sub_link: crate::types::ability::SubAbilityLink::ContinuationStep,
+            target_reads: Default::default(),
             sibling_condition: crate::types::ability::SiblingCondition::Dependent,
             modal: None,
             mode_abilities: vec![],
             parent_target_missing_reason: None,
+            activation_cost_reduction: None,
+            activation_record: None,
         }
     }
 
@@ -657,6 +672,10 @@ mod tests {
 
     fn make_lose_all(target: TargetFilter, controller: PlayerId) -> ResolvedAbility {
         ResolvedAbility {
+            declares_chosen_group: None,
+            reads_chosen_group: None,
+            declares_return_result: None,
+            reads_return_result: None,
             detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: Effect::LoseAllPlayerCounters { target },
             controller,
@@ -668,10 +687,15 @@ mod tests {
             source_incarnation: None,
             trigger_source: None,
             trigger_definition_ref: None,
+            delayed_origin: None,
             force_block_attacker: None,
             target_incarnations: Vec::new(),
-            selected_target_incarnations: Vec::new(),
+            target_pins: Vec::new(),
+            legacy_selected_target_incarnations: Vec::new(),
+            chosen_target_slots: Default::default(),
             illegal_target_slots: Vec::new(),
+            unjudged_target_slots: Vec::new(),
+            illegal_local_target_slots: Vec::new(),
             targets: vec![],
             kind: AbilityKind::Spell,
             sub_ability: None,
@@ -703,6 +727,7 @@ mod tests {
             min_x_value: 0,
             announced_x: None,
             cant_be_copied: false,
+            illegal_targets_disposition: Default::default(),
             copy_count_status: crate::types::ability::CopyCountStatus::Pending,
             forward_result: false,
             unless_pay: None,
@@ -713,10 +738,13 @@ mod tests {
             repeat_until: None,
             replacement_applied: Default::default(),
             sub_link: crate::types::ability::SubAbilityLink::ContinuationStep,
+            target_reads: Default::default(),
             sibling_condition: crate::types::ability::SiblingCondition::Dependent,
             modal: None,
             mode_abilities: vec![],
             parent_target_missing_reason: None,
+            activation_cost_reduction: None,
+            activation_record: None,
         }
     }
 

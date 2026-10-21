@@ -36,6 +36,7 @@ import {
   clearWsSession,
   loadWsSession,
   saveWsSession,
+  type WsSessionData,
 } from "../services/multiplayerSession";
 import {
   BrokerRequestError,
@@ -86,6 +87,7 @@ import {
 // the store's runtime graph, though — the `serverMetrics` import below reaches
 // it anyway (see there).
 import type { DirectorySource } from "../services/serverDirectory";
+import type { PileSource } from "../services/pileSource";
 // A VALUE import, and with it a real runtime edge: `serverMetrics` value-imports
 // `directoryUrl` from `serverDirectory`, which closes back on this store TWICE
 // — directly (`serverDirectory.ts:23` imports `useMultiplayerStore`) and via
@@ -112,7 +114,7 @@ import {
   isOfficialMultiplayerServerUrl,
 } from "../config/multiplayerServer";
 import { saveActiveGame, useGameStore } from "./gameStore";
-import { usePreferencesStore } from "./preferencesStore";
+import { usePreferencesStore, type AiDeckSelection } from "./preferencesStore";
 import {
   canAttemptNativeEngine,
   ensureNativeEngine,
@@ -125,6 +127,7 @@ import {
   type DraftPhase,
 } from "../adapter/server-draft-adapter";
 import type { DraftPlayerView } from "../adapter/draft-adapter";
+import type { CommanderBracketTier } from "../types/bracketEstimate";
 import type {
   DeckChoice,
   PlayerSlot,
@@ -156,9 +159,15 @@ let hostPingStop: (() => void) | null = null;
 // navigations so the lobby entry stays alive while the tile is showing.
 let activeBroker: BrokerClient | null = null;
 let activeBrokerGameCode: string | null = null;
+// Only the latest `openBroker` call may publish its broker.
+let brokerOpenAttempt = 0;
 let activeP2PHostAdapter: P2PHostAdapter | null = null;
 let activeP2PHostGameId: string | null = null;
 let p2pHostingAttempt = 0;
+// A server-host dial acts after its socket opens only while it is the latest.
+let serverHostAttempt = 0;
+// A host socket acts only while no `GameStarted` has handed the page off since it was dialed.
+let hostHandoffs = 0;
 
 function asDeckPayload(deck: HostingDeck): {
   main_deck: string[];
@@ -166,6 +175,7 @@ function asDeckPayload(deck: HostingDeck): {
   commander: string[];
   planar_deck: string[];
   scheme_deck: string[];
+  bracket_tier?: CommanderBracketTier;
 } {
   return {
     main_deck: deck.main_deck,
@@ -173,6 +183,7 @@ function asDeckPayload(deck: HostingDeck): {
     commander: deck.commander,
     planar_deck: deck.planar_deck ?? [],
     scheme_deck: deck.scheme_deck ?? [],
+    ...(deck.bracket_tier ? { bracket_tier: deck.bracket_tier } : {}),
   };
 }
 
@@ -181,6 +192,17 @@ function aiSeatDeckChoice(deckName: string | null): DeckChoice {
     return { type: "Random" };
   }
   return { type: "Named", data: deckName };
+}
+
+/** The wire shape of an AI seat for `CreateGameWithSettings`: client-only
+ *  fields such as `deckId` stay off the wire. */
+function aiSeatRequest(seat: AiSeatConfig) {
+  return {
+    seatIndex: seat.seatIndex,
+    difficulty: seat.difficulty,
+    deckName: seat.deckName,
+    ...(seat.deck ? { deck: seat.deck } : {}),
+  };
 }
 
 function effectiveAiSeats(settings: HostingSettings): AiSeatConfig[] {
@@ -1453,6 +1475,11 @@ export interface AiSeatConfig {
   difficulty: string;
   deckName: string | null;
   deck?: DeckChoice;
+  /** The seat's deck selection: an AI deck catalog id, or the Random sentinel
+   *  (which stays Random even after `deck` is resolved). Used by the host form and
+   *  the all-AI local start only; it is never sent on the wire — `deck` carries
+   *  the concrete decklist. */
+  deckId?: AiDeckSelection;
 }
 
 export interface HostingDeck {
@@ -1461,6 +1488,8 @@ export interface HostingDeck {
   commander: string[];
   planar_deck?: string[];
   scheme_deck?: string[];
+  /** Declared Commander bracket tier; omitted decks default to Core on the engine. */
+  bracket_tier?: CommanderBracketTier;
 }
 
 /** Persisted snapshot of the host-setup form so the lobby remembers the
@@ -1513,6 +1542,8 @@ export interface HostingSettings {
   /** Pre-minted `[A-Z0-9]{6}` game code from a Discord link. Absent → the
    *  broker/server mints one. */
   requestedCode?: string;
+  /** The host's pile for a `HostPile` format; absent = the default pile. */
+  pile?: PileSource;
 }
 
 /** Snapshot of the host's session config, captured at startHosting time.
@@ -1713,8 +1744,12 @@ interface MultiplayerActions {
   cancelHosting: () => void;
   clearPendingGameRoute: () => void;
   setServerInfo: (info: ServerInfo | null) => void;
-  openBroker: (req: RegisterHostRequest) => Promise<{ broker: BrokerClient; gameCode: string } | null>;
-  closeBroker: () => void;
+  openBroker: (
+    req: RegisterHostRequest,
+    signal?: AbortSignal,
+  ) => Promise<{ broker: BrokerClient; gameCode: string } | null>;
+  /** Closes `broker`, and clears the active slot only if it holds that broker. */
+  closeBroker: (broker: BrokerClient) => void;
   getBroker: () => { broker: BrokerClient; gameCode: string } | null;
   startP2PHostingSession: (
     settings: HostingSettings,
@@ -1888,6 +1923,7 @@ function disposeActiveP2PHost(): void {
 }
 
 function closeHostWebSocket(): void {
+  serverHostAttempt += 1;
   if (hostReconnectTimer) {
     clearTimeout(hostReconnectTimer);
     hostReconnectTimer = null;
@@ -1900,6 +1936,23 @@ function closeHostWebSocket(): void {
     hostWs.close();
     hostWs = null;
   }
+}
+
+const ABANDON_CLOSE_TIMEOUT_MS = 5_000;
+
+// Closing a LAN bridge drops frames it has not yet written, so wait for the server's reply.
+function abandonThenClose(ws: PhaseSocketTransport): void {
+  const close = () => {
+    clearTimeout(timer);
+    ws.close();
+  };
+  const timer = setTimeout(close, ABANDON_CLOSE_TIMEOUT_MS);
+  ws.onerror = null;
+  ws.onclose = null;
+  ws.onmessage = (event) => {
+    if ((JSON.parse(event.data) as { type: string }).type === "GameAbandoned") close();
+  };
+  ws.send(JSON.stringify({ type: "AbandonGame" }));
 }
 
 function activeServerHostingSocket(get: () => MultiplayerState): PhaseSocketTransport | null {
@@ -1952,25 +2005,6 @@ async function startActiveP2PHostGame(
     hostGameCode: null,
     hostingStatus: "idle",
   });
-}
-
-/**
- * Checks whether a lobby entry's host is running a compatible build with
- * the browsing client. Used by the lobby list to disable incompatible
- * rows. A missing `hostBuildCommit` (restored session, legacy entry) is
- * treated as unknown-but-allowed, matching the server's behavior at the
- * join gate. We compare against this client's `__BUILD_HASH__` rather
- * than the server's commit because in `LobbyOnly` mode the server is a
- * P2P peer broker — its commit is independent of the host/guest engine
- * build that actually has to agree at game time. In `Full` mode the
- * protocol-version check in `isServerCompatible` covers the client-to-
- * server direction, and host/guest still need matching engine builds.
- */
-export function isLobbyEntryCompatible(
-  hostBuildCommit: string | undefined,
-): boolean {
-  if (!hostBuildCommit) return true;
-  return hostBuildCommit === __BUILD_HASH__;
 }
 
 /**
@@ -2338,6 +2372,9 @@ function normalizeCustomHostConfig(
   if (typeof savedCustomFormatId !== "string") return null;
   if (!findSavedCustomFormat(savedCustomFormatId)) return null;
 
+  // The shape guard names required fields but never rejects unknown ones,
+  // so configs persisted when the removed experimental-dungeons flag still
+  // existed keep validating with the stale key ignored.
   const storedFormatConfig = persisted.formatConfig;
   if (!isFormatConfigShape(storedFormatConfig)) return null;
   // The blob must describe the format it is filed under. `isFormatConfigShape`
@@ -2428,6 +2465,7 @@ function finalizeRememberedHostConfig(
         )
         || typeof seat.difficulty !== "string"
         || (typeof seat.deckName !== "string" && seat.deckName !== null)
+        || (seat.deckId !== undefined && typeof seat.deckId !== "string")
       ) {
         continue;
       }
@@ -2435,6 +2473,7 @@ function finalizeRememberedHostConfig(
         seatIndex: seat.seatIndex,
         difficulty: seat.difficulty,
         deckName: seat.deckName,
+        ...(seat.deckId !== undefined ? { deckId: seat.deckId } : {}),
       });
     }
   }
@@ -2604,11 +2643,12 @@ function savePregameHostSession(
   get: MultiplayerGet,
   data: { game_code: string; player_token: string; full_key?: { game_code: string; generation: number } },
   serverUrl: string,
+  held: { session: WsSessionData | null },
 ): void {
   if (!data.full_key || data.full_key.game_code !== data.game_code) return;
   const existing = loadWsSession();
   const hostSession = get().hostSession ?? existing?.hostSession;
-  saveWsSession({
+  held.session = {
     gameCode: data.game_code,
     playerToken: data.player_token,
     fullKey: data.full_key,
@@ -2616,11 +2656,12 @@ function savePregameHostSession(
     timestamp: Date.now(),
     ...(hostSession ? { hostSession } : {}),
     ...(hostSession ? { hostIsPublic: get().hostIsPublic } : {}),
-  });
+  };
+  saveWsSession(held.session);
 }
 
-function clearPregameHostMetadataFromWsSession(): void {
-  const session = loadWsSession();
+function clearPregameHostMetadataFromWsSession(held: { session: WsSessionData | null }): void {
+  const session = held.session;
   if (!session) return;
   saveWsSession({
     gameCode: session.gameCode,
@@ -2637,6 +2678,7 @@ function handleServerHostMessage(
   ws: PhaseSocketTransport,
   msg: { type: string; data?: unknown },
   serverUrl: string,
+  held: { session: WsSessionData | null },
   requestedCode?: string,
 ): void {
   if (msg.type === "GameCreated") {
@@ -2652,14 +2694,16 @@ function handleServerHostMessage(
       get().cancelHosting();
       return;
     }
-    savePregameHostSession(get, data, serverUrl);
+    savePregameHostSession(get, data, serverUrl, held);
     // Reset reconnect counter on successful (re)connection.
     hostReconnectAttempt = 0;
     set({ hostGameCode: data.game_code, hostingStatus: "waiting" });
   } else if (msg.type === "GameStarted") {
     gameStartedFired = true;
-    clearPregameHostMetadataFromWsSession();
+    hostHandoffs += 1;
+    clearPregameHostMetadataFromWsSession(held);
     ws.close();
+    if (hostWs && hostWs !== ws) hostWs.close();
     hostWs = null;
     // This arm performs the handoff itself and never routes through
     // `closeHostWebSocket`, so the keepalive has to be stopped here.
@@ -2714,6 +2758,7 @@ async function openServerHostSocket(
   setupFrame: () => unknown,
   onReopen: () => void,
   serverUrl: string,
+  dialed: WsSessionData | null,
   requestedCode?: string,
 ): Promise<void> {
   // The dialed URL arrives as an argument rather than being read from store
@@ -2729,10 +2774,13 @@ async function openServerHostSocket(
     return;
   }
 
+  const attempt = ++serverHostAttempt;
+  const handoffs = hostHandoffs;
   let socket;
   try {
     socket = await openPhaseSocket(url);
   } catch (err) {
+    if (attempt !== serverHostAttempt) return;
     if (
       err instanceof HandshakeError &&
       err.kind === "protocol_mismatch"
@@ -2747,21 +2795,32 @@ async function openServerHostSocket(
     }
     return;
   }
+  if (attempt !== serverHostAttempt || handoffs !== hostHandoffs) {
+    socket.ws.close();
+    return;
+  }
 
   set({ serverInfo: socket.serverInfo });
   hostWs = socket.ws;
   const stopPing = startSocketKeepalive(socket.ws);
   hostPingStop = stopPing;
 
+  // Each host socket carries the session it dialed, so `GameStarted`
+  // re-stamps this socket's game even if the stored copy expired or was refused.
+  const held = { session: dialed };
   socket.ws.onmessage = (event) => {
+    if (handoffs !== hostHandoffs) {
+      socket.ws.close();
+      return;
+    }
     const msg = JSON.parse(event.data as string) as {
       type: string;
       data?: unknown;
     };
-    handleServerHostMessage(set, get, socket.ws, msg, url, requestedCode);
+    handleServerHostMessage(set, get, socket.ws, msg, url, held, requestedCode);
   };
   socket.ws.onerror = () => {
-    if (!gameStartedFired) {
+    if (!gameStartedFired && hostWs === socket.ws) {
       hostWs = null;
       onReopen();
     }
@@ -2810,6 +2869,7 @@ function attemptServerHostReconnect(
       // mid-game host-socket drop, and it must return to the server the game
       // is actually on even if the browsing anchor has since moved.
       session.serverUrl,
+      session,
     );
   }, delay);
 }
@@ -3125,7 +3185,7 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
                 loop_detection: settings.loopDetection,
               },
               format_config: settings.formatConfig,
-              ai_seats: aiSeats,
+              ai_seats: aiSeats.map(aiSeatRequest),
               room_name: settings.roomName,
               start_when_full: settings.startWhenFull,
               ranked: settings.ranked,
@@ -3134,6 +3194,7 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
           }),
           () => attemptServerHostReconnect(set, get),
           serverUrl,
+          null,
           settings.requestedCode,
         );
       },
@@ -3176,6 +3237,7 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
           }),
           () => attemptServerHostReconnect(set, get),
           session.serverUrl,
+          session,
         );
 
         return true;
@@ -3183,6 +3245,11 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
 
       cancelHosting: () => {
         p2pHostingAttempt += 1;
+        // A closed host socket leaves the room alive for the reconnect grace.
+        if (hostWs?.readyState === WebSocket.OPEN) {
+          abandonThenClose(hostWs);
+          hostWs = null;
+        }
         closeHostWebSocket();
         disposeActiveP2PHost();
         if (activeBroker) {
@@ -3208,7 +3275,9 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
 
       clearPendingGameRoute: () => set({ pendingGameRoute: null }),
 
-      openBroker: async (req) => {
+      openBroker: async (req, signal) => {
+        const attempt = ++brokerOpenAttempt;
+        const isStale = () => attempt !== brokerOpenAttempt || signal?.aborted === true;
         if (activeBroker) {
           activeBroker.close();
           activeBroker = null;
@@ -3222,7 +3291,15 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
         let broker: BrokerClient | null = null;
         try {
           broker = await openBrokerClient(url);
+          if (isStale()) {
+            broker.close();
+            return null;
+          }
           const registered = await broker.registerHost(req);
+          if (isStale()) {
+            broker.close();
+            return null;
+          }
           activeBroker = broker;
           activeBrokerGameCode = registered.gameCode;
           return { broker, gameCode: registered.gameCode };
@@ -3237,10 +3314,12 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
         }
       },
 
-      closeBroker: () => {
-        activeBroker?.close();
-        activeBroker = null;
-        activeBrokerGameCode = null;
+      closeBroker: (broker) => {
+        broker.close();
+        if (activeBroker === broker) {
+          activeBroker = null;
+          activeBrokerGameCode = null;
+        }
       },
 
       getBroker: () => {
@@ -4212,7 +4291,7 @@ useMultiplayerStore.subscribe((state, prev) => {
 });
 
 export function getPlayerDisplayName(playerId: number, myId?: number): string {
-  if (playerId === myId) return "You";
+  if (playerId === myId) return i18n.t("game:player.you");
   return getOpponentDisplayName(playerId);
 }
 
@@ -4220,5 +4299,5 @@ export function getOpponentDisplayName(playerId: number): string {
   const state = useMultiplayerStore.getState();
   const name = state.playerNames.get(playerId);
   if (name) return name;
-  return `Opp ${playerId + 1}`;
+  return i18n.t("game:player.opponent", { seat: playerId + 1 });
 }

@@ -1,3 +1,4 @@
+import { PLAYER_ID } from "../constants/game";
 import { boundedDiagnosticProbe, recordDiagnostic, registerEngineDiagnostics } from "../services/troubleshooting";
 import type { EngineDiagnosticSnapshot } from "../services/troubleshooting";
 import { trackEvent } from "../services/telemetry";
@@ -7,6 +8,8 @@ import type {
   AiDecisionDiagnosticsCapability,
   AiLlmProposalResult,
   AiProposalSubmission,
+  ContestClickInput,
+  ContestDriveResult,
   EngineAdapter,
   EngineSnapshot,
   FormatConfig,
@@ -478,6 +481,29 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
     return Promise.race([drain, timeout]);
   };
 
+  /**
+   * Host a running Eye to Eye / Mouth to Mouth contest on this local engine: the
+   * engine's state machine is advanced to the caller's clock and given the clicks
+   * collected since the last call. See `drive_contest_js` in engine-wasm.
+   */
+  async driveContest(
+    nowMs: number,
+    aiPlayers: PlayerId[],
+    clicks: ContestClickInput[],
+    awayPlayers: PlayerId[] = [],
+  ): Promise<ContestDriveResult> {
+    this.assertInitialized("driveContest");
+    try {
+      const result = this.engine
+        ? await this.engine.driveContest(nowMs, aiPlayers, awayPlayers, clicks)
+        : await this.fallback!.driveContest(nowMs, aiPlayers, awayPlayers, clicks);
+      this.invalidateAiDecisionDiagnostics();
+      return result;
+    } catch (err) {
+      throw await classifyEngineErrorAsync(err, this.takePanic);
+    }
+  }
+
   async submitAction(action: GameAction, actor: PlayerId): Promise<SubmitResult> {
     this.assertInitialized("submitAction");
     try {
@@ -564,11 +590,13 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
     }
   }
 
+  // The in-browser engine serves one local seat (`PLAYER_ID`); every legal-action
+  // read below asks the engine for that seat's own list.
   async getLegalActions(): Promise<LegalActionsResult> {
     this.assertInitialized("getLegalActions");
     try {
-      if (this.engine) return await this.engine.getLegalActions();
-      return await this.fallback!.getLegalActions();
+      if (this.engine) return await this.engine.getLegalActions(PLAYER_ID);
+      return await this.fallback!.getLegalActions(PLAYER_ID);
     } catch (err) {
       throw await classifyEngineErrorAsync(err, this.takePanic);
     }
@@ -598,8 +626,8 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
     this.assertInitialized("getSnapshot");
     try {
       const raw = this.engine
-        ? await this.engine.getSnapshot()
-        : await this.fallback!.getSnapshot();
+        ? await this.engine.getSnapshot(PLAYER_ID)
+        : await this.fallback!.getSnapshot(PLAYER_ID);
       return {
         state: unwrapClientGameState(raw.state),
         legalResult: raw.legalResult,
@@ -982,8 +1010,8 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
     this.assertInitialized("resumeRestoredGameState");
     try {
       const resumed = this.engine
-        ? await this.engine.resumeRestoredGameState()
-        : await this.fallback!.resumeRestoredGameState();
+        ? await this.engine.resumeRestoredGameState(PLAYER_ID)
+        : await this.fallback!.resumeRestoredGameState(PLAYER_ID);
       this.invalidateAiDecisionDiagnostics();
       return {
         presentation: resumed.presentation,
@@ -1080,8 +1108,8 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
     await this.requireCardDb();
     const json = JSON.stringify(state);
     const resumed = this.engine
-      ? await this.engine.resumeMultiplayerHostState(json)
-      : await this.fallback!.resumeMultiplayerHostState(json, owner);
+      ? await this.engine.resumeMultiplayerHostState(json, PLAYER_ID)
+      : await this.fallback!.resumeMultiplayerHostState(json, PLAYER_ID, owner);
     this.invalidateAiDecisionDiagnostics();
     return {
       presentation: resumed.presentation,
@@ -1141,6 +1169,16 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
       return this.engine.evaluateDeckCompatibility(request);
     }
     return this.fallback!.evaluateDeckCompatibility(request);
+  }
+
+  /** The engine's canonical spelling of each of `names`, index-aligned, `null` where it has none. */
+  async canonicalCardNames(names: string[]): Promise<(string | null)[]> {
+    await this.initialize();
+    await this.requireCardDb();
+    const answer = this.engine
+      ? await this.engine.canonicalCardNames(names)
+      : await this.fallback!.canonicalCardNames(names);
+    return answer as (string | null)[];
   }
 
   /**
@@ -1409,6 +1447,12 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
 
 interface MainThreadFallback {
   ensureCardDatabase(): Promise<number>;
+  driveContest(
+    nowMs: number,
+    aiPlayers: PlayerId[],
+    awayPlayers: PlayerId[],
+    clicks: ContestClickInput[],
+  ): Promise<ContestDriveResult>;
   submitAction(action: GameAction, actor: PlayerId): Promise<SubmitResult>;
   submitInteraction(submission: InteractionSubmission, actor: PlayerId): Promise<SubmitResult>;
   previewManaPayment(action: GameAction, actor: PlayerId): Promise<ObjectId[]>;
@@ -1418,8 +1462,8 @@ interface MainThreadFallback {
   ): Promise<InteractionPreview>;
   getState(): Promise<GameState>;
   getFilteredState(viewerId: number): Promise<GameState>;
-  getLegalActions(): Promise<LegalActionsResult>;
-  getSnapshot(): Promise<{ state: GameState; legalResult: LegalActionsResult }>;
+  getLegalActions(viewerId: number): Promise<LegalActionsResult>;
+  getSnapshot(viewerId: number): Promise<{ state: GameState; legalResult: LegalActionsResult }>;
   getLegalActionsForViewer(viewerId: number): Promise<LegalActionsResult>;
   getViewerSnapshot(viewerId: number): Promise<ViewerSnapshot>;
   getViewerTransitionSnapshot(
@@ -1449,9 +1493,10 @@ interface MainThreadFallback {
   llmProviderCatalog(): Promise<unknown>;
   exportState(): Promise<string>;
   restoreState(stateJson: string): Promise<void>;
-  resumeRestoredGameState(): Promise<RestoredFallbackResult>;
+  resumeRestoredGameState(viewerId: number): Promise<RestoredFallbackResult>;
   resumeMultiplayerHostState(
     stateJson: string,
+    viewerId: number,
     owner?: HostSessionOwner,
   ): Promise<RestoredFallbackResult>;
   setMultiplayerMode(enabled: boolean): Promise<void>;
@@ -1485,6 +1530,7 @@ interface MainThreadFallback {
   getCardFaceData(cardName: string): Promise<unknown>;
   getCardParseDetails(cardName: string): Promise<unknown>;
   getCardRulings(cardName: string): Promise<unknown>;
+  canonicalCardNames(names: string[]): Promise<unknown>;
 }
 
 type RestoredFallbackResult = {
@@ -1531,6 +1577,23 @@ async function createMainThreadFallback(): Promise<MainThreadFallback> {
 
   return {
     ensureCardDatabase: () => cardData.ensureCardDatabase(),
+
+    driveContest: (
+      nowMs: number,
+      aiPlayers: PlayerId[],
+      awayPlayers: PlayerId[],
+      clicks: ContestClickInput[],
+    ) =>
+      enqueue(() => {
+        const outcome = wasm.drive_contest_js(
+          nowMs,
+          Uint8Array.from(aiPlayers),
+          Uint8Array.from(awayPlayers),
+          clicks,
+        );
+        if (typeof outcome === "string") throw new Error(outcome);
+        return outcome as ContestDriveResult;
+      }),
 
     submitAction: (action: GameAction, actor: PlayerId) =>
       enqueue(() => {
@@ -1579,10 +1642,10 @@ async function createMainThreadFallback(): Promise<MainThreadFallback> {
         return s as GameState;
       }),
 
-    getLegalActions: () =>
+    getLegalActions: (viewerId: number) =>
       enqueue(() => {
-        const r = wasm.get_legal_actions_js();
-        if (r === null) throw new Error("NOT_INITIALIZED: get_legal_actions_js returned null");
+        const r = wasm.get_legal_actions_for_viewer_js(viewerId);
+        if (r === null) throw new Error("NOT_INITIALIZED: get_legal_actions_for_viewer_js returned null");
         return r as LegalActionsResult;
       }),
 
@@ -1590,12 +1653,12 @@ async function createMainThreadFallback(): Promise<MainThreadFallback> {
     // exports are synchronous and run back-to-back inside ONE `enqueue`
     // callback, so no other queued operation (notably `submit_action`) can
     // interleave between them.
-    getSnapshot: () =>
+    getSnapshot: (viewerId: number) =>
       enqueue(() => {
         const s = wasm.get_game_state();
-        const r = wasm.get_legal_actions_js();
+        const r = wasm.get_legal_actions_for_viewer_js(viewerId);
         if (s === null || r === null) {
-          throw new Error("NOT_INITIALIZED: get_game_state/get_legal_actions_js returned null");
+          throw new Error("NOT_INITIALIZED: get_game_state/get_legal_actions_for_viewer_js returned null");
         }
         return { state: s as GameState, legalResult: r as LegalActionsResult };
       }),
@@ -1680,16 +1743,16 @@ async function createMainThreadFallback(): Promise<MainThreadFallback> {
     restoreState: (stateJson: string) =>
       enqueue(() => wasm.restore_game_state(stateJson)),
 
-    resumeRestoredGameState: () =>
+    resumeRestoredGameState: (viewerId: number) =>
       enqueue(() => ({
         presentation: wasm.resume_restored_game_state() as RestoredStackAutomationPresentation,
         snapshot: {
           state: wasm.get_game_state() as GameState,
-          legalResult: wasm.get_legal_actions_js() as LegalActionsResult,
+          legalResult: wasm.get_legal_actions_for_viewer_js(viewerId) as LegalActionsResult,
         },
       })),
 
-    resumeMultiplayerHostState: (stateJson: string, owner?: HostSessionOwner) =>
+    resumeMultiplayerHostState: (stateJson: string, viewerId: number, owner?: HostSessionOwner) =>
       enqueue(() => {
         const presentation = wasm.resume_multiplayer_host_state(stateJson) as RestoredStackAutomationPresentation;
         if (owner) {
@@ -1700,7 +1763,7 @@ async function createMainThreadFallback(): Promise<MainThreadFallback> {
           presentation,
           snapshot: {
             state: wasm.get_game_state() as GameState,
-            legalResult: wasm.get_legal_actions_js() as LegalActionsResult,
+            legalResult: wasm.get_legal_actions_for_viewer_js(viewerId) as LegalActionsResult,
           },
         };
       }),
@@ -1817,5 +1880,8 @@ async function createMainThreadFallback(): Promise<MainThreadFallback> {
 
     getCardRulings: (cardName: string) =>
       enqueue(() => wasm.get_card_rulings(cardName)),
+
+    canonicalCardNames: (names: string[]) =>
+      enqueue(() => wasm.canonicalCardNames(names)),
   };
 }

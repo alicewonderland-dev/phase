@@ -74,7 +74,7 @@ Each rule below is defined in CLAUDE.md. One-sentence principle + codebase examp
 | **Never match verbatim Oracle text** — decompose every phrase into typed building blocks (grammar + helpers + enums). A verbatim string match handles exactly one card and poisons the architecture. | Contrast: typed `QuantityRef`/`Comparator` vs. literal string |
 | **Compose combinators by dimension** — N independent axes = a sum of per-axis `alt()`/`opt()` calls inside one sequence, never a flat `alt` of full-string `tag`s (the product). Variation in the *middle* or an *optional* segment still factors: `recognize((tag(..), alt(..), tag(..), opt(..), tag(..)))`. Smell: a flat `alt` whose arms share a long common prefix **and** suffix. | `oracle_nom/condition.rs` multi-axis composition; PATTERNS.md §8b |
 | **Nest by prefix dispatch** — shared prefixes use `preceded(tag(...), sub_combinator)` to eliminate redundant matching. | `oracle_trigger.rs` phase trigger nesting |
-| **Word-boundary scanning** — try a combinator at each word boundary via scanning loop, not `contains()` chains. | `oracle_casting.rs::scan_timing_restrictions`, `oracle_trigger.rs::scan_for_phase` |
+| **Word-boundary scanning** — pass a combinator to the shared first/last-match scanners; extend that authority if the required scan semantics are missing rather than copying a caller-local loop. | `oracle_nom/primitives.rs::scan_at_word_boundaries` family; `oracle_trigger.rs::scan_for_phase` |
 | **`parse_inner_condition` is the single authority** for all game-state conditions. Trigger/static parsers MUST delegate to it. | `oracle_nom/condition.rs::parse_inner_condition` |
 | **No boolean flags** — parameterize with typed enums (`ControllerRef`, `Comparator`, `Option<T>`). | `types/ability.rs` effect variants |
 | **No raw `i32` for amounts** — use `QuantityExpr` on all new effects. | `QuantityExpr::Fixed` vs `QuantityExpr::Ref` |
@@ -412,7 +412,7 @@ Unlabeled handlers interleaved between labeled slots are shown as `—` rows.
 | Label | Pattern | Router | Module |
 |-------|---------|--------|--------|
 | `14` | Line empty after reminder-text + "X can't be 0." stripping (stamps `min_x_value` on the previous ability first) | skip | `oracle.rs` |
-| `8b (early)` | "As an additional cost to cast this spell …" (non-Defiler) — must precede static classifiers that match embedded "this spell costs {N} less" tails | `parse_additional_cost_line()` → `result.additional_cost` | `oracle_casting.rs` |
+| `8b (early)` | "As an additional cost to cast this spell …" (non-Defiler), optionally behind an ability or flavor word (`additional_cost_line_text`) — must precede static classifiers that match embedded "this spell costs {N} less" tails | `parse_additional_cost_line()` → `result.additional_cost` | `oracle_casting.rs` |
 | `0` | Semicolon-separated keyword line ("Defender; reach"); colon guard excludes activated abilities | per-part keyword extraction | `oracle.rs` |
 | `1` | Modal block: "Choose one —" header + mode lines, or Spree + `+` lines (consumes multiple lines) | `parse_oracle_block()` + `lower_oracle_block()` | `oracle_modal.rs` |
 | — | "Equip {cost}" / "Equip — {cost}" (not "Equipped …"); "Crew N" with trailing cadence sentence | `try_parse_equip()`, `parse_crew_keyword()` | `oracle.rs` |
@@ -441,6 +441,7 @@ Unlabeled handlers interleaved between labeled slots are shown as `—` rows.
 | `6e` | Cross-layer compound "`<subject>` can't `<P1>` and can't `<P2>`" — each conjunct routed to both layer parsers (Blossombind: Untap-prevention replacement CR 701.26b + AddCounter-prevention replacement CR 614.6) so a conjunct isn't dropped by `is_static_pattern` claiming the whole line | `parse_static_replacement_compound()` | `oracle.rs` |
 | `6f` | Compound "`<continuous grant or restriction>` and can't become/be untapped" (Frozen in Ice class) — leading grant/restriction clause stays a static modification, trailing clause becomes a broad Untap-prevention replacement (CR 701.26b + CR 614.6) so `is_static_pattern` at `7` doesn't silently absorb and drop the untap prohibition | `try_split_and_cant_become_untapped()` | `oracle.rs` |
 | `7` | Static/continuous patterns — `is_static_pattern()`; spell lines with explicit durations and damage verbs are deferred to `9`; copy-replacement lines route to the replacement parser first | `parse_static_line_multi()` family | `oracle_classifier.rs` → `oracle_static/` |
+| — | Instant/sorcery one-shot damage replacement — success-only direct spell route when generic `8` cannot reconstruct target hosting (including Mirror Strike, Reverberation, and Reflect Damage); ordinary one-shot forms fall through to `8` | `parse_oneshot_damage_replacement()` + `oneshot_damage_replacement_requires_direct_spell_route()` | `oracle_replacement.rs` + `oracle.rs` |
 | `8` | Replacement patterns — `is_replacement_pattern()`; one paragraph can yield multiple ETB replacements | `parse_replacement_line()` | `oracle_classifier.rs` → `oracle_replacement.rs` |
 | `8c` | Leyline clause "If this card is in your opening hand, you may begin the game with it on the battlefield" (CR 103.6) | `parse_begin_game_clause()` | `oracle.rs` |
 | `8c-strive` | Strive lines — skip (cost extracted by the pre-loop scan) | skip | `oracle.rs` |
@@ -978,6 +979,16 @@ Cross-reference the `/add-trigger` skill. Parser-specific: add pattern in `try_p
 ---
 
 ## 11. Diagnostics — Swallow Detectors & `parse_warnings`
+
+To inspect live antecedent decisions, run the normal filtered export with
+`RUST_LOG=engine::parser::binding=debug cargo run -p phase-engine --features cli --bin oracle-gen -- data/ --filter 'Sylvan Library' --output /tmp/binding-cards.json`.
+These stderr logs show card/stage, chain/clause source precision, assembly
+attempts and selection, candidate guard verdicts, and selected arena provenance.
+They cover `AssemblyEnv::resolve` and `resolve_all`; specialized positional
+bindings outside those methods are not covered. These execution logs are
+separate from the stage-comparison JSON report and do not change parse warnings
+or support classification. Node IDs and source offsets retain their local scope.
+
 
 The parser must never silently discard Oracle text. Every clause must either be represented in the parsed AST OR cause the line to fail and yield `Effect::Unimplemented` carrying the original phrase. **Anything in between is a parser lie.**
 

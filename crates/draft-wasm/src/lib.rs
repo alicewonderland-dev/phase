@@ -12,7 +12,7 @@ use draft_core::pack_generator::PackGenerator;
 use draft_core::session;
 use draft_core::set_pool::LimitedSetPool;
 use draft_core::types::*;
-use draft_core::view::filter_for_player;
+use draft_core::view::{filter_for_player, DraftPlayerView};
 use engine::database::CardDatabase;
 use phase_ai::config::AiDifficulty;
 
@@ -563,7 +563,7 @@ pub fn start_quick_cube_draft(
 fn apply_human_pick_and_resolve_bots(
     draft_session: &mut DraftSession,
     human_card_id: String,
-) -> Result<(), JsValue> {
+) -> Result<(), String> {
     apply_human_pick_and_resolve_bots_with_action(
         draft_session,
         DraftAction::Pick {
@@ -576,7 +576,7 @@ fn apply_human_pick_and_resolve_bots(
 fn apply_human_pick_and_resolve_bots_with_action(
     draft_session: &mut DraftSession,
     human_action: DraftAction,
-) -> Result<(), JsValue> {
+) -> Result<(), String> {
     apply_human_pick_and_resolve_bots_with_overrides(
         draft_session,
         human_action,
@@ -596,20 +596,18 @@ fn apply_human_pick_and_resolve_bots_with_overrides(
     draft_session: &mut DraftSession,
     human_action: DraftAction,
     overrides: &std::collections::BTreeMap<u8, Vec<String>>,
-) -> Result<(), JsValue> {
+) -> Result<(), String> {
     if !matches!(draft_session.config.kind, DraftKind::Quick) {
-        return Err(JsValue::from_str(
-            "apply_human_pick_and_resolve_bots is only valid for Quick Draft",
-        ));
+        return Err("apply_human_pick_and_resolve_bots is only valid for Quick Draft".to_string());
     }
 
     session::apply(draft_session, human_action, None)
-        .map_err(|e| JsValue::from_str(&format!("Human pick failed: {}", e)))?;
+        .map_err(|e| format!("Human pick failed: {e}"))?;
 
     let difficulty = DIFFICULTY.with(|cell| cell.get());
     let mut rng = RNG
         .with(|cell| cell.take())
-        .ok_or_else(|| JsValue::from_str("RNG not initialized"))?;
+        .ok_or_else(|| "RNG not initialized".to_string())?;
 
     let result = CARD_DB.with(|cell| {
         let db_borrow = cell.borrow();
@@ -623,7 +621,7 @@ fn apply_human_pick_and_resolve_bots_with_overrides(
                 continue;
             }
 
-            // CR 903.13b: a bot owes its kind's whole pick step. This loop is
+            // CR 905.1a: a bot owes its kind's one-card Quick Draft pick step. This loop is
             // `Quick`-gated above, so `cards_per_pick` is 1 here today; reading
             // it from the procedure is what keeps that true by construction
             // rather than by coincidence.
@@ -665,10 +663,10 @@ fn apply_human_pick_and_resolve_bots_with_overrides(
                 },
                 None,
             )
-            .map_err(|e| JsValue::from_str(&format!("Bot {seat} pick failed: {}", e)))?;
+            .map_err(|e| format!("Bot {seat} pick failed: {e}"))?;
         }
 
-        Ok::<(), JsValue>(())
+        Ok::<(), String>(())
     });
 
     RNG.with(|cell| cell.set(Some(rng)));
@@ -682,7 +680,8 @@ fn apply_human_pick_and_resolve_bots_with_overrides(
 pub fn submit_pick(card_instance_id: &str) -> Result<JsValue, JsValue> {
     let card_id = card_instance_id.to_string();
     with_draft_mut(|draft_session| {
-        apply_human_pick_and_resolve_bots(draft_session, card_id)?;
+        apply_human_pick_and_resolve_bots(draft_session, card_id)
+            .map_err(|e| JsValue::from_str(&e))?;
         Ok(to_js(&filter_for_player(draft_session, 0)))
     })
 }
@@ -705,7 +704,8 @@ pub fn submit_pick_with_draft_effect(
                 effect_card_instance_id,
                 card_instance_ids,
             },
-        )?;
+        )
+        .map_err(|e| JsValue::from_str(&e))?;
         Ok(to_js(&filter_for_player(draft_session, 0)))
     })
 }
@@ -743,7 +743,8 @@ pub fn auto_pick() -> Result<JsValue, JsValue> {
         });
         RNG.with(|cell| cell.set(Some(rng)));
 
-        apply_human_pick_and_resolve_bots(draft_session, card_id)?;
+        apply_human_pick_and_resolve_bots(draft_session, card_id)
+            .map_err(|e| JsValue::from_str(&e))?;
         Ok(to_js(&filter_for_player(draft_session, 0)))
     })
 }
@@ -786,6 +787,22 @@ struct LlmDraftOutcome {
     reasoning: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// What the provider reported spending on this reply, used or not.
+    /// Diagnostic only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<phase_llm::TokenUsage>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LlmDraftPickRequest {
+    seat: u8,
+    fingerprint: String,
+    option_count: usize,
+    required_pick_count: usize,
+    /// Size of the prompt this request carries, for measuring prompt growth.
+    prompt_chars: usize,
+    request: phase_llm::HttpRequestSpec,
 }
 
 /// The seats an LLM drafter may act for: the BOT seats of this pod, and nothing
@@ -825,8 +842,17 @@ pub fn build_llm_draft_pick_requests(
     endpoint_json: &str,
     set_names_json: &str,
 ) -> Result<JsValue, JsValue> {
+    let requests = build_llm_draft_pick_requests_inner(endpoint_json, set_names_json)
+        .map_err(|e| JsValue::from_str(&e))?;
+    Ok(to_js(&requests))
+}
+
+fn build_llm_draft_pick_requests_inner(
+    endpoint_json: &str,
+    set_names_json: &str,
+) -> Result<Vec<LlmDraftPickRequest>, String> {
     let endpoint: phase_llm::LlmEndpointConfig = serde_json::from_str(endpoint_json)
-        .map_err(|e| JsValue::from_str(&format!("Invalid LLM endpoint config: {e}")))?;
+        .map_err(|e| format!("Invalid LLM endpoint config: {e}"))?;
     // A missing or unparsable name map degrades the brief to set codes; it is
     // never a reason to refuse a pick.
     let set_names: std::collections::BTreeMap<String, String> =
@@ -834,31 +860,34 @@ pub fn build_llm_draft_pick_requests(
     let set_names = phase_llm::draft_decision::set_names_from_pairs(set_names);
     let difficulty = DIFFICULTY.with(|cell| cell.get());
 
-    with_draft(|draft_session| {
-        let requests: Vec<serde_json::Value> = CARD_DB.with(|cell| {
+    with_draft_inner(|draft_session| {
+        let requests = CARD_DB.with(|cell| {
             let db_borrow = cell.borrow();
             let card_db = db_borrow.as_ref();
             llm_eligible_bot_seats(draft_session)
                 .into_iter()
                 .filter_map(|seat| {
-                    let seat = &seat;
-                    let view = filter_for_player(draft_session, *seat);
+                    let view = filter_for_player(draft_session, seat);
+                    // A seat with no prompt asks nothing: notably a forced pick
+                    // (the last card of a pack), which the bot path takes and
+                    // records without a provider round trip.
                     let request = phase_llm::build_draft_pick_prompt(
-                        *seat, &view, difficulty, card_db, &set_names,
+                        seat, &view, difficulty, card_db, &set_names,
                     )
                     .ok()?;
                     let http = phase_llm::build_chat_request(&endpoint, &request.prompt).ok()?;
-                    Some(serde_json::json!({
-                        "seat": seat,
-                        "fingerprint": request.fingerprint,
-                        "optionCount": request.option_count,
-                        "requiredPickCount": request.required_pick_count,
-                        "request": http,
-                    }))
+                    Some(LlmDraftPickRequest {
+                        seat,
+                        fingerprint: request.fingerprint,
+                        option_count: request.option_count,
+                        required_pick_count: request.required_pick_count,
+                        prompt_chars: request.prompt.char_count(),
+                        request: http,
+                    })
                 })
                 .collect()
         });
-        to_js(&requests)
+        Ok(requests)
     })
 }
 
@@ -871,16 +900,31 @@ pub fn submit_pick_with_llm_bot_picks(
     card_instance_id: &str,
     responses_json: &str,
 ) -> Result<JsValue, JsValue> {
+    let (view, outcomes) = submit_pick_with_llm_bot_picks_inner(card_instance_id, responses_json)
+        .map_err(|e| JsValue::from_str(&e))?;
+    Ok(to_js(
+        &serde_json::json!({ "view": view, "llmOutcomes": outcomes }),
+    ))
+}
+
+fn submit_pick_with_llm_bot_picks_inner(
+    card_instance_id: &str,
+    responses_json: &str,
+) -> Result<(DraftPlayerView, Vec<LlmDraftOutcome>), String> {
     let responses: Vec<LlmDraftResponse> = serde_json::from_str(responses_json)
-        .map_err(|e| JsValue::from_str(&format!("Invalid LLM draft responses: {e}")))?;
+        .map_err(|e| format!("Invalid LLM draft responses: {e}"))?;
     let card_id = card_instance_id.to_string();
 
-    with_draft_mut(|draft_session| {
+    with_draft_mut_inner(|draft_session| {
         let mut overrides: std::collections::BTreeMap<u8, Vec<String>> =
             std::collections::BTreeMap::new();
         let mut outcomes: Vec<LlmDraftOutcome> = Vec::with_capacity(responses.len());
 
         for response in &responses {
+            let usage = phase_llm::token_usage(
+                phase_llm::LlmProvider::from_label(&response.provider),
+                &response.body,
+            );
             match resolve_llm_draft_pick(draft_session, response) {
                 Ok(selection) => {
                     overrides.insert(response.seat, selection.card_instance_ids);
@@ -889,6 +933,7 @@ pub fn submit_pick_with_llm_bot_picks(
                         used: true,
                         reasoning: selection.reasoning,
                         error: None,
+                        usage,
                     });
                 }
                 Err(error) => outcomes.push(LlmDraftOutcome {
@@ -896,6 +941,7 @@ pub fn submit_pick_with_llm_bot_picks(
                     used: false,
                     reasoning: None,
                     error: Some(error.to_string()),
+                    usage,
                 }),
             }
         }
@@ -909,10 +955,7 @@ pub fn submit_pick_with_llm_bot_picks(
             &overrides,
         )?;
 
-        Ok(to_js(&serde_json::json!({
-            "view": filter_for_player(draft_session, 0),
-            "llmOutcomes": outcomes,
-        })))
+        Ok((filter_for_player(draft_session, 0), outcomes))
     })
 }
 
@@ -930,21 +973,38 @@ fn resolve_llm_draft_pick(
     ) {
         return Err(phase_llm::LlmError::StaleDecision);
     }
-    let Some(Some(pack)) = draft_session.current_pack.get(usize::from(response.seat)) else {
+    // The pack is read through the same per-seat projection the request was
+    // built from, never from `session.current_pack`. The projection can reorder
+    // a pack for presentation (a set draft lists it by rarity), and the prompt's
+    // numbered options, the fingerprint and the model's reply all speak in THAT
+    // order. Fingerprinting or indexing the raw pack instead would refuse every
+    // reply as stale, and where it did match would resolve the model's option
+    // number to a different card.
+    let view = filter_for_player(draft_session, response.seat);
+    let Some(pack) = view.current_pack.as_deref().filter(|pack| !pack.is_empty()) else {
         return Err(phase_llm::LlmError::StaleDecision);
     };
     let provider = phase_llm::LlmProvider::from_label(&response.provider);
-    let completion =
-        phase_llm::completion_from_response(provider, response.status, &response.body)?;
-    // CR 903.13b: the step's card count is the procedure's, not the model's.
+    // CR 905.1a / CR 903.13b: the configured procedure supplies the ordinary or Commander Draft pick-step count.
     let required = usize::from(draft_session.config.kind.procedure().cards_per_pick);
-    phase_llm::select_picks(
-        response.seat,
-        &pack.0,
-        required,
-        &response.fingerprint,
-        &completion,
-    )
+    // The reply is read against the option lines the REQUEST rendered: the same
+    // pack, card database and difficulty `build_llm_draft_pick_requests` used.
+    let difficulty = DIFFICULTY.with(|cell| cell.get());
+    CARD_DB.with(|cell| {
+        let db_borrow = cell.borrow();
+        phase_llm::select_picks_from_response(
+            response.seat,
+            pack,
+            required,
+            &response.fingerprint,
+            (db_borrow.as_ref(), difficulty),
+            phase_llm::LlmReply {
+                provider,
+                status: response.status,
+                body: &response.body,
+            },
+        )
+    })
 }
 
 /// The engine-owned LLM provider catalog, mirrored here so a draft-only client
@@ -1378,18 +1438,16 @@ fn get_bot_deck_inner(bot_seat: u8) -> Result<suggest::SuggestedDeck, String> {
             let db_borrow = cell.borrow();
             let card_db = db_borrow.as_ref();
 
-            // CR 903.3 + CR 903.6: eligibility and colour identity are both read
-            // off a `CardFace`, so with no card database this crate cannot
-            // designate a commander -- and a 60-card pile with no commander is
-            // not a Commander deck. Refuse rather than return a deck whose
-            // legality was never judged: the caller loads the database at host
-            // setup, and a silent empty designation would put three of four seats
-            // into a game CR 903.6 cannot start. The four CR 905.1a kinds report
-            // `0` here and are unaffected.
-            if session.config.kind.commanders_required() > 0 && card_db.is_none() {
-                return Err(
-                    "Card database must be loaded before a Commander Draft bot deck".to_string(),
-                );
+            // CR 407.3 + CR 903.3: Cube addables and Commander designations
+            // require typed faces. Ordinary set-backed pods can propose a
+            // deck without this optional database; game admission still
+            // checks every submitted name and excludes ante cards.
+            let requires_card_db = match &session.config.source {
+                DraftSource::Set { .. } => session.config.kind.commanders_required() > 0,
+                DraftSource::Cube { .. } => true,
+            };
+            if requires_card_db && card_db.is_none() {
+                return Err("Card database must be loaded before a draft bot deck".to_string());
             }
 
             let deck = suggest::suggest_deck(
@@ -1401,35 +1459,16 @@ fn get_bot_deck_inner(bot_seat: u8) -> Result<suggest::SuggestedDeck, String> {
                 &session.config.addable_cards,
             );
 
-            // CR 903.13f(1): "A player's deck must contain at least 60 cards".
-            // New and restored Commander Cube sessions clamp configured
-            // `min_deck_size` to the engine-published Cube floor, so this guard
-            // enforces at least 60 for every session.
-            //
-            // `min_deck_size` is also the same value `apply_submit_deck` hands
-            // `validate_limited_deck` for the human on this pod
-            // (`draft-core/src/session.rs`), which is what makes the two
-            // authorities on this session agree. That validator rejects a short
-            // deck with `LimitedDeckError::TooFewCards`
-            // (`draft-core/src/validation.rs`, CR 100.2b); a bot deck reaches no
-            // such gate, so the postcondition is asserted here instead. It fires
-            // when `suggest_addable_cards`'s CustomOnly arm finds no addable card
-            // inside the commander's colour identity (CR 903.5c) and returns
-            // nothing to fill the land slots with. Refuse rather than ship a deck
-            // this engine would refuse from a human on the same session: the
-            // alternative is a CR 903.13f(1) violation nobody can see without
-            // counting the bot's cards. The four CR 905.1a kinds report `0` here
-            // and are unaffected -- without that gate this would change their
-            // behaviour, which is outside this phase's scope; the general case
-            // belongs to `validate_limited_deck`, which already owns it on every
-            // path a human deck takes.
+            // Enforce the session-configured floor for the bot, as
+            // `validate_limited_deck` does for human decks. CR 100.2b sets
+            // ordinary Limited at 40 cards; CR 903.13f(1) sets Commander Draft
+            // at 60. Custom Cube floors are configuration, not CR 100.2b.
+            // Never publish an undersized proposal if the bot runs out of cards.
             let deck_total: usize =
                 deck.main_deck.len() + deck.lands.values().map(|&n| n as usize).sum::<usize>();
-            if session.config.kind.commanders_required() > 0
-                && deck_total < session.config.min_deck_size
-            {
+            if deck_total < session.config.min_deck_size {
                 return Err(format!(
-                    "Commander Draft bot deck reached {deck_total} cards, minimum is {}",
+                    "Draft bot deck reached {deck_total} cards, minimum is {}",
                     session.config.min_deck_size
                 ));
             }
@@ -2339,6 +2378,370 @@ mod shared_stack_bot_loop_tests {
         let deltas = drive_shared_stack_bot_turns(&mut healthy, AiDifficulty::Medium, None, bound)
             .expect("the derived bound is not reachable from a legal state");
         assert!(decisions_in(&deltas).len() > 1);
+    }
+}
+
+#[cfg(test)]
+mod llm_draft_resolution_tests {
+    use super::*;
+    use draft_core::pack_source::FixturePackSource;
+    use engine::types::player::PlayerId;
+
+    /// A Quick pod (seat 0 human, seats 1..8 bots), started and dealt.
+    fn started_quick_pod() -> DraftSession {
+        let config = DraftConfig {
+            source: DraftSource::single_set("TST".to_string()),
+            set_code: "TST".to_string(),
+            kind: DraftKind::Quick,
+            pod_size: 8,
+            cards_per_pack: 15,
+            pack_count: 3,
+            min_deck_size: 40,
+            addable_cards: DeckAddableCards::standard_basics(),
+            rng_seed: 20_261_004,
+            tournament_format: TournamentFormat::Swiss,
+            pod_policy: PodPolicy::Competitive,
+            spectator_visibility: SpectatorVisibility::default(),
+        };
+        let seats: Vec<DraftSeat> = (0..8)
+            .map(|i| {
+                if i == 0 {
+                    DraftSeat::Human {
+                        player_id: PlayerId(0),
+                        display_name: "Player".to_string(),
+                    }
+                } else {
+                    DraftSeat::Bot {
+                        name: format!("Bot {i}"),
+                    }
+                }
+            })
+            .collect();
+        let mut session = DraftSession::new(config, seats, "LLM-RES".to_string());
+        session::apply(
+            &mut session,
+            DraftAction::StartDraft,
+            Some(&FixturePackSource {
+                set_code: "TST".to_string(),
+                cards_per_pack: 15,
+            }),
+        )
+        .expect("a Quick pod starts");
+        session
+    }
+
+    /// A well-formed OpenAI-compatible reply choosing option `choice`.
+    fn reply_choosing(choice: usize) -> String {
+        let content = format!(r#"{{"choice": {choice}, "reason": "test"}}"#);
+        serde_json::json!({ "choices": [{ "message": { "role": "assistant", "content": content } }] })
+            .to_string()
+    }
+
+    /// The request side's own recipe: the seat's projected view, rendered into a
+    /// prompt whose fingerprint the reply will carry back.
+    fn issued_fingerprint(session: &DraftSession, seat: u8) -> String {
+        let view = filter_for_player(session, seat);
+        phase_llm::build_draft_pick_prompt(
+            seat,
+            &view,
+            AiDifficulty::Medium,
+            None,
+            &phase_llm::draft_decision::set_names_from_pairs(Vec::new()),
+        )
+        .expect("a dealt pack renders")
+        .fingerprint
+    }
+
+    fn response(session: &DraftSession, seat: u8, choice: usize) -> LlmDraftResponse {
+        LlmDraftResponse {
+            seat,
+            fingerprint: issued_fingerprint(session, seat),
+            provider: "OpenAiCompatible".to_string(),
+            status: 200,
+            body: reply_choosing(choice),
+        }
+    }
+
+    /// A set draft presents each pack by rarity, so the order the model reads
+    /// its options in is not the order the session stores the pack in. A reply
+    /// to a request this bridge issued must resolve against the order the
+    /// prompt used: refused as stale, or bound to a different card, would mean
+    /// the LLM never drafts for a set pod at all.
+    #[test]
+    fn a_reply_resolves_against_the_pack_in_the_order_the_prompt_presented() {
+        let mut session = started_quick_pod();
+        // Store seat 1's pack in the reverse of its presented (rarity) order.
+        session.current_pack[1]
+            .as_mut()
+            .expect("seat 1 holds a pack")
+            .0
+            .reverse();
+        let view_pack = filter_for_player(&session, 1)
+            .current_pack
+            .expect("seat 1 is shown its pack");
+        let raw_pack = session.current_pack[1].as_ref().unwrap().0.clone();
+        assert_ne!(
+            view_pack.iter().map(|c| &c.instance_id).collect::<Vec<_>>(),
+            raw_pack.iter().map(|c| &c.instance_id).collect::<Vec<_>>(),
+            "fixture must make the presented order differ from the stored order"
+        );
+
+        let selection = resolve_llm_draft_pick(&session, &response(&session, 1, 0))
+            .expect("a reply to an issued request is not stale");
+
+        assert_eq!(
+            selection.card_instance_ids,
+            vec![view_pack[0].instance_id.clone()],
+            "option 0 is the first card the model was shown"
+        );
+    }
+
+    #[test]
+    fn a_reply_for_a_pack_that_has_moved_on_is_refused_as_stale() {
+        let mut session = started_quick_pod();
+        let stale = response(&session, 1, 0);
+        // The seat's pack changes under the in-flight request.
+        session.current_pack[1].as_mut().unwrap().0.pop();
+
+        assert!(matches!(
+            resolve_llm_draft_pick(&session, &stale),
+            Err(phase_llm::LlmError::StaleDecision)
+        ));
+    }
+
+    #[test]
+    fn an_emptied_pack_is_refused_rather_than_resolved() {
+        let mut session = started_quick_pod();
+        let reply = response(&session, 1, 0);
+        session.current_pack[1].as_mut().unwrap().0.clear();
+
+        assert!(matches!(
+            resolve_llm_draft_pick(&session, &reply),
+            Err(phase_llm::LlmError::StaleDecision)
+        ));
+    }
+
+    /// CR 905.1a: the last card of a pack is not a choice. No seat holding one
+    /// is put to a provider, and the bot path still takes and records it.
+    #[test]
+    fn a_forced_last_pick_builds_no_request_and_is_still_recorded() {
+        let mut session = started_quick_pod();
+        for pack in session.current_pack.iter_mut().flatten() {
+            pack.0.truncate(1);
+        }
+        let human_card = session.current_pack[0].as_ref().unwrap().0[0]
+            .instance_id
+            .clone();
+        let pools_before: Vec<usize> = session.pools.iter().map(Vec::len).collect();
+
+        session_cell::install(session.clone());
+        DIFFICULTY.with(|cell| cell.set(AiDifficulty::Medium));
+        CARD_DB.with(|cell| *cell.borrow_mut() = None);
+        let requests = build_llm_draft_pick_requests_inner(
+            r#"{"provider":"OpenAiCompatible","baseUrl":"https://provider.test/v1","model":"test"}"#,
+            "{}",
+        )
+        .unwrap();
+        session_cell::clear();
+        assert!(requests.is_empty(), "a forced pick was put to a provider");
+
+        RNG.with(|cell| cell.set(Some(ChaCha20Rng::seed_from_u64(42))));
+        apply_human_pick_and_resolve_bots(&mut session, human_card).unwrap();
+        for (seat, before) in pools_before.iter().enumerate() {
+            assert_eq!(session.pools[seat].len(), before + 1, "seat {seat}");
+        }
+    }
+
+    /// The production response-to-pick path for Jev: the reply is read against
+    /// the criterion names the REQUEST carried for this seat's pack, so a valid
+    /// option number with a label the pack never offered is not that card.
+    #[test]
+    fn a_jev_reply_resolves_only_through_the_criteria_the_request_issued() {
+        let session = started_quick_pod();
+        session_cell::install(session.clone());
+        DIFFICULTY.with(|cell| cell.set(AiDifficulty::Medium));
+        CARD_DB.with(|cell| *cell.borrow_mut() = None);
+        let requests = build_llm_draft_pick_requests_inner(
+            r#"{"provider":"Jev","baseUrl":"https://relay.test","apiKey":"k","model":"jev-latest"}"#,
+            "{}",
+        )
+        .unwrap();
+        session_cell::clear();
+        let issued = requests.iter().find(|request| request.seat == 1).unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(&issued.request.body).unwrap();
+        let keys: Vec<String> = envelope["request"]["questions"]["pick"]["criteria"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(keys.len(), issued.option_count);
+
+        let reply = |choice: &str, probabilities: serde_json::Value| LlmDraftResponse {
+            seat: 1,
+            fingerprint: issued.fingerprint.clone(),
+            provider: "Jev".to_string(),
+            status: 200,
+            body: serde_json::json!({
+                "answers": { "pick": {
+                    "type": "choice",
+                    "choice": choice,
+                    "probabilities": probabilities,
+                    "confidence": 0.9,
+                }},
+            })
+            .to_string(),
+        };
+        let projected = filter_for_player(&session, 1).current_pack.unwrap();
+
+        let good = reply(
+            &keys[1],
+            serde_json::json!({ &keys[0]: 0.1, &keys[1]: 0.9 }),
+        );
+        let selection = resolve_llm_draft_pick(&session, &good).unwrap();
+        assert_eq!(
+            selection.card_instance_ids,
+            vec![projected[1].instance_id.clone()]
+        );
+
+        let unissued_label = "01: A card that is not in this pack";
+        let wrong_choice = reply(
+            unissued_label,
+            serde_json::json!({ &keys[0]: 0.1, unissued_label: 0.9 }),
+        );
+        let wrong_probability = reply(
+            &keys[1],
+            serde_json::json!({ &keys[1]: 0.8, "00: Invented": 0.2 }),
+        );
+        for bad in [wrong_choice, wrong_probability] {
+            assert!(matches!(
+                resolve_llm_draft_pick(&session, &bad),
+                Err(phase_llm::LlmError::MalformedResponse { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_reply_naming_the_human_seat_is_refused() {
+        let session = started_quick_pod();
+        assert!(matches!(
+            resolve_llm_draft_pick(&session, &response(&session, 0, 0)),
+            Err(phase_llm::LlmError::StaleDecision)
+        ));
+    }
+
+    #[test]
+    fn issued_rarity_ordered_request_selects_the_specific_bot_pool_card() {
+        let mut start = started_quick_pod();
+        start.current_pack[1].as_mut().unwrap().0.reverse();
+        let projected = filter_for_player(&start, 1).current_pack.unwrap();
+        let stored = &start.current_pack[1].as_ref().unwrap().0;
+        assert_ne!(projected[0].instance_id, stored[0].instance_id);
+        let human_id = start.current_pack[0].as_ref().unwrap().0[0]
+            .instance_id
+            .clone();
+        DIFFICULTY.with(|cell| cell.set(AiDifficulty::Medium));
+        CARD_DB.with(|cell| *cell.borrow_mut() = None);
+        RNG.with(|cell| cell.set(Some(ChaCha20Rng::seed_from_u64(42))));
+        let mut ordinary = start.clone();
+        apply_human_pick_and_resolve_bots(&mut ordinary, human_id.clone()).unwrap();
+        let ordinary_id = ordinary.pools[1][0].instance_id.clone();
+        let (choice, chosen) = projected
+            .iter()
+            .enumerate()
+            .find(|(_, card)| card.instance_id != ordinary_id)
+            .expect("the displayed pack offers a non-heuristic option");
+
+        session_cell::install(start);
+        RNG.with(|cell| cell.set(Some(ChaCha20Rng::seed_from_u64(42))));
+        let requests = build_llm_draft_pick_requests_inner(
+            r#"{"provider":"OpenAiCompatible","baseUrl":"https://provider.test/v1","model":"test"}"#,
+            "{}",
+        )
+        .unwrap();
+        assert_eq!(requests.len(), 7);
+        let issued = requests.iter().find(|request| request.seat == 1).unwrap();
+        assert_eq!(issued.option_count, projected.len());
+        assert_eq!(issued.required_pick_count, 1);
+        assert!(issued
+            .request
+            .body
+            .contains(&format!("[{choice}] {}", chosen.name)));
+        let wire = serde_json::to_value(issued).unwrap();
+        assert_eq!(wire["seat"].as_u64(), Some(1));
+        assert_eq!(
+            wire["fingerprint"].as_str(),
+            Some(issued.fingerprint.as_str())
+        );
+        assert_eq!(wire["optionCount"].as_u64(), Some(projected.len() as u64));
+        assert_eq!(wire["requiredPickCount"].as_u64(), Some(1));
+        assert_eq!(wire["request"]["method"].as_str(), Some("POST"));
+        let responses = serde_json::json!([{
+            "seat": 1,
+            "fingerprint": issued.fingerprint,
+            "provider": "OpenAiCompatible",
+            "status": 200,
+            "body": reply_choosing(choice),
+        }]);
+        let (view, outcomes) =
+            submit_pick_with_llm_bot_picks_inner(&human_id, &responses.to_string())
+                .expect("the issued response submits through the installed draft");
+        assert!(outcomes[0].used);
+        assert!(view.pool.iter().any(|card| card.instance_id == human_id));
+        session_cell::with_installed(|session| {
+            assert_eq!(session.pools[1][0].instance_id, chosen.instance_id);
+            assert_ne!(session.pools[1][0].instance_id, ordinary_id);
+            assert!(session.pools[0]
+                .iter()
+                .any(|card| card.instance_id == human_id));
+        });
+        session_cell::clear();
+    }
+
+    #[test]
+    fn submit_core_refuses_human_and_stale_responses_while_valid_bot_and_fallback_advance() {
+        let start = started_quick_pod();
+        let human_id = start.current_pack[0].as_ref().unwrap().0[0]
+            .instance_id
+            .clone();
+        session_cell::install(start);
+        DIFFICULTY.with(|cell| cell.set(AiDifficulty::Medium));
+        CARD_DB.with(|cell| *cell.borrow_mut() = None);
+        RNG.with(|cell| cell.set(Some(ChaCha20Rng::seed_from_u64(43))));
+        let requests = build_llm_draft_pick_requests_inner(
+            r#"{"provider":"OpenAiCompatible","baseUrl":"https://provider.test/v1","model":"test"}"#,
+            "{}",
+        )
+        .unwrap();
+        assert!(requests.iter().all(|request| request.seat != 0));
+        let stale = requests.iter().find(|request| request.seat == 1).unwrap();
+        let valid = requests.iter().find(|request| request.seat == 2).unwrap();
+        session_cell::with_installed_mut(|session| {
+            session.current_pack[1].as_mut().unwrap().0.pop();
+        });
+        let responses = serde_json::json!([
+            { "seat": 0, "fingerprint": "forged", "provider": "OpenAiCompatible", "status": 200, "body": reply_choosing(0) },
+            { "seat": 1, "fingerprint": stale.fingerprint, "provider": "OpenAiCompatible", "status": 200, "body": reply_choosing(0) },
+            { "seat": 2, "fingerprint": valid.fingerprint, "provider": "OpenAiCompatible", "status": 200, "body": reply_choosing(0) },
+        ]);
+        let (view, outcomes) =
+            submit_pick_with_llm_bot_picks_inner(&human_id, &responses.to_string())
+                .expect("invalid LLM responses fall back without blocking the human pick");
+        assert_eq!(
+            outcomes
+                .iter()
+                .map(|outcome| outcome.used)
+                .collect::<Vec<_>>(),
+            vec![false, false, true]
+        );
+        assert_eq!(view.pool.len(), 1);
+        session_cell::with_installed(|session| {
+            assert_eq!(session.pools[0].len(), 1);
+            assert_eq!(session.pools[0][0].instance_id, human_id);
+            assert_eq!(session.pools[1].len(), 1);
+            assert_eq!(session.pools[2].len(), 1);
+        });
+        session_cell::clear();
     }
 }
 
@@ -4555,6 +4958,24 @@ mod create_multiplayer_draft_tests {
         CARD_DB.with(|cell| *cell.borrow_mut() = Some(db));
     }
 
+    fn install_ante_fixture_db() {
+        let mut cards: serde_json::Value =
+            serde_json::from_str(&commander_fixture_db_json()).unwrap();
+        let mut contract = cards["beta"].clone();
+        contract["name"] = serde_json::json!("Contract from Below");
+        contract["card_type"]["core_types"] = serde_json::json!(["Sorcery"]);
+        contract["oracle_text"] = serde_json::json!(
+            "Remove this card from your deck before playing if you're not playing for ante.\nDiscard your hand, ante the top card of your library, then draw seven cards."
+        );
+        cards["contract from below"] = contract;
+        let mut forest = cards["plains"].clone();
+        forest["name"] = serde_json::json!("Forest");
+        forest["color_identity"] = serde_json::json!(["Green"]);
+        cards["forest"] = forest;
+        let db = CardDatabase::from_json_str(&cards.to_string()).unwrap();
+        CARD_DB.with(|cell| *cell.borrow_mut() = Some(db));
+    }
+
     #[test]
     fn quick_cube_config_raises_zero_to_one_without_lowering_higher_requests() {
         let settings = |min_deck_size| CubeDraftSettings {
@@ -4743,8 +5164,7 @@ mod create_multiplayer_draft_tests {
         clear_state();
     }
 
-    /// VM-4e — [B1] the PRECONDITION refusal: a Commander pod whose host never
-    /// loaded `CARD_DB`.
+    /// VM-4e — the source/kind gate when the host has no `CARD_DB`.
     ///
     /// `install_commander_fixture_db()` is deliberately NOT called. Do not add
     /// it back as an oversight — the whole subject of this row is the database's
@@ -4752,7 +5172,7 @@ mod create_multiplayer_draft_tests {
     /// a SET pool, so session creation itself needs no database, which is what
     /// makes the fixture constructible.
     #[test]
-    fn get_bot_deck_inner_refuses_a_commander_pod_with_no_card_database() {
+    fn get_bot_deck_inner_requires_faces_for_commander_and_cube_but_not_set_premier() {
         clear_state();
         start_commander_pod(4);
 
@@ -4762,16 +5182,149 @@ mod create_multiplayer_draft_tests {
             "the message must name the card database: {err}"
         );
 
-        // Paired control ON THE SAME no-database state: `Premier` still builds a
-        // deck. This is the reach guard — it proves the fixture reaches
-        // `suggest_deck` at all — and it isolates the `commanders_required() > 0`
-        // conjunct, so the four CR 905.1a kinds provably keep today's behaviour.
+        // The normal Set-backed Premier host does not fetch CARD_DB. Its bot
+        // still proposes a complete deck from the drafted pool and basics.
         clear_state();
         start_commander_pod(1);
+        let deck = get_bot_deck_inner(1).expect("Set Premier builds without CARD_DB");
+        assert!(!deck.main_deck.is_empty(), "deck = {:?}", deck.main_deck);
+        assert_eq!(
+            deck.main_deck.len() + deck.lands.values().map(|&n| n as usize).sum::<usize>(),
+            40
+        );
+        assert!(deck.commander.is_empty());
 
-        let deck = get_bot_deck_inner(1).expect("Premier needs no designation");
+        assert!(get_bot_deck_inner(8).unwrap_err().contains("out of range"));
+
+        // Positive reach: the same Premier seat builds with its database.
+        install_commander_fixture_db();
+        let deck = get_bot_deck_inner(1).expect("Premier builds with typed faces");
         assert!(!deck.main_deck.is_empty(), "deck = {:?}", deck.main_deck);
 
+        // Cube's host loads faces at creation. Clearing them after creation
+        // models a resumed Cube whose database is missing at bot proposal.
+        clear_state();
+        install_fixture_db();
+        let cube_input = serde_json::json!({
+            "type": "Cube",
+            "data": {
+                "cube_list_text": "20 Alpha\n20 Beta",
+                "cube_name": "Test Cube",
+                "cube_draft_settings": {
+                    "pod_size": 2,
+                    "pack_count": 1,
+                    "cards_per_pack": 2,
+                    "min_deck_size": 4,
+                    "addable_cards": { "policy": "StandardBasics", "custom": [] }
+                }
+            }
+        });
+        let seats = serde_json::json!([
+            { "type": "Human", "player_id": 0, "display_name": "Host" },
+            { "type": "Bot", "name": "Bot 1" }
+        ]);
+        create_multiplayer_draft_inner(
+            &cube_input.to_string(),
+            &seats.to_string(),
+            1,
+            42,
+            "cube-room",
+            "Swiss",
+            "Competitive",
+            2,
+        )
+        .expect("Cube session must be installed before testing missing faces");
+        seed_bot_pool(1, mono_white_bot_pool());
+        CARD_DB.with(|cell| *cell.borrow_mut() = None);
+        let err = get_bot_deck_inner(1).expect_err("Cube requires typed faces");
+        assert!(err.contains("Card database"), "{err}");
+
+        clear_state();
+    }
+
+    #[test]
+    fn limited_bot_entry_admits_only_a_typed_ante_free_full_deck() {
+        clear_state();
+        install_ante_fixture_db();
+        let cube_input = serde_json::json!({
+            "type": "Cube",
+            "data": {
+                "cube_list_text": "100 Alpha\n100 Beta\n1 Contract from Below",
+                "cube_name": "Ante Cube",
+                "cube_draft_settings": {
+                    "pod_size": 2,
+                    "pack_count": 1,
+                    "cards_per_pack": 2,
+                    "min_deck_size": 40,
+                    "addable_cards": {
+                        "policy": "CustomOnly",
+                        "custom": ["Contract from Below", "Forest"]
+                    }
+                }
+            }
+        });
+        let seats = serde_json::json!([
+            { "type": "Human", "player_id": 0, "display_name": "Host" },
+            { "type": "Bot", "name": "Bot 1" }
+        ]);
+        create_multiplayer_draft_inner(
+            &cube_input.to_string(),
+            &seats.to_string(),
+            1,
+            42,
+            "ante-cube",
+            "Swiss",
+            "Competitive",
+            2,
+        )
+        .expect("Cube with typed addable faces must start");
+        let mut pool = mono_white_bot_pool();
+        pool.insert(
+            0,
+            DraftCardInstance {
+                instance_id: "ante-first".to_string(),
+                name: "Contract from Below".to_string(),
+                set_code: "TST".to_string(),
+                collector_number: "0".to_string(),
+                rarity: "rare".to_string(),
+                colors: vec!["B".to_string()],
+                cmc: 1,
+                type_line: "Sorcery".to_string(),
+                draft_effect: None,
+            },
+        );
+        seed_bot_pool(1, pool.clone());
+        CARD_DB.with(|cell| {
+            let db = cell.borrow();
+            let db = db.as_ref().unwrap();
+            assert!(db
+                .get_face_by_name("Contract from Below")
+                .is_some_and(engine::game::face_uses_ante));
+            assert!(db
+                .get_face_by_name("Forest")
+                .is_some_and(|face| !engine::game::face_uses_ante(face)));
+        });
+
+        let deck = get_bot_deck_inner(1).expect("the legal land fills the proposal");
+        assert!(deck.main_deck.contains(&"Alpha".to_string()));
+        assert!(!deck.main_deck.contains(&"Contract from Below".to_string()));
+        assert_eq!(deck.lands.get("Forest"), Some(&36));
+        assert_eq!(
+            deck.main_deck.len() + deck.lands.values().map(|&n| n as usize).sum::<usize>(),
+            40
+        );
+
+        set_addable_cards(DeckAddableCards {
+            policy: DeckAddableCardPolicy::CustomOnly,
+            custom: vec!["Contract from Below".to_string()],
+        });
+        let err = get_bot_deck_inner(1).expect_err("ante-only fill is short");
+        assert!(err.contains("minimum is 40"), "{err}");
+
+        seed_bot_pool(1, vec![pool[0].clone()]);
+        set_addable_cards(DeckAddableCards::standard_basics());
+        let err = get_bot_deck_inner(1).expect_err("all-ante pool is exhausted");
+        assert!(err.contains("reached 0 cards"), "{err}");
         clear_state();
     }
 

@@ -167,6 +167,26 @@ describe("EngineWorkerClient request timeout", () => {
   });
 });
 
+describe("EngineWorkerClient local-seat legal actions", () => {
+  it.each([
+    ["getLegalActions", (c: EngineWorkerClient) => c.getLegalActions(2)],
+    ["getSnapshot", (c: EngineWorkerClient) => c.getSnapshot(2)],
+    ["resumeRestoredGameState", (c: EngineWorkerClient) => c.resumeRestoredGameState(2)],
+    ["resumeMultiplayerHostState", (c: EngineWorkerClient) => c.resumeMultiplayerHostState("{}", 2)],
+  ])("%s posts the viewer id the caller names", async (type, call) => {
+    const client = new EngineWorkerClient();
+    const pending = call(client);
+    const worker = currentWorker();
+    const posted = worker.posted[0];
+
+    expect(posted).toMatchObject({ type, viewerId: 2 });
+
+    worker.replyResult(posted.id as number, null);
+    await pending;
+    client.dispose();
+  });
+});
+
 describe("EngineWorkerClient viewer transition projection", () => {
   it("posts the viewer id and event slice to the transition endpoint", async () => {
     const client = new EngineWorkerClient();
@@ -214,6 +234,25 @@ describe("EngineWorkerClient viewer transition projection", () => {
     worker.replyError(requestId, "INVALID_TRANSITION_EVENTS: invalid event payload");
 
     await expect(pending).rejects.toThrow("INVALID_TRANSITION_EVENTS: invalid event payload");
+    client.dispose();
+  });
+});
+
+describe("EngineWorkerClient canonical card names", () => {
+  it("posts the name list to the canonical-name endpoint", async () => {
+    const client = new EngineWorkerClient();
+    const pending = client.canonicalCardNames(["Revival/Revenge"]);
+    const worker = currentWorker();
+    const posted = worker.posted[0];
+
+    expect(posted).toMatchObject({
+      type: "canonicalCardNames",
+      names: ["Revival/Revenge"],
+    });
+
+    worker.replyResult(posted.id as number, ["Revival // Revenge"]);
+
+    await expect(pending).resolves.toEqual(["Revival // Revenge"]);
     client.dispose();
   });
 });

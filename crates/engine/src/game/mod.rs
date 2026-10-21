@@ -1,6 +1,7 @@
 pub mod ability_rw;
 pub mod ability_scan;
 pub mod ability_utils;
+pub(crate) mod announcement_triggers;
 pub(crate) mod ante;
 pub mod arithmetic;
 pub mod attractions;
@@ -29,6 +30,7 @@ pub mod combat_damage;
 pub mod commander;
 pub mod companion;
 pub(crate) mod conditions;
+pub mod contest;
 pub mod contraptions;
 #[cfg(test)]
 #[path = "contraptions_tests.rs"]
@@ -122,6 +124,7 @@ pub mod object_state;
 pub(crate) mod off_zone_characteristics;
 pub mod pairing;
 pub mod perf_counters;
+pub mod period_confirm;
 // Tests for `archenemy` live in a sibling file (declared here, not in
 // `archenemy.rs`, so `archenemy.rs` stays implementation-only).
 #[cfg(test)]
@@ -142,6 +145,23 @@ pub mod players;
 pub(crate) mod precast_copy_shortcut;
 pub use precast_copy_shortcut::normalize_untrusted_restore;
 pub use precast_copy_shortcut::rekey_after_trusted_restore;
+pub(crate) mod payment_transaction;
+/// Test-support accessor for the materialized shadow contract. Production
+/// consumers continue to use viewer-filtered projections and never receive the
+/// authoritative replay helper directly.
+#[cfg(feature = "test-support")]
+pub fn staged_payment_shadow_for_test(
+    state: &crate::types::game_state::GameState,
+) -> crate::types::game_state::GameState {
+    payment_transaction::project(state)
+}
+pub(crate) mod play_trace;
+#[cfg(any(test, feature = "test-support"))]
+pub use play_trace::{
+    install_plays_for_tests, play_trace_view, AnswerOptionality, CarriedView, CostMove, EntryKind,
+    NamedSpan, NamingCause, PeriodReach, PlayLocus, PlayTraceView, PromptClass, SpanSource,
+    TraceEntry,
+};
 pub mod preview;
 pub mod printed_cards;
 pub mod priority;
@@ -151,6 +171,7 @@ pub mod replacement;
 pub mod replay;
 pub(crate) mod resolution_prompt;
 pub mod restrictions;
+pub(crate) mod retarget_completion;
 pub mod room;
 pub(crate) mod sacrifice;
 pub mod sba;
@@ -170,7 +191,9 @@ pub mod stickers;
 #[cfg(test)]
 #[path = "stickers_tests.rs"]
 mod stickers_tests;
+pub mod target_occurrences;
 pub mod targeting;
+pub mod text_substitution;
 pub mod token_presets;
 pub mod topology;
 pub mod transform;
@@ -199,6 +222,7 @@ pub(crate) mod zones;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
 
+pub use ante::face_uses_ante;
 pub use bracket_estimate::{
     estimate_bracket, BracketAxis, BracketAxisCounts, BracketContributingCards, BracketEstimate,
     BracketViolation, CommanderBracketTier,

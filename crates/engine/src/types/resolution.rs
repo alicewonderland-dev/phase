@@ -18,22 +18,24 @@ use crate::types::ability::{
     AbilityDefinition, DieResultBranch, DieRollIgnoreRule, DieRollModifier, DiscardedCardResult,
     EffectKind, ResolvedAbility, TargetRef,
 };
+use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    CostResume, DrainStatus, DrawSequenceStack, GameState, GameStateDecode, GameStateDecodeMode,
-    PayCostKind, PendingBatchDeliveries, PendingChangeZoneIteration, PendingChooseOneOf,
-    PendingConniveReentry, PendingContinuation, PendingCopyTokenResolution,
+    ChangeZoneMemberEntry, CostResume, DrainStatus, DrawSequenceStack, GameState, GameStateDecode,
+    GameStateDecodeMode, PayCostKind, PendingBatchDeliveries, PendingChangeZoneIteration,
+    PendingChooseOneOf, PendingConniveReentry, PendingContinuation, PendingCopyTokenResolution,
     PendingCounterAdditionQueue, PendingCounterMoveQueue, PendingCounterRemoval,
     PendingCounterRemovalInFlight, PendingCounterRemovalQueue, PendingDebugCardEntries,
     PendingEachPlayerCopyChosen, PendingLifeTotalAssignment, PendingMultiDraw,
     PendingPerCategoryZoneChoice, PendingPerPlayerZoneChoice, PendingRepeatIteration,
     PendingRepeatUntil, PendingSpellResolution, PendingVoteBallotIteration, PostReplacementDrain,
     PostReplacementDrainDispatch, PostReplacementDrainStack, PostReplacementFrameId,
-    ResidentDrainPolicy, ResolvingTriggerContext, WaitingFor,
+    RepeatIterationChoice, ResidentDrainPolicy, ResolvingTriggerContext, WaitingFor,
 };
 use crate::types::identifiers::{DiscardFrameId, ObjectId};
 use crate::types::player::PlayerId;
 use crate::types::proposed_event::ProposedEvent;
+use crate::types::zones::EtbTapState;
 
 /// The complete shipped draw authority carried by one `MultiDraw` frame.
 ///
@@ -98,6 +100,10 @@ pub struct OptionalEffectFrame {
     pub trigger_events: Vec<GameEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_match_count: Option<u32>,
+    /// CR 608.2c: the resolving instruction-result frame survives a choice
+    /// prompt, including save/reload before its named result is published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_result_occurrence: Option<crate::types::game_state::ReturnResultOccurrenceId>,
 }
 
 /// CR 705.1 + CR 614.1a: Discriminates which multi-flip resolver paused for a
@@ -855,6 +861,14 @@ impl ResolutionStack {
     /// to [`frame_vec`] and this module is its parent, not its descendant.
     pub fn capture_child_boundary(&self) -> ChildStackDepth {
         self.frames.capture_depth()
+    }
+
+    /// Whether the frame at the captured `child_stack_start` is a `CopyToken` owner.
+    pub fn copy_token_at_child_boundary(&self, child_stack_start: ChildStackDepth) -> bool {
+        self.frames
+            .slot_at_captured_depth(child_stack_start)
+            .and_then(|slot| self.frames.get(slot))
+            .is_some_and(|frame| matches!(frame, ResolutionFrame::CopyToken(_)))
     }
 
     pub fn last(&self) -> Option<&ResolutionFrame> {
@@ -1982,6 +1996,18 @@ impl ResolutionStack {
         }
     }
 
+    /// CR 104.4b + CR 608.2d: a descendant choice belongs to every
+    /// unfinished enclosing iteration. This changes evidence, never ownership.
+    pub(crate) fn note_repeat_until_descendant_choice(&mut self) {
+        for frame in self.frames.iter_mut() {
+            if let ResolutionFrame::RepeatUntil(pending) = frame {
+                if let Some(witness) = pending.iteration_progress.as_mut() {
+                    witness.choice = RepeatIterationChoice::OptionalOffered;
+                }
+            }
+        }
+    }
+
     /// Park a newly active repeat-until owner.
     pub fn push_repeat_until(&mut self, frame: PendingRepeatUntil) {
         self.push_inner(ResolutionFrame::RepeatUntil(frame));
@@ -2925,6 +2951,16 @@ impl ResolutionStack {
         }
     }
 
+    /// CR 616.1g: the drain count of the frame `id` names, if it is still
+    /// resident. Identity-addressed, like the dispatcher's own cleanup.
+    pub(crate) fn post_replacement_frame_drain_count(
+        &self,
+        id: PostReplacementFrameId,
+    ) -> Option<usize> {
+        self.post_replacement_frame(id)
+            .map(PostReplacementDrainStack::len)
+    }
+
     /// The mutable twin of [`Self::post_replacement_frame`].
     fn post_replacement_frame_mut(
         &mut self,
@@ -3291,6 +3327,108 @@ impl ResolutionStack {
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &ResolutionFrame> {
         self.frames.iter()
+    }
+
+    /// CR 104.4b: whether any parked frame is an unsettled delivery (a
+    /// zone-change or batch delivery mid-flight). Its retained events are not
+    /// normalized, so loop equality treats a state holding one as not
+    /// comparable. Exhaustive on purpose: a new frame family must say whether
+    /// it is a settled, visited carrier or an unsettled one.
+    pub(crate) fn holds_unsettled_delivery_frame(&self) -> bool {
+        self.frames.iter().any(|frame| match frame {
+            ResolutionFrame::ChangeZone(_) | ResolutionFrame::BatchDelivery(_) => true,
+            ResolutionFrame::AbilityContinuation(_)
+            | ResolutionFrame::RepeatFor(_)
+            | ResolutionFrame::RepeatUntil(_)
+            | ResolutionFrame::RepeatedOptionalPayment(_)
+            | ResolutionFrame::CounterMoves(_)
+            | ResolutionFrame::CounterRemovals(_)
+            | ResolutionFrame::CounterAdditions(_)
+            | ResolutionFrame::CopyToken(_)
+            | ResolutionFrame::DebugCardEntries(_)
+            | ResolutionFrame::EachPlayerCopyChosen(_)
+            | ResolutionFrame::ChooseOneOf(_)
+            | ResolutionFrame::VoteBallot(_)
+            | ResolutionFrame::PerPlayerZoneChoice(_)
+            | ResolutionFrame::PerCategoryZoneChoice(_)
+            | ResolutionFrame::OptionalEffect(_)
+            | ResolutionFrame::CoinFlip(_)
+            | ResolutionFrame::DieRoll(_)
+            | ResolutionFrame::Proliferate(_)
+            | ResolutionFrame::MultiDraw(_)
+            | ResolutionFrame::Discard(_)
+            | ResolutionFrame::ConniveReentry(_)
+            | ResolutionFrame::LifeTotalAssignment(_)
+            | ResolutionFrame::SpellResolution(_)
+            | ResolutionFrame::MutateMerge(_)
+            | ResolutionFrame::CipherEncode(_)
+            | ResolutionFrame::PostReplacement(_) => false,
+        })
+    }
+
+    /// CR 104.4b: every trigger event a parked frame retains, in every frame
+    /// rather than only the active one — an optional frame's singular and plural
+    /// events, a copy-chosen walk's trigger event, and an ability continuation's zone-choice and pending trigger
+    /// contexts. Loop normalization's one carrier traversal reads and renumbers
+    /// identities through this.
+    pub(crate) fn for_each_retained_trigger_event_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut GameEvent),
+    ) {
+        for frame in self.frames.iter_mut() {
+            match frame {
+                ResolutionFrame::OptionalEffect(frame) => {
+                    if let Some(event) = frame.trigger_event.as_mut() {
+                        f(event);
+                    }
+                    frame.trigger_events.iter_mut().for_each(&mut *f);
+                }
+                ResolutionFrame::EachPlayerCopyChosen(pending) => {
+                    if let Some(event) = pending.trigger_event.as_mut() {
+                        f(event);
+                    }
+                }
+                ResolutionFrame::AbilityContinuation(frame) => {
+                    let contexts = frame
+                        .choose_zone_trigger_context
+                        .iter_mut()
+                        .chain(frame.pending.trigger_context.iter_mut());
+                    for context in contexts {
+                        if let Some(event) = context.event.as_mut() {
+                            f(event);
+                        }
+                        context.events.iter_mut().for_each(&mut *f);
+                    }
+                }
+                // Exhaustive on purpose: a frame family that starts retaining a
+                // trigger event must be visited here.
+                ResolutionFrame::RepeatFor(_)
+                | ResolutionFrame::RepeatUntil(_)
+                | ResolutionFrame::RepeatedOptionalPayment(_)
+                | ResolutionFrame::ChangeZone(_)
+                | ResolutionFrame::BatchDelivery(_)
+                | ResolutionFrame::CounterMoves(_)
+                | ResolutionFrame::CounterRemovals(_)
+                | ResolutionFrame::CounterAdditions(_)
+                | ResolutionFrame::CopyToken(_)
+                | ResolutionFrame::DebugCardEntries(_)
+                | ResolutionFrame::ChooseOneOf(_)
+                | ResolutionFrame::VoteBallot(_)
+                | ResolutionFrame::PerPlayerZoneChoice(_)
+                | ResolutionFrame::PerCategoryZoneChoice(_)
+                | ResolutionFrame::CoinFlip(_)
+                | ResolutionFrame::DieRoll(_)
+                | ResolutionFrame::Proliferate(_)
+                | ResolutionFrame::MultiDraw(_)
+                | ResolutionFrame::Discard(_)
+                | ResolutionFrame::ConniveReentry(_)
+                | ResolutionFrame::LifeTotalAssignment(_)
+                | ResolutionFrame::SpellResolution(_)
+                | ResolutionFrame::MutateMerge(_)
+                | ResolutionFrame::CipherEncode(_)
+                | ResolutionFrame::PostReplacement(_) => {}
+            }
+        }
     }
 
     /// Park work that is inside the current active operation.
@@ -3673,8 +3811,14 @@ impl ResolutionStack {
 /// The full-state resolution wire version for typed [`ResolutionStack`] frames.
 ///
 /// Version 3 distinguishes the current exploited-trigger source/victim roles
-/// from the legacy actor fallback stored in `valid_card`.
-pub const RESOLUTION_STATE_WIRE_VERSION: u64 = 3;
+/// from the legacy actor fallback stored in `valid_card`. Version 4 requires
+/// every draw frame to carry its result owner explicitly, including `null`.
+/// Version 5 adds the simultaneous-draw dealer to the draw frame.
+/// Version 6 retains deferred Clash bottom choices until the final answer.
+/// Version 7 carries each unprocessed member of a parked ChangeZone with the
+/// entry modifications resolved before the event's first member moved
+/// (`ChangeZoneMemberEntry`) in place of a bare id and the raw entry gates.
+pub const RESOLUTION_STATE_WIRE_VERSION: u64 = 7;
 
 /// Historical full-state resolution wire version accepted only for migration.
 ///
@@ -3684,6 +3828,31 @@ const LEGACY_RESOLUTION_STATE_WIRE_VERSION: u64 = 1;
 
 /// Historical typed-frame wire version accepted only for migration.
 const LEGACY_TYPED_FRAME_RESOLUTION_STATE_WIRE_VERSION: u64 = 2;
+
+/// Last typed-frame wire version written before draw result ownership became
+/// part of the required persisted shape.
+const LEGACY_RESULT_OWNERSHIP_RESOLUTION_STATE_WIRE_VERSION: u64 = 3;
+
+/// Last wire version written before a draw frame could carry a simultaneous-draw
+/// dealer. It is also the first version that requires `delivery_owner`.
+const LEGACY_DEALERLESS_RESOLUTION_STATE_WIRE_VERSION: u64 = 4;
+
+/// Last wire version whose parked ChangeZone carrier held bare member ids
+/// with carrier-level entry modifications and gates. Its readers migrate or
+/// refuse that carrier before the typed decode
+/// (`migrate_legacy_change_zone_member_entries` for v2–v6 frames and the v1
+/// reader arm for v1, both through `migrate_legacy_change_zone_carrier`).
+const LEGACY_UNRESOLVED_CHANGE_ZONE_MEMBER_RESOLUTION_STATE_WIRE_VERSION: u64 = 6;
+
+/// Stable, machine-recognizable restore refusal for a v1–v6 save paused inside
+/// a multi-object ChangeZone whose unprocessed members' entry modifications
+/// depend on an entry gate. CR 603.6a + CR 614.12: each member's gate is read
+/// against the board as it was before the event's first member moved, and that
+/// board is not in the save, so no member entry can be reconstructed. Player-
+/// visible copy (see `reject_viewer_projection_as_authority` for the frames
+/// that wrap it): it neither repeats "could not restore" nor announces a new
+/// game.
+pub const LEGACY_GATED_CHANGE_ZONE_ENTRY_RESTORE_ERROR: &str = "RESTORE_INCOMPATIBLE_GATED_CHANGE_ZONE_ENTRY: This saved game was paused while several cards were entering the battlefield at once, and whether each remaining card enters with counters, tapped, or attacking depends on the battlefield as it was before any of them entered. That battlefield is not part of the save, so the move cannot be finished as the rules require.";
 
 /// The `GameState` fields whose serialized form is UNCONDITIONAL: each carries
 /// `#[serde(default …)]` but NO `skip_serializing_if`, so the derived
@@ -3707,17 +3876,15 @@ const LEGACY_TYPED_FRAME_RESOLUTION_STATE_WIRE_VERSION: u64 = 2;
 /// limit and what its serde-default control does and does not close. Read it
 /// there before trusting this list against a serde change. Do not delete it.
 ///
-/// STOPGAP, and scoped to stay one. This list exists only because the producer
-/// leaves no positive mark. The engine's other projection gate,
+/// The producer now also writes a positive `wire_projection` mark. This list
+/// remains as a legacy fallback for unmarked historical captures, because
+/// those bytes cannot be retroactively stamped. The engine's other projection gate,
 /// `reject_viewer_projection_as_authority` (`crate::types::game_state`), keys
 /// on a `viewer_projection` stamp its writer sets; the principled sibling here
-/// is the same thing for the client wire — a `wire_projection` stamp written at
-/// `client_state_wire_value` (`crate::game::derived_views`). That stamp is a
-/// DEFERRED item and is not shipped, so reading absence is what a reader must
-/// do UNTIL THE PRODUCER STAMPS. When it lands, this const and
-/// [`is_redacted_client_wire_projection`] are what it replaces, and a versioned
-/// payload already takes [`declare_raw_resolution_wire`]'s early return, so it
-/// can supersede this without conflicting with it.
+/// is the same thing for the client wire — the `wire_projection` stamp written
+/// at `client_state_wire_value` (`crate::game::derived_views`) is checked before
+/// any declared-version early return. The absence fingerprint below remains
+/// only for legacy unmarked captures.
 const CLIENT_WIRE_UNCONDITIONAL_FIELDS: &[&str] = &[
     "next_delayed_trigger_token",
     "next_delayed_trigger_instance",
@@ -3726,10 +3893,9 @@ const CLIENT_WIRE_UNCONDITIONAL_FIELDS: &[&str] = &[
 ];
 
 /// Whether an unversioned raw payload was written by the client wire rather
-/// than by a raw persistence writer — inferred from what that writer REMOVED,
-/// because it leaves no positive mark. A fingerprint UNTIL THE PRODUCER STAMPS:
-/// see [`CLIENT_WIRE_UNCONDITIONAL_FIELDS`] for the deferred `wire_projection`
-/// stamp at `client_state_wire_value` that supersedes it.
+/// than by a raw persistence writer — legacy inference from what that writer
+/// removed. New client wires carry the positive `wire_projection` marker and
+/// are rejected before this fallback is consulted.
 ///
 /// Conjunctive on purpose. Each field individually went in at a different time
 /// — `resolved_rules_journal` in #6331 (2026-07-22), the two allocators in
@@ -3755,6 +3921,402 @@ fn is_redacted_client_wire_projection(object: &Map<String, Value>) -> bool {
         .all(|field| !object.contains_key(*field))
 }
 
+/// Presence-aware view of the one runtime field whose serde default would
+/// otherwise erase the distinction between an omitted owner and an explicit
+/// ownerless (`null`) value at the persistence boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DrawSequenceDeliveryOwnerPresence {
+    #[default]
+    Missing,
+    Present(Option<crate::types::game_state::DrawSequenceFrameId>),
+}
+
+impl<'de> Deserialize<'de> for DrawSequenceDeliveryOwnerPresence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Self::Present(Option::<
+            crate::types::game_state::DrawSequenceFrameId,
+        >::deserialize(deserializer)?))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DrawSequenceBoundaryFrame {
+    #[serde(default)]
+    delivery_owner: DrawSequenceDeliveryOwnerPresence,
+    #[serde(default)]
+    remaining: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct DrawSequenceBoundaryStack {
+    #[serde(default)]
+    frames: Vec<DrawSequenceBoundaryFrame>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MultiDrawBoundaryFrame {
+    draw_sequences: DrawSequenceBoundaryStack,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum ResolutionBoundaryFrame {
+    MultiDraw {
+        data: MultiDrawBoundaryFrame,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolutionBoundaryStack {
+    #[serde(default)]
+    frames: Vec<ResolutionBoundaryFrame>,
+}
+
+fn typed_draw_sequence_frames(value: &Value) -> Result<Vec<DrawSequenceBoundaryFrame>, String> {
+    let stack = serde_json::from_value::<ResolutionBoundaryStack>(value.clone())
+        .map_err(|error| format!("typed resolution frame boundary is malformed: {error}"))?;
+    Ok(stack
+        .frames
+        .into_iter()
+        .filter_map(|frame| match frame {
+            ResolutionBoundaryFrame::MultiDraw { data: frame } => Some(frame.draw_sequences.frames),
+            ResolutionBoundaryFrame::Other => None,
+        })
+        .flatten()
+        .collect())
+}
+
+fn typed_carrier_draw_sequence_frames(
+    value: &Value,
+    carrier: &str,
+) -> Result<Vec<DrawSequenceBoundaryFrame>, String> {
+    value
+        .get(carrier)
+        .map(typed_draw_sequence_frames)
+        .unwrap_or_else(|| Ok(Vec::new()))
+}
+
+fn has_draw_sequence_delivery_owner(value: &Value) -> Result<bool, String> {
+    Ok(typed_draw_sequence_frames(value)?.iter().any(|frame| {
+        matches!(
+            frame.delivery_owner,
+            DrawSequenceDeliveryOwnerPresence::Present(_)
+        )
+    }))
+}
+
+/// One parked ChangeZone member as written by some wire version. Only the shape
+/// is inspected: it dates an unversioned payload.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ChangeZoneBoundaryMember {
+    /// A v1–v6 bare member id; only the shape is inspected.
+    BareId(#[allow(dead_code)] ObjectId),
+    /// A v7 `ChangeZoneMemberEntry`; only the shape is inspected.
+    Resolved(#[allow(dead_code)] Map<String, Value>),
+}
+
+#[derive(Debug, Deserialize)]
+struct ChangeZoneBoundaryCarrier {
+    #[serde(default)]
+    remaining: Vec<ChangeZoneBoundaryMember>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChangeZoneBoundaryData {
+    #[serde(default)]
+    pending: Option<ChangeZoneBoundaryCarrier>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum ChangeZoneBoundaryFrame {
+    ChangeZone {
+        data: ChangeZoneBoundaryData,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChangeZoneBoundaryStack {
+    #[serde(default)]
+    frames: Vec<ChangeZoneBoundaryFrame>,
+}
+
+/// Whether any parked ChangeZone carrier in a serialized `ResolutionStack`
+/// holds a v7 member record (`ChangeZoneMemberEntry`) rather than a bare id.
+fn carries_resolved_change_zone_members(stack: &Value) -> Result<bool, String> {
+    let stack = serde_json::from_value::<ChangeZoneBoundaryStack>(stack.clone())
+        .map_err(|error| format!("typed resolution frame boundary is malformed: {error}"))?;
+    Ok(stack.frames.iter().any(|frame| match frame {
+        ChangeZoneBoundaryFrame::ChangeZone { data } => {
+            data.pending.as_ref().is_some_and(|carrier| {
+                carrier
+                    .remaining
+                    .iter()
+                    .any(|member| matches!(member, ChangeZoneBoundaryMember::Resolved(_)))
+            })
+        }
+        ChangeZoneBoundaryFrame::Other => false,
+    }))
+}
+
+fn validate_draw_sequence_delivery_owner_fields(
+    value: &Value,
+    version: u64,
+    legacy_frames: Option<&[Value]>,
+) -> Result<(), String> {
+    let frames = if let Some(legacy_frames) = legacy_frames {
+        legacy_frames
+            .iter()
+            .map(|frame| {
+                serde_json::from_value::<DrawSequenceBoundaryFrame>(frame.clone())
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    } else {
+        typed_carrier_draw_sequence_frames(value, "resolution_frames")?
+    };
+    for frame in frames {
+        let has_delivery_owner = matches!(
+            frame.delivery_owner,
+            DrawSequenceDeliveryOwnerPresence::Present(_)
+        );
+        if version >= LEGACY_DEALERLESS_RESOLUTION_STATE_WIRE_VERSION && !has_delivery_owner {
+            return Err(format!(
+                "resolution_state_version {version} draw sequence frame is missing required delivery_owner"
+            ));
+        }
+        if version < LEGACY_DEALERLESS_RESOLUTION_STATE_WIRE_VERSION && has_delivery_owner {
+            return Err(format!(
+                "draw sequence delivery_owner requires resolution_state_version {LEGACY_DEALERLESS_RESOLUTION_STATE_WIRE_VERSION}; found {version}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_ambiguous_legacy_paused_draw_result(value: &Value, version: u64) -> Result<(), String> {
+    if !matches!(
+        version,
+        LEGACY_TYPED_FRAME_RESOLUTION_STATE_WIRE_VERSION
+            | LEGACY_RESULT_OWNERSHIP_RESOLUTION_STATE_WIRE_VERSION
+    ) {
+        return Ok(());
+    }
+    let state = value.get("state").unwrap_or(value);
+    let is_waiting_for_replacement = state
+        .get("waiting_for")
+        .and_then(|waiting_for| waiting_for.get("type"))
+        .and_then(Value::as_str)
+        == Some("ReplacementChoice");
+    if !is_waiting_for_replacement {
+        return Ok(());
+    }
+
+    let pending_draw_has_applied_count_change = state
+        .get("pending_replacement")
+        .and_then(|pending| pending.get("proposed"))
+        .and_then(|proposed| proposed.get("Draw"))
+        .is_some_and(|draw| {
+            draw.get("count")
+                .and_then(Value::as_u64)
+                .is_some_and(|count| count > 1)
+                && draw
+                    .get("applied")
+                    .and_then(Value::as_array)
+                    .is_some_and(|applied| !applied.is_empty())
+        });
+    if !pending_draw_has_applied_count_change {
+        return Ok(());
+    }
+
+    let Some(frames) = state
+        .get("resolution_frames")
+        .and_then(|stack| stack.get("frames"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    let has_related_post_replacement_continuation = frames.windows(2).any(|pair| {
+        let has_ready_rider = pair[0].get("type").and_then(Value::as_str)
+            == Some("PostReplacement")
+            && pair[0]
+                .get("data")
+                .and_then(|data| data.get("drains"))
+                .and_then(Value::as_array)
+                .is_some_and(|drains| {
+                    drains.iter().any(|drain| {
+                        drain
+                            .get("status")
+                            .and_then(Value::as_object)
+                            .is_some_and(|status| status.contains_key("Ready"))
+                    })
+                });
+        if !has_ready_rider || pair[1].get("type").and_then(Value::as_str) != Some("MultiDraw") {
+            return false;
+        }
+
+        let Ok(ResolutionBoundaryFrame::MultiDraw { data: frame }) =
+            serde_json::from_value::<ResolutionBoundaryFrame>(pair[1].clone())
+        else {
+            return false;
+        };
+        frame.draw_sequences.frames.iter().any(|frame| {
+            matches!(
+                frame.delivery_owner,
+                DrawSequenceDeliveryOwnerPresence::Missing
+            ) && frame.remaining == 0
+        })
+    });
+    if has_related_post_replacement_continuation {
+        return Err(format!(
+            "legacy resolution_state_version {version} cannot safely restore a paused multi-draw replacement with a pending post-replacement continuation and no delivery_owner"
+        ));
+    }
+    Ok(())
+}
+
+/// The carrier fields a v1–v6 parked ChangeZone wrote and v7 replaced with
+/// per-member records.
+const LEGACY_CHANGE_ZONE_ENTRY_FIELDS: &[&str] = &[
+    "enter_tapped",
+    "enters_attacking",
+    "enter_with_counters",
+    "conditional_enter_with_counters",
+    "enters_modified_if",
+];
+
+/// The v1–v6 carrier's unprocessed members, written as bare ids.
+#[derive(Deserialize)]
+struct LegacyChangeZoneMembers {
+    remaining: Vec<ObjectId>,
+}
+
+/// The v1–v6 carrier-level entry modifications. The gates are read for presence
+/// only: their content is the pre-event authority this migration never consults.
+#[derive(Deserialize)]
+struct LegacyChangeZoneEntrySpec {
+    #[serde(default, with = "crate::types::zones::etb_tap_bool_compat")]
+    enter_tapped: EtbTapState,
+    enters_attacking: bool,
+    #[serde(default)]
+    enter_with_counters: Vec<(CounterType, u32)>,
+    #[serde(default)]
+    conditional_enter_with_counters: Vec<serde::de::IgnoredAny>,
+    #[serde(default)]
+    enters_modified_if: Option<serde::de::IgnoredAny>,
+}
+
+impl LegacyChangeZoneEntrySpec {
+    /// CR 614.12: whether a member's entry depends on a gate verdict. Conditional
+    /// counters always do. A rider gate matters only when a rider is set:
+    /// `effective_enter_mods` yields `(Unspecified, false)` on a mismatch, so a
+    /// gate over default riders gives every member the same entry either way.
+    fn entry_depends_on_gate(&self) -> bool {
+        !self.conditional_enter_with_counters.is_empty()
+            || (self.enters_modified_if.is_some()
+                && (!self.enter_tapped.is_unspecified() || self.enters_attacking))
+    }
+}
+
+/// Rewrites one v1–v6 parked ChangeZone carrier into its v7 shape, or refuses
+/// it when its members' entries depend on a gate the save cannot evaluate.
+fn migrate_legacy_change_zone_carrier(carrier: &mut Value) -> Result<(), String> {
+    let object = carrier
+        .as_object_mut()
+        .ok_or_else(|| "legacy ChangeZone carrier must be a JSON object".to_string())?;
+    let mut entry_fields = Map::new();
+    for field in LEGACY_CHANGE_ZONE_ENTRY_FIELDS {
+        if let Some(field_value) = object.remove(*field) {
+            entry_fields.insert((*field).to_string(), field_value);
+        }
+    }
+    let mut members_value = Map::new();
+    if let Some(remaining) = object.get("remaining") {
+        members_value.insert("remaining".to_string(), remaining.clone());
+    }
+    let members = serde_json::from_value::<LegacyChangeZoneMembers>(Value::Object(members_value))
+        .map_err(|error| format!("legacy ChangeZone carrier is malformed: {error}"))?
+        .remaining;
+    // The gate fields only ever drove the per-member loop, so a carrier with no
+    // unprocessed member loses nothing when they are dropped.
+    if members.is_empty() {
+        return Ok(());
+    }
+    let spec = serde_json::from_value::<LegacyChangeZoneEntrySpec>(Value::Object(entry_fields))
+        .map_err(|error| format!("legacy ChangeZone carrier is malformed: {error}"))?;
+    if spec.entry_depends_on_gate() {
+        // CR 603.6a + CR 614.12: the gate reads the board before the event's
+        // first member moved, which the save does not hold.
+        return Err(LEGACY_GATED_CHANGE_ZONE_ENTRY_RESTORE_ERROR.to_string());
+    }
+    // CR 614.12: with no gate, each member's entry is the carrier's own
+    // modifications, exactly as `resolve_change_zone_member_entry` resolves them.
+    let entries = members
+        .into_iter()
+        .map(|object_id| ChangeZoneMemberEntry {
+            object_id,
+            enter_with_counters: spec.enter_with_counters.clone(),
+            enter_tapped: spec.enter_tapped,
+            enters_attacking: spec.enters_attacking,
+        })
+        .collect::<Vec<_>>();
+    object.insert(
+        "remaining".to_string(),
+        serde_json::to_value(entries).map_err(|error| error.to_string())?,
+    );
+    Ok(())
+}
+
+/// The v2–v6 typed-frame half of the → v7 migration for parked ChangeZone
+/// carriers. Runs before any typed carrier decode: every ungated frame carrier
+/// is expanded into per-member records from its own fields, and every carrier
+/// whose unprocessed members' entries depend on a gate is refused with
+/// [`LEGACY_GATED_CHANGE_ZONE_ENTRY_RESTORE_ERROR`]. The v1 top-level carrier
+/// is migrated by the v1 reader arm of `ResolutionStateWire::from_value`
+/// through the same `migrate_legacy_change_zone_carrier`, which stays the
+/// single per-carrier authority. v7 and later decode directly.
+fn migrate_legacy_change_zone_member_entries(
+    value: &mut Value,
+    version: u64,
+) -> Result<(), String> {
+    // v1 carries its carrier at a top-level v1 key, which only the v1 reader
+    // arm of `ResolutionStateWire::from_value` may read; it migrates it there.
+    if !(LEGACY_TYPED_FRAME_RESOLUTION_STATE_WIRE_VERSION
+        ..=LEGACY_UNRESOLVED_CHANGE_ZONE_MEMBER_RESOLUTION_STATE_WIRE_VERSION)
+        .contains(&version)
+    {
+        return Ok(());
+    }
+    let Some(frames) = value
+        .get_mut("resolution_frames")
+        .and_then(|stack| stack.get_mut("frames"))
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    for frame in frames {
+        if frame.get("type").and_then(Value::as_str) != Some("ChangeZone") {
+            continue;
+        }
+        if let Some(carrier) = frame
+            .get_mut("data")
+            .and_then(|data| data.get_mut("pending"))
+            .filter(|carrier| !carrier.is_null())
+        {
+            migrate_legacy_change_zone_carrier(carrier)?;
+        }
+    }
+    Ok(())
+}
+
 /// Declares the resolution-wire shape of an UNVERSIONED raw `GameState`
 /// payload. The only place in the engine permitted to infer a wire version.
 ///
@@ -3768,19 +4330,14 @@ fn is_redacted_client_wire_projection(object: &Map<String, Value>) -> bool {
 /// 2. `client_state_wire_value` (`crate::game::derived_views`) — production
 ///    Rust, the origin of every payload that crosses the WASM boundary to the
 ///    client, and therefore of every client debug export. It runs that same
-///    derived `Serialize` and then removes nine top-level carriers plus a
-///    recursive six-key firing sweep. It removes NEITHER `resolution_stack`
-///    NOR `resolving_stack_entry`, so its output carries `resolution_stack`
-///    under exactly the same condition as (1).
+///    derived `Serialize`, writes a positive `wire_projection` marker, and
+///    removes the private top-level carriers plus recursive firing data. The
+///    shared viewer projection also removes the private `resolution_stack`.
 ///
-///    Writer (2)'s UNVERSIONED output is now REFUSED rather than inferred:
-///    [`is_redacted_client_wire_projection`] recognises it by the three
-///    unconditionally-serialized fields the redactor removes, and this function
-///    returns an error for it below. A VERSIONED client-wire payload is
-///    unaffected — it takes the first statement's early return and never
-///    reaches the fingerprint check, which is what leaves room for a future
-///    write-time `wire_projection` stamp to supersede the inference without
-///    conflicting with it.
+///    Writer (2)'s output is refused by the positive marker before any
+///    declared-version or unversioned wire inference. Historical unmarked
+///    captures still use [`is_redacted_client_wire_projection`] as a
+///    compatibility fallback below.
 ///
 ///    `phase_ai::saved_state::load_saved_game_state` is a second in-repo
 ///    consumer of this arm besides a player's restore: it decodes the
@@ -3793,19 +4350,17 @@ fn is_redacted_client_wire_projection(object: &Map<String, Value>) -> bool {
 ///
 /// This reader keys on that field, and the mapping holds for both writers.
 ///
-/// For writer (2) that agreement is a fact about a MUTABLE removal list, not a
-/// structural identity: if `client_state_wire_value` ever begins stripping
-/// `resolution_stack`, this rule silently stops applying to the entire
-/// client-wire population, with no compiler signal. That is why it is pinned by
-/// a test rather than by this comment — `client_wire_still_carries_resolution_stack`
-/// in `types/game_state.rs`'s `mod tests` goes red if the redactor's keep-list
-/// changes. Do not delete it.
+/// For historical writer (2) bytes that agreement is a fact about a MUTABLE
+/// removal list, not a structural identity. New bytes do not depend on that
+/// premise because the positive marker is checked first. The projection test
+/// in `types/game_state.rs` pins that the shared fail-closed redaction removes
+/// the private stack and emits the marker.
 ///
-/// The version stamped below is the same kind of mutable premise: the mapping
-/// is to the current typed-frame shape, whose carrier is `resolution_frames`
-/// and which deserializes the same `ResolutionStack` that `resolution_stack`
-/// does. It must be RE-DERIVED, not merely recompiled, if the current wire
-/// changes shape.
+/// The current derived writer emits `delivery_owner` on every draw frame,
+/// including an explicit `null`; historical unversioned `resolution_stack`
+/// payloads omit that key. That marker selects v4 versus the compatible v3
+/// typed-frame reader before the carrier is renamed. Re-derive this mapping if
+/// either writer changes shape.
 ///
 /// An undeclared payload carrying BOTH carriers is refused rather than
 /// inferred: choosing one would discard the other with no error, at an ingress
@@ -3815,15 +4370,16 @@ fn is_redacted_client_wire_projection(object: &Map<String, Value>) -> bool {
 /// through `ResolutionStateWire::to_value`, which always declares the current
 /// version.
 ///
-/// The mapping is exact, not heuristic. #6269 (`f4a6f32b85`, 2026-07-21) added
-/// `resolution_stack` and removed all 29 legacy `pending_*` /
+/// The mapping is structural, not heuristic. #6269 (`f4a6f32b85`, 2026-07-21)
+/// added `resolution_stack` and removed all 29 legacy `pending_*` /
 /// `post_replacement_*` fields in ONE commit, and no legacy field has been
 /// re-added since, so a payload carrying `resolution_stack` is necessarily
-/// post-#6269 and never a v1 save. A payload WITHOUT it is either pre-#6269 or
-/// post-#6269 with an empty frame stack; both project to the same empty frame
-/// stack through the v1 branch. (The three `ResolutionStack` allocators are a
-/// separate, pre-existing matter: `is_empty` reads only `frames`, so an
-/// empty-frames save omits the whole field and loses them either way.)
+/// post-#6269 and never a v1 save. Presence of `delivery_owner` then
+/// distinguishes v4 from an older unversioned typed-frame payload, which is
+/// read as v3. A payload WITHOUT `resolution_stack` keeps the v1 path. (The
+/// three `ResolutionStack` allocators are a separate, pre-existing matter:
+/// `is_empty` reads only `frames`, so an empty-frames save omits the whole field
+/// and loses them either way.)
 ///
 /// A payload that already declares a version keeps it, and receives exactly the
 /// treatment that version gets through any other ingress — there is no
@@ -3836,12 +4392,23 @@ fn is_redacted_client_wire_projection(object: &Map<String, Value>) -> bool {
 /// `ResolutionStack`.
 /// The move below is a rename, not a reinterpretation.
 pub(crate) fn declare_raw_resolution_wire(value: &mut Value) -> Result<(), String> {
+    reject_wire_projection_marker(value)?;
     let object = value
         .as_object_mut()
         .ok_or_else(|| "persisted game state must be a JSON object".to_string())?;
     if object.contains_key("resolution_state_version") {
         return Ok(());
     }
+    let unversioned_stack_has_delivery_owner = object
+        .get("resolution_stack")
+        .map(has_draw_sequence_delivery_owner)
+        .transpose()?
+        .unwrap_or(false);
+    let unversioned_stack_has_resolved_change_zone_members = object
+        .get("resolution_stack")
+        .map(carries_resolved_change_zone_members)
+        .transpose()?
+        .unwrap_or(false);
     // An undeclared payload carrying BOTH carriers is ambiguous, and inferring
     // from one would move `resolution_stack` onto the `resolution_frames` key
     // and discard the declared `resolution_frames` silently. Refuse instead.
@@ -3916,9 +4483,20 @@ pub(crate) fn declare_raw_resolution_wire(value: &mut Value) -> Result<(), Strin
     match object.remove("resolution_stack") {
         Some(frames) => {
             object.insert("resolution_frames".to_string(), frames);
+            // A ChangeZone member record is written only by the v7 carrier, so
+            // it dates the payload exactly as `delivery_owner` dates v4. A
+            // stack written that late also carries `delivery_owner` on every
+            // draw frame, which v7 validation still requires.
+            let declared_version = if unversioned_stack_has_resolved_change_zone_members {
+                RESOLUTION_STATE_WIRE_VERSION
+            } else if unversioned_stack_has_delivery_owner {
+                LEGACY_DEALERLESS_RESOLUTION_STATE_WIRE_VERSION
+            } else {
+                LEGACY_RESULT_OWNERSHIP_RESOLUTION_STATE_WIRE_VERSION
+            };
             object.insert(
                 "resolution_state_version".to_string(),
-                Value::from(RESOLUTION_STATE_WIRE_VERSION),
+                Value::from(declared_version),
             );
         }
         None => {
@@ -3927,6 +4505,22 @@ pub(crate) fn declare_raw_resolution_wire(value: &mut Value) -> Result<(), Strin
                 Value::from(LEGACY_RESOLUTION_STATE_WIRE_VERSION),
             );
         }
+    }
+    Ok(())
+}
+
+/// Refuses a client projection at any persistence ingress, including a
+/// versioned/trusted envelope. Transport decoding intentionally does not call
+/// this helper because redacted client state is valid on the wire.
+pub(crate) fn reject_wire_projection_marker(value: &Value) -> Result<(), String> {
+    if value
+        .as_object()
+        .is_some_and(|object| object.contains_key("wire_projection"))
+    {
+        return Err(
+            "This saved game is missing the private rules record for the resolution it was paused in — this is what a debug export of the on-screen state looks like."
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -3948,8 +4542,8 @@ const LEGACY_LIVE_ZONE_CHANGED_EVENT_ROOTS: &[&str] = &[
 ///
 /// This adapter is the persistence seam between v1's legacy-only payloads and
 /// typed frames. v1 decoding converts migrated family payloads into the
-/// runtime stack; v2/v3 decoding restores those frames directly while retaining
-/// legacy slots solely for unmigrated families. Both supported versions refuse
+/// runtime stack; v2-v4 decoding restores those frames directly while retaining
+/// legacy slots solely for unmigrated families. The typed-frame versions refuse
 /// `CreatureExploited` events that predate authoritative victim records; the
 /// version distinguishes frame layouts and cannot safely synthesize event facts.
 #[derive(Debug, Clone)]
@@ -3996,7 +4590,12 @@ impl ResolutionStateWire {
     /// Decodes persisted full-game state at the resolution compatibility boundary.
     ///
     /// Version 1 is read only through the legacy migration path below. Versions
-    /// 2 and 3 share the typed-frame reader; only version 3 is written.
+    /// 2 and 3 share the typed-frame reader; versions 4 through 7 use the same
+    /// frame layout with an explicit draw-result-owner presence check, and a
+    /// version-4 draw frame simply has no dealer. A v2–v6 parked ChangeZone
+    /// frame carrier is migrated or refused first by
+    /// `migrate_legacy_change_zone_member_entries`; the v1 top-level carrier,
+    /// by the v1 reader arm before that arm's validation and legacy decodes.
     fn from_value(mut value: Value) -> Result<Self, String> {
         let version = {
             let object = value
@@ -4016,13 +4615,24 @@ impl ResolutionStateWire {
             LEGACY_TYPED_FRAME_RESOLUTION_STATE_WIRE_VERSION => {
                 GameStateDecodeMode::ResolutionWireV2
             }
-            RESOLUTION_STATE_WIRE_VERSION => GameStateDecodeMode::ResolutionWireV3,
+            LEGACY_RESULT_OWNERSHIP_RESOLUTION_STATE_WIRE_VERSION => {
+                GameStateDecodeMode::ResolutionWireV3
+            }
+            LEGACY_DEALERLESS_RESOLUTION_STATE_WIRE_VERSION
+            | 5
+            | LEGACY_UNRESOLVED_CHANGE_ZONE_MEMBER_RESOLUTION_STATE_WIRE_VERSION
+            | RESOLUTION_STATE_WIRE_VERSION => GameStateDecodeMode::ResolutionWireV4,
             _ => {
                 return Err(format!(
-                    "unsupported resolution_state_version {version}; expected 1, 2, or {RESOLUTION_STATE_WIRE_VERSION}"
+                    "unsupported resolution_state_version {version}; expected 1, 2, {LEGACY_RESULT_OWNERSHIP_RESOLUTION_STATE_WIRE_VERSION}, {LEGACY_DEALERLESS_RESOLUTION_STATE_WIRE_VERSION}, 5, {LEGACY_UNRESOLVED_CHANGE_ZONE_MEMBER_RESOLUTION_STATE_WIRE_VERSION}, or {RESOLUTION_STATE_WIRE_VERSION}"
                 ));
             }
         };
+        if version != LEGACY_RESOLUTION_STATE_WIRE_VERSION {
+            validate_draw_sequence_delivery_owner_fields(&value, version, None)?;
+        }
+        reject_ambiguous_legacy_paused_draw_result(&value, version)?;
+        migrate_legacy_change_zone_member_entries(&mut value, version)?;
         // `ResolutionStateWire` is a public persistence boundary in its own
         // right. Its historic-shape preparation and raw-state materialization
         // both belong to `GameStateDecode`; no wire branch gets a private
@@ -4032,7 +4642,9 @@ impl ResolutionStateWire {
         GameStateDecode::prepare_resolution_wire(&mut value, decode_mode)?;
         let additional_live_event_roots = match decode_mode {
             GameStateDecodeMode::ResolutionWireV1 => LEGACY_LIVE_ZONE_CHANGED_EVENT_ROOTS,
-            GameStateDecodeMode::ResolutionWireV2 | GameStateDecodeMode::ResolutionWireV3 => &[],
+            GameStateDecodeMode::ResolutionWireV2
+            | GameStateDecodeMode::ResolutionWireV3
+            | GameStateDecodeMode::ResolutionWireV4 => &[],
             GameStateDecodeMode::PersistedRaw
             | GameStateDecodeMode::TrustedEnvelope
             | GameStateDecodeMode::DirectCurrentRaw => {
@@ -4048,6 +4660,32 @@ impl ResolutionStateWire {
             // V1 reader compatibility path: historical keys are consumed here
             // and projected into typed frames before runtime state is restored.
             GameStateDecodeMode::ResolutionWireV1 => {
+                // CR 603.6a + CR 614.12: a v1 save paused inside a multi-object
+                // ChangeZone wrote bare member ids with carrier-level entry
+                // modifications. Migrate (or refuse, when a gate decides the
+                // entries) before this arm's validation or the `LegacyChangeZoneWire`
+                // decode reads it. Unlike the v2–v6 frame migration, this runs after
+                // `prepare_resolution_wire` and the provenance migration. Their
+                // whole-value walks reach this carrier, but they only rewrite or
+                // refuse shapes a writer never puts in its `remaining` or entry
+                // fields, so the migrated result is unchanged.
+                if let Some(carrier) = value
+                    .get_mut("pending_change_zone_iteration")
+                    .filter(|carrier| !carrier.is_null())
+                {
+                    migrate_legacy_change_zone_carrier(carrier)?;
+                }
+                let legacy_draw_sequence_frames = value
+                    .get("draw_sequences")
+                    .and_then(|stack| stack.get("frames"))
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                validate_draw_sequence_delivery_owner_fields(
+                    &value,
+                    version,
+                    Some(legacy_draw_sequence_frames),
+                )?;
                 crate::types::game_state::reconcile_persisted_zone_change_occurrences(
                     &mut value,
                     LEGACY_LIVE_ZONE_CHANGED_EVENT_ROOTS,
@@ -4215,11 +4853,15 @@ impl ResolutionStateWire {
                     .validate(&legacy.waiting_for)
                     .map_err(|error| error.to_string())?;
                 crate::types::game_state::validate_trigger_firing_coherence(&legacy)?;
+                crate::types::game_state::validate_owed_spell_final_part_coherence(&legacy)?;
+                crate::types::game_state::validate_return_result_occurrence_coherence(&legacy)?;
                 #[cfg(debug_assertions)]
                 debug_assert_runtime_resolution_invariants(&legacy);
                 Ok(Self { state: legacy })
             }
-            GameStateDecodeMode::ResolutionWireV2 | GameStateDecodeMode::ResolutionWireV3 => {
+            GameStateDecodeMode::ResolutionWireV2
+            | GameStateDecodeMode::ResolutionWireV3
+            | GameStateDecodeMode::ResolutionWireV4 => {
                 crate::types::game_state::reconcile_persisted_zone_change_occurrences(
                     &mut value,
                     &[],
@@ -4275,6 +4917,8 @@ impl ResolutionStateWire {
                     );
                 }
                 crate::types::game_state::validate_trigger_firing_coherence(&projected)?;
+                crate::types::game_state::validate_owed_spell_final_part_coherence(&projected)?;
+                crate::types::game_state::validate_return_result_occurrence_coherence(&projected)?;
                 #[cfg(debug_assertions)]
                 debug_assert_runtime_resolution_invariants(&projected);
                 Ok(Self { state: projected })
@@ -4316,6 +4960,7 @@ fn normalize_legacy_completed_resolution_carrier(state: &mut GameState) {
     {
         state.resolving_stack_entry = None;
         state.resolving_trigger_firing = None;
+        state.resolving_spell_final_part = None;
         state.resolution_source_relatch = None;
     }
 }
@@ -4488,18 +5133,6 @@ pub(crate) fn debug_assert_runtime_resolution_invariants(state: &GameState) {
         state.current_triggered_mana_override.is_none(),
         "the active inline-mana override must not survive a public boundary"
     );
-
-    if let Ok(current) = ResolutionStateWire::from_game_state(state.clone()).to_value() {
-        let object = current
-            .as_object()
-            .expect("resolution wire serialization is always an object");
-        for field in legacy_resolution_wire_fields() {
-            assert!(
-                !object.contains_key(*field),
-                "current resolution frames must not co-reside with legacy runtime field {field}"
-            );
-        }
-    }
 }
 
 /// v1-only continuation fields. Runtime state never carries these names after
@@ -4838,6 +5471,7 @@ impl LegacyOptionalEffectWire {
             // (no in-flight reproduction on a legacy-serialized optional frame).
             trigger_events: Vec::new(),
             trigger_match_count: self.pending_optional_trigger_match_count,
+            return_result_occurrence: None,
         }))
     }
 }
@@ -5346,6 +5980,7 @@ mod tests {
             .expect("the fixture emits an authoritative departure record");
         let exploit = GameEvent::CreatureExploited {
             exploiter,
+            exploiter_incarnation: None,
             sacrificed: victim,
             record,
         };
@@ -5353,8 +5988,26 @@ mod tests {
         (state, exploit)
     }
 
+    fn strip_delivery_owner_fields(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                object.remove("delivery_owner");
+                for child in object.values_mut() {
+                    strip_delivery_owner_fields(child);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    strip_delivery_owner_fields(item);
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
+    }
+
     fn v1_wire_value(state: GameState) -> Value {
         let mut value = serde_json::to_value(state).expect("state serializes");
+        strip_delivery_owner_fields(&mut value);
         let object = value.as_object_mut().expect("state is an object");
         object.remove("resolution_stack");
         object.insert(
@@ -5368,9 +6021,22 @@ mod tests {
         let mut value = ResolutionStateWire::from_game_state(state)
             .to_value()
             .expect("current wire serializes before fixture downgrade");
+        strip_delivery_owner_fields(&mut value);
         value["resolution_state_version"] =
             Value::from(LEGACY_TYPED_FRAME_RESOLUTION_STATE_WIRE_VERSION);
         value
+    }
+
+    #[test]
+    fn malformed_unversioned_draw_carrier_preserves_boundary_error() {
+        let mut value = serde_json::json!({
+            "resolution_stack": {
+                "frames": [{"type": "MultiDraw", "data": {"draw_sequences": {"frames": "invalid"}}}]
+            }
+        });
+        let error = declare_raw_resolution_wire(&mut value).unwrap_err();
+        assert!(error.contains("typed resolution frame boundary is malformed"));
+        assert!(value.get("resolution_state_version").is_none());
     }
 
     #[test]
@@ -5617,6 +6283,7 @@ mod tests {
             .expect("empty logical group still needs its pre-delivery latch");
         ResolutionFrame::ChangeZone(Box::new(ChangeZoneFrame {
             pending: Some(PendingChangeZoneIteration {
+                pending_return_result_producer: None,
                 logical_zone_change_group,
                 paused_current: None,
                 remaining: Vec::new(),
@@ -5625,18 +6292,13 @@ mod tests {
                 origin: None,
                 destination: Zone::Battlefield,
                 enter_transformed: false,
-                enter_tapped: EtbTapState::Unspecified,
                 enters_under_player: None,
-                enters_attacking: false,
-                enter_with_counters: Vec::new(),
-                conditional_enter_with_counters: Vec::new(),
                 duration: None,
                 track_exiled_by_source: false,
                 face_down_in_exile: crate::types::ability::ExileConcealment::Public,
                 moved_count: None,
                 face_down_profile: None,
                 library_placement: None,
-                enters_modified_if: None,
                 enter_attached_to: None,
                 effect_kind: EffectKind::ChangeZone,
             }),
@@ -6060,6 +6722,7 @@ mod tests {
         v2["resolution_state_version"] =
             Value::from(LEGACY_TYPED_FRAME_RESOLUTION_STATE_WIRE_VERSION);
         v2["resolution_frames"] = serde_json::to_value(frames).expect("fixture frames serialize");
+        strip_delivery_owner_fields(&mut v2);
         v2
     }
 
@@ -6216,6 +6879,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         }));
         optional_effect
             .validate(&WaitingFor::OpponentMayChoice {
@@ -6303,6 +6967,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         }));
         let optional_payload = v2_fixture_with_frames(optional_state, optional_frames);
         let restored: ResolutionStateWire = serde_json::from_value(optional_payload)
@@ -6388,6 +7053,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         })
     }
 
@@ -6592,10 +7258,16 @@ mod tests {
     }
 
     #[test]
-    fn resolution_wire_contract_pins_v3_and_the_legacy_readers() {
-        assert_eq!(RESOLUTION_STATE_WIRE_VERSION, 3);
+    fn resolution_wire_contract_pins_v5_and_the_legacy_readers() {
+        assert_eq!(RESOLUTION_STATE_WIRE_VERSION, 7);
         assert_eq!(LEGACY_RESOLUTION_STATE_WIRE_VERSION, 1);
         assert_eq!(LEGACY_TYPED_FRAME_RESOLUTION_STATE_WIRE_VERSION, 2);
+        assert_eq!(LEGACY_RESULT_OWNERSHIP_RESOLUTION_STATE_WIRE_VERSION, 3);
+        assert_eq!(LEGACY_DEALERLESS_RESOLUTION_STATE_WIRE_VERSION, 4);
+        assert_eq!(
+            LEGACY_UNRESOLVED_CHANGE_ZONE_MEMBER_RESOLUTION_STATE_WIRE_VERSION,
+            6
+        );
 
         let mut v1 =
             serde_json::to_value(GameState::new_two_player(57)).expect("legacy state serializes");
@@ -6746,8 +7418,10 @@ mod tests {
             .expect("legacy paired state serializes");
         v1["post_replacement_drains"] =
             serde_json::to_value(drains).expect("paused drain serializes");
-        v1["draw_sequences"] =
+        let mut draw_sequences =
             serde_json::to_value(draw.draw_sequences).expect("active draw serializes");
+        strip_delivery_owner_fields(&mut draw_sequences);
+        v1["draw_sequences"] = draw_sequences;
         v1["resolution_state_version"] = Value::from(LEGACY_RESOLUTION_STATE_WIRE_VERSION);
 
         let wire: ResolutionStateWire =
@@ -6822,6 +7496,7 @@ mod tests {
                 trigger_event: None,
                 trigger_events: Vec::new(),
                 trigger_match_count: None,
+                return_result_occurrence: None,
             })
         };
         let opponent_may = WaitingFor::OpponentMayChoice {
@@ -6952,6 +7627,7 @@ mod tests {
                 trigger_event: None,
                 trigger_events: Vec::new(),
                 trigger_match_count: None,
+                return_result_occurrence: None,
             },
         );
         apply_as_current(
@@ -7073,6 +7749,7 @@ mod tests {
             restored.stop_progress, None,
             "a legacy payload carries no baseline, and `None` can never stop the repeat"
         );
+        assert_eq!(restored.iteration_progress, None);
         // Positive reach-guard: the payload really parsed — the frame's ability
         // survived intact, so `stop_progress == None` is not a parse failure.
         assert_eq!(
@@ -7099,6 +7776,12 @@ mod tests {
         let frame = PendingRepeatUntil {
             ability: Box::new(repeat_ability),
             stop_progress: Some(witness.clone()),
+            iteration_progress: Some(crate::types::game_state::RepeatUntilIterationWitness {
+                choice: RepeatIterationChoice::MandatoryOnly(
+                    crate::types::game_state::RepeatIterationMovement::Stationary,
+                ),
+                zone_changes_before: 3,
+            }),
         };
         let round_tripped: PendingRepeatUntil =
             serde_json::from_str(&serde_json::to_string(&frame).expect("frame serializes"))
@@ -7134,6 +7817,7 @@ mod tests {
                 iterated_counter_kinds: Vec::new(),
                 next_iteration: 0,
                 total_iterations: 0,
+                copy_order_fixed: None,
             },
         ));
         assert!(repeat_for.active_repeat_for().is_none());
@@ -7147,6 +7831,7 @@ mod tests {
             PendingRepeatUntil {
                 ability: Box::new(repeat_ability),
                 stop_progress: None,
+                iteration_progress: None,
             },
         ));
         assert!(matches!(
@@ -7378,11 +8063,12 @@ mod tests {
                 controller: PlayerId(0),
                 source_id: ObjectId(131),
                 branches: Vec::new(),
-                parent_targets: Vec::new(),
+                parent_occurrences: Default::default(),
                 context: Box::new(SpellContext::default()),
                 continuation: None,
                 replacement_applied: HashSet::new(),
                 remaining_players: Vec::new(),
+                trigger_context: None,
             },
         );
         crate::game::effects::choose_one_of::resume_pending(&mut choose_one_of, &mut Vec::new());
@@ -7430,6 +8116,8 @@ mod tests {
                 ability: Box::new(choose_from_zone),
                 remaining_players: Vec::new(),
                 accumulated: false,
+                current: None,
+                nominee: None,
             },
         );
         crate::game::effects::choose_from_zone::drain_active_per_player_zone_choice(
@@ -7480,6 +8168,7 @@ mod tests {
         );
         let mut v2 = serde_json::to_value(ResolutionStateWire::from_game_state(state))
             .expect("v2 active draw fixture serializes");
+        strip_delivery_owner_fields(&mut v2);
         v2["resolution_state_version"] =
             Value::from(LEGACY_TYPED_FRAME_RESOLUTION_STATE_WIRE_VERSION);
         let mut with_outer_allocator = v2.clone();
@@ -8047,6 +8736,7 @@ mod tests {
 
         let mut v2 = serde_json::to_value(ResolutionStateWire::from_game_state(state))
             .expect("current writer serializes the fixture before its v2 downgrade");
+        strip_delivery_owner_fields(&mut v2);
         v2["resolution_state_version"] =
             Value::from(LEGACY_TYPED_FRAME_RESOLUTION_STATE_WIRE_VERSION);
         let restored = serde_json::from_value::<ResolutionStateWire>(v2)
@@ -8072,8 +8762,10 @@ mod tests {
         let inner = draw_sequences.push(PlayerId(0), 0);
         let mut multi_draw = serde_json::to_value(GameState::new_two_player(140))
             .expect("legacy multi-draw fixture serializes");
-        multi_draw["draw_sequences"] =
+        let mut draw_wire =
             serde_json::to_value(draw_sequences).expect("legacy draw sequences serialize");
+        strip_delivery_owner_fields(&mut draw_wire);
+        multi_draw["draw_sequences"] = draw_wire;
         multi_draw["resolution_state_version"] = Value::from(LEGACY_RESOLUTION_STATE_WIRE_VERSION);
         let mut multi_draw = serde_json::from_value::<ResolutionStateWire>(multi_draw)
             .expect("v1 nested multi-draw fixture restores")
@@ -8200,6 +8892,7 @@ mod tests {
             lifelink_bonus: 0,
             may_cost_paid: false,
             may_cost_remaining: None,
+            delivery_boundary: None,
         });
         spell.waiting_for =
             crate::game::replacement::replacement_choice_waiting_for(PlayerId(0), &spell);
@@ -8262,8 +8955,10 @@ mod tests {
             .expect("legacy paired fixture serializes");
         paired["post_replacement_drains"] =
             serde_json::to_value(drains).expect("paused drain serializes");
-        paired["draw_sequences"] =
+        let mut draw_sequences =
             serde_json::to_value(draw.draw_sequences).expect("active draw serializes");
+        strip_delivery_owner_fields(&mut draw_sequences);
+        paired["draw_sequences"] = draw_sequences;
         paired["resolution_state_version"] = Value::from(LEGACY_RESOLUTION_STATE_WIRE_VERSION);
         let mut paired = serde_json::from_value::<ResolutionStateWire>(paired)
             .expect("v1 paired fixture restores")
@@ -8345,6 +9040,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         }));
         buried_optional_frames.push_inner(continuation_frame(151));
         assert!(
@@ -8395,8 +9091,10 @@ mod tests {
             serde_json::to_value(GameState::new_two_player(154)).expect("v1 serializes");
         ambiguous_legacy_pair["post_replacement_drains"] =
             serde_json::to_value(ready_drains).expect("ready drain serializes");
-        ambiguous_legacy_pair["draw_sequences"] =
+        let mut draw_sequences =
             serde_json::to_value(draw.draw_sequences).expect("draw serializes");
+        strip_delivery_owner_fields(&mut draw_sequences);
+        ambiguous_legacy_pair["draw_sequences"] = draw_sequences;
         ambiguous_legacy_pair["resolution_state_version"] =
             Value::from(LEGACY_RESOLUTION_STATE_WIRE_VERSION);
         let error = serde_json::from_value::<ResolutionStateWire>(ambiguous_legacy_pair)
@@ -8411,8 +9109,9 @@ mod tests {
         let ResolutionFrame::MultiDraw(draw) = active_multi_draw_frame() else {
             unreachable!("fixture constructs a multi-draw frame")
         };
-        let draw_sequences =
+        let mut draw_sequences =
             serde_json::to_value(draw.draw_sequences).expect("draw sequences serialize");
+        strip_delivery_owner_fields(&mut draw_sequences);
 
         let mut draw_with_life_tail =
             serde_json::to_value(GameState::new_two_player(155)).expect("v1 serializes");
@@ -8518,5 +9217,95 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    fn state_with_dealer_frame(dealer: bool) -> GameState {
+        use crate::types::game_state::{
+            DrawDealer, DrawDealerSeat, DrawDealerStage, DrawSequenceOrigin,
+        };
+        let mut state = GameState::new_two_player(42);
+        let id = state.push_draw_sequence_with_origin(
+            PlayerId(0),
+            2,
+            std::collections::HashSet::new(),
+            DrawSequenceOrigin::Plain,
+        );
+        if dealer {
+            let seat = |player, accumulated| DrawDealerSeat {
+                player: PlayerId(player),
+                count: 2,
+                applied: std::collections::HashSet::new(),
+                accumulated,
+            };
+            state.draw_sequence_frame_mut(id).expect("frame").dealer = Some(DrawDealer {
+                stage: DrawDealerStage::Dealing {
+                    schedule: vec![PlayerId(0), PlayerId(1)],
+                },
+                seats: vec![seat(0, 0), seat(1, 1)],
+            });
+        }
+        state
+    }
+
+    #[test]
+    fn a_parked_dealer_frame_survives_the_resolution_wire() {
+        let state = state_with_dealer_frame(true);
+        let wire = serde_json::to_value(ResolutionStateWire::from_game_state(state.clone()))
+            .expect("wire serializes");
+        assert_eq!(
+            wire["resolution_state_version"],
+            Value::from(RESOLUTION_STATE_WIRE_VERSION)
+        );
+        assert!(wire.to_string().contains("\"dealer\""), "reach: written");
+
+        let restored = serde_json::from_value::<ResolutionStateWire>(wire)
+            .expect("current wire restores")
+            .into_game_state();
+        assert_eq!(
+            restored.active_draw_sequence().map(|frame| &frame.dealer),
+            state.active_draw_sequence().map(|frame| &frame.dealer),
+            "the dealer's stage, schedule and seats round-trip"
+        );
+        assert!(restored
+            .active_draw_sequence()
+            .is_some_and(|frame| frame.dealer.is_some()));
+    }
+
+    #[test]
+    fn a_frame_without_a_dealer_writes_no_dealer_key() {
+        let wire = serde_json::to_value(ResolutionStateWire::from_game_state(
+            state_with_dealer_frame(false),
+        ))
+        .expect("wire serializes");
+        assert!(
+            wire.to_string().contains("delivery_owner"),
+            "reach: a draw frame"
+        );
+        assert!(!wire.to_string().contains("\"dealer\""));
+    }
+
+    #[test]
+    fn the_dealerless_version_still_decodes_and_the_next_one_is_refused() {
+        let current = serde_json::to_value(ResolutionStateWire::from_game_state(
+            state_with_dealer_frame(false),
+        ))
+        .expect("wire serializes");
+
+        let mut dealerless = current.clone();
+        dealerless["resolution_state_version"] =
+            Value::from(LEGACY_DEALERLESS_RESOLUTION_STATE_WIRE_VERSION);
+        let restored = serde_json::from_value::<ResolutionStateWire>(dealerless)
+            .expect("a version-4 payload decodes")
+            .into_game_state();
+        assert!(restored
+            .active_draw_sequence()
+            .is_some_and(|frame| frame.dealer.is_none()));
+
+        let mut future = current;
+        future["resolution_state_version"] = Value::from(RESOLUTION_STATE_WIRE_VERSION + 1);
+        let error = serde_json::from_value::<ResolutionStateWire>(future)
+            .expect_err("an unknown version is refused")
+            .to_string();
+        assert!(error.contains("1, 2, 3, 4, 5, 6, or 7"), "{error}");
     }
 }
