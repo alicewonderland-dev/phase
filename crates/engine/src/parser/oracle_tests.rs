@@ -7,7 +7,7 @@ use crate::parser::oracle_ir::doc::{
 use crate::parser::oracle_ir::static_ir::StaticIr;
 use crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER;
 use crate::types::ability::{
-    AdditionalCostOrigin, AdditionalCostPaymentSource, ChooseOneOfKind, CountScope,
+    AdditionalCostOrigin, AdditionalCostPaymentSource, ChooseOneOfKind, CoinFlipRun, CountScope,
     CounterAdjustment, DamageKindFilter, DoorLockOp, PlayerRelation,
     SpellStackToGraveyardReplacement, SubAbilityLink, TargetReadOrigin,
 };
@@ -27947,16 +27947,78 @@ fn enters_with_n_additional_counters_parses_canonical_type() {
         (counter_type.clone(), count.clone())
     }
 
-    // "that creature enters with two additional +1/+1 counters on it" (Necromantic Summons)
-    let (ct, count) = enters_counter(
-        "Put target creature card from a graveyard onto the battlefield under your control.\n\
-         Spell mastery — If there are two or more instant and/or sorcery cards in your graveyard, \
-         that creature enters with two additional +1/+1 counters on it.",
-        "Necromantic Summons",
-        &["Sorcery"],
-    );
-    assert_eq!(ct, CounterType::Plus1Plus1, "Necromantic Summons type");
-    assert_eq!(count, QuantityExpr::Fixed { value: 2 }, "count");
+    // CR 608.2c + CR 614.12: riders whose subject a preceding mover supplies are
+    // not replacements on the card. Necromantic Summons gates its rider on spell
+    // mastery and Turntimber Symbiosis on the card's mana value — neither is an
+    // "enters this way" gate the mover's entry counters can carry — so each rider
+    // is an explicit gap, never a `PutCounter` replacement on the sorcery itself.
+    let battlefield_mover = |effect: &Effect| {
+        matches!(
+            effect,
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                ..
+            }
+        )
+    };
+    let dig = |effect: &Effect| matches!(effect, Effect::Dig { .. });
+    struct PrimaryMoverCase {
+        card: &'static str,
+        text: &'static str,
+        is_primary_mover: fn(&Effect) -> bool,
+    }
+    let cases = [
+        PrimaryMoverCase {
+            card: "Necromantic Summons",
+            text: "Put target creature card from a graveyard onto the battlefield under your control.\n\
+             Spell mastery — If there are two or more instant and/or sorcery cards in your graveyard, \
+             that creature enters with two additional +1/+1 counters on it.",
+            is_primary_mover: battlefield_mover,
+        },
+        PrimaryMoverCase {
+            card: "Turntimber Symbiosis",
+            text: "Look at the top seven cards of your library. You may put a creature card from among them \
+             onto the battlefield. If that card has mana value 3 or less, it enters with three \
+             additional +1/+1 counters on it. Put the rest on the bottom of your library in a random order.",
+            is_primary_mover: dig,
+        },
+    ];
+    for PrimaryMoverCase {
+        card: name,
+        text: oracle,
+        is_primary_mover: primary_mover,
+    } in cases
+    {
+        let parsed = parse_oracle_text(oracle, name, &[], &["Sorcery".to_string()], &[]);
+        fn chain_nodes(ability: &AbilityDefinition) -> impl Iterator<Item = &AbilityDefinition> {
+            let mut cursor = Some(ability);
+            std::iter::from_fn(move || {
+                let node = cursor?;
+                cursor = node.sub_ability.as_deref();
+                Some(node)
+            })
+        }
+        assert!(
+            parsed
+                .abilities
+                .iter()
+                .flat_map(chain_nodes)
+                .any(|node| primary_mover(&node.effect)),
+            "{name}: reach guard: the primary mover parses: {parsed:?}"
+        );
+        assert!(
+            parsed.replacements.is_empty(),
+            "{name}: the rider is not a replacement on the sorcery: {parsed:?}"
+        );
+        assert!(
+            parsed.abilities.iter().flat_map(chain_nodes).any(|node| {
+                node.effect
+                    .unimplemented_description()
+                    .is_some_and(|text| text.contains("enters with"))
+            }),
+            "{name}: the rider stays an explicit gap: {parsed:?}"
+        );
+    }
 
     // "it enters with two additional +1/+1 counters on it" (Heroic Return).
     //
@@ -27996,17 +28058,6 @@ fn enters_with_n_additional_counters_parses_canonical_type() {
     assert_eq!(*ct, CounterType::Plus1Plus1, "Heroic Return type");
     assert_eq!(*count, QuantityExpr::Fixed { value: 2 }, "count");
 
-    // "it enters with three additional +1/+1 counters on it" (Turntimber Symbiosis)
-    let (ct, count) = enters_counter(
-        "Look at the top seven cards of your library. You may put a creature card from among them \
-         onto the battlefield. If that card has mana value 3 or less, it enters with three \
-         additional +1/+1 counters on it. Put the rest on the bottom of your library in a random order.",
-        "Turntimber Symbiosis",
-        &["Sorcery"],
-    );
-    assert_eq!(ct, CounterType::Plus1Plus1, "Turntimber Symbiosis type");
-    assert_eq!(count, QuantityExpr::Fixed { value: 3 }, "count");
-
     // Non-P/T counter class: "it enters with three additional time counters on it" (Ravaging Riftwurm)
     let (ct, count) = enters_counter(
         "If this creature was kicked, it enters with three additional time counters on it.",
@@ -28041,17 +28092,19 @@ fn reflexive_entry_rider_voices_all_stay_on_the_trigger_path() {
          from your graveyard to the battlefield. If a creature is put onto the battlefield \
          this way, it enters with an additional +1/+1 counter on it.";
 
-    // Premise for the Passive Voice row (this is what makes its negative below
-    // non-vacuous and pins the revert): handed the WHOLE line, the replacement
-    // parser really does claim it. Only the head-scoped `enters with` gate keeps
-    // the interceptor from reaching this and dropping the reanimation instruction.
+    // Premise for the Passive Voice row: handed the WHOLE line, the replacement
+    // parser no longer claims it either (CR 614.1c + CR 608.2c, #9658: a line of
+    // several sentences is never one replacement, and the rider's pronoun names
+    // the reanimated card, not this creature). The head-scoped `enters with` gate
+    // and the whole-line gate are now two independent guards against publishing
+    // a replacement and dropping the head reanimation.
     assert!(
         crate::parser::oracle_replacement::parse_replacement_line(
             PASSIVE_VOICE,
             "Passive Voice Reanimator"
         )
-        .is_some(),
-        "Passive Voice Reanimator: premise — the un-scoped line is claimable by the \
+        .is_none(),
+        "Passive Voice Reanimator: premise — the un-scoped line is not claimable by the \
          replacement parser"
     );
     // Premise for the Winter Soldier row (#9657): its first "with" belongs to the
@@ -29939,7 +29992,7 @@ fn unbound_delayed_graveyard_sweep_stays_honestly_unimplemented() {
 /// that fixture for this pass.
 ///
 /// It plants one refused rider in sixteen carriers — the ability-node chain
-/// links, the two `FlipCoin` payloads, `ChooseOneOf`, a trigger, a granted
+/// links, the two `FlipCoins` payloads, `ChooseOneOf`, a trigger, a granted
 /// ability, a replacement payload, the four cost slots (CR 602.1a activation
 /// cost, CR 118.12 `unless_pay` on both an ability and a trigger, and
 /// `ReplacementMode::MayCost`) and the two decline branches — and asserts every
@@ -30001,8 +30054,9 @@ fn demote_net_reaches_every_ability_carrier() {
     chain.mode_abilities.push(refused());
     parsed.abilities.push(chain);
 
-    // 5, 6 — FlipCoin's two payloads.
-    parsed.abilities.push(holder(Effect::FlipCoin {
+    // 5, 6 — FlipCoins' two payloads.
+    parsed.abilities.push(holder(Effect::FlipCoins {
+        flips: CoinFlipRun::single(),
         win_effect: Some(Box::new(refused())),
         lose_effect: Some(Box::new(refused())),
         flipper: TargetFilter::Controller,
@@ -30042,7 +30096,8 @@ fn demote_net_reaches_every_ability_carrier() {
     // red before these four existed.
     fn refused_cost() -> crate::types::ability::AbilityCost {
         crate::types::ability::AbilityCost::EffectCost {
-            effect: Box::new(Effect::FlipCoin {
+            effect: Box::new(Effect::FlipCoins {
+                flips: CoinFlipRun::single(),
                 win_effect: Some(Box::new(refused())),
                 lose_effect: None,
                 flipper: TargetFilter::Controller,
@@ -31451,8 +31506,7 @@ fn render_net_effect_carrier_census() {
         "CreatePlaneswalkReplacement",
         "EachPlayerCopyChosen",
         "ExileResolvingSpellInsteadOfGraveyard",
-        "FlipCoin",
-        "FlipCoinUntilLose",
+        "ExileTopCardContest",
         "FlipCoins",
         "GenericEffect",
         "GrantCastingPermission",
@@ -31695,7 +31749,10 @@ fn render_net_reaches_every_nested_description_carrier() {
     parsed
         .abilities
         .push(carrier(Effect::AddPendingEntersModifications {
-            modifications: vec![granted("add_pending_enters")],
+            rider: crate::types::ability::PendingEntersModifications {
+                modifications: vec![granted("add_pending_enters")],
+                cast_filter: None,
+            },
         }));
     tags.push("add_pending_enters");
 
@@ -31836,7 +31893,8 @@ fn render_net_reaches_every_nested_description_carrier() {
         }));
     tags.push("exiled_spell_rider");
 
-    parsed.abilities.push(carrier(Effect::FlipCoin {
+    parsed.abilities.push(carrier(Effect::FlipCoins {
+        flips: CoinFlipRun::single(),
         win_effect: Some(Box::new(ability("flip_coin_win"))),
         lose_effect: Some(Box::new(ability("flip_coin_lose"))),
         flipper: TargetFilter::Controller,
@@ -31844,15 +31902,20 @@ fn render_net_reaches_every_nested_description_carrier() {
     tags.extend(["flip_coin_win", "flip_coin_lose"]);
 
     parsed.abilities.push(carrier(Effect::FlipCoins {
-        count: QuantityExpr::Fixed { value: 2 },
+        flips: CoinFlipRun::Exactly {
+            count: QuantityExpr::Fixed { value: 2 },
+        },
         win_effect: Some(Box::new(ability("flip_coins_win"))),
         lose_effect: Some(Box::new(ability("flip_coins_lose"))),
         flipper: TargetFilter::Controller,
     }));
     tags.extend(["flip_coins_win", "flip_coins_lose"]);
 
-    parsed.abilities.push(carrier(Effect::FlipCoinUntilLose {
-        win_effect: Box::new(ability("flip_until_lose")),
+    parsed.abilities.push(carrier(Effect::FlipCoins {
+        flips: CoinFlipRun::UntilLoss,
+        win_effect: Some(Box::new(ability("flip_until_lose"))),
+        lose_effect: None,
+        flipper: TargetFilter::Controller,
     }));
     tags.push("flip_until_lose");
 
@@ -31883,7 +31946,10 @@ fn render_net_reaches_every_nested_description_carrier() {
                 duration: None,
                 graveyard_replacement: None,
                 enters_with_counter: None,
-                enters_with_modifications: vec![granted("grant_casting_permission")],
+                enters_with_modifications: crate::types::ability::PendingEntersModifications {
+                    modifications: vec![granted("grant_casting_permission")],
+                    cast_filter: None,
+                },
                 mana_spend_permission: None,
                 cast_cost_modifier: None,
             },
@@ -31940,6 +32006,11 @@ fn render_net_reaches_every_nested_description_carrier() {
         unchosen_pile_effect: Some(Box::new(ability("piles_unchosen"))),
     }));
     tags.extend(["piles_chosen", "piles_unchosen"]);
+
+    parsed.abilities.push(carrier(Effect::ExileTopCardContest {
+        winner_effect: Box::new(ability("contest_winner")),
+    }));
+    tags.push("contest_winner");
 
     let mut token_static = static_def("token_static");
     token_static.modifications.push(granted("token_static_mod"));
@@ -32102,7 +32173,10 @@ fn guard_walk_reaches_every_continuous_modification_carrier() {
         (
             "AddPendingEntersModifications.modifications",
             Effect::AddPendingEntersModifications {
-                modifications: vec![marked()],
+                rider: crate::types::ability::PendingEntersModifications {
+                    modifications: vec![marked()],
+                    cast_filter: None,
+                },
             },
         ),
         (
@@ -32130,7 +32204,10 @@ fn guard_walk_reaches_every_continuous_modification_carrier() {
                     duration: None,
                     graveyard_replacement: None,
                     enters_with_counter: None,
-                    enters_with_modifications: vec![marked()],
+                    enters_with_modifications: crate::types::ability::PendingEntersModifications {
+                        modifications: vec![marked()],
+                        cast_filter: None,
+                    },
                     mana_spend_permission: None,
                     cast_cost_modifier: None,
                 },
@@ -34019,11 +34096,15 @@ fn phylactery_lich_as_enters_object_effect_body_keeps_prior_shape() {
 }
 
 /// The static-shaped routing site runs before Priority 8. Static-shaped frame
-/// lines that a Priority-8 arm claims today (Thief of Blood's population
-/// counter removal, Arsenal Thresher's optional reveal) are declined by the
-/// gate and keep their Priority-8 replacement.
+/// lines (Thief of Blood's population counter removal, Arsenal Thresher's
+/// optional reveal) are declined by the one-shot gate and reach Priority 8.
+/// CR 614.1c + CR 608.2c: there the frame's instruction and the source
+/// enters-with sentence are two instructions; one replacement cannot carry
+/// both, and the counter count depends on the frame's result ("removed this
+/// way" / "revealed this way"), so the whole line is one `enters_with_clause`
+/// gap, never a counter replacement that drops the frame's instruction.
 #[test]
-fn static_shaped_as_enters_lines_keep_priority_eight_replacement() {
+fn static_shaped_as_enters_lines_are_one_enters_with_clause_gap() {
     for (name, oracle, line, description, keywords, types, subtypes) in [
         (
             "Thief of Blood",
@@ -34045,20 +34126,22 @@ fn static_shaped_as_enters_lines_keep_priority_eight_replacement() {
         ),
     ] {
         let parsed = parse_oracle_text(oracle, name, &keywords, &types, &subtypes);
-        let moved: Vec<&ReplacementDefinition> = parsed
-            .replacements
-            .iter()
-            .filter(|repl| repl.event == ReplacementEvent::Moved)
-            .collect();
-        assert_eq!(moved.len(), 1, "{name}: {:?}", parsed.replacements);
-        assert_eq!(moved[0].description.as_deref(), Some(description), "{name}");
         assert!(
-            matches!(
-                moved[0].execute.as_deref().map(|e| &*e.effect),
-                Some(Effect::PutCounter { .. })
-            ),
-            "{name}: {:?}",
-            moved[0].execute
+            parsed
+                .replacements
+                .iter()
+                .all(|repl| repl.event != ReplacementEvent::Moved),
+            "{name}: no replacement may carry half of the line, got {:?}",
+            parsed.replacements
+        );
+        assert!(
+            parsed.abilities.iter().any(|ability| matches!(
+                &*ability.effect,
+                Effect::Unimplemented { name, description: Some(text) }
+                    if name == "enters_with_clause" && text == description
+            )),
+            "{name}: the whole line is one enters_with_clause gap, got {:?}",
+            parsed.abilities
         );
         // Reach-guard: the static-shaped routing site sees the frame and the gate declines the body.
         assert!(
@@ -34071,6 +34154,207 @@ fn static_shaped_as_enters_lines_keep_priority_eight_replacement() {
         );
         assert!(parse_as_enters_one_shot_replacement(AS_ENTERS_LOSE_TWO, name).is_some());
     }
+}
+
+/// CR 614.1c + CR 608.2c: Power Level Analyzer's as-enters choice line carries
+/// a source enters-with sentence (and an "instead" override) beside the choice.
+/// One replacement cannot carry them all, so the whole line is one
+/// `enters_with_clause` gap — never a `Choose` replacement that drops the
+/// counters (issue #9993). Oracle text verbatim (Scryfall / AtomicCards).
+#[test]
+fn as_enters_choose_line_with_source_enters_with_sentence_is_one_enters_with_clause_gap() {
+    use crate::game::coverage::{card_face_gaps, card_face_has_unimplemented_parts};
+    use crate::types::card::CardFace;
+
+    const NAME: &str = "Power Level Analyzer";
+    const ORACLE: &str = "As Power Level Analyzer enters the battlefield, you and target opponent each secretly choose a number between 1 and 10, then reveal. Power Level Analyzer enters with a number of +1/+1 counters equal to the distance between the two numbers. If both players chose the same number, put seven +1/+1 counters on Power Level Analyzer instead.";
+    const NORMALIZED: &str = "As ~ enters the battlefield, you and target opponent each secretly choose a number between 1 and 10, then reveal. ~ enters with a number of +1/+1 counters equal to the distance between the two numbers. If both players chose the same number, put seven +1/+1 counters on ~ instead.";
+    const FIRST_SENTENCE: &str = "As Power Level Analyzer enters the battlefield, you and target opponent each secretly choose a number between 1 and 10, then reveal.";
+
+    let parsed = parse(ORACLE, NAME, &[], &["Artifact", "Creature"], &["Construct"]);
+    // (1) Negative, revert-failing: no replacement carries part of the line.
+    assert!(parsed.replacements.is_empty(), "{:?}", parsed.replacements);
+    // (2) Positive: the whole line is exactly one enters_with_clause gap.
+    assert_eq!(parsed.abilities.len(), 1, "{:?}", parsed.abilities);
+    assert!(
+        matches!(
+            &*parsed.abilities[0].effect,
+            Effect::Unimplemented { name, description: Some(text) }
+                if name == "enters_with_clause" && text == NORMALIZED
+        ),
+        "the whole line is the gap, got {:?}",
+        parsed.abilities
+    );
+    assert!(parsed.triggers.is_empty(), "{:?}", parsed.triggers);
+    assert!(parsed.statics.is_empty(), "{:?}", parsed.statics);
+    // (3) Coverage honesty: the card face reports the AST gap.
+    let face = CardFace {
+        name: NAME.to_string(),
+        abilities: parsed.abilities.clone(),
+        triggers: parsed.triggers.clone(),
+        static_abilities: parsed.statics.clone(),
+        replacements: parsed.replacements.clone(),
+        ..CardFace::default()
+    };
+    assert!(card_face_has_unimplemented_parts(&face));
+    assert!(
+        card_face_gaps(&face)
+            .iter()
+            .any(|g| g == "Effect:enters_with_clause"),
+        "{:?}",
+        card_face_gaps(&face)
+    );
+    // Reach guards for (1): the gap authority owns the line, and the
+    // as-enters choose arm is live — it still claims the choice sentence alone,
+    // so (1) is not satisfied by a broken arm.
+    assert_eq!(
+        enters_with_fails_closed(ORACLE, NAME),
+        Some(EntersWithGap::Clause)
+    );
+    let choice = parse_replacement_line(FIRST_SENTENCE, NAME)
+        .expect("the choice sentence alone is still an as-enters choose replacement");
+    assert_eq!(choice.event, ReplacementEvent::Moved);
+    assert!(
+        matches!(
+            &*choice.execute.as_ref().expect("execute").effect,
+            Effect::Choose {
+                choice_type: ChoiceType::NumberRange {
+                    min: 1,
+                    max: Some(10),
+                    ..
+                },
+                persist: true,
+                ..
+            }
+        ),
+        "{:?}",
+        choice.execute
+    );
+}
+
+/// CR 614.1c + CR 608.2c: Gluttonous Hellkite's trigger-prefixed line (the
+/// Priority 5-pre route) prints the trigger's own instruction and a source
+/// enters-with sentence whose count depends on it ("sacrificed this way"). One
+/// replacement cannot carry both, so the whole line is one `enters_with_clause`
+/// gap rather than a cast trigger whose body silently carries the replacement's
+/// sentence.
+#[test]
+fn trigger_prefixed_enters_with_sentence_is_one_enters_with_clause_gap() {
+    let oracle = "When you cast this spell, each player sacrifices X creatures. This creature enters with two +1/+1 counters on it for each creature sacrificed this way.\nFlying, trample";
+    let line = "When you cast this spell, each player sacrifices X creatures. This creature enters with two +1/+1 counters on it for each creature sacrificed this way.";
+    let description = "When you cast this spell, each player sacrifices X creatures. ~ enters with two +1/+1 counters on it for each creature sacrificed this way.";
+    let parsed = parse_oracle_text(
+        oracle,
+        "Gluttonous Hellkite",
+        &["Flying".into(), "Trample".into()],
+        &["Creature".into()],
+        &["Dragon".into()],
+    );
+    let gaps: Vec<&AbilityDefinition> = parsed
+        .abilities
+        .iter()
+        .filter(|ability| {
+            matches!(
+                &*ability.effect,
+                Effect::Unimplemented { name, .. } if name == "enters_with_clause"
+            )
+        })
+        .collect();
+    assert_eq!(gaps.len(), 1, "{:?}", parsed.abilities);
+    assert!(
+        matches!(
+            &*gaps[0].effect,
+            Effect::Unimplemented { description: Some(text), .. } if text == description
+        ),
+        "the whole line is the gap, got {:?}",
+        gaps[0]
+    );
+    assert!(parsed.replacements.is_empty(), "{:?}", parsed.replacements);
+    assert!(
+        parsed.triggers.is_empty(),
+        "no trigger may carry the enters-with sentence, got {:?}",
+        parsed.triggers
+    );
+    // Reach guards: the enters-with parser fails the line closed with `Clause`,
+    // and the keyword line beside it still parses.
+    assert_eq!(
+        enters_with_fails_closed(line, "Gluttonous Hellkite"),
+        Some(EntersWithGap::Clause)
+    );
+    assert_eq!(parsed.abilities.len(), 1, "{:?}", parsed.abilities);
+    assert!(
+        parsed
+            .extracted_keywords
+            .iter()
+            .any(|keyword| matches!(keyword, Keyword::Flying))
+            && parsed
+                .extracted_keywords
+                .iter()
+                .any(|keyword| matches!(keyword, Keyword::Trample)),
+        "{:?}",
+        parsed.extracted_keywords
+    );
+}
+
+/// CR 614.1c + CR 608.2c: a distributive for-each enters-with line (the
+/// Priority 7 route) the parser owns but cannot carry is one
+/// `enters_with_clause` gap; it does not fall to the static parser. Gev, Scaled
+/// Scorch's sentence beside an anthem sentence (synthetic) is the case the
+/// static parser would otherwise claim in part, keeping the anthem and dropping
+/// the enters-with sentence. A subject clause the typed filter cannot carry
+/// ("that was cast this turn", synthetic) lands on the same gap.
+#[test]
+fn for_each_enters_with_clause_line_is_one_enters_with_clause_gap() {
+    for line in [
+        "Other creatures you control enter with an additional +1/+1 counter on them for each opponent who lost life this turn. Creatures you control get +1/+1.",
+        "Each creature you control that was cast this turn enters with an additional +1/+1 counter on it for each creature you control.",
+    ] {
+        let parsed = parse_oracle_text(line, "Test Enchantment", &[], &["Enchantment".into()], &[]);
+        let gaps: Vec<&AbilityDefinition> = parsed
+            .abilities
+            .iter()
+            .filter(|ability| {
+                matches!(
+                    &*ability.effect,
+                    Effect::Unimplemented { name, description: Some(text) }
+                        if name == "enters_with_clause" && text == line
+                )
+            })
+            .collect();
+        assert_eq!(gaps.len(), 1, "{line:?}: {:?}", parsed.abilities);
+        assert_eq!(parsed.abilities.len(), 1, "{line:?}: {:?}", parsed.abilities);
+        assert!(parsed.statics.is_empty(), "{line:?}: {:?}", parsed.statics);
+        assert!(
+            parsed.replacements.iter().all(|repl| !matches!(
+                repl.event,
+                ReplacementEvent::Moved | ReplacementEvent::ChangeZone
+            )),
+            "{line:?}: {:?}",
+            parsed.replacements
+        );
+        // Reach guards: the line reaches the Priority 7 enters-with branch and
+        // fails closed with `Clause`.
+        assert!(
+            is_enters_with_counter_replacement_line(&line.to_lowercase()),
+            "{line:?}"
+        );
+        assert_eq!(
+            enters_with_fails_closed(line, "Test Enchantment"),
+            Some(EntersWithGap::Clause),
+            "{line:?}"
+        );
+    }
+    // Reach guard: the single-sentence twin stays claimed.
+    let twin = parse_oracle_text(
+        "Each other creature you control enters with an additional +1/+1 counter on it for each creature you control.",
+        "Test Enchantment",
+        &[],
+        &["Enchantment".into()],
+        &[],
+    );
+    assert_eq!(twin.replacements.len(), 1, "{twin:?}");
+    assert_eq!(twin.replacements[0].event, ReplacementEvent::ChangeZone);
+    assert!(twin.abilities.is_empty(), "{:?}", twin.abilities);
 }
 
 /// Admitted class face (CR 614.1c + CR 603.6d + CR 119.3): Lich's "As this
