@@ -746,6 +746,10 @@ pub(crate) fn apply_copy_token_after_replacement_with_created_ids(
         donor,
     } = copy;
     let name = values.name.clone();
+    // CR 508.4: a resume carries the earlier ids so they are republished, but a
+    // token's destination is selected by its ordinal among the tokens this call
+    // creates, so the carried ids do not shift it.
+    let prefix_len = initial_created_ids.len();
     let mut created_ids = initial_created_ids;
     created_ids.reserve(final_count as usize);
     if let Some(loyalty) = copy_starting_loyalty_override(&additional_modifications) {
@@ -793,7 +797,7 @@ pub(crate) fn apply_copy_token_after_replacement_with_created_ids(
     for index in 0..final_count {
         // CR 508.4: this token's own destination, selected by its creation
         // ordinal within the batch.
-        let attack_destination = attack_request.for_entrant(created_ids.len());
+        let attack_destination = attack_request.for_entrant(created_ids.len() - prefix_len);
         if liminal_immediate {
             let (token_id, mut token) =
                 super::token::reserve_liminal_token_object(state, token_owner, name.clone());
@@ -975,7 +979,8 @@ pub(crate) fn apply_copy_token_after_replacement_with_created_ids(
         // tokens from zero, so its request starts past the tokens created so
         // far, this one included.
         let mut resume_copy = copy_spec.clone();
-        resume_copy.attack_request = attack_request.after_entrants(created_ids.len() + 1);
+        resume_copy.attack_request =
+            attack_request.after_entrants(created_ids.len() - prefix_len + 1);
         let tail = CopyTokenEntryTail {
             owner: token_owner,
             copy: resume_copy,
