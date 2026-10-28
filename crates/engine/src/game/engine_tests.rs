@@ -679,6 +679,7 @@ fn shigeki_channel_x_zero_resolves_from_stack_without_zone_choice() {
         GameAction::ActivateAbility {
             source_id: shigeki,
             ability_index: 1,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -796,6 +797,7 @@ fn eldrazi_temple_restricted_mana_casts_kindred_eldrazi_spell_only() {
         GameAction::ActivateAbility {
             source_id: temple,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -879,6 +881,7 @@ fn eldrazi_temple_restricted_mana_casts_kindred_eldrazi_spell_only() {
         GameAction::ActivateAbility {
             source_id: temple,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -1751,6 +1754,7 @@ fn broadside_bombardiers_boast_activates_after_attacking_and_requires_sacrifice(
         GameAction::ActivateAbility {
             source_id: bombardiers,
             ability_index,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -2325,10 +2329,7 @@ fn an_ordinary_permanent_copying_a_room_gains_its_door_gated_form() {
             TargetFilter::SpecificObject { id: bear },
             vec![crate::types::ability::ContinuousModification::CopyValues {
                 values: Box::new(values),
-                display_source: crate::game::game_object::DisplaySource::Card,
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: Default::default(),
             }],
             None,
         )
@@ -2437,10 +2438,7 @@ fn a_room_under_a_copy_effect_shows_the_copied_rooms_halves() {
             TargetFilter::SpecificObject { id: room },
             vec![crate::types::ability::ContinuousModification::CopyValues {
                 values: Box::new(values),
-                display_source: crate::game::game_object::DisplaySource::Card,
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: Default::default(),
             }],
             None,
         )
@@ -2502,10 +2500,7 @@ fn a_copy_of_an_already_copied_room_snapshots_the_copied_halves() {
             TargetFilter::SpecificObject { id: bear },
             vec![crate::types::ability::ContinuousModification::CopyValues {
                 values: Box::new(values),
-                display_source: crate::game::game_object::DisplaySource::Card,
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: Default::default(),
             }],
             None,
         )
@@ -2559,10 +2554,7 @@ fn a_set_name_exception_survives_the_room_name_derivation() {
         vec![
             crate::types::ability::ContinuousModification::CopyValues {
                 values: Box::new(values),
-                display_source: crate::game::game_object::DisplaySource::Card,
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: Default::default(),
             },
             // CR 707.9b: the "except its name is X" rider follows CopyValues
             // within the same effect, exactly as production installs it.
@@ -2623,10 +2615,7 @@ fn a_set_name_exception_survives_the_room_name_derivation() {
             TargetFilter::SpecificObject { id: bear2 },
             vec![crate::types::ability::ContinuousModification::CopyValues {
                 values: Box::new(chained),
-                display_source: crate::game::game_object::DisplaySource::Card,
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: Default::default(),
             }],
             None,
         )
@@ -2649,10 +2638,7 @@ fn a_set_name_exception_survives_the_room_name_derivation() {
             TargetFilter::SpecificObject { id: bear },
             vec![crate::types::ability::ContinuousModification::CopyValues {
                 values: Box::new(plain),
-                display_source: crate::game::game_object::DisplaySource::Card,
-                printed_ref: None,
-                token_image_ref: None,
-                token_art: None,
+                display: Default::default(),
             }],
             None,
         )
@@ -3133,8 +3119,8 @@ fn a_room_cast_from_exile_offers_the_face_choice_per_cast() {
 /// IS eligible. Before this fix the unlock cost paid via
 /// `PaymentContext::Effect`, which rejects every restriction — the restricted
 /// {R} could not pay and the unlock failed. Reverting the
-/// `pay_special_action_mana_cost` wiring flips this assertion (the unlock
-/// would error "Cannot pay mana cost").
+/// `pay_special_action_mana_cost_with_resume` wiring flips this assertion (the
+/// unlock would error "Cannot pay mana cost").
 #[test]
 fn unlock_door_restricted_mana_pays_room_unlock_cost() {
     use crate::types::mana::{ManaRestriction, ManaType, ManaUnit, SpecialAction};
@@ -3231,7 +3217,7 @@ fn setup_face_down_morph(state: &mut GameState, player: PlayerId) -> ObjectId {
         };
         obj.power = Some(4);
         obj.toughness = Some(5);
-        obj.keywords = vec![crate::types::keywords::Keyword::Morph(ManaCost::Cost {
+        obj.keywords = vec![crate::types::keywords::Keyword::morph(ManaCost::Cost {
             generic: 3,
             shards: vec![],
         })];
@@ -3271,7 +3257,8 @@ fn fund_restricted_pool(
 /// is paid through `PaymentContext::SpecialAction(TurnFaceUp)`, the permanent
 /// flips face up, a `TurnedFaceUp` event fires, and the pool empties. This is the
 /// positive reach-guard proving the payment routes through the real
-/// `pay_special_action_mana_cost` site, so R2/R3's negatives aren't vacuous.
+/// `pay_special_action_mana_cost_with_resume` site, so R2/R3's negatives aren't
+/// vacuous.
 #[test]
 fn turn_face_up_restricted_mana_funds_special_action() {
     use crate::types::mana::{ManaRestriction, SpecialAction};
@@ -5055,6 +5042,7 @@ fn black_dragon_gate_tap_offers_fixed_black_or_chosen_color() {
         GameAction::ActivateAbility {
             source_id: gate,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -7207,6 +7195,7 @@ fn multi_mana_land_activates_via_ability_index() {
         GameAction::ActivateAbility {
             source_id: dual_id,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -7272,6 +7261,7 @@ fn multi_mana_land_undoable_after_activate_ability() {
         GameAction::ActivateAbility {
             source_id: dual_id,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -7321,6 +7311,7 @@ fn controller_harming_mana_land_is_not_undoable_after_manual_activation() {
         GameAction::ActivateAbility {
             source_id: brushland,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -7449,6 +7440,7 @@ fn utopia_sprawl_on_forest_taps_for_both_base_and_additional_mana_inline() {
         GameAction::ActivateAbility {
             source_id: forest,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .expect("Forest mana ability should activate");
@@ -7817,6 +7809,7 @@ fn brainstorm_resolves_draw_then_put_two_cards_on_top() {
             ),
             count: QuantityExpr::Fixed { value: 2 },
             position: LibraryPosition::Top,
+            arranger: None,
         },
     )));
     {
@@ -9256,6 +9249,7 @@ fn test_mana_ability_during_priority_does_not_push_stack() {
         GameAction::ActivateAbility {
             source_id: obj_id,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -9329,6 +9323,9 @@ fn test_mana_ability_during_mana_payment_stays_in_mana_payment() {
         deferred_target_selection: false,
         chosen_modes: Vec::new(),
         additional_cost_decided: false,
+        keyword_queue_before_targets: false,
+        alternative_cost_election:
+            crate::types::game_state::SpellAlternativeCostElection::Undecided,
         declared_kickers_to_pay: Vec::new(),
         declined_kickers: Vec::new(),
         convoked_creatures: Vec::new(),
@@ -9343,6 +9340,7 @@ fn test_mana_ability_during_mana_payment_stays_in_mana_payment() {
         activation_cost_committed: false,
         alt_cost_grant_source: None,
         activation_trigger_collection: None,
+        activation_phyrexian_intent: None,
     }));
     state.waiting_for = WaitingFor::ManaPayment {
         player: PlayerId(0),
@@ -9417,6 +9415,7 @@ fn test_mana_ability_during_mana_payment_stays_in_mana_payment() {
         GameAction::ActivateAbility {
             source_id: obj_id,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -9512,6 +9511,7 @@ fn springleaf_drum_prompts_for_creature_then_adds_mana() {
         GameAction::ActivateAbility {
             source_id: drum,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -9666,6 +9666,7 @@ fn taps_for_mana_multiplier_fires_once_on_color_choice_priority_resume() {
         GameAction::ActivateAbility {
             source_id: any_color,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -9771,6 +9772,9 @@ fn taps_for_mana_multiplier_fires_once_on_color_choice_mana_payment_resume() {
         deferred_target_selection: false,
         chosen_modes: Vec::new(),
         additional_cost_decided: false,
+        keyword_queue_before_targets: false,
+        alternative_cost_election:
+            crate::types::game_state::SpellAlternativeCostElection::Undecided,
         declared_kickers_to_pay: Vec::new(),
         declined_kickers: Vec::new(),
         convoked_creatures: Vec::new(),
@@ -9785,6 +9789,7 @@ fn taps_for_mana_multiplier_fires_once_on_color_choice_mana_payment_resume() {
         activation_cost_committed: false,
         alt_cost_grant_source: None,
         activation_trigger_collection: None,
+        activation_phyrexian_intent: None,
     }));
     state.waiting_for = WaitingFor::ManaPayment {
         player: PlayerId(0),
@@ -9863,6 +9868,7 @@ fn taps_for_mana_multiplier_fires_once_on_color_choice_mana_payment_resume() {
         GameAction::ActivateAbility {
             source_id: any_color,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -10126,6 +10132,7 @@ fn non_mana_activation_tap_creatures_cost_prompts_then_pays() {
         GameAction::ActivateAbility {
             source_id: lathril,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap();
@@ -10217,6 +10224,7 @@ fn non_mana_activation_tap_creatures_cost_rejects_tapped_source_before_prompt() 
         GameAction::ActivateAbility {
             source_id: source,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     )
     .unwrap_err();
@@ -11283,7 +11291,7 @@ fn morph_creature_offers_face_down_alternative_cast() {
     let morph = add_face_down_castable_to_hand(
         &mut state,
         PlayerId(0),
-        crate::types::keywords::Keyword::Morph(ManaCost::generic(4)),
+        crate::types::keywords::Keyword::morph(ManaCost::generic(4)),
         ManaCost::generic(5),
     );
     add_mana(&mut state, PlayerId(0), ManaType::Colorless, 5);
@@ -11369,7 +11377,7 @@ fn face_down_cast_puts_blank_2_2_on_stack() {
     let morph = add_face_down_castable_to_hand(
         &mut state,
         PlayerId(0),
-        crate::types::keywords::Keyword::Morph(ManaCost::generic(4)),
+        crate::types::keywords::Keyword::morph(ManaCost::generic(4)),
         ManaCost::generic(5),
     );
     add_mana(&mut state, PlayerId(0), ManaType::Colorless, 5);
@@ -11440,7 +11448,7 @@ fn face_down_cast_resolves_to_face_down_permanent() {
     let morph = add_face_down_castable_to_hand(
         &mut state,
         PlayerId(0),
-        crate::types::keywords::Keyword::Morph(ManaCost::generic(4)),
+        crate::types::keywords::Keyword::morph(ManaCost::generic(4)),
         ManaCost::generic(5),
     );
     add_mana(&mut state, PlayerId(0), ManaType::Colorless, 5);
@@ -11502,7 +11510,7 @@ fn tin_street_gossip_restricted_mana_funds_face_down_cast() {
     let morph = add_face_down_castable_to_hand(
         &mut state,
         PlayerId(0),
-        crate::types::keywords::Keyword::Morph(ManaCost::generic(4)),
+        crate::types::keywords::Keyword::morph(ManaCost::generic(4)),
         ManaCost::generic(5),
     );
     fund_restricted_pool(
@@ -11586,7 +11594,7 @@ fn disguise_face_down_has_ward_morph_does_not() {
         "CR 702.168a: a disguise face-down 2/2 must have ward {{2}}"
     );
     assert!(
-        !cast_face_down(crate::types::keywords::Keyword::Morph(ManaCost::generic(4))),
+        !cast_face_down(crate::types::keywords::Keyword::morph(ManaCost::generic(4))),
         "a morph face-down 2/2 must NOT have ward"
     );
 }
@@ -11601,7 +11609,7 @@ fn countered_face_down_spell_is_revealed_in_graveyard() {
     let morph = add_face_down_castable_to_hand(
         &mut state,
         PlayerId(0),
-        crate::types::keywords::Keyword::Morph(ManaCost::generic(4)),
+        crate::types::keywords::Keyword::morph(ManaCost::generic(4)),
         ManaCost::generic(5),
     );
     add_mana(&mut state, PlayerId(0), ManaType::Colorless, 5);
@@ -11660,7 +11668,7 @@ fn face_down_spell_on_stack_is_redacted_to_opponents() {
     let morph = add_face_down_castable_to_hand(
         &mut state,
         PlayerId(0),
-        crate::types::keywords::Keyword::Morph(ManaCost::generic(4)),
+        crate::types::keywords::Keyword::morph(ManaCost::generic(4)),
         ManaCost::generic(5),
     );
     add_mana(&mut state, PlayerId(0), ManaType::Colorless, 5);
@@ -11764,7 +11772,7 @@ fn morph_creature_in_graveyard_offers_and_casts_face_down() {
     let morph = add_face_down_castable_to_hand(
         &mut state,
         PlayerId(0),
-        crate::types::keywords::Keyword::Morph(ManaCost::generic(4)),
+        crate::types::keywords::Keyword::morph(ManaCost::generic(4)),
         ManaCost::generic(5),
     );
     grant_graveyard_creature_cast_and_bury(&mut state, PlayerId(0), morph);
@@ -11904,7 +11912,7 @@ fn face_down_cast_cancel_at_mana_payment_restores_real_card() {
     let morph = add_face_down_castable_to_hand(
         &mut state,
         PlayerId(0),
-        crate::types::keywords::Keyword::Morph(ManaCost::generic(4)),
+        crate::types::keywords::Keyword::morph(ManaCost::generic(4)),
         ManaCost::generic(5),
     );
     add_mana(&mut state, PlayerId(0), ManaType::Colorless, 5);
@@ -11993,7 +12001,7 @@ fn morph_free_normal_cast_not_robbed_by_face_down_autoroute() {
     let morph = add_face_down_castable_to_hand(
         &mut state,
         PlayerId(0),
-        crate::types::keywords::Keyword::Morph(ManaCost::generic(4)),
+        crate::types::keywords::Keyword::morph(ManaCost::generic(4)),
         ManaCost::generic(5),
     );
     add_mana(&mut state, PlayerId(0), ManaType::Colorless, 3);
@@ -12089,7 +12097,7 @@ fn nocost_morph_auto_casts_face_down_for_three() {
     let morph = add_face_down_castable_to_hand(
         &mut state,
         PlayerId(0),
-        crate::types::keywords::Keyword::Morph(ManaCost::generic(4)),
+        crate::types::keywords::Keyword::morph(ManaCost::generic(4)),
         ManaCost::NoCost,
     );
     add_mana(&mut state, PlayerId(0), ManaType::Colorless, 3);
@@ -12182,7 +12190,7 @@ fn nocost_morph_without_three_mana_rejected() {
     let morph = add_face_down_castable_to_hand(
         &mut state,
         PlayerId(0),
-        crate::types::keywords::Keyword::Morph(ManaCost::generic(4)),
+        crate::types::keywords::Keyword::morph(ManaCost::generic(4)),
         ManaCost::NoCost,
     );
     add_mana(&mut state, PlayerId(0), ManaType::Colorless, 2);
@@ -12218,7 +12226,7 @@ fn nocost_morph_offered_as_legal_action() {
     let morph = add_face_down_castable_to_hand(
         &mut state,
         PlayerId(0),
-        crate::types::keywords::Keyword::Morph(ManaCost::generic(4)),
+        crate::types::keywords::Keyword::morph(ManaCost::generic(4)),
         ManaCost::NoCost,
     );
     add_mana(&mut state, PlayerId(0), ManaType::Colorless, 3);
@@ -12292,7 +12300,7 @@ fn prohibited_morph_fixture(axis: ProhibitionAxis, mana: usize) -> (GameState, O
     let morph = add_face_down_castable_to_hand(
         &mut state,
         PlayerId(0),
-        crate::types::keywords::Keyword::Morph(ManaCost::generic(4)),
+        crate::types::keywords::Keyword::morph(ManaCost::generic(4)),
         ManaCost::generic(5),
     );
     add_mana(&mut state, PlayerId(0), ManaType::Colorless, mana);
@@ -12489,7 +12497,7 @@ fn morph_casts_face_down_under_multiple_name_prohibitions() {
         let morph = add_face_down_castable_to_hand(
             &mut state,
             PlayerId(0),
-            crate::types::keywords::Keyword::Morph(ManaCost::generic(4)),
+            crate::types::keywords::Keyword::morph(ManaCost::generic(4)),
             ManaCost::generic(5),
         );
         add_mana(&mut state, PlayerId(0), ManaType::Colorless, 5);
@@ -12971,6 +12979,7 @@ fn a_reversed_activation_discards_its_lifecycle_frame() {
             GameAction::ActivateAbility {
                 source_id: source,
                 ability_index: 0,
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .expect("the activation reaches its election");
@@ -13010,4 +13019,220 @@ fn a_reversed_activation_discards_its_lifecycle_frame() {
         !reversed.has_outer_lifecycle_facts(),
         "a reversal must discard its lifecycle frame"
     );
+}
+
+// ---------------------------------------------------------------------------
+// CR 701.18b + CR 305.2a: playing a land during resolution
+// (`resolution_land_play_is_legal` / `play_land_during_resolution`)
+// ---------------------------------------------------------------------------
+
+/// P0's main phase with a NON-empty stack (the resolving ability's stand-in) and
+/// an exiled land owned by P0. The special action would refuse here (CR 305.1:
+/// empty stack); a play during resolution has no such gate.
+fn resolution_land_play_board() -> (GameState, ObjectId) {
+    let mut state = setup_game_at_main_phase();
+    state.stack.push_back(no_op_stack_entry(7_901, PlayerId(0)));
+    let land = create_object(
+        &mut state,
+        CardId(7_902),
+        PlayerId(0),
+        "Exiled Land".to_string(),
+        Zone::Exile,
+    );
+    let obj = state.objects.get_mut(&land).unwrap();
+    obj.card_types.core_types.push(CoreType::Land);
+    obj.base_card_types = obj.card_types.clone();
+    (state, land)
+}
+
+/// A1 — CR 305.2a + CR 116.2a + CR 110.2a: a land played during resolution enters
+/// from the zone it was in, under the player's control, and counts as the turn's
+/// land play.
+#[test]
+fn play_land_during_resolution_enters_from_exile_and_counts_the_play() {
+    let (mut state, land) = resolution_land_play_board();
+    assert!(
+        !state.stack.is_empty(),
+        "reach-guard: the stack is not empty"
+    );
+    assert!(resolution_land_play_is_legal(&state, PlayerId(0), land));
+    let mut events = Vec::new();
+    let commit = play_land_during_resolution(&mut state, PlayerId(0), land, &mut events);
+    assert_eq!(commit, Some(LandPlayCommit::Entered));
+    let obj = &state.objects[&land];
+    assert_eq!(obj.zone, Zone::Battlefield);
+    assert!(!obj.face_down);
+    assert_eq!(obj.controller, PlayerId(0));
+    assert_eq!(state.lands_played_this_turn, 1);
+    assert_eq!(state.players[0].lands_played_this_turn, 1);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        GameEvent::LandPlayed {
+            object_id,
+            player_id: PlayerId(0),
+            from_zone: Zone::Exile,
+        } if *object_id == land
+    )));
+}
+
+/// A2 — CR 305.2b: at the allowance the instruction is ignored; an additional
+/// land drop (CR 305.2) restores it.
+#[test]
+fn play_land_during_resolution_is_ignored_at_the_allowance() {
+    let (mut state, land) = resolution_land_play_board();
+    state.lands_played_this_turn = 1;
+    state.players[0].lands_played_this_turn = 1;
+    assert!(!resolution_land_play_is_legal(&state, PlayerId(0), land));
+    let mut events = Vec::new();
+    assert_eq!(
+        play_land_during_resolution(&mut state, PlayerId(0), land, &mut events),
+        None
+    );
+    assert_eq!(state.objects[&land].zone, Zone::Exile);
+    assert_eq!(state.lands_played_this_turn, 1);
+    assert!(events.is_empty());
+
+    // Hostile sibling: one additional land drop makes the same play legal.
+    let source = create_object(
+        &mut state,
+        CardId(7_903),
+        PlayerId(0),
+        "Extra Drop".to_string(),
+        Zone::Battlefield,
+    );
+    state
+        .objects
+        .get_mut(&source)
+        .unwrap()
+        .static_definitions
+        .push(StaticDefinition::new(StaticMode::AdditionalLandDrop {
+            count: 1,
+        }));
+    assert_eq!(
+        play_land_during_resolution(&mut state, PlayerId(0), land, &mut events),
+        Some(LandPlayCommit::Entered)
+    );
+    assert_eq!(state.objects[&land].zone, Zone::Battlefield);
+    assert_eq!(state.lands_played_this_turn, 2);
+}
+
+/// A3 — CR 305.3: a player can't play a land if it isn't their turn; CR 805.4c:
+/// a teammate may during the team's turn.
+#[test]
+fn play_land_during_resolution_requires_the_players_turn() {
+    let (mut state, land) = resolution_land_play_board();
+    state.active_player = PlayerId(1);
+    assert!(!resolution_land_play_is_legal(&state, PlayerId(0), land));
+    let mut events = Vec::new();
+    assert_eq!(
+        play_land_during_resolution(&mut state, PlayerId(0), land, &mut events),
+        None
+    );
+    assert_eq!(state.objects[&land].zone, Zone::Exile);
+    assert_eq!(state.lands_played_this_turn, 0);
+
+    // CR 805.4c: under shared team turns, with P0's teammate active, P0 may
+    // still play a land during the team's turn.
+    let mut team = GameState::new(FormatConfig::two_headed_giant(), 4, 42);
+    team.turn_number = 2;
+    team.phase = Phase::PreCombatMain;
+    let teammate = crate::game::topology::team_members(&team, PlayerId(0))
+        .into_iter()
+        .find(|member| *member != PlayerId(0))
+        .expect("P0 has a teammate under Two-Headed Giant");
+    team.active_player = teammate;
+    let team_land = create_object(
+        &mut team,
+        CardId(7_904),
+        PlayerId(0),
+        "Team Land".to_string(),
+        Zone::Exile,
+    );
+    team.objects
+        .get_mut(&team_land)
+        .unwrap()
+        .card_types
+        .core_types
+        .push(CoreType::Land);
+    assert!(resolution_land_play_is_legal(&team, PlayerId(0), team_land));
+}
+
+/// A4 — CR 305.2: a "can't play lands" static refuses the play during resolution.
+#[test]
+fn play_land_during_resolution_respects_cant_play_land() {
+    let (mut state, land) = resolution_land_play_board();
+    assert!(
+        resolution_land_play_is_legal(&state, PlayerId(0), land),
+        "reach-guard: legal before the static exists"
+    );
+    let source = create_object(
+        &mut state,
+        CardId(7_905),
+        PlayerId(0),
+        "Static Source".to_string(),
+        Zone::Battlefield,
+    );
+    state
+        .objects
+        .get_mut(&source)
+        .unwrap()
+        .static_definitions
+        .push(
+            StaticDefinition::new(StaticMode::Other("CantPlayLand".to_string())).affected(
+                TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::You)),
+            ),
+        );
+    assert!(!resolution_land_play_is_legal(&state, PlayerId(0), land));
+    let mut events = Vec::new();
+    assert_eq!(
+        play_land_during_resolution(&mut state, PlayerId(0), land, &mut events),
+        None
+    );
+    assert_eq!(state.objects[&land].zone, Zone::Exile);
+}
+
+/// A5 — CR 712.12: only a modal DFC whose back face is a land offers a land-face
+/// election; a transform DFC with a land back face does not (CR 712.8a).
+#[test]
+fn modal_land_face_election_requires_a_modal_land_back_face() {
+    use crate::types::card::LayoutKind;
+    let mut state = setup_game_at_main_phase();
+    let mut make = |front: CoreType, back: Option<(CoreType, LayoutKind)>| {
+        let id = create_object(
+            &mut state,
+            CardId(7_910),
+            PlayerId(0),
+            "Double Face".to_string(),
+            Zone::Exile,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(front);
+        obj.back_face = back.map(|(core, layout)| {
+            let mut card_types = CardType::default();
+            card_types.core_types.push(core);
+            BackFaceData {
+                name: "Back Face".to_string(),
+                card_types,
+                layout_kind: Some(layout),
+                ..Default::default()
+            }
+        });
+        obj.clone()
+    };
+    let spell_land = make(CoreType::Instant, Some((CoreType::Land, LayoutKind::Modal)));
+    let land_land = make(CoreType::Land, Some((CoreType::Land, LayoutKind::Modal)));
+    let transform_land = make(
+        CoreType::Enchantment,
+        Some((CoreType::Land, LayoutKind::Transform)),
+    );
+    let spell_spell = make(
+        CoreType::Sorcery,
+        Some((CoreType::Instant, LayoutKind::Modal)),
+    );
+    let single_land = make(CoreType::Land, None);
+    assert!(modal_land_face_election_available(&spell_land));
+    assert!(modal_land_face_election_available(&land_land));
+    assert!(!modal_land_face_election_available(&transform_land));
+    assert!(!modal_land_face_election_available(&spell_spell));
+    assert!(!modal_land_face_election_available(&single_land));
 }

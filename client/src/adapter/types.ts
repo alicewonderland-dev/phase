@@ -832,12 +832,20 @@ export type PayCostKind =
   | { type: "TapCreatures"; mode: TapCreaturesSelectionMode }
   | { type: "Behold"; action: "ChooseOrReveal" | "ExileChosen" };
 
-// CR 118.12 + CR 601.2b + CR 605.3b: resumption context after a `PayCost`
+// CR 118.12 + CR 601.2b + CR 605.3b + CR 702.37e: resumption context after a `PayCost`
 // choice. The frontend treats the inner pending payload as opaque pass-through.
 export type CostResume =
   | { type: "Spell"; Spell: PendingCast }
+  | { type: "SpellCost"; Spell: PendingCast; cost: unknown; source: "Other" | "Offering" | "Emerge" }
   | { type: "Resolution" }
-  | { type: "ManaAbility"; ManaAbility: unknown };
+  | { type: "ManaAbility"; ManaAbility: unknown }
+  | {
+      type: "TurnFaceUp";
+      source?: ObjectIncarnationRef;
+      object_id?: number;
+      cost_source: "Morph" | "Megamorph" | "Disguise" | "ManifestManaCost";
+      remaining_cost?: unknown;
+    };
 
 export type ManaColor = "White" | "Blue" | "Black" | "Red" | "Green";
 
@@ -948,7 +956,9 @@ export type SpecialAction =
   | "TurnFaceUp"
   | "RollPlanarDie"
   // CR 116.2c: pay a continuous effect's printed termination cost to end it.
-  | "EndContinuousEffect";
+  | "EndContinuousEffect"
+  // CR 116.2h: pay {2} to exile a card with foretell from hand face down.
+  | "Foretell";
 
 export type ManaRestriction =
   // "Spend this mana only to cast spells."
@@ -1528,9 +1538,12 @@ export type ChooseFromZoneConstraint =
   | { type: "DistinctCardTypes"; categories: string[] }
   | { type: "TotalManaValue"; comparator: string; value: number };
 
+// Mirrors Rust `SharedQualityRelation` (relation among the chosen cards).
+export type SharedQualityRelation = "Shares" | "DoesNotShare";
+
 export type SearchSelectionConstraint =
   | { type: "None" }
-  | { type: "DistinctQualities"; qualities: string[] }
+  | { type: "SharesQualities"; qualities: string[]; relation: SharedQualityRelation }
   | { type: "TotalManaValue"; comparator: string; value: number }
   | { type: "MatchEachFilter"; filters: TargetFilter[] };
 
@@ -2223,6 +2236,32 @@ export interface PendingCast {
   // `#[serde(default, skip_serializing_if = "Option::is_none")]` — absent for
   // spells and for activations that have not reached their fold.
   activation_cost_snapshot?: ActivationCostSnapshot;
+  // CR 107.4f + CR 118.13a + CR 601.2b + CR 601.2h: a manually paid
+  // activation's Phyrexian announcement and, once selected, its actual
+  // Phyrexian payment. Engine-authored and transported as is; the frontend
+  // derives nothing from it. `#[serde(default, skip_serializing_if =
+  // "Option::is_none")]` — absent for spells, automatic activations and a
+  // manual activation that has not reached its announcement.
+  activation_phyrexian_intent?: ActivationPhyrexianIntent;
+}
+
+/// CR 107.4f + CR 118.13a: how one Phyrexian-shaped symbol of an activation's
+/// mana cost is paid, keyed by its index in the activation's mana component and
+/// the raw printed symbol at that index.
+export interface ActivationShardChoice {
+  shard_index: number;
+  shard: ManaCostShard;
+  choice: ShardChoice;
+}
+
+/// CR 118.13a + CR 601.2b + CR 601.2h: the announcement (`native_choices`, bound
+/// while the activation is proposed) and the actual payment selections
+/// (`payment_choices`, bound when the locked total is paid). No permission is
+/// stored.
+export interface ActivationPhyrexianIntent {
+  native_choices: ActivationShardChoice[];
+  // `#[serde(default, skip_serializing_if = "Option::is_none")]`.
+  payment_choices?: ActivationShardChoice[];
 }
 
 /// CR 601.2f + CR 602.2b: every cost modifier that applied to one activation,
@@ -2729,7 +2768,7 @@ export type WaitingFor =
   | { type: "SpellbookDraft"; data: { player: PlayerId; source_id: ObjectId; options: string[]; destination: Zone; tapped?: boolean } }
   | { type: "DamageSourceChoice"; data: { player: PlayerId; source_filter: TargetFilter; options: ObjectId[] } }
   | { type: "ModeChoice"; data: { player: PlayerId; modal: ModalChoice; pending_cast: PendingCast; unavailable_modes?: number[] } }
-  | { type: "AbilityModeChoice"; data: { player: PlayerId; modal: ModalChoice; source_id: ObjectId; mode_abilities: unknown[]; is_activated: boolean; ability_index?: number; ability_cost?: unknown; activation_cost_snapshot?: ActivationCostSnapshot; unavailable_modes?: number[] } }
+  | { type: "AbilityModeChoice"; data: { player: PlayerId; modal: ModalChoice; source_id: ObjectId; mode_abilities: unknown[]; is_activated: boolean; ability_index?: number; ability_cost?: unknown; activation_cost_snapshot?: ActivationCostSnapshot; activation_payment_mode?: CastPaymentMode; unavailable_modes?: number[] } }
   | { type: "DiscardToHandSize"; data: { player: PlayerId; count: number; cards: ObjectId[] } }
   | { type: "OptionalCostChoice"; data: { player: PlayerId; cost: AdditionalCost; times_kicked: number; origin?: string; gift_kind?: { type: string }; pending_cast: PendingCast } }
   | { type: "CostTypeChoice"; data: { player: PlayerId; choice_type: string | Record<string, unknown>; options: string[]; pending_cast: PendingCast } }
@@ -2819,7 +2858,7 @@ export type WaitingFor =
   | { type: "CombatTaxPayment"; data: { player: PlayerId; context: CombatTaxContext; total_cost: ManaCost; per_creature: [ObjectId, ManaCost][]; pending: CombatTaxPending } }
   | { type: "UntapChoice"; data: { player: PlayerId; candidates: ObjectId[]; chosen_not_to_untap?: ObjectId[] } }
   | { type: "ChooseUntapSubset"; data: { player: PlayerId; group: ObjectId[]; max: number } }
-  | { type: "ExertChoice"; data: { player: PlayerId; attacker: ObjectId; remaining?: ObjectId[] } }
+  | { type: "ExertChoice"; data: { player: PlayerId; attacker: ObjectId; permission: TriggerDefinitionRef; remaining?: { attacker: ObjectId; permission: TriggerDefinitionRef }[] } }
   | { type: "EnlistChoice"; data: { player: PlayerId; attacker: ObjectId; eligible: ObjectId[]; remaining?: ObjectId[] } }
   | { type: "PhyrexianPayment"; data: { player: PlayerId; spell_object: ObjectId; shards: PhyrexianShard[] } }
   | { type: "AssignCombatDamage"; data: { player: PlayerId; attacker_id: ObjectId; total_damage: number; blockers: { blocker_id: ObjectId; lethal_minimum: number }[]; trample: TrampleKind | null; defending_player: PlayerId; attack_target: AttackTarget; pw_loyalty?: number; pw_controller?: PlayerId } }
@@ -2829,7 +2868,7 @@ export type WaitingFor =
   | { type: "AssignBlockerDamage"; data: { player: PlayerId; blocker_id: ObjectId; total_damage: number; attackers: ObjectId[] } }
   | { type: "DistributeAmong"; data: { player: PlayerId; total: number; targets: TargetRef[]; unit: DistributionUnit } }
   | { type: "MoveCountersDistribution"; data: { player: PlayerId; source_id: ObjectId; counter_type?: CounterType | null; available: [CounterType, number][]; destinations: ObjectId[]; pending_effect: unknown } }
-  | { type: "RemoveCountersChoice"; data: { player: PlayerId; source_id: ObjectId; counter_type?: CounterType | null; available: [CounterType, number][]; pending_effect: unknown } }
+  | { type: "RemoveCountersChoice"; data: { player: PlayerId; source_id: ObjectId; counter_type?: CounterType | null; available: [CounterType, number][]; max_total?: number | null; pending_effect: unknown } }
   | { type: "ChooseFromZoneChoice"; data: { player: PlayerId; cards: ObjectId[]; count: number; up_to?: boolean; constraint?: ChooseFromZoneConstraint | null; source_id: ObjectId; reciprocal_role?: "Produce" | "Consume" | null } }
   | { type: "BeholdChoice"; data: { player: PlayerId; choices: ObjectId[] } }
   | { type: "EmpowerJaceChoice"; data: { player: PlayerId; source_id: ObjectId; choices: ObjectId[]; count: number } }
@@ -2868,7 +2907,7 @@ export type WaitingFor =
   | { type: "ClashChooseOpponent"; data: { player: PlayerId; candidates: PlayerId[]; ability: unknown } }
   // CR 608.2d: "an opponent chooses" from a zone (multiplayer) — the controller
   // picks WHICH opponent makes the choice before the zone choice is presented.
-  | { type: "ChooseFromZoneOpponentChooser"; data: { player: PlayerId; candidates: PlayerId[]; ability: unknown; purpose?: "Ordinary" | "BindReciprocalConsume" | "PerPlayerChoiceOrder" | "SubstituteChooser" } }
+  | { type: "ChooseFromZoneOpponentChooser"; data: { player: PlayerId; candidates: PlayerId[]; ability: unknown; purpose?: "Ordinary" | "BindReciprocalConsume" | "PerPlayerChoiceOrder" | "SubstituteChooser" | "SubstituteArranger" } }
   | { type: "ChooseAnnouncingOpponent"; data: { player: PlayerId; candidates: PlayerId[]; choice_index: number; choice_count: number; target_type?: CoreType; pending_cast: unknown } }
   | { type: "ChooseGiftRecipient"; data: { player: PlayerId; candidates: PlayerId[]; gift_kind?: { type: string }; pending_cast: unknown } }
   | { type: "ClashCardPlacement"; data: { player: PlayerId; card: ObjectId; remaining: [PlayerId, ObjectId][]; bottom_cards?: ObjectId[] } }
@@ -3200,6 +3239,8 @@ export type DebugAction =
   | { type: "GrantKeyword"; data: { object_id: ObjectId; keyword: Keyword } }
   | { type: "RemoveKeyword"; data: { object_id: ObjectId; keyword: Keyword } }
   | { type: "SetLife"; data: { player_id: PlayerId; life: number } }
+  | { type: "GainLife"; data: { player_id: PlayerId; amount: number } }
+  | { type: "LoseLife"; data: { player_id: PlayerId; amount: number } }
   | { type: "ModifyPlayerCounters"; data: { player_id: PlayerId; counter_kind: PlayerCounterKind; delta: number } }
   | { type: "ModifyEnergy"; data: { player_id: PlayerId; delta: number } }
   | { type: "AddMana"; data: { player_id: PlayerId; mana: ManaType[] } }
@@ -3269,7 +3310,7 @@ export type GameAction =
   | { type: "PlayLand"; data: { object_id: ObjectId; card_id: CardId } }
   | { type: "CastSpell"; data: { object_id: ObjectId; card_id: CardId; targets: ObjectId[]; payment_mode?: CastPaymentMode } }
   | { type: "Foretell"; data: { object_id: ObjectId; card_id: CardId } }
-  | { type: "ActivateAbility"; data: { source_id: ObjectId; ability_index: number } }
+  | { type: "ActivateAbility"; data: { source_id: ObjectId; ability_index: number; payment_mode?: CastPaymentMode } }
   | { type: "DeclareAttackers"; data: { attacks: [ObjectId, AttackTarget][]; bands?: ObjectId[][] } }
   | { type: "DeclareBlockers"; data: { assignments: [ObjectId, ObjectId][] } }
   | { type: "MulliganDecision"; data: { choice: MulliganChoice } }
@@ -3509,8 +3550,8 @@ export type GameEvent =
   | { type: "XValueChosen"; data: { player: PlayerId; object_id: ObjectId; value: number } }
   // `kind` is the engine's activated-ability kind (CR 605.1a / 606.1); it is
   // omitted by legacy payloads, which mean "Normal". `departed_source_lki`,
-  // `trigger_state` and `stack_entry` are engine-internal trigger authority the
-  // UI never renders.
+  // `trigger_state`, `stack_entry` and `activation_cost` are engine-internal
+  // trigger authority the UI never renders.
   | { type: "AbilityActivated"; data: { player_id: PlayerId; source_id: ObjectId; kind?: ActivatedAbilityKind } }
   | { type: "ExhaustAbilityActivated"; data: { player_id: PlayerId; source_id: ObjectId; is_mana_ability: boolean } }
   // `from` is null for an object that enters from no zone (a created token).
@@ -3605,6 +3646,7 @@ export type GameEvent =
   | { type: "DungeonCompleted"; data: { player_id: PlayerId; dungeon: DungeonId } }
   | { type: "InitiativeTaken"; data: { player_id: PlayerId } }
   | { type: "CardPredicateGuessMade"; data: { player_id: PlayerId; source_id: ObjectId | null; choice: string } }
+  | { type: "CardNamed"; data: { player_id: PlayerId; source_id: ObjectId | null; name: string } }
   | { type: "DebugActionUsed"; data: { player_id: PlayerId; description: string } }
   | { type: "DebugPermissionGranted"; data: { host: PlayerId; player_id: PlayerId } }
   | { type: "DebugPermissionRevoked"; data: { host: PlayerId; player_id: PlayerId } }
@@ -4808,6 +4850,21 @@ export class AdapterError extends Error {
     this.recoverable = recoverable;
     this.panic = panic;
     this.rejection = rejection;
+  }
+}
+
+/**
+ * A browser's module map retains failed dynamic imports for the document
+ * lifetime. Retrying this requires a page reload, unlike WASM initialization
+ * and card-data loading failures.
+ */
+export class EngineModuleReloadRequiredError extends Error {
+  readonly cause: unknown;
+
+  constructor(cause: unknown) {
+    super("The engine module failed to load; reload the page to retry.");
+    this.name = "EngineModuleReloadRequiredError";
+    this.cause = cause;
   }
 }
 

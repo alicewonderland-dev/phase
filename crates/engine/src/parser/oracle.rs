@@ -3,26 +3,25 @@ use std::{borrow::Cow, ops::ControlFlow};
 use crate::parser::oracle_nom::error::{OracleError, OracleResult};
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till, take_until, take_while};
-use nom::character::complete::multispace0;
-use nom::combinator::{all_consuming, map, opt, value};
+use nom::character::complete::{anychar, multispace0};
+use nom::combinator::{all_consuming, map, not, opt, recognize, value};
+use nom::multi::{many1, separated_list1};
 use nom::sequence::{preceded, terminated};
 use nom::Parser;
 use serde::{Deserialize, Serialize};
 
-use crate::game::effects::cast_from_zone;
-use crate::game::filter::{
-    filter_contains_filter_prop, retarget_chosen_card_type_to_creature_type,
-};
 use crate::types::ability::{
-    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag,
-    ActivationManaPaymentRestriction, ActivationRestriction, AdditionalCost, CardPlayMode,
-    CastManaSpentMetric, CastTimingPermission, CastingPermission, CastingRestriction, ChoiceType,
-    ChosenSubtypeKind, ContinuousModification, ControllerRef, CostReduction, CounterSourceRider,
-    DamageRedirectTarget, DelayedTriggerCondition, Duration, Effect, EffectScope, FilterProp,
-    GuardReading, ManaProduction, ModalChoice, ParsedCondition, PlayerFilter, QuantityExpr,
-    QuantityRef, ReplacementDefinition, ReplacementMode, SolveCondition, SpellCastingOption,
-    StaticCondition, StaticDefinition, TapStateChange, TargetFilter, TriggerCondition,
-    TriggerDefinition, TypeFilter, TypedFilter, UnloweredGuard, VoteSubject,
+    filter_contains_filter_prop, graveyard_destination_rider, is_graveyard_exile_rider_subability,
+    retarget_chosen_card_type_to_creature_type, AbilityCondition, AbilityCost, AbilityDefinition,
+    AbilityKind, AbilityTag, ActivationManaPaymentRestriction, ActivationRestriction,
+    AdditionalCost, CardPlayMode, CastManaSpentMetric, CastTimingPermission, CastingPermission,
+    CastingRestriction, ChoiceType, ChosenSubtypeKind, ContinuousModification, ControllerRef,
+    CostReduction, CounterSourceRider, DamageRedirectTarget, DelayedTriggerCondition, Duration,
+    Effect, EffectScope, FilterProp, GuardReading, ManaProduction, ModalChoice, ParsedCondition,
+    PlayerFilter, QuantityExpr, QuantityRef, ReplacementDefinition, ReplacementMode,
+    SolveCondition, SpellCastingOption, StaticCondition, StaticDefinition, TapStateChange,
+    TargetFilter, TriggerCondition, TriggerDefinition, TypeFilter, TypedFilter, UnloweredGuard,
+    VoteSubject,
 };
 use crate::types::ability_visit::{
     granter_symbols, visit_ability_def_scoped, DefinitionNode, ResolutionScope,
@@ -40,7 +39,7 @@ use crate::types::triggers::TriggerMode;
 use crate::types::zones::Zone;
 
 use super::oracle_nom::bridge::{nom_on_lower, nom_parse_lower, split_once_on_lower};
-use super::oracle_nom::condition::parse_graveyard_keyword_grant_sentence;
+use super::oracle_nom::condition::{parse_graveyard_keyword_grant_sentence, parse_inner_condition};
 use super::oracle_nom::prevention::has_each_time_event_relative_prevention;
 use super::oracle_nom::primitives::{
     parse_number as nom_parse_number, parse_object_recipient_pronoun, parse_period_sentences,
@@ -78,8 +77,8 @@ use super::oracle_effect::sequence::try_parse_same_is_true_continuation;
 use super::oracle_effect::{
     ability_chain_grants_chosen_color_keyword, lower_ability_ir, parse_ability_ir_standalone,
     parse_ability_ir_with_context, parse_additional_cost_instead_condition_fragment,
-    parse_effect_chain, parse_effect_chain_with_context, parse_windowed_replacement_install_ir,
-    rewrite_condition_keyword, target_filter_controller_ref,
+    parse_effect_chain, parse_effect_chain_with_context, parse_phase_name_set,
+    parse_windowed_replacement_install_ir, rewrite_condition_keyword, target_filter_controller_ref,
     try_parse_temporal_delayed_trigger_ability,
 };
 use super::oracle_ir::ast::parsed_clause;
@@ -229,6 +228,30 @@ fn definition_grants_flashback(def: &AbilityDefinition) -> bool {
             .sub_ability
             .as_deref()
             .is_some_and(definition_grants_flashback)
+}
+
+pub(crate) fn parse_attack_exert_header(input: &str) -> OracleResult<'_, Option<StaticCondition>> {
+    let (input, condition) = opt(preceded(
+        tag("if "),
+        terminated(parse_inner_condition, tag(", ")),
+    ))
+    .parse(input)?;
+    let (input, _) = tag("you may exert ").parse(input)?;
+    let (input, _) = take_until(" as ").parse(input)?;
+    let (input, _) = tag(" as ").parse(input)?;
+    let (input, _) = alt((tag("it"), tag("he"), tag("she"), tag("they"))).parse(input)?;
+    let (input, _) = tag(" attacks").parse(input)?;
+    Ok((input, condition))
+}
+
+pub(crate) fn parse_unknown_conditioned_attack_exert_header(input: &str) -> OracleResult<'_, ()> {
+    let (input, _) = tag("if ").parse(input)?;
+    let (input, _) = take_until(", you may exert ").parse(input)?;
+    let (input, _) = tag(", you may exert ").parse(input)?;
+    let (input, _) = take_until(" as ").parse(input)?;
+    let (input, _) = tag(" as ").parse(input)?;
+    let (input, _) = alt((tag("it"), tag("he"), tag("she"), tag("they"))).parse(input)?;
+    value((), tag(" attacks")).parse(input)
 }
 
 fn parse_commander_permission_sentence(input: &str) -> nom::IResult<&str, (), OracleError<'_>> {
@@ -1678,6 +1701,7 @@ fn apply_self_replacement_override(
         let DocumentRelationIr::SelfReplacementOverride {
             base,
             override_item,
+            selector,
         } = relation
         else {
             continue;
@@ -1699,12 +1723,27 @@ fn apply_self_replacement_override(
         } else {
             base_pos
         };
-        let condition = override_def.condition.take().expect(
-            "self-replacement override relations are emitted only for conditioned abilities",
+        // CR 614.6 + CR 608.2c: a body condition the selector already states is
+        // the selector; any other stays on the body as its own guard.
+        let selector = match selector {
+            Some(selector) => {
+                if override_def.condition.as_ref().is_some_and(|condition| {
+                    merge_ability_condition(Some(selector.clone()), condition.clone()) == *selector
+                }) {
+                    override_def.condition = None;
+                }
+                selector.clone()
+            }
+            None => override_def.condition.take().expect(
+                "self-replacement override relations are emitted only for conditioned abilities",
+            ),
+        };
+        let mut override_def = crate::parser::oracle_effect::instead_override_definition(
+            override_def,
+            AbilityCondition::ConditionInstead {
+                inner: Box::new(selector),
+            },
         );
-        override_def.condition = Some(AbilityCondition::ConditionInstead {
-            inner: Box::new(condition),
-        });
         let base = &mut result.abilities[base_pos];
         // CR 614.15 + CR 111.1 + CR 608.2c: The override paragraph was lowered in
         // isolation (its own single-ability `defs` slice), so
@@ -1716,7 +1755,7 @@ fn apply_self_replacement_override(
         // hour — If you have 5 or less life, create five of those tokens
         // instead.").
         crate::parser::oracle_effect::lower::rewrite_those_tokens_from_antecedent(
-            &mut override_def.effect,
+            &mut crate::parser::oracle_effect::instead_override_body_mut(&mut override_def).effect,
             &base.effect,
         );
         override_def.else_ability = base.sub_ability.take();
@@ -3414,6 +3453,26 @@ fn strip_instead_clause(
             // chain parser to produce `AdditionalCostPaidInstead` on the sub-ability.
             let before_trim = before.original.trim().trim_end_matches('.');
             if !before_trim.contains('.') {
+                // CR 614.6 + CR 608.2c: a leading "if [condition], " is the selector,
+                // kept off any guard the body prints.
+                if let Some((cond_text, body)) =
+                    crate::parser::oracle_effect::conditions::split_leading_conditional(
+                        before.original.trim(),
+                    )
+                {
+                    let cond_lower = cond_text.to_lowercase();
+                    let cond_rest = value::<_, _, OracleError<'_>, _>((), tag("if "))
+                        .parse(cond_lower.as_str())
+                        .ok()
+                        .map(|(rest, ())| rest.trim().to_string());
+                    if let Some(condition) = cond_rest.and_then(|rest| {
+                        crate::parser::oracle_effect::conditions::lower_instead_condition(
+                            &rest, ctx,
+                        )
+                    }) {
+                        return (body, Some(condition), true);
+                    }
+                }
                 return (before.original.trim().to_string(), None, true);
             }
         }
@@ -5675,8 +5734,10 @@ fn parse_normalized_oracle_ir(
             //    branches) — every one of them a CR 608.2 resolution-tree field.
             //    The shell stamps NONE of them: it writes cost, cost_reduction,
             //    activation restrictions and the other CR 602.1 envelope fields
-            //    only. So the pre-shell and post-shell lowerings still agree on
-            //    this predicate.
+            //    only. Once that envelope is complete, the linked-paid-cast
+            //    mana-composition fence can additionally refuse unsupported
+            //    inline work; the pre-shell trial has no activation cost and
+            //    deliberately does not classify that composition yet.
             //
             // Cost: one extra lowering per LEVEL-block activated line (two or
             // three rather than one or two). It is intrinsic, not laziness — the
@@ -6639,8 +6700,8 @@ fn parse_normalized_oracle_ir(
         {
             // CR 603.1 + CR 603.3 + CR 614.1c/614.12: "Whenever you cast [spell],
             // that [subject] enters with … counter(s) on it[, where X is …]"
-            // (Wildgrowth Archaic and cousin cards — Runadi, Communal Brewing; Torgal
-            // and Boreal Outrider are NOT recognized here; the self-exile form, Dark
+            // (Wildgrowth Archaic and cousin cards — Runadi, Communal Brewing, Torgal;
+            // Boreal Outrider is NOT recognized here; the self-exile form, Dark
             // Intimations, is recognized only to fail closed below) is a TRIGGERED
             // ability (CR 603.1),
             // not an object-hosted static replacement — the entering-with-counters
@@ -6806,98 +6867,58 @@ fn parse_normalized_oracle_ir(
             }
         }
 
-        // CR 701.43d: "You may exert [creature] as it attacks" — optional attack cost.
-        // Must intercept BEFORE Priority 7 (static patterns) because the "When you do"
-        // linked effect often contains "gets +N/+M" which is_static_pattern would match.
-        // Standalone: skip (separate "Whenever you exert" trigger line follows).
-        // Compound: produce an Exerted trigger with the linked effect.
-        if let Some(((), rest_original)) = nom_on_lower(&line, &lower, |i| {
-            value(
-                (),
-                alt((
-                    tag("you may exert this creature as it attacks"),
-                    tag("you may exert ~ as it attacks"),
-                    tag("you may exert it as it attacks"),
-                )),
-            )
-            .parse(i)
-        }) {
-            // Check for linked "When you do, [effect]" in same sentence
-            let rest_trimmed = rest_original.trim().trim_start_matches('.').trim_start();
-            let rest_lower = rest_trimmed.to_lowercase();
-            if let Some(((), effect_rest)) = nom_on_lower(rest_trimmed, &rest_lower, |i| {
-                value((), tag("when you do, ")).parse(i)
+        // CR 701.43d + CR 607.2h: Keep the optional attack cost and its
+        // linked payoff together, intercepting before static P/T dispatch.
+        // CR 603.4: A leading condition gates payment, not trigger resolution.
+        if let Some((attack_cost_condition, rest_original)) =
+            nom_on_lower(&line, &lower, parse_attack_exert_header)
+        {
+            let mut trigger = TriggerDefinition::new(TriggerMode::Exerted)
+                .valid_card(TargetFilter::SelfRef)
+                .trigger_zones(vec![Zone::Battlefield])
+                .description(line.to_string());
+            let rest_lower = rest_original.to_lowercase();
+            if let Some(((), effect_rest)) = nom_on_lower(rest_original, &rest_lower, |input| {
+                value((), tag(". when you do, ")).parse(input)
             }) {
                 ctx.subject = None;
                 ctx.actor = None;
-                let effect_def = parse_effect_chain_with_context(
+                trigger = trigger.execute(parse_effect_chain_with_context(
                     effect_rest.trim(),
                     AbilityKind::Spell,
                     &mut ctx,
+                ));
+            } else if all_consuming(opt(tag::<_, _, OracleError<'_>>(".")))
+                .parse(rest_lower.trim())
+                .is_err()
+            {
+                emitter.ability_at(
+                    item_line,
+                    AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        Effect::unimplemented("attack_exert_rider", &line),
+                    ),
                 );
-                let trigger = TriggerDefinition::new(TriggerMode::Exerted)
-                    .valid_card(TargetFilter::SelfRef)
-                    .trigger_zones(vec![Zone::Battlefield])
-                    .execute(effect_def)
-                    .description(line.to_string());
-                // `&line` is the whole printed sentence, which is also what the
-                // recognizer stamped as `description` — the body was parsed
-                // from the suffix after ". When you do, ", but the CR 701.43d
-                // optional attack cost and its CR 607.2h linked reflexive
-                // trigger are one printed paragraph.
-                emitter.trigger_ir_at(item_line, TriggerNodeIr::from_definition(&line, trigger));
+                i += 1;
+                continue;
             }
+            if let Some(condition) = attack_cost_condition {
+                trigger = trigger.attack_cost_condition(condition);
+            }
+            emitter.trigger_ir_at(item_line, TriggerNodeIr::from_definition(&line, trigger));
             i += 1;
             continue;
         }
-        // CR 701.43d: Variant with card name — "You may exert {Name} as {he/she/it/they} attacks"
-        if nom_on_lower(&line, &lower, |i| value((), tag("you may exert ")).parse(i)).is_some()
-            && scan_contains(&lower, "as ")
-            && scan_contains(&lower, "attacks")
-        {
-            if let Some((_, effect_text)) = split_once_on_lower(&line, &lower, ". when you do, ") {
-                ctx.subject = None;
-                ctx.actor = None;
-                let effect_def = parse_effect_chain_with_context(
-                    effect_text.trim(),
+        // A syntactically attack-exert paragraph with an unknown leading gate
+        // must remain unsupported rather than silently losing its restriction.
+        if nom_on_lower(&line, &lower, parse_unknown_conditioned_attack_exert_header).is_some() {
+            emitter.ability_at(
+                item_line,
+                AbilityDefinition::new(
                     AbilityKind::Spell,
-                    &mut ctx,
-                );
-                let trigger = TriggerDefinition::new(TriggerMode::Exerted)
-                    .valid_card(TargetFilter::SelfRef)
-                    .trigger_zones(vec![Zone::Battlefield])
-                    .execute(effect_def)
-                    .description(line.to_string());
-                emitter.trigger_ir_at(item_line, TriggerNodeIr::from_definition(&line, trigger));
-            }
-            i += 1;
-            continue;
-        }
-        // CR 701.43d: Conditional exert — "If [creature] hasn't been exerted this turn, you may exert it"
-        if nom_on_lower(&line, &lower, |i| value((), tag("if ")).parse(i)).is_some()
-            && scan_contains(&lower, "you may exert")
-            && scan_contains(&lower, "attacks")
-        {
-            if let Some((_, effect_text)) = split_once_on_lower(&line, &lower, ". when you do, ") {
-                ctx.subject = None;
-                ctx.actor = None;
-                let effect_def = parse_effect_chain_with_context(
-                    effect_text.trim(),
-                    AbilityKind::Spell,
-                    &mut ctx,
-                );
-                let trigger = TriggerDefinition::new(TriggerMode::Exerted)
-                    .valid_card(TargetFilter::SelfRef)
-                    .trigger_zones(vec![Zone::Battlefield])
-                    .execute(effect_def)
-                    .description(line.to_string());
-                // The leading if-gate this arm dispatches on is still DROPPED —
-                // no condition is stamped for "hasn't been exerted this turn".
-                // That gap is pre-existing and deliberately preserved here: the
-                // conversion is behavior-identical, and the fix belongs in a
-                // change that is allowed to move bytes.
-                emitter.trigger_ir_at(item_line, TriggerNodeIr::from_definition(&line, trigger));
-            }
+                    Effect::unimplemented("attack_exert_condition", &line),
+                ),
+            );
             i += 1;
             continue;
         }
@@ -8246,19 +8267,32 @@ fn parse_normalized_oracle_ir(
             // Ability-word condition (if any) is the "existing" baseline —
             // the chain-extracted condition is merged onto it, preserving the
             // historical `[ability_word, chain]` ordering when both are distinct.
-            if let Some(ability_word_condition) =
-                ability_word_to_ability_condition(&aw_condition, &mut ctx)
-            {
-                ability_ir
-                    .root_transforms
-                    .push(AbilityRootTransform::PrependCondition(
-                        ability_word_condition,
-                    ));
-            }
-            if let Some(instead_condition) = instead_condition {
-                ability_ir
-                    .root_transforms
-                    .push(AbilityRootTransform::AppendCondition(instead_condition));
+            let ability_word_condition = ability_word_to_ability_condition(&aw_condition, &mut ctx);
+            let selector = match (&ability_word_condition, &instead_condition) {
+                (Some(word), Some(instead)) => {
+                    Some(merge_ability_condition(Some(word.clone()), instead.clone()))
+                }
+                (word, instead) => word.clone().or_else(|| instead.clone()),
+            };
+            // CR 614.6 + CR 614.15: a bound override carries its paragraph selector
+            // to the fold rather than merging it into the body's own guard.
+            let binds_override =
+                (is_instead || is_cross_line_dig_alt || is_instead_replacement_line(&effect_line))
+                    && emitter.last_ability_id().is_some()
+                    && (selector.is_some() || lower_ability_ir(&ability_ir).condition.is_some());
+            if !binds_override {
+                if let Some(ability_word_condition) = ability_word_condition {
+                    ability_ir
+                        .root_transforms
+                        .push(AbilityRootTransform::PrependCondition(
+                            ability_word_condition,
+                        ));
+                }
+                if let Some(instead_condition) = instead_condition {
+                    ability_ir
+                        .root_transforms
+                        .push(AbilityRootTransform::AppendCondition(instead_condition));
+                }
             }
             i = next_i;
             // CR 706.3b: An immediately following valid results table belongs to
@@ -8295,21 +8329,25 @@ fn parse_normalized_oracle_ir(
                 && !scan_contains(&effect_line_lower, "would");
 
             if is_instead || is_cross_line_dig_alt || is_instead_replacement_line(&effect_line) {
-                if lower_ability_ir(&ability_ir).condition.is_some() {
-                    if let Some(base) = emitter.last_ability_id() {
-                        let Some(_) = previous_spell else {
-                            unreachable!(
-                                "`spells_emitted` holds only spell nodes, and all three spell shapes lower"
-                            );
-                        };
-                        let override_item = emitter.ability_ir_at(item_line, ability_ir);
-                        document_relations.push(DocumentRelationIr::SelfReplacementOverride {
-                            base,
-                            override_item,
-                        });
-                        continue;
-                    }
-                } else if emitter.last_ability_node().is_some() {
+                if binds_override {
+                    let base = emitter
+                        .last_ability_id()
+                        .expect("a bound override has a preceding ability");
+                    let Some(_) = previous_spell else {
+                        unreachable!(
+                            "`spells_emitted` holds only spell nodes, and all three spell shapes lower"
+                        );
+                    };
+                    let override_item = emitter.ability_ir_at(item_line, ability_ir);
+                    document_relations.push(DocumentRelationIr::SelfReplacementOverride {
+                        base,
+                        override_item,
+                        selector,
+                    });
+                    continue;
+                } else if lower_ability_ir(&ability_ir).condition.is_none()
+                    && emitter.last_ability_node().is_some()
+                {
                     // CR 614.6: "If an event is replaced, it never happens."
                     //
                     // The line IS a self-replacement override of the preceding
@@ -8778,6 +8816,15 @@ fn parse_activated_ability_ir(
     // reference. Restored after the effect parse — no leak to sibling abilities.
     let prev_exile_zone = ctx.current_ability_exile_cost_zone.take();
     ctx.current_ability_exile_cost_zone = non_self_exile_cost_zone(&cost);
+    // CR 608.2k: likewise expose the cost's payment components (the
+    // `AbilityCost` classifier, one entry per component, no deduplication) so
+    // "the discarded card" / "the sacrificed creature" name a cost-paid object
+    // only when this ability's one slot-binding payment discards / sacrifices.
+    // Restored beside the exile zone.
+    let prev_cost_components = std::mem::replace(
+        &mut ctx.current_ability_cost_components,
+        cost.component_categories(),
+    );
     // CR 707.9a: thread the activated-ability index so "except it has this
     // ability" inside the effect body resolves to RetainPrintedAbilityFromSource.
     let prev_ability_index = ctx.current_ability_index;
@@ -8789,6 +8836,7 @@ fn parse_activated_ability_ir(
     let mut ir = parse_activated_ability_ir_with_self_ref_fallback(&effect_text, card_name, ctx);
 
     ctx.current_ability_exile_cost_zone = prev_exile_zone;
+    ctx.current_ability_cost_components = prev_cost_components;
     ctx.current_ability_index = prev_ability_index;
     let lowered_for_activation_zone = lower_ability_ir(&ir);
     // Three-authority precedence for the activation zone. The ORDER IS A RULES
@@ -8949,15 +8997,13 @@ fn guard_owner(body: &AbilityDefinition, parent: Option<&Effect>) -> bool {
     match parent {
         // O1a — CR 614.1a + CR 608.2n.
         Some(Effect::CastFromZone { .. }) => {
-            cast_from_zone::graveyard_destination_rider(&body.effect, body.condition.as_ref())
-                .is_some()
+            graveyard_destination_rider(&body.effect, body.condition.as_ref()).is_some()
         }
         // O1b — CR 608.2c + CR 614.1a. Exile only: the counter path's library/hand
         // redirect rides `countered_spell_zone`, never a sub-ability.
-        Some(Effect::Counter { .. }) => cast_from_zone::is_graveyard_exile_rider_subability(
-            &body.effect,
-            body.condition.as_ref(),
-        ),
+        Some(Effect::Counter { .. }) => {
+            is_graveyard_exile_rider_subability(&body.effect, body.condition.as_ref())
+        }
         // R-a. CR-neutral hygiene, not a rules claim: the parent already records this
         // clause's unsupportedness, and a second gap over the same defect double-counts it
         // — the same per-unit suppression rule `swallow_check` applies via its
@@ -9527,6 +9573,7 @@ fn resolve_guards_in_effect(effect: &mut Effect) {
         | Effect::SkipNextStep { .. }
         | Effect::AdditionalPhase { .. }
         | Effect::Double { .. }
+        | Effect::ModifyAnnouncedX { .. }
         | Effect::RuntimeHandled { .. }
         | Effect::Incubate { .. }
         | Effect::Amass { .. }
@@ -10148,7 +10195,7 @@ fn unsupported_residual(gap: &str, description: &Option<String>) -> AbilityDefin
 fn demote_lifetimes_in_ability(def: &mut AbilityDefinition) {
     let refused = match &*def.effect {
         Effect::AddTargetReplacement { replacement, .. } => {
-            crate::game::effects::add_target_replacement::replacement_install_is_refused(
+            crate::types::ability::replacement_install_is_refused(
                 replacement,
                 def.duration.as_ref(),
             )
@@ -10162,7 +10209,7 @@ fn demote_lifetimes_in_ability(def: &mut AbilityDefinition) {
         Effect::PreventDamage {
             prevention_duration,
             ..
-        } => crate::game::effects::prevent_damage::prevention_shield_is_refused(
+        } => crate::types::ability::prevention_shield_is_refused(
             prevention_duration.as_ref(),
             def.duration.as_ref(),
         ),
@@ -10609,6 +10656,7 @@ fn demote_lifetimes_in_effect(effect: &mut Effect) {
         | Effect::SkipNextStep { .. }
         | Effect::AdditionalPhase { .. }
         | Effect::Double { .. }
+        | Effect::ModifyAnnouncedX { .. }
         | Effect::RuntimeHandled { .. }
         | Effect::Incubate { .. }
         | Effect::Amass { .. }
@@ -11949,6 +11997,9 @@ fn find_top_level_colon(line: &str) -> Option<usize> {
 /// turn-role and turn-window axes are consumed by their own sub-combinators, so
 /// the four role×window gates come from four small tags instead of eight
 /// enumerated phrases (and a new spelling on either axis is a one-tag change).
+/// The unscoped determiner×step arm ("during the <step> step" / "during any
+/// <step> step") shares the same prefix and still lowers to the existing
+/// `RequiresCondition` variant.
 fn parse_activation_during_role_gate(i: &str) -> OracleResult<'_, ActivationRestriction> {
     alt((
         value(
@@ -12057,6 +12108,70 @@ fn parse_activation_timing_restriction(phrase: &str) -> Option<Vec<ActivationRes
         return Some(vec![require_restriction_condition(condition_text)?]);
     }
     None
+}
+
+/// The item separator of a compound "Activate only <A>, only <B>, and only <C>"
+/// instruction. Longest first, so ", and only " is never read as ", " plus a
+/// residual "and only ".
+fn parse_activation_restriction_list_separator(i: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        alt((
+            tag::<_, _, OracleError<'_>>(", and only "),
+            tag(", only "),
+            tag(" and only "),
+        )),
+    )
+    .parse(i)
+}
+
+/// One item of a compound activation-restriction list: a cadence ("once" /
+/// "once each turn") or any phrase the single-restriction authority
+/// `parse_activation_timing_restriction` accepts (speed, turn/step gates,
+/// before-windows, "if <condition>").
+fn parse_activation_restriction_item(item: &str) -> Option<Vec<ActivationRestriction>> {
+    if let Ok((_, cadence)) = all_consuming(parse_activation_cadence).parse(item) {
+        return Some(vec![cadence]);
+    }
+    parse_activation_timing_restriction(item)
+}
+
+/// CR 602.1b + CR 602.5: an "Activate only <A> and only <B>[, and only <C>]…"
+/// instruction is a list of activation restrictions, every one of which must
+/// hold (Defenders of Humanity: "Activate only if you control no creatures and
+/// only during your turn"; Grizzled Wolverine: "Activate only during the
+/// declare blockers step, only if at least one creature is blocking this
+/// creature, and only once each turn").
+///
+/// All-or-nothing: if any item fails to parse the whole list returns `None`, so
+/// the caller leaves the sentence intact and it surfaces as
+/// `Effect::Unimplemented` rather than committing a partial, more permissive
+/// gate. A single item is refused (`None`) — single phrases belong to
+/// `parse_activation_timing_restriction` and the dedicated condition branch.
+///
+/// Items are emitted in REVERSE text order. Restrictions are conjunctive, so
+/// order carries no rules meaning; reversing matches the right-to-left peeling
+/// order `strip_activated_constraints` already produces for two-item forms,
+/// keeping their output byte-identical.
+fn parse_activation_restriction_list(phrase: &str) -> Option<Vec<ActivationRestriction>> {
+    let lower = phrase.trim().trim_end_matches('.').trim().to_lowercase();
+    let (_, items) = all_consuming(separated_list1(
+        parse_activation_restriction_list_separator,
+        recognize(many1((
+            not(parse_activation_restriction_list_separator),
+            anychar,
+        ))),
+    ))
+    .parse(lower.as_str())
+    .ok()?;
+    if items.len() < 2 {
+        return None;
+    }
+    let per_item = items
+        .into_iter()
+        .map(parse_activation_restriction_item)
+        .collect::<Option<Vec<_>>>()?;
+    Some(per_item.into_iter().rev().flatten().collect())
 }
 
 /// CR 602.5: Build a `RequiresCondition` activation restriction, or fail.
@@ -12213,13 +12328,27 @@ fn parse_activation_turn_window(i: &str) -> OracleResult<'_, ActivationTurnWindo
     .parse(i)
 }
 
-/// CR 602.1b: the composed `during <role> <window>` activation gate — the
-/// shared prefix is consumed once, then each axis by its own sub-combinator.
+/// The unscoped step-determiner axis of a `during ...` activation gate:
+/// "the" / "any" name a step with no turn owner. Plumbing only — the rules
+/// reading lives in `named_step_activation_restriction`. The trailing space is
+/// load-bearing: "their" (a turn-role possessive) cannot match "the ".
+fn parse_unscoped_step_determiner(i: &str) -> OracleResult<'_, ()> {
+    value((), alt((tag::<_, _, OracleError<'_>>("the "), tag("any ")))).parse(i)
+}
+
+/// CR 602.1b: the composed `during ...` activation gate — the shared prefix is
+/// consumed once, then either the unscoped determiner×step axes ("during the
+/// <step> step" / "during any <step> step", via the shared step-name grammar
+/// `parse_phase_name_set`) or the `<role> <window>` axes, each by its own
+/// sub-combinator. Every arm emits an EXISTING `ActivationRestriction` variant.
 fn parse_activation_during_gate(i: &str) -> OracleResult<'_, ActivationRestriction> {
     preceded(
         tag::<_, _, OracleError<'_>>("during "),
         alt((
-            value(any_upkeep_activation_restriction(), tag("any upkeep step")),
+            map(
+                preceded(parse_unscoped_step_determiner, parse_phase_name_set),
+                named_step_activation_restriction,
+            ),
             map(
                 (parse_activation_turn_role, parse_activation_turn_window),
                 |(role, window)| activation_turn_gate(role, window),
@@ -12269,25 +12398,28 @@ fn opponents_turn_activation_condition() -> ParsedCondition {
 /// CR 602.5b + CR 102.3 + CR 503.1: "Activate only during an opponent's upkeep"
 /// gates activation to the upkeep step of an opponent's turn (Trade Caravan).
 /// Composed from the same team-aware opponent-turn leaf as
-/// `opponents_turn_activation_condition` plus the `IsDuringUpkeep` step
-/// predicate, so the opponent scope reuses the existing composition idiom
-/// instead of a dedicated `DuringOpponents*` restriction sibling per step.
+/// `opponents_turn_activation_condition` plus the step predicate
+/// `CurrentPhaseIs { phases: [Upkeep] }`, so the opponent scope reuses the
+/// existing composition idiom instead of a dedicated `DuringOpponents*`
+/// restriction sibling per step.
 fn opponents_upkeep_activation_restriction() -> ActivationRestriction {
     ActivationRestriction::RequiresCondition {
         condition: Some(ParsedCondition::And {
             conditions: vec![
                 opponents_turn_activation_condition(),
-                ParsedCondition::IsDuringUpkeep,
+                ParsedCondition::CurrentPhaseIs {
+                    phases: vec![Phase::Upkeep],
+                },
             ],
         }),
     }
 }
 
-/// CR 602.1b + CR 503.1: activation instructions can restrict activation to
-/// the upkeep step. "Any upkeep" imposes no active-player restriction.
-fn any_upkeep_activation_restriction() -> ActivationRestriction {
+/// CR 602.1b + CR 500.1 + CR 506.1: "during the <step> step" / "during any <step>
+/// step" names one turn step with no turn owner.
+fn named_step_activation_restriction(phases: Vec<Phase>) -> ActivationRestriction {
     ActivationRestriction::RequiresCondition {
-        condition: Some(ParsedCondition::IsDuringUpkeep),
+        condition: Some(ParsedCondition::CurrentPhaseIs { phases }),
     }
 }
 
@@ -12419,30 +12551,41 @@ pub(super) fn strip_activated_constraints(text: &str) -> (String, ActivatedConst
 
         // CR 602.5b: Delegate bare "Activate only <timing>" phrases to the same
         // timing parser used by the "Any player may activate ... but only"
-        // composition path. The condition-only form stays on its specialized
-        // branch below so the once-per-turn rider is stripped before condition
-        // parsing. Here and below, the unmodernized "Activate this ability
-        // only …" wording (M'Odo, the Gnarled Oracle; Piercing Rays; Riku and
-        // Riku) is the same restriction as "Activate only …".
+        // composition path. A lone condition ("Activate only if …") stays on its
+        // specialized branch below so the once-per-turn rider is stripped before
+        // condition parsing. Here and below, the unmodernized "Activate this
+        // ability only …" wording (M'Odo, the Gnarled Oracle; Piercing Rays; Riku
+        // and Riku) is the same restriction as "Activate only …".
+        // CR 602.1b + CR 602.5: when the tail is not one phrase, it may be a
+        // compound list ("if you control no creatures and only during your
+        // turn", "once each turn and only during your turn") — every item must
+        // parse or nothing is committed. The list only applies when the
+        // instruction opens its own sentence.
         if let Some((before, restriction)) = tp
             .rsplit_around("activate this ability only ")
             .or_else(|| tp.rsplit_around("activate only "))
         {
-            if tag::<_, _, OracleError<'_>>("if ")
+            let is_condition_tail = tag::<_, _, OracleError<'_>>("if ")
                 .parse(restriction.lower.trim_start())
-                .is_err()
-            {
-                if let Some(parsed) = parse_activation_timing_restriction(restriction.original) {
-                    constraints.restrictions.extend(parsed);
-                    remaining = before
-                        .original
-                        .trim_end_matches(|c: char| c == '.' || c == ',' || c.is_whitespace())
-                        .to_string();
-                    if remaining.is_empty() {
-                        break;
-                    }
-                    continue;
+                .is_ok();
+            let single = (!is_condition_tail)
+                .then(|| parse_activation_timing_restriction(restriction.original))
+                .flatten();
+            let parsed = single.or_else(|| {
+                is_empty_or_sentence_boundary(before.original)
+                    .then(|| parse_activation_restriction_list(restriction.original))
+                    .flatten()
+            });
+            if let Some(parsed) = parsed {
+                constraints.restrictions.extend(parsed);
+                remaining = before
+                    .original
+                    .trim_end_matches(|c: char| c == '.' || c == ',' || c.is_whitespace())
+                    .to_string();
+                if remaining.is_empty() {
+                    break;
                 }
+                continue;
             }
         }
 
@@ -12817,22 +12960,30 @@ fn peel_only_once_rider(lower: &str) -> Option<(usize, ActivationRestriction)> {
     take_until::<_, _, OracleError<'_>>("activate only")
         .parse(before)
         .ok()?;
-    // "each turn" is the optional longest-match tail; the rider must end the line.
-    let (rest, each_turn) = preceded(
-        tag::<_, _, OracleError<'_>>(" and only once"),
-        opt(tag::<_, _, OracleError<'_>>(" each turn")),
-    )
+    // The cadence grammar is shared with the restriction list; the rider must
+    // end the line.
+    let (_, restriction) = all_consuming(preceded(
+        tag::<_, _, OracleError<'_>>(" and only "),
+        parse_activation_cadence,
+    ))
     .parse(rider_onward)
     .ok()?;
-    if !rest.is_empty() {
-        return None;
-    }
-    let restriction = if each_turn.is_some() {
-        ActivationRestriction::OnlyOnceEachTurn
-    } else {
-        ActivationRestriction::OnlyOnce
-    };
     Some((before.len(), restriction))
+}
+
+/// CR 602.5b: the activation-cadence item of an "Activate only …" instruction —
+/// "once each turn" → `OnlyOnceEachTurn`, "once" → `OnlyOnce`. Longest match
+/// first so "once each turn" is never read as "once" with a residual. Callers
+/// wrap it in `all_consuming` so "once more" / "twice" are refused.
+fn parse_activation_cadence(i: &str) -> OracleResult<'_, ActivationRestriction> {
+    alt((
+        value(
+            ActivationRestriction::OnlyOnceEachTurn,
+            tag::<_, _, OracleError<'_>>("once each turn"),
+        ),
+        value(ActivationRestriction::OnlyOnce, tag("once")),
+    ))
+    .parse(i)
 }
 
 /// Strip trailing "X can't be 0." / "This ability can't be copied and X can't

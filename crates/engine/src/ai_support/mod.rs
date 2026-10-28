@@ -147,11 +147,10 @@ pub fn validated_candidate_actions_with_probe(
 }
 
 /// CR 701.23a + CR 608.2c: A `SelectCards` answering a library search is legal
-/// exactly when it meets the three conditions the submission guard checks —
-/// cardinality, membership in the searched pool, and the printed-text selection
-/// constraint (`engine_resolution_choices.rs`, the `SearchChoice` arm). All
-/// three are decidable from the prompt without mutating the game, so
-/// `SimulationFilter` can skip its clone-and-apply probe. Mirrors
+/// exactly when it meets the submission guard's cardinality, distinct in-pool
+/// membership, and printed-text selection constraint (`engine_resolution_choices.rs`,
+/// the `SearchChoice` arm). These are decidable without mutating the game, so
+/// `SimulationFilter` can skip its clone-and-apply probe for ordinary searches. Mirrors
 /// [`structurally_valid_tap_for_convoke_payment`].
 ///
 /// This is load-bearing for a single-card search, where the enumerator issues
@@ -198,13 +197,7 @@ pub(crate) fn structurally_valid_search_selection(state: &GameState, action: &Ga
         return false;
     }
 
-    // Membership plus distinctness: a repeated id would select one card twice,
-    // which pool membership alone would not catch.
-    let mut seen = std::collections::HashSet::with_capacity(chosen.len());
-    if !chosen
-        .iter()
-        .all(|id| cards.contains(id) && seen.insert(*id))
-    {
+    if !crate::game::effects::search_library::selection_is_distinct_subset(chosen, cards) {
         return false;
     }
 
@@ -755,8 +748,13 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
             // the submission guard / candidate generation lower bound so the
             // validated legal-action path does not drop legal short picks.
             let lower_bounded = *up_to || *allows_partial_find || constraint.permits_partial_find();
-            let exact = if lower_bounded { None } else { Some(*count) };
-            selection_mismatch(chosen, cards, exact) || (lower_bounded && chosen.len() > *count)
+            let invalid_count = if lower_bounded {
+                chosen.len() > *count
+            } else {
+                chosen.len() != *count
+            };
+            invalid_count
+                || !crate::game::effects::search_library::selection_is_distinct_subset(chosen, cards)
         }
         (
             WaitingFor::ChooseFromZoneChoice {
@@ -1297,6 +1295,7 @@ fn grouped_mana_requires_priority(state: &GameState, player: PlayerId) -> bool {
             GameAction::ActivateAbility {
                 source_id,
                 ability_index,
+                ..
             } => activate_mana_action_would_queue_non_mana_trigger(
                 state,
                 player,
@@ -1364,6 +1363,7 @@ fn classify_flat_priority_action(action: &GameAction) -> FlatPriorityActionClass
         GameAction::ActivateAbility {
             source_id,
             ability_index,
+            ..
         } => FlatPriorityActionClass::ActivateAbility {
             source_id: *source_id,
             ability_index: *ability_index,
@@ -1569,7 +1569,7 @@ fn meaningful_sacrifice_mana_actions<'a>(
             action,
             GameAction::ActivateAbility {
                 source_id,
-                ability_index,
+                ability_index, ..
             } if activate_ability_is_meaningful_priority(state, *source_id, *ability_index)
         )
     })
@@ -1942,6 +1942,7 @@ fn beneficial_mana_tap_trigger_hold(
             GameAction::ActivateAbility {
                 source_id,
                 ability_index,
+                ..
             } => {
                 let has_tap = state
                     .objects
@@ -3789,6 +3790,7 @@ mod tests {
                 &GameAction::ActivateAbility {
                     source_id: card,
                     ability_index: 0,
+                    payment_mode: crate::types::game_state::CastPaymentMode::Auto
                 },
             ),
             "cycling ActivateAbility must be offered"
@@ -3828,6 +3830,7 @@ mod tests {
                 &GameAction::ActivateAbility {
                     source_id: card,
                     ability_index: 0,
+                    payment_mode: crate::types::game_state::CastPaymentMode::Auto
                 },
             ),
             "cycling ActivateAbility must still be offered"
@@ -3909,6 +3912,7 @@ mod tests {
                 &GameAction::ActivateAbility {
                     source_id: hand_sliver,
                     ability_index: transient_index,
+                    payment_mode: crate::types::game_state::CastPaymentMode::Auto
                 },
             ),
             "legal actions must expose the runtime-granted Slivercycling activation"
@@ -3919,6 +3923,7 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: hand_sliver,
                 ability_index: transient_index,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .expect("runtime-granted Typecycling activation should be accepted");
@@ -4036,6 +4041,7 @@ mod tests {
             &GameAction::ActivateAbility {
                 source_id: rock,
                 ability_index,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto
             },
         ));
         assert!(!flat.iter().any(
@@ -4079,6 +4085,7 @@ mod tests {
         let mana_action = GameAction::ActivateAbility {
             source_id: rock,
             ability_index,
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
         };
         let count = grouped
             .get(&rock)
@@ -4196,6 +4203,7 @@ mod tests {
             &GameAction::ActivateAbility {
                 source_id: altar,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto
             },
         ));
         assert!(!flat.iter().any(
@@ -4410,6 +4418,42 @@ mod tests {
                     &state,
                     &GameAction::SelectCards { cards: chosen }
                 ));
+            }
+        }
+    }
+
+    #[test]
+    fn search_guards_share_distinct_subset_and_count_boundaries() {
+        let mut state = GameState::new_two_player(42);
+        let choices = vec![ObjectId(1), ObjectId(2), ObjectId(3)];
+        for (up_to, allows_partial_find) in [(false, false), (true, false), (false, true)] {
+            state.waiting_for = WaitingFor::SearchChoice {
+                player: PlayerId(0),
+                library_owner: None,
+                cards: choices.clone(),
+                count: 2,
+                reveal: false,
+                up_to,
+                allows_partial_find,
+                constraint: SearchSelectionConstraint::None,
+                ordering_hint: Default::default(),
+                split: None,
+            };
+            // CR 701.23b + CR 701.23d: quality/up-to permits short finds; quantity does not.
+            for (chosen, valid) in [
+                (vec![choices[1], choices[0]], true),
+                (vec![choices[0], choices[0]], false),
+                (vec![choices[0], ObjectId(99)], false),
+                (choices.clone(), false),
+                (vec![], up_to || allows_partial_find),
+                (vec![choices[0]], up_to || allows_partial_find),
+            ] {
+                let action = GameAction::SelectCards { cards: chosen };
+                assert_eq!(
+                    super::structurally_valid_search_selection(&state, &action),
+                    valid
+                );
+                assert_eq!(cheap_reject_candidate(&state, &action), !valid);
             }
         }
     }
@@ -4694,6 +4738,7 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: land,
                 ability_index: 1,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         ];
         assert!(
@@ -4711,6 +4756,7 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: land,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         ];
         assert!(
@@ -4811,6 +4857,7 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: kci,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         ];
         // Classifier reach-guard: the sac-for-mana is still a meaningful
@@ -4840,6 +4887,7 @@ mod tests {
                 &GameAction::ActivateAbility {
                     source_id: kci,
                     ability_index: 0,
+                    payment_mode: crate::types::game_state::CastPaymentMode::Auto
                 },
             ),
             "KCI activation must appear in legal_actions_by_object"
@@ -4987,6 +5035,7 @@ mod tests {
         let action = GameAction::ActivateAbility {
             source_id: source,
             ability_index,
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
         };
         let flat = super::flat_priority_actions(runner.state());
         assert!(
@@ -5185,6 +5234,7 @@ mod tests {
                 &GameAction::ActivateAbility {
                     source_id: kci,
                     ability_index: 0,
+                    payment_mode: crate::types::game_state::CastPaymentMode::Auto
                 },
             ),
             "KCI activation must appear in legal_actions_by_object"
@@ -6829,7 +6879,7 @@ mod tests {
                 action,
                 GameAction::ActivateAbility {
                     source_id,
-                    ability_index: 1,
+                    ability_index: 1, ..
                 } if *source_id == land_id
             )),
             "flash sacrifice ability must be activatable when {{1}} is payable"
@@ -8142,6 +8192,7 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: src,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         ];
 
@@ -8180,6 +8231,7 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: src,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         ];
 
@@ -8231,6 +8283,7 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: src,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         ];
         let cast_actions = vec![
@@ -8316,6 +8369,7 @@ mod tests {
             GameAction::ActivateAbility {
                 source_id: src,
                 ability_index: 0,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         ];
 

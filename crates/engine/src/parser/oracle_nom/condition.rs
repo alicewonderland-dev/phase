@@ -6,7 +6,7 @@
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::bytes::complete::take_until;
-use nom::character::complete::multispace1;
+use nom::character::complete::{multispace1, satisfy};
 use nom::combinator::{cut, eof, map, not, opt, peek, recognize, value, verify};
 use nom::multi::many0;
 use nom::sequence::{delimited, preceded, terminated};
@@ -431,10 +431,10 @@ fn parse_state_presence_conditions(input: &str) -> OracleResult<'_, StaticCondit
 /// The group is an ARITY-MANAGEMENT device first. Besides the control-related
 /// productions it also hosts the THRESHOLD-COUNT family — the arms that
 /// compare an object count against a fixed number
-/// (`parse_creatures_attacking_count_threshold`, headed by the
+/// (`parse_creatures_in_combat_count_threshold`, headed by the
 /// comparator-aware `parse_count_threshold`, and
 /// `parse_attached_to_referent_count_ge`, headed by the GE-only
-/// `parse_ge_threshold`). The attacking-count arm lives here
+/// `parse_ge_threshold`). The combat-count arm lives here
 /// because it MUST precede `parse_control_conditions` (see its comment below);
 /// the attachment-threshold arm lives here for family proximity and to leave
 /// the parent `alt`'s remaining tuple headroom free.
@@ -448,15 +448,16 @@ fn parse_control_presence_conditions(input: &str) -> OracleResult<'_, StaticCond
         parse_control_named_pair,
         parse_compound_control_presence,
         parse_filter_have_total_property,
-        // CR 508.1k + CR 118.9: "<count threshold> creature(s) is/are attacking"
-        // ("three or more creatures are attacking", "exactly one creature is
-        // attacking") — must precede `parse_control_conditions` so the bare
-        // count phrase is not mis-read as "you control N or more creatures".
-        parse_creatures_attacking_count_threshold,
+        // CR 508.1k + CR 509.1g: "<count threshold> creature(s)
+        // is/are attacking | blocking <source>" ("three or more creatures are
+        // attacking", "at least one creature is blocking ~") — must precede
+        // `parse_control_conditions` so the bare count phrase is not mis-read
+        // as "you control N or more creatures".
+        parse_creatures_in_combat_count_threshold,
         // CR 301.5 + CR 303.4 + CR 611.3a: "N or more <type> are attached to
-        // <referent>" — the attachment-threshold sibling of the attacking-count
+        // <referent>" — the attachment-threshold sibling of the combat-count
         // arm above. Ordering relative to that arm is NOT load-bearing (its
-        // "creature(s) is/are attacking" tail and this arm's required
+        // "creature(s) is/are attacking | blocking" tail and this arm's required
         // `" attached to "` referent are mutually exclusive after the count
         // heads); they are adjacent so the threshold-count family is
         // discoverable in one place.
@@ -2486,6 +2487,41 @@ fn parse_source_is_saddled(input: &str) -> OracleResult<'_, StaticCondition> {
     Ok((rest, condition))
 }
 
+/// CR 722.3a + CR 700.7 + CR 603.4: Parse "<explicit self> is[n't] prepared"
+/// → SourceMatchesFilter over the property-only prepared filter, wrapping the
+/// negated idiom in `Not { SourceMatchesFilter }`. The polarity is a single
+/// `alt()` axis over the affirmative ("is prepared") and the two negated
+/// spellings ("isn't prepared" / "is not prepared"), longest-match first so
+/// "is not" wins over "is " before the predicate — the `parse_source_is_saddled`
+/// template. Woodwork Prodigy's upkeep trigger ("if this creature isn't
+/// prepared, it becomes prepared"; same sentence on Stingerquill Voxmancer and
+/// Paradox Shaper) drives the negated branch.
+///
+/// Explicit-self subjects only (`parse_explicit_self_source_subject`: `~` /
+/// "this creature" / "this permanent" / ...). Attached prefixes ("equipped /
+/// enchanted creature ") and the bare recipient-anaphoric "it" are deliberately
+/// NOT accepted here: for those the real subject is the host/recipient, not
+/// the ability source, so a `Source*` check would bind the wrong object.
+/// Property-only filter shape (no creature-type gate): the prepared
+/// designation is a permanent property, and CR 700.7 keeps "this creature"
+/// bound even after type loss (One with the Stars).
+fn parse_source_is_prepared(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = parse_explicit_self_source_subject(input)?;
+    let (rest, negated) = parse_copula_is_or_isnt(rest)?;
+    let (rest, _) = tag("prepared").parse(rest)?;
+    let condition = StaticCondition::SourceMatchesFilter {
+        filter: crate::parser::oracle_effect::conditions::prepared_source_filter(),
+    };
+    let condition = if negated {
+        StaticCondition::Not {
+            condition: Box::new(condition),
+        }
+    } else {
+        condition
+    };
+    Ok((rest, condition))
+}
+
 /// CR 702.171b + CR 508.1m: Bare elided-subject participle state gate
 /// ("Whenever this creature attacks while saddled" — Alacrian Jaguar). The
 /// printed while-gate elides the subject; the participle is part of the trigger
@@ -2568,6 +2604,30 @@ fn parse_contraction_source_state_condition(input: &str) -> OracleResult<'_, Sta
     .parse(rest)
 }
 
+/// CR 701.43b: Source exert history, with negation composed over the same leaf.
+fn parse_source_exerted_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = parse_source_subject(input)?;
+    terminated(
+        alt((
+            value(
+                StaticCondition::SourceExertedThisTurn,
+                tag("has been exerted this turn"),
+            ),
+            value(
+                StaticCondition::Not {
+                    condition: Box::new(StaticCondition::SourceExertedThisTurn),
+                },
+                (parse_hasnt, tag(" been exerted this turn")),
+            ),
+        )),
+        peek(alt((
+            value((), eof),
+            value((), satisfy(|c: char| !c.is_alphanumeric())),
+        ))),
+    )
+    .parse(rest)
+}
+
 /// CR 611.2b: Parse source-state conditions (tapped, untapped, entered this turn).
 fn parse_source_state_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
     alt((
@@ -2589,6 +2649,9 @@ fn parse_source_state_conditions(input: &str) -> OracleResult<'_, StaticConditio
         // CR 702.171b: "~ is saddled" / "this creature isn't saddled" / etc.
         // (negation composes Not { SourceIsSaddled }).
         parse_source_is_saddled,
+        // CR 722.3a: "~ is prepared" / "this creature isn't prepared" / etc.
+        // (negation composes Not { SourceMatchesFilter { Typed([Prepared]) } }).
+        parse_source_is_prepared,
         // CR 301.5 + CR 303.4: "~ is attached to a creature" / "this equipment is attached to a creature".
         // Must precede `parse_source_is_type` so the specific "is attached to a creature"
         // predicate wins over generic "is <type>" dispatch.
@@ -2617,6 +2680,7 @@ fn parse_source_state_conditions(input: &str) -> OracleResult<'_, StaticConditio
         // Not(SourceHasDealtDamage). Specific full-phrase tag; placed before the
         // generic predicates so it is not shadowed.
         parse_source_hasnt_dealt_damage,
+        parse_source_exerted_this_turn,
         // CR 400.7: Entered this turn.
         // Accept both the long "entered the battlefield this turn" and the abbreviated
         // "entered this turn" forms — Oracle templates vary between them for the same
@@ -4927,6 +4991,13 @@ fn parse_control_count_ge_distinct_quality(input: &str) -> OracleResult<'_, Stat
 /// objects. The group/count layer split likewise carries no CR number of its
 /// own. This function moves the constraint from the filter to that authority.
 ///
+/// The marker is equally inert inside a library-search filter
+/// (`evaluate_shares_quality` answers true per card), so
+/// `oracle_effect::search::parse_search_library_details` is the second consumer
+/// of this lift: it moves the marker into
+/// `SearchSelectionConstraint::SharesQualities { relation: Shares }`
+/// (CR 608.2c + CR 701.23a).
+///
 /// Declines, leaving the filter untouched, for:
 ///   * `reference: Some(..)` — that IS a per-object predicate and
 ///     `ObjectCount` is correct for it;
@@ -4934,14 +5005,16 @@ fn parse_control_count_ge_distinct_quality(input: &str) -> OracleResult<'_, Stat
 ///   * a non-`Typed` filter — an `Or`/`And` of counted populations is not one
 ///     bucketed count.
 ///
-/// In each case the caller's `alt` falls through to `parse_control_count_ge`
-/// and the row keeps exactly the shape it has today. A refusal cannot be raised
+/// For the count consumer, the caller's `alt` falls through to
+/// `parse_control_count_ge`; for the search consumer, the marker stays in the
+/// per-card filter and `selection_constraint` stays `None`. Either way the row
+/// keeps exactly the shape it has today. A refusal cannot be raised
 /// from here instead: three transitive callers disagree about what a refusal
 /// means, and two of them (`static_helpers::try_parse_cost_modification` and
 /// `oracle_trigger::try_extract_intervening`) turn one into an UNCONDITIONAL
 /// static or an unhoisted intervening-if — strictly worse than the shape they
 /// would refuse.
-fn take_group_shared_quality(filter: &mut TargetFilter) -> Option<SharedQuality> {
+pub(crate) fn take_group_shared_quality(filter: &mut TargetFilter) -> Option<SharedQuality> {
     let TargetFilter::Typed(tf) = filter else {
         return None;
     };
@@ -5339,7 +5412,7 @@ fn parse_filtered_creature_is_attacking(input: &str) -> OracleResult<'_, StaticC
 /// No controller restriction — a matching attacker/blocker controlled by any
 /// player qualifies. The singular article requirement rejects the counted
 /// forms ("three or more creatures are attacking", "exactly one creature is
-/// attacking"), which `parse_creatures_attacking_count_threshold` owns.
+/// attacking"), which `parse_creatures_in_combat_count_threshold` owns.
 fn parse_a_type_is_in_combat(input: &str) -> OracleResult<'_, StaticCondition> {
     // Require a singular article; `parse_type_phrase_folding` strips it itself.
     nom::combinator::peek(alt((tag("a "), tag("an "))).map(|_| ())).parse(input)?;
@@ -5364,31 +5437,42 @@ fn parse_a_type_is_in_combat(input: &str) -> OracleResult<'_, StaticCondition> {
     ))
 }
 
-/// CR 508.1k + CR 118.9: Parse "<count threshold> creature(s) is/are attacking"
-/// → `QuantityComparison(ObjectCount(creature + Attacking) <cmp> N)`.
+/// CR 508.1k + CR 509.1g: Parse "<count threshold> creature(s)
+/// is/are <combat state>" → `QuantityComparison(ObjectCount(creature +
+/// <combat prop>) <cmp> N)`, where the combat state is either "attacking"
+/// (`Attacking`) or "blocking it / ~ / this creature" (`BlockingSource`).
 ///
 /// The head is the comparator-aware `parse_count_threshold`, so every
 /// comparator idiom shares this one arm:
 ///
 /// * Lethargy Trap: "If three or more creatures are attacking, …" → GE 3;
 /// * Arrow Volley Trap: "If four or more creatures are attacking, …" → GE 4;
-/// * Pitfall Trap: "If exactly one creature is attacking, …" → EQ 1.
+/// * Pitfall Trap: "If exactly one creature is attacking, …" → EQ 1;
+/// * Grizzled Wolverine: "only if at least one creature is blocking this
+///   creature" → GE 1 BlockingSource;
+/// * Rampaging Cyclops: "as long as two or more creatures are blocking it" →
+///   GE 2 BlockingSource.
 ///
 /// Both copulas are accepted ("creatures are" / "creature is") because the
-/// singular follows "exactly one" / "more than one". The count spans every
-/// attacking creature regardless of controller (no defender restriction). A
-/// bare count ("one creature is attacking") and the defender form
-/// ("… is attacking you") are deliberately not produced here.
-fn parse_creatures_attacking_count_threshold(input: &str) -> OracleResult<'_, StaticCondition> {
+/// singular follows "exactly one" / "more than one". The attacking count spans
+/// every attacking creature regardless of controller (no defender
+/// restriction). The blocking referent comes from the shared
+/// `parse_blocking_source_referent` authority and names the SOURCE object;
+/// "it" there binds the source, so a host-relative "it" (an Aura's enchanted
+/// creature) is not modeled. A bare count ("one creature is attacking"), the
+/// defender form ("… is attacking you") and a referent-less "… is blocking"
+/// are deliberately not produced here.
+fn parse_creatures_in_combat_count_threshold(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, (n, comparator)) = parse_count_threshold(input)?;
-    let (rest, _) = (
+    let (rest, (_, combat_prop)) = (
         alt((tag("creatures are"), tag("creature is"))),
-        tag(" attacking"),
+        alt((
+            value(FilterProp::Attacking { defender: None }, tag(" attacking")),
+            nom_quantity::parse_blocking_source_referent,
+        )),
     )
         .parse(rest)?;
-    let filter = TargetFilter::Typed(
-        TypedFilter::creature().properties(vec![FilterProp::Attacking { defender: None }]),
-    );
+    let filter = TargetFilter::Typed(TypedFilter::creature().properties(vec![combat_prop]));
     Ok((
         rest,
         make_quantity_comparison(QuantityRef::ObjectCount { filter }, comparator, n),
@@ -5425,8 +5509,8 @@ fn parse_creatures_attacking_count_threshold(input: &str) -> OracleResult<'_, St
 /// count is built by their shared constructor (`attachment_object_count`), so
 /// all four referents (`~`, him/her, it/that creature, them/that player) and
 /// every multi-type list work here on day one. The ONLY things this combinator
-/// adds are the threshold head (`parse_ge_threshold`; the attacking-count
-/// sibling `parse_creatures_attacking_count_threshold` uses the
+/// adds are the threshold head (`parse_ge_threshold`; the combat-count
+/// sibling `parse_creatures_in_combat_count_threshold` uses the
 /// comparator-aware `parse_count_threshold`) and the copula.
 ///
 /// THE COPULA IS REQUIRED, NOT OPTIONAL. "two or more Equipment attached to it"
@@ -12219,6 +12303,29 @@ mod tests {
     ];
 
     #[test]
+    fn source_exert_history_grammar_preserves_polarity_and_boundaries() {
+        for subject in ["~", "this creature", "this permanent"] {
+            let text = format!("{subject} has been exerted this turn, draw a card");
+            let (rest, condition) = parse_inner_condition(&text).unwrap();
+            assert_eq!(rest, ", draw a card");
+            assert_eq!(condition, StaticCondition::SourceExertedThisTurn);
+            for tense in ["hasn't", "hasn’t"] {
+                let text = format!("{subject} {tense} been exerted this turn");
+                let (rest, condition) = parse_inner_condition(&text).unwrap();
+                assert!(rest.is_empty());
+                assert_eq!(
+                    condition,
+                    StaticCondition::Not {
+                        condition: Box::new(StaticCondition::SourceExertedThisTurn)
+                    }
+                );
+            }
+        }
+        assert!(parse_inner_condition("this creature has been exerted this turnip").is_err());
+        assert!(parse_inner_condition("this creature hasn't been exerted this turnip").is_err());
+    }
+
+    #[test]
     fn they_control_count_ge_marker() {
         let (rest, condition) =
             parse_they_control_count_ge("they control three or more creatures").unwrap();
@@ -15183,6 +15290,99 @@ mod tests {
         }
     }
 
+    fn blocking_source_count_filter() -> TargetFilter {
+        TargetFilter::Typed(TypedFilter::creature().properties(vec![FilterProp::BlockingSource]))
+    }
+
+    /// CR 509.1g: "<count threshold> creature(s) is/are blocking
+    /// <source>" is a count of creatures blocking the SOURCE object, for every
+    /// source referent ("~", "it", "this creature") and comparator idiom
+    /// (Grizzled Wolverine GE 1, Rampaging Cyclops GE 2), and reaches the
+    /// restriction-condition bridge. The attacking sibling is unchanged.
+    #[test]
+    fn creatures_blocking_source_count_threshold() {
+        for (input, expected) in [
+            ("at least one creature is blocking ~", (Comparator::GE, 1)),
+            ("two or more creatures are blocking it", (Comparator::GE, 2)),
+            (
+                "exactly one creature is blocking this creature",
+                (Comparator::EQ, 1),
+            ),
+        ] {
+            let (rest, c) = parse_inner_condition(input)
+                .unwrap_or_else(|e| panic!("expected {input:?} to parse, got {e:?}"));
+            assert_eq!(rest, "", "combinator must consume all of {input:?}");
+            match c {
+                StaticCondition::QuantityComparison {
+                    lhs:
+                        QuantityExpr::Ref {
+                            qty: QuantityRef::ObjectCount { filter },
+                        },
+                    comparator,
+                    rhs: QuantityExpr::Fixed { value },
+                } => {
+                    assert_eq!(filter, blocking_source_count_filter(), "for {input:?}");
+                    assert_eq!((comparator, value), expected, "for {input:?}");
+                }
+                other => panic!("expected blocking-source count for {input:?}, got {other:?}"),
+            }
+        }
+        assert!(
+            crate::parser::oracle_condition::parse_restriction_condition(
+                "at least one creature is blocking ~"
+            )
+            .is_some(),
+            "the blocking-source count must reach the restriction bridge"
+        );
+        // Regression: the attacking axis of the same arm still parses.
+        assert_eq!(
+            attacking_count_parts("three or more creatures are attacking"),
+            (Comparator::GE, 3)
+        );
+    }
+
+    /// The blocking-source arm requires a SOURCE referent: a referent-less
+    /// "are blocking" and a non-source object ("blocking target creature") are
+    /// refused, and Wall of Caltrops' "no other creatures are blocking that
+    /// creature" never becomes a blocking-source count. Reach-guard: the
+    /// well-formed sibling parses to the blocking-source count.
+    #[test]
+    fn creatures_blocking_source_count_refuses_non_source_referents() {
+        assert!(
+            crate::parser::oracle_condition::parse_restriction_condition(
+                "two or more creatures are blocking it"
+            )
+            .is_some()
+        );
+        for input in [
+            "two or more creatures are blocking",
+            "at least one creature is blocking target creature",
+        ] {
+            assert_eq!(
+                crate::parser::oracle_condition::parse_restriction_condition(input),
+                None,
+                "{input:?} must not parse as a restriction condition"
+            );
+        }
+        if let Ok((
+            _,
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::ObjectCount { filter },
+                    },
+                ..
+            },
+        )) = parse_inner_condition("no other creatures are blocking that creature")
+        {
+            assert_ne!(
+                filter,
+                blocking_source_count_filter(),
+                "Wall of Caltrops' condition must not become the blocking-source count"
+            );
+        }
+    }
+
     /// Destructure an attachment-threshold condition into
     /// `(threshold, type_filters, properties)`, or panic with the actual shape.
     /// Shared by the `parse_attached_to_referent_count_ge` tests below.
@@ -15344,7 +15544,7 @@ mod tests {
         );
     }
 
-    /// Registering the attachment arm beside `parse_creatures_attacking_count_threshold`
+    /// Registering the attachment arm beside `parse_creatures_in_combat_count_threshold`
     /// must not shadow it. Both accept the "N or more" head (`parse_ge_threshold`
     /// / `parse_count_threshold`), so a future widening of either would surface
     /// here first.

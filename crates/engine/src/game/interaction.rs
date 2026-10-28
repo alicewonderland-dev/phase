@@ -1059,6 +1059,16 @@ struct SelectionProjection {
     source_id: Option<ObjectId>,
 }
 
+impl SelectionProjection {
+    /// One pick is this decision's whole answer only when the decision admits
+    /// exactly one. A count above one is the player's to fill — "Tap X untapped
+    /// artifacts" lets the controller choose X (CR 107.3a) — and an aggregate
+    /// admits any number, so neither may be finalized by a single pick.
+    fn admits_single_pick(&self) -> bool {
+        selection_max_count(&self.constraint) == Some(1)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CounterAssignmentCandidate {
     object_id: ObjectId,
@@ -1196,6 +1206,15 @@ struct TargetSequenceProjection {
     /// answer this; every other state on this model is a "choose" without a
     /// per-slot effect attribution and stays neutral.
     intent: InteractionIntentCode,
+}
+
+impl TargetSequenceProjection {
+    /// As [`SelectionProjection::admits_single_pick`]: a per-slot target
+    /// announcement (`max == 1`, CR 601.2c) is one step; "choose any number"
+    /// shapes such as proliferate (CR 701.34a) are not.
+    fn admits_single_pick(&self) -> bool {
+        self.max == 1
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2564,11 +2583,19 @@ fn amount_assignment_projection(
                 action: AmountAssignmentAction::MoveCounters,
             }
         }
-        WaitingFor::RemoveCountersChoice { available, .. } => {
-            let max_total = available
+        WaitingFor::RemoveCountersChoice {
+            available,
+            max_total: cap,
+            ..
+        } => {
+            let available_total = available
                 .iter()
                 .try_fold(0u32, |total, (_, count)| total.checked_add(*count))
                 .ok_or(InteractionReasonCode::PayloadTooLarge)?;
+            // CR 608.2d: a capped "remove up to N counters" prompt publishes its
+            // engine-computed total bound; "any number" is bounded only by the
+            // counters available (CR 107.1c).
+            let max_total = cap.unwrap_or(available_total);
             AmountAssignmentProjection {
                 candidates: available
                     .iter()
@@ -4141,6 +4168,18 @@ fn count_constraint(min: usize, max: usize) -> SelectionConstraint {
     }
 }
 
+/// The most objects a selection admits, or `None` when an aggregate bounds it
+/// by a property total rather than by a count. The read-side counterpart of
+/// [`count_constraint`]; [`selection_progress`] publishes it as
+/// `InteractionProgress::maximum`, and the attachment fan gates on it.
+fn selection_max_count(constraint: &SelectionConstraint) -> Option<u32> {
+    match constraint {
+        SelectionConstraint::Count { max, .. }
+        | SelectionConstraint::EngineValidatedCount { max, .. } => Some(*max),
+        SelectionConstraint::Aggregate { .. } => None,
+    }
+}
+
 fn effect_zone_intent(effect_kind: EffectKind, destination: Option<Zone>) -> InteractionIntentCode {
     if effect_kind == EffectKind::Sacrifice && destination.is_none() {
         InteractionIntentCode::Sacrifice
@@ -4747,7 +4786,7 @@ fn selection_projection(
                         amount: *value,
                     }
                 }
-                SearchSelectionConstraint::DistinctQualities { .. }
+                SearchSelectionConstraint::SharesQualities { .. }
                 | SearchSelectionConstraint::MatchEachFilter { .. } => {
                     SelectionConstraint::EngineValidatedCount {
                         min: bounds.0.min(u32::MAX as usize) as u32,
@@ -5316,6 +5355,7 @@ fn interaction_mana_special_action(action: SpecialAction) -> InteractionManaSpec
         SpecialAction::TurnFaceUp => InteractionManaSpecialAction::TurnFaceUp,
         SpecialAction::RollPlanarDie => InteractionManaSpecialAction::RollPlanarDie,
         SpecialAction::EndContinuousEffect => InteractionManaSpecialAction::EndContinuousEffect,
+        SpecialAction::Foretell => InteractionManaSpecialAction::Foretell,
     }
 }
 
@@ -5865,8 +5905,17 @@ fn project_action_payload(
                 cast_payment_mode_code(*payment_mode),
             );
         }
-        GameAction::ActivateAbility { ability_index, .. } => {
-            push_value_surface(surfaces, InteractionRoleCode::AbilityIndex, ability_index)
+        GameAction::ActivateAbility {
+            ability_index,
+            payment_mode,
+            ..
+        } => {
+            push_value_surface(surfaces, InteractionRoleCode::AbilityIndex, ability_index);
+            push_value_surface(
+                surfaces,
+                InteractionRoleCode::PaymentMode,
+                cast_payment_mode_code(*payment_mode),
+            );
         }
         GameAction::DeclareAttackers { attacks, bands } => {
             for (index, (attacker, target)) in attacks.iter().enumerate() {
@@ -6903,6 +6952,10 @@ fn actor_candidates(
     let manual_cast_candidates = candidates
         .iter()
         .filter_map(|candidate| {
+            // CR 605.3a: a mana ability has no payment of its own to make by hand.
+            if super::casting::activates_mana_ability(state, &candidate.action) {
+                return None;
+            }
             let mut manual = candidate.clone();
             let payment_mode = manual.action.payment_mode_mut()?;
             if *payment_mode == CastPaymentMode::Manual {
@@ -7735,13 +7788,10 @@ fn selection_progress(
         .iter()
         .all(|object_id| candidate_ids.contains(object_id));
     let selected_count = selected.len().min(u32::MAX as usize) as u32;
-    let (minimum, maximum, aggregate, constraint_satisfied) = match &selection.constraint {
-        SelectionConstraint::Count { min, max } => (
-            *min,
-            Some(*max),
-            None,
-            selected_count >= *min && selected_count <= *max,
-        ),
+    let (minimum, aggregate, constraint_satisfied) = match &selection.constraint {
+        SelectionConstraint::Count { min, max } => {
+            (*min, None, selected_count >= *min && selected_count <= *max)
+        }
         SelectionConstraint::Aggregate {
             function,
             property,
@@ -7787,22 +7837,18 @@ fn selection_progress(
             ));
             (
                 minimum,
-                None,
                 Some(total),
                 selected_count >= minimum && compare_aggregate(*comparator, total, *amount),
             )
         }
-        SelectionConstraint::EngineValidatedCount { min, max } => (
-            *min,
-            Some(*max),
-            None,
-            selected_count >= *min && selected_count <= *max,
-        ),
+        SelectionConstraint::EngineValidatedCount { min, max } => {
+            (*min, None, selected_count >= *min && selected_count <= *max)
+        }
     };
     InteractionProgress {
         selected: selected_count,
         minimum,
-        maximum,
+        maximum: selection_max_count(&selection.constraint),
         aggregate,
         confirmable: unique.len() == selected.len() && all_candidates && constraint_satisfied,
     }
@@ -9242,11 +9288,15 @@ fn attachment_fans_for_slot(
 ) -> BTreeMap<u64, InteractionAttachmentFan> {
     let semantic_owner = PlayerId(slot.semantic_owner);
     let model = human_response_model(&filtered_state.waiting_for, semantic_owner);
+    // A fan pick submits ONE choice as the decision's entire answer, so a
+    // multi-pick decision publishes no fan pick; its attached candidates stay
+    // on the normal interaction surface, where the player keeps choosing.
     let object_choices = match model {
         HumanResponseModel::TargetSequence => {
             target_sequence_projection(&filtered_state.waiting_for)
                 .ok()
                 .flatten()
+                .filter(TargetSequenceProjection::admits_single_pick)
                 .into_iter()
                 .flat_map(|projection| {
                     projection
@@ -9268,6 +9318,7 @@ fn attachment_fans_for_slot(
             selection_projection(&filtered_state.waiting_for, filtered_state, semantic_owner)
                 .ok()
                 .flatten()
+                .filter(SelectionProjection::admits_single_pick)
                 .into_iter()
                 .flat_map(|projection| {
                     projection
@@ -9381,9 +9432,11 @@ fn attachment_fans_for_object_choices(
         .collect()
 }
 
-/// Only publish one-step attachment picks. Multi-choice objects and response
-/// families that require the UI to synthesize a payload stay in the normal
-/// interaction surface until the engine exposes a dedicated picker model.
+/// Map one published object choice to the response that answers its decision
+/// in one step. Reached only for exact candidates and for decisions that admit
+/// a single pick — `attachment_fans_for_slot` withholds multi-pick projections,
+/// so a fan never finalizes a choice the player is still making. Response
+/// families that require the UI to synthesize a payload publish nothing.
 fn attachment_fan_submission(
     interaction_id: &InteractionId,
     model: HumanResponseModel,
@@ -12250,6 +12303,38 @@ mod tests {
             offer_at(IterationCount::UntilLethal, Some(12), 12),
             InteractionShortcutCountSpec::UntilLethal,
             "CR 732.2a: `UntilLethal` names no count, so there is no ceiling to publish"
+        );
+    }
+
+    /// The selection maximum is read from the constraint itself: a counted
+    /// shape publishes its declared ceiling, and an aggregate — bounded by a
+    /// property total rather than a count — publishes none.
+    #[test]
+    fn selection_max_count_reads_every_constraint_shape() {
+        assert_eq!(
+            selection_max_count(&SelectionConstraint::Count { min: 0, max: 1 }),
+            Some(1)
+        );
+        assert_eq!(
+            selection_max_count(&SelectionConstraint::Count { min: 0, max: 3 }),
+            Some(3)
+        );
+        assert_eq!(
+            selection_max_count(&SelectionConstraint::EngineValidatedCount { min: 0, max: 1 }),
+            Some(1)
+        );
+        assert_eq!(
+            selection_max_count(&SelectionConstraint::EngineValidatedCount { min: 1, max: 2 }),
+            Some(2)
+        );
+        assert_eq!(
+            selection_max_count(&SelectionConstraint::Aggregate {
+                function: InteractionAggregateFunction::Sum,
+                property: InteractionObjectProperty::Power,
+                comparator: AggregateComparator::AtLeast,
+                amount: 3,
+            }),
+            None
         );
     }
 }
